@@ -1,0 +1,68 @@
+# API 与数据契约
+
+前后端以 `/api` 为前缀。FastAPI 启动后的 `/docs` 展示当前路由；本页说明每条路由是否真正实现。当前无身份认证，仅限本机开发。
+
+## 导图格式 v0
+
+```json
+{
+  "title": "人工智能",
+  "root": {
+    "id": "root",
+    "label": "人工智能",
+    "children": [
+      {"id": "node-1", "label": "机器学习", "children": []}
+    ]
+  },
+  "source_usage": [
+    {"source_id": "source-1", "kind": "text", "filename": null, "char_count": 42}
+  ]
+}
+```
+
+每个节点需要非空 `id`、非空 `label`；省略 `children` 时默认为空。整棵树 ID 唯一，最多 300 节点、8 层、每个节点最多 50 个子节点。标题和节点文字长度不超过 200。
+
+`source_usage` 是可选的**整张导图来源摘要**：多来源流水线根据实际输入填写，保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。直接文本生成时该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
+
+## 已实现
+
+| 方法和路径 | 请求 | 成功响应 | 失败情况 |
+|---|---|---|---|
+| `GET /api/health` | 无 | `{"status":"ok","version":"..."}` | — |
+| `POST /api/generations` | `{"text":"输入内容"}` | `{"mode":"demo 或 model","content":导图}` | 输入无效 422；模型配置或生成失败 502。 |
+| `POST /api/ingestion/text` | `{"text":"内容","kind":"text 或 markdown"}` | `{"source": 来源}` | 空文本或其他来源类型 422 |
+| `POST /api/pipeline/generate` | `{"sources":[来源]}` | `mode`、`content`、`diagnostics`、`stages` | 来源无效、重复或合并超过 8000 字 422；模型失败 502 |
+| `POST /api/optimization/check` | `{"content":导图}` | 结构诊断列表 | 结构无效 422 |
+| `POST /api/optimization/suggest` | `{"content":导图}` | 诊断与候选建议 | 结构无效 422；建议需用户判断 |
+| `POST /api/export/puml` | `{"content":导图}` | PlantUML 文本；根节点来自 `root.label` | 结构无效 422 |
+| `GET /api/mindmaps` | 无 | 导图记录数组 | — |
+| `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
+| `GET /api/mindmaps/{id}` | 无 | 导图记录 | 不存在 404 |
+| `PUT /api/mindmaps/{id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
+
+记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。流水线目前同步返回，`stages` 是完成后的阶段记录，不是实时进度。
+
+`source` 是 `/api/ingestion/text` 返回的对象，也可按 `/docs` 中的 Source 结构提交；每次流水线最多 50 个来源，必须均为非空且已解析，ID 不可重复。当前超长会报错，不会静默截断或丢弃来源。
+
+## 已注册但尚未实现
+
+| 路由 | 当前行为 |
+|---|---|
+| `POST /api/ingestion/files` | 所有文件类型返回 501；文本或 Markdown 可通过 `/api/ingestion/text` 提交。 |
+| `POST /api/knowledge/search` | 返回空列表与 `implemented: false`，没有接入检索。 |
+| `POST /api/agent/tasks` | 返回固定阶段与 `implemented: false`，不会生成导图。 |
+| `POST /api/export/markdown`、`POST /api/export/opml` | 返回 501。 |
+
+## 功能接口规划（均未实现）
+
+| 模块 | 候选接口/契约 | 目的 |
+|---|---|---|
+| 多模态文件 | 文件接收与来源查询接口待确定 | 上传或解析 PDF、Word、PPT、图片、音频，返回来源状态及定位信息。 |
+| 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。 |
+| 优化 | 已有 `/api/optimization/suggest`，持久化和应用接口待确定 | 未来补齐矛盾、缺失、重组、跨节点关系候选及依据，不直接覆盖。 |
+| 知识库 | `POST /api/knowledge-bases`、`POST .../{id}/sources`、`POST .../{id}/search` | 导入来源、切分、向量化、检索与引用。 |
+| AI 代理 | 以 `/api/agent/tasks` 桩为起点 | 目标规划、多步生成、讨论总结与翻译，记录过程和来源。 |
+| 协作 | 房间授权接口 + Yjs WebSocket | 房间鉴权、实时同步、在线状态、恢复；最终协议由协作负责人完成设计。 |
+| 更多导出 | `/api/export/markdown`、`/api/export/opml` | Markdown 和 OPML 目前返回 501；图像导出待开发。 |
+
+未来接口的请求、响应、权限、错误和任务生命周期需在实现前由双方评审，不能将候选路径视为已实现承诺。

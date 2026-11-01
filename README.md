@@ -179,3 +179,9 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 - 本文档内容整理自本项目申报书，未作技术方案层面的增补。
 - 申报书原文写作 `pluml-encode`，此处按 npm 实际包名写作 `plantuml-encoder`（另有 `plantuml-encode` 存在，为不同包）。
 - 后端架构一节在申报书中尚未填写，待项目组确定后更新。
+
+---
+
+## 开发骨架与团队分工
+
+请参阅 [组员阅读说明](TEAM-GUIDE.md)、[开发骨架使用说明](START_HERE.md)、[系统架构](docs/ARCHITECTURE.md)和[功能清单与分工](docs/FEATURES_AND_OWNERS.md)。当前为开发骨架，具体功能状态见清单。

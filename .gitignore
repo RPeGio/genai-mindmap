@@ -33,3 +33,10 @@ uploads/
 exports/
 eval/results/
 eval/reports/
+
+# Python development
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.db
