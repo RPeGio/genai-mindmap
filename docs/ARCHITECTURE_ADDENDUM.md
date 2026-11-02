@@ -70,6 +70,11 @@ update mindmaps
 
 ## 2 流式协议（SSE）
 
+> **本章是设计稿，与当前实现有差异。** 落地版本是「单次调用 + 增量 JSON 解析」，
+> 事件用 `data:` 里带 `type` 字段（不用 `event:` 行），字段名是 `content` / `latencyMs`
+> 而不是这里的 `mapId` / `nodeCount`，代码见 `backend/app/generation/stream_partial.py`。
+> 本章保留的价值是记录「任务化 + 断线重放」这条演进路线，尚未实现。
+
 对应 [API 契约](API.md) 里规划的 `GET /api/generation-tasks/{id}/events`。当前 `POST /api/generations` 同步返回完整导图，SSE 是**新增的第二条通道**，不替换同步接口——短输入和演示模式继续走同步。
 
 ### 2.1 事件格式

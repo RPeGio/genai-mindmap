@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线：后端 19 个测试（pytest 收集 unittest 用例）、前端 3 个 vitest 用例，全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线：后端 40 个测试（pytest）、前端 5 个 vitest 用例，全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 `unittest` 默认可能将进度输出到 stderr；这本身不代表失败。请同时检查最后的 `OK` 和 `$LASTEXITCODE`，测试成功时退出码应为 0。
 
@@ -92,7 +92,7 @@ backend/
     agent/             AI 代理                    （桩）
     export/            导出 puml                  （puml 可用）
     mindmaps/          保存 / 读取 / 版本冲突     （可用）
-  tests/               19 个测试
+  tests/               40 个测试
 frontend/
   src/
     App.vue            工作台（输入 + 层级预览；画布 R2 接入）
@@ -100,7 +100,7 @@ frontend/
     styles.css         Tailwind 入口
     api/client.ts      fetch 封装 + ApiError（目前只接了 /api/generations）
     api/types.ts       与后端契约 v1 对应的 TS 类型
-  tests/app.spec.ts    3 个 vitest 用例
+  tests/app.spec.ts    5 个 vitest 用例
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度

@@ -31,7 +31,8 @@ flowchart TD
 
 | 入口 | 接口 | 输入 | 输出 | 状态 |
 |---|---|---|---|---|
-| 快速生成 | `POST /api/generations` | 一段文本 | 导图 | 已实现（demo / model） |
+| 快速生成（同步） | `POST /api/generations` | 一段文本 | 导图 | 已实现（demo / model） |
+| 流式生成（主路径） | `POST /api/generations/stream` | 一段文本 | SSE：节点逐个下发 | 已实现，页面默认走这条 |
 | 多来源流水线 | `POST /api/pipeline/generate` | `Source[]` | 导图 + 阶段轨迹 + 诊断 | 已实现（文本来源） |
 | 目标驱动 | `POST /api/agent/tasks` | 一句目标 | 阶段骨架 | 桩（不产生导图） |
 
@@ -63,7 +64,7 @@ flowchart TD
 
 | 前端位置 | 调用 | 用途 |
 |---|---|---|
-| 输入框（`src/App.vue`） | `POST /api/generations` | **已接入（R1）**：输入 → 候选导图 → 层级预览 |
+| 输入框（`src/App.vue`） | `POST /api/generations/stream` | **已接入**：输入 → 流式生成 → 节点逐个出现 |
 | 画布（R2） | 无请求 | 纯前端：`@vue-flow/core` + tidy-tree 布局消费 `content` |
 | 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | 带 `version` 的乐观锁，409 时提示重新打开 |
 | 上传面板（待开发） | `POST /api/ingestion/files` | 当前所有文件类型均返回 501，接口实现后才能接入 |

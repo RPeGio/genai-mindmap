@@ -7,11 +7,10 @@ const prompt = ref('');
 const content = ref<MindMapContent | null>(null);
 const mode = ref<'demo' | 'model' | null>(null);
 const busy = ref(false);
-const status = ref('输入主题或文本后生成。先出骨架，再补细节。');
+const status = ref('输入主题或文本后生成，节点会边生成边出现。');
 /** 当前阶段文案 + 已等待秒数，避免长时间没有反馈时界面看起来像卡死。 */
 const stageText = ref('');
 const waitedMs = ref(0);
-const degraded = ref(false);
 
 let controller: AbortController | null = null;
 
@@ -75,7 +74,6 @@ async function generate() {
   const previousMode = mode.value;
 
   busy.value = true;
-  degraded.value = false;
   waitedMs.value = 0;
   stageText.value = '正在连接';
   content.value = null;
@@ -93,10 +91,8 @@ async function generate() {
           stageText.value = event.detail;
           break;
         case 'skeleton':
-          // 两段式方案：骨架先到，主结构立刻可见。
+          // 只有 demo 模式会发这个事件：它一次性给出整棵树，不走增量推送。
           content.value = event.content;
-          stageText.value = '骨架已就绪，正在展开分支';
-          status.value = '已显示骨架，细节还在补全中…';
           break;
         case 'node':
           // 增量方案：节点一个个长出来，同一 id 的文字会越补越全。
@@ -111,12 +107,9 @@ async function generate() {
           settled = true;
           content.value = event.content;
           mode.value = event.mode;
-          degraded.value = event.degraded;
-          status.value = event.degraded
-            ? `展开阶段失败，当前是骨架结果（${(event.latencyMs / 1000).toFixed(1)} 秒）。${event.reason ?? ''}`
-            : event.mode === 'demo'
-              ? '这是固定结构的演示数据，不是 AI 生成。'
-              : `模型已生成候选导图，用时 ${(event.latencyMs / 1000).toFixed(1)} 秒。`;
+          status.value = event.mode === 'demo'
+            ? '这是固定结构的演示数据，不是 AI 生成。'
+            : `模型已生成候选导图，用时 ${(event.latencyMs / 1000).toFixed(1)} 秒。`;
           stageText.value = '';
           break;
         case 'error':
@@ -124,8 +117,7 @@ async function generate() {
           // 后端在流里报错时，之前那份导图同样要还回来，不能只留一个空画布。
           content.value = previous;
           mode.value = previousMode;
-          degraded.value = false;
-          status.value = event.message;
+                  status.value = event.message;
           stageText.value = '';
           break;
       }
@@ -232,9 +224,6 @@ onBeforeUnmount(() => controller?.abort());
             <h2 class="text-base font-semibold">{{ content.title }}</h2>
             <span v-if="mode" class="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
               {{ mode === 'demo' ? '演示模式' : '模型生成' }}
-            </span>
-            <span v-if="degraded" class="rounded bg-amber-100 px-2 py-0.5 text-xs text-amber-700">
-              骨架结果
             </span>
             <span class="text-xs text-slate-400">{{ nodeCount }} 个节点</span>
           </div>

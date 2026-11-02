@@ -62,7 +62,7 @@ free -h
 **DoD**：v1 旧库（若本地有 `backend/data/mindmaps.db`）迁移后全部可读；非法数据（重复 id / 关系指向不存在节点）返回 422 且错误信息指明节点 id。
 **讲解稿要点**：为什么要 `schema_version` 而不是探测字段；为什么 `pos` 只在 manual 下允许。
 
-## D3（11/4–11/5）生成两段式 + SSE
+## D3（11/4–11/5）单次流式生成 + SSE
 
 | 任务 | 交付 |
 |---|---|
@@ -74,11 +74,11 @@ free -h
 | 结构化输出 | 先试 `response_format=json_schema`，失败回退提示词；两种情况都过 `model_validate`，仅对 `ValidationError` 重试一次并把字段路径回灌 |
 
 **DoD**：`curl -N` 能看到逐条 `node` 事件；首节点延迟 < 3s（DeepSeek，短输入）；断网时前端收到 `error` 事件而不是白屏。
-**讲解稿要点**：为什么两段式而不是一次调用；SSE 与同步接口并存的分工。
+**讲解稿要点**：为什么用流式而不是等整棵树；SSE 与同步接口并存的分工。（注：曾评估过「两段式：先骨架再展开」，因要多一次模型调用且代码要维护两套，最终采用单次增量解析。）
 
 ## D4（11/5–11/6）Vue 前端重建 + 画布
 
-> 状态（2026-11-02）：**R1 已完成**——Vue 3 + TS + Vite + Tailwind 骨架、`src/api/client.ts`、`src/api/types.ts`、层级预览、3 个 vitest 用例，构建产物 69.66 kB / gzip 28.01 kB；`npm test` 与 `npm run build` 均通过。**R2（画布）与 R3（编辑/撤销/保存）未做**；`pinia`、`@vue-flow/*` 尚未安装，进 R2 时再装，避免留未用依赖。
+> 状态（2026-11-02 更新）：**R1 已完成并已接上流式生成**——Vue 3 + TS + Vite + Tailwind 骨架、`src/api/client.ts`（含 `generateMindMapStream` 流式封装与 SSE 解析）、`src/api/types.ts`、层级预览、5 个 vitest 用例；`npm test` 与 `npm run build` 均通过。**R2（画布）与 R3（编辑/撤销/保存）未做**；`pinia`、`@vue-flow/*` 尚未安装，进 R2 时再装，避免留未用依赖。
 
 ```powershell
 cd frontend
@@ -128,7 +128,7 @@ npm i @vue-flow/core @vue-flow/background @vue-flow/controls
 
 - [ ] CI 绿；后端覆盖率 ≥50%（W1 目标，W3 到 60%）
 - [ ] 线上 `IP:8080` 可访问，`/api/health` 返回 commit
-- [ ] 两段式 SSE 首节点 < 3s，截图存证
+- [ ] 流式 SSE 首节点 < 2s、整棵树 < 4s，截图存证
 - [ ] 画布可编辑、可保存、可撤销
 - [x] 旧 React 前端已打 tag；四份文档已按 Vue 现状同步（2026-11-02）
 - [ ] 双方各交一篇「讲解稿」，互讲 30 分钟，勾掉 20 题中已覆盖的

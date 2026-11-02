@@ -94,8 +94,8 @@ describe('App', () => {
     await wrapper.get('textarea').setValue('机器学习');
     void wrapper.get('button').trigger('click');   // 不 await：流不会结束
 
+    // 心跳只负责显示等待秒数；节点出现的文案由 node 事件驱动。
     await vi.waitFor(() => expect(wrapper.text()).toContain('已等待 3 秒'));
-    expect(wrapper.text()).toContain('骨架已就绪');
   });
 
   it('后端返回非 2xx 时展示 message 文案', async () => {

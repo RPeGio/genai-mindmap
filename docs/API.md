@@ -2,9 +2,9 @@
 
 前后端以 `/api` 为前缀。FastAPI 启动后的 `/docs` 展示当前路由；本页说明每条路由是否真正实现。当前无身份认证，仅限本机开发。
 
-**错误体现状**：FastAPI 默认 `{"detail": "..."}`（422 为校验错误数组），前端 `src/api/client.ts` 的 `ApiError` 按 `detail` 取文案。**目标**是统一为 `{code, message, detail, request_id}`（D1 落地，见 [执行计划](PLAN.md) 第 5 节工程门第 4 条）；`client.ts` 已同时兼容两种形状，后端切换时前端无需改。
+**错误体已统一**：所有错误响应都是 `{code, message, detail, request_id}`（实现见 `backend/app/core/errors.py`）。`message` 是中文可读文案，`detail` 保留原始细节（校验错误为数组），`request_id` 优先沿用请求头 `X-Request-ID`、没有则生成，并同时通过响应头回传。前端 `src/api/client.ts` 的 `ApiError` 读 `message`，缺失时回退到 `detail`。
 
-**前端消费情况**：目前只封装了 `POST /api/generations`（`generateMindMap`）；其余路由待 R2–R3 接入。
+**前端消费情况**：已封装 `POST /api/generations`（`generateMindMap`，一次性）与 `POST /api/generations/stream`（`generateMindMapStream`，流式，页面默认走这条）；其余路由待 R2–R3 接入。
 
 ## 导图格式 v1（当前）与 v2（候选）
 
@@ -36,6 +36,7 @@
 |---|---|---|---|
 | `GET /api/health` | 无 | `{"status":"ok","version":"..."}` | — |
 | `POST /api/generations` | `{"text":"输入内容"}` | `{"mode":"demo 或 model","content":导图}` | 输入无效 422；模型配置或生成失败 502。 |
+| `POST /api/generations/stream` | `{"text":"输入内容"}` | SSE：`stage` / `node` / `done` / `error`，末尾 `data: [DONE]` | 流开始前校验失败走普通 JSON 422；开始后错误以 `{"type":"error"}` 事件下发 |
 | `POST /api/ingestion/text` | `{"text":"内容","kind":"text 或 markdown"}` | `{"source": 来源}` | 空文本或其他来源类型 422 |
 | `POST /api/pipeline/generate` | `{"sources":[来源]}` | `mode`、`content`、`diagnostics`、`stages` | 来源无效、重复或合并超过 8000 字 422；模型失败 502 |
 | `POST /api/optimization/check` | `{"content":导图}` | 结构诊断列表 | 结构无效 422 |
@@ -45,6 +46,8 @@
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
 | `GET /api/mindmaps/{id}` | 无 | 导图记录 | 不存在 404 |
 | `PUT /api/mindmaps/{id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
+
+**流式接口的帧格式**：每帧 `data: <json>`，`type` 字段区分事件；`node` 事件的节点只有 `id`/`label`（不含 children），前端按 id 插入或覆盖；收到 `done` 后前端应用完整 `content` 对齐；`data: [DONE]` 表示流正常结束，不是 JSON。事件定义与生成逻辑见 `backend/app/generation/stream_partial.py`。
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。流水线目前同步返回，`stages` 是完成后的阶段记录，不是实时进度。
 
