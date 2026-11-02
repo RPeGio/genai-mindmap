@@ -1,7 +1,13 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vitest/config';
+import vue from '@vitejs/plugin-vue';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
-  plugins: [react()],
-  server: { proxy: { '/api': 'http://127.0.0.1:8000' } },
+  plugins: [vue(), tailwindcss()],
+  server: {
+    proxy: { '/api': 'http://127.0.0.1:8000' },
+  },
+  test: {
+    environment: 'jsdom',
+  },
 });
