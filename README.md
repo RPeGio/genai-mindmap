@@ -103,22 +103,24 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 前端
 
-前端使用 React 构建用户界面提供组件化开发模式，使用 Zustand 状态管理库管理复杂的应用状态，通过 TypeScript 提高代码质量，基于 AI 大模型的中间层实现多模态的处理，通过 TailwindCSS 实现流畅的交互动画和统一美观的样式布局，基于 `plantuml-encoder` 和 `viz.js` 处理 puml 代码，以 axios 作为网络通信库，Zod 做数据校验，确保数据的准确性和完备性。
+前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容与版本状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布（W1 R2 接入），Vitest + Vue Test Utils 覆盖关键交互。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
 
 | 位置 | 选型 |
 |---|---|
-| UI 框架 | React（组件化开发模式） |
-| 状态管理 | Zustand |
+| UI 框架 | Vue 3（`<script setup>` 组合式 API） |
+| 状态管理 | Pinia |
 | 开发语言 | TypeScript |
-| 样式方案 | TailwindCSS（交互动画与样式布局） |
-| 中间层 | AI 大模型，承担多模态处理 |
-| puml 处理 | `plantuml-encoder` + `viz.js` |
-| 网络通信 | axios |
-| 数据校验 | Zod |
+| 构建与测试 | Vite 7 + Vitest + Vue Test Utils |
+| 样式方案 | TailwindCSS 4 |
+| 画布 | `@vue-flow/core` + 自研 tidy-tree 布局（R2） |
+| 网络通信 | `fetch`（`src/api/client.ts` 统一错误体） |
+| 数据校验 | 后端 Pydantic v2 契约；前端只做类型镜像 |
+
+> 申报书原文写的是 React + Zustand + axios + Zod + `plantuml-encoder`/`viz.js`。实际实现改走 Vue 生态：React 骨架仅作过渡，已打 tag `v0.1.0-react-scaffold` 存档；Zustand/axios/Zod 未采用；PUML 由后端生成文本、前端只下载，不在浏览器里渲染，因此 `plantuml-encoder` 与 `viz.js` 也不引入。
 
 #### 后端
 
-待补充。
+FastAPI + Pydantic v2。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。8 组路由统一挂在 `/api` 下，**未实现的接口返回 501 并带 `implemented: false`，不返回空对象冒充成功**。模型调用集中在 `backend/app/generation/`：默认 `demo` 模式不联网，设 `MINDMAP_LLM_MODE=model` 后才走 Chat Completions 兼容接口。生成结果不自动保存，保存是带版本号的乐观锁（冲突返回 409）。
 
 ### 核心模块开发
 
@@ -176,12 +178,13 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 ## 关于本仓库
 
-- 本文档内容整理自本项目申报书，未作技术方案层面的增补。
+- 前四节（背景、现状、创新点、预期成果）整理自本项目申报书，未作技术方案层面的增补。
+- 「技术路线」一节已按实际实现更新（Vue 生态 + FastAPI），与申报书原文的差异在上一节用引用块标注。
 - 申报书原文写作 `pluml-encode`，此处按 npm 实际包名写作 `plantuml-encoder`（另有 `plantuml-encode` 存在，为不同包）。
-- 后端架构一节在申报书中尚未填写，待项目组确定后更新。
+- 后端架构在申报书中留空，现按 `docs/ARCHITECTURE.md` 与 `docs/API.md` 实现。
 
 ---
 
 ## 开发骨架与团队分工
 
-请参阅 [组员阅读说明](TEAM-GUIDE.md)、[开发骨架使用说明](START_HERE.md)、[系统架构](docs/ARCHITECTURE.md)和[功能清单与分工](docs/FEATURES_AND_OWNERS.md)。当前为开发骨架，具体功能状态见清单。
+请参阅 [组员阅读说明](TEAM-GUIDE.md)、[开发骨架使用说明](START_HERE.md)、[系统架构](docs/ARCHITECTURE.md)、[功能清单与分工](docs/FEATURES_AND_OWNERS.md) 和 [项目执行计划](docs/PLAN.md)（里程碑、验收门、风险表、决策记录）。当前为开发骨架，具体功能状态见清单。

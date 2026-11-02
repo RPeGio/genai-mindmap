@@ -3,21 +3,13 @@
 > 前置：`docs/PLAN.md` 与 `docs/CONTRACT_V2.md` 已 review 通过。
 > 每周五验收门：浏览器输入一句话 → 画布逐节点长出导图 → 刷新后能打开，且线上 `IP:8080` 可访问。
 
-## D0 一次性准备（今天，30 分钟）
+## D0 已完成（2026-11-02）
 
-本地分支已经建好：`main`、`dev`（从 `main` 拉出，与 `main` 同起点）、`docs/project-plan`（含三份文档，commit `8f51f5b`）。
-
-```powershell
-# 1. 推 dev 与文档分支
-git push -u origin dev
-git switch docs/project-plan
-git push -u origin docs/project-plan
-
-# 2. GitHub 上开 PR：base = dev（不是 main），双人 assign
-#    合并后本地同步
-git switch dev
-git pull --ff-only
-```
+- `dev` 已在远端；`docs/project-plan` 已合入 `dev`（PR #2）；CI 配置已合入（PR #1）；CI 第 1–4 次 run 全绿。
+- **fork 仓库的 Actions 必须手动启用一次**：到 Actions 页面点 "I understand my workflows, go ahead and enable them"，否则后续提交不会触发（`PUT /actions/permissions` 与空提交都推不动）。
+- 旧 React 骨架已打 tag `v0.1.0-react-scaffold`（指向 `c4ff5e1`）并推送；Vue 重建的 R1 在 `feat/vue-rebuild`（PR #3，待合入 `dev`）。
+- 推送代理脚本 `scripts/git-net.ps1` **不入库**（个人环境专用，已从索引删除，本机走 `.git/info/exclude`）；`git config --local http.proxy` 固定代理，`git net` 别名带"端口不通就直连"的回退。
+- 新机器仍需执行的只有：`git switch dev && git pull --ff-only`，然后从 `dev` 切 `feat/*` 或 `fix/*`。原 D0 的推送命令已执行完毕，不再保留。
 
 之后所有开发分支都从 `dev` 切出（`feat/*`、`fix/*`），PR 目标一律 `dev`；`dev` 每周日合 `main` 并打 tag。
 
@@ -86,6 +78,8 @@ free -h
 
 ## D4（11/5–11/6）Vue 前端重建 + 画布
 
+> 状态（2026-11-02）：**R1 已完成**——Vue 3 + TS + Vite + Tailwind 骨架、`src/api/client.ts`、`src/api/types.ts`、层级预览、3 个 vitest 用例，构建产物 69.66 kB / gzip 28.01 kB；`npm test` 与 `npm run build` 均通过。**R2（画布）与 R3（编辑/撤销/保存）未做**；`pinia`、`@vue-flow/*` 尚未安装，进 R2 时再装，避免留未用依赖。
+
 ```powershell
 cd frontend
 git rm -r src tests   # 旧 React 源码与测试（先在 main 打 tag v0.1.0-react-scaffold）
@@ -120,6 +114,8 @@ npm i @vue-flow/core @vue-flow/background @vue-flow/controls
 
 ## D6（11/7–11/8）文档同步与联调
 
+> 状态（2026-11-02）：**首轮同步已完成**（PR：`docs/sync-vue`）——README / START_HERE / TEAM-GUIDE / ARCHITECTURE / API / FLOW / FEATURES 已按 Vue、v1 现状、部署形态改完；联调仍待 W1 末。
+
 - `README.md`：技术路线改 Vue / FastAPI / PG，删掉未落地的 Zustand/axios/Zod/`viz.js` 承诺（或标注"未采用"）。
 - `docs/ARCHITECTURE.md`：React Flow → Vue Flow；补 v2 契约与 PG。
 - `docs/API.md`、`docs/FLOW.md`：新增任务/SSE/认证接口。
@@ -134,5 +130,5 @@ npm i @vue-flow/core @vue-flow/background @vue-flow/controls
 - [ ] 线上 `IP:8080` 可访问，`/api/health` 返回 commit
 - [ ] 两段式 SSE 首节点 < 3s，截图存证
 - [ ] 画布可编辑、可保存、可撤销
-- [ ] 旧 React 前端已打 tag，四份文档已同步
+- [x] 旧 React 前端已打 tag；四份文档已按 Vue 现状同步（2026-11-02）
 - [ ] 双方各交一篇「讲解稿」，互讲 30 分钟，勾掉 20 题中已覆盖的

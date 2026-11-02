@@ -2,7 +2,11 @@
 
 前后端以 `/api` 为前缀。FastAPI 启动后的 `/docs` 展示当前路由；本页说明每条路由是否真正实现。当前无身份认证，仅限本机开发。
 
-## 导图格式 v0
+**错误体现状**：FastAPI 默认 `{"detail": "..."}`（422 为校验错误数组），前端 `src/api/client.ts` 的 `ApiError` 按 `detail` 取文案。**目标**是统一为 `{code, message, detail, request_id}`（D1 落地，见 [执行计划](PLAN.md) 第 5 节工程门第 4 条）；`client.ts` 已同时兼容两种形状，后端切换时前端无需改。
+
+**前端消费情况**：目前只封装了 `POST /api/generations`（`generateMindMap`）；其余路由待 R2–R3 接入。
+
+## 导图格式 v1（当前）与 v2（候选）
 
 ```json
 {
@@ -21,6 +25,8 @@
 ```
 
 每个节点需要非空 `id`、非空 `label`；省略 `children` 时默认为空。整棵树 ID 唯一，最多 300 节点、8 层、每个节点最多 50 个子节点。标题和节点文字长度不超过 200。
+
+**v2 候选**在 v1 之上新增 `schema_version`、`layout`、`theme`、`relations[]` 以及节点的 `note`/`collapsed`/`style`/`source_refs`/`pos`，详见 [CONTRACT_V2](CONTRACT_V2.md)。**后端尚未实现 v2**，前端当前按 v1 对接，v2 字段只留扩展位。
 
 `source_usage` 是可选的**整张导图来源摘要**：多来源流水线根据实际输入填写，保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。直接文本生成时该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
 

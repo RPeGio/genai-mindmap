@@ -2,6 +2,8 @@
 
 > 状态：**冻结候选**（W1 定稿后冻结）· 归属：A/B 共管 · 任何字段改动需双人 review + 迁移脚本
 > v1 定义见 `backend/app/contracts/mindmap.py`（`id` / `label` / `children`）。
+>
+> **落地状态（2026-11-02）**：后端仍是 v1，`MindMapContent` 只有 `title` / `root` / `source_usage`；`frontend/src/api/types.ts` 是手写的 v1 镜像，**不是** v2 生成物。D2 把 v2 写进 Pydantic 后，前端类型改由 `openapi-typescript` 从 `/openapi.json` 生成，禁止再手写第二份。
 
 ## 1 v1 → v2 变更摘要
 
@@ -137,7 +139,7 @@ npx openapi-typescript http://127.0.0.1:8000/openapi.json -o src/api/schema.d.ts
 ```
 
 - 生成物 `src/api/schema.d.ts` **提交入库**，CI 里跑 `npm run gen:api && git diff --exit-code` 保证与后端同步。
-- 手写的 `src/types.ts` 删除；业务层只从 `schema.d.ts` 取 `components["schemas"]["MindMapContent"]`。
+- 手写的 `frontend/src/api/types.ts`（v1 镜像）删除；业务层只从 `schema.d.ts` 取 `components["schemas"]["MindMapContent"]`。
 - 前端额外需要、后端没有的类型（如画布内部节点）放在 `src/canvas/types.ts`，**不得**与契约同名。
 
 ## 6 完整示例
