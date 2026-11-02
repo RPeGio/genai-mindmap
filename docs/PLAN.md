@@ -52,7 +52,7 @@
 |---|---|---|
 | F05 | PDF / DOCX / PPTX 导入 | 只取文本层；扫描件走 F06 兜底；50 页上限 |
 | F06 | 图片/草图 → 导图 | 单图；`deepseek-flash` 视觉；识别结果先给候选 |
-| F07 | 语音 → 导图 | sidecar 可插拔后端；线上 60s 上限 |
+| F07 | 语音 → 导图 | sidecar 可插拔后端（默认 MOSS；`faster-whisper` small-int8 为降级档）；线上 60s 上限 |
 | F08 | 混合输入（文本+图+音） | 复用 `Source[]` 合并，保留来源标签 |
 | F03 | 会议纪要/碎片文本整理 | 专用 prompt + 2 个测试 |
 | F02 | 目标驱动框架生成（AI 代理） | 四阶段可见，产出导图，不承诺多轮代理 |
@@ -90,7 +90,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 2. **存储换 PG 不再保留 SQLite 双轨**：部署要求"含数据库"，协作快照、`llm_calls`、pgvector 都要真库；双轨会让测试与迁移分叉。开发与 CI 都用 compose 起的 PG，单测用事务回滚隔离。
 3. **协作必须真 CRDT**：现有乐观锁只能防覆盖，无法合并并发编辑。Yjs 单房间 + 房间 token（api 签发）+ 30s 快照。映射层（`MindMapContent` ↔ `Y.Map`）自研，这是能讲清的技术点。
 4. **视觉直接用 `deepseek-flash`，不引入第二家**：该模型原生支持图片输入，三种传法（base64 内联 / 外链 / Files API `file_id`），单图上限 32 MiB（base64）或 64 MiB（file_id），请求体 48 MiB，每图最多计 1024 token，且图片只能出现在 `user` 消息中。我们走**前端压缩到 1600px → base64 内联**，草图为一次性输入，不需要 Files API 复用。
-5. **ASR 做成可插拔 sidecar**：`moss`（本地演示，带说话人分离）/ `aliyun`（线上，免费额度）/ `faster-whisper`（离线评测基线）。线上 2C2G 不常驻 MOSS 模型。
+5. **ASR 做成可插拔 sidecar**：`moss`（默认，带说话人分离）/ `aliyun`（线上备选，免费额度）/ `faster-whisper`（降级档 + 评测基线）。线上 2C2G 不常驻 MOSS 模型；faster-whisper 只上 `small` int8，且必须 `vad_filter=True`、`beam_size=1`、`num_workers=1`（2 核上 medium 起实时率 >2x，large-v3 等于不可用，且**没有**说话人分离）。W2 D1 用 3 分钟真实中文音频跑 RTF / 峰值内存 / 字错率，数字写进 `docs/API.md` 效果章节。
 6. **不做**：Celery/Redis、K8s、微服务拆分、Docling、本地 LLM、多租户 RBAC、OSS/CDN。
 
 **2C2G 内存预算（含 swap 2G）**
@@ -116,6 +116,8 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 | **缓冲** 11/30–12/1 | 只修 P0；现场环境预热；静态截图与录屏备份 | 断网也能讲完 |
 
 每周节奏：周一 30 分钟对齐（本周目标/风险）；周三 15 分钟同步；周五 30 分钟互讲 + 合并 `dev`；周日 `dev` → `main` 并打 tag。
+
+**上线节奏（Q32 定）**：W1 只上 `IP:8080`（安全组放通 22 + 8080），日常开发与答辩演示都以"公网 IP 在校园网可达"为准；域名 + Cloudflare 推迟到 W3 视备案进度，W4 仍作可选项。W1 不做 TLS，nginx 先只做静态与反代。
 
 ## 5 验收门与指标口径
 
@@ -179,13 +181,26 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `FERNET_KEY` | 加密用户 BYOK |
 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | 默认模型（`deepseek-flash`） |
 | `LLM_MODE` | `demo`（离线占位）/ `live` |
-| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` | `moss`\|`aliyun`\|`faster-whisper`；线上 60 |
+| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` | `moss`（默认）\|`aliyun`\|`faster-whisper`；线上 60 |
+| `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | `small` / `int8`（仅降级档，禁止改 `medium`/`large-v3`） |
 | `MAX_INPUT_CHARS` | 统一为 8000（修掉 10000/8000 双上限） |
 | `UPLOAD_DIR` / `MAX_UPLOAD_MB` | `uploads/`；20 |
 | `DAILY_LLM_QUOTA` | 200 |
 
-## 11 变更记录
+## 11 决策记录（Q26–Q32）
+
+| # | 决策 | 理由 / 影响 |
+|---|---|---|
+| Q27 | ASR 默认 MOSS，`faster-whisper` small-int8 为降级档 | 2C2G 上 large-v3 不可用且无说话人分离；保留 sidecar 接口即可随时切换，W2 benchmark 定档 |
+| Q28 | 全部服务跑在同一台 ECS，`IP:8080` 暴露 | 2C2G 无法拆机；单机 compose 也最符合"独立部署"的考核表述 |
+| Q29 | BYOK：用户自带 key、服务端 Fernet 加密存库、每用户每日 200 次、前端不落明文、演示账号单独限额 | 密钥不进代码库、不进日志；额度与滥用风险由 R11 兜底 |
+| Q30 | `main` ← `dev` ← `feat/*`·`fix/*`；PR 目标一律 `dev` | `dev` 已从 `main` 拉出（空提交起点），`docs/project-plan` 的 PR 目标改 `dev` |
+| Q31 | A：契约 / Vue 画布 / 布局主题导出 / 协作客户端 / 部署基建 / CI；B：后端地基 / 生成链路 / 多模态解析 / RAG / 诊断 / 代理 / 评估集 | W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W2 起交叉 review |
+| Q32 | W1 只上 `IP:8080`，域名与 CF 推迟 W3 | 备案不可控（R1）；验收只看"能独立部署并访问"，TLS 不是硬门 |
+
+## 12 变更记录
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.0 | 2026-11-02 | 首版定稿（基于四轮需求澄清，见 PR 描述） |
+| v1.1 | 2026-11-02 | 补 Q27–Q32 决策、ASR 降级档与 `ASR_WHISPER_*` 配置、上线节奏（W1 仅 IP:8080） |

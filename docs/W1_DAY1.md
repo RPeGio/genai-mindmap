@@ -5,18 +5,23 @@
 
 ## D0 一次性准备（今天，30 分钟）
 
-```powershell
-# 1. 建集成分支（main 受保护）
-git switch main
-git pull
-git switch -c dev
-git push -u origin dev
+本地分支已经建好：`main`、`dev`（从 `main` 拉出，与 `main` 同起点）、`docs/project-plan`（含三份文档，commit `8f51f5b`）。
 
-# 2. 本次计划文档走 PR → dev
-git switch -c docs/project-plan
-# ... 文档已提交后 ...
+```powershell
+# 1. 推 dev 与文档分支
+git push -u origin dev
+git switch docs/project-plan
 git push -u origin docs/project-plan
+
+# 2. GitHub 上开 PR：base = dev（不是 main），双人 assign
+#    合并后本地同步
+git switch dev
+git pull --ff-only
 ```
+
+之后所有开发分支都从 `dev` 切出（`feat/*`、`fix/*`），PR 目标一律 `dev`；`dev` 每周日合 `main` 并打 tag。
+
+工作区里 `frontend/package-lock.json` 有既存的 esbuild 版本漂移（未提交），W1 D4 重建前端时会整份重写，**不要**单独提交它。
 
 **服务器（阿里云控制台）**
 
