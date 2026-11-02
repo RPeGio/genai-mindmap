@@ -1,4 +1,4 @@
-import type { GenerateResponse, MindMapContent } from './types';
+﻿import type { GenerateResponse, MindMapContent } from './types';
 
 /** 后端错误体现在只返回 detail；契约 v2 会带 code/request_id，这里先兼容两种。 */
 interface ErrorBody {
@@ -61,6 +61,7 @@ export function generateMindMap(text: string): Promise<GenerateResponse> {
 export type StreamEvent =
   | { type: 'stage'; stage: string; progress: number; detail: string }
   | { type: 'skeleton'; content: MindMapContent }
+  | { type: 'node'; parentId: string | null; node: { id: string; label: string; children: [] }; index: number }
   | { type: 'heartbeat'; waitedMs: number }
   | { type: 'done'; mode: 'demo' | 'model'; content: MindMapContent; latencyMs: number; degraded: boolean; reason?: string }
   | { type: 'error'; code: string; message: string };
@@ -112,16 +113,23 @@ export async function generateMindMapStream(
     }
   };
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let cut = buffer.indexOf('\n\n');
-    while (cut >= 0) {
-      flush(buffer.slice(0, cut));
-      buffer = buffer.slice(cut + 2);
-      cut = buffer.indexOf('\n\n');
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let cut = buffer.indexOf('\n\n');
+      while (cut >= 0) {
+        flush(buffer.slice(0, cut));
+        buffer = buffer.slice(cut + 2);
+        cut = buffer.indexOf('\n\n');
+      }
     }
+    if (buffer.trim()) flush(buffer);
+  } catch (error) {
+    // 主动取消（点「取消」）不是错误；其余中断要让调用方知道流没走完，
+    // 否则界面会停在「正在生成」上，看起来像卡死。
+    if ((error as Error).name === 'AbortError') return;
+    throw new ApiError(0, 'stream_interrupted', '连接中断，请重试。');
   }
-  if (buffer.trim()) flush(buffer);
 }

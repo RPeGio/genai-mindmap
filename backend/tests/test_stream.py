@@ -8,9 +8,10 @@ import json
 import os
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import app.generation.stream as stream_mod
+import app.generation.stream_partial as partial_mod
 from app.contracts.mindmap import MindMapContent, Node
 from app.generation.service import GenerationError
 from app.generation.stream import generate_stream
@@ -31,6 +32,13 @@ EXPANDED = MindMapContent(
         Node(id="b2", label="分支二"),
     ]),
 )
+
+
+def collect(agen) -> list[str]:
+    """把异步生成器一次性收成列表，测试里不必到处写 asyncio.run。"""
+    async def run():
+        return [frame async for frame in agen]
+    return asyncio.run(run())
 
 
 def parse_frames(frames: list[str]) -> list[tuple[str, dict | None]]:
@@ -98,8 +106,8 @@ class StreamEventTest(unittest.TestCase):
     def test_demo_frame_order(self):
         """demo 分支：stage → skeleton → done → [DONE]，且不调用模型。"""
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "demo"}), \
-             patch.object(stream_mod, "build_skeleton") as build_mock:
-            parsed = parse_frames(list(generate_stream("测试输入")))
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock()) as build_mock:
+            parsed = parse_frames(collect(generate_stream("测试输入")))
 
         self.assertEqual([k for k, _ in parsed], ["stage", "skeleton", "done", "__done__"])
         self.assertEqual(parsed[0][1]["stage"], "demo")
@@ -109,9 +117,9 @@ class StreamEventTest(unittest.TestCase):
     def test_model_skeleton_precedes_done(self):
         """骨架帧必须早于 done，且骨架里的一级分支没有子节点。"""
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
-             patch.object(stream_mod, "build_skeleton", return_value=SKELETON), \
-             patch.object(stream_mod, "expand_skeleton", return_value=EXPANDED):
-            parsed = parse_frames(list(generate_stream("x")))
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(return_value=SKELETON)), \
+             patch.object(stream_mod, "expand_skeleton", new=AsyncMock(return_value=EXPANDED)):
+            parsed = parse_frames(collect(generate_stream("x")))
 
         kinds = [k for k, _ in parsed]
         self.assertEqual(kinds[-1], "__done__")
@@ -130,7 +138,7 @@ class StreamEventTest(unittest.TestCase):
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
              patch.object(stream_mod, "build_skeleton",
                           side_effect=GenerationError("模型服务返回 HTTP 401")):
-            parsed = parse_frames(list(generate_stream("x")))
+            parsed = parse_frames(collect(generate_stream("x")))
 
         kinds = [k for k, _ in parsed]
         self.assertIn("error", kinds)
@@ -141,10 +149,10 @@ class StreamEventTest(unittest.TestCase):
     def test_expand_failure_degrades_to_skeleton(self):
         """展开段失败：骨架已经在屏幕上了，退回它并标记 degraded。"""
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
-             patch.object(stream_mod, "build_skeleton", return_value=SKELETON), \
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(return_value=SKELETON)), \
              patch.object(stream_mod, "expand_skeleton",
                           side_effect=GenerationError("展开超时")):
-            parsed = parse_frames(list(generate_stream("x")))
+            parsed = parse_frames(collect(generate_stream("x")))
 
         done = next(p for k, p in parsed if k == "done")
         self.assertTrue(done["degraded"])
@@ -157,8 +165,8 @@ class StreamEventTest(unittest.TestCase):
         """模型只给了一个光杆根节点时不往下走，直接报错。"""
         lonely = MindMapContent(title="空", root=Node(id="root", label="空"))
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
-             patch.object(stream_mod, "build_skeleton", return_value=lonely):
-            parsed = parse_frames(list(generate_stream("x")))
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(return_value=lonely)):
+            parsed = parse_frames(collect(generate_stream("x")))
 
         kinds = [k for k, _ in parsed]
         self.assertIn("error", kinds)
@@ -167,16 +175,16 @@ class StreamEventTest(unittest.TestCase):
 
     def test_heartbeat_while_waiting(self):
         """等待期间要有心跳，否则前端会以为连接死了。"""
-        def slow(_text: str) -> MindMapContent:
+        async def slow(_text: str) -> MindMapContent:
             # mock 会把被调参数透传给 side_effect，所以这里必须接一个参数
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             return SKELETON
 
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
              patch.object(stream_mod, "_HEARTBEAT_SECONDS", 0.1), \
-             patch.object(stream_mod, "build_skeleton", side_effect=slow), \
-             patch.object(stream_mod, "expand_skeleton", return_value=EXPANDED):
-            parsed = parse_frames(list(generate_stream("x")))
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(side_effect=slow)), \
+             patch.object(stream_mod, "expand_skeleton", new=AsyncMock(return_value=EXPANDED)):
+            parsed = parse_frames(collect(generate_stream("x")))
 
         self.assertIn("heartbeat", [k for k, _ in parsed])
         beat = next(p for k, p in parsed if k == "heartbeat")
@@ -185,7 +193,7 @@ class StreamEventTest(unittest.TestCase):
     def test_bad_mode_returns_error_frame(self):
         """模式配置错时也走流，不让连接无声中断。"""
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "nonsense"}):
-            parsed = parse_frames(list(generate_stream("x")))
+            parsed = parse_frames(collect(generate_stream("x")))
 
         kinds = [k for k, _ in parsed]
         self.assertIn("error", kinds)
@@ -216,6 +224,145 @@ class StreamEndpointTest(unittest.TestCase):
         body = json.loads(raw)
         self.assertEqual(body["code"], "validation_error")
         self.assertTrue(body["request_id"])
+
+
+class PartialStreamTest(unittest.TestCase):
+    """增量解析方案（默认实现）的行为。"""
+
+    def _kinds(self, frames):
+        return [k for k, _ in parse_frames(frames)]
+
+    def _run(self, payload: str):
+        async def fake_stream(_system, _user):
+            yield payload
+
+        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
+             patch.object(partial_mod, "_stream_chat", new=fake_stream):
+            return parse_frames(collect(partial_mod.generate_stream_partial("x")))
+
+    def test_single_node_is_rejected(self):
+        """只给一个根节点不算生成成功 —— F01 要的是层次结构。"""
+        parsed = self._run('{"title":"X","root":{"id":"r","label":"根"}}')
+        kinds = [k for k, _ in parsed]
+        self.assertIn("error", kinds)
+        self.assertNotIn("done", kinds)
+        self.assertEqual(kinds[-1], "__done__")
+
+    def test_single_branch_is_accepted(self):
+        """只有一条分支也算层次结构，与同步接口保持一致（下限是 1）。"""
+        payload = ('{"title":"X","root":{"id":"r","label":"根","children":['
+                   '{"id":"b1","label":"唯一","children":[]}]}}')
+        kinds = [k for k, _ in self._run(payload)]
+        self.assertIn("done", kinds)
+        self.assertNotIn("error", kinds)
+
+    def test_two_branches_pass(self):
+        payload = ('{"title":"X","root":{"id":"r","label":"根","children":['
+                   '{"id":"b1","label":"甲","children":[]},'
+                   '{"id":"b2","label":"乙","children":[]}]}}')
+        parsed = self._run(payload)
+        kinds = [k for k, _ in parsed]
+        self.assertIn("done", kinds)
+        done = next(p for k, p in parsed if k == "done")
+        self.assertFalse(done["degraded"])
+
+    def test_truncated_id_is_not_pushed(self):
+        """label 先于 id 输出时，半截 id（b）不该被当成一个节点推出去。"""
+        seen: dict[str, str] = {}
+        pushed: list[str] = []
+        buffer = ""
+        for piece in ['{"title":"X","root":{"id":"root","label":"根","children":[',
+                      '{"label":"监督学习","id":"b',
+                      '1","children":[]}]}}']:
+            buffer += piece
+            obj = partial_mod.parse_partial(buffer)
+            if not obj:
+                continue
+            for _, node in partial_mod.collect_new_nodes(obj, seen, buffer):
+                pushed.append(node["id"])
+        self.assertNotIn("b", pushed)
+        self.assertIn("b1", pushed)
+
+    def test_parse_partial_closes_brackets(self):
+        """补齐括号的基本能力：截断在字符串中间也能解析出已有节点。"""
+        raw = '{"title":"X","root":{"id":"r","label":"根","children":[{"id":"b1","label":"分'
+        obj = partial_mod.parse_partial(raw)
+        self.assertIsNotNone(obj)
+        nodes = partial_mod.collect_new_nodes(obj, {}, raw)
+        self.assertEqual([n[1]["id"] for n in nodes], ["r", "b1"])
+
+    def test_colliding_id_does_not_overwrite_existing_node(self):
+        """已有 id b，新节点 id b1 只输出到 b 时，不能把文字写到旧节点上。"""
+        seen = {"b": "分支甲"}
+        obj = {"root": {"id": "r", "label": "根", "children": [
+            {"id": "b", "label": "分支甲", "children": []},
+            {"id": "b", "label": "监", "children": []},
+        ]}}
+        picked = partial_mod.collect_new_nodes(obj, seen, '{"id":"b","label":"分支甲"}')
+        self.assertEqual(picked, [])
+        self.assertEqual(seen["b"], "分支甲")
+
+    def test_label_growth_still_passes(self):
+        """正常打字机：同一个 id 的文字变长要能继续推。"""
+        seen = {"b": "监督"}
+        obj = {"root": {"id": "r", "label": "根", "children": [
+            {"id": "b", "label": "监督学习", "children": []},
+        ]}}
+        picked = partial_mod.collect_new_nodes(obj, seen, '{"id":"b","label":"监督学习"}')
+        self.assertEqual([n[1]["label"] for n in picked], ["监督学习"])
+
+    def test_unparseable_fragment_returns_none(self):
+        """截断在 "label": 这种位置补不出合法 JSON，应返回 None 而不是猜。"""
+        self.assertIsNone(partial_mod.parse_partial('{"title":"X","root":{"label":'))
+
+
+class SkeletonConsistencyTest(unittest.TestCase):
+    """两段式：展开结果必须保留骨架，否则退回骨架并标记降级。"""
+
+    def test_expand_returning_other_tree_degrades(self):
+        other = MindMapContent(title="另一棵树", root=Node(id="zzz", label="别的东西",
+            children=[Node(id="y1", label="无关"), Node(id="y2", label="无关2")]))
+        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(return_value=SKELETON)), \
+             patch.object(stream_mod, "expand_skeleton", new=AsyncMock(return_value=other)):
+            parsed = parse_frames(collect(generate_stream("x")))
+        done = next(p for k, p in parsed if k == "done")
+        self.assertTrue(done["degraded"])
+        self.assertEqual(done["content"]["title"], SKELETON.title)
+
+    def test_expand_changing_root_id_degrades(self):
+        """根节点 id 变了等于换了一棵树，必须降级。"""
+        other_root_id = MindMapContent(title=SKELETON.title, root=Node(
+            id="different-root", label=SKELETON.root.label,
+            children=[Node(id="b1", label="分支一"), Node(id="b2", label="分支二")]))
+        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(return_value=SKELETON)), \
+             patch.object(stream_mod, "expand_skeleton", new=AsyncMock(return_value=other_root_id)):
+            parsed = parse_frames(collect(generate_stream("x")))
+        done = next(p for k, p in parsed if k == "done")
+        self.assertTrue(done["degraded"])
+
+    def test_expand_rewriting_labels_degrades(self):
+        """id 没变但分支文字被改写，同样算没保留骨架。"""
+        rewritten = MindMapContent(title=SKELETON.title, root=Node(
+            id=SKELETON.root.id, label=SKELETON.root.label,
+            children=[Node(id="b1", label="被改写过的分支一"),
+                      Node(id="b2", label="被改写过的分支二")]))
+        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(return_value=SKELETON)), \
+             patch.object(stream_mod, "expand_skeleton", new=AsyncMock(return_value=rewritten)):
+            parsed = parse_frames(collect(generate_stream("x")))
+        done = next(p for k, p in parsed if k == "done")
+        self.assertTrue(done["degraded"])
+
+    def test_expand_keeping_skeleton_passes(self):
+        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model"}), \
+             patch.object(stream_mod, "build_skeleton", new=AsyncMock(return_value=SKELETON)), \
+             patch.object(stream_mod, "expand_skeleton", new=AsyncMock(return_value=EXPANDED)):
+            parsed = parse_frames(collect(generate_stream("x")))
+        done = next(p for k, p in parsed if k == "done")
+        self.assertFalse(done["degraded"])
+        self.assertEqual(len(done["content"]["root"]["children"][0]["children"]), 1)
 
 
 if __name__ == "__main__":

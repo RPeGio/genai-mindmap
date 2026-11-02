@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import unittest
 from unittest.mock import patch
@@ -58,7 +58,8 @@ class GenerationTest(unittest.TestCase):
         return json.dumps({"choices": [{"message": {"content": json.dumps(tree)}}]}).encode()
 
     def test_model_response(self):
-        tree = {"title": "测试", "root": {"id": "1", "label": "测试", "children": []}}
+        tree = {"title": "测试", "root": {"id": "1", "label": "测试",
+                "children": [{"id": "b1", "label": "分支", "children": []}]}}
         client_class = self.use_client(MockStreamResponse(self.body_of(tree)))
         result = generate("测试")
         self.assertEqual(result.mode, "model")
@@ -76,10 +77,19 @@ class GenerationTest(unittest.TestCase):
         self.assertIn("不是符合约定的导图 JSON", str(raised.exception))
 
     def test_model_cannot_claim_unverified_source_metadata(self):
-        tree = {"title": "测试", "root": {"id": "1", "label": "测试", "children": []},
+        tree = {"title": "测试", "root": {"id": "1", "label": "测试",
+                "children": [{"id": "b1", "label": "分支", "children": []}]},
                 "source_usage": [{"source_id": "fake", "kind": "text", "filename": None, "char_count": 3}]}
         self.use_client(MockStreamResponse(self.body_of(tree)))
         self.assertEqual(generate("测试").content.source_usage, [])
+
+    def test_root_only_tree_is_rejected(self):
+        """光杆根节点不算生成成功：同步接口与流式接口用的是同一个下限。"""
+        tree = {"title": "测试", "root": {"id": "1", "label": "测试", "children": []}}
+        self.use_client(MockStreamResponse(self.body_of(tree)))
+        with self.assertRaises(GenerationError) as raised:
+            generate("测试")
+        self.assertIn("没有任何分支", str(raised.exception))
 
     def test_model_service_http_error_is_reported(self):
         self.use_client(MockStreamResponse(b"", status_code=503))
