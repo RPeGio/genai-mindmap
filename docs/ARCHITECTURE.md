@@ -6,7 +6,7 @@
 
 ```mermaid
 flowchart LR
-  U[用户] --> UI[React 编辑器和输入界面]
+  U[用户] --> UI[Vue 编辑器与输入界面]
   UI --> API[FastAPI API 层]
   UI -. 规划中 .-> Y[Yjs WebSocket 协作服务]
   API --> MAP[导图管理与版本]
@@ -31,10 +31,10 @@ flowchart LR
 
 | 模块 | 当前代码 / 计划位置 | 输入 → 输出 | 职责 |
 |---|---|---|---|
-| 导图编辑 | `frontend/src/App.tsx` | 导图 JSON → 修改后的 JSON | 当前树形列表；后续拆分编辑器组件、接入 React Flow 画布和布局。 |
+| 导图编辑 | `frontend/src/App.vue`、`frontend/src/api/client.ts` | 导图 JSON → 修改后的 JSON | 当前是输入 + 层级预览；R2 接入 `@vue-flow/core` 画布与自研 tidy-tree 布局，编辑/撤销/保存放 R3。 |
 | 导图管理 | `backend/app/mindmaps/` | 导图 JSON + 版本 → 保存记录 | 当前 SQLite 本地存储；后续 PostgreSQL、用户权限、历史版本。 |
 | 生成与模型适配 | `backend/app/generation/` | 文本 → 导图 JSON | 演示适配器和基础模型适配；后续接入生成任务、提示词管理和重试策略。 |
-| 共享数据契约 | `backend/app/contracts/`，`frontend/src/types.ts` | 结构验证 | 当前约定树及限制；修改必须两端同步。 |
+| 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 当前后端仍是 v1 契约（`docs/API.md`）；v2 已冻结候选、待 D2 落地，届时前端类型由 `openapi-typescript` 生成，不再手写。 |
 | 多模态输入（部分实现） | `backend/app/ingestion/` | 文本 → 来源；其他输入待实现 | JSON 文本和 Markdown 可用；文件上传、识别及来源定位待实现。 |
 | 知识增强（待实现） | `backend/app/knowledge/` | 文档 → 分块/向量；问题 → 有来源片段 | 当前只有明确标识为未实现的检索桩；真实知识库与引用待开发。 |
 | 逻辑优化（部分实现） | `backend/app/optimization/` | 当前导图 → 结构提示 | 单子节点、深度上限、同级重复提示可用；语义纠错等待实现。 |
@@ -55,15 +55,15 @@ flowchart LR
 
 ## 技术选择及来源
 
-- **React + TypeScript、FastAPI + Pydantic**：和申报书前端方向一致，Python 便于对接模型与解析工具。开源项目 [ultra-mindmap](https://github.com/Anionex/ultra-mindmap) 展示了 FastAPI + React + 模型生成导图的思路；其项目结构仅作参考。
-- **React Flow（规划）**：用于节点与连线式交互，参见 [xyflow/xyflow](https://github.com/xyflow/xyflow)。当前仅有树状列表，画布和树布局尚未接入。
+- **Vue 3 + TypeScript、FastAPI + Pydantic**：申报书原定 React 前端，实际改为 Vue 生态——负责前端的人只有 Vue 实战经验，而考核要求"必须能讲清代码逻辑"，自己写比沿用不熟的骨架更可靠；旧 React 骨架打 tag `v0.1.0-react-scaffold` 存档。开源项目 [ultra-mindmap](https://github.com/Anionex/ultra-mindmap) 展示了 FastAPI + 前端框架 + 模型生成导图的思路，仅作参考。
+- **Vue Flow（R2 接入）**：`@vue-flow/core` 负责节点与连线交互（参见 [xyflow/xyflow](https://github.com/xyflow/xyflow)），节点坐标由自研 tidy-tree 布局计算，不引入 dagre——2C2G 上少一个依赖比省几行代码重要。
 - **Docling（候选，未接入）**：支持 PDF、DOCX、PPTX 等统一处理，参见 [支持格式](https://github.com/docling-project/docling/blob/main/docs/usage/supported_formats.md)。运行成本、复杂排版及识别质量需实际测试，也可先使用轻量解析器。
 - **PostgreSQL + pgvector（规划）**：PostgreSQL 保存业务数据，pgvector 实现向量检索；参见 [pgvector](https://github.com/pgvector/pgvector)。当前存储仅为 SQLite，没有 PostgreSQL 或向量检索实现。
 - **Yjs + y-websocket（规划）**：Yjs 提供共享数据类型，y-websocket 是其 WebSocket 连接方案；参见 [Yjs](https://github.com/yjs/yjs)、[y-websocket](https://github.com/yjs/y-websocket)。需要额外实现用户权限、房间授权、持久化、恢复和数据格式映射。
-- **PUML（部分实现）**：已提供结构化导图转 PUML 文本的接口；渲染和前端导出入口尚待实现。`plantuml-encoder` 与 `viz.js` 各自职责不同，不能假定组合就能直接渲染任意 PlantUML。
+- **PUML（部分实现）**：后端已提供导图转 PUML 文本的接口，前端只做下载，不在浏览器渲染。`plantuml-encoder` 输出的是 URL 片段、真正出图需要 JVM 服务，`viz.js` 只认 DOT 语法，两者都不引入（论证见 [增量附录](ARCHITECTURE_ADDENDUM.md)）。
 
 以上为技术调研和候选选型，不表示引用项目的代码已被复制，也不暗示它们已证明满足本项目的性能指标。引入第三方组件前应核对许可证和依赖。
 
 ## 安全与部署边界
 
-当前仅限本机开发：没有用户认证、权限隔离、文件上传及生产日志策略。接入文件、知识库和协作前，应增加用户身份与资源授权、上传大小和类型限制、恶意文件防护、密钥管理、外部请求限制、日志脱敏及备份；未经授权不得上传敏感资料。未来使用 Docker Compose 编排应用和数据库，Kubernetes 为扩容选项，均未配置或验证。
+当前仅限本机与单机部署：没有用户认证、权限隔离、文件上传和生产日志策略。目标形态是**单台 2 核 2G ECS + Docker Compose**（nginx / api / web / postgres / y-websocket 五个容器，ASR 走 `profiles: [asr]` 不常驻），先以 `IP:8080` 暴露、不做 TLS，域名与 Cloudflare 推迟到 W3（理由与降级路径见 [执行计划](PLAN.md) 第 4 节与 R1/R3）。CORS 目前只放通 `localhost:5173`/`127.0.0.1:5173`，上线前必须改成部署地址白名单。最小登录（JWT）与每用户 BYOK 密钥加密（Fernet）在 W2 落地；在此之前不得开放公网注册，也不得上传敏感资料。接入文件、知识库和协作前，还需补上传大小与类型限制、恶意文件防护、外部请求限制、日志脱敏和备份。

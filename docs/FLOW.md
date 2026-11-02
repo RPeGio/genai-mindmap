@@ -19,7 +19,7 @@ flowchart TD
   R --> MAP[导图 JSON]
 
   MAP --> SAVE[(保存 / 版本)]
-  MAP --> CANVAS[前端树形列表编辑]
+  MAP --> CANVAS[Vue 画布（R2）+ 层级预览（R1）]
   CANVAS --> EDIT[人工编辑]
   EDIT --> SAVE
   MAP --> EXP[导出 puml，其他格式待实现]
@@ -63,12 +63,13 @@ flowchart TD
 
 | 前端位置 | 调用 | 用途 |
 |---|---|---|
-| 输入框 | `POST /api/generations` | 现有的快速生成，保持不变 |
+| 输入框（`src/App.vue`） | `POST /api/generations` | **已接入（R1）**：输入 → 候选导图 → 层级预览 |
+| 画布（R2） | 无请求 | 纯前端：`@vue-flow/core` + tidy-tree 布局消费 `content` |
+| 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | 带 `version` 的乐观锁，409 时提示重新打开 |
 | 上传面板（待开发） | `POST /api/ingestion/files` | 当前所有文件类型均返回 501，接口实现后才能接入 |
-| 生成按钮（多来源，待接入） | `POST /api/pipeline/generate` | 拿 `content` 渲染，响应完成后可显示 `stages` 执行记录 |
-| 画布保存 | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | 现有逻辑不变 |
-| 诊断面板 | `POST /api/optimization/suggest` | 显示建议，用户点确认后再改 |
-| 导出按钮 | `POST /api/export/puml` | 下载文本文件 |
+| 多来源生成（待接入） | `POST /api/pipeline/generate` | 拿 `content` 渲染，`stages` 仅作完成记录展示 |
+| 诊断面板（待接入） | `POST /api/optimization/suggest` | 显示建议，用户点确认后再改 |
+| 导出按钮（待接入） | `POST /api/export/puml` | 下载文本文件 |
 
 `stages` 随同步响应一次性返回，只能展示完成后的阶段记录，不能显示生成中的实时进度；实时进度需要未来的任务状态接口或 SSE。
 

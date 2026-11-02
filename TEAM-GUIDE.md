@@ -60,7 +60,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```powershell
 # 后端
 cd backend
-python -m unittest discover -s tests
+pytest -q            # pytest.ini 已设 pythonpath = .
 
 # 前端
 cd frontend
@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线：后端 19 个测试、前端 3 个测试，全部通过。
+当前基线：后端 19 个测试（pytest 收集 unittest 用例）、前端 3 个 vitest 用例，全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 `unittest` 默认可能将进度输出到 stderr；这本身不代表失败。请同时检查最后的 `OK` 和 `$LASTEXITCODE`，测试成功时退出码应为 0。
 
@@ -95,15 +95,20 @@ backend/
   tests/               19 个测试
 frontend/
   src/
-    App.tsx            工作台（树形列表编辑器，还不是画布）
-    api.ts             接口封装（目前只有 5 个老接口）
-    types.ts           与后端契约对应的 TS 类型
-  tests/App.test.tsx   3 个测试
+    App.vue            工作台（输入 + 层级预览；画布 R2 接入）
+    main.ts            入口
+    styles.css         Tailwind 入口
+    api/client.ts      fetch 封装 + ApiError（目前只接了 /api/generations）
+    api/types.ts       与后端契约 v1 对应的 TS 类型
+  tests/app.spec.ts    3 个 vitest 用例
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
   ARCHITECTURE.md      模块边界、技术选型及来源
   ARCHITECTURE_ADDENDUM.md  存储迁移、SSE 协议、流水线细节
+  PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q34）
+  CONTRACT_V2.md       目标契约（尚未落地，后端仍是 v1）
+  W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
 START_HERE.md          原始的骨架说明
 ```
@@ -147,12 +152,14 @@ PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
 
 ## 6 两人分工
 
-按 `docs/FEATURES_AND_OWNERS.md` 的划分：
+按 `docs/FEATURES_AND_OWNERS.md` 的 F 编号划分，具体见 `docs/PLAN.md` 第 11 节 Q31：
 
-- **A：导图产品与协作** —— 画布、布局（导图/逻辑结构/时间轴/鱼骨）、样式主题、实时协作、PUML 导出、容器部署。
-- **B：AI 与知识处理** —— 生成质量、文档/图片/语音解析、知识库与 RAG、逻辑检测、评估与微调。
+- **A（我）**：契约与前端（Vue 画布、布局、主题、导出、协作客户端）、部署基建、CI。
+- **B（队友）**：后端地基、生成链路、多模态解析、RAG 与诊断、AI 代理、评估集。
 
-交界只有一个：`backend/app/contracts/`。改这里的任何字段，必须两个人同时知道，并且同步改 `frontend/src/types.ts`。
+W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W2 起交叉 review。
+
+交界只有一个：`backend/app/contracts/`。改这里的任何字段，必须两个人同时知道，同步 `docs/CONTRACT_V2.md`、`docs/API.md` 和前端 `src/api/types.ts`（v2 落地后改为 `npm run gen:api` 生成）。
 
 ---
 
@@ -173,7 +180,7 @@ PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
 - **两个上限不一致**：`/api/ingestion/text` 允许 10000 字，但 `/api/pipeline/generate` 合并后限 8000 字。9000 字的文本能存成 Source，却进不了流水线。要统一的话改 `MAX_INPUT_CHARS` 或 contract 里的 `max_length`。
 - **导出用根节点文字，不是标题**：`export/puml` 取的是 `root.label`。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
 - **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得等 SSE 或任务化改造。
-- **前端还没接新接口**：`api.ts` 只有 generate / list / get / create / update 五个方法，pipeline、optimization、export 都还没封装。
+- **前端只接了生成接口**：`src/api/client.ts` 目前只有 `generateMindMap`（`POST /api/generations`），list / get / create / update / pipeline / optimization / export 都还没封装，R2–R3 补齐。
 - **当前没有登录和权限**：所有接口裸奔，只能在本机跑，不要往公网放。
 
 ---
@@ -183,8 +190,8 @@ PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
 如果只有一个人有余力，按这个顺序：
 
 1. 让真实模型跑通一条完整链路（目前只在 demo 模式验证过，真实密钥环境没验收）。
-2. 画布替换树形列表（这是“看起来像产品”的关键）。
+2. 层级预览换成 `@vue-flow/core` 画布（R2，这是"看起来像产品"的关键）。
 3. PDF / Word / PPT 解析（第二个可演示入口）。
-4. 其余按 `FEATURES_AND_OWNERS.md` 的 F 编号推进。
+4. 其余按 `FEATURES_AND_OWNERS.md` 的 F 编号推进，范围取舍以 `docs/PLAN.md` 第 2 节为准。
 
 别急着上 Celery、Redis、Milvus 这些东西。当前是单进程同步架构，两人团队把时间花在功能上比花在运维上划算得多。
