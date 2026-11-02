@@ -130,6 +130,9 @@ async function generate() {
           break;
       }
     }, ctrl.signal);
+    // 已经被后来的请求接管：这个旧请求无论成功、失败还是被取消，
+    // 都不许再改画面和状态，否则新请求的预览会被旧导图替换。
+    if (controller !== null && controller !== ctrl) return;
     if (ctrl.signal.aborted) {
       // 主动取消：把画面退回取消前的样子，而不是留下一堆半截节点。
       content.value = previous;

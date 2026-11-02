@@ -1,9 +1,7 @@
-"""单次调用 + 增量 JSON 解析：让节点在模型还在输出时就逐个出现在画面上。
+﻿"""单次调用 + 增量 JSON 解析：让节点在模型还在输出时就逐个出现在画面上。
 
-与 `stream.py` 的两段式方案并存，用环境变量 `MINDMAP_STREAM_IMPL` 切换：
-
-    partial（默认）   一次调用边收边解析，节点 1 秒内开始出现，总耗时更短
-    two-phase         先要骨架再展开，两次模型调用，骨架 1.5–2 秒到
+这是唯一的流式实现。曾经还有一个「两段式」（先骨架再展开）的方案，
+已经删除 —— 两套实现要维护两套测试、两套文档，而增量方案的完整耗时更短。
 
 增量解析的难点是 JSON 还没写完。这里的做法是「补齐括号」：扫描已收到的文本，
 跟踪字符串状态与括号栈，在末尾补上缺失的引号与闭括号，再交给 json.loads。
@@ -110,31 +108,39 @@ def parse_partial(buffer: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _id_looks_complete(node_id: str, seen: dict[str, str], raw: str) -> bool:
-    """判断这个 id 在模型输出里是不是真的写完了。
+def _id_belongs_to_node(buffer: str, node_id: str, label: str) -> bool:
+    """确认这个 id 与 label 属于**同一个 JSON 对象**。
 
-    模型先吐 label 再吐 id 时，`"id":"b` 会被补齐引号解析成 `"b"`，随后真正输出
-    `"b1"`，同一个节点先被当成 b、后变成 b1，画面上会闪出一个多余节点。
+    只在整个 buffer 里搜 `"id":"x"` 是不够的：已有节点 id=b，新节点 id 是 b1
+    但只输出到 `"id":"b` 时，解析结果里新节点的 id 会被补齐成 b，于是整段搜索
+    会命中前一个节点的 id，把新节点的文字写到旧节点上。
 
-    判断依据不是 id 长短（`root` 的 id 完全可能就叫 `r`），而是**它的闭合引号
-    有没有真的出现在原文里**。拿不到原文时退化成「跳过单字符 id + 跳过是已推
-    id 前缀的 id」。
+    做法是定位 label 在原文里的位置，往前找最近的 `{`，要求两者之间存在完整
+    的 `"id":"<node_id>"`。截断的 id 找不到自己的 label，会被跳过。
+
+    代价是节点要等 label 完全闭合才出现，不再逐字长大 —— 用准确性换掉打字机
+    效果，因为「文字突然变成别人的」比「晚几十毫秒出现」更糟。
     """
-    if raw:
-        pattern = r'"id"\s*:\s*"' + re.escape(node_id) + r'"'
-        return re.search(pattern, raw) is not None
-    if len(node_id) < 2:
+    marker = f'"{label}"'
+    pos = buffer.rfind(marker)
+    if pos < 0:
         return False
-    return not any(other.startswith(node_id) and other != node_id for other in seen)
+    start = buffer.rfind("{", 0, pos)
+    if start < 0:
+        return False
+    # 对象范围要取到 } 为止，不能截在 label 前面 —— id 完全可能写在 label 之后。
+    end = buffer.find("}", pos)
+    segment = buffer[start:end if end >= 0 else len(buffer)]
+    pattern = r'"id"\s*:\s*"' + re.escape(node_id) + r'"'
+    return re.search(pattern, segment) is not None
 
 
 def collect_new_nodes(obj: dict, seen: dict[str, str],
                       raw: str = "") -> list[tuple[str | None, dict]]:
-    """挑出「新的」或「文字变长了」的节点，保持出现顺序。
+    """挑出尚未推送过的节点，保持出现顺序。
 
-    JSON 还没写完时 label 会被补齐的引号截断（"监督学" 而不是 "监督学习"），
-    所以同一个 id 在流里会反复出现、文字越来越长。这里按 id 记录上一次推送的
-    文字，只在变长时重推，前端按 id 覆盖即可呈现打字机效果。
+    `raw` 是模型到目前为止的原始输出，用来判断某个节点是不是真的写完了；
+    拿不到原文时（例如单元测试）退化成「只推新 id」，不做文字更新。
     """
     picked: list[tuple[str | None, dict]] = []
 
@@ -144,15 +150,10 @@ def collect_new_nodes(obj: dict, seen: dict[str, str],
         node_id = node.get("id")
         label = node.get("label")
         if isinstance(node_id, str) and isinstance(label, str) and label.strip():
-            previous = seen.get(node_id)
-            if previous != label and _id_looks_complete(node_id, seen, raw):
-                # 同一个 id 的文字只该「越补越长」。新文字不是旧文字的延续，
-                # 说明是另一个节点被截断后撞了 id（例如已有的 b 与未写完的 b1），
-                # 跳过这个节点的推送，但**继续往下遍历它的子节点**。
-                if previous is None or label.startswith(previous):
-                    seen[node_id] = label
-                    picked.append((parent_id, {"id": node_id, "label": label,
-                                               "children": []}))
+            if node_id not in seen and _id_belongs_to_node(raw, node_id, label):
+                seen[node_id] = label
+                picked.append((parent_id, {"id": node_id, "label": label,
+                                           "children": []}))
         for child in node.get("children") or []:
             walk(child, node_id if isinstance(node_id, str) else parent_id)
 
@@ -261,7 +262,7 @@ async def _stream_events(text: str) -> AsyncIterator[str]:
 
 
 async def generate_stream_partial(text: str) -> AsyncIterator[str]:
-    """增量解析版本的唯一出口，帧格式与两段式完全一致（末尾同样是 [DONE]）。
+    """流式生成的唯一出口：若干 `data: {json}`，末尾必然是 `data: [DONE]`。
 
     被取消时不吞 CancelledError，让它继续上抛，连接才会真的断开。
     """
