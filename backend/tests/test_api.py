@@ -68,8 +68,10 @@ class ApiTest(unittest.TestCase):
         content["root"]["label"] = "已编辑"
         status, updated = self.call("/mindmaps/" + map_id, "PUT", {"version": 1, "content": content})
         self.assertEqual((status, updated["version"]), (200, 2))
-        status, _ = self.call("/mindmaps/" + map_id, "PUT", {"version": 1, "content": content})
-        self.assertEqual(status, 409)
+        # 冲突时错误信息要能看见（统一错误格式的 code / message）
+        status, conflict = self.call("/mindmaps/" + map_id, "PUT", {"version": 1, "content": content})
+        self.assertEqual((status, conflict["code"]), (409, "version_conflict"))
+        self.assertEqual(conflict["message"], "导图已被修改，请重新打开后再保存")
         self.assertEqual(self.call("/mindmaps/" + map_id)[1]["content"]["root"]["label"], "已编辑")
 
     def test_validation_and_not_found(self):

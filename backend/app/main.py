@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.agent.router import router as agent_router
+from app.core.errors import register_error_handlers
 from app.export.router import router as export_router
 from app.generation.router import router as generation_router
 from app.ingestion.router import router as ingestion_router
@@ -11,6 +12,8 @@ from app.optimization.router import router as optimization_router
 from app.pipeline.router import router as pipeline_router
 
 app = FastAPI(title="生成式 AI 思维导图", version="0.2.0")
+# 所有错误出口统一成 {code, message, detail, request_id}，见 app/core/errors.py
+register_error_handlers(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],

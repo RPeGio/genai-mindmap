@@ -1,4 +1,4 @@
-import type { GenerateResponse } from './types';
+import type { GenerateResponse, MindMapContent } from './types';
 
 /** 后端错误体现在只返回 detail；契约 v2 会带 code/request_id，这里先兼容两种。 */
 interface ErrorBody {
@@ -53,4 +53,75 @@ export function generateMindMap(text: string): Promise<GenerateResponse> {
     method: 'POST',
     body: JSON.stringify({ text }),
   });
+}
+
+// ---- 流式生成 ----
+
+/** 后端 generation/stream.py 推送的事件。类型放在 JSON 的 type 字段里。 */
+export type StreamEvent =
+  | { type: 'stage'; stage: string; progress: number; detail: string }
+  | { type: 'skeleton'; content: MindMapContent }
+  | { type: 'heartbeat'; waitedMs: number }
+  | { type: 'done'; mode: 'demo' | 'model'; content: MindMapContent; latencyMs: number; degraded: boolean; reason?: string }
+  | { type: 'error'; code: string; message: string };
+
+/**
+ * 流式生成：先收骨架再收细节，回调按到达顺序触发。
+ *
+ * 不用 EventSource 是因为它只能发 GET，而输入文本可能很长；这里用 fetch
+ * 的 ReadableStream 自己切帧。SSE 的帧以空行分隔，每帧取第一条 `data: ` 行。
+ */
+export async function generateMindMapStream(
+  text: string,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${BASE}/generations/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+      signal,
+    });
+  } catch (error) {
+    if ((error as Error).name === 'AbortError') return;
+    throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
+  }
+
+  if (!response.ok || !response.body) {
+    const body = (await response.json().catch(() => ({}))) as ErrorBody;
+    throw new ApiError(response.status, body.code ?? `http_${response.status}`,
+      errorMessage(response.status, body), body.request_id);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const flush = (frame: string) => {
+    const line = frame.split('\n').find(part => part.startsWith('data: '));
+    if (!line) return;
+    const data = line.slice(6).trim();
+    // 终止帧沿用 OpenAI 的 [DONE] 约定，不是 JSON，遇到即表示流正常结束。
+    if (data === '[DONE]') return;
+    try {
+      onEvent(JSON.parse(data) as StreamEvent);
+    } catch {
+      // 单帧解析失败不该打断整条流，跳过即可。
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut = buffer.indexOf('\n\n');
+    while (cut >= 0) {
+      flush(buffer.slice(0, cut));
+      buffer = buffer.slice(cut + 2);
+      cut = buffer.indexOf('\n\n');
+    }
+  }
+  if (buffer.trim()) flush(buffer);
 }
