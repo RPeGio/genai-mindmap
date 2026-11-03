@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MindNode } from '../src/api/types';
-import { handleSide, layoutTidy, NODE_SIZE } from '../src/canvas/layout/tidy';
+import { childSide, layoutTidy, NODE_SIZE } from '../src/canvas/layout/tidy';
 
 /** 造一棵两层树：根 + 三个叶子。 */
 function tree(): MindNode {
@@ -88,14 +88,22 @@ describe('layoutTidy', () => {
     expect(point(single, 'a').x).toBeGreaterThan(0);
   });
 
-  it('句柄方向跟随布局方向', () => {
-    expect(handleSide('a', layoutTidy(tree(), { direction: 'right' }))).toBe('left');
-    expect(handleSide('a', layoutTidy(tree(), { direction: 'left' }))).toBe('right');
-    expect(handleSide('a', layoutTidy(tree(), { direction: 'down' }))).toBe('top');
-    // 双向布局里左侧的节点句柄朝右
+  it('连线方向按几何位置判断，双向布局里两侧各走各的', () => {
+    const right = layoutTidy(tree(), { direction: 'right' });
+    expect(childSide(point(right, 'root'), point(right, 'a'), 'right')).toBe('right');
+
+    const left = layoutTidy(tree(), { direction: 'left' });
+    expect(childSide(point(left, 'root'), point(left, 'a'), 'left')).toBe('left');
+
+    const down = layoutTidy(tree(), { direction: 'down' });
+    expect(childSide(point(down, 'root'), point(down, 'a'), 'down')).toBe('bottom');
+
+    // 双向：只看 direction 会把两侧都当成同一侧，必须逐个按坐标判断
     const both = layoutTidy(tree(), { direction: 'both' });
-    const leftNode = ['a', 'b', 'c'].find(id => point(both, id).x < 0) as string;
-    expect(handleSide(leftNode, both)).toBe('right');
+    for (const id of ['a', 'b', 'c']) {
+      const expected = point(both, id).x < 0 ? 'left' : 'right';
+      expect(childSide(point(both, 'root'), point(both, id), 'both')).toBe(expected);
+    }
   });
 
   it('深层子树不会与相邻兄弟的子树重叠', () => {

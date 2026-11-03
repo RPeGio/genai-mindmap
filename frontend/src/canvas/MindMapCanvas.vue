@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Background } from '@vue-flow/background';
 import { VueFlow, useVueFlow } from '@vue-flow/core';
-import { nextTick, onBeforeUnmount, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import MindNode from './MindNode.vue';
@@ -27,11 +27,15 @@ function scheduleFit() {
 watch(() => store.nodeCount, scheduleFit);
 watch(() => store.direction, scheduleFit);
 
-// 换方向会改掉每个节点的句柄位置（左 / 右 / 上）。Vue Flow 只在自己重新测量节点时
+// 换方向会改掉每个节点的句柄位置（左 / 右 / 上 / 下）。Vue Flow 只在自己重新测量节点时
 // 才知道句柄动了，否则连线依旧按旧坐标绘制——表现为线头悬空、或从错误的一侧进出。
-// 节点数量变化时也一样，新节点第一次测量往往赶不上布局。
+// 用"每条连线用了哪两个句柄"做签名：它变了才需要重测，标签更新之类的变化不用。
+const handleSignature = computed(() =>
+  store.edges.map(edge => `${edge.sourceHandle}>${edge.targetHandle}`).join('|'),
+);
+
 watch(
-  [() => store.direction, () => store.nodeCount],
+  [() => store.direction, () => store.nodeCount, handleSignature],
   async () => {
     await nextTick();
     updateNodeInternals(store.nodes.map(node => node.id));

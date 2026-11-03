@@ -204,9 +204,9 @@ describe('mindmap store', () => {
     store.setDirection('down');
     const downA = store.nodes.find(item => item.id === 'a');
 
-    // 向右时子节点在父节点左侧接入；向下时改为顶部
-    expect(rightA?.data?.side).toBe('left');
-    expect(downA?.data?.side).toBe('top');
+    // 向右时子节点从左侧接入父节点；向下时改为从顶部接入
+    expect(rightA?.data?.in).toEqual(['left']);
+    expect(downA?.data?.in).toEqual(['top']);
     expect(store.viewAdjusted).toBe(false);
   });
 
@@ -251,26 +251,35 @@ describe('mindmap store', () => {
     expect(store.breadcrumb).toEqual([]);
   });
 
-  it('连线显式指定句柄 id，换方向后不会退回"无 id 取第一个句柄"', () => {
-    // 没有 id 时 Vue Flow 取 handles[0]，换方向只改了句柄位置、几何没重新测量，
-    // 连线就会停在旧的进出侧——这正是"线方向写死右出左进"的原因。
+  it('连线按几何位置选句柄，双向布局的根左右各一个出口', () => {
+    // 只看 direction 会把双向布局两侧的线都挂到同一个句柄上，
+    // 表现就是连线绕过根节点、从头节点另一侧到子节点。
     const store = useMindMapStore();
     store.preview(
-      { title: '示例', root: { id: 'r', label: '根', children: [node('a', '子')] } },
-      'right',
+      {
+        title: '示例',
+        root: {
+          id: 'r',
+          label: '根',
+          children: [node('a', '甲'), node('b', '乙'), node('c', '丙')],
+        },
+      },
+      'both',
     );
 
-    expect(store.edges).toEqual([
-      expect.objectContaining({
-        id: 'r->a',
-        source: 'r',
-        target: 'a',
-        sourceHandle: 'out',
-        targetHandle: 'in',
-      }),
-    ]);
+    const root = store.nodes.find(item => item.id === 'r');
+    expect([...(root?.data?.out ?? [])].sort()).toEqual(['left', 'right']);
 
-    store.setDirection('left');
-    expect(store.edges[0]).toMatchObject({ sourceHandle: 'out', targetHandle: 'in' });
+    const fromLeft = store.edges.find(edge => edge.sourceHandle === 'out-left');
+    const fromRight = store.edges.find(edge => edge.sourceHandle === 'out-right');
+    expect(fromLeft?.targetHandle).toBe('in-right');
+    expect(fromRight?.targetHandle).toBe('in-left');
+
+    store.setDirection('right');
+    expect(
+      store.edges.every(
+        edge => edge.sourceHandle === 'out-right' && edge.targetHandle === 'in-left',
+      ),
+    ).toBe(true);
   });
 });

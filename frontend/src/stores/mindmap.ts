@@ -4,7 +4,7 @@ import { computed, ref } from 'vue';
 
 import { ApiError, generateMindMapStream } from '../api/client';
 import type { MindMapContent, MindNode } from '../api/types';
-import { layoutTidy, handleSide, NODE_SIZE, type Direction, type LayoutResult } from '../canvas/layout/tidy';
+import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 
 /** 画布节点上最多显示的字数（按码点算，避免把 emoji 切成半个）。 */
 export const TRUNCATE_CHARS = 24;
@@ -32,8 +32,10 @@ export interface MindNodeData {
   /** 完整 label（不截断），供 title 属性与无障碍读屏使用 */
   fullLabel: string;
   depth: number;
-  /** 句柄挂哪一侧：水平布局左右、垂直布局顶部 */
-  side: 'left' | 'right' | 'top';
+  /** 需要渲染的源句柄：子节点分布在哪几侧就要哪几个（双向布局的根两侧都有） */
+  out: ChildSide[];
+  /** 需要渲染的目标句柄：连线从父节点进来时落在哪一侧 */
+  in: ChildSide[];
 }
 
 export interface FlatNode {
@@ -77,38 +79,69 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const nodes = computed<FlowNode<MindNodeData>[]>(() => {
     const current = layout.value;
     if (!current) return [];
+
+    const parentOf = new Map<string, string | null>();
+    for (const { node, parentId } of flatNodes.value) parentOf.set(node.id, parentId);
+
     return flatNodes.value.map(({ node, depth }) => {
-      const point = current.positions.get(node.id);
+      const point = current.positions.get(node.id) ?? { x: 0, y: 0 };
+
+      // 子节点在哪几侧，就在哪几侧留出口（双向布局里根的两边都有）。
+      const outSides: ChildSide[] = [];
+      for (const child of node.children) {
+        const childPoint = current.positions.get(child.id);
+        if (!childPoint) continue;
+        const side = childSide(point, childPoint, direction.value);
+        if (!outSides.includes(side)) outSides.push(side);
+      }
+
+      // 入口在父节点到自己的连线的对面：父在左边就从左边进来。
+      const inSides: ChildSide[] = [];
+      const parentPoint = current.positions.get(parentOf.get(node.id) ?? '');
+      if (parentPoint) {
+        const side = childSide(parentPoint, point, direction.value);
+        inSides.push(side === 'left' ? 'right' : side === 'right' ? 'left' : 'top');
+      }
+
       return {
         id: node.id,
         type: 'mind',
         draggable: false,
         connectable: false,
         position: {
-          x: (point?.x ?? 0) - NODE_SIZE.width / 2,
-          y: (point?.y ?? 0) - NODE_SIZE.height / 2,
+          x: point.x - NODE_SIZE.width / 2,
+          y: point.y - NODE_SIZE.height / 2,
         },
         data: {
           label: displayTitle(node),
           body: displayBody(node),
           fullLabel: node.label,
           depth,
-          side: handleSide(node.id, current),
+          out: outSides,
+          in: inSides,
         },
       } satisfies FlowNode<MindNodeData>;
     });
   });
 
   const edges = computed<FlowEdge[]>(() => {
+    const current = layout.value;
+    if (!current) return [];
+
     const out: FlowEdge[] = [];
     for (const { node, parentId } of flatNodes.value) {
       if (!parentId) continue;
+      const parentPoint = current.positions.get(parentId);
+      const childPoint = current.positions.get(node.id);
+      if (!parentPoint || !childPoint) continue;
+
+      const side = childSide(parentPoint, childPoint, direction.value);
       out.push({
         id: `${parentId}->${node.id}`,
         source: parentId,
-        sourceHandle: 'out',
+        sourceHandle: `out-${side}`,
         target: node.id,
-        targetHandle: 'in',
+        targetHandle: `in-${side === 'left' ? 'right' : side === 'right' ? 'left' : 'top'}`,
         type: 'smoothstep',
       });
     }

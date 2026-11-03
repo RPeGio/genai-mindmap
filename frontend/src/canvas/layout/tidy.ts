@@ -225,16 +225,14 @@ export function layoutTidy(root: MindNode, options: LayoutOptions = {}): LayoutR
 }
 
 /**
- * 节点在画布上的连接方向：源句柄朝外，目标句柄朝向父节点。
- * 双向布局按节点自身在 x 轴的正负决定挂哪一侧。
+ * 子节点相对父节点在哪一侧，决定连线从父节点的哪条边走、进入子节点的哪条边。
+ * 用几何位置判断而不是看 direction：双向布局里根的两侧都有子节点，
+ * 只看 direction 会把两侧的线都挂到同一个句柄上（正是连线绕过父节点的原因）。
+ * 轴向仍要看 direction——垂直布局里兄弟间距比层间距大，比大小会判错。
  */
-export function handleSide(nodeId: string, layout: LayoutResult): 'left' | 'right' | 'top' {
-  if (layout.direction === 'down') return 'top';
-  if (layout.direction === 'left') return 'right';
+export type ChildSide = 'left' | 'right' | 'bottom' | 'top';
 
-  if (layout.direction === 'right') return 'left';
-
-  // both：左侧子树的节点（x < 0）朝右挂，右侧朝左挂。
-  const point = layout.positions.get(nodeId);
-  return point && point.x < 0 ? 'right' : 'left';
+export function childSide(parent: Point, child: Point, direction: Direction): ChildSide {
+  if (direction === 'down') return child.y >= parent.y ? 'bottom' : 'top';
+  return child.x < parent.x ? 'left' : 'right';
 }

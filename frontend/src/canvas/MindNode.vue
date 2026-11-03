@@ -2,6 +2,7 @@
 import { Handle, Position } from '@vue-flow/core';
 import { computed, onBeforeUnmount, ref } from 'vue';
 
+import type { ChildSide } from '../canvas/layout/tidy';
 import type { MindNodeData } from '../stores/mindmap';
 
 const props = defineProps<{
@@ -10,16 +11,12 @@ const props = defineProps<{
   selected?: boolean;
 }>();
 
-/** 目标句柄（连线进入的一侧）由布局方向决定；源句柄在对面。 */
-const targetPosition = computed(() => {
-  if (props.data.side === 'top') return Position.Top;
-  return props.data.side === 'right' ? Position.Right : Position.Left;
-});
-
-const sourcePosition = computed(() => {
-  if (props.data.side === 'top') return Position.Bottom;
-  return props.data.side === 'right' ? Position.Left : Position.Right;
-});
+const POSITIONS: Record<ChildSide, Position> = {
+  left: Position.Left,
+  right: Position.Right,
+  top: Position.Top,
+  bottom: Position.Bottom,
+};
 
 /** 文字被截断时才有必要浮现卡片；没截断也照样允许悬停查看（标题本身可能就是全文）。 */
 const truncated = computed(() => props.data.label !== props.data.fullLabel);
@@ -51,8 +48,22 @@ onBeforeUnmount(() => clearTimeout(timer));
     @focusin="scheduleCard"
     @focusout="hideCard"
   >
-    <Handle id="in" type="target" :position="targetPosition" class="!h-1.5 !w-1.5 !border-0 !bg-slate-300" />
-    <Handle id="out" type="source" :position="sourcePosition" class="!h-1.5 !w-1.5 !border-0 !bg-slate-300" />
+    <Handle
+      v-for="side in data.in"
+      :id="`in-${side}`"
+      :key="`in-${side}`"
+      type="target"
+      :position="POSITIONS[side]"
+      class="!h-1.5 !w-1.5 !border-0 !bg-slate-300"
+    />
+    <Handle
+      v-for="side in data.out"
+      :id="`out-${side}`"
+      :key="`out-${side}`"
+      type="source"
+      :position="POSITIONS[side]"
+      class="!h-1.5 !w-1.5 !border-0 !bg-slate-300"
+    />
 
     <div
       class="flex h-12 w-[180px] items-center justify-center rounded-md border px-3 text-center text-sm leading-tight"
