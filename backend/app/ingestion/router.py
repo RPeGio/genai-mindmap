@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from starlette.concurrency import run_in_threadpool
 
@@ -10,8 +10,10 @@ from app.contracts.source import (
 from app.ingestion.service import (
     DOCUMENT_SUFFIXES,
     NotSupportedSource,
+    available_memory_mb,
     parse_bytes,
     parse_text,
+    resolve_pdf_parser,
 )
 
 router = APIRouter(prefix="/ingestion", tags=["多模态输入"])
@@ -68,6 +70,12 @@ async def create_file_source(file: UploadFile = File(...)):
 
 @router.get("/formats")
 def list_supported_formats():
-    """列出当前支持的文件类型，前端可据此限制文件选择框。"""
+    """列出当前支持的文件类型，前端可据此限制文件选择框。
+
+    顺带报出 PDF 实际会走哪条解析链路：2C2G 机器上 Docling 会 OOM，
+    排查"为什么表格散了"时先看这里。
+    """
     return {"document": sorted(DOCUMENT_SUFFIXES),
-            "maxUploadBytes": MAX_UPLOAD_BYTES}
+            "maxUploadBytes": MAX_UPLOAD_BYTES,
+            "pdfParser": resolve_pdf_parser(),
+            "availableMemoryMb": available_memory_mb()}
