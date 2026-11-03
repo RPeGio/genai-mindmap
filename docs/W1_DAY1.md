@@ -120,9 +120,9 @@ npm i @vue-flow/core @vue-flow/background @vue-flow/controls
 - `docs/ARCHITECTURE.md`：React Flow → Vue Flow；补 v2 契约与 PG。
 - `docs/API.md`、`docs/FLOW.md`：新增任务/SSE/认证接口。
 - `START_HERE.md` / `TEAM-GUIDE.md`：目录结构与启动命令更新（含 Docker 路线）。
-- 两人联调：真实模型 + 画布 + 保存，跑 PLAN 第 4 节 W1 验收门。
+- RPeGio 与陈嘉涛联调：真实模型 + 画布 + 保存，跑 PLAN 第 4 节 W1 验收门。
 
-**DoD**：新人按 `START_HERE.md` 从零能跑起来（你们互相按文档走一遍，不许口头补充）。
+**DoD**：新人按 `START_HERE.md` 从零能跑起来（RPeGio 与陈嘉涛各自按文档走一遍，不许口头补充）。
 
 ## 周检查表（周五 20:00）
 
@@ -131,4 +131,4 @@ npm i @vue-flow/core @vue-flow/background @vue-flow/controls
 - [ ] 流式 SSE 首节点 < 2s、整棵树 < 4s，截图存证
 - [ ] 画布可编辑、可保存、可撤销
 - [x] 旧 React 前端已打 tag；四份文档已按 Vue 现状同步（2026-11-02）
-- [ ] 双方各交一篇「讲解稿」，互讲 30 分钟，勾掉 20 题中已覆盖的
+- [ ] RPeGio 与陈嘉涛各交一篇「讲解稿」，互讲 30 分钟，勾掉 20 题中已覆盖的
