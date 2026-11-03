@@ -104,7 +104,7 @@ frontend/
     canvas/MindNode.vue       自定义节点：截断 + 悬停看全文
     canvas/layout/tidy.ts     自研紧凑树布局（向右 / 向左 / 向下 / 双向）
     stores/mindmap.ts   Pinia：内容、布局、选中、生成状态与流式归约
-  tests/               22 个 vitest 用例（布局 / store / 界面）
+  tests/               23 个 vitest 用例（布局 / store / 界面 / 真实画布挂载）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
