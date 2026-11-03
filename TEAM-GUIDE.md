@@ -95,19 +95,24 @@ backend/
   tests/               50 个测试
 frontend/
   src/
-    App.vue            工作台（输入 + 层级预览；画布 R2 接入）
-    main.ts            入口
+    App.vue            工作台（三栏：输入 / 画布 / 节点详情）
+    main.ts            入口（挂 Pinia 与 Vue Flow 样式）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（目前只接了 /api/generations）
-    api/types.ts       与后端契约 v1 对应的 TS 类型
-  tests/app.spec.ts    5 个 vitest 用例
+    api/client.ts      fetch 封装 + ApiError（同步与流式生成）
+    api/types.ts       与后端契约 v1 对应的 TS 类型（`note` 为 v2 预留）
+    canvas/MindMapCanvas.vue  Vue Flow 容器：平移 / 缩放 / 点选
+    canvas/MindNode.vue       自定义节点：截断 + 悬停看全文
+    canvas/layout/tidy.ts     自研紧凑树布局（向右 / 向左 / 向下 / 双向）
+    stores/mindmap.ts   Pinia：内容、布局、选中、生成状态与流式归约
+  tests/               22 个 vitest 用例（布局 / store / 界面）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
   ARCHITECTURE.md      模块边界、技术选型及来源
   ARCHITECTURE_ADDENDUM.md  存储迁移、SSE 协议、流水线细节
-  PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q34）
+  PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q36）
   CONTRACT_V2.md       目标契约（尚未落地，后端仍是 v1）
+  HANDOFF.md           需要对方知悉或确认的跨人决策（待确认 / 已确认）
   W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
 START_HERE.md          原始的骨架说明

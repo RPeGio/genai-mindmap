@@ -3,7 +3,9 @@
 > 状态：**冻结候选**（W1 定稿后冻结）· 归属：A/B 共管 · 任何字段改动需双人 review + 迁移脚本
 > v1 定义见 `backend/app/contracts/mindmap.py`（`id` / `label` / `children`）。
 >
-> **落地状态（2026-11-02）**：后端仍是 v1，`MindMapContent` 只有 `title` / `root` / `source_usage`；`frontend/src/api/types.ts` 是手写的 v1 镜像，**不是** v2 生成物。D2 把 v2 写进 Pydantic 后，前端类型改由 `openapi-typescript` 从 `/openapi.json` 生成，禁止再手写第二份。
+> **落地状态（2026-11-03）**：后端仍是 v1，`MindMapContent` 只有 `title` / `root` / `source_usage`；`frontend/src/api/types.ts` 是手写的 v1 镜像，**不是** v2 生成物。D2 把 v2 写进 Pydantic 后，前端类型改由 `openapi-typescript` 从 `/openapi.json` 生成，禁止再手写第二份。
+>
+> R2 画布已按 `node.note ?? node.label` 渲染正文（取值收敛在 `frontend/src/stores/mindmap.ts` 的 `displayBody()`），但**不发送** `note` 字段：v1 是 `extra="forbid"`，提前发送会 422。`note` 与 v2 同批上线，待确认项见 [交接文档](HANDOFF.md) H1。
 
 ## 1 v1 → v2 变更摘要
 
