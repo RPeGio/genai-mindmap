@@ -42,7 +42,7 @@ flowchart TD
 
 | 环节 | 模块 | 输入 | 输出 | 状态 |
 |---|---|---|---|---|
-| 来源解析 | `app/ingestion` | 文本 / Markdown 字符串 | `Source` | JSON 文本入口已实现；文件上传任何类型均返回 501 |
+| 来源解析 | `app/ingestion` | 文本 / Markdown 字符串 / 上传的文档 | `Source` | 文本与文档（Docling）均已实现；图片与语音仍待实现 |
 | 合并理解 | `app/pipeline._understand` | `Source[]` | 单一文本 | 已实现；任一来源不可用或合并超 8000 字时拒绝，不截断 |
 | 大纲生成 | `app/generation` | 文本 | `MindMapContent` | 已实现（demo 占位 / model 调模型） |
 | 契约校验 | `app/contracts/mindmap.py` | 任何模型输出 | 合法树 / 异常 | 已实现（300 节点 / 8 层 / 50 子节点） |
@@ -67,7 +67,7 @@ flowchart TD
 | 输入框（`src/App.vue`） | `POST /api/generations/stream` | **已接入**：输入 → 流式生成 → 节点逐个出现 |
 | 画布（R2） | 无请求 | 纯前端：`@vue-flow/core` + tidy-tree 布局消费 `content` |
 | 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | 带 `version` 的乐观锁，409 时提示重新打开 |
-| 上传面板（待开发） | `POST /api/ingestion/files` | 当前所有文件类型均返回 501，接口实现后才能接入 |
+| 上传面板（待接入） | `POST /api/ingestion/files` | 已实现：multipart 上传，Docling 解析后返回 `source`，再传给 `/api/pipeline/generate` |
 | 多来源生成（待接入） | `POST /api/pipeline/generate` | 拿 `content` 渲染，`stages` 仅作完成记录展示 |
 | 诊断面板（待接入） | `POST /api/optimization/suggest` | 显示建议，用户点确认后再改 |
 | 导出按钮（待接入） | `POST /api/export/puml` | 下载文本文件 |

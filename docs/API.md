@@ -42,6 +42,8 @@
 | `POST /api/optimization/check` | `{"content":导图}` | 结构诊断列表 | 结构无效 422 |
 | `POST /api/optimization/suggest` | `{"content":导图}` | 诊断与候选建议 | 结构无效 422；建议需用户判断 |
 | `POST /api/export/puml` | `{"content":导图}` | PlantUML 文本；根节点来自 `root.label` | 结构无效 422 |
+| `POST /api/ingestion/files` | multipart，字段名 `file` | `{"source": 来源}`，`source.text` 是解析出的正文 | 扩展名不在白名单 422；超过 10MB 413；扫描件无文本层 422 |
+| `GET /api/ingestion/formats` | 无 | 支持的扩展名列表与上传上限 | — |
 | `GET /api/mindmaps` | 无 | 导图记录数组 | — |
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
 | `GET /api/mindmaps/{id}` | 无 | 导图记录 | 不存在 404 |
@@ -51,13 +53,14 @@
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。流水线目前同步返回，`stages` 是完成后的阶段记录，不是实时进度。
 
+**文档解析**用 Docling，输出保留标题层级与表格结构（表格会变成 Markdown 表格）。首次调用需加载模型（约 13 秒），之后每次转换 1–2 秒。扫描件解析结果为空时返回 422 并说明原因，不返回空内容。
+
 `source` 是 `/api/ingestion/text` 返回的对象，也可按 `/docs` 中的 Source 结构提交；每次流水线最多 50 个来源，必须均为非空且已解析，ID 不可重复。当前超长会报错，不会静默截断或丢弃来源。
 
 ## 已注册但尚未实现
 
 | 路由 | 当前行为 |
 |---|---|
-| `POST /api/ingestion/files` | 所有文件类型返回 501；文本或 Markdown 可通过 `/api/ingestion/text` 提交。 |
 | `POST /api/knowledge/search` | 返回空列表与 `implemented: false`，没有接入检索。 |
 | `POST /api/agent/tasks` | 返回固定阶段与 `implemented: false`，不会生成导图。 |
 | `POST /api/export/markdown`、`POST /api/export/opml` | 返回 501。 |

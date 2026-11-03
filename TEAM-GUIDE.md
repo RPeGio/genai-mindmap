@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线：后端 40 个测试（pytest）、前端 5 个 vitest 用例，全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线：后端 50 个测试（pytest）、前端 5 个 vitest 用例，全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 `unittest` 默认可能将进度输出到 stderr；这本身不代表失败。请同时检查最后的 `OK` 和 `$LASTEXITCODE`，测试成功时退出码应为 0。
 
@@ -92,7 +92,7 @@ backend/
     agent/             AI 代理                    （桩）
     export/            导出 puml                  （puml 可用）
     mindmaps/          保存 / 读取 / 版本冲突     （可用）
-  tests/               40 个测试
+  tests/               50 个测试
 frontend/
   src/
     App.vue            工作台（输入 + 层级预览；画布 R2 接入）
@@ -117,23 +117,25 @@ START_HERE.md          原始的骨架说明
 
 ## 4 现在到底有什么
 
-**能用的**：文本生成导图（demo 或真实模型）、多来源流水线（文本来源）、结构诊断（单子节点 / 深度上限 / 同级重复标签）、候选建议、导出 PlantUML、保存与版本冲突检测。
+**能用的**：文本生成导图（demo 或真实模型，同步与流式两条接口）、文档导入（PDF/Word/PPT/Excel/HTML 经 Docling 解析）、多来源流水线、结构诊断（单子节点 / 深度上限 / 同级重复标签）、候选建议、导出 PlantUML、保存与版本冲突检测。
 
 **是桩的**：知识检索（返回空 + `implemented:false`）、AI 代理（返回固定四阶段，不产生导图）。
 
-**返回 501 的**：文件上传（PDF/Word/PPT/图片/语音全部）、Markdown 导出、OPML 导出。
+**返回 501 的**：图片与语音输入（`/api/ingestion/files` 目前只处理文档，图片和语音走 `parse_bytes` 时仍抛待实现）、Markdown 导出、OPML 导出。
 
 这条规矩写在代码注释里，也写在 `docs/FLOW.md` 第 4 节：**不允许返回空对象假装成功**。桩接口必须带 `implemented:false`，让前端能据此禁用入口。
 
 ---
 
-## 5 接口一览（16 条）
+## 5 接口一览（16 个路径 / 18 个端点）
 
 ```
 GET  /api/health
-POST /api/generations              文本 → 导图
+POST /api/generations              文本 → 导图（一次性）
+POST /api/generations/stream       文本 → 导图（SSE 流式，页面默认走这条）
 POST /api/ingestion/text           文本 → Source
-POST /api/ingestion/files          文件 → Source（501）
+POST /api/ingestion/files          上传文档 → Source（multipart）
+GET  /api/ingestion/formats        支持的扩展名与上传上限
 POST /api/pipeline/generate        Source[] → 导图 + 阶段 + 诊断
 POST /api/optimization/check       导图 → 诊断
 POST /api/optimization/suggest     导图 → 候选建议
