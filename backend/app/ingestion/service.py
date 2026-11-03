@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 import threading
 
-from app.contracts.source import Source, SourceKind
+from app.contracts.source import Source, SourceKind, SourceSpan
 
 # 单份文档最多解析的页数。超过就截断，理由见 docs/PLAN.md 的 F05 边界：
 # 导图本身容纳不了几百页的细节，而解析每一页都要跑版面模型，纯属浪费。
@@ -84,7 +84,11 @@ def _normalize_markdown(markdown: str) -> str:
     保留 `#` 标题层级 —— 那是现成的结构线索，模型可以直接映射成节点层级；
     去掉图片、空链接这类对导图没意义的标记，并压缩多余空行。
     """
-    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", markdown)          # 图片
+    # 图片的 URL 对导图没意义，但 alt 里常写着「图 3 系统架构」这类信息，
+    # 直接整段删掉会丢线索，所以保留成 [图: ...]。
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)",
+                  lambda m: f"[图: {m.group(1).strip()}]" if m.group(1).strip() else "",
+                  markdown)
     text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)       # 行尾空白
     text = re.sub(r"\n{3,}", "\n\n", text)                        # 连续空行
     return text.strip()
@@ -137,8 +141,16 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
         raise NotSupportedSource(
             "这份文档没有解析出任何文字，可能是扫描件或纯图片版，暂不支持")
 
+    # 记下文档级页数。注意这是「整份文档多少页」，不是「某个节点出自第几页」——
+    # 节点级溯源要模型在生成时标注来源，属于 RAG 阶段的事，见 docs/API.md。
+    #
+    # 只有 PDF 才有页概念：Docling 的 pages 对 DOCX/PPTX 是空列表，
+    # 因为它们不走 PDF 的版面流水线，不存在「第几页」。此时 span 留空。
+    page_count = len(result.pages) if getattr(result, "pages", None) else None
+    span = SourceSpan(page=page_count) if page_count else None
+
     return Source(kind=SourceKind.document, filename=filename, text=text,
-                  status="parsed")
+                  span=span, status="parsed")
 
 
 def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:

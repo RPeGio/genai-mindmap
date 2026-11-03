@@ -31,6 +31,26 @@ class TextSourceTest(unittest.TestCase):
             parse_text("x", SourceKind.document)
 
 
+class MarkdownCleanupTest(unittest.TestCase):
+    """解析结果转文本时的清洗规则。"""
+
+    def test_image_alt_is_kept_url_dropped(self):
+        from app.ingestion.service import _normalize_markdown
+        out = _normalize_markdown("正文\n\n![图 3 系统架构](http://x/y.png)\n\n后续")
+        self.assertIn("[图: 图 3 系统架构]", out)
+        self.assertNotIn("http://x/y.png", out)
+
+    def test_image_without_alt_disappears(self):
+        from app.ingestion.service import _normalize_markdown
+        out = _normalize_markdown("正文\n\n![](http://x/y.png)\n\n后续")
+        self.assertNotIn("http://x/y.png", out)
+        self.assertNotIn("[图:", out)
+
+    def test_blank_lines_are_squeezed(self):
+        from app.ingestion.service import _normalize_markdown
+        self.assertEqual(_normalize_markdown("a\n\n\n\n\nb"), "a\n\nb")
+
+
 class DocumentGuardTest(unittest.TestCase):
     """这些分支在真正调用 Docling 之前就返回，跑得很快。"""
 
