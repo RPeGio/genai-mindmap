@@ -1,4 +1,6 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+﻿from fastapi import APIRouter, File, HTTPException, UploadFile, status
+
+from starlette.concurrency import run_in_threadpool
 
 from app.contracts.source import (
     CreateTextSourceRequest,
@@ -53,7 +55,9 @@ async def create_file_source(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail="文件内容为空")
 
     try:
-        source = parse_bytes(SourceKind.document, filename, raw)
+        # 解析是同步阻塞的（Docling 要跑版面分析），直接在 async 函数里调用
+        # 会把事件循环占住，同进程的其他请求全部排队。甩给线程池，循环继续接客。
+        source = await run_in_threadpool(parse_bytes, SourceKind.document, filename, raw)
     except NotSupportedSource as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return CreateTextSourceResponse(source=source)

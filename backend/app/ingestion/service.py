@@ -30,6 +30,9 @@ DOCUMENT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
 
 _converter = None
 _converter_lock = threading.Lock()
+# 解析串行化：DocumentConverter 是进程内单例，多线程同时调用它内部状态不安全。
+# 两个用户的项目里排队解析可以接受，换来的是不会偶发解析错乱。
+_parse_lock = threading.Lock()
 
 
 class NotSupportedSource(Exception):
@@ -102,7 +105,8 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
         # 裸 BytesIO 会被 pydantic 拒掉，必须包成 DocumentStream。
         # 走内存不落盘：上传的文件没必要在内核上留痕。
         stream = DocumentStream(name=filename or "upload", stream=io.BytesIO(raw))
-        result = converter.convert(stream)
+        with _parse_lock:
+            result = converter.convert(stream)
         markdown = result.document.export_to_markdown()
     except NotSupportedSource:
         raise
