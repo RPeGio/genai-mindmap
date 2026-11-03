@@ -19,6 +19,10 @@ if (import.meta.env.DEV) {
   void import('./dev/samples').then(mod => {
     sampleMaps = mod.SAMPLE_MAPS;
     samples.value = mod.SAMPLE_MAPS.map(({ id, label }) => ({ id, label }));
+    // 方便复现与截图：地址栏加 ?sample=down 就直接装那个示例。
+    const wanted = new URLSearchParams(window.location.search).get('sample');
+    const initial = sampleMaps.find(item => item.id === wanted);
+    if (initial) store.preview(initial.content, initial.direction);
   });
 }
 

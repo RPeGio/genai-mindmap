@@ -51,8 +51,8 @@ onBeforeUnmount(() => clearTimeout(timer));
     @focusin="scheduleCard"
     @focusout="hideCard"
   >
-    <Handle type="target" :position="targetPosition" class="!h-1.5 !w-1.5 !border-0 !bg-slate-300" />
-    <Handle type="source" :position="sourcePosition" class="!h-1.5 !w-1.5 !border-0 !bg-slate-300" />
+    <Handle id="in" type="target" :position="targetPosition" class="!h-1.5 !w-1.5 !border-0 !bg-slate-300" />
+    <Handle id="out" type="source" :position="sourcePosition" class="!h-1.5 !w-1.5 !border-0 !bg-slate-300" />
 
     <div
       class="flex h-12 w-[180px] items-center justify-center rounded-md border px-3 text-center text-sm leading-tight"

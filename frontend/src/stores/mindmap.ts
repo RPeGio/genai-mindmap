@@ -106,7 +106,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       out.push({
         id: `${parentId}->${node.id}`,
         source: parentId,
+        sourceHandle: 'out',
         target: node.id,
+        targetHandle: 'in',
         type: 'smoothstep',
       });
     }

@@ -250,4 +250,27 @@ describe('mindmap store', () => {
     store.select(null);
     expect(store.breadcrumb).toEqual([]);
   });
+
+  it('连线显式指定句柄 id，换方向后不会退回"无 id 取第一个句柄"', () => {
+    // 没有 id 时 Vue Flow 取 handles[0]，换方向只改了句柄位置、几何没重新测量，
+    // 连线就会停在旧的进出侧——这正是"线方向写死右出左进"的原因。
+    const store = useMindMapStore();
+    store.preview(
+      { title: '示例', root: { id: 'r', label: '根', children: [node('a', '子')] } },
+      'right',
+    );
+
+    expect(store.edges).toEqual([
+      expect.objectContaining({
+        id: 'r->a',
+        source: 'r',
+        target: 'a',
+        sourceHandle: 'out',
+        targetHandle: 'in',
+      }),
+    ]);
+
+    store.setDirection('left');
+    expect(store.edges[0]).toMatchObject({ sourceHandle: 'out', targetHandle: 'in' });
+  });
 });

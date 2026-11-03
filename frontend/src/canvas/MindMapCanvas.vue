@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { Background } from '@vue-flow/background';
 import { VueFlow, useVueFlow } from '@vue-flow/core';
-import { onBeforeUnmount, watch } from 'vue';
+import { nextTick, onBeforeUnmount, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import MindNode from './MindNode.vue';
 
 const store = useMindMapStore();
-const { fitView, onNodeClick, onPaneClick, onMoveEnd } = useVueFlow();
+const { fitView, onNodeClick, onPaneClick, onMoveEnd, updateNodeInternals } = useVueFlow();
 
 onNodeClick(({ node }) => store.select(node.id));
 onPaneClick(() => store.select(null));
@@ -26,6 +26,18 @@ function scheduleFit() {
 
 watch(() => store.nodeCount, scheduleFit);
 watch(() => store.direction, scheduleFit);
+
+// 换方向会改掉每个节点的句柄位置（左 / 右 / 上）。Vue Flow 只在自己重新测量节点时
+// 才知道句柄动了，否则连线依旧按旧坐标绘制——表现为线头悬空、或从错误的一侧进出。
+// 节点数量变化时也一样，新节点第一次测量往往赶不上布局。
+watch(
+  [() => store.direction, () => store.nodeCount],
+  async () => {
+    await nextTick();
+    updateNodeInternals(store.nodes.map(node => node.id));
+  },
+  { flush: 'post' },
+);
 
 onBeforeUnmount(() => clearTimeout(fitTimer));
 </script>
