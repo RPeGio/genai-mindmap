@@ -24,6 +24,10 @@ import threading
 
 from app.contracts.source import Source, SourceKind
 
+# 单份文档最多解析的页数。超过就截断，理由见 docs/PLAN.md 的 F05 边界：
+# 导图本身容纳不了几百页的细节，而解析每一页都要跑版面模型，纯属浪费。
+MAX_PAGES = 50
+
 # Docling 支持的文档扩展名。列表外的类型一律拒绝，避免让解析器去猜。
 DOCUMENT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
                      ".html", ".htm", ".md", ".asciidoc", ".adoc"}
@@ -106,7 +110,7 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
         # 走内存不落盘：上传的文件没必要在内核上留痕。
         stream = DocumentStream(name=filename or "upload", stream=io.BytesIO(raw))
         with _parse_lock:
-            result = converter.convert(stream)
+            result = converter.convert(stream, max_num_pages=MAX_PAGES)
         markdown = result.document.export_to_markdown()
     except NotSupportedSource:
         raise
