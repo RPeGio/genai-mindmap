@@ -1,4 +1,4 @@
-"""生成流水线（F01 / F02 / F03 / F15 / F16）。
+﻿"""生成流水线（F01 / F02 / F03 / F15 / F16）。
 
 把"素材 → 导图"分成四个阶段，当前只提供同步整体调用：
 
@@ -23,8 +23,10 @@ from app.contracts.source import Source, SourceUsage
 from app.generation.service import GenerationError, generate
 from app.optimization.service import check
 
-# 当前同步链路的输入限制；超限直接返回错误，不静默丢弃内容。
-MAX_INPUT_CHARS = 8000
+# 单次生成允许的输入上限。定 20000 是因为文档解析（Docling）出来的正文
+# 动辄上万字，8000 会把正常的一份讲义直接挡在门外；20000 字符约合
+# 一万出头 token，deepseek-chat 的上下文完全吃得下。
+MAX_INPUT_CHARS = 20000
 
 
 @dataclass

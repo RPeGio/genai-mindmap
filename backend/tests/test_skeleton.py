@@ -127,7 +127,7 @@ class SkeletonTest(unittest.TestCase):
 
     def test_pipeline_rejects_truncation_and_unparsed_sources(self):
         sources = [
-            {"id": "one", "kind": "text", "text": "a" * 8000, "status": "parsed"},
+            {"id": "one", "kind": "text", "text": "a" * 20001, "status": "parsed"},
             {"id": "two", "kind": "text", "text": "important second source", "status": "parsed"},
         ]
         status, raw = request("POST", "/api/pipeline/generate", {"sources": sources})
@@ -190,17 +190,16 @@ class SkeletonTest(unittest.TestCase):
         self.assertIn('"implemented":false', body)
         self.assertNotIn('"root"', body)
 
-    def test_unknown_source_kind_returns_501(self):
-        status, _ = request("POST", "/api/ingestion/files?kind=image")
-        self.assertEqual(status, 501)
+    def test_file_upload_requires_actual_file(self):
+        """文件入口改成 multipart 后，不带文件不能假装成功。"""
+        status, _ = request("POST", "/api/ingestion/files", {})
+        self.assertEqual(status, 422)
 
-    def test_file_upload_is_not_falsely_reported_as_success(self):
-        for kind in ("text", "markdown", "document", "image", "audio"):
-            with self.subTest(kind=kind):
-                status, _ = request("POST", "/api/ingestion/files?kind=" + kind)
-                self.assertEqual(status, 501)
+    def test_text_endpoint_rejects_image_kind(self):
         status, _ = request("POST", "/api/ingestion/text", {"text": "内容", "kind": "image"})
         self.assertEqual(status, 422)
+
+    def test_bytes_parser_rejects_blank_text(self):
         with self.assertRaises(NotSupportedSource):
             parse_bytes(SourceKind.text, "empty.txt", b"  ")
 
