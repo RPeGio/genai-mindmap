@@ -125,6 +125,12 @@ START_HERE.md          原始的骨架说明
 
 这条规矩写在代码注释里，也写在 `docs/FLOW.md` 第 4 节：**不允许返回空对象假装成功**。桩接口必须带 `implemented:false`，让前端能据此禁用入口。
 
+### 文档解析的两个前提
+
+**PDF 要模型，DOCX/PPTX 不用。** Docling 处理 PDF 时会加载版面模型，第一次解析要在有网环境下自动下载（几百 MB），缓存到 `~/.cache/docling/models`。之后每次解析 1–2 秒。DOCX / PPTX / XLSX / HTML 走的是轻量路径，不碰模型，离线也能用。
+
+**离线部署要预置缓存。** 部署机如果没有外网，把开发机上那个 `~/.cache/docling/models` 目录整个拷过去；否则 PDF 会返回 422 并提示缺少模型缓存。另外 `.doc/.ppt/.xls` 这类旧格式**刻意不支持**——它们要 LibreOffice 才能读，那是几百 MB 的系统依赖，遇到旧格式请先另存为 `.docx/.pptx/.xlsx`。
+
 ---
 
 ## 5 接口一览（16 个路径 / 18 个端点）

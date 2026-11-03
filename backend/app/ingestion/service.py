@@ -119,7 +119,18 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
     except NotSupportedSource:
         raise
     except Exception as exc:  # noqa: BLE001 - 第三方库异常类型很杂，统一转成可读文案
-        raise NotSupportedSource(f"文档解析失败：{exc}") from exc
+        message = str(exc)
+        # Docling 处理 PDF 时要加载版面模型；离线或缓存缺失时它抛的异常里
+        # 会带 model / download / cache 之类的字样。这里做一次启发式识别，
+        # 把「解析失败：<一堆堆栈>」换成能指导用户的一句话。
+        lowered = message.lower()
+        if any(key in lowered for key in ("model", "download", "cache", "artifact")):
+            raise NotSupportedSource(
+                "解析 PDF 需要下载版面模型，当前环境缺少模型缓存。"
+                "请在有网环境跑一次解析完成下载，或把 ~/.cache/docling/models "
+                "预置到部署机；DOCX/PPTX/HTML 不需要模型，可先改用这些格式"
+            ) from exc
+        raise NotSupportedSource(f"文档解析失败：{message}") from exc
 
     text = _normalize_markdown(markdown)
     if not text:
