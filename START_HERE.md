@@ -52,7 +52,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 ## 团队从这里开始
 
-1. 两人先共同阅读 [系统架构](docs/ARCHITECTURE.md)、[API 契约](docs/API.md) 和 [CONTRACT_V2](docs/CONTRACT_V2.md)，固定导图 JSON 格式；契约改动必须双人 review 并附迁移脚本。
-2. 分工按 [执行计划第 11 节](docs/PLAN.md)：A 负责契约 / Vue 画布 / 布局主题导出 / 部署与 CI，B 负责后端地基 / 生成链路 / 多模态解析 / RAG / 诊断。任务与依赖仍以 [功能清单与分工](docs/FEATURES_AND_OWNERS.md) 的 F 编号为准。
-3. 先分别在各自电脑跑通生成（R1 已有）与保存/重新打开（R3 完成后），再按功能清单实现剩余能力。
+1. RPeGio 与陈嘉涛先共同阅读 [系统架构](docs/ARCHITECTURE.md)、[API 契约](docs/API.md) 和 [CONTRACT_V2](docs/CONTRACT_V2.md)，固定导图 JSON 格式；契约改动必须经 RPeGio 与陈嘉涛双人 review 并附迁移脚本。
+2. 分工按 [执行计划第 11 节](docs/PLAN.md)：RPeGio 负责契约 / Vue 画布 / 布局主题导出 / 部署与 CI，陈嘉涛负责后端地基 / 生成链路 / 多模态解析 / RAG / 诊断。任务与依赖仍以 [功能清单与分工](docs/FEATURES_AND_OWNERS.md) 的 F 编号为准。
+3. RPeGio 与陈嘉涛先在本人电脑跑通生成（R1 已有）与保存/重新打开（R3 完成后），再按功能清单实现剩余能力。
 4. 分支：`main` ← `dev` ← `feat/*`·`fix/*`，**PR 目标一律 `dev`**，提交信息用中文 Conventional Commits，PR 模板三问必填；`dev` 每周日合 `main` 并打 tag。CI 必须绿才能合并。
