@@ -1,8 +1,9 @@
-﻿"""本地演示和 OpenAI Chat Completions 兼容服务接入。"""
+"""本地演示和 OpenAI Chat Completions 兼容服务接入。"""
 from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -33,6 +34,35 @@ MIN_BRANCHES = 1
 
 class GenerationError(Exception):
     pass
+
+
+# 模型偶尔无视「不要代码围栏」的指示，把 JSON 包进 ```json … ``` 里。
+# 裸 json.loads 会因此直接抛错，用户侧表现为随机失败 —— 实测 18 次调用里
+# 撞到 1 次。解析前先剥干净，比要求模型「务必听话」可靠。
+_FENCE_OPEN = re.compile(r"^\s*```(?:json|JSON)?\s*")
+_FENCE_CLOSE = re.compile(r"\s*```\s*$")
+
+
+def parse_model_json(content: str) -> Any:
+    """解析模型返回的 JSON，容忍代码围栏与前后多余文字。"""
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("模型返回了空内容")
+    text = _FENCE_CLOSE.sub("", _FENCE_OPEN.sub("", text))
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # 还有解释文字包着时，截取最外层的对象或数组
+    for left, right in (("{", "}"), ("[", "]")):
+        start, end = text.find(left), text.rfind(right)
+        if start < 0 or end <= start:
+            continue
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("模型返回内容里没有可解析的 JSON")
 
 
 def _config() -> tuple[str, str, str]:
@@ -76,7 +106,7 @@ def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, 
                     if len(buffer) > _MAX_RESPONSE_BYTES:
                         raise GenerationError("模型响应过大")
         body = json.loads(buffer)
-        return json.loads(body["choices"][0]["message"]["content"])
+        return parse_model_json(body["choices"][0]["message"]["content"])
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         raise GenerationError(f"模型服务返回 HTTP {code}，请检查服务配置") from exc
@@ -119,7 +149,7 @@ async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -
                     if len(buffer) > _MAX_RESPONSE_BYTES:
                         raise GenerationError("模型响应过大")
         body = json.loads(buffer)
-        return json.loads(body["choices"][0]["message"]["content"])
+        return parse_model_json(body["choices"][0]["message"]["content"])
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         raise GenerationError(f"模型服务返回 HTTP {code}，请检查服务配置") from exc
