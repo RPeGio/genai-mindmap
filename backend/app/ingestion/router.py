@@ -41,9 +41,12 @@ async def create_file_source(file: UploadFile = File(...)):
     filename = file.filename or ""
     suffix = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
     if suffix not in DOCUMENT_SUFFIXES:
+        hint = ""
+        if suffix in {".doc", ".ppt", ".xls"}:
+            hint = f"；这是旧版二进制格式，请另存为 {suffix}x 后再上传"
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"暂不支持的文件类型：{suffix or '未知'}；"
+            detail=f"暂不支持的文件类型：{suffix or '未知'}{hint}；"
                    f"目前支持 {', '.join(sorted(DOCUMENT_SUFFIXES))}")
 
     raw = await file.read(MAX_UPLOAD_BYTES + 1)

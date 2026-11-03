@@ -28,8 +28,12 @@ from app.contracts.source import Source, SourceKind
 # 导图本身容纳不了几百页的细节，而解析每一页都要跑版面模型，纯属浪费。
 MAX_PAGES = 50
 
-# Docling 支持的文档扩展名。列表外的类型一律拒绝，避免让解析器去猜。
-DOCUMENT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
+# 接受解析的文档扩展名。
+#
+# 刻意不含 .doc / .ppt / .xls：这三个是二进制旧格式，Docling 要靠 LibreOffice
+# 先转成新格式才能读，而 LibreOffice 在 Linux 上要装几百 MB 系统包，
+# 2C2G 的部署机扛不住。与其"装了依赖才能用"，不如明确拒绝并提示另存为新格式。
+DOCUMENT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx",
                      ".html", ".htm", ".md", ".asciidoc", ".adoc"}
 
 _converter = None

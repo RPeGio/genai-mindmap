@@ -1,4 +1,4 @@
-"""文档导入的边界行为。
+﻿"""文档导入的边界行为。
 
 真实的 Docling 解析很慢（首次要加载模型），所以这里只测不触发解析的路径：
 格式白名单、空文件、文本直通。实际解析效果由手工端到端验证覆盖。
@@ -51,6 +51,13 @@ class DocumentGuardTest(unittest.TestCase):
     def test_supported_suffixes_include_core_formats(self):
         for suffix in (".pdf", ".docx", ".pptx"):
             self.assertIn(suffix, DOCUMENT_SUFFIXES)
+
+    def test_legacy_office_formats_rejected(self):
+        """旧版二进制格式需要 LibreOffice，刻意不支持，并提示另存为新格式。"""
+        for suffix in (".doc", ".ppt", ".xls"):
+            with self.subTest(suffix=suffix):
+                with self.assertRaises(NotSupportedSource):
+                    parse_document_bytes("a" + suffix, b"x")
 
     def test_bytes_dispatch_by_kind(self):
         """parse_bytes 会把 document 交给文档解析器，而不是当成文本。"""
