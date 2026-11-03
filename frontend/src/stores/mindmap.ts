@@ -177,6 +177,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
     viewAdjusted.value = false;
   }
 
+  /**
+   * 不经过网络直接装载一份导图，开发期的示例选择器用它预览布局。
+   * 走 cancel() 先掐掉在途请求，避免旧流回来后把示例顶掉。
+   */
+  function preview(next: MindMapContent, dir: Direction) {
+    cancel();
+    direction.value = dir;
+    content.value = next;
+    mode.value = 'demo';
+    selectedId.value = null;
+    viewAdjusted.value = false;
+    status.value = '这是本地示例数据，用来检查布局与截断，不是模型生成的。';
+  }
+
   function cancel() {
     const active = controller;
     controller = null;
@@ -308,6 +322,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     breadcrumb,
     generate,
     cancel,
+    preview,
     select,
     setDirection,
   };

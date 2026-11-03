@@ -3,12 +3,29 @@ import { computed, ref } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
+import type { SampleMap } from './dev/samples';
 import { displayBody, useMindMapStore } from './stores/mindmap';
 
 const store = useMindMapStore();
 
 const prompt = ref('');
 const copied = ref('');
+
+// 开发期示例选择器：只在 dev 服务器下加载，生产构建里这段会被整体去掉。
+const samples = ref<{ id: string; label: string }[]>([]);
+let sampleMaps: SampleMap[] = [];
+
+if (import.meta.env.DEV) {
+  void import('./dev/samples').then(mod => {
+    sampleMaps = mod.SAMPLE_MAPS;
+    samples.value = mod.SAMPLE_MAPS.map(({ id, label }) => ({ id, label }));
+  });
+}
+
+function loadSample(id: string) {
+  const found = sampleMaps.find(item => item.id === id);
+  if (found) store.preview(found.content, found.direction);
+}
 
 const directions: { value: Direction; label: string }[] = [
   { value: 'right', label: '向右' },
@@ -43,7 +60,21 @@ async function copyBody() {
 <template>
   <div class="flex h-full w-full flex-col bg-slate-50 text-slate-900">
     <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-2">
-      <h1 class="text-sm font-semibold">生成式 AI 思维导图</h1>
+      <div class="flex items-center gap-3">
+        <h1 class="text-sm font-semibold">生成式 AI 思维导图</h1>
+        <div v-if="samples.length" class="flex items-center gap-1 text-xs text-slate-500">
+          <span class="mr-1">布局示例</span>
+          <button
+            v-for="item in samples"
+            :key="item.id"
+            type="button"
+            class="rounded border border-slate-200 px-2 py-0.5 hover:bg-slate-100"
+            @click="loadSample(item.id)"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+      </div>
       <p class="text-xs text-slate-500">
         <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
           演示模式（非 AI 生成）
