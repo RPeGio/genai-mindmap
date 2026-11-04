@@ -1,0 +1,183 @@
+import { createPinia, setActivePinia } from 'pinia';
+import { beforeEach, describe, expect, it } from 'vitest';
+
+import type { MindMapContent, MindNode } from '../src/api/types';
+import { HISTORY_LIMIT, useMindMapStore } from '../src/stores/mindmap';
+
+const tree = (): MindNode => ({
+  id: 'root',
+  label: '根',
+  children: [
+    {
+      id: 'a',
+      label: '甲',
+      children: [{ id: 'a1', label: '甲一', children: [] }],
+    },
+    { id: 'b', label: '乙', children: [] },
+  ],
+});
+
+const sample = (): MindMapContent => ({ title: '示例', root: tree() });
+
+const node = (id: string, label: string, children: MindNode[] = []): MindNode => ({
+  id,
+  label,
+  children,
+});
+
+beforeEach(() => {
+  setActivePinia(createPinia());
+});
+
+describe('编辑与撤销', () => {
+  it('装载示例后没有历史、也不脏', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    expect(store.canUndo).toBe(false);
+    expect(store.canRedo).toBe(false);
+    expect(store.dirty).toBe(false);
+  });
+
+  it('改文字后可以撤销、重做', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.commitLabel('a1', '改过的甲一');
+    expect(store.content?.root.children[0].children[0].label).toBe('改过的甲一');
+    expect(store.dirty).toBe(true);
+    expect(store.canUndo).toBe(true);
+
+    store.undo();
+    expect(store.content?.root.children[0].children[0].label).toBe('甲一');
+    expect(store.canRedo).toBe(true);
+
+    store.redo();
+    expect(store.content?.root.children[0].children[0].label).toBe('改过的甲一');
+  });
+
+  it('文字没变或为空白时不记历史', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.commitLabel('a1', ' 甲一 ');
+    store.commitLabel('a1', '   ');
+
+    expect(store.canUndo).toBe(false);
+    expect(store.status).toBe('节点标题不能为空');
+  });
+
+  it('撤销栈只保留最近 50 步', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    for (let i = 1; i <= HISTORY_LIMIT + 10; i += 1) {
+      store.commitLabel('a', `第${i}次`);
+    }
+    for (let i = 0; i < HISTORY_LIMIT; i += 1) store.undo();
+
+    expect(store.canUndo).toBe(false);
+    expect(store.content?.root.children[0].label).toBe('第10次');
+  });
+});
+
+describe('建树与删除', () => {
+  it('加子节点后选中并进入编辑', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.addChildTo('a');
+
+    const children = store.content?.root.children[0].children ?? [];
+    const added = children[children.length - 1];
+    expect(added?.label).toBe('新节点');
+    expect(store.selectedId).toBe(added?.id);
+    expect(store.editingId).toBe(added?.id);
+    expect(store.nodeCount).toBe(5);
+  });
+
+  it('加兄弟插在当前节点后面；根节点退化成加子节点', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.addSiblingTo('a1');
+    expect(store.content?.root.children[0].children.map(child => child.label)).toEqual([
+      '甲一',
+      '新节点',
+    ]);
+
+    const before = store.nodeCount;
+    store.addSiblingTo('root');
+    expect(store.nodeCount).toBe(before + 1);
+    expect(store.content?.root.children).toHaveLength(3);
+  });
+
+  it('删除节点会删掉子树并选中父节点', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.deleteNode('a');
+
+    expect(store.content?.root.children.map(child => child.id)).toEqual(['b']);
+    expect(store.selectedId).toBe('root');
+    expect(store.editingId).toBeNull();
+  });
+
+  it('根节点不能删除，超 8 层不能再加子节点', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.deleteNode('root');
+    expect(store.status).toBe('根节点不能删除');
+
+    let deep = node('d8', '第八层');
+    for (let depth = 7; depth >= 1; depth -= 1) deep = node(`d${depth}`, `第${depth}层`, [deep]);
+    store.preview({ title: '深树', root: deep }, 'right');
+
+    store.addChildTo('d8');
+    expect(store.status).toBe('导图最多 8 层');
+    expect(store.nodeCount).toBe(8);
+  });
+});
+
+describe('保存状态', () => {
+  it('打开已保存的导图后不脏、历史清空，模式记为已保存', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+    store.commitLabel('a1', '改过');
+
+    store.loadMap(sample(), { id: 'm1', version: 3, updated_at: '2026-11-04T00:00:00Z' });
+
+    expect(store.dirty).toBe(false);
+    expect(store.canUndo).toBe(false);
+    expect(store.canRedo).toBe(false);
+    expect(store.mapId).toBe('m1');
+    expect(store.version).toBe(3);
+    expect(store.mode).toBe('saved');
+  });
+
+  it('保存成功后清掉脏标记并记住版本号', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+    store.commitLabel('a1', '改过');
+    expect(store.dirty).toBe(true);
+
+    store.markSaved({ id: 'm2', version: 1, updated_at: '2026-11-04T00:00:00Z' });
+
+    expect(store.dirty).toBe(false);
+    expect(store.mapId).toBe('m2');
+    expect(store.version).toBe(1);
+  });
+
+  it('标题改名走同一套校验', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.renameTitle('  新标题  ');
+    expect(store.content?.title).toBe('新标题');
+
+    store.renameTitle('   ');
+    expect(store.status).toBe('标题不能为空');
+    expect(store.content?.title).toBe('新标题');
+  });
+});
