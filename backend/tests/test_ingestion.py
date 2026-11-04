@@ -197,16 +197,57 @@ class PdfVisionTest(unittest.TestCase):
                 parse_document_bytes("scan.pdf", raw)
         self.assertIn("没有文本层", str(raised.exception))
 
-    def test_partial_page_failure_marks_truncated(self):
+    def test_failed_page_is_filled_from_text_layer(self):
+        """视觉识别失败的页，若同一页有文本层就用它补回来。
+
+        原 PDF 有文本层说明这页本来就有文字，只是渲染或模型那侧出了问题；
+        直接丢掉等于白丢一页正文。
+        """
         from unittest.mock import patch
 
         with patch("app.ingestion.vision_pdf.extract_pages") as extract:
-            # 3 页里第 2 页失败
-            extract.return_value = (["# 一", "", "# 三"], 3, 3, [2])
+            # 3 页里第 2 页识别失败
+            extract.return_value = (["# 第一页", "", "# 第三页"], 3, 3, [2])
             source = parse_document_bytes("a.pdf", make_pdf(3))
-        self.assertIn("# 一", source.text)
-        self.assertIn("# 三", source.text)
-        self.assertTrue(source.truncated)
+
+        self.assertIn("# 第一页", source.text)
+        self.assertIn("# 第三页", source.text)
+        # 第 2 页由文本层补回：make_pdf 每页写的是 "page N content"
+        self.assertIn("page 2 content", source.text)
+        self.assertEqual(source.failed_pages, [])
+        self.assertFalse(source.truncated)
+        self.assertEqual(source.parsed_pages, 3)
+
+    def test_unrecoverable_page_is_reported(self):
+        """既识别失败又没有文本层时，页码要明确报出来，不能只标一个 truncated。"""
+        from unittest.mock import patch
+
+        with patch("app.ingestion.service._parse_pdf", return_value=(["", "", ""], 3)), \
+             patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            extract.return_value = (["# 第一页", "", "# 第三页"], 3, 3, [2])
+            source = parse_document_bytes("a.pdf", b"%PDF-fake")
+
+        self.assertIn("# 第一页", source.text)
+        self.assertEqual(source.failed_pages, [2])
+        # 页数没超上限，所以不算"截断"——这两个信号必须分开
+        self.assertFalse(source.truncated)
+        self.assertEqual(source.parsed_pages, 2)
+        self.assertEqual(source.span.page, 3)
+
+    def test_partial_failure_does_not_fake_truncated_hint(self):
+        """3 页里 1 页失败，不能给出"共 3 页仅处理前 3 页"这种自相矛盾的组合。"""
+        from unittest.mock import patch
+
+        with patch("app.ingestion.service._parse_pdf", return_value=(["", "", ""], 3)), \
+             patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            extract.return_value = (["# 一", "", "# 三"], 3, 3, [2])
+            source = parse_document_bytes("a.pdf", b"%PDF-fake")
+
+        # truncated 为假时前端不会渲染"仅处理前 N 页"，改由 failed_pages 说明
+        self.assertFalse(source.truncated)
+        self.assertEqual(source.failed_pages, [2])
+        self.assertEqual(source.span.page, 3)
+        self.assertLess(source.parsed_pages, source.span.page)
 
     def test_page_limit_marks_truncated(self):
         from unittest.mock import patch

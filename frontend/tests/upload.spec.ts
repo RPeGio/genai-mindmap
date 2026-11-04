@@ -58,6 +58,7 @@ function source(overrides: Partial<Source> = {}): Source {
     error: null,
     parsed_pages: 3,
     truncated: false,
+    failed_pages: [],
     ...overrides,
   };
 }
@@ -308,6 +309,47 @@ describe('上传文档生成导图', () => {
 
     await pickFile(wrapper, smallFile());
     await vi.waitFor(() => expect(wrapper.text()).toContain('共 51 页，仅处理前 50 页'));
+  });
+
+  it('中间有页识别失败时提示具体页码，而不是谎报"仅处理前 N 页"', async () => {
+    // 3 页都处理了，但第 2 页没拿到内容。旧实现会输出
+    // "共 3 页，仅处理前 3 页"——自相矛盾，也没说清缺哪一页。
+    stubFetch(call =>
+      call.url === UPLOAD_URL
+        ? jsonResponse({
+            source: source({
+              span: { page: 3, start: null, end: null },
+              parsed_pages: 2,
+              truncated: false,
+              failed_pages: [2],
+            }),
+          })
+        : jsonResponse(pipelineReply()),
+    );
+    const { wrapper } = mountApp();
+
+    await pickFile(wrapper, smallFile());
+    await vi.waitFor(() => expect(wrapper.text()).toContain('第 2 页 识别失败'));
+    expect(wrapper.text()).not.toContain('仅处理前');
+  });
+
+  it('失败页较多时只列前几个并给出总数', async () => {
+    stubFetch(call =>
+      call.url === UPLOAD_URL
+        ? jsonResponse({
+            source: source({
+              span: { page: 10, start: null, end: null },
+              parsed_pages: 4,
+              truncated: false,
+              failed_pages: [2, 3, 5, 6, 7, 9],
+            }),
+          })
+        : jsonResponse(pipelineReply()),
+    );
+    const { wrapper } = mountApp();
+
+    await pickFile(wrapper, smallFile());
+    await vi.waitFor(() => expect(wrapper.text()).toContain('等 6 页'));
   });
 
   const details = [

@@ -60,10 +60,17 @@ export interface Source {
   span: SourceSpan | null;
   status: 'pending' | 'parsed' | 'failed';
   error: string | null;
-  /** 实际解析的页数：51 页的 PDF 只解析前 50 页时这里是 50，span.page 才是 51。 */
+  /** 实际得到内容的页数：51 页的 PDF 只处理前 50 页时这里是 50，span.page 才是 51。 */
   parsed_pages: number | null;
-  /** 是否因后端 50 页上限被截断。为 true 时界面必须明确告知用户正文缺了尾巴。 */
+  /** 是否因后端页数上限被截断（后半截根本没处理）。 */
   truncated: boolean;
+  /**
+   * 处理过但彻底没拿到内容的页码（1 起）。
+   *
+   * 与 truncated 是两回事：那个是"没处理到"，这个是"处理了但中间有洞"。
+   * 合并成一个布尔值会给出"共 3 页，仅处理前 3 页"这种自相矛盾的提示。
+   */
+  failed_pages: number[];
 }
 
 export interface CreateTextSourceResponse {

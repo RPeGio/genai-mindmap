@@ -91,24 +91,27 @@ def _parse_pdf(raw: bytes) -> tuple[str, int, int]:
     30 页中文文档 0.38 秒 / 66MB。扫描件抽不出文字，这里会返回空正文，
     由调用方拒绝。
 
-    总页数与解析页数分开返回：超过 MAX_PAGES 时只解析前面那些页，
-    调用方要据此告诉用户"这份文档被截断了"，而不是让界面显示解析成功。
+    返回逐页文本而不是拼好的一个串：视觉提取可能有个别页失败，那时要用
+    同一页的文本层补上。整份拼接后就无法按页取了。
+
+    总页数与已取页数分开返回：超过 MAX_PAGES 时只取前面那些页，
+    调用方要据此告诉用户"这份文档被截断了"。
     """
     import pymupdf
 
     doc = pymupdf.open(stream=raw, filetype="pdf")
     try:
         page_count = doc.page_count
-        parsed_pages = min(page_count, MAX_PAGES)
+        readable_pages = min(page_count, MAX_PAGES)
         chunks = []
-        for index in range(parsed_pages):
+        for index in range(readable_pages):
             try:
                 chunks.append(doc[index].get_text("text") or "")
             except Exception:  # noqa: BLE001 - 单页损坏不该拖垮整份文档
-                continue
+                chunks.append("")
     finally:
         doc.close()
-    return "\n\n".join(c for c in chunks if c.strip()), page_count, parsed_pages
+    return chunks, page_count
 
 
 def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
@@ -125,7 +128,7 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
 
     # 兜底用，同时也是"这份文档到底有没有文字"的判断依据
     try:
-        fallback_text, page_count, text_pages = _parse_pdf(raw)
+        text_pages, page_count = _parse_pdf(raw)
     except ImportError as exc:  # pragma: no cover - 只在缺依赖的部署上触发
         raise NotSupportedSource(
             "PDF 解析需要 pymupdf，当前环境没有安装；请执行 "
@@ -135,15 +138,16 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
 
     def fallback(reason: str) -> Source:
         """视觉不可用时退回文本层；文本层也空就只能报错。"""
-        text = _normalize_markdown(fallback_text)
+        usable = [page for page in text_pages if page.strip()]
+        text = _normalize_markdown("\n\n".join(usable))
         if not text:
             raise NotSupportedSource(
                 f"{reason}；这份 PDF 也没有文本层可以退回（可能是扫描件），"
                 "请确认模型服务可用后重试")
         return Source(kind=SourceKind.document, filename=filename, text=text,
                       span=SourceSpan(page=page_count) if page_count else None,
-                      parsed_pages=text_pages,
-                      truncated=text_pages < page_count,
+                      parsed_pages=len(usable),
+                      truncated=len(text_pages) < page_count,
                       status="parsed")
 
     try:
@@ -153,21 +157,33 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
     except Exception as exc:  # noqa: BLE001 - 渲染/并发层的意外错误
         return fallback(f"视觉提取失败（{exc}）")
 
-    markdown = "\n\n".join(page.strip() for page in pages if page.strip())
-    if not markdown.strip():
+    # 识别失败的页先拿同一页的文本层补回来。原 PDF 有文本层就说明这页
+    # 本来就有文字，只是因为渲染/模型那一侧出了问题才没拿到——直接丢掉等于
+    # 白丢一页正文。补不回来的才计入 failed_pages 告诉用户。
+    unrecovered: list[int] = []
+    for page_no in failed:
+        index = page_no - 1
+        if index < len(text_pages) and text_pages[index].strip():
+            pages[index] = text_pages[index]
+        else:
+            unrecovered.append(page_no)
+
+    usable = [page for page in pages if page.strip()]
+    if not usable:
         return fallback("所有页面都没能识别出来")
 
-    text = _normalize_markdown(markdown)
+    text = _normalize_markdown("\n\n".join(page.strip() for page in usable))
     if not text:
         return fallback("识别结果里没有可用文字")
 
-    # truncated 有两个来源：页数超上限、以及部分页识别失败。
-    # 两者都意味着"这份正文比原文档少了一部分"，必须让调用方知道。
-    truncated = limit < total or bool(failed)
+    # 两个信号分开表达，含义不同：
+    #   truncated    —— 页数超过上限，后半截根本没处理
+    #   failed_pages —— 处理过的页里有几页彻底没拿到内容（中间有洞）
     return Source(kind=SourceKind.document, filename=filename, text=text,
                   span=SourceSpan(page=total) if total else None,
-                  parsed_pages=limit,
-                  truncated=truncated,
+                  parsed_pages=len(usable),
+                  truncated=limit < total,
+                  failed_pages=unrecovered,
                   status="parsed")
 
 

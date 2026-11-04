@@ -37,13 +37,19 @@ class Source(BaseModel):
     span: SourceSpan | None = None
     status: Literal["pending", "parsed", "failed"] = "pending"
     error: str | None = None
-    # 实际解析的页数。与 span.page（整份文档共几页）不是一回事：
-    # 51 页的 PDF 只解析前 50 页时，span.page = 51、parsed_pages = 50。
-    # 只有分页格式（PDF）才有意义，其余留 None。
+    # 实际得到内容的页数。与 span.page（整份文档共几页）不是一回事：
+    # 51 页的 PDF 只处理前 50 页时 span.page = 51、parsed_pages = 50；
+    # 中间有页识别失败时它还会更小。只有分页格式（PDF）才有意义，其余留 None。
     parsed_pages: int | None = None
-    # 是否因 MAX_PAGES 被截断。必须显式告诉调用方——否则用户拿到的是一份
-    # 缺了尾巴的正文，界面却显示"解析成功"，导图会静默漏掉后面的章节。
+    # 是否因 MAX_PAGES 被截断：后半截根本没处理过。
+    # 必须显式告诉调用方——否则用户拿到的是一份缺了尾巴的正文，
+    # 界面却显示"解析成功"，导图会静默漏掉后面的章节。
     truncated: bool = False
+    # 处理过的页里，彻底没拿到内容的页码（1 起）。
+    # 与 truncated 语义不同：那个是"没处理到"，这个是"处理了但中间有洞"。
+    # 两者对用户的含义不一样，合并成一个布尔值会给出自相矛盾的提示
+    # （"共 3 页，仅处理前 3 页"这种）。
+    failed_pages: list[int] = Field(default_factory=list)
 
 
 class SourceUsage(BaseModel):

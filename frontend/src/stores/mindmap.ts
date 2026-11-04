@@ -820,16 +820,32 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const truncateHint = computed(() => {
     const source = uploadSource.value;
-    if (!source?.truncated) return '';
-    const total = source.span?.page;
-    const parsed = source.parsed_pages;
-    if (typeof total === 'number' && typeof parsed === 'number') {
-      return `本文档共 ${total} 页，仅处理前 ${parsed} 页`;
+    if (!source) return '';
+
+    const parts: string[] = [];
+
+    // 中间有洞：处理过但没拿到内容。必须报出具体页码，否则用户对着导图
+    // 找不到那一页的内容也不知道为什么。
+    const failed = source.failed_pages ?? [];
+    if (failed.length > 0) {
+      const shown = failed.slice(0, 5).map(n => `第 ${n} 页`).join('、');
+      const rest = failed.length > 5 ? ` 等 ${failed.length} 页` : '';
+      parts.push(`${shown}${rest} 识别失败，这些页的内容不在导图里`);
     }
-    // 拿不到总页数时也不能让提示消失，否则截断又变回静默行为。
-    return typeof parsed === 'number'
-      ? `文档较长，本次只处理了前 ${parsed} 页`
-      : '文档较长，本次只处理了一部分内容';
+
+    // 缺了尾巴：页数超过上限，后面的根本没处理
+    if (source.truncated) {
+      const total = source.span?.page;
+      const parsed = source.parsed_pages;
+      if (typeof total === 'number' && typeof parsed === 'number') {
+        parts.push(`本文档共 ${total} 页，仅处理前 ${parsed} 页`);
+      } else {
+        // 拿不到总页数时也不能让提示消失，否则截断又变回静默行为。
+        parts.push('文档较长，本次只处理了一部分内容');
+      }
+    }
+
+    return parts.join('；');
   });
 
   let parseTimer: ReturnType<typeof setInterval> | null = null;
