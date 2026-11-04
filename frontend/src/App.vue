@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
+import RecordButton from './components/RecordButton.vue';
 import type { SampleMap } from './dev/samples';
 import { displayBody, useMindMapStore } from './stores/mindmap';
 
@@ -54,8 +55,17 @@ async function onPickFile(event: Event) {
   // 清掉 value：否则再选同一个文件时 change 不会触发，看起来像"点了没反应"。
   input.value = '';
   if (!file) return;
-  // 上传成功同样会整体替换画布上的树，和「生成导图」一样先确认能不能丢掉未保存的修改。
-  if (!confirmDiscard('上传文档生成导图')) return;
+  await submitSource(file, '上传文件生成导图');
+}
+
+/** 录音产出的 File 和用户选的 File 走同一条路径，不另开一套确认与替换逻辑。 */
+async function onRecorded(file: File) {
+  await submitSource(file, '录音生成导图');
+}
+
+/** 上传成功会整体替换画布上的树，和「生成导图」一样先确认能不能丢掉未保存的修改。 */
+async function submitSource(file: File, action: string) {
+  if (!confirmDiscard(action)) return;
   // 解析 + 生成可能几十秒，这期间用户还能改画布。结果回来时如果发现改过，
   // 交给用户决定要不要替换——静默覆盖等于把这段时间的工作丢掉。
   await store.uploadAndGenerate(file, {
@@ -276,9 +286,14 @@ async function copyBody() {
           {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
         </p>
 
+        <RecordButton
+          :disabled="store.uploadBusy || store.busy"
+          @recorded="onRecorded"
+        />
+
         <div class="flex items-center gap-2 text-xs">
           <span class="h-px flex-1 bg-slate-200" />
-          <span class="text-slate-400">或者上传文档</span>
+          <span class="text-slate-400">或者上传文档 / 音频</span>
           <span class="h-px flex-1 bg-slate-200" />
         </div>
 
@@ -290,14 +305,14 @@ async function copyBody() {
             <input
               type="file"
               class="sr-only"
-              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc"
+              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc,.wav"
               :disabled="store.uploadBusy || store.busy"
               @change="onPickFile"
             />
-            {{ store.uploadBusy ? '处理中…' : '选择文件：PDF / Word / PPT / Excel / HTML' }}
+            {{ store.uploadBusy ? '处理中…' : '选择文件：PDF / Word / PPT / Excel / HTML / WAV' }}
           </label>
           <p class="text-xs leading-relaxed text-slate-400">
-            选完自动上传解析，上限 10MB。PDF 逐页识别，扫描件也能读，最多 20 页。
+            选完自动上传解析，文档上限 10MB，WAV 音频上限 20MB。PDF 逐页识别，扫描件也能读，最多 20 页。
           </p>
 
           <p v-if="store.uploadState === 'parsing'" class="text-xs text-slate-600">

@@ -29,6 +29,20 @@ export const HISTORY_LIMIT = 50;
  */
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
+/**
+ * 音频单独一档，对应后端 MAX_AUDIO_BYTES。
+ *
+ * 20MB 约合 11 分钟 16kHz 单声道 WAV。音频比文档占地方得多——60 秒
+ * 就是 1.83MB——沿用 10MB 会让超过 5 分钟的录音传不上去，而用户
+ * 在录音界面上看不出这个上限是从哪来的。
+ */
+export const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
+
+/** 按扩展名挑上限。后端也是这么分的，两边不能各说各话。 */
+function uploadLimitFor(file: File): number {
+  return file.name.toLowerCase().endsWith('.wav') ? MAX_AUDIO_BYTES : MAX_UPLOAD_BYTES;
+}
+
 /** 保存的结果分类：界面据此决定提示什么，而不是把所有失败都说成"保存失败"。 */
 export type SaveResult = 'saved' | 'conflict' | 'invalid' | 'empty' | 'busy' | 'failed';
 
@@ -976,8 +990,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     uploadSource.value = null;
     parseSeconds.value = 0;
 
-    if (file.size > MAX_UPLOAD_BYTES) {
-      uploadError.value = `「${file.name}」超过 10MB 上限，请压缩或拆分后再上传。`;
+    const limit = uploadLimitFor(file);
+    if (file.size > limit) {
+      const label = limit >= MAX_AUDIO_BYTES ? '20MB' : '10MB';
+      uploadError.value = `「${file.name}」超过 ${label} 上限，请压缩或拆分后再上传。`;
       status.value = uploadError.value;
       return;
     }
