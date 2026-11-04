@@ -1,5 +1,10 @@
+import { createPinia } from 'pinia';
 import { createApp } from 'vue';
-import App from './App.vue';
-import './styles.css';
 
-createApp(App).mount('#app');
+import '@vue-flow/core/dist/style.css';
+import '@vue-flow/core/dist/theme-default.css';
+
+import './styles.css';
+import App from './App.vue';
+
+createApp(App).use(createPinia()).mount('#app');

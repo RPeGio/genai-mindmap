@@ -78,7 +78,13 @@ free -h
 
 ## D4（11/5–11/6）Vue 前端重建 + 画布
 
-> 状态（2026-11-02 更新）：**R1 已完成并已接上流式生成**——Vue 3 + TS + Vite + Tailwind 骨架、`src/api/client.ts`（含 `generateMindMapStream` 流式封装与 SSE 解析）、`src/api/types.ts`、层级预览、5 个 vitest 用例；`npm test` 与 `npm run build` 均通过。**R2（画布）与 R3（编辑/撤销/保存）未做**；`pinia`、`@vue-flow/*` 尚未安装，进 R2 时再装，避免留未用依赖。
+> 状态（2026-11-04 更新）：**R1、R2、R3 已完成**。
+> R1：Vue 3 + TS + Vite + Tailwind 骨架、`src/api/client.ts`（`generateMindMapStream` 流式封装与 SSE 解析）、`src/api/types.ts`。
+> R2：`@vue-flow/core` 画布（`src/canvas/MindMapCanvas.vue`、`src/canvas/MindNode.vue`）、自研紧凑树布局（`src/canvas/layout/tidy.ts`，支持向右 / 向左 / 向下 / 双向）、Pinia store（`src/stores/mindmap.ts`）、三栏界面（输入 / 画布 / 节点详情）、截断文字的悬停卡片与详情面板。
+> R3：`src/mindmap/edits.ts`（改名 / 加子节点 / 加兄弟 / 删子树 / 提交前校验）、双击内联编辑、Tab/Enter/Delete 建树、撤销重做（整树快照 50 步）、保存（首次 POST、之后 PUT 带 `version`，409 三选弹层）、打开列表与新建、Ctrl+S 与 `beforeunload` 保护。
+> 81 个 vitest 用例（9 个文件：纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 真实画布挂载）；`npm test` 与 `npm run build` 均通过。
+> **R3 未做**：拖拽调结构（W3）、自动保存、v2 的 layout/theme、导出。
+> 依赖已装 `pinia`、`@vue-flow/core`、`@vue-flow/background`；未装 `@vue-flow/controls`、minimap、dagre。
 
 ```powershell
 cd frontend
@@ -120,9 +126,9 @@ npm i @vue-flow/core @vue-flow/background @vue-flow/controls
 - `docs/ARCHITECTURE.md`：React Flow → Vue Flow；补 v2 契约与 PG。
 - `docs/API.md`、`docs/FLOW.md`：新增任务/SSE/认证接口。
 - `START_HERE.md` / `TEAM-GUIDE.md`：目录结构与启动命令更新（含 Docker 路线）。
-- 两人联调：真实模型 + 画布 + 保存，跑 PLAN 第 4 节 W1 验收门。
+- RPeGio 与陈嘉涛联调：真实模型 + 画布 + 保存，跑 PLAN 第 4 节 W1 验收门。
 
-**DoD**：新人按 `START_HERE.md` 从零能跑起来（你们互相按文档走一遍，不许口头补充）。
+**DoD**：新人按 `START_HERE.md` 从零能跑起来（RPeGio 与陈嘉涛各自按文档走一遍，不许口头补充）。
 
 ## 周检查表（周五 20:00）
 
@@ -131,4 +137,4 @@ npm i @vue-flow/core @vue-flow/background @vue-flow/controls
 - [ ] 流式 SSE 首节点 < 2s、整棵树 < 4s，截图存证
 - [ ] 画布可编辑、可保存、可撤销
 - [x] 旧 React 前端已打 tag；四份文档已按 Vue 现状同步（2026-11-02）
-- [ ] 双方各交一篇「讲解稿」，互讲 30 分钟，勾掉 20 题中已覆盖的
+- [ ] RPeGio 与陈嘉涛各交一篇「讲解稿」，互讲 30 分钟，勾掉 20 题中已覆盖的

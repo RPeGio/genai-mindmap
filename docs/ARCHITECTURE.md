@@ -31,11 +31,11 @@ flowchart LR
 
 | 模块 | 当前代码 / 计划位置 | 输入 → 输出 | 职责 |
 |---|---|---|---|
-| 导图编辑 | `frontend/src/App.vue`、`frontend/src/api/client.ts` | 导图 JSON → 修改后的 JSON | 当前是输入 + 层级预览；R2 接入 `@vue-flow/core` 画布与自研 tidy-tree 布局，编辑/撤销/保存放 R3。 |
+| 导图编辑 | `frontend/src/App.vue`、`frontend/src/canvas/`、`frontend/src/stores/mindmap.ts` | 导图 JSON → 修改后的 JSON | R2 已接入 `@vue-flow/core` 画布与自研 tidy-tree 布局（只读：平移 / 缩放 / 点选节点看全文）；编辑、撤销、保存放 R3。 |
 | 导图管理 | `backend/app/mindmaps/` | 导图 JSON + 版本 → 保存记录 | 当前 SQLite 本地存储；后续 PostgreSQL、用户权限、历史版本。 |
 | 生成与模型适配 | `backend/app/generation/` | 文本 → 导图 JSON | 演示适配器和基础模型适配；后续接入生成任务、提示词管理和重试策略。 |
 | 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 当前后端仍是 v1 契约（`docs/API.md`）；v2 已冻结候选、待 D2 落地，届时前端类型由 `openapi-typescript` 生成，不再手写。 |
-| 多模态输入（部分实现） | `backend/app/ingestion/` | 文本 → 来源；其他输入待实现 | JSON 文本和 Markdown 可用；文件上传、识别及来源定位待实现。 |
+| 多模态输入（部分实现） | `backend/app/ingestion/` | 文本 / 文档文件 → 来源；图片与语音待实现 | JSON 文本、Markdown 与文档上传（Docling，PDF/DOCX/PPTX/XLSX/HTML）可用；图片与语音仍待实现。 |
 | 知识增强（待实现） | `backend/app/knowledge/` | 文档 → 分块/向量；问题 → 有来源片段 | 当前只有明确标识为未实现的检索桩；真实知识库与引用待开发。 |
 | 逻辑优化（部分实现） | `backend/app/optimization/` | 当前导图 → 结构提示 | 单子节点、深度上限、同级重复提示可用；语义纠错等待实现。 |
 | AI 代理（待实现） | `backend/app/agent/` | 目标/协作内容 → 带依据的方案或建议 | 当前只返回固定阶段桩；多步骤规划等能力待实现。 |
@@ -56,8 +56,8 @@ flowchart LR
 ## 技术选择及来源
 
 - **Vue 3 + TypeScript、FastAPI + Pydantic**：申报书原定 React 前端，实际改为 Vue 生态——负责前端的人只有 Vue 实战经验，而考核要求"必须能讲清代码逻辑"，自己写比沿用不熟的骨架更可靠；旧 React 骨架打 tag `v0.1.0-react-scaffold` 存档。开源项目 [ultra-mindmap](https://github.com/Anionex/ultra-mindmap) 展示了 FastAPI + 前端框架 + 模型生成导图的思路，仅作参考。
-- **Vue Flow（R2 接入）**：`@vue-flow/core` 负责节点与连线交互（参见 [xyflow/xyflow](https://github.com/xyflow/xyflow)），节点坐标由自研 tidy-tree 布局计算，不引入 dagre——2C2G 上少一个依赖比省几行代码重要。
-- **Docling（候选，未接入）**：支持 PDF、DOCX、PPTX 等统一处理，参见 [支持格式](https://github.com/docling-project/docling/blob/main/docs/usage/supported_formats.md)。运行成本、复杂排版及识别质量需实际测试，也可先使用轻量解析器。
+- **Vue Flow（已接入，R2）**：`@vue-flow/core` 负责节点与连线交互（参见 [xyflow/xyflow](https://github.com/xyflow/xyflow)），节点坐标由自研 tidy-tree 布局计算，不引入 dagre——2C2G 上少一个依赖比省几行代码重要。
+- **Docling（已接入）**：支持 PDF、DOCX、PPTX 等统一处理，参见 [支持格式](https://github.com/docling-project/docling/blob/main/docs/usage/supported_formats.md)。PDF 首次解析需联网下载版面模型并缓存到 `~/.cache/docling/models`，离线缺缓存时返回 422 并说明预置方法。
 - **PostgreSQL + pgvector（规划）**：PostgreSQL 保存业务数据，pgvector 实现向量检索；参见 [pgvector](https://github.com/pgvector/pgvector)。当前存储仅为 SQLite，没有 PostgreSQL 或向量检索实现。
 - **Yjs + y-websocket（规划）**：Yjs 提供共享数据类型，y-websocket 是其 WebSocket 连接方案；参见 [Yjs](https://github.com/yjs/yjs)、[y-websocket](https://github.com/yjs/y-websocket)。需要额外实现用户权限、房间授权、持久化、恢复和数据格式映射。
 - **PUML（部分实现）**：后端已提供导图转 PUML 文本的接口，前端只做下载，不在浏览器渲染。`plantuml-encoder` 输出的是 URL 片段、真正出图需要 JVM 服务，`viz.js` 只认 DOT 语法，两者都不引入（论证见 [增量附录](ARCHITECTURE_ADDENDUM.md)）。

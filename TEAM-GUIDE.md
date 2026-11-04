@@ -68,7 +68,9 @@ npm test
 npm run build
 ```
 
-当前基线：后端 50 个测试（pytest）、前端 5 个 vitest 用例，全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线：后端 54 个测试（pytest）、前端 81 个 vitest 用例（9 个文件），全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+
+开发服务器左上角有一排「布局示例」按钮（单节点 / 向右 / 向左 / 向下 / 双向）：点一下就能不经过后端装载一份示例导图，用来肉眼检查布局与文本截断。数据在 `frontend/src/dev/samples.ts`，只在 `npm run dev` 下按需加载，生产构建里不进包。
 
 `unittest` 默认可能将进度输出到 stderr；这本身不代表失败。请同时检查最后的 `OK` 和 `$LASTEXITCODE`，测试成功时退出码应为 0。
 
@@ -92,22 +94,29 @@ backend/
     agent/             AI 代理                    （桩）
     export/            导出 puml                  （puml 可用）
     mindmaps/          保存 / 读取 / 版本冲突     （可用）
-  tests/               50 个测试
+  tests/               54 个测试
 frontend/
   src/
-    App.vue            工作台（输入 + 层级预览；画布 R2 接入）
-    main.ts            入口
+    App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层）
+    main.ts            入口（挂 Pinia 与 Vue Flow 样式）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（目前只接了 /api/generations）
-    api/types.ts       与后端契约 v1 对应的 TS 类型
-  tests/app.spec.ts    5 个 vitest 用例
+    api/client.ts      fetch 封装 + ApiError（生成 2 个、导图 CRUD 4 个）
+    api/types.ts       与后端契约 v1 对应的 TS 类型（`note` 为 v2 预留）
+    canvas/MindMapCanvas.vue  Vue Flow 容器：平移 / 缩放 / 点选 / 键盘建树
+    canvas/MindNode.vue       自定义节点：截断 + 悬停看全文 + 内联编辑
+    canvas/layout/tidy.ts     自研紧凑树布局（向右 / 向左 / 向下 / 双向）
+    mindmap/edits.ts   纯函数：改名 / 加子节点 / 加兄弟 / 删子树 / 提交前校验
+    stores/mindmap.ts   Pinia：内容、布局、选中、编辑、撤销重做、保存状态
+    dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
+  tests/               81 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
   ARCHITECTURE.md      模块边界、技术选型及来源
   ARCHITECTURE_ADDENDUM.md  存储迁移、SSE 协议、流水线细节
-  PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q34）
+  PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q36）
   CONTRACT_V2.md       目标契约（尚未落地，后端仍是 v1）
+  HANDOFF.md           需要对方知悉或确认的跨人决策（待确认 / 已确认）
   W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
 START_HERE.md          原始的骨架说明
@@ -158,12 +167,12 @@ PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
 
 ---
 
-## 6 两人分工
+## 6 RPeGio 与陈嘉涛的分工
 
 按 `docs/FEATURES_AND_OWNERS.md` 的 F 编号划分，具体见 `docs/PLAN.md` 第 11 节 Q31：
 
-- **A（我）**：契约与前端（Vue 画布、布局、主题、导出、协作客户端）、部署基建、CI。
-- **B（队友）**：后端地基、生成链路、多模态解析、RAG 与诊断、AI 代理、评估集。
+- **A（RPeGio）**：契约与前端（Vue 画布、布局、主题、导出、协作客户端）、部署基建、CI。
+- **B（陈嘉涛）**：后端地基、生成链路、多模态解析、RAG 与诊断、AI 代理、评估集。
 
 W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W2 起交叉 review。
 
@@ -188,7 +197,9 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 - **两个上限不一致**：`/api/ingestion/text` 允许 10000 字，但 `/api/pipeline/generate` 合并后限 8000 字。9000 字的文本能存成 Source，却进不了流水线。要统一的话改 `MAX_INPUT_CHARS` 或 contract 里的 `max_length`。
 - **导出用根节点文字，不是标题**：`export/puml` 取的是 `root.label`。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
 - **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得等 SSE 或任务化改造。
-- **前端只接了生成接口**：`src/api/client.ts` 目前只有 `generateMindMap`（`POST /api/generations`），list / get / create / update / pipeline / optimization / export 都还没封装，R2–R3 补齐。
+- **前端只封了生成与导图 CRUD**：`src/api/client.ts` 有 `generateMindMap` / `generateMindMapStream`、`listMindMaps` / `getMindMap` / `createMindMap` / `updateMindMap`；pipeline / optimization / export / ingestion 尚未封装。
+- **编辑不记协作方**：保存以整棵树为单位（`version` 乐观锁），没有字段级合并；两个人同时编辑同一张图，后保存的会拿到 409，只能选择覆盖（重新加载）或另存为新导图。
+- **撤销栈只在内存**：刷新页面后撤销历史清空，最多 50 步；保存不写历史。
 - **当前没有登录和权限**：所有接口裸奔，只能在本机跑，不要往公网放。
 
 ---
@@ -198,8 +209,8 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 如果只有一个人有余力，按这个顺序：
 
 1. 让真实模型跑通一条完整链路（目前只在 demo 模式验证过，真实密钥环境没验收）。
-2. 层级预览换成 `@vue-flow/core` 画布（R2，这是"看起来像产品"的关键）。
-3. PDF / Word / PPT 解析（第二个可演示入口）。
+2. 前端画布与编辑已可用（R2 只读画布、R3 编辑 / 撤销 / 保存 / 打开）；下一步是拖拽调结构、v2 的 layout/theme 与导出（W3）。
+3. PDF / Word / PPT 解析已接入（Docling），补页码与节点级来源引用。
 4. 其余按 `FEATURES_AND_OWNERS.md` 的 F 编号推进，范围取舍以 `docs/PLAN.md` 第 2 节为准。
 
-别急着上 Celery、Redis、Milvus 这些东西。当前是单进程同步架构，两人团队把时间花在功能上比花在运维上划算得多。
+别急着上 Celery、Redis、Milvus 这些东西。当前是单进程同步架构，RPeGio 与陈嘉涛的时间花在功能上比花在运维上划算得多。

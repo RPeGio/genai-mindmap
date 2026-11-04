@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main, dev]
+  # PR 的 base 不限：拆成多个叠起来的分支时（如 R3 叠在 R2 上），
+  # 目标分支不是 dev 也要有检查结果，否则那个 PR 没有 CI 可看。
   pull_request:
-    branches: [main, dev]
   workflow_dispatch:
 
 concurrency:

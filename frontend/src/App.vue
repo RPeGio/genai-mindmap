@@ -1,247 +1,418 @@
-﻿<script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue';
-import { ApiError, generateMindMapStream } from './api/client';
-import type { MindMapContent, MindNode } from './api/types';
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+
+import MindMapCanvas from './canvas/MindMapCanvas.vue';
+import type { Direction } from './canvas/layout/tidy';
+import type { SampleMap } from './dev/samples';
+import { displayBody, useMindMapStore } from './stores/mindmap';
+
+const store = useMindMapStore();
 
 const prompt = ref('');
-const content = ref<MindMapContent | null>(null);
-const mode = ref<'demo' | 'model' | null>(null);
-const busy = ref(false);
-const status = ref('输入主题或文本后生成，节点会边生成边出现。');
-/** 当前阶段文案 + 已等待秒数，避免长时间没有反馈时界面看起来像卡死。 */
-const stageText = ref('');
-const waitedMs = ref(0);
+const copied = ref('');
 
-let controller: AbortController | null = null;
+// 开发期示例选择器：只在 dev 服务器下加载，生产构建里这段会被整体去掉。
+const samples = ref<{ id: string; label: string }[]>([]);
+let sampleMaps: SampleMap[] = [];
 
-interface Row {
-  id: string;
-  label: string;
-  depth: number;
+if (import.meta.env.DEV) {
+  void import('./dev/samples').then(mod => {
+    sampleMaps = mod.SAMPLE_MAPS;
+    samples.value = mod.SAMPLE_MAPS.map(({ id, label }) => ({ id, label }));
+    // 方便复现与截图：地址栏加 ?sample=down 就直接装那个示例。
+    const wanted = new URLSearchParams(window.location.search).get('sample');
+    const initial = sampleMaps.find(item => item.id === wanted);
+    if (initial) store.preview(initial.content, initial.direction);
+  });
 }
 
-/** R1/R2 先用扁平列表验证链路；画布在 R3 接入。 */
-const rows = computed<Row[]>(() => {
-  const out: Row[] = [];
-  const walk = (node: MindNode, depth: number) => {
-    out.push({ id: node.id, label: node.label, depth });
-    node.children.forEach((child) => walk(child, depth + 1));
-  };
-  if (content.value) walk(content.value.root, 0);
-  return out;
-});
-
-const nodeCount = computed(() => rows.value.length);
-
-/**
- * 把增量节点合并进当前树。
- * 同一个 id 会反复到达（文字逐渐变长），所以已存在时更新文字、保留其子节点。
- */
-function upsert(node: MindNode, parentId: string, incoming: MindNode): MindNode {
-  if (node.id === parentId) {
-    const idx = node.children.findIndex(c => c.id === incoming.id);
-    const children = idx >= 0
-      ? node.children.map((c, i) => (i === idx ? { ...incoming, children: c.children } : c))
-      : [...node.children, incoming];
-    return { ...node, children };
-  }
-  return { ...node, children: node.children.map(c => upsert(c, parentId, incoming)) };
+function loadSample(id: string) {
+  const found = sampleMaps.find(item => item.id === id);
+  if (found) store.preview(found.content, found.direction);
 }
 
-function applyNode(parentId: string | null, incoming: MindNode) {
-  if (!content.value) {
-    content.value = { title: incoming.label, root: incoming };
-    return;
-  }
-  const root = content.value.root;
-  if (parentId === null) {
-    content.value = { ...content.value, root: { ...incoming, children: root.children } };
-  } else {
-    content.value = { ...content.value, root: upsert(root, parentId, incoming) };
-  }
-}
+const directions: { value: Direction; label: string }[] = [
+  { value: 'right', label: '向右' },
+  { value: 'left', label: '向左' },
+  { value: 'down', label: '向下' },
+  { value: 'both', label: '双向' },
+];
+
+const selected = computed(() => store.selectedNode);
+const pathText = computed(() => store.breadcrumb.map(node => node.label.trim()).join(' / '));
 
 async function generate() {
-  const text = prompt.value.trim();
-  if (!text) {
-    status.value = '请输入主题或文本。';
-    return;
+  // 生成会替换整棵树（并清掉 mapId，避免之后保存覆盖上一张图），先确认不丢未保存的修改。
+  if (!confirmDiscard('重新生成')) return;
+  await store.generate(prompt.value);
+}
+
+/** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
+const saveHint = computed(() => {
+  if (store.saving) return '保存中…';
+  if (!store.content) return '';
+  if (store.dirty) return '有未保存的修改';
+  return store.savedAt ? '已保存' : '';
+});
+
+function saveNow() {
+  void store.save();
+}
+
+/** 打开/新建都会丢掉当前这张图上的未保存修改，先问一句。 */
+function confirmDiscard(action: string): boolean {
+  if (!store.dirty) return true;
+  return window.confirm(`当前有未保存的修改，${action}会丢掉这些修改，继续？`);
+}
+
+function newMap() {
+  if (!confirmDiscard('新建导图')) return;
+  store.newMap();
+}
+
+async function openSaved(id: string) {
+  if (!confirmDiscard('打开另一张导图')) return;
+  await store.openMap(id);
+}
+
+function formatTime(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false });
+}
+
+/** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
+function onKeydown(event: KeyboardEvent) {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    saveNow();
   }
-  if (busy.value) return;
+}
 
-  // 先把上一份结果存起来：新请求失败时恢复它，而不是让用户白等一场还丢了旧图。
-  const previous = content.value;
-  const previousMode = mode.value;
+/** 有未保存的修改时，关标签页/刷新要弹浏览器自己的确认框。 */
+function onBeforeUnload(event: BeforeUnloadEvent) {
+  if (!store.dirty) return;
+  event.preventDefault();
+  event.returnValue = '';
+}
 
-  busy.value = true;
-  waitedMs.value = 0;
-  stageText.value = '正在连接';
-  content.value = null;
-  mode.value = null;
-  const ctrl = new AbortController();
-  controller = ctrl;
-  // settled 表示这次请求已经有了明确结局（成功或明确失败）；
-  // 只有「既没 done 也没 error」才说明连接是被掐断的。
-  let settled = false;
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown);
+  window.addEventListener('beforeunload', onBeforeUnload);
+});
 
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown);
+  window.removeEventListener('beforeunload', onBeforeUnload);
+});
+
+/** 标题用 change 提交（失焦或回车时），不在每次按键上都记一步撤销。 */
+function commitTitle(event: Event) {
+  store.renameTitle((event.target as HTMLInputElement).value);
+}
+
+async function copyBody() {
+  const node = selected.value?.node;
+  if (!node) return;
   try {
-    await generateMindMapStream(text, (event) => {
-      switch (event.type) {
-        case 'stage':
-          stageText.value = event.detail;
-          break;
-        case 'skeleton':
-          // 只有 demo 模式会发这个事件：它一次性给出整棵树，不走增量推送。
-          content.value = event.content;
-          break;
-        case 'node':
-          // 增量方案：节点一个个长出来，同一 id 的文字会越补越全。
-          applyNode(event.parentId, event.node as MindNode);
-          stageText.value = '节点生成中';
-          status.value = '正在生成，节点会陆续出现…';
-          break;
-        case 'heartbeat':
-          waitedMs.value = Math.round(event.waitedMs / 1000);
-          break;
-        case 'done':
-          settled = true;
-          content.value = event.content;
-          mode.value = event.mode;
-          status.value = event.mode === 'demo'
-            ? '这是固定结构的演示数据，不是 AI 生成。'
-            : `模型已生成候选导图，用时 ${(event.latencyMs / 1000).toFixed(1)} 秒。`;
-          stageText.value = '';
-          break;
-        case 'error':
-          settled = true;
-          // 后端在流里报错时，之前那份导图同样要还回来，不能只留一个空画布。
-          content.value = previous;
-          mode.value = previousMode;
-                  status.value = event.message;
-          stageText.value = '';
-          break;
-      }
-    }, ctrl.signal);
-    // 已经被后来的请求接管：这个旧请求无论成功、失败还是被取消，
-    // 都不许再改画面和状态，否则新请求的预览会被旧导图替换。
-    if (controller !== null && controller !== ctrl) return;
-    if (ctrl.signal.aborted) {
-      // 主动取消：把画面退回取消前的样子，而不是留下一堆半截节点。
-      content.value = previous;
-      mode.value = previousMode;
-      status.value = '已取消。';
-    } else if (!settled) {
-      // 流正常结束但没有 done 帧：中途断了，不能假装成功。
-      content.value = previous;
-      mode.value = previousMode;
-      status.value = '连接中断，结果可能不完整，请重试。';
-    }
-  } catch (error) {
-    // 已经被后来的请求接管：旧请求的错误不许再改画面和状态，
-    // 否则会出现「新请求的预览被旧导图替换、状态显示已取消」这种鬼现象。
-    if (controller !== null && controller !== ctrl) return;
-    content.value = previous;
-    mode.value = previousMode;
-    status.value = ctrl.signal.aborted
-      ? '已取消。'
-      : error instanceof ApiError
-        ? error.message
-        : '生成失败，请重试。';
-    stageText.value = '';
-  } finally {
-    // 取消后立刻重新生成时，旧请求的收尾不能把新请求的状态清掉，
-    // 否则「取消」按钮会突然消失、busy 被打回 false。
-    if (controller === ctrl) {
-      busy.value = false;
-      controller = null;
-    }
+    await navigator.clipboard.writeText(displayBody(node));
+    copied.value = '已复制';
+  } catch {
+    // 非 HTTPS 或浏览器拒绝剪贴板权限时只能提示，不能假装成功。
+    copied.value = '复制失败，请手动选择文字';
   }
+  setTimeout(() => {
+    copied.value = '';
+  }, 2000);
 }
-
-function cancel() {
-  const active = controller;
-  controller = null;
-  active?.abort();
-  busy.value = false;
-  stageText.value = '';
-  status.value = '已取消。';
-}
-
-onBeforeUnmount(() => controller?.abort());
 </script>
 
 <template>
-  <div class="flex h-full flex-col">
-    <header class="border-b border-slate-200 px-6 py-4">
-      <h1 class="text-lg font-semibold">生成式 AI 思维导图</h1>
-      <p class="text-sm text-slate-500">文本 → 思维导图（画布编辑为 R3 目标）</p>
+  <div class="flex h-full w-full flex-col bg-slate-50 text-slate-900">
+    <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-2">
+      <div class="flex items-center gap-3">
+        <h1 class="text-sm font-semibold">生成式 AI 思维导图</h1>
+        <div v-if="samples.length" class="flex items-center gap-1 text-xs text-slate-500">
+          <span class="mr-1">布局示例</span>
+          <button
+            v-for="item in samples"
+            :key="item.id"
+            type="button"
+            class="rounded border border-slate-200 px-2 py-0.5 hover:bg-slate-100"
+            @click="loadSample(item.id)"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+      </div>
+      <div class="flex items-center gap-3 text-xs text-slate-500">
+        <span v-if="saveHint" :class="store.dirty ? 'text-amber-600' : 'text-slate-400'">
+          {{ saveHint }}
+        </span>
+        <button
+          type="button"
+          class="rounded-md bg-slate-900 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+          :disabled="!store.content || store.saving"
+          title="保存（Ctrl+S）"
+          @click="saveNow"
+        >
+          保存
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 disabled:opacity-40"
+          :disabled="store.listBusy"
+          @click="store.openList()"
+        >
+          打开
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700"
+          @click="newMap"
+        >
+          新建
+        </button>
+        <p>
+          <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
+            演示模式（非 AI 生成）
+          </span>
+          <span v-else-if="store.mode === 'model'" class="rounded bg-emerald-100 px-2 py-0.5 text-emerald-700">
+            模型生成
+          </span>
+          <span v-else-if="store.mode === 'saved'" class="rounded bg-slate-100 px-2 py-0.5 text-slate-600">
+            已保存导图
+          </span>
+          <span v-else>未生成</span>
+          <span class="ml-3">{{ store.nodeCount }} 个节点</span>
+        </p>
+      </div>
     </header>
 
-    <div class="flex min-h-0 flex-1">
-      <aside class="w-96 shrink-0 overflow-y-auto border-r border-slate-200 p-6">
-        <label for="prompt" class="mb-2 block text-sm font-medium">主题或文本</label>
+    <main class="flex min-h-0 flex-1">
+      <section class="flex w-80 shrink-0 flex-col gap-3 border-r border-slate-200 bg-white p-4">
+        <div class="flex flex-col gap-1">
+          <label for="title" class="text-xs font-medium text-slate-600">导图标题</label>
+          <input
+            v-if="store.content"
+            id="title"
+            :value="store.content.title"
+            class="rounded-md border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-slate-500"
+            @change="commitTitle"
+          />
+          <p v-else class="text-xs text-slate-400">生成或新建之后可以改标题</p>
+        </div>
+
+        <label for="prompt" class="text-xs font-medium text-slate-600">输入主题或文本</label>
         <textarea
           id="prompt"
           v-model="prompt"
-          :disabled="busy"
-          maxlength="10000"
-          rows="10"
-          placeholder="例如：整理机器学习的主要方向"
-          class="w-full resize-y rounded border border-slate-300 p-2 text-sm disabled:bg-slate-100"
+          rows="6"
+          class="resize-none rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500"
+          placeholder="例如：机器学习的主要方向"
         />
-        <div class="mt-3 flex gap-2">
+        <div class="flex gap-2">
           <button
             type="button"
-            :disabled="busy"
-            class="flex-1 rounded bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-50"
+            class="flex-1 rounded-md bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+            :disabled="store.busy"
             @click="generate"
           >
-            {{ busy ? '生成中…' : '生成导图' }}
+            {{ store.busy ? '生成中…' : '生成导图' }}
           </button>
           <button
-            v-if="busy"
+            v-if="store.busy"
             type="button"
-            class="rounded border border-slate-300 px-3 py-2 text-sm"
-            @click="cancel"
+            class="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700"
+            @click="store.cancel()"
           >
             取消
           </button>
         </div>
-
-        <p class="mt-3 text-sm text-slate-600" role="status">{{ status }}</p>
-
-        <!-- 等待期间给出内容级进度，而不是一个假的百分比条 -->
-        <div v-if="busy && stageText" class="mt-2 rounded bg-slate-50 px-3 py-2 text-xs text-slate-500">
-          <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
-          <span class="ml-2">{{ stageText }}</span>
-          <span v-if="waitedMs > 0" class="ml-1 text-slate-400">已等待 {{ waitedMs }} 秒</span>
-        </div>
-      </aside>
-
-      <main class="min-w-0 flex-1 overflow-auto p-6">
-        <div v-if="content" class="space-y-3">
-          <div class="flex items-baseline gap-3">
-            <h2 class="text-base font-semibold">{{ content.title }}</h2>
-            <span v-if="mode" class="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
-              {{ mode === 'demo' ? '演示模式' : '模型生成' }}
-            </span>
-            <span class="text-xs text-slate-400">{{ nodeCount }} 个节点</span>
-          </div>
-          <ul class="text-sm">
-            <li
-              v-for="row in rows"
-              :key="row.id"
-              class="py-0.5"
-              :style="{ paddingLeft: `${row.depth * 1.25}rem` }"
-            >
-              {{ row.label }}
-            </li>
-          </ul>
-        </div>
-        <p v-else class="text-sm text-slate-400">
-          {{ busy ? '正在生成，稍候…' : '还没有导图，先在左侧输入内容。' }}
+        <p role="status" class="text-xs leading-relaxed text-slate-500">
+          {{ store.status }}
         </p>
-      </main>
+        <p v-if="store.stageText" class="text-xs text-slate-400">
+          {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
+        </p>
+        <p class="mt-auto text-xs leading-relaxed text-slate-400">
+          双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销、Ctrl+Shift+Z 重做。
+        </p>
+      </section>
+
+      <section class="relative min-w-0 flex-1">
+        <div class="absolute left-4 top-4 z-10 flex gap-1 rounded-md border border-slate-200 bg-white p-1 shadow-sm">
+          <button
+            v-for="item in directions"
+            :key="item.value"
+            type="button"
+            class="rounded px-2 py-1 text-xs"
+            :class="store.direction === item.value ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'"
+            @click="store.setDirection(item.value)"
+          >
+            {{ item.label }}
+          </button>
+          <span class="mx-1 w-px bg-slate-200" />
+          <button
+            type="button"
+            class="rounded px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="!store.canUndo"
+            title="撤销（Ctrl+Z）"
+            @click="store.undo()"
+          >
+            撤销
+          </button>
+          <button
+            type="button"
+            class="rounded px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="!store.canRedo"
+            title="重做（Ctrl+Shift+Z）"
+            @click="store.redo()"
+          >
+            重做
+          </button>
+        </div>
+        <MindMapCanvas />
+      </section>
+
+      <aside class="flex w-80 shrink-0 flex-col gap-3 border-l border-slate-200 bg-white p-4">
+        <template v-if="selected">
+          <p class="text-xs text-slate-400">{{ pathText }}</p>
+          <h2 class="text-sm font-semibold">
+            {{ selected.node.label.trim() }}
+          </h2>
+          <p class="flex-1 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
+            {{ displayBody(selected.node) }}
+          </p>
+          <div class="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+              @click="store.beginEdit(selected.node.id)"
+            >
+              改文字（F2）
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+              @click="store.addChildTo(selected.node.id)"
+            >
+              加子节点（Tab）
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+              @click="store.addSiblingTo(selected.node.id)"
+            >
+              加兄弟（Enter）
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+              :disabled="selected.node.id === store.content?.root.id"
+              @click="store.deleteNode(selected.node.id)"
+            >
+              删除（Delete）
+            </button>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700"
+              @click="copyBody"
+            >
+              复制全文
+            </button>
+            <span class="text-xs text-slate-400">{{ copied }}</span>
+          </div>
+        </template>
+        <template v-else>
+          <h2 class="text-sm font-semibold">节点详情</h2>
+          <p class="text-xs leading-relaxed text-slate-500">
+            点击画布上的任意节点查看完整内容与它所在的层级路径；双击节点可以直接改文字。
+          </p>
+        </template>
+      </aside>
+    </main>
+
+    <div
+      v-if="store.listOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="list-title"
+    >
+      <div class="flex max-h-[70vh] w-full max-w-lg flex-col rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+        <div class="flex items-center justify-between">
+          <h2 id="list-title" class="text-sm font-semibold">已保存的导图</h2>
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="store.closeList()">
+            关闭
+          </button>
+        </div>
+        <p v-if="store.listBusy" class="mt-3 text-xs text-slate-400">正在读取…</p>
+        <p v-else-if="store.maps.length === 0" class="mt-3 text-xs text-slate-400">
+          还没有保存过任何导图。
+        </p>
+        <ul v-else class="mt-3 flex-1 divide-y divide-slate-100 overflow-y-auto">
+          <li
+            v-for="item in store.maps"
+            :key="item.id"
+            class="flex items-center justify-between gap-3 py-2"
+          >
+            <div class="min-w-0">
+              <p class="truncate text-sm text-slate-800">{{ item.content.title }}</p>
+              <p class="text-xs text-slate-400">
+                版本 {{ item.version }} · {{ item.content.root.children.length }} 个一级分支 ·
+                {{ formatTime(item.updated_at) }}
+              </p>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 rounded-md border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              @click="openSaved(item.id)"
+            >
+              打开
+            </button>
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <div
+      v-if="store.conflict"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="conflict-title"
+    >
+      <div class="w-full max-w-md rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+        <h2 id="conflict-title" class="text-sm font-semibold">保存冲突</h2>
+        <p class="mt-2 text-xs leading-relaxed text-slate-600">
+          这张导图在别处被改过（{{ store.conflict.message }}）。你本地的修改还没有保存，选择怎么处理：
+        </p>
+        <div class="mt-4 flex flex-col gap-2">
+          <button
+            type="button"
+            class="rounded-md border border-slate-300 px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-50"
+            @click="store.reloadFromServer()"
+          >
+            放弃本地修改，加载服务端最新版本
+          </button>
+          <button
+            type="button"
+            class="rounded-md border border-slate-300 px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-50"
+            @click="store.saveAsNew()"
+          >
+            保留本地修改，另存为新导图
+          </button>
+          <button
+            type="button"
+            class="rounded-md px-3 py-2 text-left text-xs text-slate-500 hover:bg-slate-50"
+            @click="store.dismissConflict()"
+          >
+            取消，稍后再说
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>

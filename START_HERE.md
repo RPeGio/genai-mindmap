@@ -1,13 +1,13 @@
 # 项目开发骨架使用说明
 
-本目录是在原申报书和 README 基础上搭建的开发起点。**已实现的是最小文本演示闭环，不是项目书全部功能的完成品**。完整功能、责任人、验收方式和实现状态见 [功能清单与分工](docs/FEATURES_AND_OWNERS.md)，系统设计见 [系统架构](docs/ARCHITECTURE.md)，里程碑与工程门见 [项目执行计划](docs/PLAN.md)，目标契约见 [CONTRACT_V2](docs/CONTRACT_V2.md)（**尚未落地，后端仍是 v1**）。
+本目录是在原申报书和 README 基础上搭建的开发起点。**已实现的是最小文本演示闭环，不是项目书全部功能的完成品**。完整功能、责任人、验收方式和实现状态见 [功能清单与分工](docs/FEATURES_AND_OWNERS.md)，系统设计见 [系统架构](docs/ARCHITECTURE.md)，里程碑与工程门见 [项目执行计划](docs/PLAN.md)，目标契约见 [CONTRACT_V2](docs/CONTRACT_V2.md)（**尚未落地，后端仍是 v1**），需要双方确认的跨人决策见 [交接文档](docs/HANDOFF.md)。
 
 ## 当前可运行范围
 
-- 前端 Vue 3 + TypeScript：输入文字、按层级预览节点、生成候选导图；画布、编辑、保存及撤销/重做在 W1 R2–R3 接入（旧 React 骨架已打 tag `v0.1.0-react-scaffold` 存档）。
-- 后端 FastAPI：生成接口、结构校验、SQLite 保存和读取、版本冲突检测、文本多来源流水线、基础结构提示及 PUML 文本导出。
+- 前端 Vue 3 + TypeScript：输入文字 → 流式生成 → `@vue-flow/core` 画布（平移、缩放、点选节点看全文，支持向右 / 向左 / 向下 / 双向四种布局）→ 双击改文字 / Tab 加子节点 / Enter 加兄弟 / Delete 删子树 / 撤销重做 / Ctrl+S 保存（`version` 乐观锁，409 时三选弹层）→ 打开已保存导图（旧 React 骨架已打 tag `v0.1.0-react-scaffold` 存档）。
+- 后端 FastAPI：生成接口（同步与 SSE 流式）、结构校验、SQLite 保存和读取、版本冲突检测、文本多来源流水线、文档上传（Docling）、统一错误体、基础结构提示及 PUML 文本导出。
 - 默认 `demo` 生成固定结构，用于联调，**不会调用 AI**。可配置 Chat Completions 兼容模型服务，实际能力取决于服务商和模型。模型调用尚未在真实密钥环境验收。
-- 可视化画布、文件/图片/语音处理、知识库、知识图谱、协作、翻译、模型评估等均尚未实现，详见功能清单。
+- 可视化编辑、图片/语音处理、知识库、知识图谱、协作、翻译、模型评估等尚未实现，详见功能清单。
 - 多来源流水线记录整图来源摘要并可随导图保存；原文持久化和节点级来源引用尚未实现。合并超过 8000 字会报错，不会悄悄丢弃内容。
 
 **当前只有本地单用户开发能力，没有登录、授权、访问隔离或生产安全加固，不要直接部署到公网或用于敏感数据。**
@@ -52,7 +52,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 ## 团队从这里开始
 
-1. 两人先共同阅读 [系统架构](docs/ARCHITECTURE.md)、[API 契约](docs/API.md) 和 [CONTRACT_V2](docs/CONTRACT_V2.md)，固定导图 JSON 格式；契约改动必须双人 review 并附迁移脚本。
-2. 分工按 [执行计划第 11 节](docs/PLAN.md)：A 负责契约 / Vue 画布 / 布局主题导出 / 部署与 CI，B 负责后端地基 / 生成链路 / 多模态解析 / RAG / 诊断。任务与依赖仍以 [功能清单与分工](docs/FEATURES_AND_OWNERS.md) 的 F 编号为准。
-3. 先分别在各自电脑跑通生成（R1 已有）与保存/重新打开（R3 完成后），再按功能清单实现剩余能力。
+1. RPeGio 与陈嘉涛先共同阅读 [系统架构](docs/ARCHITECTURE.md)、[API 契约](docs/API.md) 和 [CONTRACT_V2](docs/CONTRACT_V2.md)，固定导图 JSON 格式；契约改动必须经 RPeGio 与陈嘉涛双人 review 并附迁移脚本。
+2. 分工按 [执行计划第 11 节](docs/PLAN.md)：RPeGio 负责契约 / Vue 画布 / 布局主题导出 / 部署与 CI，陈嘉涛负责后端地基 / 生成链路 / 多模态解析 / RAG / 诊断。任务与依赖仍以 [功能清单与分工](docs/FEATURES_AND_OWNERS.md) 的 F 编号为准。
+3. RPeGio 与陈嘉涛先在本人电脑跑通生成（R1）→ 画布（R2）→ 编辑与保存（R3）整条链路，再按功能清单实现剩余能力。
 4. 分支：`main` ← `dev` ← `feat/*`·`fix/*`，**PR 目标一律 `dev`**，提交信息用中文 Conventional Commits，PR 模板三问必填；`dev` 每周日合 `main` 并打 tag。CI 必须绿才能合并。
