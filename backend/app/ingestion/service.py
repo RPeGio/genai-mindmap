@@ -108,8 +108,20 @@ def _parse_pdf(raw: bytes) -> tuple[str, int, int]:
 
 
 def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
+    """PDF 一律走视觉提取：逐页渲染成图交给多模态模型转 Markdown。
+
+    为什么不再用文本层做主路径：文本层只有字符，表格退化成散行、公式丢结构、
+    字号层级全无，扫描件更是一个字符都拿不到。视觉模型读整页能同时拿到文字、
+    表格行列、公式与标题层级。
+
+    文本层仍然会被读一遍，但只为兜底：模型服务不可用（没配密钥、网络不通、
+    整份识别失败）时，有文本层的文档还能降级给出内容，不至于直接不可用。
+    """
+    from app.ingestion import vision_pdf
+
+    # 兜底用，同时也是"这份文档到底有没有文字"的判断依据
     try:
-        text, page_count, parsed_pages = _parse_pdf(raw)
+        fallback_text, page_count, text_pages = _parse_pdf(raw)
     except ImportError as exc:  # pragma: no cover - 只在缺依赖的部署上触发
         raise NotSupportedSource(
             "PDF 解析需要 pymupdf，当前环境没有安装；请执行 "
@@ -117,15 +129,41 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
     except Exception as exc:  # noqa: BLE001 - pymupdf 的异常类型不稳定
         raise NotSupportedSource(f"PDF 解析失败：{exc}") from exc
 
-    text = _normalize_markdown(text)
+    def fallback(reason: str) -> Source:
+        """视觉不可用时退回文本层；文本层也空就只能报错。"""
+        text = _normalize_markdown(fallback_text)
+        if not text:
+            raise NotSupportedSource(
+                f"{reason}；这份 PDF 也没有文本层可以退回（可能是扫描件），"
+                "请确认模型服务可用后重试")
+        return Source(kind=SourceKind.document, filename=filename, text=text,
+                      span=SourceSpan(page=page_count) if page_count else None,
+                      parsed_pages=text_pages,
+                      truncated=text_pages < page_count,
+                      status="parsed")
+
+    try:
+        pages, total, limit, failed = vision_pdf.extract_pages(raw)
+    except vision_pdf.VisionUnavailable as exc:
+        return fallback(f"视觉提取不可用（{exc}）")
+    except Exception as exc:  # noqa: BLE001 - 渲染/并发层的意外错误
+        return fallback(f"视觉提取失败（{exc}）")
+
+    markdown = "\n\n".join(page.strip() for page in pages if page.strip())
+    if not markdown.strip():
+        return fallback("所有页面都没能识别出来")
+
+    text = _normalize_markdown(markdown)
     if not text:
-        raise NotSupportedSource(
-            "这份 PDF 没有文本层，可能是扫描件或纯图片版；"
-            "pymupdf 只读文本层，扫描件需要 OCR 才能处理")
+        return fallback("识别结果里没有可用文字")
+
+    # truncated 有两个来源：页数超上限、以及部分页识别失败。
+    # 两者都意味着"这份正文比原文档少了一部分"，必须让调用方知道。
+    truncated = limit < total or bool(failed)
     return Source(kind=SourceKind.document, filename=filename, text=text,
-                  span=SourceSpan(page=page_count) if page_count else None,
-                  parsed_pages=parsed_pages,
-                  truncated=parsed_pages < page_count,
+                  span=SourceSpan(page=total) if total else None,
+                  parsed_pages=limit,
+                  truncated=truncated,
                   status="parsed")
 
 

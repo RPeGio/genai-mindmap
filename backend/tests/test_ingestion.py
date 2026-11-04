@@ -140,5 +140,85 @@ class PdfPageLimitTest(unittest.TestCase):
         self.assertEqual(source.status, "parsed")
 
 
+class PdfVisionTest(unittest.TestCase):
+    """PDF 主路径是视觉提取，文本层只在模型不可用时兜底。"""
+
+    def test_vision_output_is_used(self):
+        from unittest.mock import patch
+
+        with patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            extract.return_value = (["# 第一章\n\n正文内容", "## 1.1 小节\n\n更多"], 2, 2, [])
+            source = parse_document_bytes("a.pdf", make_pdf(2))
+        self.assertIn("# 第一章", source.text)
+        self.assertIn("## 1.1 小节", source.text)
+        self.assertFalse(source.truncated)
+        self.assertEqual(source.parsed_pages, 2)
+        self.assertEqual(source.span.page, 2)
+
+    def test_vision_failure_falls_back_to_text_layer(self):
+        from unittest.mock import patch
+
+        from app.ingestion.vision_pdf import VisionUnavailable
+
+        with patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            extract.side_effect = VisionUnavailable("未配置模型地址")
+            source = parse_document_bytes("a.pdf", make_pdf(3))
+        # 回落到 pymupdf 抽出的文本层
+        self.assertIn("page 1 content", source.text)
+        self.assertEqual(source.status, "parsed")
+
+    def test_vision_returns_nothing_falls_back(self):
+        from unittest.mock import patch
+
+        with patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            extract.return_value = (["", ""], 2, 2, [1, 2])
+            source = parse_document_bytes("a.pdf", make_pdf(2))
+        self.assertIn("page 1 content", source.text)
+
+    def test_vision_failure_without_text_layer_raises(self):
+        from unittest.mock import patch
+
+        import pymupdf
+
+        from app.ingestion.vision_pdf import VisionUnavailable
+
+        # 造一份纯图片 PDF：整页是一张图，没有文本层
+        doc = pymupdf.open()
+        page = doc.new_page()
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), False)
+        pix.clear_with(200)
+        page.insert_image(pymupdf.Rect(50, 50, 250, 250), pixmap=pix)
+        raw = doc.tobytes()
+        doc.close()
+
+        with patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            extract.side_effect = VisionUnavailable("网络不通")
+            with self.assertRaises(NotSupportedSource) as raised:
+                parse_document_bytes("scan.pdf", raw)
+        self.assertIn("没有文本层", str(raised.exception))
+
+    def test_partial_page_failure_marks_truncated(self):
+        from unittest.mock import patch
+
+        with patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            # 3 页里第 2 页失败
+            extract.return_value = (["# 一", "", "# 三"], 3, 3, [2])
+            source = parse_document_bytes("a.pdf", make_pdf(3))
+        self.assertIn("# 一", source.text)
+        self.assertIn("# 三", source.text)
+        self.assertTrue(source.truncated)
+
+    def test_page_limit_marks_truncated(self):
+        from unittest.mock import patch
+
+        with patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            # 25 页的文档，视觉只处理前 20 页
+            extract.return_value = (["# 内容"] * 20, 25, 20, [])
+            source = parse_document_bytes("a.pdf", make_pdf(25))
+        self.assertEqual(source.span.page, 25)
+        self.assertEqual(source.parsed_pages, 20)
+        self.assertTrue(source.truncated)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -275,7 +275,7 @@ async function copyBody() {
             正在解析…已等待 {{ store.parseSeconds }} 秒
           </p>
           <p v-if="store.uploadState === 'parsing'" class="text-xs leading-relaxed text-slate-400">
-            首次解析需加载模型，可能约一分钟，请先别关页面。
+            PDF 会逐页识别，页数越多越慢（约每页 5–10 秒，最多 20 页），请先别关页面。
           </p>
           <p v-if="store.uploadState === 'generating'" class="text-xs text-slate-600">
             正在生成导图…
