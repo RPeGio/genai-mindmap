@@ -51,6 +51,17 @@ const input = ref<HTMLInputElement | null>(null);
 let settled = false;
 
 /**
+ * 用户继续打字就把锁解开。
+ *
+ * 提交不一定成功：store 那边会拒绝空标题和超长标题，那时编辑态仍然开着。
+ * 如果锁一直不放，用户改成合法文字后按回车、Tab、Esc 都毫无反应，看起来
+ * 像编辑器坏了。input 事件说明内容又变了，自然应该允许再提交一次。
+ */
+function onDraftInput() {
+  settled = false;
+}
+
+/**
  * 新加的节点是刚插进画布的，下一帧才真正挂到 document 上；对还没挂上的元素调 focus()
  * 是空操作，用户就得再点一下才能打字。所以每帧试一次，直到焦点确实落进来。
  */
@@ -144,6 +155,7 @@ onBeforeUnmount(() => clearTimeout(timer));
         @keydown.enter.prevent="finish(true)"
         @keydown.esc.prevent="finish(false)"
         @keydown.tab.prevent="finishAndNext"
+        @input="onDraftInput"
         @blur="finish(true)"
       />
       <span v-else class="line-clamp-2 break-words">{{ data.label }}</span>

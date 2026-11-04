@@ -62,6 +62,39 @@ describe('节点内联编辑', () => {
     wrapper.unmount();
   });
 
+  it('提交被拒后继续打字，仍能再次提交或取消', async () => {
+    // store 会拒绝空标题和超长标题，那时编辑态仍然开着。若提交锁不放，
+    // 用户改成合法文字后按回车、Tab、Esc 都毫无反应，看起来像编辑器坏了。
+    const wrapper = render({ editing: true });
+    const input = wrapper.get('input');
+
+    // 清空后回车：父组件（store）会拒绝，这里只是模拟它没有关闭编辑态
+    await input.setValue('');
+    await input.trigger('keydown.enter');
+    expect(wrapper.emitted('commit')?.length).toBe(1);
+
+    // 继续打字，锁应该解开
+    await input.setValue('合法的标题');
+    await input.trigger('keydown.enter');
+    expect(wrapper.emitted('commit')?.length).toBe(2);
+    expect(wrapper.emitted('commit')?.[1]).toEqual(['合法的标题']);
+
+    wrapper.unmount();
+  });
+
+  it('提交被拒后按 Esc 也能取消', async () => {
+    const wrapper = render({ editing: true });
+    const input = wrapper.get('input');
+
+    await input.setValue('');
+    await input.trigger('keydown.enter');
+    await input.setValue('x');
+    await input.trigger('keydown.esc');
+
+    expect(wrapper.emitted('cancel')?.length).toBe(1);
+    wrapper.unmount();
+  });
+
   it('Tab 走 next 事件：提交文字后还要接着加下一个', async () => {
     const wrapper = render({ editing: true });
 
