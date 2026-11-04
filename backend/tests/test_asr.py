@@ -4,6 +4,7 @@
 WAV 规格校验、60 秒切片边界、协议帧字段、Token 缓存策略、
 以及失败时必须是报错而不是返回空正文。
 """
+import array
 import io
 import time
 import unittest
@@ -44,18 +45,16 @@ class WavSpecTest(unittest.TestCase):
         _, rate, _, _ = asr._decode_wav(make_wav(1.0, rate=8000))
         self.assertEqual(rate, 8000)
 
-    def test_rejects_stereo(self):
-        """服务端不拒绝立体声，会静默产出乱码，所以必须本地拦死（实测）。
+    def test_accepts_stereo(self):
+        """双声道不再拒收，改走两条车道分别识别。"""
+        _, rate, _, channels = asr._decode_wav(make_wav(1.0, channels=2))
+        self.assertEqual(channels, 2)
+        self.assertEqual(rate, 16000)
 
-        把左右声道内容不同的立体声发过去，服务端返回 200 和 39 个字，
-        但内容是「向人手一下中山笑声风雨…」这种噪音。这类错误不会触发
-        任何告警，会一路流进导图。
-        """
+    def test_rejects_more_than_two_channels(self):
         with self.assertRaises(AsrError) as ctx:
-            asr._decode_wav(make_wav(1.0, channels=2))
-        message = str(ctx.exception)
-        self.assertIn("声道", message)
-        self.assertIn("不报错", message)
+            asr._decode_wav(make_wav(1.0, channels=3))
+        self.assertIn("声道", str(ctx.exception))
 
     def test_rejects_8bit(self):
         with self.assertRaises(AsrError) as ctx:
@@ -162,19 +161,23 @@ class TokenCacheTest(unittest.TestCase):
 
 
 class TranscribeTest(unittest.TestCase):
-    """端到端行为，网络层用 mock 替掉。"""
+    """端到端行为，网络层用 mock 替掉。
 
-    def _run(self, wav, results):
+    _recognize_lanes 的返回值与 lanes 同构：单声道是 [["段1","段2"]]，
+    双声道是 [["左"], ["右"]]。
+    """
+
+    def _run(self, wav, lane_results):
         with patch("app.ingestion.asr._config", return_value=("ak", "sk", "app")), \
              patch("app.ingestion.asr._token", return_value="tok"), \
-             patch("app.ingestion.asr._recognize_all",
-                   new_callable=AsyncMock) as recognize_all:
-            recognize_all.return_value = results
+             patch("app.ingestion.asr._recognize_lanes",
+                   new_callable=AsyncMock) as recognize:
+            recognize.return_value = lane_results
             source = transcribe_audio("录音.wav", wav)
-        return source, recognize_all
+        return source, recognize
 
     def test_single_segment_source_fields(self):
-        source, _ = self._run(make_wav(10), ["识别出来的话"])
+        source, _ = self._run(make_wav(10), [["识别出来的话"]])
         self.assertEqual(source.kind, SourceKind.audio)
         self.assertEqual(source.text, "识别出来的话")
         self.assertEqual(source.status, "parsed")
@@ -182,19 +185,84 @@ class TranscribeTest(unittest.TestCase):
         self.assertAlmostEqual(source.duration_seconds, 10.0, places=1)
 
     def test_segments_are_joined_in_order(self):
-        source, recognize_all = self._run(make_wav(61), ["前半段", "后半段"])
+        source, recognize = self._run(make_wav(61), [["前半段", "后半段"]])
         self.assertEqual(source.text, "前半段后半段")
-        pieces = recognize_all.call_args[0][2]
-        self.assertEqual(len(pieces), 2)
+        lanes = recognize.call_args[0][2]
+        self.assertEqual(len(lanes), 1)
+        self.assertEqual(len(lanes[0]), 2)
 
     def test_empty_result_is_an_error(self):
         """识别不出内容要报错，不能返回空正文让下游生成空树。"""
         with self.assertRaises(AsrError):
-            self._run(make_wav(5), ["", "   "])
+            self._run(make_wav(5), [["", "   "]])
 
     def test_blank_edges_are_stripped(self):
-        source, _ = self._run(make_wav(5), ["  有内容  "])
+        source, _ = self._run(make_wav(5), [["  有内容  "]])
         self.assertEqual(source.text, "有内容")
+
+    def test_stereo_runs_two_lanes(self):
+        """左右不同时应该开两条车道，而不是降混或只取一路。"""
+        with patch("app.ingestion.asr._config", return_value=("ak", "sk", "app")), \
+             patch("app.ingestion.asr._token", return_value="tok"), \
+             patch("app.ingestion.asr._nearly_identical", return_value=False), \
+             patch("app.ingestion.asr._recognize_lanes",
+                   new_callable=AsyncMock) as recognize:
+            recognize.return_value = [["会议决定周三评审"], ["思维导图是可视化方法"]]
+            source = transcribe_audio("录音.wav", make_wav(2.0, channels=2))
+        lanes = recognize.call_args[0][2]
+        self.assertEqual(len(lanes), 2)
+        self.assertIn("会议决定", source.text)
+        self.assertIn("思维导图", source.text)
+
+    def test_stereo_identical_channels_use_one_lane(self):
+        """单麦克风 upmix 出来的双声道完全一致，不该付第二次调用。"""
+        with patch("app.ingestion.asr._config", return_value=("ak", "sk", "app")), \
+             patch("app.ingestion.asr._token", return_value="tok"), \
+             patch("app.ingestion.asr._nearly_identical", return_value=True), \
+             patch("app.ingestion.asr._recognize_lanes",
+                   new_callable=AsyncMock) as recognize:
+            recognize.return_value = [["同一段话"]]
+            source = transcribe_audio("录音.wav", make_wav(2.0, channels=2))
+        lanes = recognize.call_args[0][2]
+        self.assertEqual(len(lanes), 1)
+        self.assertEqual(source.text, "同一段话")
+
+
+class StereoTest(unittest.TestCase):
+    """拆声道与合并规则的单元测试。"""
+
+    def test_split_stereo_separates_channels(self):
+        interleaved = array.array("h")
+        for left, right in zip([1, 2, 3], [10, 20, 30]):
+            interleaved.append(left)
+            interleaved.append(right)
+        got_left, got_right = asr._split_stereo(interleaved.tobytes())
+        self.assertEqual(array.array("h", got_left).tolist(), [1, 2, 3])
+        self.assertEqual(array.array("h", got_right).tolist(), [10, 20, 30])
+
+    def test_nearly_identical_detects_upmix(self):
+        same = array.array("h", [100, -200, 300] * 1000)
+        self.assertTrue(asr._nearly_identical(same.tobytes(), same.tobytes()))
+
+        different = array.array("h", same)
+        different[0::2] = array.array("h", [900] * 1500)
+        self.assertFalse(asr._nearly_identical(same.tobytes(), different.tobytes()))
+
+    def test_similarity_of_identical_text(self):
+        self.assertAlmostEqual(asr._similarity("同一段话", "同一段话"), 1.0)
+
+    def test_merge_identical_channels_keeps_one(self):
+        self.assertEqual(asr._merge_lanes("同一段话", "同一段话"), "同一段话")
+
+    def test_merge_falls_back_to_non_empty_lane(self):
+        self.assertEqual(asr._merge_lanes("有内容", ""), "有内容")
+        self.assertEqual(asr._merge_lanes("   ", "有内容"), "有内容")
+
+    def test_merge_keeps_both_when_content_differs(self):
+        """双人分轨录音，丢任何一路都是信息损失。"""
+        merged = asr._merge_lanes("会议决定周三评审", "思维导图是可视化方法")
+        self.assertIn("会议决定", merged)
+        self.assertIn("思维导图", merged)
 
 
 class ServiceBranchTest(unittest.TestCase):

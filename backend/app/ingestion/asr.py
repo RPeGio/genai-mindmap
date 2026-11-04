@@ -34,6 +34,7 @@ Token 有效期约 36 小时，这里缓存在进程内并提前 1 小时刷新�
 from __future__ import annotations
 
 import asyncio
+import array
 import io
 import json
 import logging
@@ -66,7 +67,10 @@ _token_cache: dict[str, object] = {"id": None, "expire": 0.0}
 
 # 一句话识别按并发配额计费，试用版额度很小。默认 2 路，可用环境变量调大。
 _concurrency = int(os.getenv("MINDMAP_ASR_CONCURRENCY", "2"))
-_gate = threading.BoundedSemaphore(max(1, _concurrency))
+# 一句话识别按账号计并发额度，超了直接回 TOO_MANY_REQUESTS。这里一次只
+# 放一个请求进来，请求内部再按额度并发片段——两个用户同时上传时，宁可
+# 排队也不能把额度吃穿。
+_gate = threading.BoundedSemaphore(1)
 
 
 class AsrError(Exception):
@@ -155,13 +159,12 @@ def _decode_wav(raw: bytes) -> tuple[bytes, int, float, int]:
     except (wave.Error, EOFError) as exc:
         raise AsrError("音频不是合法的 WAV 文件") from exc
 
-    if channels != 1:
-        # 服务端不会拒绝立体声——实测它照收并返回 200，然后把交错的
-        # L/R 采样按单声道解释，静默吐出一段听起来像话的乱码（实测
-        # 「会议决定…」+「思维导图…」混成立体声后识别成 39 字噪音）。
-        # 那种错误会一路流进导图而不触发任何告警，所以必须在这里拦死。
-        raise AsrError(f"音频是 {channels} 声道，语音识别只接受单声道；"
-                       f"双声道内容会被当成交错采样解析，产出错误文本而不报错")
+    if channels not in (1, 2):
+        # 立体声不能原样发给服务端：payload 里没有声道字段，交错采样会被
+        # 按单声道解析，实测「会议决定…」+「思维导图…」混在一起后返回
+        # 39 字噪声，且是 200 成功响应，不触发任何告警。所以这里拆声道
+        # 分别识别，见 transcribe_audio。
+        raise AsrError(f"音频是 {channels} 声道，只支持单声道或双声道")
     if width != 2:
         raise AsrError(f"音频位宽 {width * 8} bit，语音识别只接受 16 bit")
     if rate not in SUPPORTED_RATES:
@@ -177,6 +180,80 @@ def _split(pcm: bytes, rate: int) -> list[bytes]:
     """按 60 秒切片。最后一片可能不足 60 秒，照常送去识别。"""
     limit = MAX_SLICE_SECONDS * rate * 2   # 16bit = 2 字节/样本
     return [pcm[start:start + limit] for start in range(0, len(pcm), limit)]
+
+
+def _split_stereo(pcm: bytes) -> tuple[bytes, bytes]:
+    """拆开交错的立体声 PCM。每 4 字节是一组 L(2) + R(2)。"""
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    return samples[0::2].tobytes(), samples[1::2].tobytes()
+
+
+def _nearly_identical(left: bytes, right: bytes, step: int = 97) -> bool:
+    """抽样比对两路是否几乎相同。
+
+    单麦克风被浏览器 upmix 成立体声时两路完全一致，这时没必要付第二次
+    调用。抽样而不是逐采样比较——60 秒音频有 96 万个采样，全比一遍不划算，
+    而且这里只需要区分"一模一样"和"有真实差异"。
+    """
+    a = array.array("h")
+    b = array.array("h")
+    a.frombytes(left)
+    b.frombytes(right)
+    count = min(len(a), len(b))
+    if count == 0:
+        return True
+    diff = 0
+    scale = 0
+    for index in range(0, count, step):
+        diff += abs(a[index] - b[index])
+        scale += abs(a[index]) + 1
+    return scale > 0 and diff / scale < 0.01
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if not a:
+        return len(b)
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1,
+                               previous[j - 1] + (ca != cb)))
+        previous = current
+    return previous[-1]
+
+
+def _similarity(a: str, b: str) -> float:
+    """两段文本的相似度，用于判断两个声道是不是同一段话。"""
+    left, right = _normalize(a), _normalize(b)
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return 1 - _edit_distance(left, right) / max(len(left), len(right))
+
+
+def _normalize(text: str) -> str:
+    return "".join(c for c in text.lower()
+                   if c.isalnum() or "\u4e00" <= c <= "\u9fff")
+
+
+def _merge_lanes(left_text: str, right_text: str) -> str:
+    """合并两个声道的识别结果。
+
+    实测得到的三种情形：
+      一路为空            → 取非空的那路（只接了一个声道的麦克风）
+      文本相似度 > 80%    → 取一路（单麦克风 upmix，两路本就相同）
+      内容确实不同        → 两段都留（双人分轨录音，丢任何一路都是损失）
+    """
+    if not _normalize(left_text):
+        return right_text
+    if not _normalize(right_text):
+        return left_text
+    if _similarity(left_text, right_text) > 0.8:
+        return left_text if len(left_text) >= len(right_text) else right_text
+    return f"{left_text}\n{right_text}"
 
 
 def _gateway_url(token: str) -> str:
@@ -267,12 +344,27 @@ async def _recognize_segment(token: str, appkey: str, pcm: bytes, rate: int) -> 
                     f"语音识别失败 {header.get('status')}: {header.get('status_text')}")
 
 
-async def _recognize_all(token: str, appkey: str, pieces: list[bytes],
-                         rate: int) -> list[str]:
-    results = []
-    for piece in pieces:
-        results.append(await _recognize_segment(token, appkey, piece, rate))
-    return results
+async def _recognize_lanes(token: str, appkey: str, lanes: list[list[bytes]],
+                           rate: int, concurrency: int) -> list[list[str]]:
+    """按车道识别所有片段，返回与 lanes 同构的文本结构。
+
+    双声道是两条车道，单声道是一条。片段之间用 Semaphore 卡住并发数，
+    因为这个数是阿里云按账号给的硬额度，不是本地能随便调的。
+    """
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    jobs = [(lane_index, piece_index, piece)
+            for lane_index, lane in enumerate(lanes)
+            for piece_index, piece in enumerate(lane)]
+
+    async def run(piece: bytes) -> str:
+        async with semaphore:
+            return await _recognize_segment(token, appkey, piece, rate)
+
+    texts = await asyncio.gather(*(run(piece) for _, _, piece in jobs))
+    result = [[""] * len(lane) for lane in lanes]
+    for (lane_index, piece_index, _), text in zip(jobs, texts):
+        result[lane_index][piece_index] = text
+    return result
 
 
 def transcribe_audio(filename: str | None, raw: bytes) -> Source:
@@ -280,25 +372,44 @@ def transcribe_audio(filename: str | None, raw: bytes) -> Source:
 
     同步接口，与 parse_bytes 其余分支保持一致——路由层已经把它甩进
     线程池，这里自己开事件循环跑 WebSocket 不会撞上外层循环。
+
+    立体声走两条车道分别识别再合并，不降混：实测平均降混在左右反相时
+    会完全抵消（RMS 掉到 0），左右不同时又会把两句话搅成一段乱码。
     """
-    pcm, rate, duration, _ = _decode_wav(raw)
+    pcm, rate, duration, channels = _decode_wav(raw)
     _, _, appkey = _config()
     token = _token()
 
-    pieces = _split(pcm, rate)
-    if len(pieces) > 1:
-        logger.info("音频 %.1f 秒，切成 %d 段识别", duration, len(pieces))
+    if channels == 1:
+        channel_payloads = [pcm]
+    else:
+        left, right = _split_stereo(pcm)
+        if _nearly_identical(left, right):
+            # 单麦克风被浏览器 upmix 成立体声，两路完全一致，
+            # 再识别一次纯属浪费额度和费用。
+            logger.info("双声道内容相同，按单声道处理")
+            channel_payloads = [left]
+        else:
+            channel_payloads = [left, right]
+
+    lanes = [_split(channel, rate) for channel in channel_payloads]
+    segments = sum(len(lane) for lane in lanes)
+    if segments > 1:
+        logger.info("音频 %.1f 秒 / %d 路声道，共 %d 段送识别",
+                    duration, len(lanes), segments)
 
     with _gate:
         try:
-            texts = asyncio.run(_recognize_all(token, appkey, pieces, rate))
+            texts = asyncio.run(
+                _recognize_lanes(token, appkey, lanes, rate, _concurrency))
         except AsrError:
             raise
         except Exception as exc:  # noqa: BLE001 - 网络层异常统一转成 AsrError
             raise AsrError(f"语音识别请求失败：{exc}") from exc
 
-    text = "".join(texts).strip()
-    if not text:
+    joined = ["".join(lane).strip() for lane in texts]
+    text = _merge_lanes(joined[0], joined[1]) if len(joined) == 2 else joined[0]
+    if not _normalize(text):
         raise AsrError("没有从音频里识别出语音内容")
 
     logger.info("语音转写完成：%.1f 秒 → %d 字", duration, len(text))
