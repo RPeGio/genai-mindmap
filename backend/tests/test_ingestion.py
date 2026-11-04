@@ -1,4 +1,4 @@
-﻿"""文档导入的边界行为。
+"""文档导入的边界行为。
 
 真实的 Docling 解析很慢（首次要加载模型），所以这里只测不触发解析的路径：
 格式白名单、空文件、文本直通。实际解析效果由手工端到端验证覆盖。
@@ -8,6 +8,7 @@ import unittest
 from app.contracts.source import SourceKind
 from app.ingestion.service import (
     DOCUMENT_SUFFIXES,
+    MAX_PAGES,
     NotSupportedSource,
     parse_bytes,
     parse_document_bytes,
@@ -89,6 +90,54 @@ class DocumentGuardTest(unittest.TestCase):
         for kind in (SourceKind.image, SourceKind.audio):
             with self.assertRaises(NotSupportedSource):
                 parse_bytes(kind, None, b"x")
+
+
+def make_pdf(pages: int) -> bytes:
+    """生成一份带文本层的 PDF，用于测分页与截断。"""
+    import pymupdf
+
+    doc = pymupdf.open()
+    for index in range(pages):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"page {index + 1} content")
+    raw = doc.tobytes()
+    doc.close()
+    return raw
+
+
+class PdfPageLimitTest(unittest.TestCase):
+    """超过 MAX_PAGES 时必须显式标注截断，不能静默丢内容。
+
+    验收时上传 51 页 PDF，接口返回成功但只有前 50 页进了正文，
+    响应里没有任何字段说明这件事——用户拿到的是一份缺了尾巴的正文。
+    """
+
+    def test_within_limit_is_not_truncated(self):
+        source = parse_document_bytes("small.pdf", make_pdf(5))
+        self.assertEqual(source.parsed_pages, 5)
+        self.assertFalse(source.truncated)
+        self.assertEqual(source.span.page, 5)
+        self.assertIn("page 1 content", source.text)
+
+    def test_exactly_at_limit_is_not_truncated(self):
+        source = parse_document_bytes("edge.pdf", make_pdf(MAX_PAGES))
+        self.assertEqual(source.parsed_pages, MAX_PAGES)
+        self.assertFalse(source.truncated)
+        self.assertEqual(source.span.page, MAX_PAGES)
+
+    def test_over_limit_is_marked_truncated(self):
+        over = MAX_PAGES + 1
+        source = parse_document_bytes("big.pdf", make_pdf(over))
+
+        # 正文只到第 MAX_PAGES 页
+        self.assertEqual(source.parsed_pages, MAX_PAGES)
+        self.assertIn(f"page {MAX_PAGES} content", source.text)
+        self.assertNotIn(f"page {over} content", source.text)
+
+        # 但必须明确告诉调用方：总共多少页、解析了多少页、内容被截断了
+        self.assertEqual(source.span.page, over)
+        self.assertTrue(source.truncated)
+        self.assertEqual(source.status, "parsed")
 
 
 if __name__ == "__main__":

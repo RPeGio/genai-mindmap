@@ -37,6 +37,13 @@ class Source(BaseModel):
     span: SourceSpan | None = None
     status: Literal["pending", "parsed", "failed"] = "pending"
     error: str | None = None
+    # 实际解析的页数。与 span.page（整份文档共几页）不是一回事：
+    # 51 页的 PDF 只解析前 50 页时，span.page = 51、parsed_pages = 50。
+    # 只有分页格式（PDF）才有意义，其余留 None。
+    parsed_pages: int | None = None
+    # 是否因 MAX_PAGES 被截断。必须显式告诉调用方——否则用户拿到的是一份
+    # 缺了尾巴的正文，界面却显示"解析成功"，导图会静默漏掉后面的章节。
+    truncated: bool = False
 
 
 class SourceUsage(BaseModel):

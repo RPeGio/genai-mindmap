@@ -80,32 +80,36 @@ def _suffix_of(filename: str | None) -> str:
     return filename[dot:].lower() if dot >= 0 else ""
 
 
-def _parse_pdf(raw: bytes) -> tuple[str, int]:
-    """PyMuPDF 抽文本，返回 (正文, 总页数)。
+def _parse_pdf(raw: bytes) -> tuple[str, int, int]:
+    """PyMuPDF 抽文本，返回 (正文, 总页数, 实际解析页数)。
 
     只读文本层，不碰版面：实测 15 页英文双栏论文 0.19 秒 / 55MB，
     30 页中文文档 0.38 秒 / 66MB。扫描件抽不出文字，这里会返回空正文，
     由调用方拒绝。
+
+    总页数与解析页数分开返回：超过 MAX_PAGES 时只解析前面那些页，
+    调用方要据此告诉用户"这份文档被截断了"，而不是让界面显示解析成功。
     """
     import pymupdf
 
     doc = pymupdf.open(stream=raw, filetype="pdf")
     try:
         page_count = doc.page_count
+        parsed_pages = min(page_count, MAX_PAGES)
         chunks = []
-        for index in range(min(page_count, MAX_PAGES)):
+        for index in range(parsed_pages):
             try:
                 chunks.append(doc[index].get_text("text") or "")
             except Exception:  # noqa: BLE001 - 单页损坏不该拖垮整份文档
                 continue
     finally:
         doc.close()
-    return "\n\n".join(c for c in chunks if c.strip()), page_count
+    return "\n\n".join(c for c in chunks if c.strip()), page_count, parsed_pages
 
 
 def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
     try:
-        text, page_count = _parse_pdf(raw)
+        text, page_count, parsed_pages = _parse_pdf(raw)
     except ImportError as exc:  # pragma: no cover - 只在缺依赖的部署上触发
         raise NotSupportedSource(
             "PDF 解析需要 pymupdf，当前环境没有安装；请执行 "
@@ -120,6 +124,8 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
             "pymupdf 只读文本层，扫描件需要 OCR 才能处理")
     return Source(kind=SourceKind.document, filename=filename, text=text,
                   span=SourceSpan(page=page_count) if page_count else None,
+                  parsed_pages=parsed_pages,
+                  truncated=parsed_pages < page_count,
                   status="parsed")
 
 
