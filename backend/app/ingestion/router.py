@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from starlette.concurrency import run_in_threadpool
 
@@ -16,8 +16,8 @@ from app.ingestion.service import (
 
 router = APIRouter(prefix="/ingestion", tags=["多模态输入"])
 
-# 上传上限。Docling 要把整份文档读进内存做版面分析，定太小会白等，
-# 定太大在 2C2G 机器上会把内存吃满；10MB 大约够 300 页纯文字 PDF。
+# 上传上限。PDF 用 pymupdf 只读文本层，开销很小；DOCX/PPTX 要整份读进内存，
+# 定太大在 2C2G 机器上会把内存吃满。10MB 大约够 300 页纯文字 PDF。
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
@@ -43,7 +43,8 @@ async def create_file_source(file: UploadFile = File(...)):
     if suffix not in DOCUMENT_SUFFIXES:
         hint = ""
         if suffix in {".doc", ".ppt", ".xls"}:
-            hint = f"；这是旧版二进制格式，请另存为 {suffix}x 后再上传"
+            hint = (f"；这是旧版二进制格式，解析它需要经 LibreOffice 转换，"
+                    f"内存与耗时都是新格式的数倍，请另存为 {suffix}x 后再上传")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"暂不支持的文件类型：{suffix or '未知'}{hint}；"
@@ -58,8 +59,8 @@ async def create_file_source(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail="文件内容为空")
 
     try:
-        # 解析是同步阻塞的（Docling 要跑版面分析），直接在 async 函数里调用
-        # 会把事件循环占住，同进程的其他请求全部排队。甩给线程池，循环继续接客。
+        # 解析是同步阻塞的，直接在 async 函数里调用会把事件循环占住，
+        # 同进程的其他请求全部排队。甩给线程池，循环继续接客。
         source = await run_in_threadpool(parse_bytes, SourceKind.document, filename, raw)
     except NotSupportedSource as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -68,6 +69,6 @@ async def create_file_source(file: UploadFile = File(...)):
 
 @router.get("/formats")
 def list_supported_formats():
-    """列出当前支持的文件类型，前端可据此限制文件选择框。"""
+    """列出当前支持的文件类型与上传上限，前端可据此限制文件选择框。"""
     return {"document": sorted(DOCUMENT_SUFFIXES),
             "maxUploadBytes": MAX_UPLOAD_BYTES}
