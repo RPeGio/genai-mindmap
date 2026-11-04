@@ -17,6 +17,12 @@ from app.contracts.mindmap import GenerateResponse, MindMapContent, Node
 _TIMEOUT_SECONDS = 60.0
 _MAX_RESPONSE_BYTES = 2_000_000
 
+# 输出 token 上限。模型服务默认 8192，而实测一棵 240 节点的树要 7578 tok、
+# 输出文本约 1.3 万字符；DETAIL_PROMPT 允许 300 节点，必然超出上限被截断，
+# 而截断的 JSON 解析不出来，整次请求报废（实测 20000 字符的输入就撞过一次，
+# finish_reason=length、输出正好 8192）。服务端接受更大的值，取 16384 留余量。
+MAX_OUTPUT_TOKENS = 16384
+
 # 一次性生成完整导图的提示词（非流式接口、流式接口的第二段都用它）。
 DETAIL_PROMPT = (
     "将用户输入整理成思维导图。只返回一个 JSON 对象，不要代码围栏。"
@@ -88,9 +94,8 @@ def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, 
             {"role": "user", "content": user},
         ],
         "temperature": 0.2,
+        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
     }
-    if max_tokens is not None:
-        request_body["max_tokens"] = max_tokens
     payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     try:
@@ -133,9 +138,8 @@ async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -
             {"role": "user", "content": user},
         ],
         "temperature": 0.2,
+        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
     }
-    if max_tokens is not None:
-        request_body["max_tokens"] = max_tokens
     payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     try:

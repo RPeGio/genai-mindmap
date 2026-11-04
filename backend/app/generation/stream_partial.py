@@ -1,4 +1,4 @@
-﻿"""单次调用 + 增量 JSON 解析：让节点在模型还在输出时就逐个出现在画面上。
+"""单次调用 + 增量 JSON 解析：让节点在模型还在输出时就逐个出现在画面上。
 
 这是唯一的流式实现。曾经还有一个「两段式」（先骨架再展开）的方案，
 已经删除 —— 两套实现要维护两套测试、两套文档，而增量方案的完整耗时更短。
@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from app.contracts.mindmap import MindMapContent
 from app.generation.service import (
     DETAIL_PROMPT,
+    MAX_OUTPUT_TOKENS,
     MIN_BRANCHES,
     GenerationError,
     _config,
@@ -173,6 +174,7 @@ async def _stream_chat(system: str, user: str) -> AsyncIterator[str]:
             {"role": "user", "content": user},
         ],
         "temperature": 0.2,
+        "max_tokens": MAX_OUTPUT_TOKENS,
         "stream": True,
     }
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}

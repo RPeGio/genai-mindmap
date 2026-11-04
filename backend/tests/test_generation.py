@@ -1,9 +1,14 @@
-﻿import json
+import json
 import os
 import unittest
 from unittest.mock import patch
 import httpx
-from app.generation.service import GenerationError, generate
+from app.generation.service import (
+    MAX_OUTPUT_TOKENS,
+    GenerationError,
+    chat,
+    generate,
+)
 
 
 class MockStreamResponse:
@@ -108,6 +113,31 @@ class GenerationTest(unittest.TestCase):
         with self.assertRaises(GenerationError) as raised:
             generate("测试")
         self.assertIn("模型响应过大", str(raised.exception))
+
+    def test_request_carries_explicit_output_token_limit(self):
+        """必须显式给 max_tokens。
+
+        服务端默认 8192，而 DETAIL_PROMPT 允许 300 个节点、实测 240 节点就要
+        7578 token，不抬高上限就会被静默截断成半截 JSON（实测 20000 字符的
+        输入撞过一次，finish_reason=length、输出正好 8192 后报废）。
+        """
+        tree = {"title": "测试", "root": {"id": "1", "label": "测试",
+                "children": [{"id": "b1", "label": "分支", "children": []}]}}
+        client_class = self.use_client(MockStreamResponse(self.body_of(tree)))
+        generate("测试")
+        _, _, kwargs = client_class.return_value.calls[0]
+        payload = json.loads(kwargs["content"])
+        self.assertEqual(payload["max_tokens"], MAX_OUTPUT_TOKENS)
+        self.assertGreater(MAX_OUTPUT_TOKENS, 8192)
+
+    def test_explicit_max_tokens_still_wins(self):
+        """调用方显式指定时以调用方为准，便于个别短请求省钱。"""
+        tree = {"title": "测试", "root": {"id": "1", "label": "测试",
+                "children": [{"id": "b1", "label": "分支", "children": []}]}}
+        client_class = self.use_client(MockStreamResponse(self.body_of(tree)))
+        chat("系统", "用户", max_tokens=512)
+        _, _, kwargs = client_class.return_value.calls[0]
+        self.assertEqual(json.loads(kwargs["content"])["max_tokens"], 512)
 
 
 if __name__ == "__main__":
