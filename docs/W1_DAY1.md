@@ -78,11 +78,12 @@ free -h
 
 ## D4（11/5–11/6）Vue 前端重建 + 画布
 
-> 状态（2026-11-03 更新）：**R1、R2 已完成**。
+> 状态（2026-11-04 更新）：**R1、R2、R3 已完成**。
 > R1：Vue 3 + TS + Vite + Tailwind 骨架、`src/api/client.ts`（`generateMindMapStream` 流式封装与 SSE 解析）、`src/api/types.ts`。
 > R2：`@vue-flow/core` 画布（`src/canvas/MindMapCanvas.vue`、`src/canvas/MindNode.vue`）、自研紧凑树布局（`src/canvas/layout/tidy.ts`，支持向右 / 向左 / 向下 / 双向）、Pinia store（`src/stores/mindmap.ts`）、三栏界面（输入 / 画布 / 节点详情）、截断文字的悬停卡片与详情面板。
-> 23 个 vitest 用例（布局 8 / store 9 / 界面 5 / 真实画布挂载 1）；`npm test` 与 `npm run build` 均通过。
-> **R2 是只读画布**：不能拖拽节点、不能改文字、不能增删、没有撤销与保存——这些是 R3 的范围。
+> R3：`src/mindmap/edits.ts`（改名 / 加子节点 / 加兄弟 / 删子树 / 提交前校验）、双击内联编辑、Tab/Enter/Delete 建树、撤销重做（整树快照 50 步）、保存（首次 POST、之后 PUT 带 `version`，409 三选弹层）、打开列表与新建、Ctrl+S 与 `beforeunload` 保护。
+> 81 个 vitest 用例（9 个文件：纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 真实画布挂载）；`npm test` 与 `npm run build` 均通过。
+> **R3 未做**：拖拽调结构（W3）、自动保存、v2 的 layout/theme、导出。
 > 依赖已装 `pinia`、`@vue-flow/core`、`@vue-flow/background`；未装 `@vue-flow/controls`、minimap、dagre。
 
 ```powershell

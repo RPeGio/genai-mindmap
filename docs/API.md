@@ -4,7 +4,7 @@
 
 **错误体已统一**：所有错误响应都是 `{code, message, detail, request_id}`（实现见 `backend/app/core/errors.py`）。`message` 是中文可读文案，`detail` 保留原始细节（校验错误为数组），`request_id` 优先沿用请求头 `X-Request-ID`、没有则生成，并同时通过响应头回传。前端 `src/api/client.ts` 的 `ApiError` 读 `message`，缺失时回退到 `detail`。
 
-**前端消费情况**：已封装 `POST /api/generations`（`generateMindMap`，一次性）与 `POST /api/generations/stream`（`generateMindMapStream`，流式，页面默认走这条）；R2 画布消费 `content` 做只读渲染（`src/canvas/`）；其余路由待 R3 接入。
+**前端消费情况**：已封装 `POST /api/generations`（`generateMindMap`）、`POST /api/generations/stream`（`generateMindMapStream`，页面默认走这条）、`GET /api/mindmaps`、`GET /api/mindmaps/{id}`、`POST /api/mindmaps`、`PUT /api/mindmaps/{id}`（后四个构成 R3 的保存与打开）；画布与编辑全部在 `src/canvas/` 与 `src/mindmap/edits.ts` 里完成，只把整棵树发给后端。pipeline / optimization / export / ingestion 尚未封装。
 
 ## 导图格式 v1（当前）与 v2（候选）
 

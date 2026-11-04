@@ -19,8 +19,8 @@ flowchart TD
   R --> MAP[导图 JSON]
 
   MAP --> SAVE[(保存 / 版本)]
-  MAP --> CANVAS[Vue 画布（R2，只读）]
-  CANVAS --> EDIT[人工编辑]
+  MAP --> CANVAS[Vue 画布（R2/R3）]
+  CANVAS --> EDIT[人工编辑<br/>改名 / 增删 / 撤销]
   EDIT --> SAVE
   MAP --> EXP[导出 puml，其他格式待实现]
   SAVE --> SUG[optimization<br/>候选建议]
@@ -65,8 +65,9 @@ flowchart TD
 | 前端位置 | 调用 | 用途 |
 |---|---|---|
 | 输入框（`src/App.vue`） | `POST /api/generations/stream` | **已接入**：输入 → 流式生成 → 节点逐个出现 |
-| 画布（R2） | 无请求 | **已接入**：`src/canvas/MindMapCanvas.vue` 消费 `content`，坐标由 `src/canvas/layout/tidy.ts` 计算；只读，可平移缩放点选 |
-| 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | 带 `version` 的乐观锁，409 时提示重新打开 |
+| 画布（R2） | 无请求 | **已接入**：`src/canvas/MindMapCanvas.vue` 消费 `content`，坐标由 `src/canvas/layout/tidy.ts` 计算；可平移缩放点选，双击内联改文字，Tab / Enter / Delete 建树，撤销栈最多 50 步 |
+| 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | **已接入**：首次保存 POST 建新图，之后 PUT 带 `version`；409 弹三选（重新加载服务端版本 / 另存为新导图 / 取消）；Ctrl+S 触发，`beforeunload` 拦未保存离开 |
+| 打开列表（R3） | `GET /api/mindmaps` / `GET /api/mindmaps/{id}` | **已接入**：顶部"打开"弹层列出已保存导图，点开替换画布并清空撤销栈 |
 | 上传面板（待接入） | `POST /api/ingestion/files` | 已实现：multipart 上传，Docling 解析后返回 `source`，再传给 `/api/pipeline/generate` |
 | 多来源生成（待接入） | `POST /api/pipeline/generate` | 拿 `content` 渲染，`stages` 仅作完成记录展示 |
 | 诊断面板（待接入） | `POST /api/optimization/suggest` | 显示建议，用户点确认后再改 |

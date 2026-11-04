@@ -25,3 +25,11 @@ export interface GenerateResponse {
   mode: 'demo' | 'model';
   content: MindMapContent;
 }
+
+/** 已保存的导图记录。`version` 是乐观锁的版本号，保存时要原样带回去。 */
+export interface MapRecord {
+  id: string;
+  version: number;
+  content: MindMapContent;
+  updated_at: string;
+}
