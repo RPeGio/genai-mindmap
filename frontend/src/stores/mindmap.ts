@@ -731,9 +731,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
     editingId.value = null;
     viewAdjusted.value = false;
     // 生成出来的是新导图，还没存过；上一份已保存的导图不能因此被覆盖。
+    // 会话也要跟着换：上一份图在途的保存响应回来时不能把它的 id 写进 mapId，
+    // 否则画布上是新图、身份是旧图，下次保存就把新内容 PUT 到旧记录上。
+    mapSession += 1;
+    titleDraft.value = null;
     mapId.value = null;
     version.value = 0;
     savedAt.value = null;
+    saving.value = false;
     dirty.value = false;
     resetHistory();
 
