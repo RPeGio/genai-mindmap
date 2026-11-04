@@ -33,3 +33,47 @@ export interface MapRecord {
   content: MindMapContent;
   updated_at: string;
 }
+
+// ---- 来源（文档解析）----
+
+/** 来源模态。后端 SourceKind 的镜像，目前只有 document 走得通。 */
+export type SourceKind = 'text' | 'markdown' | 'document' | 'image' | 'audio';
+
+/** 来源定位，供节点溯源。 */
+export interface SourceSpan {
+  /** 整份文档共几页（PDF 才有），不是"解析了几页"。 */
+  page: number | null;
+  start: number | null;
+  end: number | null;
+}
+
+/**
+ * 解析后的统一来源。字段与 backend/app/contracts/source.py 的 `Source` 一一对应：
+ * 后端是 `extra="forbid"`，多一个字段就 422，所以这里宁可保守也不要自作主张加字段。
+ */
+export interface Source {
+  id: string;
+  kind: SourceKind;
+  filename: string | null;
+  /** 抽取出的正文；解析失败时为 null。 */
+  text: string | null;
+  span: SourceSpan | null;
+  status: 'pending' | 'parsed' | 'failed';
+  error: string | null;
+  /** 实际解析的页数：51 页的 PDF 只解析前 50 页时这里是 50，span.page 才是 51。 */
+  parsed_pages: number | null;
+  /** 是否因后端 50 页上限被截断。为 true 时界面必须明确告知用户正文缺了尾巴。 */
+  truncated: boolean;
+}
+
+export interface CreateTextSourceResponse {
+  source: Source;
+}
+
+/** 生成流水线的响应。stages / diagnostics 目前只用于排障，界面不渲染。 */
+export interface PipelineResponse {
+  mode: 'demo' | 'model';
+  content: MindMapContent;
+  diagnostics: unknown[];
+  stages: unknown[];
+}

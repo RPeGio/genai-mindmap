@@ -2,8 +2,8 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, generateMindMapStream, getMindMap, listMindMaps, updateMindMap } from '../api/client';
-import type { MapRecord, MindMapContent, MindNode } from '../api/types';
+import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, updateMindMap, uploadDocument } from '../api/client';
+import type { MapRecord, MindMapContent, MindNode, Source } from '../api/types';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -22,6 +22,12 @@ export const TRUNCATE_CHARS = 24;
 
 /** 撤销栈上限。整树快照一步几 KB，50 步封顶，内存与手感都够用。 */
 export const HISTORY_LIMIT = 50;
+
+/**
+ * 上传上限，与后端 `ingestion/router.py` 的 MAX_UPLOAD_BYTES 同一口径。
+ * 前端先拦一道：超过上限的文件传一遍必定 413，白等一趟网络还占着带宽。
+ */
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
 /** 保存的结果分类：界面据此决定提示什么，而不是把所有失败都说成"保存失败"。 */
 export type SaveResult = 'saved' | 'conflict' | 'invalid' | 'empty' | 'busy' | 'failed';
@@ -796,6 +802,128 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
   }
 
+  // ---- 上传文档 → 解析 → 生成 ----
+
+  /** 上传链路的进度。idle 之外的两种状态界面各有各的提示，不能并成一个布尔值。 */
+  const uploadState = ref<'idle' | 'parsing' | 'generating'>('idle');
+  /** 解析已等待的秒数：首次解析 DOCX 要加载模型，实测 47 秒，只转圈用户会以为卡死。 */
+  const parseSeconds = ref(0);
+  const uploadError = ref('');
+  /** 最近一次解析出的来源：截断提示要从它身上取总页数与已解析页数。 */
+  const uploadSource = ref<Source | null>(null);
+
+  const uploadBusy = computed(() => uploadState.value !== 'idle');
+
+  /**
+   * 截断提示。后端最多解析 50 页，正文缺了尾巴；界面若只说"解析成功"，
+   * 用户看导图时会以为后面那些章节本来就没有内容。
+   */
+  const truncateHint = computed(() => {
+    const source = uploadSource.value;
+    if (!source?.truncated) return '';
+    const total = source.span?.page;
+    const parsed = source.parsed_pages;
+    if (typeof total === 'number' && typeof parsed === 'number') {
+      return `本文档共 ${total} 页，仅处理前 ${parsed} 页`;
+    }
+    // 拿不到总页数时也不能让提示消失，否则截断又变回静默行为。
+    return typeof parsed === 'number'
+      ? `文档较长，本次只处理了前 ${parsed} 页`
+      : '文档较长，本次只处理了一部分内容';
+  });
+
+  let parseTimer: ReturnType<typeof setInterval> | null = null;
+
+  function stopParseTimer() {
+    if (parseTimer !== null) {
+      clearInterval(parseTimer);
+      parseTimer = null;
+    }
+  }
+
+  function startParseTimer() {
+    stopParseTimer();
+    parseSeconds.value = 0;
+    parseTimer = setInterval(() => {
+      parseSeconds.value += 1;
+    }, 1000);
+  }
+
+  /**
+   * 上传 → 解析 → 生成一条龙。选完文件直接调，不再要第二次确认。
+   *
+   * 失败时不动画布上的旧图：解析失败和生成失败都只提示原因。
+   * 用户手上那张导图仍在，比清成白板更接近预期，也免得无谓地丢掉未保存的修改。
+   */
+  async function uploadAndGenerate(file: File): Promise<void> {
+    // 同一时刻只走一条链路：preview() 会掐掉在途的流式请求，反过来流式结束也会顶掉新结果。
+    if (uploadState.value !== 'idle' || busy.value) return;
+
+    uploadError.value = '';
+    uploadSource.value = null;
+    parseSeconds.value = 0;
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      uploadError.value = `「${file.name}」超过 10MB 上限，请压缩或拆分后再上传。`;
+      status.value = uploadError.value;
+      return;
+    }
+
+    uploadState.value = 'parsing';
+    status.value = `正在解析「${file.name}」…`;
+    startParseTimer();
+
+    let source: Source;
+    try {
+      source = await uploadDocument(file);
+    } catch (error) {
+      stopParseTimer();
+      uploadState.value = 'idle';
+      // 后端的 detail 已经写清了原因（旧版二进制格式、扫描件没有文本层、内容为空），
+      // 原样展示即可；统一成"上传失败"用户就不知道该改什么了。
+      uploadError.value = error instanceof ApiError ? error.message : '上传失败，请重试。';
+      status.value = uploadError.value;
+      return;
+    }
+
+    stopParseTimer();
+    uploadSource.value = source;
+
+    const text = source.text?.trim() ?? '';
+    if (!text) {
+      // 后端对空正文会走 422，这里再兜一层：真收下空来源也不该送去生成。
+      uploadState.value = 'idle';
+      uploadError.value = source.error?.trim() || '这份文档没有解析出任何文字。';
+      status.value = uploadError.value;
+      return;
+    }
+
+    uploadState.value = 'generating';
+    status.value = `已解析「${source.filename ?? file.name}」，正在生成导图…`;
+
+    try {
+      const result = await generateFromSources([source]);
+      // preview() 会把模式与脏标记按"本地示例"重置，所以调完再按真实来源改回来。
+      preview(result.content, direction.value);
+      mode.value = result.mode;
+      // 生成结果还没存过，标脏：离开页面要提醒，保存时走"创建"。
+      dirty.value = true;
+
+      const label = source.filename ?? file.name;
+      const cut = source.truncated ? '（正文已截断）' : '';
+      status.value =
+        result.mode === 'demo'
+          ? `已根据上传的「${label}」生成演示导图（固定结构，非 AI 生成）${cut}，记得保存。`
+          : `已根据上传的「${label}」生成导图${cut}，可直接编辑，记得保存。`;
+    } catch (error) {
+      // 生成失败不要把解析结果也一并吞掉：来源还留着，界面才能继续显示页数与截断提示。
+      uploadError.value = error instanceof ApiError ? error.message : '生成失败，请重试。';
+      status.value = uploadError.value;
+    } finally {
+      uploadState.value = 'idle';
+    }
+  }
+
   return {
     content,
     mode,
@@ -850,5 +978,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     openList,
     closeList,
     openMap,
+    uploadState,
+    uploadBusy,
+    parseSeconds,
+    uploadError,
+    uploadSource,
+    truncateHint,
+    uploadAndGenerate,
   };
 });

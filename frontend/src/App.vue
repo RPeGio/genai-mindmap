@@ -47,6 +47,18 @@ async function generate() {
   await store.generate(prompt.value);
 }
 
+/** 选完文件立刻上传解析，不再要第二次确认；change 里拿不到文件说明用户取消了选择。 */
+async function onPickFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  // 清掉 value：否则再选同一个文件时 change 不会触发，看起来像"点了没反应"。
+  input.value = '';
+  if (!file) return;
+  // 上传成功同样会整体替换画布上的树，和「生成导图」一样先确认能不能丢掉未保存的修改。
+  if (!confirmDiscard('上传文档生成导图')) return;
+  await store.uploadAndGenerate(file);
+}
+
 /** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
 const saveHint = computed(() => {
   if (store.saving) return '保存中…';
@@ -189,7 +201,7 @@ async function copyBody() {
     </header>
 
     <main class="flex min-h-0 flex-1">
-      <section class="flex w-80 shrink-0 flex-col gap-3 border-r border-slate-200 bg-white p-4">
+      <section class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-white p-4">
         <div class="flex flex-col gap-1">
           <label for="title" class="text-xs font-medium text-slate-600">导图标题</label>
           <input
@@ -234,6 +246,58 @@ async function copyBody() {
         <p v-if="store.stageText" class="text-xs text-slate-400">
           {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
         </p>
+
+        <div class="flex items-center gap-2 text-xs">
+          <span class="h-px flex-1 bg-slate-200" />
+          <span class="text-slate-400">或者上传文档</span>
+          <span class="h-px flex-1 bg-slate-200" />
+        </div>
+
+        <div class="flex flex-col gap-2">
+          <label
+            class="cursor-pointer rounded-md border border-dashed border-slate-300 px-3 py-2 text-center text-xs text-slate-600 hover:border-slate-400 hover:bg-slate-50 focus-within:border-slate-500 focus-within:ring-2 focus-within:ring-slate-200"
+            :class="store.uploadBusy ? 'pointer-events-none opacity-60' : ''"
+          >
+            <input
+              type="file"
+              class="sr-only"
+              accept=".pdf,.docx,.pptx,.xlsx,.html,.htm,.md,.asciidoc,.adoc"
+              :disabled="store.uploadBusy || store.busy"
+              @change="onPickFile"
+            />
+            {{ store.uploadBusy ? '处理中…' : '选择文件：PDF / Word / PPT / Excel / HTML' }}
+          </label>
+          <p class="text-xs leading-relaxed text-slate-400">
+            选完自动上传解析，上限 10MB。PDF 只读文本层，扫描件需要先做 OCR。
+          </p>
+
+          <p v-if="store.uploadState === 'parsing'" class="text-xs text-slate-600">
+            正在解析…已等待 {{ store.parseSeconds }} 秒
+          </p>
+          <p v-if="store.uploadState === 'parsing'" class="text-xs leading-relaxed text-slate-400">
+            首次解析需加载模型，可能约一分钟，请先别关页面。
+          </p>
+          <p v-if="store.uploadState === 'generating'" class="text-xs text-slate-600">
+            正在生成导图…
+          </p>
+
+          <p
+            v-if="store.truncateHint"
+            role="alert"
+            class="rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs leading-relaxed text-amber-800"
+          >
+            {{ store.truncateHint }}
+          </p>
+
+          <p
+            v-if="store.uploadError"
+            role="alert"
+            class="whitespace-pre-wrap break-words rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs leading-relaxed text-rose-700"
+          >
+            {{ store.uploadError }}
+          </p>
+        </div>
+
         <p class="mt-auto text-xs leading-relaxed text-slate-400">
           双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销、Ctrl+Shift+Z 重做。
         </p>

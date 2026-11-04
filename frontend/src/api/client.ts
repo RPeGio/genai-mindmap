@@ -1,4 +1,12 @@
-import type { GenerateResponse, MapRecord, MindMapContent, MindNode } from './types';
+import type {
+  CreateTextSourceResponse,
+  GenerateResponse,
+  MapRecord,
+  MindMapContent,
+  MindNode,
+  PipelineResponse,
+  Source,
+} from './types';
 
 /** 后端错误体现在只返回 detail；契约 v2 会带 code/request_id，这里先兼容两种。 */
 interface ErrorBody {
@@ -28,6 +36,20 @@ function errorMessage(status: number, body: ErrorBody): string {
   return `请求失败（HTTP ${status}）`;
 }
 
+/**
+ * 后端错误体 → ApiError。JSON 解析失败时退化成空对象，保底给出 HTTP 状态码。
+ * JSON 请求与 multipart 上传共用这一处，免得两边文案各自漂移。
+ */
+async function toApiError(response: Response): Promise<ApiError> {
+  const body = (await response.json().catch(() => ({}))) as ErrorBody;
+  return new ApiError(
+    response.status,
+    body.code ?? `http_${response.status}`,
+    errorMessage(response.status, body),
+    body.request_id,
+  );
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -39,10 +61,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
   }
 
-  if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as ErrorBody;
-    throw new ApiError(response.status, body.code ?? `http_${response.status}`, errorMessage(response.status, body), body.request_id);
-  }
+  if (!response.ok) throw await toApiError(response);
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
@@ -182,4 +201,42 @@ export async function generateMindMapStream(
     if ((error as Error).name === 'AbortError') return;
     throw new ApiError(0, 'stream_interrupted', '连接中断，请重试。');
   }
+}
+
+// ---- 文档上传与多来源生成 ----
+
+/**
+ * 上传文档，由后端解析成文本来源。
+ *
+ * 不走 request()：它固定带 `Content-Type: application/json`，而 multipart 的
+ * boundary 必须由浏览器自己生成。手动设头的结果是后端拆不出 file 字段，
+ * 所以这里只给 method 和 body，让 fetch 自己填类型。
+ */
+export async function uploadDocument(file: File): Promise<Source> {
+  const form = new FormData();
+  form.append('file', file);
+
+  let response: Response;
+  try {
+    response = await fetch(`${BASE}/ingestion/files`, { method: 'POST', body: form });
+  } catch {
+    throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
+  }
+
+  if (!response.ok) throw await toApiError(response);
+
+  const body = (await response.json().catch(() => null)) as CreateTextSourceResponse | null;
+  if (!body?.source?.id) {
+    // 契约里解析失败一定走 422；拿到空壳说明后端出了问题，别把 undefined 传给下一步。
+    throw new ApiError(response.status, 'empty_source', '后端没有返回解析结果，请重试。');
+  }
+  return body.source;
+}
+
+/** 把解析好的来源原样送回流水线生成导图。不做裁剪：后端 Source 是 extra="forbid"，少字段才安全。 */
+export function generateFromSources(sources: Source[]): Promise<PipelineResponse> {
+  return request<PipelineResponse>('/pipeline/generate', {
+    method: 'POST',
+    body: JSON.stringify({ sources }),
+  });
 }
