@@ -127,6 +127,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   let controller: AbortController | null = null;
 
+  /**
+   * 当前这轮流式生成的"回滚到生成前"函数。
+   *
+   * 用户主动点取消时要用它把旧图还回来；而换图（loadMap / newMap / preview）
+   * 引起的失效则不能回滚——那时画布上已经是要展示的新内容了。
+   */
+  let pendingRestore: (() => void) | null = null;
+
   const layout = computed<LayoutResult | null>(() =>
     content.value ? layoutTidy(content.value.root, { direction: direction.value }) : null,
   );
@@ -722,12 +730,23 @@ export const useMindMapStore = defineStore('mindmap', () => {
     status.value = '这是本地示例数据，用来检查布局与截断，不是模型生成的。';
   }
 
-  function cancel() {
+  /**
+   * 掐掉在途的流式生成。
+   *
+   * `restorePrevious` 为真表示这是用户主动取消，应该把生成前的导图还回来；
+   * 换图场景（loadMap / newMap / preview）传 false —— 那时画布上已经是要
+   * 展示的新内容，再回滚旧图反而是错的。
+   */
+  function cancel(restorePrevious = false) {
     const active = controller;
     controller = null;
     active?.abort();
     busy.value = false;
     stageText.value = '';
+    if (restorePrevious && pendingRestore) {
+      pendingRestore();
+    }
+    pendingRestore = null;
     status.value = '已取消。';
   }
 
@@ -783,6 +802,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       savedAt.value = previousSave.savedAt;
       dirty.value = previousSave.dirty;
     };
+    // 注册给 cancel()：用户点取消时由它负责回滚，因为那时 controller 已经被
+    // 清空，收尾分支认不出这次中断属于"主动取消"还是"换图"。
+    pendingRestore = restore;
 
     try {
       await generateMindMapStream(
@@ -859,6 +881,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
         busy.value = false;
         controller = null;
       }
+      // 本轮已经收尾，回滚注册作废，免得下一次 cancel() 拿到过期的闭包。
+      if (pendingRestore === restore) pendingRestore = null;
     }
   }
 

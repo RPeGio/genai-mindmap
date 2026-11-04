@@ -47,6 +47,77 @@ describe('节点文字', () => {
   });
 });
 
+describe('生成的取消与失效', () => {
+  it('用户主动取消生成：旧图要还回来，不能留下半成品', async () => {
+    // cancel() 会把 controller 清空，收尾分支因此认不出"这是我取消的"，
+    // 走不到回滚。结果画布上留着半棵树，mapId 为空、dirty 为假，
+    // 用户既存不了也不知道它没存过。
+    const encoder = new TextEncoder();
+    let push!: (frame: unknown) => void;
+    let closeStream!: () => void;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = frame => controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+        closeStream = () => controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, body, json: async () => ({}),
+    }) as unknown as Response));
+
+    const store = useMindMapStore();
+    // 先有一份已保存的旧图
+    store.loadMap(
+      { title: '旧图', root: { id: 'old', label: '旧图', children: [] } },
+      { id: 'm1', version: 3, updated_at: '2026-11-04T00:00:00Z' },
+    );
+
+    const task = store.generate('新主题');
+    push({ type: 'node', parentId: null, node: node('r', '半成品'), index: 0 });
+    await vi.waitFor(() => expect(store.content?.root.label).toBe('半成品'));
+
+    // 用户点取消。mock 的流不会因为 abort 自己结束，手动收尾。
+    store.cancel(true);
+    closeStream();
+    await task;
+
+    // 旧图（含身份与版本）回来了
+    expect(store.content?.title).toBe('旧图');
+    expect(store.mapId).toBe('m1');
+    expect(store.version).toBe(3);
+    expect(store.busy).toBe(false);
+  });
+
+  it('换图引起的失效不回滚：新建后不该冒回旧图', async () => {
+    const encoder = new TextEncoder();
+    let push!: (frame: unknown) => void;
+    let closeStream!: () => void;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = frame => controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+        closeStream = () => controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, body, json: async () => ({}),
+    }) as unknown as Response));
+
+    const store = useMindMapStore();
+    store.preview({ title: '示例', root: { id: 's', label: '示例', children: [] } }, 'right');
+
+    const task = store.generate('新主题');
+    push({ type: 'node', parentId: null, node: node('r', '半成品'), index: 0 });
+    await vi.waitFor(() => expect(store.content?.root.label).toBe('半成品'));
+
+    // 换图（内部 cancel() 不带 restore）
+    store.newMap();
+    closeStream();
+    await task;
+
+    expect(store.content).toBeNull();
+  });
+});
+
 describe('生成期间的编辑限制', () => {
   it('生成进行中不接受编辑：done 帧会整树替换，期间的改动静默丢失', async () => {
     // 流式生成边出节点边显示，用户看到就想改。但 done 到达时会用完整结果

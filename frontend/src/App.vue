@@ -264,7 +264,7 @@ async function copyBody() {
             v-if="store.busy"
             type="button"
             class="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700"
-            @click="store.cancel()"
+            @click="store.cancel(true)"
           >
             取消
           </button>
