@@ -137,4 +137,58 @@ describe('App', () => {
     expect(wrapper.text()).toContain('1 个节点');
     expect(wrapper.text()).toContain('演示模式');
   });
+
+  it('点保存把当前导图发给后端，成功后显示版本号', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: 'm1',
+        version: 1,
+        content: { title: '单节点', root: { id: 's', label: '单节点', children: [] } },
+        updated_at: '2026-11-04T00:00:00Z',
+      }),
+    }) as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = mountApp();
+
+    await vi.waitFor(() => expect(buttonByText(wrapper, '单节点')).toBeTruthy());
+    await buttonByText(wrapper, '单节点').trigger('click');
+    await buttonByText(wrapper, '保存').trigger('click');
+
+    await vi.waitFor(() =>
+      expect(wrapper.get('[role="status"]').text()).toContain('已保存，版本 1'));
+    expect(fetchMock).toHaveBeenCalledWith('/api/mindmaps', expect.objectContaining({ method: 'POST' }));
+  });
+
+  it('打开列表列出已保存的导图，点开后进入该导图', async () => {
+    const record = {
+      id: 'm9',
+      version: 2,
+      content: {
+        title: '打开这张',
+        root: {
+          id: 'r',
+          label: '打开这张',
+          children: [{ id: 'a', label: '甲', children: [] }],
+        },
+      },
+      updated_at: '2026-11-04T03:00:00Z',
+    };
+    const fetchMock = vi.fn(async (url: string) => ({
+      ok: true,
+      status: 200,
+      json: async () => (url === '/api/mindmaps' ? [record] : record),
+    }) as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = mountApp();
+
+    await buttonByText(wrapper, '打开').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('打开这张'));
+
+    await wrapper.get('ul li button').trigger('click');
+    await vi.waitFor(() =>
+      expect(wrapper.get('[role="status"]').text()).toContain('已打开导图，版本 2'));
+    expect(wrapper.text()).toContain('2 个节点');
+  });
 });

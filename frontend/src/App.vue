@@ -57,6 +57,27 @@ function saveNow() {
   void store.save();
 }
 
+/** 打开/新建都会丢掉当前这张图上的未保存修改，先问一句。 */
+function confirmDiscard(action: string): boolean {
+  if (!store.dirty) return true;
+  return window.confirm(`当前有未保存的修改，${action}会丢掉这些修改，继续？`);
+}
+
+function newMap() {
+  if (!confirmDiscard('新建导图')) return;
+  store.newMap();
+}
+
+async function openSaved(id: string) {
+  if (!confirmDiscard('打开另一张导图')) return;
+  await store.openMap(id);
+}
+
+function formatTime(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false });
+}
+
 /** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
 function onKeydown(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
@@ -133,6 +154,21 @@ async function copyBody() {
           @click="saveNow"
         >
           保存
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 disabled:opacity-40"
+          :disabled="store.listBusy"
+          @click="store.openList()"
+        >
+          打开
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700"
+          @click="newMap"
+        >
+          新建
         </button>
         <p>
           <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
@@ -295,6 +331,49 @@ async function copyBody() {
         </template>
       </aside>
     </main>
+
+    <div
+      v-if="store.listOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="list-title"
+    >
+      <div class="flex max-h-[70vh] w-full max-w-lg flex-col rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+        <div class="flex items-center justify-between">
+          <h2 id="list-title" class="text-sm font-semibold">已保存的导图</h2>
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="store.closeList()">
+            关闭
+          </button>
+        </div>
+        <p v-if="store.listBusy" class="mt-3 text-xs text-slate-400">正在读取…</p>
+        <p v-else-if="store.maps.length === 0" class="mt-3 text-xs text-slate-400">
+          还没有保存过任何导图。
+        </p>
+        <ul v-else class="mt-3 flex-1 divide-y divide-slate-100 overflow-y-auto">
+          <li
+            v-for="item in store.maps"
+            :key="item.id"
+            class="flex items-center justify-between gap-3 py-2"
+          >
+            <div class="min-w-0">
+              <p class="truncate text-sm text-slate-800">{{ item.content.title }}</p>
+              <p class="text-xs text-slate-400">
+                版本 {{ item.version }} · {{ item.content.root.children.length }} 个一级分支 ·
+                {{ formatTime(item.updated_at) }}
+              </p>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 rounded-md border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              @click="openSaved(item.id)"
+            >
+              打开
+            </button>
+          </li>
+        </ul>
+      </div>
+    </div>
 
     <div
       v-if="store.conflict"
