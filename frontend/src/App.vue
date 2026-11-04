@@ -45,6 +45,11 @@ async function generate() {
   await store.generate(prompt.value);
 }
 
+/** 标题用 change 提交（失焦或回车时），不在每次按键上都记一步撤销。 */
+function commitTitle(event: Event) {
+  store.renameTitle((event.target as HTMLInputElement).value);
+}
+
 async function copyBody() {
   const node = selected.value?.node;
   if (!node) return;
@@ -86,6 +91,9 @@ async function copyBody() {
         <span v-else-if="store.mode === 'model'" class="rounded bg-emerald-100 px-2 py-0.5 text-emerald-700">
           模型生成
         </span>
+        <span v-else-if="store.mode === 'saved'" class="rounded bg-slate-100 px-2 py-0.5 text-slate-600">
+          已保存导图
+        </span>
         <span v-else>未生成</span>
         <span class="ml-3">{{ store.nodeCount }} 个节点</span>
       </p>
@@ -93,11 +101,23 @@ async function copyBody() {
 
     <main class="flex min-h-0 flex-1">
       <section class="flex w-80 shrink-0 flex-col gap-3 border-r border-slate-200 bg-white p-4">
+        <div class="flex flex-col gap-1">
+          <label for="title" class="text-xs font-medium text-slate-600">导图标题</label>
+          <input
+            v-if="store.content"
+            id="title"
+            :value="store.content.title"
+            class="rounded-md border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-slate-500"
+            @change="commitTitle"
+          />
+          <p v-else class="text-xs text-slate-400">生成或新建之后可以改标题</p>
+        </div>
+
         <label for="prompt" class="text-xs font-medium text-slate-600">输入主题或文本</label>
         <textarea
           id="prompt"
           v-model="prompt"
-          rows="8"
+          rows="6"
           class="resize-none rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500"
           placeholder="例如：机器学习的主要方向"
         />
@@ -126,7 +146,7 @@ async function copyBody() {
           {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
         </p>
         <p class="mt-auto text-xs leading-relaxed text-slate-400">
-          当前版本是只读画布：可以平移、缩放、点选节点查看全文，不能拖动或编辑节点。
+          双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销、Ctrl+Shift+Z 重做。
         </p>
       </section>
 
@@ -142,6 +162,25 @@ async function copyBody() {
           >
             {{ item.label }}
           </button>
+          <span class="mx-1 w-px bg-slate-200" />
+          <button
+            type="button"
+            class="rounded px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="!store.canUndo"
+            title="撤销（Ctrl+Z）"
+            @click="store.undo()"
+          >
+            撤销
+          </button>
+          <button
+            type="button"
+            class="rounded px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="!store.canRedo"
+            title="重做（Ctrl+Shift+Z）"
+            @click="store.redo()"
+          >
+            重做
+          </button>
         </div>
         <MindMapCanvas />
       </section>
@@ -155,6 +194,37 @@ async function copyBody() {
           <p class="flex-1 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
             {{ displayBody(selected.node) }}
           </p>
+          <div class="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+              @click="store.beginEdit(selected.node.id)"
+            >
+              改文字（F2）
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+              @click="store.addChildTo(selected.node.id)"
+            >
+              加子节点（Tab）
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+              @click="store.addSiblingTo(selected.node.id)"
+            >
+              加兄弟（Enter）
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+              :disabled="selected.node.id === store.content?.root.id"
+              @click="store.deleteNode(selected.node.id)"
+            >
+              删除（Delete）
+            </button>
+          </div>
           <div class="flex items-center gap-2">
             <button
               type="button"
@@ -169,7 +239,7 @@ async function copyBody() {
         <template v-else>
           <h2 class="text-sm font-semibold">节点详情</h2>
           <p class="text-xs leading-relaxed text-slate-500">
-            点击画布上的任意节点查看完整内容与它所在的层级路径。生成的导图只是候选结构，编辑与保存将在下一版本提供。
+            点击画布上的任意节点查看完整内容与它所在的层级路径；双击节点可以直接改文字。
           </p>
         </template>
       </aside>

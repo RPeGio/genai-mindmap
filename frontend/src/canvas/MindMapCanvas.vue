@@ -1,20 +1,65 @@
 <script setup lang="ts">
 import { Background } from '@vue-flow/background';
 import { VueFlow, useVueFlow } from '@vue-flow/core';
-import { computed, nextTick, onBeforeUnmount, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import MindNode from './MindNode.vue';
 
 const store = useMindMapStore();
-const { fitView, onNodeClick, onPaneClick, onMoveEnd, updateNodeInternals } = useVueFlow();
+const { fitView, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
+  useVueFlow();
 
 onNodeClick(({ node }) => store.select(node.id));
+onNodeDoubleClick(({ node }) => store.beginEdit(node.id));
 onPaneClick(() => store.select(null));
 // 用户手动平移或缩放后停止自动适配，否则每长一个节点视图就会被拽回全图。
 onMoveEnd(() => {
   store.viewAdjusted = true;
 });
+
+/** 焦点在输入框里时不能抢键：那边的 Tab、Delete 归输入框自己管。 */
+function isTyping(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (isTyping(event.target)) return;
+
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+    event.preventDefault();
+    if (event.shiftKey) store.redo();
+    else store.undo();
+    return;
+  }
+
+  const id = store.selectedId;
+  if (!id) return;
+
+  switch (event.key) {
+    case 'Tab':
+      event.preventDefault();
+      store.addChildTo(id);
+      break;
+    case 'Enter':
+      event.preventDefault();
+      store.addSiblingTo(id);
+      break;
+    case 'Delete':
+    case 'Backspace':
+      event.preventDefault();
+      store.deleteNode(id);
+      break;
+    case 'F2':
+      event.preventDefault();
+      store.beginEdit(id);
+      break;
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown));
 
 let fitTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleFit() {
@@ -43,7 +88,10 @@ watch(
   { flush: 'post' },
 );
 
-onBeforeUnmount(() => clearTimeout(fitTimer));
+onBeforeUnmount(() => {
+  clearTimeout(fitTimer);
+  window.removeEventListener('keydown', onKeydown);
+});
 </script>
 
 <template>
@@ -63,7 +111,12 @@ onBeforeUnmount(() => clearTimeout(fitTimer));
     >
       <Background :gap="20" pattern-color="#e2e8f0" />
       <template #node-mind="nodeProps">
-        <MindNode v-bind="nodeProps" />
+        <MindNode
+          v-bind="nodeProps"
+          :editing="store.editingId === nodeProps.id"
+          @commit="label => store.commitLabel(nodeProps.id, label)"
+          @cancel="store.endEdit()"
+        />
       </template>
     </VueFlow>
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Handle, Position } from '@vue-flow/core';
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
 import type { ChildSide } from '../canvas/layout/tidy';
 import type { MindNodeData } from '../stores/mindmap';
@@ -9,6 +9,12 @@ const props = defineProps<{
   id: string;
   data: MindNodeData;
   selected?: boolean;
+  editing?: boolean;
+}>();
+
+const emit = defineEmits<{
+  commit: [label: string];
+  cancel: [];
 }>();
 
 const POSITIONS: Record<ChildSide, Position> = {
@@ -35,6 +41,34 @@ function scheduleCard() {
 function hideCard() {
   clearTimeout(timer);
   card.value = false;
+}
+
+const draft = ref('');
+const input = ref<HTMLInputElement | null>(null);
+/** 防止"回车提交"之后紧跟的 blur 再提交一次（第二次会带着旧值覆盖结果）。 */
+let settled = false;
+
+watch(
+  () => props.editing,
+  async editing => {
+    if (!editing) {
+      settled = false;
+      return;
+    }
+    draft.value = props.data.fullLabel;
+    settled = false;
+    await nextTick();
+    input.value?.focus();
+    input.value?.select();
+  },
+  { immediate: true },
+);
+
+function finish(commit: boolean) {
+  if (settled) return;
+  settled = true;
+  if (commit) emit('commit', draft.value);
+  else emit('cancel');
 }
 
 onBeforeUnmount(() => clearTimeout(timer));
@@ -77,11 +111,22 @@ onBeforeUnmount(() => clearTimeout(timer));
       :title="data.fullLabel"
       tabindex="0"
     >
-      <span class="line-clamp-2 break-words">{{ data.label }}</span>
+      <input
+        v-if="editing"
+        ref="input"
+        v-model="draft"
+        class="w-full bg-transparent text-center outline-none"
+        :maxlength="200"
+        @keydown.enter.prevent="finish(true)"
+        @keydown.esc.prevent="finish(false)"
+        @keydown.tab.prevent="finish(true)"
+        @blur="finish(true)"
+      />
+      <span v-else class="line-clamp-2 break-words">{{ data.label }}</span>
     </div>
 
     <div
-      v-if="card"
+      v-if="card && !editing"
       class="absolute bottom-full left-1/2 z-30 mb-2 w-72 -translate-x-1/2 rounded-md border border-slate-300 bg-white p-3 text-left shadow-lg"
     >
       <p class="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-sm text-slate-700">
