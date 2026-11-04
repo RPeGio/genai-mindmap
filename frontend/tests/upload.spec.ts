@@ -195,6 +195,26 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     expect(store.content?.root.children[0].label).toBe('监督学习');
   });
 
+  it('等待期间正在输入框里打字（尚未提交）：同样不落图', async () => {
+    // 打字时文字只在 MindNode.vue 的本地 draft 里，store 的 content 引用没变。
+    // 只比引用会漏掉这种"输入到一半"的修改，所以要连编辑态一起判断。
+    const { store } = mountApp();
+    store.preview(generated, 'right');
+
+    const gate = stubGeneratePending();
+    const running = store.uploadAndGenerate(smallFile());
+    await gate.waitUntilPending();
+
+    // 打开编辑器但不提交
+    store.beginEdit('c');
+    expect(store.editingId).toBe('c');
+    gate.release();
+    await running;
+
+    expect(store.content?.root.children[0].label).toBe('监督学习');
+    expect(store.uploadError).toContain('保留你的修改');
+  });
+
   it('等待期间切换导图：不套到当前图上', async () => {
     const { store } = mountApp();
     store.preview(generated, 'right');

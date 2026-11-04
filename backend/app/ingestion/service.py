@@ -144,10 +144,14 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
             raise NotSupportedSource(
                 f"{reason}；这份 PDF 也没有文本层可以退回（可能是扫描件），"
                 "请确认模型服务可用后重试")
+        # 文本层里空白的页也要报出来：整份都是扫描页与"中间夹了几页扫描页"
+        # 是两种不同的残缺，用户需要知道到底缺哪几页。
+        empty = [index + 1 for index, page in enumerate(text_pages) if not page.strip()]
         return Source(kind=SourceKind.document, filename=filename, text=text,
                       span=SourceSpan(page=page_count) if page_count else None,
-                      parsed_pages=len(usable),
+                      parsed_pages=len(text_pages),
                       truncated=len(text_pages) < page_count,
+                      failed_pages=empty,
                       status="parsed")
 
     try:
@@ -177,11 +181,16 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
         return fallback("识别结果里没有可用文字")
 
     # 两个信号分开表达，含义不同：
-    #   truncated    —— 页数超过上限，后半截根本没处理
+    #   truncated    —— 页数超过上限，第 limit+1 页往后根本没处理
     #   failed_pages —— 处理过的页里有几页彻底没拿到内容（中间有洞）
+    #
+    # parsed_pages 表示**处理边界**（最多处理到第几页），不是"有内容的页数"。
+    # 前端拿它渲染「共 N 页，仅处理前 M 页」，用成功页数会算出偏小的边界
+    # ——比如前 20 页里第 2 页失败，成功 19 页，就会误报"仅处理前 19 页"，
+    # 而第 20 页其实处理过。缺哪几页由 failed_pages 表达。
     return Source(kind=SourceKind.document, filename=filename, text=text,
                   span=SourceSpan(page=total) if total else None,
-                  parsed_pages=len(usable),
+                  parsed_pages=limit,
                   truncated=limit < total,
                   failed_pages=unrecovered,
                   status="parsed")

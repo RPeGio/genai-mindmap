@@ -231,7 +231,8 @@ class PdfVisionTest(unittest.TestCase):
         self.assertEqual(source.failed_pages, [2])
         # 页数没超上限，所以不算"截断"——这两个信号必须分开
         self.assertFalse(source.truncated)
-        self.assertEqual(source.parsed_pages, 2)
+        # parsed_pages 是处理边界（3 页都处理了），不是"有内容的页数"
+        self.assertEqual(source.parsed_pages, 3)
         self.assertEqual(source.span.page, 3)
 
     def test_partial_failure_does_not_fake_truncated_hint(self):
@@ -243,11 +244,27 @@ class PdfVisionTest(unittest.TestCase):
             extract.return_value = (["# 一", "", "# 三"], 3, 3, [2])
             source = parse_document_bytes("a.pdf", b"%PDF-fake")
 
-        # truncated 为假时前端不会渲染"仅处理前 N 页"，改由 failed_pages 说明
+        # truncated 为假时前端不渲染"仅处理前 N 页"，缺页改由 failed_pages 说明
         self.assertFalse(source.truncated)
         self.assertEqual(source.failed_pages, [2])
         self.assertEqual(source.span.page, 3)
-        self.assertLess(source.parsed_pages, source.span.page)
+        # 处理边界是 3（全部处理过），但正文里只有两页的内容
+        self.assertEqual(source.parsed_pages, 3)
+        self.assertNotIn("page 2", source.text or "")
+
+    def test_fallback_reports_pages_without_text_layer(self):
+        """视觉整体不可用、退回文本层时，文本层里空白的页同样要报出来。"""
+        from unittest.mock import patch
+
+        # 3 页里第 2 页没有文本层（扫描页），另外两页有
+        with patch("app.ingestion.service._parse_pdf",
+                   return_value=(["page 1 text", "", "page 3 text"], 3)):
+            source = parse_document_bytes("a.pdf", b"%PDF-fake")
+
+        self.assertIn("page 1 text", source.text)
+        self.assertEqual(source.failed_pages, [2])
+        self.assertEqual(source.parsed_pages, 3)
+        self.assertFalse(source.truncated)
 
     def test_page_limit_marks_truncated(self):
         from unittest.mock import patch

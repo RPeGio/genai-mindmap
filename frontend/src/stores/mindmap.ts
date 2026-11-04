@@ -935,7 +935,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
       // 落图之前先看用户在这几十秒里做了什么
       const switched = sessionAtStart !== mapSession;
-      const edited = content.value !== contentAtStart;
+      // editingId 非空时，用户正在节点输入框里打字，文字还在组件的本地 draft 里，
+      // content 引用根本没变——只比引用会漏掉这种"输入到一半"的修改。
+      const edited = content.value !== contentAtStart || editingId.value !== null;
       if (switched || edited) {
         const reason = switched ? 'switched' : 'edited';
         const replace = options?.confirmReplace?.(reason) ?? false;
