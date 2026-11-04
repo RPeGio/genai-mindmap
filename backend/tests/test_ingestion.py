@@ -73,12 +73,12 @@ class DocumentGuardTest(unittest.TestCase):
         for suffix in (".pdf", ".docx", ".pptx"):
             self.assertIn(suffix, DOCUMENT_SUFFIXES)
 
-    def test_legacy_office_formats_rejected(self):
-        """旧版二进制格式需要 LibreOffice，刻意不支持，并提示另存为新格式。"""
+    def test_legacy_office_formats_are_supported(self):
+        """旧格式现在支持：.doc/.ppt 经 LibreOffice 转 PDF 再走视觉提取，
+        .xls 用 xlrd 直读。依赖缺失时会报错并给出安装命令，不静默降级。"""
         for suffix in (".doc", ".ppt", ".xls"):
             with self.subTest(suffix=suffix):
-                with self.assertRaises(NotSupportedSource):
-                    parse_document_bytes("a" + suffix, b"x")
+                self.assertIn(suffix, DOCUMENT_SUFFIXES)
 
     def test_bytes_dispatch_by_kind(self):
         """parse_bytes 会把 document 交给文档解析器，而不是当成文本。"""
@@ -218,6 +218,77 @@ class PdfVisionTest(unittest.TestCase):
         self.assertEqual(source.span.page, 25)
         self.assertEqual(source.parsed_pages, 20)
         self.assertTrue(source.truncated)
+
+
+class LegacyOfficeTest(unittest.TestCase):
+    """旧格式的三条链路：.doc/.ppt 转 PDF 后走视觉，.xls 用 xlrd。"""
+
+    def test_doc_without_libreoffice_reports_install_hint(self):
+        """没装 LibreOffice 时要给出安装命令，而不是笼统的"解析失败"。"""
+        from unittest.mock import patch
+
+        from app.ingestion.legacy_office import LegacyFormatUnavailable
+
+        with patch("app.ingestion.legacy_office.soffice_cmd", return_value=None):
+            with self.assertRaises(NotSupportedSource) as raised:
+                parse_document_bytes("a.doc", b"\xd0\xcf\x11\xe0fake")
+        message = str(raised.exception)
+        self.assertIn("LibreOffice", message)
+        self.assertIn("apt install", message)
+
+    def test_ppt_conversion_failure_is_reported(self):
+        from unittest.mock import patch
+
+        from app.ingestion.legacy_office import LegacyFormatUnavailable
+
+        with patch("app.ingestion.legacy_office.convert_to_pdf",
+                   side_effect=LegacyFormatUnavailable("转换超时")):
+            with self.assertRaises(NotSupportedSource) as raised:
+                parse_document_bytes("a.ppt", b"\xd0\xcf\x11\xe0fake")
+        self.assertIn("转换超时", str(raised.exception))
+
+    def test_converted_pdf_goes_through_vision(self):
+        """转换成功后应当复用 PDF 的视觉提取链路。"""
+        from unittest.mock import patch
+
+        with patch("app.ingestion.legacy_office.convert_to_pdf",
+                   return_value=make_pdf(2)) as convert, \
+             patch("app.ingestion.vision_pdf.extract_pages") as extract:
+            extract.return_value = (["# 第一章", "## 1.1"], 2, 2, [])
+            source = parse_document_bytes("a.doc", b"\xd0\xcf\x11\xe0fake")
+        convert.assert_called_once()
+        self.assertIn("# 第一章", source.text)
+        self.assertEqual(source.span.page, 2)
+
+    def test_xls_cell_formatting(self):
+        """日期的序列号、整数的多余小数都要在输出前处理掉。"""
+        from app.ingestion.legacy_office import _cell_text
+
+        class Cell:
+            def __init__(self, ctype, value):
+                self.ctype = ctype
+                self.value = value
+
+        import xlrd
+
+        book = type("Book", (), {"datemode": 0})()
+        self.assertEqual(_cell_text(book, Cell(xlrd.XL_CELL_NUMBER, 12.0)), "12")
+        self.assertEqual(_cell_text(book, Cell(xlrd.XL_CELL_NUMBER, 3.5)), "3.5")
+        self.assertEqual(_cell_text(book, Cell(xlrd.XL_CELL_TEXT, "苹果")), "苹果")
+        self.assertEqual(_cell_text(book, Cell(xlrd.XL_CELL_EMPTY, "")), "")
+        self.assertEqual(_cell_text(book, Cell(xlrd.XL_CELL_BOOLEAN, 1)), "TRUE")
+        # 46096 是 Excel 日期序列号，对应 2026-03-15
+        self.assertEqual(_cell_text(book, Cell(xlrd.XL_CELL_DATE, 46096.0)), "2026-03-15")
+
+    def test_xls_empty_content_is_rejected(self):
+        from unittest.mock import patch
+
+        from app.ingestion.legacy_office import LegacyFormatUnavailable
+
+        with patch("app.ingestion.legacy_office.read_xls",
+                   side_effect=LegacyFormatUnavailable("没有可读的单元格")):
+            with self.assertRaises(NotSupportedSource):
+                parse_document_bytes("a.xls", b"\xd0\xcf\x11\xe0fake")
 
 
 if __name__ == "__main__":

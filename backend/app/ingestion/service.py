@@ -17,18 +17,16 @@
 **其余格式仍然走 Docling**：DOCX / PPTX / XLSX / HTML 走的是它的非版式
 流水线，不加载 PDF 版面模型，内存开销可以忽略，没有理由换掉。
 
-旧格式 .doc / .ppt / .xls 不在支持列表里：它们是二进制复合文档，Docling 要先
-经 LibreOffice 转成新格式才能读。实测代价——
+旧格式 .doc / .ppt / .xls 现已支持，但走的路不同：
 
-    磁盘      LibreOffice 装完占 1.5GB
-    内存      转换时进程树峰值 720~745MB
-              （Docling 主进程 365MB + soffice 子进程 355~380MB）
-    耗时      是新格式的 4~9 倍（.doc 8.1s vs .docx 1.8s；.xls 4.8s vs .xlsx 0.5s）
-    质量      与新格式逐字相同，没有额外收益
+    .doc / .ppt   交给 LibreOffice 渲染成 PDF，再复用 PDF 的视觉提取。
+                  纯 Python 抽不全——实测 .ppt 只能捞出字体名和母版占位符，
+                  正文与表格根本拿不到。
+    .xls          xlrd 直接读单元格。它是行列结构，读出来又快又准，
+                  没必要绕一圈渲染再识别。
 
-而且 Docling 每份文件都用独立的临时 LibreOffice profile，没有进程复用，
-意味着这个开销每份文件都要付一次。2C2G 的部署机同时养 Docling 和 LibreOffice
-并不现实，明确拒绝并提示另存为新格式，比"装了依赖才能用"更诚实。
+前者需要安装 LibreOffice（约 1.5GB 磁盘），后者需要 xlrd（约 100KB）。
+缺依赖时报错文案会给出安装命令，不会静默降级成空内容。
 
 未实现的格式统一抛 NotSupportedSource，由路由层转成 422，
 不要返回空 Source 假装成功。
@@ -46,11 +44,17 @@ MAX_PAGES = 50
 
 # 接受解析的文档扩展名。
 #
-# 刻意不含 .doc / .ppt / .xls：这三个是二进制旧格式，需要 LibreOffice 先转换。
-# 实测转换时进程树峰值 720~745MB、耗时是新格式的 4~9 倍，而 LibreOffice 本身
-# 还要占 1.5GB 磁盘；2C2G 的部署机同时养 Docling 和它并不现实。
+# 分三类，走三条不同的解析链路：
+#   PDF                      视觉提取（逐页渲染 → 多模态模型）
+#   DOCX/PPTX/XLSX/HTML/MD   Docling 读结构化格式，不需要版面模型
+#   DOC/PPT/XLS              旧版二进制：前两者经 LibreOffice 转 PDF 后走视觉提取，
+#                            .xls 用 xlrd 直读单元格
 DOCUMENT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx",
-                     ".html", ".htm", ".md", ".asciidoc", ".adoc"}
+                     ".html", ".htm", ".md", ".asciidoc", ".adoc",
+                     ".doc", ".ppt", ".xls"}
+
+# 需要先经 LibreOffice 渲染成 PDF 的旧格式
+LEGACY_RENDER_SUFFIXES = {".doc", ".ppt"}
 
 _converter = None
 _converter_lock = threading.Lock()
@@ -241,11 +245,46 @@ def _parse_office_source(filename: str | None, raw: bytes) -> Source:
                   status="parsed")
 
 
+def _parse_legacy_rendered_source(filename: str | None, raw: bytes,
+                                  suffix: str) -> Source:
+    """旧格式 .doc / .ppt：先转 PDF，再复用视觉提取。
+
+    转出来的 PDF 自带文本层（LibreOffice 渲染的），所以视觉提取若不可用，
+    `_parse_pdf_source` 的兜底逻辑还能从文本层拿到内容。
+    """
+    from app.ingestion import legacy_office
+
+    try:
+        pdf_bytes = legacy_office.convert_to_pdf(raw, suffix)
+    except legacy_office.LegacyFormatUnavailable as exc:
+        raise NotSupportedSource(str(exc)) from exc
+    return _parse_pdf_source(filename, pdf_bytes)
+
+
+def _parse_xls_source(filename: str | None, raw: bytes) -> Source:
+    """旧格式 .xls：xlrd 直读单元格，转成 Markdown 表格。"""
+    from app.ingestion import legacy_office
+
+    try:
+        markdown = legacy_office.read_xls(raw)
+    except legacy_office.LegacyFormatUnavailable as exc:
+        raise NotSupportedSource(str(exc)) from exc
+
+    text = _normalize_markdown(markdown)
+    if not text:
+        raise NotSupportedSource("这份 .xls 里没有可读的单元格内容")
+
+    # 表格没有"页"的概念，span 留空；行数放 parsed_pages 也不合适，一并留空。
+    return Source(kind=SourceKind.document, filename=filename, text=text,
+                  span=None, parsed_pages=None, truncated=False,
+                  status="parsed")
+
+
 def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
     """解析上传的文档，返回带正文的 Source。
 
-    扫描件（没有文本层）会解析出空内容，这里显式拒绝 —— 返回空 Source
-    会让下游生成一棵空树，比直接报错更难排查。
+    空内容与无文本层都会显式拒绝 —— 返回空 Source 会让下游生成一棵空树，
+    比直接报错更难排查。
     """
     suffix = _suffix_of(filename)
     if suffix not in DOCUMENT_SUFFIXES:
@@ -256,6 +295,10 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
 
     if suffix == ".pdf":
         return _parse_pdf_source(filename, raw)
+    if suffix in LEGACY_RENDER_SUFFIXES:
+        return _parse_legacy_rendered_source(filename, raw, suffix)
+    if suffix == ".xls":
+        return _parse_xls_source(filename, raw)
     return _parse_office_source(filename, raw)
 
 

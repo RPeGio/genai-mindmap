@@ -261,7 +261,7 @@ async function copyBody() {
             <input
               type="file"
               class="sr-only"
-              accept=".pdf,.docx,.pptx,.xlsx,.html,.htm,.md,.asciidoc,.adoc"
+              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc"
               :disabled="store.uploadBusy || store.busy"
               @change="onPickFile"
             />
