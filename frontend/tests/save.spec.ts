@@ -389,6 +389,44 @@ describe('保存', () => {
     // 切图后 saving 已被 loadMap 重置，新页面可以立即保存
     expect(store.saving).toBe(false);
   });
+  it('保存期间换了一张图：saving 要复位，新图还能继续保存', async () => {
+    // 旧保存的 finally 因为会话不匹配会跳过清理，换图入口必须自己复位。
+    // 否则 saving 永远为真，之后每次 save() 都直接返回 busy。
+    const store = useMindMapStore();
+    store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
+    store.commitLabel('a', 'A 的改动');
+
+    let releaseSave: (() => void) | null = null;
+    stubFetch(async () => {
+      await new Promise<void>(resolve => { releaseSave = resolve; });
+      return jsonResponse({
+        id: 'm1', version: 2, content: sample(), updated_at: '2026-11-04T01:00:00Z',
+      } satisfies MapRecord);
+    });
+
+    const saving = store.save();
+    await vi.waitFor(() => expect(releaseSave).not.toBeNull());
+
+    // 保存还没回来，上传生成替换了画布
+    store.preview(
+      { title: '新图', root: { id: 'nr', label: '新根', children: [] } },
+      'right',
+    );
+
+    releaseSave!();
+    await saving;
+
+    // 新图不卡在"保存中"
+    expect(store.saving).toBe(false);
+
+    // 而且真的能保存
+    stubFetch(() =>
+      jsonResponse({ id: 'm2', version: 1, content: sample(), updated_at: '2026-11-04T02:00:00Z' }, 201),
+    );
+    await expect(store.save()).resolves.toBe('saved');
+    expect(store.mapId).toBe('m2');
+  });
+
   it('保存期间重新生成：旧响应不会把身份套到生成出的新图上', async () => {
     // 文本生成同样会换掉整张图，会话必须跟着切。否则 A 的保存响应回来时
     // 会话号没变，mapId 会被写回 A，之后保存新图就 PUT 到 A 的记录上。

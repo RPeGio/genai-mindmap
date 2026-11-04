@@ -680,6 +680,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 下次保存就把新内容 PUT 到旧记录上。
     mapSession += 1;
     titleDraft.value = null;
+    // 上一张图在途的保存到这里就作废了：它的 finally 因为会话不匹配不会
+    // 清理 saving，这里必须自己复位，否则新图永远卡在"保存中"，点保存
+    // 只会返回 busy。loadMap / newMap / generate 都是同一套处理。
+    saving.value = false;
     direction.value = dir;
     content.value = next;
     mode.value = 'demo';
