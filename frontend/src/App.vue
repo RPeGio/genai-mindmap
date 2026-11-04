@@ -268,7 +268,7 @@ async function copyBody() {
             {{ store.uploadBusy ? '处理中…' : '选择文件：PDF / Word / PPT / Excel / HTML' }}
           </label>
           <p class="text-xs leading-relaxed text-slate-400">
-            选完自动上传解析，上限 10MB。PDF 只读文本层，扫描件需要先做 OCR。
+            选完自动上传解析，上限 10MB。PDF 逐页识别，扫描件也能读，最多 20 页。
           </p>
 
           <p v-if="store.uploadState === 'parsing'" class="text-xs text-slate-600">

@@ -203,8 +203,8 @@ describe('上传文档生成导图', () => {
   });
 
   const details = [
-    '暂不支持的文件类型：.doc；这是旧版二进制格式，解析它需要经 LibreOffice 转换，请另存为 .docx 后再上传',
-    '这份 PDF 没有文本层，可能是扫描件或纯图片版；请先做 OCR 或直接粘贴文字',
+    '解析 .doc / .ppt 需要 LibreOffice 做格式转换。安装方式：apt install -y libreoffice-writer libreoffice-impress',
+    '视觉提取不可用（当前是 demo 模式）；这份 PDF 也没有文本层可以退回（可能是扫描件），请确认模型服务可用后重试',
     '文件内容为空',
   ];
 
