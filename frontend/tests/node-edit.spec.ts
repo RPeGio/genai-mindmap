@@ -62,6 +62,18 @@ describe('节点内联编辑', () => {
     wrapper.unmount();
   });
 
+  it('Tab 走 next 事件：提交文字后还要接着加下一个', async () => {
+    const wrapper = render({ editing: true });
+
+    const input = wrapper.get('input');
+    await input.setValue('第一个');
+    await input.trigger('keydown', { key: 'Tab' });
+
+    expect(wrapper.emitted('next')).toEqual([['第一个']]);
+    expect(wrapper.emitted('commit')).toBeUndefined();
+    wrapper.unmount();
+  });
+
   it('失焦也算提交，且不会因为回车后再失焦重复提交一次', async () => {
     const wrapper = render({ editing: true });
 

@@ -112,6 +112,58 @@ describe('建树与删除', () => {
     expect(store.content?.root.children).toHaveLength(3);
   });
 
+  it('编辑中连按 Tab，加的是同一个父节点下的一串兄弟，不是一路下钻', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.select('a');
+    store.addChildTo('a');
+    const first = store.editingId!;
+    store.commitAndAddChild('第一');
+    store.commitAndAddChild('第二');
+
+    const children = store.content?.root.children[0].children ?? [];
+    expect(children.map(child => child.label)).toEqual(['甲一', '第一', '第二', '新节点']);
+    expect(children.map(child => child.id)).toContain(first);
+    // 最后一个新节点仍挂在 a 下面，深度没有变。
+    expect(store.editingId).toBe(children[children.length - 1]?.id);
+  });
+
+  it('Tab 提交被拦下（空标题）时不再接着加节点', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.addChildTo('a');
+    const before = store.nodeCount;
+    store.commitAndAddChild('   ');
+
+    expect(store.nodeCount).toBe(before);
+    expect(store.status).toBe('节点标题不能为空');
+  });
+
+  it('别的输入框失焦重提时，不会把正在编辑的新节点关掉', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.addChildTo('root');
+    const editing = store.editingId!;
+    // 上一个编辑框卸载时浏览器还会补一个 blur，等于把没改过的文字再提交一遍。
+    store.commitLabel('a', '甲');
+
+    expect(store.editingId).toBe(editing);
+  });
+
+  it('selected 标志跟着 store 的选中走，画布高亮才不会停在旧节点', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.addChildTo('a');
+    const added = store.editingId!;
+
+    const selected = store.nodes.filter(item => item.selected === true).map(item => item.id);
+    expect(selected).toEqual([added]);
+  });
+
   it('删除节点会删掉子树并选中父节点', () => {
     const store = useMindMapStore();
     store.preview(sample(), 'right');

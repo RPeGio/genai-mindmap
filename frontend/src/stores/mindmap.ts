@@ -61,6 +61,12 @@ export interface FlatNode {
   parentId: string | null;
 }
 
+/**
+ * 画布节点。Vue Flow 的 `Node` 输入类型里没有 `selected`（它把选中当内部状态），
+ * 但 `:nodes` 变化时 applyChanges 会把 `selected` 同步进去，所以这里补上这个字段的类型。
+ */
+export type MindFlowNode = FlowNode<MindNodeData> & { selected: boolean };
+
 function flatten(root: MindNode): FlatNode[] {
   const out: FlatNode[] = [];
   const walk = (node: MindNode, depth: number, parentId: string | null) => {
@@ -114,7 +120,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     content.value ? flatten(content.value.root) : [],
   );
 
-  const nodes = computed<FlowNode<MindNodeData>[]>(() => {
+  const nodes = computed<MindFlowNode[]>(() => {
     const current = layout.value;
     if (!current) return [];
 
@@ -146,6 +152,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
         type: 'mind',
         draggable: false,
         connectable: false,
+        // 选中态由 store 说了算。只在点击时靠 Vue Flow 自己切换的话，代码里改选中
+        // （加节点、删节点后跳到父节点）画布上看不出来，用户会以为还停在原来那个节点上。
+        selected: selectedId.value === node.id,
         position: {
           x: point.x - NODE_SIZE.width / 2,
           y: point.y - NODE_SIZE.height / 2,
@@ -158,7 +167,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
           out: outSides,
           in: inSides,
         },
-      } satisfies FlowNode<MindNodeData>;
+      } satisfies MindFlowNode;
     });
   });
 
@@ -267,7 +276,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     const next = label.trim();
     if (next === node.label.trim()) {
-      editingId.value = null;
+      // 只收拾自己的编辑态：连按 Tab 时上一个输入框失焦会再提交一次，
+      // 那时正在编辑的其实是新节点，这里不能把新节点的编辑态一起关掉。
+      if (editingId.value === id) editingId.value = null;
       return;
     }
     if (!next) {
@@ -280,7 +291,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
 
     applyContent({ ...content.value, root: renameNode(content.value.root, id, next) }, true);
-    editingId.value = null;
+    if (editingId.value === id) editingId.value = null;
     status.value = '已修改，记得保存。';
   }
 
@@ -321,6 +332,21 @@ export const useMindMapStore = defineStore('mindmap', () => {
     selectedId.value = node.id;
     editingId.value = node.id;
     status.value = '已加子节点，输入文字后按回车确认。';
+  }
+
+  /**
+   * 编辑新节点时按 Tab：先提交文字，再回到它的父节点下加一个兄弟。
+   * 若只看 selectedId，新节点一被选中，Tab 就变成"给子节点加子节点"——连按会一路下钻；
+   * 用户预期是同一个父节点下排出一串兄弟，所以这里固定回到父节点。
+   */
+  function commitAndAddChild(label: string) {
+    const id = editingId.value;
+    if (!id) return;
+    const parent = content.value ? findParent(content.value.root, id) : null;
+    commitLabel(id, label);
+    // 提交被拦下（空标题、超长）时编辑态还在，别在错误的基础上接着加节点。
+    if (editingId.value === id) return;
+    addChildTo(parent?.id ?? selectedId.value ?? id);
   }
 
   function addSiblingTo(id: string) {
@@ -763,6 +789,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     renameTitle,
     addChildTo,
     addSiblingTo,
+    commitAndAddChild,
     deleteNode,
     undo,
     redo,

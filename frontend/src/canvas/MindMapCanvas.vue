@@ -115,6 +115,7 @@ onBeforeUnmount(() => {
           v-bind="nodeProps"
           :editing="store.editingId === nodeProps.id"
           @commit="label => store.commitLabel(nodeProps.id, label)"
+          @next="label => store.commitAndAddChild(label)"
           @cancel="store.endEdit()"
         />
       </template>
