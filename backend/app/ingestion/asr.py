@@ -156,7 +156,12 @@ def _decode_wav(raw: bytes) -> tuple[bytes, int, float, int]:
         raise AsrError("音频不是合法的 WAV 文件") from exc
 
     if channels != 1:
-        raise AsrError(f"音频是 {channels} 声道，语音识别只接受单声道")
+        # 服务端不会拒绝立体声——实测它照收并返回 200，然后把交错的
+        # L/R 采样按单声道解释，静默吐出一段听起来像话的乱码（实测
+        # 「会议决定…」+「思维导图…」混成立体声后识别成 39 字噪音）。
+        # 那种错误会一路流进导图而不触发任何告警，所以必须在这里拦死。
+        raise AsrError(f"音频是 {channels} 声道，语音识别只接受单声道；"
+                       f"双声道内容会被当成交错采样解析，产出错误文本而不报错")
     if width != 2:
         raise AsrError(f"音频位宽 {width * 8} bit，语音识别只接受 16 bit")
     if rate not in SUPPORTED_RATES:

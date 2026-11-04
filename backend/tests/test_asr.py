@@ -45,9 +45,17 @@ class WavSpecTest(unittest.TestCase):
         self.assertEqual(rate, 8000)
 
     def test_rejects_stereo(self):
+        """服务端不拒绝立体声，会静默产出乱码，所以必须本地拦死（实测）。
+
+        把左右声道内容不同的立体声发过去，服务端返回 200 和 39 个字，
+        但内容是「向人手一下中山笑声风雨…」这种噪音。这类错误不会触发
+        任何告警，会一路流进导图。
+        """
         with self.assertRaises(AsrError) as ctx:
             asr._decode_wav(make_wav(1.0, channels=2))
-        self.assertIn("声道", str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn("声道", message)
+        self.assertIn("不报错", message)
 
     def test_rejects_8bit(self):
         with self.assertRaises(AsrError) as ctx:
