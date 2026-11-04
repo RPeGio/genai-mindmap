@@ -56,7 +56,16 @@ async function onPickFile(event: Event) {
   if (!file) return;
   // 上传成功同样会整体替换画布上的树，和「生成导图」一样先确认能不能丢掉未保存的修改。
   if (!confirmDiscard('上传文档生成导图')) return;
-  await store.uploadAndGenerate(file);
+  // 解析 + 生成可能几十秒，这期间用户还能改画布。结果回来时如果发现改过，
+  // 交给用户决定要不要替换——静默覆盖等于把这段时间的工作丢掉。
+  await store.uploadAndGenerate(file, {
+    confirmReplace: reason =>
+      window.confirm(
+        reason === 'switched'
+          ? '生成结果已就绪，但你已经切换到另一张导图。\n用新生成的导图替换当前画布吗？取消将保留当前内容。'
+          : '生成结果已就绪，但等待期间你修改过当前导图。\n用新生成的导图替换你的修改吗？取消将保留你的修改。',
+      ),
+  });
 }
 
 /** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */

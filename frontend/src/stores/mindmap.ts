@@ -854,10 +854,23 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *
    * 失败时不动画布上的旧图：解析失败和生成失败都只提示原因。
    * 用户手上那张导图仍在，比清成白板更接近预期，也免得无谓地丢掉未保存的修改。
+   *
+   * 解析 + 生成可能持续几十秒（PDF 逐页识别尤其慢）。这期间画布仍然可编辑，
+   * 用户在等待过程中改的东西不能被结果静默盖掉，所以落图前要检查：
+   *   - 导图身份变了（切到别的图或点了新建）→ 结果属于上一张，不能套到当前图上
+   *   - 内容变过（用户改了节点）→ 尊重用户的改动，先问一句
+   * 两种情形都交给 confirmReplace 决定，没提供回调时一律保留现状。
    */
-  async function uploadAndGenerate(file: File): Promise<void> {
+  async function uploadAndGenerate(
+    file: File,
+    options?: { confirmReplace?: (reason: 'edited' | 'switched') => boolean },
+  ): Promise<void> {
     // 同一时刻只走一条链路：preview() 会掐掉在途的流式请求，反过来流式结束也会顶掉新结果。
     if (uploadState.value !== 'idle' || busy.value) return;
+
+    // 记录等待开始时的状态，生成回来时用来判断用户有没有动过
+    const sessionAtStart = mapSession;
+    const contentAtStart = content.value;
 
     uploadError.value = '';
     uploadSource.value = null;
@@ -903,6 +916,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     try {
       const result = await generateFromSources([source]);
+
+      // 落图之前先看用户在这几十秒里做了什么
+      const switched = sessionAtStart !== mapSession;
+      const edited = content.value !== contentAtStart;
+      if (switched || edited) {
+        const reason = switched ? 'switched' : 'edited';
+        const replace = options?.confirmReplace?.(reason) ?? false;
+        if (!replace) {
+          uploadError.value = switched
+            ? '生成结果已就绪，但期间已切换到别的导图，已保留当前内容。'
+            : '生成结果已就绪，但期间你修改过当前导图，已保留你的修改。';
+          status.value = uploadError.value;
+          return;
+        }
+      }
+
       // preview() 会把模式与脏标记按"本地示例"重置，所以调完再按真实来源改回来。
       preview(result.content, direction.value);
       mode.value = result.mode;

@@ -110,6 +110,114 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('上传期间用户改动不会被静默覆盖', () => {
+  /**
+   * 让生成请求挂起，返回放行函数。
+   *
+   * 直接调 store.uploadAndGenerate 而不 mount App：这里验证的是覆盖判定逻辑，
+   * 走 UI 会引入 Vue Test Utils 的异步时序干扰（trigger 不等 async handler 结束），
+   * 反而不稳定。界面层的 confirmDiscard 由其他用例覆盖。
+   */
+  function stubGeneratePending() {
+    let release: (() => void) | null = null;
+    stubFetch(async call => {
+      if (call.url === UPLOAD_URL) return jsonResponse({ source: source() });
+      await new Promise<void>(resolve => { release = resolve; });
+      return jsonResponse(pipelineReply());
+    });
+    return {
+      async waitUntilPending() {
+        await vi.waitFor(() => expect(release).not.toBeNull());
+      },
+      release() {
+        release?.();
+      },
+    };
+  }
+
+  it('等待期间编辑过节点：保留用户改动，不落生成结果', async () => {
+    const { store } = mountApp();
+    store.preview(generated, 'right');
+    store.commitLabel('c', '我改过的字');
+
+    const gate = stubGeneratePending();
+    const running = store.uploadAndGenerate(smallFile());
+    await gate.waitUntilPending();
+
+    // 生成请求在途时用户又改了内容
+    store.commitLabel('c', '等待期间又改了一次');
+    gate.release();
+    await running;
+
+    // 画布上仍是用户最后那次修改，生成结果没有盖上来
+    expect(store.content?.root.children[0].label).toBe('等待期间又改了一次');
+    expect(store.uploadError).toContain('保留你的修改');
+    expect(store.uploadState).toBe('idle');
+  });
+
+  it('没有改动时正常落图', async () => {
+    const { store } = mountApp();
+    store.preview(generated, 'right');
+    store.commitLabel('c', '我改过的字');
+
+    const gate = stubGeneratePending();
+    const running = store.uploadAndGenerate(smallFile());
+    await gate.waitUntilPending();
+    gate.release();
+    await running;
+
+    // 用户没动过，生成结果照常替换
+    expect(store.content?.root.children[0].label).toBe('监督学习');
+    expect(store.uploadError).toBe('');
+    expect(store.dirty).toBe(true);
+  });
+
+  it('confirmReplace 返回 true 时按用户意愿替换', async () => {
+    const { store } = mountApp();
+    store.preview(generated, 'right');
+    store.commitLabel('c', '原始文字');
+
+    const gate = stubGeneratePending();
+    const asked: string[] = [];
+    const running = store.uploadAndGenerate(smallFile(), {
+      confirmReplace: reason => {
+        asked.push(reason);
+        return true;
+      },
+    });
+    await gate.waitUntilPending();
+    store.commitLabel('c', '等待期间的修改');
+    gate.release();
+    await running;
+
+    expect(asked).toEqual(['edited']);
+    expect(store.content?.root.children[0].label).toBe('监督学习');
+  });
+
+  it('等待期间切换导图：不套到当前图上', async () => {
+    const { store } = mountApp();
+    store.preview(generated, 'right');
+
+    const other: MindMapContent = {
+      title: '另一张图',
+      root: { id: 'r2', label: '另一张', children: [] },
+    };
+
+    const gate = stubGeneratePending();
+    const running = store.uploadAndGenerate(smallFile());
+    await gate.waitUntilPending();
+
+    // 生成还没回来，用户打开了另一张导图
+    store.loadMap(other, { id: 'm9', version: 4, updated_at: '2026-11-04T00:00:00Z' });
+    gate.release();
+    await running;
+
+    expect(store.mapId).toBe('m9');
+    expect(store.content?.title).toBe('另一张图');
+    expect(store.uploadError).toContain('切换到别的导图');
+  });
+});
+
 describe('上传文档生成导图', () => {
   it('解析成功后自动送进生成流水线，第一次请求是 multipart', async () => {
     stubFetch(call =>
