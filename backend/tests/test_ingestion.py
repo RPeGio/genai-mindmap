@@ -349,5 +349,46 @@ class LegacyOfficeTest(unittest.TestCase):
                 parse_document_bytes("a.xls", b"\xd0\xcf\x11\xe0fake")
 
 
+    def test_truncated_page_output_is_treated_as_failure(self):
+        """单页输出撞上 max_tokens 时不能当成功——半页正文收下就等于永久缺一截。"""
+        from unittest.mock import patch
+
+        import httpx
+
+        from app.ingestion.vision_pdf import VisionUnavailable, _page_to_markdown
+
+        fake = httpx.Response(200, json={
+            "choices": [{"message": {"content": "ONLY THE FIRST HALF"},
+                         "finish_reason": "length"}],
+        })
+
+        with patch("app.ingestion.vision_pdf._config",
+                   return_value=("https://example.com/v1", "k", "m")), \
+             patch("httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.post.return_value = fake
+            with self.assertRaises(VisionUnavailable) as raised:
+                _page_to_markdown(b"\x89PNG-fake", 3)
+
+        self.assertIn("截断", str(raised.exception))
+
+    def test_complete_page_output_is_accepted(self):
+        from unittest.mock import patch
+
+        import httpx
+
+        from app.ingestion.vision_pdf import _page_to_markdown
+
+        fake = httpx.Response(200, json={
+            "choices": [{"message": {"content": "## 标题\n\n正文"},
+                         "finish_reason": "stop"}],
+        })
+
+        with patch("app.ingestion.vision_pdf._config",
+                   return_value=("https://example.com/v1", "k", "m")), \
+             patch("httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.post.return_value = fake
+            self.assertIn("标题", _page_to_markdown(b"\x89PNG-fake", 1))
+
+
 if __name__ == "__main__":
     unittest.main()

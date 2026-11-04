@@ -99,7 +99,14 @@ def _page_to_markdown(image_png: bytes, page_no: int) -> str:
             raise VisionUnavailable(
                 f"第 {page_no} 页识别失败：HTTP {resp.status_code}")
         body = resp.json()
-    content = body["choices"][0]["message"].get("content") or ""
+    choice = body["choices"][0]
+    # finish_reason=length 表示输出撞上了 max_tokens 被硬切。半页内容如果当成
+    # 成功收下，这一页的正文就永久缺了一截，而整份结果还报"解析完整"。
+    # 当成该页失败处理，上层会用同一页的文本层补。
+    if (choice.get("finish_reason") or "").lower() == "length":
+        raise VisionUnavailable(
+            f"第 {page_no} 页输出被截断（达到单页 token 上限）")
+    content = choice["message"].get("content") or ""
     text = _strip_fence(content)
     if not text:
         raise VisionUnavailable(f"第 {page_no} 页没有返回内容")

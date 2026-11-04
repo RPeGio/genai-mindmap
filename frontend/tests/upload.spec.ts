@@ -215,6 +215,24 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     expect(store.uploadError).toContain('保留你的修改');
   });
 
+  it('等待期间标题框有未提交的输入：同样不落图', async () => {
+    // 标题走 :value + @change，打字时 content 不变也碰不到 editingId，
+    // 只有 titleDraft 能反映"这里有没提交的输入"。
+    const { store } = mountApp();
+    store.preview(generated, 'right');
+
+    const gate = stubGeneratePending();
+    const running = store.uploadAndGenerate(smallFile());
+    await gate.waitUntilPending();
+
+    store.setTitleDraft('我在改标题');
+    gate.release();
+    await running;
+
+    expect(store.content?.title).toBe('机器学习');
+    expect(store.uploadError).toContain('保留你的修改');
+  });
+
   it('等待期间切换导图：不套到当前图上', async () => {
     const { store } = mountApp();
     store.preview(generated, 'right');

@@ -28,7 +28,7 @@ interface Call {
 
 let calls: Call[] = [];
 
-function stubFetch(handler: (call: Call) => Response) {
+function stubFetch(handler: (call: Call) => Response | Promise<Response>) {
   calls = [];
   vi.stubGlobal(
     'fetch',
@@ -373,6 +373,39 @@ describe('保存', () => {
     await store.save();
     // 切图后 saving 已被 loadMap 重置，新页面可以立即保存
     expect(store.saving).toBe(false);
+  });
+  it('保存期间切换到新生成的导图：旧响应不会把身份套上来', async () => {
+    // preview() 是"换了一张图"，必须递增会话号。否则 A 的保存响应回来时
+    // 会话号仍是旧的，mapId 会被写成 A，而画布上是新图——下次保存就把
+    // 新内容 PUT 到 A 的记录上。
+    const store = useMindMapStore();
+    store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
+    store.commitLabel('a', 'A 的改动');
+
+    let release: (() => void) | null = null;
+    stubFetch(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return jsonResponse({
+        id: 'm1', version: 2, content: sample(), updated_at: '2026-11-04T01:00:00Z',
+      } satisfies MapRecord);
+    });
+
+    const saving = store.save();
+    await vi.waitFor(() => expect(release).not.toBeNull());
+
+    // 保存还没回来，上传生成出了一张新图
+    store.preview(
+      { title: '生成的新图', root: { id: 'nr', label: '新根', children: [] } },
+      'right',
+    );
+
+    release!();
+    await saving;
+
+    // 新图不该挂上 m1 的身份
+    expect(store.mapId).toBeNull();
+    expect(store.version).toBe(0);
+    expect(store.content?.title).toBe('生成的新图');
   });
 });
 

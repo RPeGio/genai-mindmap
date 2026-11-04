@@ -131,6 +131,14 @@ function commitTitle(event: Event) {
   store.renameTitle((event.target as HTMLInputElement).value);
 }
 
+/**
+ * 标题框走 `:value` + `@change`，打字期间 content 不会变。把草稿同步给 store，
+ * 上传生成完成时才知道"这里还有没提交的输入"，否则标题会被静默换掉。
+ */
+function onTitleInput(event: Event) {
+  store.setTitleDraft((event.target as HTMLInputElement).value);
+}
+
 async function copyBody() {
   const node = selected.value?.node;
   if (!node) return;
@@ -218,7 +226,9 @@ async function copyBody() {
             id="title"
             :value="store.content.title"
             class="rounded-md border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-slate-500"
+            @input="onTitleInput"
             @change="commitTitle"
+            @blur="store.setTitleDraft(null)"
           />
           <p v-else class="text-xs text-slate-400">生成或新建之后可以改标题</p>
         </div>

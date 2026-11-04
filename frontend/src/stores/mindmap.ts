@@ -98,6 +98,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 正在内联编辑的节点 id；null 表示没有编辑框打开。 */
   const editingId = ref<string | null>(null);
 
+  /**
+   * 标题输入框里还没提交的文字。
+   *
+   * 标题走 `:value` + `@change`，用户打字时 DOM 的 value 变了但 content 没变，
+   * 也碰不到 editingId。没有这个草稿，上传生成完成后标题会被直接换掉，
+   * 那半截输入一声不响就没了。
+   */
+  const titleDraft = ref<string | null>(null);
+
   /** 保存相关状态：mapId 为空表示这份导图还没存过。 */
   const mapId = ref<string | null>(null);
   const version = ref(0);
@@ -304,6 +313,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function renameTitle(title: string) {
     if (!content.value) return;
     const next = title.trim();
+    // 提交后草稿就作废：已经落到 content 里了，再留着会让「等待期间有未提交
+    // 输入」的判断一直为真。
+    titleDraft.value = null;
     if (next === content.value.title) return;
     if (!next) {
       status.value = '标题不能为空';
@@ -314,6 +326,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
     applyContent({ ...content.value, title: next }, true);
+  }
+
+  /** 标题框每次按键都同步草稿，只记"有未提交的输入"，不改 content。 */
+  function setTitleDraft(value: string | null) {
+    titleDraft.value = value;
   }
 
   function addChildTo(parentId: string) {
@@ -436,6 +453,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     cancel();
     mapSession += 1;
     saving.value = false;
+    titleDraft.value = null;
     content.value = next;
     mapId.value = record.id;
     version.value = record.version;
@@ -453,6 +471,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     cancel();
     mapSession += 1;
     saving.value = false;
+    titleDraft.value = null;
     content.value = null;
     mapId.value = null;
     version.value = 0;
@@ -656,6 +675,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   function preview(next: MindMapContent, dir: Direction) {
     cancel();
+    // 换了一张图，会话必须跟着换：否则上一张图在途的保存响应回来时，
+    // 会因为会话号没变而把它的 id 写进 mapId——画布上是新图、身份却是旧图，
+    // 下次保存就把新内容 PUT 到旧记录上。
+    mapSession += 1;
+    titleDraft.value = null;
     direction.value = dir;
     content.value = next;
     mode.value = 'demo';
@@ -775,7 +799,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
       // 已经被后来的请求接管：这个旧请求无论成功、失败还是被取消，
       // 都不许再改画面和状态，否则新请求的预览会被旧导图替换。
-      if (controller !== null && controller !== ctrl) return;
+      // 只要当前 controller 不是自己（被新请求接管，或被 cancel() 
+      // 清成了 null），这个旧请求就无权再改画面。旧写法要求 controller 非空，
+      // 于是「生成中点新建」时 controller 被清成 null，restore() 照样执行，
+      // 新建出来的空白画布又被旧图盖了回去。
+      if (controller !== ctrl) return;
       if (ctrl.signal.aborted) {
         restore();
         status.value = '已取消。';
@@ -785,7 +813,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
         status.value = '连接中断，结果可能不完整，请重试。';
       }
     } catch (error) {
-      if (controller !== null && controller !== ctrl) return;
+      if (controller !== ctrl) return;
       restore();
       status.value = ctrl.signal.aborted
         ? '已取消。'
@@ -937,7 +965,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const switched = sessionAtStart !== mapSession;
       // editingId 非空时，用户正在节点输入框里打字，文字还在组件的本地 draft 里，
       // content 引用根本没变——只比引用会漏掉这种"输入到一半"的修改。
-      const edited = content.value !== contentAtStart || editingId.value !== null;
+      // 标题框同理：它走 :value + @change，打字期间 content 也不变，
+      // 只能靠 titleDraft 感知。
+      const edited = content.value !== contentAtStart
+        || editingId.value !== null
+        || titleDraft.value !== null;
       if (switched || edited) {
         const reason = switched ? 'switched' : 'edited';
         const replace = options?.confirmReplace?.(reason) ?? false;
@@ -982,6 +1014,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     direction,
     viewAdjusted,
     editingId,
+    titleDraft,
+    setTitleDraft,
     mapId,
     version,
     savedAt,
