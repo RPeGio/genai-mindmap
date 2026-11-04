@@ -77,6 +77,13 @@ const saveHint = computed(() => {
 });
 
 function saveNow() {
+  // 正在输入的标题或节点还没提交，文字只在输入框里。直接保存存的是旧内容，
+  // 界面却显示"已保存"，刷新后那段输入就没了。先让它失焦提交一次——
+  // 标题走 @change、节点走 @blur，两者都会在 blur 时把值落到 content 上。
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && active !== document.body) {
+    active.blur();
+  }
   void store.save();
 }
 
@@ -111,7 +118,10 @@ function onKeydown(event: KeyboardEvent) {
 
 /** 有未保存的修改时，关标签页/刷新要弹浏览器自己的确认框。 */
 function onBeforeUnload(event: BeforeUnloadEvent) {
-  if (!store.dirty) return;
+  // 除了脏标记，还要看有没有"输入到一半"的文字：标题草稿和节点草稿都不改
+  // content，dirty 是 false，但那些字一样会丢。
+  const hasDraft = store.editingId !== null || store.titleDraft !== null;
+  if (!store.dirty && !hasDraft) return;
   event.preventDefault();
   event.returnValue = '';
 }

@@ -161,6 +161,38 @@ describe('App', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/mindmaps', expect.objectContaining({ method: 'POST' }));
   });
 
+  it('Ctrl+S 保存前让正在输入的控件失焦，草稿才会被提交', async () => {
+    // 点「保存」按钮时浏览器已经让输入框失焦了，问题只出在键盘快捷键：
+    // Ctrl+S 不会触发 blur，草稿留在输入框里，保存发出去的是旧内容，
+    // 界面却显示"已保存"。
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 201,
+      json: async () => ({
+        id: 'm1', version: 1,
+        content: { title: '单节点', root: { id: 's', label: '单节点', children: [] } },
+        updated_at: '2026-11-04T00:00:00Z',
+      }),
+    })) as unknown as typeof fetch);
+    const wrapper = mountApp();
+
+    await vi.waitFor(() => expect(buttonByText(wrapper, '单节点')).toBeTruthy());
+    await buttonByText(wrapper, '单节点').trigger('click');
+
+    const titleInput = wrapper.get('#title');
+    (titleInput.element as HTMLInputElement).focus();
+    // jsdom 的 activeElement 需要显式设置：focus() 在无头环境里不一定生效
+    Object.defineProperty(document, 'activeElement', {
+      value: titleInput.element, configurable: true,
+    });
+    const blurSpy = vi.spyOn(titleInput.element as HTMLInputElement, 'blur');
+
+    window.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 's', ctrlKey: true, bubbles: true, cancelable: true,
+    }));
+
+    expect(blurSpy).toHaveBeenCalled();
+  });
+
   it('打开列表列出已保存的导图，点开后进入该导图', async () => {
     const record = {
       id: 'm9',
