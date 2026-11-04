@@ -75,6 +75,34 @@ describe('保存', () => {
     expect(store.dirty).toBe(false);
   });
 
+  it('保存时把 v2 的 note 裁掉，只发 v1 认识的字段', async () => {
+    const store = useMindMapStore();
+    // v1 后端是 extra="forbid"：带上 note 会直接 422（见 docs/HANDOFF.md H1）。
+    store.preview(
+      {
+        title: '示例',
+        root: {
+          id: 'root',
+          label: '根',
+          note: '这是只在界面上显示的正文',
+          children: [{ id: 'a', label: '甲', note: '子节点的正文', children: [] }],
+        },
+      },
+      'right',
+    );
+
+    stubFetch(() =>
+      jsonResponse({ id: 'm1', version: 1, content: sample(), updated_at: '2026-11-04T00:00:00Z' }, 201),
+    );
+
+    await expect(store.save()).resolves.toBe('saved');
+    const body = calls[0].body as { content: { root: MindNode } };
+    expect(JSON.stringify(body)).not.toContain('note');
+    expect(body.content.root.children[0].label).toBe('甲');
+    // 本地仍保留 note，详情面板要能显示全文。
+    expect(store.content?.root.note).toBe('这是只在界面上显示的正文');
+  });
+
   it('再次保存走 PUT，并把读到的版本号带回去', async () => {
     const store = useMindMapStore();
     store.preview(sample(), 'right');

@@ -1,4 +1,4 @@
-import type { GenerateResponse, MapRecord, MindMapContent } from './types';
+import type { GenerateResponse, MapRecord, MindMapContent, MindNode } from './types';
 
 /** 后端错误体现在只返回 detail；契约 v2 会带 code/request_id，这里先兼容两种。 */
 interface ErrorBody {
@@ -66,11 +66,27 @@ export function getMindMap(id: string): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`);
 }
 
+/**
+ * 发出去之前裁成后端当前认识的形状。
+ *
+ * 后端 v1 的 `MindMapContent` 是 `extra="forbid"`：多一个 `note` 就直接 422，
+ * 而 `note` 属于契约 v2（见 `docs/HANDOFF.md` H1，与 v2 同批上线）。
+ * 所以这里显式按 v1 序列化：本地留着 `note` 供界面显示正文，但不把后端还不认识的字段发出去。
+ */
+function toContractV1(content: MindMapContent): MindMapContent {
+  const strip = (node: MindNode): MindNode => ({
+    id: node.id,
+    label: node.label,
+    children: node.children.map(strip),
+  });
+  return { title: content.title, root: strip(content.root) };
+}
+
 /** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
 export function createMindMap(content: MindMapContent): Promise<MapRecord> {
   return request<MapRecord>('/mindmaps', {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content: toContractV1(content) }),
   });
 }
 
@@ -85,7 +101,7 @@ export function updateMindMap(
 ): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`, {
     method: 'PUT',
-    body: JSON.stringify({ content, version }),
+    body: JSON.stringify({ content: toContractV1(content), version }),
   });
 }
 
