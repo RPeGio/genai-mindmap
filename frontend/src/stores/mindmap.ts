@@ -574,8 +574,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
   async function reloadFromServer(): Promise<void> {
     const id = mapId.value;
     if (!id) return;
+    const session = mapSession;
     try {
       const record = await getMindMap(id);
+      // 等待期间用户可能已经新建或切到别的图，这份响应不能再盖上去。
+      if (session !== mapSession) return;
       loadMap(record.content, record);
       conflict.value = null;
     } catch (error) {
@@ -631,9 +634,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   async function openMap(id: string) {
+    const session = mapSession;
     listBusy.value = true;
     try {
       const record = await getMindMap(id);
+      // 点开之后等网络这段时间，用户可能已经关掉列表并新建了一张图。
+      // 直接 loadMap 会把那张新画布替换成刚读回来的旧记录。
+      if (session !== mapSession) return;
       loadMap(record.content, record);
       listOpen.value = false;
       conflict.value = null;

@@ -496,6 +496,33 @@ describe('保存', () => {
     expect(store.version).toBe(0);
     expect(store.content?.title).toBe('生成的新图');
   });
+  it('打开导图期间用户新建：响应回来不覆盖新画布', async () => {
+    // 点开之后等网络这段时间，用户可能已经关掉列表点了新建。
+    // 旧响应直接 loadMap 会把新建的空白画布替换成刚读回来的记录。
+    const store = useMindMapStore();
+
+    let release: (() => void) | null = null;
+    stubFetch(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return jsonResponse({
+        id: 'm9', version: 1, content: sample(), updated_at: '2026-11-04T00:00:00Z',
+      } satisfies MapRecord);
+    });
+
+    const opening = store.openMap('m9');
+    await vi.waitFor(() => expect(release).not.toBeNull());
+
+    // 等待期间用户新建
+    store.newMap();
+    expect(store.content).toBeNull();
+
+    release!();
+    await opening;
+
+    // 新建的空白画布不该被旧记录盖回去
+    expect(store.content).toBeNull();
+    expect(store.mapId).toBeNull();
+  });
 });
 
 describe('打开列表', () => {
