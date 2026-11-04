@@ -1,4 +1,4 @@
-﻿import type { GenerateResponse, MindMapContent } from './types';
+import type { GenerateResponse, MapRecord, MindMapContent } from './types';
 
 /** 后端错误体现在只返回 detail；契约 v2 会带 code/request_id，这里先兼容两种。 */
 interface ErrorBody {
@@ -52,6 +52,40 @@ export function generateMindMap(text: string): Promise<GenerateResponse> {
   return request<GenerateResponse>('/generations', {
     method: 'POST',
     body: JSON.stringify({ text }),
+  });
+}
+
+// ---- 保存与打开 ----
+
+/** 已保存的导图列表（不含筛选，按更新时间倒序由后端决定）。 */
+export function listMindMaps(): Promise<MapRecord[]> {
+  return request<MapRecord[]>('/mindmaps');
+}
+
+export function getMindMap(id: string): Promise<MapRecord> {
+  return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`);
+}
+
+/** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
+export function createMindMap(content: MindMapContent): Promise<MapRecord> {
+  return request<MapRecord>('/mindmaps', {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  });
+}
+
+/**
+ * 覆盖保存已有导图。`version` 是"我打开时看到的版本"：
+ * 服务端发现不是最新就返回 409，不会用旧内容盖掉别人的修改。
+ */
+export function updateMindMap(
+  id: string,
+  content: MindMapContent,
+  version: number,
+): Promise<MapRecord> {
+  return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ content, version }),
   });
 }
 

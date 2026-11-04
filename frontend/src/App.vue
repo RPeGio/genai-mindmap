@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
@@ -45,6 +45,43 @@ async function generate() {
   await store.generate(prompt.value);
 }
 
+/** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
+const saveHint = computed(() => {
+  if (store.saving) return '保存中…';
+  if (!store.content) return '';
+  if (store.dirty) return '有未保存的修改';
+  return store.savedAt ? '已保存' : '';
+});
+
+function saveNow() {
+  void store.save();
+}
+
+/** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
+function onKeydown(event: KeyboardEvent) {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    saveNow();
+  }
+}
+
+/** 有未保存的修改时，关标签页/刷新要弹浏览器自己的确认框。 */
+function onBeforeUnload(event: BeforeUnloadEvent) {
+  if (!store.dirty) return;
+  event.preventDefault();
+  event.returnValue = '';
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown);
+  window.addEventListener('beforeunload', onBeforeUnload);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown);
+  window.removeEventListener('beforeunload', onBeforeUnload);
+});
+
 /** 标题用 change 提交（失焦或回车时），不在每次按键上都记一步撤销。 */
 function commitTitle(event: Event) {
   store.renameTitle((event.target as HTMLInputElement).value);
@@ -84,19 +121,33 @@ async function copyBody() {
           </button>
         </div>
       </div>
-      <p class="text-xs text-slate-500">
-        <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
-          演示模式（非 AI 生成）
+      <div class="flex items-center gap-3 text-xs text-slate-500">
+        <span v-if="saveHint" :class="store.dirty ? 'text-amber-600' : 'text-slate-400'">
+          {{ saveHint }}
         </span>
-        <span v-else-if="store.mode === 'model'" class="rounded bg-emerald-100 px-2 py-0.5 text-emerald-700">
-          模型生成
-        </span>
-        <span v-else-if="store.mode === 'saved'" class="rounded bg-slate-100 px-2 py-0.5 text-slate-600">
-          已保存导图
-        </span>
-        <span v-else>未生成</span>
-        <span class="ml-3">{{ store.nodeCount }} 个节点</span>
-      </p>
+        <button
+          type="button"
+          class="rounded-md bg-slate-900 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+          :disabled="!store.content || store.saving"
+          title="保存（Ctrl+S）"
+          @click="saveNow"
+        >
+          保存
+        </button>
+        <p>
+          <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
+            演示模式（非 AI 生成）
+          </span>
+          <span v-else-if="store.mode === 'model'" class="rounded bg-emerald-100 px-2 py-0.5 text-emerald-700">
+            模型生成
+          </span>
+          <span v-else-if="store.mode === 'saved'" class="rounded bg-slate-100 px-2 py-0.5 text-slate-600">
+            已保存导图
+          </span>
+          <span v-else>未生成</span>
+          <span class="ml-3">{{ store.nodeCount }} 个节点</span>
+        </p>
+      </div>
     </header>
 
     <main class="flex min-h-0 flex-1">
@@ -244,5 +295,43 @@ async function copyBody() {
         </template>
       </aside>
     </main>
+
+    <div
+      v-if="store.conflict"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="conflict-title"
+    >
+      <div class="w-full max-w-md rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+        <h2 id="conflict-title" class="text-sm font-semibold">保存冲突</h2>
+        <p class="mt-2 text-xs leading-relaxed text-slate-600">
+          这张导图在别处被改过（{{ store.conflict.message }}）。你本地的修改还没有保存，选择怎么处理：
+        </p>
+        <div class="mt-4 flex flex-col gap-2">
+          <button
+            type="button"
+            class="rounded-md border border-slate-300 px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-50"
+            @click="store.reloadFromServer()"
+          >
+            放弃本地修改，加载服务端最新版本
+          </button>
+          <button
+            type="button"
+            class="rounded-md border border-slate-300 px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-50"
+            @click="store.saveAsNew()"
+          >
+            保留本地修改，另存为新导图
+          </button>
+          <button
+            type="button"
+            class="rounded-md px-3 py-2 text-left text-xs text-slate-500 hover:bg-slate-50"
+            @click="store.dismissConflict()"
+          >
+            取消，稍后再说
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>

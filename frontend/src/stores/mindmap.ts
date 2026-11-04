@@ -2,8 +2,8 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, generateMindMapStream } from '../api/client';
-import type { MindMapContent, MindNode } from '../api/types';
+import { ApiError, createMindMap, generateMindMapStream, getMindMap, listMindMaps, updateMindMap } from '../api/client';
+import type { MapRecord, MindMapContent, MindNode } from '../api/types';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -14,6 +14,7 @@ import {
   LIMITS,
   removeNode,
   renameNode,
+  validateDraft,
 } from '../mindmap/edits';
 
 /** 画布节点上最多显示的字数（按码点算，避免把 emoji 切成半个）。 */
@@ -21,6 +22,9 @@ export const TRUNCATE_CHARS = 24;
 
 /** 撤销栈上限。整树快照一步几 KB，50 步封顶，内存与手感都够用。 */
 export const HISTORY_LIMIT = 50;
+
+/** 保存的结果分类：界面据此决定提示什么，而不是把所有失败都说成"保存失败"。 */
+export type SaveResult = 'saved' | 'conflict' | 'invalid' | 'empty' | 'busy' | 'failed';
 
 /** 节点上显示的短标题：按码点截断，超出加省略号。 */
 export function displayTitle(node: MindNode): string {
@@ -91,6 +95,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 撤销/重做存整树 JSON 快照：比命令模式少一半代码，300 节点的树一步也不到 100KB。 */
   const past = ref<string[]>([]);
   const future = ref<string[]>([]);
+
+  const saving = ref(false);
+  /** 保存撞上 409 时置位，由界面弹窗让用户选"重新加载 / 另存为新导图 / 取消"。 */
+  const conflict = ref<{ message: string } | null>(null);
+  /** 打开列表用的缓存。 */
+  const maps = ref<MapRecord[]>([]);
+  const listOpen = ref(false);
+  const listBusy = ref(false);
 
   let controller: AbortController | null = null;
 
@@ -417,6 +429,108 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
+   * 保存。返回结果让界面分流提示：正常、内容不合法、版本冲突各走各的。
+   * 失败时保留 dirty —— 一次网络抖动不能让用户以为已经存上了。
+   */
+  async function save(): Promise<SaveResult> {
+    const current = content.value;
+    if (!current) {
+      status.value = '没有可保存的导图。';
+      return 'empty';
+    }
+    const invalid = validateDraft(current);
+    if (invalid) {
+      status.value = invalid;
+      return 'invalid';
+    }
+    if (saving.value) return 'busy';
+
+    saving.value = true;
+    status.value = '正在保存…';
+    try {
+      const record = mapId.value
+        ? await updateMindMap(mapId.value, current, version.value)
+        : await createMindMap(current);
+      markSaved(record);
+      return 'saved';
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        conflict.value = { message: error.message };
+        status.value = '这张导图已被别人改过，本地修改还没保存。';
+        return 'conflict';
+      }
+      status.value = error instanceof ApiError ? error.message : '保存失败，请重试。';
+      return 'failed';
+    } finally {
+      saving.value = false;
+    }
+  }
+
+  /** 409 的选项一：放弃本地修改，换成服务端最新版本（撤销栈一并清空）。 */
+  async function reloadFromServer(): Promise<void> {
+    const id = mapId.value;
+    if (!id) return;
+    try {
+      const record = await getMindMap(id);
+      loadMap(record.content, record);
+      conflict.value = null;
+    } catch (error) {
+      status.value = error instanceof ApiError ? error.message : '读取服务端版本失败。';
+    }
+  }
+
+  /** 409 的选项二：把当前内容存成一条新记录，两边的修改都保留。 */
+  async function saveAsNew(): Promise<void> {
+    const current = content.value;
+    if (!current) return;
+    try {
+      const record = await createMindMap(current);
+      markSaved(record);
+      conflict.value = null;
+      status.value = `已另存为新导图，版本 ${record.version}。`;
+    } catch (error) {
+      status.value = error instanceof ApiError ? error.message : '另存失败，请重试。';
+    }
+  }
+
+  /** 409 的选项三：先不处理，本地修改继续留在页面上。 */
+  function dismissConflict() {
+    conflict.value = null;
+    status.value = '已取消保存，本地修改还在，可以再试一次。';
+  }
+
+  async function openList() {
+    listOpen.value = true;
+    listBusy.value = true;
+    try {
+      maps.value = await listMindMaps();
+    } catch (error) {
+      maps.value = [];
+      status.value = error instanceof ApiError ? error.message : '读取导图列表失败。';
+    } finally {
+      listBusy.value = false;
+    }
+  }
+
+  function closeList() {
+    listOpen.value = false;
+  }
+
+  async function openMap(id: string) {
+    listBusy.value = true;
+    try {
+      const record = await getMindMap(id);
+      loadMap(record.content, record);
+      listOpen.value = false;
+      conflict.value = null;
+    } catch (error) {
+      status.value = error instanceof ApiError ? error.message : '打开导图失败。';
+    } finally {
+      listBusy.value = false;
+    }
+  }
+
+  /**
    * 把增量节点合并进当前树。
    * 同一个 id 会反复到达（文字逐渐变长），所以已存在时更新文字、保留其子节点。
    */
@@ -633,6 +747,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     breadcrumb,
     canUndo,
     canRedo,
+    saving,
+    conflict,
+    maps,
+    listOpen,
+    listBusy,
     generate,
     cancel,
     preview,
@@ -650,5 +769,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     loadMap,
     newMap,
     markSaved,
+    save,
+    reloadFromServer,
+    saveAsNew,
+    dismissConflict,
+    openList,
+    closeList,
+    openMap,
   };
 });
