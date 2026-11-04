@@ -43,7 +43,7 @@ flowchart TD
 | 环节 | 模块 | 输入 | 输出 | 状态 |
 |---|---|---|---|---|
 | 来源解析 | `app/ingestion` | 文本 / Markdown 字符串 / 上传的文档 | `Source` | 文本与文档（Docling）均已实现；图片与语音仍待实现 |
-| 合并理解 | `app/pipeline._understand` | `Source[]` | 单一文本 | 已实现；任一来源不可用或合并超 8000 字时拒绝，不截断 |
+| 合并理解 | `app/pipeline._understand` | `Source[]` | 单一文本 | 已实现；任一来源不可用或合并超 20000 字时拒绝，不截断 |
 | 大纲生成 | `app/generation` | 文本 | `MindMapContent` | 已实现（demo 占位 / model 调模型） |
 | 契约校验 | `app/contracts/mindmap.py` | 任何模型输出 | 合法树 / 异常 | 已实现（300 节点 / 8 层 / 50 子节点） |
 | 结构诊断 | `app/optimization.check` | 导图 | `Diagnostic[]` | 单子节点、深度上限、同级重复标签三种结构提示 |

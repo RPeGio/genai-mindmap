@@ -12,7 +12,7 @@
 | 分工 | **A**（RPeGio）：契约、前端、画布/布局/主题/导出、协作客户端、部署基建、CI；**B**（陈嘉涛）：生成链路、多模态解析、RAG、诊断、代理、评估集、后端地基 |
 | 交界 | 契约、SSE 协议、协作协议、上线联调 —— 改动必须双人 review |
 | 前端 | Vue 3 + TypeScript + Vite + Pinia + Tailwind + `@vue-flow/core` + Vitest |
-| 后端 | FastAPI + Pydantic v2 + `pydantic-settings` + httpx + SQLAlchemy 2 + Alembic + pytest |
+| 后端 | FastAPI + Pydantic v2 + httpx + `sqlite3` 直连；`pydantic-settings` / SQLAlchemy / Alembic 顺延到验收之后（Q35），当前配置经 `os.getenv` 读取，见第 10 节 |
 | 数据 | PostgreSQL 16（compose 容器）+ pgvector（W3） |
 | 协作 | Yjs + `y-websocket`（独立 Node 容器） |
 | 部署 | 阿里云 ECS 2C2G / 40G ESSD / Alibaba Cloud Linux 3.2104 / 华南1深圳 / 无 GPU，`docker compose` 五容器，公网 `IP:8080` |
@@ -122,7 +122,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 ## 5 验收门与指标口径
 
 **工程门（12 条，全部可勾选）**
-1. 后端覆盖率 ≥60%（pytest + `--cov`） 2. 前端组件测试覆盖关键交互 3. CI 双端 lint/test/build 全绿 4. 统一错误体 `{code, message, detail, request_id}` 5. 结构化日志 + `request_id` + `llm_calls` 埋点 6. `pydantic-settings` 单一配置源 + `.env.example` 7. `docker compose up -d` 一键起 8. `/api/health` + readiness 9. ADR 每决策一页 10. PR 模板 + 契约变更 checklist 11. 种子数据脚本 12. 部署与回滚文档
+1. 后端覆盖率 ≥60%（pytest + `--cov`） 2. 前端组件测试覆盖关键交互 3. CI 双端 lint/test/build 全绿 4. 统一错误体 `{code, message, detail, request_id}` 5. 结构化日志 + `request_id` + `llm_calls` 埋点 6. 单一配置源 + `.env.example`（当前经 `os.getenv` 读 5 个 `MINDMAP_*` 变量，样例文件已齐；`pydantic-settings` 随 Q35 顺延） 7. `docker compose up -d` 一键起 8. `/api/health` + readiness 9. ADR 每决策一页 10. PR 模板 + 契约变更 checklist 11. 种子数据脚本 12. 部署与回滚文档
 
 **指标口径**
 - **结构合理性 >85%**：20 条中文样本（课程大纲 / 会议纪要 / 项目立项），双人独立盲评 4 维度（覆盖、层次、无捏造、可读），报一致率与分歧，通过率 = 双人一致判"合格"的比例。
@@ -171,21 +171,37 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 
 Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、模型微调训练、知识图谱嵌入落地、压测集群、i18n、移动端适配、支付与配额计费、对象存储/CDN。
 
-## 10 配置项（后端 env，全部经 `pydantic-settings`）
+## 10 配置项
 
-| 变量 | 说明 |
-|---|---|
-| `APP_ENV` | `dev` / `prod` |
-| `DATABASE_URL` | `postgresql+psycopg://...` |
-| `JWT_SECRET` / `JWT_TTL_HOURS` | 登录签发 |
-| `FERNET_KEY` | 加密用户 BYOK |
-| `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | 默认模型（`deepseek-flash`） |
-| `LLM_MODE` | `demo`（离线占位）/ `live` |
-| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` | `moss`（默认）\|`aliyun`\|`faster-whisper`；线上 60 |
-| `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | `small` / `int8`（仅降级档，禁止改 `medium`/`large-v3`） |
-| `MAX_INPUT_CHARS` | 统一为 8000（修掉 10000/8000 双上限） |
-| `UPLOAD_DIR` / `MAX_UPLOAD_MB` | `uploads/`；20 |
-| `DAILY_LLM_QUOTA` | 200 |
+### 10.1 已实现（代码经 `os.getenv` 读取，共 5 项）
+
+`.env` 文件不会自动加载，须在启动服务前设入进程环境变量；样例见 `backend/.env.example`。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MINDMAP_LLM_MODE` | `demo` | `demo` 不联网、返回本地占位；`model` 才调 Chat Completions 兼容接口。写成其他值会被拒 |
+| `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
+| `MINDMAP_LLM_API_KEY` | — | 调用密钥，只从环境变量读，不进代码库与日志 |
+| `MINDMAP_LLM_MODEL` | — | 模型名（当前用 `deepseek-chat`；`deepseek-flash` 是推理模型，reasoning token 波动大，未采用） |
+| `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径，留空即取默认值 |
+
+### 10.2 规划中（当前代码不读这些变量）
+
+| 变量 | 依赖功能 | 状态 |
+|---|---|---|
+| `APP_ENV` | 区分 dev / prod | 未排期 |
+| `DATABASE_URL` | PostgreSQL 迁移 | Q35：顺延到验收之后 |
+| `JWT_SECRET` / `JWT_TTL_HOURS` / `FERNET_KEY` / `DAILY_LLM_QUOTA` | 登录签发、BYOK 加密、每日配额 | F12 为单用户单库，暂不需要 |
+| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` / `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | 语音转写（F07） | 未实现，`backend/app/ingestion/service.py` 里是 `TODO(F07)` |
+
+### 10.3 不是环境变量，是代码常量
+
+改动这两项要改代码并重新部署：
+
+| 常量 | 位置 | 当前值 |
+|---|---|---|
+| `MAX_INPUT_CHARS` | `backend/app/pipeline/service.py` | 20000 |
+| `MAX_UPLOAD_BYTES` | `backend/app/ingestion/router.py` | 10 MB |
 
 ## 11 决策记录（Q26–Q36）
 

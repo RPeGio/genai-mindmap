@@ -38,7 +38,7 @@
 | `POST /api/generations` | `{"text":"输入内容"}` | `{"mode":"demo 或 model","content":导图}` | 输入无效 422；模型配置或生成失败 502。 |
 | `POST /api/generations/stream` | `{"text":"输入内容"}` | SSE：`stage` / `node` / `done` / `error`，末尾 `data: [DONE]` | 流开始前校验失败走普通 JSON 422；开始后错误以 `{"type":"error"}` 事件下发 |
 | `POST /api/ingestion/text` | `{"text":"内容","kind":"text 或 markdown"}` | `{"source": 来源}` | 空文本或其他来源类型 422 |
-| `POST /api/pipeline/generate` | `{"sources":[来源]}` | `mode`、`content`、`diagnostics`、`stages` | 来源无效、重复或合并超过 8000 字 422；模型失败 502 |
+| `POST /api/pipeline/generate` | `{"sources":[来源]}` | `mode`、`content`、`diagnostics`、`stages` | 来源无效、重复或合并超过 20000 字 422；模型失败 502 |
 | `POST /api/optimization/check` | `{"content":导图}` | 结构诊断列表 | 结构无效 422 |
 | `POST /api/optimization/suggest` | `{"content":导图}` | 诊断与候选建议 | 结构无效 422；建议需用户判断 |
 | `POST /api/export/puml` | `{"content":导图}` | PlantUML 文本；根节点来自 `root.label` | 结构无效 422 |
