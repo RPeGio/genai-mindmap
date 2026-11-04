@@ -49,8 +49,54 @@ _FENCE_OPEN = re.compile(r"^\s*```(?:json|JSON)?\s*")
 _FENCE_CLOSE = re.compile(r"\s*```\s*$")
 
 
+def _balance_brackets(text: str) -> str:
+    """修正括号收支不平衡：多出来的闭合符丢掉，缺失的补上。
+
+    两个方向都实测出现过：
+      - 多一个 `}`：输入 100000 字符时 3 次里 2 次，模型收尾多写一个花括号，
+        `finish_reason` 仍然是 `stop`（它认为自己写完了），整份 JSON 报废。
+      - 少若干闭合符：输出撞上 max_tokens 被硬切。
+    只动括号，不碰字符串内部 —— 节点文字里的 `{` `}` 必须原样保留。
+    """
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+        elif ch in "{[":
+            stack.append(ch)
+            out.append(ch)
+        elif ch in "}]":
+            expected = "{" if ch == "}" else "["
+            if stack and stack[-1] == expected:
+                stack.pop()
+                out.append(ch)
+            # 没有配对的开启符：这个闭合符是多余的，直接丢弃
+        else:
+            out.append(ch)
+
+    if in_string:
+        out.append('"')
+    for opener in reversed(stack):
+        out.append("}" if opener == "{" else "]")
+    return "".join(out)
+
+
 def parse_model_json(content: str) -> Any:
-    """解析模型返回的 JSON，容忍代码围栏与前后多余文字。"""
+    """解析模型返回的 JSON，容忍代码围栏、多余文字与括号收支错位。"""
     text = (content or "").strip()
     if not text:
         raise ValueError("模型返回了空内容")
@@ -59,13 +105,23 @@ def parse_model_json(content: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+
+    # 括号收支错位：这是实测最常见的一种失败，先修它再试
+    balanced = _balance_brackets(text)
+    if balanced != text:
+        try:
+            return json.loads(balanced)
+        except json.JSONDecodeError:
+            pass
+
     # 还有解释文字包着时，截取最外层的对象或数组
     for left, right in (("{", "}"), ("[", "]")):
         start, end = text.find(left), text.rfind(right)
         if start < 0 or end <= start:
             continue
+        candidate = _balance_brackets(text[start:end + 1])
         try:
-            return json.loads(text[start:end + 1])
+            return json.loads(candidate)
         except json.JSONDecodeError:
             continue
     raise ValueError("模型返回内容里没有可解析的 JSON")

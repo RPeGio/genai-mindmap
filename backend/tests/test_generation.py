@@ -8,6 +8,7 @@ from app.generation.service import (
     GenerationError,
     chat,
     generate,
+    parse_model_json,
 )
 
 
@@ -138,6 +139,58 @@ class GenerationTest(unittest.TestCase):
         chat("系统", "用户", max_tokens=512)
         _, _, kwargs = client_class.return_value.calls[0]
         self.assertEqual(json.loads(kwargs["content"])["max_tokens"], 512)
+
+
+class ParseModelJsonTest(unittest.TestCase):
+    """模型输出的 JSON 修复。
+
+    实测两大类失败：收尾多写一个花括号（finish_reason 仍是 stop），
+    以及撞 max_tokens 被硬切断（缺闭合符）。
+    """
+
+    TREE = ('{"title":"t","root":{"id":"1","label":"根","children":'
+            '[{"id":"2","label":"分支","children":[]}]}}')
+
+    def test_plain_json(self):
+        self.assertEqual(parse_model_json(self.TREE)["title"], "t")
+
+    def test_code_fence(self):
+        self.assertEqual(parse_model_json(f"```json\n{self.TREE}\n```")["title"], "t")
+
+    def test_extra_closing_brace_is_dropped(self):
+        """末尾多一个 }：实测 100000 字符输入 3 次里 2 次这样。"""
+        broken = self.TREE + "}"
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(broken)
+        self.assertEqual(parse_model_json(broken)["title"], "t")
+
+    def test_extra_closing_bracket_is_dropped(self):
+        broken = '{"a":[1,2]]}'
+        self.assertEqual(parse_model_json(broken), {"a": [1, 2]})
+
+    def test_missing_closing_braces_are_filled(self):
+        """输出被 max_tokens 切断：结构没写完，补齐后仍可用。"""
+        truncated = self.TREE[:-3]          # 去掉末尾的 "}}"
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(truncated)
+        parsed = parse_model_json(truncated)
+        self.assertEqual(parsed["root"]["label"], "根")
+
+    def test_braces_inside_strings_are_untouched(self):
+        """节点文字里出现 { } 时不能被当成结构括号修掉。"""
+        payload = ('{"title":"a}b","root":{"id":"1","label":"含 } 与 { 的文字",'
+                   '"children":[]}}') + "}"
+        parsed = parse_model_json(payload)
+        self.assertEqual(parsed["title"], "a}b")
+        self.assertEqual(parsed["root"]["label"], "含 } 与 { 的文字")
+
+    def test_surrounding_prose_is_ignored(self):
+        text = f"好的，结果如下：\n{self.TREE}\n以上。"
+        self.assertEqual(parse_model_json(text)["title"], "t")
+
+    def test_unrecoverable_content_still_raises(self):
+        with self.assertRaises(ValueError):
+            parse_model_json("完全不是 JSON")
 
 
 if __name__ == "__main__":
