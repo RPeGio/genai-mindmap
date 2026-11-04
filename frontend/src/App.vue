@@ -42,6 +42,8 @@ const selected = computed(() => store.selectedNode);
 const pathText = computed(() => store.breadcrumb.map(node => node.label.trim()).join(' / '));
 
 async function generate() {
+  // 生成会替换整棵树（并清掉 mapId，避免之后保存覆盖上一张图），先确认不丢未保存的修改。
+  if (!confirmDiscard('重新生成')) return;
   await store.generate(prompt.value);
 }
 
