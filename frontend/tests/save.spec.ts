@@ -263,6 +263,117 @@ describe('保存', () => {
     expect(store.dirty).toBe(true);
     expect(store.status).toContain('保存期间又有修改');
   });
+
+  it('保存期间切到另一张导图：响应不会把身份改回上一张', async () => {
+    // 危险场景：A 的保存请求在途时打开 B，响应回来后若把 mapId 改回 A，
+    // 画布显示的是 B、身份却是 A，再点保存就会把 B 的内容写进 A。
+    const store = useMindMapStore();
+    store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
+    store.commitLabel('a', 'A 的改动');
+
+    const other: MindMapContent = {
+      title: 'B 导图',
+      root: { id: 'root', label: 'B 根', children: [] },
+    };
+
+    stubFetch(() => {
+      // 模拟请求在途时用户打开了另一张导图
+      store.loadMap(other, { id: 'm2', version: 3, updated_at: '2026-11-04T05:00:00Z' });
+      return jsonResponse({
+        id: 'm1',
+        version: 2,
+        content: sample(),
+        updated_at: '2026-11-04T01:00:00Z',
+      } satisfies MapRecord);
+    });
+
+    await expect(store.save()).resolves.toBe('saved');
+
+    // 身份与内容都还是 B，没有被 A 的响应覆盖
+    expect(store.mapId).toBe('m2');
+    expect(store.version).toBe(3);
+    expect(store.content?.title).toBe('B 导图');
+    expect(store.status).toContain('当前导图未受影响');
+  });
+
+  it('切图后再保存，PUT 打到新导图的 id 上', async () => {
+    const store = useMindMapStore();
+    store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
+    store.commitLabel('a', 'A 的改动');
+
+    const other: MindMapContent = {
+      title: 'B 导图',
+      root: { id: 'root', label: 'B 根', children: [] },
+    };
+
+    let phase = 0;
+    stubFetch(() => {
+      phase += 1;
+      if (phase === 1) {
+        store.loadMap(other, { id: 'm2', version: 3, updated_at: '2026-11-04T05:00:00Z' });
+        return jsonResponse({
+          id: 'm1', version: 2, content: sample(), updated_at: '2026-11-04T01:00:00Z',
+        } satisfies MapRecord);
+      }
+      return jsonResponse({
+        id: 'm2', version: 4, content: other, updated_at: '2026-11-04T06:00:00Z',
+      } satisfies MapRecord);
+    });
+
+    await store.save();                 // 保存 A（期间切到 B）
+    store.renameTitle('B 导图改名');     // 在 B 上改点东西
+    await store.save();                 // 保存 B
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].url).toBe('/api/mindmaps/m1');
+    expect(calls[1].url).toBe('/api/mindmaps/m2');
+    expect(calls[1].method).toBe('PUT');
+  });
+
+  it('保存期间新建导图：响应同样不改身份', async () => {
+    // 边界：保存前 mapId 是 m1，新建后是 null，直接比 mapId 判断不出"切走过"，
+    // 所以用会话号。这里断言新建的空白图不会被挂上 m1 的身份。
+    const store = useMindMapStore();
+    store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
+    store.commitLabel('a', 'A 的改动');
+
+    stubFetch(() => {
+      store.newMap();
+      return jsonResponse({
+        id: 'm1', version: 2, content: sample(), updated_at: '2026-11-04T01:00:00Z',
+      } satisfies MapRecord);
+    });
+
+    await store.save();
+
+    expect(store.mapId).toBeNull();
+    expect(store.content).toBeNull();
+    expect(store.version).toBe(0);
+  });
+
+  it('切图后新页面的保存状态不会被上一轮 finally 清掉', async () => {
+    // A 的 finally 若无条件把 saving 置 false，会把 B 正在保存的状态也清掉，
+    // 用户连点两次就会发出两个请求。
+    const store = useMindMapStore();
+    store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
+    store.commitLabel('a', 'A 改');
+
+    const other: MindMapContent = {
+      title: 'B 导图',
+      root: { id: 'root', label: 'B 根', children: [] },
+    };
+
+    stubFetch(() => {
+      store.loadMap(other, { id: 'm2', version: 3, updated_at: '2026-11-04T05:00:00Z' });
+      return jsonResponse({
+        id: 'm1', version: 2, content: sample(), updated_at: '2026-11-04T01:00:00Z',
+      } satisfies MapRecord);
+    });
+
+    await store.save();
+    // 切图后 saving 已被 loadMap 重置，新页面可以立即保存
+    expect(store.saving).toBe(false);
+  });
 });
 
 describe('打开列表', () => {

@@ -416,8 +416,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /** 打开一张已保存的导图：撤销栈、选中、脏标记全部重置到"刚读出来"的状态。 */
+  /**
+   * 当前页面"正在看哪张图"的会话号。每次 loadMap / newMap 递增。
+   *
+   * 保存请求在途时用户可能切到另一张导图，那份响应回来时不能再拿它改当前
+   * 页面的身份：否则 mapId 会被改回上一张，而画布上显示的还是新的那张，
+   * 之后保存就会把 B 的内容写进 A。用会话号比比较 mapId 更严格——它也覆盖
+   * 「保存中点了新建」（mapId 前后都是 null）这种情形。
+   */
+  let mapSession = 0;
+
   function loadMap(next: MindMapContent, record: { id: string; version: number; updated_at: string }) {
     cancel();
+    mapSession += 1;
+    saving.value = false;
     content.value = next;
     mapId.value = record.id;
     version.value = record.version;
@@ -433,6 +445,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function newMap() {
     cancel();
+    mapSession += 1;
+    saving.value = false;
     content.value = null;
     mapId.value = null;
     version.value = 0;
@@ -473,10 +487,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     saving.value = true;
     status.value = '正在保存…';
+    const session = mapSession;
     try {
       const record = mapId.value
         ? await updateMindMap(mapId.value, current, version.value)
         : await createMindMap(current);
+
+      // 请求在途时用户可能已经切到别的导图（或点了新建）。这时响应属于
+      // 上一张图，不能拿它改当前页面的 mapId —— 改了之后画布显示的是 B、
+      // 身份却是 A，再点保存就会把 B 的内容写进 A。
+      if (session !== mapSession) {
+        status.value = `上一张导图已保存（版本 ${record.version}），当前导图未受影响。`;
+        return 'saved';
+      }
 
       // 请求在途时用户可能还在编辑。applyContent() 是整体替换 content.value，
       // 所以比一次引用就知道内容有没有变过。变了必须把脏标记恢复回来——
@@ -490,6 +513,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       }
       return 'saved';
     } catch (error) {
+      if (session !== mapSession) {
+        return 'saved';
+      }
       if (error instanceof ApiError && error.status === 409) {
         conflict.value = { message: error.message };
         status.value = '这张导图已被别人改过，本地修改还没保存。';
@@ -498,7 +524,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = error instanceof ApiError ? error.message : '保存失败，请重试。';
       return 'failed';
     } finally {
-      saving.value = false;
+      // 切图后新页面的保存状态不能被打扫：只清理自己这一轮。
+      if (session === mapSession) saving.value = false;
     }
   }
 
@@ -519,8 +546,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
   async function saveAsNew(): Promise<void> {
     const current = content.value;
     if (!current) return;
+    const session = mapSession;
     try {
       const record = await createMindMap(current);
+      if (session !== mapSession) {
+        return;
+      }
       const changedDuringSave = content.value !== current;
       markSaved(record);
       conflict.value = null;
