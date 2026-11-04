@@ -199,6 +199,70 @@ describe('保存', () => {
     expect(calls).toHaveLength(0);
     expect(store.status).toBe('节点标题不能为空');
   });
+
+  it('保存期间继续编辑：请求返回后仍标记为有未保存修改', async () => {
+    // 请求体里发的是点保存那一刻的树；在途时的改动没有被发出去。
+    // markSaved() 会无条件把 dirty 清掉，如果这里不恢复，界面会显示"已保存"，
+    // 用户以为后改的内容也存上了，刷新即丢。
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+    store.commitLabel('a', '甲改');
+
+    stubFetch(() => {
+      // 模拟请求在途时用户又改了内容
+      store.commitLabel('a', '甲又改');
+      return jsonResponse(
+        { id: 'm1', version: 1, content: sample(), updated_at: '2026-11-04T00:00:00Z' },
+        201,
+      );
+    });
+
+    await expect(store.save()).resolves.toBe('saved');
+
+    // 版本号确实存上了，但本地仍有未保存的修改
+    expect(store.version).toBe(1);
+    expect(store.mapId).toBe('m1');
+    expect(store.dirty).toBe(true);
+    expect(store.status).toContain('保存期间又有修改');
+    // 改动的内容没有被服务端返回的旧内容覆盖掉
+    expect(store.content?.root.children[0].label).toBe('甲又改');
+  });
+
+  it('保存期间没有改动时，正常清掉脏标记', async () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+    store.commitLabel('a', '甲改');
+
+    stubFetch(() =>
+      jsonResponse(
+        { id: 'm1', version: 1, content: sample(), updated_at: '2026-11-04T00:00:00Z' },
+        201,
+      ),
+    );
+
+    await expect(store.save()).resolves.toBe('saved');
+    expect(store.dirty).toBe(false);
+    expect(store.status).toBe('已保存，版本 1。');
+  });
+
+  it('另存为新导图期间继续编辑，同样保留脏标记', async () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    stubFetch(() => {
+      store.commitLabel('a', '甲又改');
+      return jsonResponse(
+        { id: 'm2', version: 1, content: sample(), updated_at: '2026-11-04T00:00:00Z' },
+        201,
+      );
+    });
+
+    await store.saveAsNew();
+    expect(store.mapId).toBe('m2');
+    expect(store.conflict).toBeNull();
+    expect(store.dirty).toBe(true);
+    expect(store.status).toContain('保存期间又有修改');
+  });
 });
 
 describe('打开列表', () => {

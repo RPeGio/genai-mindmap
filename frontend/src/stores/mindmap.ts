@@ -477,7 +477,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const record = mapId.value
         ? await updateMindMap(mapId.value, current, version.value)
         : await createMindMap(current);
+
+      // 请求在途时用户可能还在编辑。applyContent() 是整体替换 content.value，
+      // 所以比一次引用就知道内容有没有变过。变了必须把脏标记恢复回来——
+      // markSaved() 无条件把它清成 false，那样后改的内容会被误标成"已保存"，
+      // 而请求体里发出去的只是点保存那一刻的树，刷新即丢。
+      const changedDuringSave = content.value !== current;
       markSaved(record);
+      if (changedDuringSave) {
+        dirty.value = true;
+        status.value = `已保存版本 ${record.version}，但保存期间又有修改，请再次保存。`;
+      }
       return 'saved';
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
@@ -511,9 +521,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (!current) return;
     try {
       const record = await createMindMap(current);
+      const changedDuringSave = content.value !== current;
       markSaved(record);
       conflict.value = null;
-      status.value = `已另存为新导图，版本 ${record.version}。`;
+      if (changedDuringSave) {
+        dirty.value = true;
+        status.value = `已另存为新导图（版本 ${record.version}），但保存期间又有修改，请再次保存。`;
+      } else {
+        status.value = `已另存为新导图，版本 ${record.version}。`;
+      }
     } catch (error) {
       status.value = error instanceof ApiError ? error.message : '另存失败，请重试。';
     }
