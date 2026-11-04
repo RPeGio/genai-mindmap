@@ -103,7 +103,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 前端
 
-前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容与版本状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布（W1 R2 接入），Vitest + Vue Test Utils 覆盖关键交互。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
+前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
 
 | 位置 | 选型 |
 |---|---|
@@ -112,7 +112,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 | 开发语言 | TypeScript |
 | 构建与测试 | Vite 7 + Vitest + Vue Test Utils |
 | 样式方案 | TailwindCSS 4 |
-| 画布 | `@vue-flow/core` + 自研 tidy-tree 布局（R2） |
+| 画布 | `@vue-flow/core` + 自研 tidy-tree 布局（R2），编辑与撤销在 store（R3） |
 | 网络通信 | `fetch`（`src/api/client.ts` 统一错误体） |
 | 数据校验 | 后端 Pydantic v2 契约；前端只做类型镜像 |
 

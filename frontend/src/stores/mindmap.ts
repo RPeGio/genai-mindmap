@@ -2,12 +2,29 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, generateMindMapStream } from '../api/client';
-import type { MindMapContent, MindNode } from '../api/types';
+import { ApiError, createMindMap, generateMindMapStream, getMindMap, listMindMaps, updateMindMap } from '../api/client';
+import type { MapRecord, MindMapContent, MindNode } from '../api/types';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
+import {
+  addChild,
+  addSibling,
+  countNodes,
+  findNode,
+  findParent,
+  LIMITS,
+  removeNode,
+  renameNode,
+  validateDraft,
+} from '../mindmap/edits';
 
 /** 画布节点上最多显示的字数（按码点算，避免把 emoji 切成半个）。 */
 export const TRUNCATE_CHARS = 24;
+
+/** 撤销栈上限。整树快照一步几 KB，50 步封顶，内存与手感都够用。 */
+export const HISTORY_LIMIT = 50;
+
+/** 保存的结果分类：界面据此决定提示什么，而不是把所有失败都说成"保存失败"。 */
+export type SaveResult = 'saved' | 'conflict' | 'invalid' | 'empty' | 'busy' | 'failed';
 
 /** 节点上显示的短标题：按码点截断，超出加省略号。 */
 export function displayTitle(node: MindNode): string {
@@ -44,6 +61,12 @@ export interface FlatNode {
   parentId: string | null;
 }
 
+/**
+ * 画布节点。Vue Flow 的 `Node` 输入类型里没有 `selected`（它把选中当内部状态），
+ * 但 `:nodes` 变化时 applyChanges 会把 `selected` 同步进去，所以这里补上这个字段的类型。
+ */
+export type MindFlowNode = FlowNode<MindNodeData> & { selected: boolean };
+
 function flatten(root: MindNode): FlatNode[] {
   const out: FlatNode[] = [];
   const walk = (node: MindNode, depth: number, parentId: string | null) => {
@@ -56,7 +79,7 @@ function flatten(root: MindNode): FlatNode[] {
 
 export const useMindMapStore = defineStore('mindmap', () => {
   const content = ref<MindMapContent | null>(null);
-  const mode = ref<'demo' | 'model' | null>(null);
+  const mode = ref<'demo' | 'model' | 'saved' | null>(null);
   const status = ref('输入主题或文本后生成，节点会边生成边出现。');
   const stageText = ref('');
   const waitedMs = ref(0);
@@ -65,6 +88,27 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const direction = ref<Direction>('right');
   /** 用户手动平移/缩放后不再自动 fitView，否则每次节点增长都会把视图拽回去。 */
   const viewAdjusted = ref(false);
+
+  /** 正在内联编辑的节点 id；null 表示没有编辑框打开。 */
+  const editingId = ref<string | null>(null);
+
+  /** 保存相关状态：mapId 为空表示这份导图还没存过。 */
+  const mapId = ref<string | null>(null);
+  const version = ref(0);
+  const savedAt = ref<string | null>(null);
+  const dirty = ref(false);
+
+  /** 撤销/重做存整树 JSON 快照：比命令模式少一半代码，300 节点的树一步也不到 100KB。 */
+  const past = ref<string[]>([]);
+  const future = ref<string[]>([]);
+
+  const saving = ref(false);
+  /** 保存撞上 409 时置位，由界面弹窗让用户选"重新加载 / 另存为新导图 / 取消"。 */
+  const conflict = ref<{ message: string } | null>(null);
+  /** 打开列表用的缓存。 */
+  const maps = ref<MapRecord[]>([]);
+  const listOpen = ref(false);
+  const listBusy = ref(false);
 
   let controller: AbortController | null = null;
 
@@ -76,7 +120,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     content.value ? flatten(content.value.root) : [],
   );
 
-  const nodes = computed<FlowNode<MindNodeData>[]>(() => {
+  const nodes = computed<MindFlowNode[]>(() => {
     const current = layout.value;
     if (!current) return [];
 
@@ -108,6 +152,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
         type: 'mind',
         draggable: false,
         connectable: false,
+        // 选中态由 store 说了算。只在点击时靠 Vue Flow 自己切换的话，代码里改选中
+        // （加节点、删节点后跳到父节点）画布上看不出来，用户会以为还停在原来那个节点上。
+        selected: selectedId.value === node.id,
         position: {
           x: point.x - NODE_SIZE.width / 2,
           y: point.y - NODE_SIZE.height / 2,
@@ -120,7 +167,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
           out: outSides,
           in: inSides,
         },
-      } satisfies FlowNode<MindNodeData>;
+      } satisfies MindFlowNode;
     });
   });
 
@@ -170,6 +217,344 @@ export const useMindMapStore = defineStore('mindmap', () => {
     };
     return walk(content.value.root) ? path : [];
   });
+
+  const canUndo = computed(() => past.value.length > 0);
+  const canRedo = computed(() => future.value.length > 0);
+
+  function snapshot(): string | null {
+    return content.value ? JSON.stringify(content.value) : null;
+  }
+
+  /** 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。 */
+  function pushHistory() {
+    const snap = snapshot();
+    if (!snap) return;
+    past.value.push(snap);
+    if (past.value.length > HISTORY_LIMIT) past.value.shift();
+    future.value = [];
+  }
+
+  function resetHistory() {
+    past.value = [];
+    future.value = [];
+  }
+
+  /** 选中的节点可能已被删掉：兜底清空，免得详情面板指向不存在的节点。 */
+  function ensureSelection() {
+    const target = selectedId.value;
+    if (target && content.value && !findNode(content.value.root, target)) {
+      selectedId.value = null;
+    }
+  }
+
+  function applyContent(next: MindMapContent, history: boolean) {
+    if (history) pushHistory();
+    content.value = next;
+    dirty.value = true;
+  }
+
+  /** 节点深度，1 起算（与契约的"最多 8 层"同一口径）。 */
+  function depthOfId(id: string): number | null {
+    const hit = flatNodes.value.find(entry => entry.node.id === id);
+    return hit ? hit.depth + 1 : null;
+  }
+
+  function beginEdit(id: string) {
+    if (!content.value || !findNode(content.value.root, id)) return;
+    selectedId.value = id;
+    editingId.value = id;
+  }
+
+  function endEdit() {
+    editingId.value = null;
+  }
+
+  function commitLabel(id: string, label: string) {
+    if (!content.value) return;
+    const node = findNode(content.value.root, id);
+    if (!node) return;
+
+    const next = label.trim();
+    if (next === node.label.trim()) {
+      // 只收拾自己的编辑态：连按 Tab 时上一个输入框失焦会再提交一次，
+      // 那时正在编辑的其实是新节点，这里不能把新节点的编辑态一起关掉。
+      if (editingId.value === id) editingId.value = null;
+      return;
+    }
+    if (!next) {
+      status.value = '节点标题不能为空';
+      return;
+    }
+    if (Array.from(next).length > LIMITS.label) {
+      status.value = `节点标题最多 ${LIMITS.label} 个字`;
+      return;
+    }
+
+    applyContent({ ...content.value, root: renameNode(content.value.root, id, next) }, true);
+    if (editingId.value === id) editingId.value = null;
+    status.value = '已修改，记得保存。';
+  }
+
+  function renameTitle(title: string) {
+    if (!content.value) return;
+    const next = title.trim();
+    if (next === content.value.title) return;
+    if (!next) {
+      status.value = '标题不能为空';
+      return;
+    }
+    if (Array.from(next).length > LIMITS.title) {
+      status.value = `标题最多 ${LIMITS.title} 个字`;
+      return;
+    }
+    applyContent({ ...content.value, title: next }, true);
+  }
+
+  function addChildTo(parentId: string) {
+    if (!content.value) return;
+    if (countNodes(content.value.root) >= LIMITS.nodes) {
+      status.value = `导图最多 ${LIMITS.nodes} 个节点`;
+      return;
+    }
+    const parent = findNode(content.value.root, parentId);
+    if (!parent) return;
+    if (parent.children.length >= LIMITS.children) {
+      status.value = `一个节点最多 ${LIMITS.children} 个子节点`;
+      return;
+    }
+    if ((depthOfId(parentId) ?? 1) + 1 > LIMITS.depth) {
+      status.value = `导图最多 ${LIMITS.depth} 层`;
+      return;
+    }
+
+    const { root, node } = addChild(content.value.root, parentId);
+    applyContent({ ...content.value, root }, true);
+    selectedId.value = node.id;
+    editingId.value = node.id;
+    status.value = '已加子节点，输入文字后按回车确认。';
+  }
+
+  /**
+   * 编辑新节点时按 Tab：先提交文字，再回到它的父节点下加一个兄弟。
+   * 若只看 selectedId，新节点一被选中，Tab 就变成"给子节点加子节点"——连按会一路下钻；
+   * 用户预期是同一个父节点下排出一串兄弟，所以这里固定回到父节点。
+   */
+  function commitAndAddChild(label: string) {
+    const id = editingId.value;
+    if (!id) return;
+    const parent = content.value ? findParent(content.value.root, id) : null;
+    commitLabel(id, label);
+    // 提交被拦下（空标题、超长）时编辑态还在，别在错误的基础上接着加节点。
+    if (editingId.value === id) return;
+    addChildTo(parent?.id ?? selectedId.value ?? id);
+  }
+
+  function addSiblingTo(id: string) {
+    if (!content.value) return;
+    if (countNodes(content.value.root) >= LIMITS.nodes) {
+      status.value = `导图最多 ${LIMITS.nodes} 个节点`;
+      return;
+    }
+    const parent = findParent(content.value.root, id);
+    // 根节点没有兄弟，退化成一个子节点；这时要按"加子节点"的规则校验层数与个数。
+    if (!parent) {
+      addChildTo(id);
+      return;
+    }
+    if (parent.children.length >= LIMITS.children) {
+      status.value = `一个节点最多 ${LIMITS.children} 个子节点`;
+      return;
+    }
+    if ((depthOfId(parent.id) ?? 1) + 1 > LIMITS.depth) {
+      status.value = `导图最多 ${LIMITS.depth} 层`;
+      return;
+    }
+
+    const { root, node } = addSibling(content.value.root, id);
+    applyContent({ ...content.value, root }, true);
+    selectedId.value = node.id;
+    editingId.value = node.id;
+    status.value = '已加兄弟节点，输入文字后按回车确认。';
+  }
+
+  function deleteNode(id: string) {
+    if (!content.value) return;
+    if (content.value.root.id === id) {
+      status.value = '根节点不能删除';
+      return;
+    }
+
+    const parent = findParent(content.value.root, id);
+    applyContent({ ...content.value, root: removeNode(content.value.root, id) }, true);
+    selectedId.value = parent?.id ?? null;
+    editingId.value = null;
+    status.value = '已删除该节点及其子节点，可撤销。';
+  }
+
+  function undo() {
+    const snap = past.value.pop();
+    if (!snap) return;
+    const current = snapshot();
+    if (current) future.value.push(current);
+    content.value = JSON.parse(snap) as MindMapContent;
+    dirty.value = true;
+    ensureSelection();
+    editingId.value = null;
+    status.value = '已撤销。';
+  }
+
+  function redo() {
+    const snap = future.value.pop();
+    if (!snap) return;
+    const current = snapshot();
+    if (current) past.value.push(current);
+    content.value = JSON.parse(snap) as MindMapContent;
+    dirty.value = true;
+    ensureSelection();
+    editingId.value = null;
+    status.value = '已重做。';
+  }
+
+  /** 打开一张已保存的导图：撤销栈、选中、脏标记全部重置到"刚读出来"的状态。 */
+  function loadMap(next: MindMapContent, record: { id: string; version: number; updated_at: string }) {
+    cancel();
+    content.value = next;
+    mapId.value = record.id;
+    version.value = record.version;
+    savedAt.value = record.updated_at;
+    mode.value = 'saved';
+    dirty.value = false;
+    selectedId.value = null;
+    editingId.value = null;
+    viewAdjusted.value = false;
+    resetHistory();
+    status.value = `已打开导图，版本 ${record.version}。`;
+  }
+
+  function newMap() {
+    cancel();
+    content.value = null;
+    mapId.value = null;
+    version.value = 0;
+    savedAt.value = null;
+    mode.value = null;
+    dirty.value = false;
+    selectedId.value = null;
+    editingId.value = null;
+    resetHistory();
+    status.value = '新建导图：输入主题生成，或直接在画布上手动编辑。';
+  }
+
+  function markSaved(record: { id: string; version: number; updated_at: string }) {
+    mapId.value = record.id;
+    version.value = record.version;
+    savedAt.value = record.updated_at;
+    dirty.value = false;
+    mode.value = 'saved';
+    status.value = `已保存，版本 ${record.version}。`;
+  }
+
+  /**
+   * 保存。返回结果让界面分流提示：正常、内容不合法、版本冲突各走各的。
+   * 失败时保留 dirty —— 一次网络抖动不能让用户以为已经存上了。
+   */
+  async function save(): Promise<SaveResult> {
+    const current = content.value;
+    if (!current) {
+      status.value = '没有可保存的导图。';
+      return 'empty';
+    }
+    const invalid = validateDraft(current);
+    if (invalid) {
+      status.value = invalid;
+      return 'invalid';
+    }
+    if (saving.value) return 'busy';
+
+    saving.value = true;
+    status.value = '正在保存…';
+    try {
+      const record = mapId.value
+        ? await updateMindMap(mapId.value, current, version.value)
+        : await createMindMap(current);
+      markSaved(record);
+      return 'saved';
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        conflict.value = { message: error.message };
+        status.value = '这张导图已被别人改过，本地修改还没保存。';
+        return 'conflict';
+      }
+      status.value = error instanceof ApiError ? error.message : '保存失败，请重试。';
+      return 'failed';
+    } finally {
+      saving.value = false;
+    }
+  }
+
+  /** 409 的选项一：放弃本地修改，换成服务端最新版本（撤销栈一并清空）。 */
+  async function reloadFromServer(): Promise<void> {
+    const id = mapId.value;
+    if (!id) return;
+    try {
+      const record = await getMindMap(id);
+      loadMap(record.content, record);
+      conflict.value = null;
+    } catch (error) {
+      status.value = error instanceof ApiError ? error.message : '读取服务端版本失败。';
+    }
+  }
+
+  /** 409 的选项二：把当前内容存成一条新记录，两边的修改都保留。 */
+  async function saveAsNew(): Promise<void> {
+    const current = content.value;
+    if (!current) return;
+    try {
+      const record = await createMindMap(current);
+      markSaved(record);
+      conflict.value = null;
+      status.value = `已另存为新导图，版本 ${record.version}。`;
+    } catch (error) {
+      status.value = error instanceof ApiError ? error.message : '另存失败，请重试。';
+    }
+  }
+
+  /** 409 的选项三：先不处理，本地修改继续留在页面上。 */
+  function dismissConflict() {
+    conflict.value = null;
+    status.value = '已取消保存，本地修改还在，可以再试一次。';
+  }
+
+  async function openList() {
+    listOpen.value = true;
+    listBusy.value = true;
+    try {
+      maps.value = await listMindMaps();
+    } catch (error) {
+      maps.value = [];
+      status.value = error instanceof ApiError ? error.message : '读取导图列表失败。';
+    } finally {
+      listBusy.value = false;
+    }
+  }
+
+  function closeList() {
+    listOpen.value = false;
+  }
+
+  async function openMap(id: string) {
+    listBusy.value = true;
+    try {
+      const record = await getMindMap(id);
+      loadMap(record.content, record);
+      listOpen.value = false;
+      conflict.value = null;
+    } catch (error) {
+      status.value = error instanceof ApiError ? error.message : '打开导图失败。';
+    } finally {
+      listBusy.value = false;
+    }
+  }
 
   /**
    * 把增量节点合并进当前树。
@@ -222,7 +607,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
     content.value = next;
     mode.value = 'demo';
     selectedId.value = null;
+    editingId.value = null;
     viewAdjusted.value = false;
+    // 示例只是用来看布局的，不算用户的作品，别让它挂上"未保存"的包袱。
+    mapId.value = null;
+    version.value = 0;
+    savedAt.value = null;
+    dirty.value = false;
+    resetHistory();
     status.value = '这是本地示例数据，用来检查布局与截断，不是模型生成的。';
   }
 
@@ -246,6 +638,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 先把上一份结果存起来：新请求失败时恢复它，而不是让用户白等一场还丢了旧图。
     const previous = content.value;
     const previousMode = mode.value;
+    const previousSave = {
+      mapId: mapId.value,
+      version: version.value,
+      savedAt: savedAt.value,
+      dirty: dirty.value,
+    };
 
     busy.value = true;
     waitedMs.value = 0;
@@ -253,7 +651,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
     content.value = null;
     mode.value = null;
     selectedId.value = null;
+    editingId.value = null;
     viewAdjusted.value = false;
+    // 生成出来的是新导图，还没存过；上一份已保存的导图不能因此被覆盖。
+    mapId.value = null;
+    version.value = 0;
+    savedAt.value = null;
+    dirty.value = false;
+    resetHistory();
 
     const ctrl = new AbortController();
     controller = ctrl;
@@ -264,6 +669,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const restore = () => {
       content.value = previous;
       mode.value = previousMode;
+      mapId.value = previousSave.mapId;
+      version.value = previousSave.version;
+      savedAt.value = previousSave.savedAt;
+      dirty.value = previousSave.dirty;
     };
 
     try {
@@ -291,10 +700,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
               settled = true;
               content.value = event.content;
               mode.value = event.mode;
+              // 生成结果还没存过，标脏：离开页面前会提醒，保存时走"创建"。
+              dirty.value = true;
               status.value =
                 event.mode === 'demo'
                   ? '这是固定结构的演示数据，不是 AI 生成。'
-                  : `模型已生成候选导图，用时 ${(event.latencyMs / 1000).toFixed(1)} 秒。`;
+                  : `模型已生成候选导图，用时 ${(event.latencyMs / 1000).toFixed(1)} 秒，可直接编辑，记得保存。`;
               stageText.value = '';
               break;
             case 'error':
@@ -348,6 +759,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     selectedId,
     direction,
     viewAdjusted,
+    editingId,
+    mapId,
+    version,
+    savedAt,
+    dirty,
     layout,
     flatNodes,
     nodes,
@@ -355,10 +771,37 @@ export const useMindMapStore = defineStore('mindmap', () => {
     nodeCount,
     selectedNode,
     breadcrumb,
+    canUndo,
+    canRedo,
+    saving,
+    conflict,
+    maps,
+    listOpen,
+    listBusy,
     generate,
     cancel,
     preview,
     select,
     setDirection,
+    beginEdit,
+    endEdit,
+    commitLabel,
+    renameTitle,
+    addChildTo,
+    addSiblingTo,
+    commitAndAddChild,
+    deleteNode,
+    undo,
+    redo,
+    loadMap,
+    newMap,
+    markSaved,
+    save,
+    reloadFromServer,
+    saveAsNew,
+    dismissConflict,
+    openList,
+    closeList,
+    openMap,
   };
 });

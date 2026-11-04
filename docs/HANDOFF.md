@@ -18,9 +18,11 @@
 
 | 编号 | 日期 | 提出人 | 决策 | 理由 | 影响面 | 未回复期间的默认做法 |
 |---|---|---|---|---|---|---|
-| H1 | 2026-11-03 | RPeGio | 节点正文复用契约 v2 已有的 `Node.note`（`max_length=2000`），`label` 继续当短标题，**不收紧** 200 字上限 | 画布节点只有 180×48 px，长文本必须截断；截断后要能看全文，就需要一个"标题 + 正文"的双字段结构。v2 已经定义了 `note`，再加一个新字段会让迁移多一条无意义的分支 | `docs/CONTRACT_V2.md` 的 `Node`；前端 `src/api/types.ts`、`src/stores/mindmap.ts` 的 `displayBody()` | 前端按 `node.note ?? node.label` 取值并已实现；`note` **与契约 v2 同批上线**——v1 的 `backend/app/contracts/mindmap.py` 是 `extra="forbid"`，提前塞 `note` 会直接 422。在 v2 落地前，后端不应接受该字段，前端也不发送该字段 |
+| H1 | 2026-11-03 | RPeGio | 节点正文复用契约 v2 已有的 `Node.note`（`max_length=2000`），`label` 继续当短标题，**不收紧** 200 字上限 | 画布节点只有 180×48 px，长文本必须截断；截断后要能看全文，就需要一个"标题 + 正文"的双字段结构。v2 已经定义了 `note`，再加一个新字段会让迁移多一条无意义的分支 | `docs/CONTRACT_V2.md` 的 `Node`；前端 `src/api/types.ts`、`src/stores/mindmap.ts` 的 `displayBody()` | 前端按 `node.note ?? node.label` 取值并已实现；`note` **与契约 v2 同批上线**——v1 的 `backend/app/contracts/mindmap.py` 是 `extra="forbid"`，提前塞 `note` 会直接 422。在 v2 落地前，后端不应接受该字段，前端也不发送该字段——`src/api/client.ts` 的 `toContractV1()` 在序列化时把 `note` 裁掉，本地仍保留它供详情面板显示 |
 
 > H1 需要陈嘉涛在 PR 审查阶段确认。五条要点：① 复用 v2 的 `note`，不新增字段；② `label` 不收紧上限，仍允许长文本，`note` 只是可选的更长正文；③ `note` 必须与 v2 同批上线，不与 v1 混用；④ `migrate_v1_to_v2` 里 `note` 置 `None`、`label` 原样，保证迁移无损；⑤ 前端取值收敛在 `displayBody()` 一处，回退逻辑不散落到组件里。
+
+| H2 | 2026-11-04 | RPeGio | 保存以**整棵树**为单位提交（`POST /api/mindmaps` 建图、`PUT /api/mindmaps/{id}` 带 `version`），不做字段级合并；编辑上限在前端也校验一遍（标题/节点 200 字、300 节点、8 层、每节点 50 子节点），文案与后端一致 | 字段级合并需要 diff + 三方合并，代价远超当前收益；单机单人对同一张图并发编辑的概率低，409 时让用户选"重新加载 / 另存为新图 / 取消"已经够用。前端先校验是为了不把明显非法的树发出去、省一次 422 往返，**不替代**后端校验 | 无后端改动；前端 `src/mindmap/edits.ts` 的 `validateDraft()` 与 `backend/app/contracts/mindmap.py` 的限制必须同步（改动任一侧要同时改另一侧） | 已按此实现（R3，PR #7）。若陈嘉涛不认同，改动集中在前端 `save()` 一个函数与 409 弹层，回退成本低；后端校验始终是唯一权威，前端校验只为省一次 422 往返 |
 
 ## 已确认
 
