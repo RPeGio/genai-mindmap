@@ -7,7 +7,7 @@
     text / markdown   已实现（解码 + 空白规整）
     document          PDF 走 pymupdf；DOCX / PPTX / XLSX / HTML 走 Docling
     image             待实现：视觉模型生成结构化描述
-    audio             待实现：ASR 转写 + 时间戳
+    audio             阿里云一句话识别，超 60 秒自动切片，见 app/ingestion/asr.py
 
 **PDF 为什么不用 Docling**：它的版面模型常驻 1.2GB、实测峰值 1.6–2.8GB，
 2C2G 的部署机会被 OOM 直接杀掉。PDF 改用 pymupdf 只读文本层，30 页中文文档
@@ -37,6 +37,7 @@ import re
 import threading
 
 from app.contracts.source import Source, SourceKind, SourceSpan
+from app.ingestion.asr import AsrError, transcribe_audio
 
 # 单份文档最多解析的页数。超过就截断，理由见 docs/PLAN.md 的 F05 边界：
 # 导图本身容纳不了几百页的细节。
@@ -55,6 +56,11 @@ DOCUMENT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx",
 
 # 需要先经 LibreOffice 渲染成 PDF 的旧格式
 LEGACY_RENDER_SUFFIXES = {".doc", ".ppt"}
+
+# 语音来源只收 WAV。云端一句话识别本身支持 mp3/aac/amr/opus，但解码这些
+# 要拖进 ffmpeg（2C2G 上又多一个系统依赖），而浏览器录音和 decodeAudioData
+# 都能直接产出 16k 单声道 WAV，没必要为边缘格式付出这个代价。
+AUDIO_SUFFIXES = {".wav"}
 
 _converter = None
 _converter_lock = threading.Lock()
@@ -351,7 +357,9 @@ def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
         raise NotSupportedSource("图片理解待实现")
 
     if kind is SourceKind.audio:
-        # TODO(F07): ASR 转写 + 分段，保留时间戳写进 SourceSpan
-        raise NotSupportedSource("语音转写待实现")
+        try:
+            return transcribe_audio(filename, raw)
+        except AsrError as exc:
+            raise NotSupportedSource(str(exc)) from exc
 
     raise NotSupportedSource(f"未知来源类型：{kind}")

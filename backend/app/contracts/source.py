@@ -50,6 +50,10 @@ class Source(BaseModel):
     # 两者对用户的含义不一样，合并成一个布尔值会给出自相矛盾的提示
     # （"共 3 页，仅处理前 3 页"这种）。
     failed_pages: list[int] = Field(default_factory=list)
+    # 语音来源的音频时长（秒）。文档用 parsed_pages 表示"处理了多少"，
+    # 语音用时长更贴切：转写结果没有页的概念，用户关心的是"这段录音多长"。
+    # 其余模态留 None。
+    duration_seconds: float | None = None
 
 
 class SourceUsage(BaseModel):
