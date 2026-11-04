@@ -262,10 +262,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
   }
 
-  function applyContent(next: MindMapContent, history: boolean) {
+  function applyContent(next: MindMapContent, history: boolean): boolean {
+    // 生成还在进行时禁止用户改动：done 帧会用完整结果整树替换，期间的编辑
+    // 必然被覆盖；撤销栈里也会混进生成中间态，撤销起来只剩半成品。
+    // 返回 false 让调用方提前退出，免得它接着把 status 改成「已修改」。
+    if (busy.value) {
+      status.value = '正在生成导图，完成之后才能编辑。';
+      return false;
+    }
     if (history) pushHistory();
     content.value = next;
     dirty.value = true;
+    return true;
   }
 
   /** 节点深度，1 起算（与契约的"最多 8 层"同一口径）。 */
@@ -305,7 +313,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    applyContent({ ...content.value, root: renameNode(content.value.root, id, next) }, true);
+    if (!applyContent({ ...content.value, root: renameNode(content.value.root, id, next) }, true)) return;
     if (editingId.value === id) editingId.value = null;
     status.value = '已修改，记得保存。';
   }
@@ -325,7 +333,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = `标题最多 ${LIMITS.title} 个字`;
       return;
     }
-    applyContent({ ...content.value, title: next }, true);
+    if (!applyContent({ ...content.value, title: next }, true)) return;
   }
 
   /** 标题框每次按键都同步草稿，只记"有未提交的输入"，不改 content。 */
@@ -351,7 +359,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
 
     const { root, node } = addChild(content.value.root, parentId);
-    applyContent({ ...content.value, root }, true);
+    if (!applyContent({ ...content.value, root }, true)) return;
     selectedId.value = node.id;
     editingId.value = node.id;
     status.value = '已加子节点，输入文字后按回车确认。';
@@ -394,7 +402,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
 
     const { root, node } = addSibling(content.value.root, id);
-    applyContent({ ...content.value, root }, true);
+    if (!applyContent({ ...content.value, root }, true)) return;
     selectedId.value = node.id;
     editingId.value = node.id;
     status.value = '已加兄弟节点，输入文字后按回车确认。';
@@ -408,13 +416,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
 
     const parent = findParent(content.value.root, id);
-    applyContent({ ...content.value, root: removeNode(content.value.root, id) }, true);
+    if (!applyContent({ ...content.value, root: removeNode(content.value.root, id) }, true)) return;
     selectedId.value = parent?.id ?? null;
     editingId.value = null;
     status.value = '已删除该节点及其子节点，可撤销。';
   }
 
   function undo() {
+    if (busy.value) {
+      status.value = '正在生成导图，完成之后才能编辑。';
+      return;
+    }
     const snap = past.value.pop();
     if (!snap) return;
     const current = snapshot();
@@ -427,6 +439,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   function redo() {
+    if (busy.value) {
+      status.value = '正在生成导图，完成之后才能编辑。';
+      return;
+    }
     const snap = future.value.pop();
     if (!snap) return;
     const current = snapshot();

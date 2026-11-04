@@ -47,6 +47,60 @@ describe('节点文字', () => {
   });
 });
 
+describe('生成期间的编辑限制', () => {
+  it('生成进行中不接受编辑：done 帧会整树替换，期间的改动静默丢失', async () => {
+    // 流式生成边出节点边显示，用户看到就想改。但 done 到达时会用完整结果
+    // 整树替换，那些编辑必然被覆盖，撤销栈里还会混进生成中间态。
+    const encoder = new TextEncoder();
+    let push!: (frame: unknown) => void;
+    let close!: () => void;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = frame => controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+        close = () => controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, body, json: async () => ({}),
+    }) as unknown as Response));
+
+    const store = useMindMapStore();
+    const task = store.generate('机器学习');
+
+    // 增量阶段先有一个节点
+    push({ type: 'node', parentId: null, node: node('r', '机器学习'), index: 0 });
+    push({ type: 'node', parentId: 'r', node: node('a', '监督学习'), index: 1 });
+    await vi.waitFor(() => expect(store.nodeCount).toBe(2));
+
+    // 生成还没结束，用户试图改名
+    store.commitLabel('a', '我改的名字');
+    expect(store.content?.root.children[0].label).toBe('监督学习');
+    expect(store.status).toContain('完成之后才能编辑');
+
+    // 撤销同样被挡住
+    store.undo();
+    expect(store.status).toContain('完成之后才能编辑');
+
+    push({
+      type: 'done',
+      mode: 'model',
+      content: {
+        title: '机器学习',
+        root: { id: 'r', label: '机器学习', children: [node('a', '监督学习')] },
+      },
+      latencyMs: 800, degraded: false, reason: '',
+    });
+    push('[DONE]');
+    close();
+    await task;
+
+    // 生成结束后恢复正常
+    expect(store.busy).toBe(false);
+    store.commitLabel('a', '现在可以改了');
+    expect(store.content?.root.children[0].label).toBe('现在可以改了');
+  });
+});
+
 describe('mindmap store', () => {
   it('增量 node 事件按 id 合并进树，重复到达时更新文字并保留子节点', async () => {
     // 手动控制流的推进：只有这样才能在 done 到达之前检查中间的树。
