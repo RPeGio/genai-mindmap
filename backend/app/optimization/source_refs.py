@@ -1,9 +1,18 @@
 """第三层：引用与本次提供的原文匹配，不将文本匹配宣称为事实核验。"""
 from __future__ import annotations
 
+import logging
+
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceRef
+
+logger = logging.getLogger(__name__)
+
+# 单次生成最多对多少条引用跑 NLI。一次推理 15–44 ms，不设上限时 300 节点
+# 每条引用都跑一遍能拖到几十秒，而用户只是点了「生成导图」。超出预算的
+# 引用静默跳过——它们是可选的附加评分，不是功能的必要条件。
+MAX_NLI_CHECKS = 100
 
 
 def _reference_problem(ref: SourceRef, source: Source | None) -> tuple[str, str] | None:
@@ -96,6 +105,8 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
 
     by_id = {source.id: source for source in sources}
     diagnostics: list[Diagnostic] = []
+    checked = 0
+    skipped = 0
     stack = [content.root]
     while stack:
         node = stack.pop()
@@ -107,6 +118,11 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
                     evidence = (source.text or "")[ref.start:ref.end]
             if not (evidence or "").strip():
                 continue
+
+            if checked >= MAX_NLI_CHECKS:
+                skipped += 1
+                continue
+            checked += 1
 
             result = nli.judge(node.label, evidence)
             if not result:
@@ -130,4 +146,7 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
                     evidence=ref.quote,
                 ))
         stack.extend(reversed(node.children))
+
+    if skipped:
+        logger.info("NLI 评估达到上限 %d 条，另有 %d 条引用跳过", MAX_NLI_CHECKS, skipped)
     return diagnostics

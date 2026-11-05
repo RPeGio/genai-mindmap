@@ -165,13 +165,15 @@ class _OnnxBackend:
 def _load() -> object | None:
     """加载一次并缓存。任何失败都只记录原因，不抛异常。"""
     with _lock:
-        if _cache["tried"]:
-            return _cache["backend"]
-        _cache["tried"] = True
-
+        # 关闭状态**不写缓存**：否则关闭期间只要被调过一次（judge 会走到这里），
+        # tried 就被钉成 True，之后即使把开关打开也永远返回不可用。生产上环境
+        # 变量不会中途改，但测试和多环境切换会踩，而且症状是"开了但不管用"。
         if not _enabled():
             _cache["reason"] = f"未开启（{ENABLED_ENV} 未设）"
             return None
+        if _cache["tried"]:
+            return _cache["backend"]
+        _cache["tried"] = True
         model_dir = _model_dir()
         if not model_dir:
             _cache["reason"] = f"未设置 {MODEL_DIR_ENV}"
@@ -196,8 +198,6 @@ def _load() -> object | None:
 
 
 def available() -> bool:
-    if not _enabled():
-        return False
     return _load() is not None
 
 
