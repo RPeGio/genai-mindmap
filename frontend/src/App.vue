@@ -105,6 +105,10 @@ function confirmDiscard(action: string): boolean {
 }
 
 const exporting = ref(false);
+// 必须由 Vue 管住选中值：把占位项写成 disabled 时，浏览器会把第一个可用项
+// （PlantUML）当成初始选中，用户第一次点它就等于"值没变"，change 不触发，
+// 表现为点了没反应。
+const exportChoice = ref<ExportFormat | ''>('');
 
 /** 浏览器端落盘：三种导出都是纯文本，不需要后端再跑一趟。 */
 function saveTextFile(filename: string, text: string): void {
@@ -117,11 +121,10 @@ function saveTextFile(filename: string, text: string): void {
   URL.revokeObjectURL(url);
 }
 
-async function onExport(event: Event): Promise<void> {
-  const select = event.target as HTMLSelectElement;
-  const format = select.value as ExportFormat;
-  // 复位，否则连着导同一种格式时 change 不会再次触发，看起来像"点了没反应"
-  select.value = '';
+async function onExport(): Promise<void> {
+  const format = exportChoice.value;
+  // 复位，否则连着导同一种格式时 change 不会再次触发
+  exportChoice.value = '';
   const content = store.content;
   if (!content || !format) return;
 
@@ -256,12 +259,13 @@ async function copyBody() {
           新建
         </button>
         <select
+          v-model="exportChoice"
           class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 disabled:opacity-40"
           :disabled="!store.content || exporting"
           title="导出为文本格式"
           @change="onExport"
         >
-          <option value="" disabled>{{ exporting ? '导出中…' : '导出' }}</option>
+          <option value="" hidden>{{ exporting ? '导出中…' : '导出' }}</option>
           <option value="puml">PlantUML</option>
           <option value="markdown">Markdown</option>
           <option value="opml">OPML（XMind）</option>

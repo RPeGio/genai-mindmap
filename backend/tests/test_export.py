@@ -59,6 +59,17 @@ class MarkdownTest(unittest.TestCase):
         self.assertIn("# 文档标题", text)
         self.assertIn("- 根节点文字", text)
 
+    def test_angle_brackets_are_escaped(self):
+        """不转义的话渲染器会把 <T> 当 HTML 标签吞掉，节点文字就残了。"""
+        content = build(title="泛型 List<String>",
+                        root_label="Map<K,V>",
+                        children=[child("x", "a < b")])
+        text = to_markdown(content)
+        self.assertIn("List&lt;String&gt;", text)
+        self.assertIn("Map&lt;K,V&gt;", text)
+        self.assertIn("a &lt; b", text)
+        self.assertNotIn("<T>", text)
+
 
 class OpmlTest(unittest.TestCase):
     def test_output_is_valid_xml(self):

@@ -119,8 +119,15 @@ def _call_vision(image_bytes: bytes, mime: str, prompt: str, label: str) -> str:
         "max_tokens": _PAGE_MAX_TOKENS,
     }
     with httpx.Client(timeout=180.0) as client:
-        resp = client.post(base + "/chat/completions", json=payload,
-                           headers={"Authorization": f"Bearer {key}"})
+        try:
+            resp = client.post(base + "/chat/completions", json=payload,
+                               headers={"Authorization": f"Bearer {key}"})
+        except httpx.HTTPError as exc:
+            # 连接失败、超时、DNS 错误都在这里。不包一层的话异常会直接冒到
+            # 路由层变成 500，用户看到的是"服务器内部错误"，而不是"图片识别
+            # 没成功"。PDF 路径有单页兜底看不出来，图片路径没有兜底。
+            raise VisionUnavailable(
+                f"{label}请求失败：{type(exc).__name__}") from exc
         if resp.status_code != 200:
             raise VisionUnavailable(
                 f"{label}识别失败：HTTP {resp.status_code}")

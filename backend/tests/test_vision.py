@@ -106,6 +106,23 @@ class ParseImageTest(unittest.TestCase):
                 vision_pdf.describe_image(PNG)
         self.assertIn("截断", str(ctx.exception))
 
+    def test_network_error_becomes_vision_unavailable(self):
+        """连接失败/超时必须转成业务错误，否则图片路径会冒成 500。
+
+        PDF 路径有单页兜底看不出来，图片没有兜底——不包这一层的话用户看到
+        的是"服务器内部错误"，而不是"图片识别没成功"。
+        """
+        import httpx
+
+        with patch.dict("os.environ", MODEL_ENV, clear=False), \
+             patch("httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.post.side_effect = \
+                httpx.ReadTimeout("timed out")
+            with self.assertRaises(vision_pdf.VisionUnavailable) as ctx:
+                vision_pdf.describe_image(PNG)
+        self.assertIn("请求失败", str(ctx.exception))
+        self.assertIn("ReadTimeout", str(ctx.exception))
+
 
 class FormatsTest(unittest.TestCase):
     def test_image_listed_with_own_limit(self):

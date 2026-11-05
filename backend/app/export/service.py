@@ -33,6 +33,15 @@ def _sanitize(text: str) -> str:
     return _one_line(text).replace("*", "·")
 
 
+def _escape_markdown(text: str) -> str:
+    """转义会破坏 Markdown 结构的字符。
+
+    尖括号不转义会被渲染器当成 HTML 标签——`List<T>` 里的 `<T>` 直接消失，
+    节点文字就残了。节点总在 `- ` 之后，不占行首，所以 `#` 和 `>` 不用管。
+    """
+    return _one_line(text).replace("<", "&lt;").replace(">", "&gt;")
+
+
 def to_puml(content: MindMapContent) -> str:
     """把导图转成 PlantUML mindmap 语法。"""
     lines: list[str] = ["@startmindmap"]
@@ -55,12 +64,12 @@ def to_markdown(content: MindMapContent) -> str:
     根节点也写成列表项而不是跳过——否则 `title` 和 `root.label` 不一致时
     （生成器允许不同），根节点的文字会在导出结果里消失。
     """
-    lines: list[str] = [f"# {_one_line(content.title)}", ""]
-    lines.append(f"- {_one_line(content.root.label)}")
+    lines: list[str] = [f"# {_escape_markdown(content.title)}", ""]
+    lines.append(f"- {_escape_markdown(content.root.label)}")
 
     def walk(node: Node, depth: int) -> None:
         for child in node.children:
-            lines.append(f"{'  ' * depth}- {_one_line(child.label)}")
+            lines.append(f"{'  ' * depth}- {_escape_markdown(child.label)}")
             walk(child, depth + 1)
 
     walk(content.root, 1)
