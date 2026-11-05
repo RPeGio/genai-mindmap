@@ -7,7 +7,7 @@ cd backend
 pip install -r requirements.txt
 ```
 
-十项全部是请求路径上的硬依赖，缺任何一项都会让对应功能不可用（`tests/test_dependencies.py` 会守住这一点）。语音转写的两项（`aliyun-python-sdk-core`、`websockets`）只在调用语音接口时导入，缺了不影响文档解析，但语音功能会报错并提示重装依赖。
+八项全部是请求路径上的硬依赖，缺任何一项都会让对应功能不可用（`tests/test_dependencies.py` 会守住这一点）。语音转写复用 `httpx`，不需要额外 SDK，也不依赖 websockets 客户端。
 
 ## 2. 系统依赖：LibreOffice
 
@@ -41,14 +41,10 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_LLM_MODEL` | — | 模型名，当前用 `deepseek-chat` |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径 |
 | `MINDMAP_SOFFICE_CMD` | 自动探测 | 可选，LibreOffice 可执行文件路径 |
-| `ALIYUN_AK_ID` | — | 语音转写的 AccessKey ID |
-| `ALIYUN_AK_SECRET` | — | 语音转写的 AccessKey Secret |
-| `NLS_APPKEY` | — | 智能语音交互项目的 Appkey |
-| `MINDMAP_ASR_INTERNAL` | 空 | 部署在阿里云北京/上海/深圳时设为 `1`，语音走内网网关 |
+| `DASHSCOPE_API_KEY` | — | 语音转写用。阿里云百炼控制台创建，`sk-` 开头 |
 | `MINDMAP_NLI_ENABLED` | 空（关） | 引用核验的第三层（语义蕴含打分）。需同时配 `MINDMAP_NLI_MODEL_DIR` |
 | `MINDMAP_NLI_MODEL_DIR` | — | 含 `model.onnx` / `tokenizer.json` / `config.json` 的目录 |
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
-| `MINDMAP_ASR_CONCURRENCY` | `2` | 账号的一句话识别并发额度，调大不会变快只会报错 |
 
 ## 4. 各格式的依赖与耗时
 
@@ -58,7 +54,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `.docx` `.pptx` `.xlsx` `.html` `.md` | `docling` | 1–2 秒 | 读结构化格式，不加载版面模型 |
 | `.doc` `.ppt` | `docling` + LibreOffice + 模型 | 约 10–60 秒 | 先转 PDF 再视觉识别；**耗时按转换后的页数算**，重排版后页数会增加 |
 | `.xls` | `xlrd` | 0.1 秒 | 直接读单元格 |
-| `.wav` | `websockets` + 阿里云 | 约 0.14 秒/秒音频 | 一句话识别；≤60 秒单次，更长自动切片成多段 |
+| `.wav` | `httpx` + 阿里云百炼 | 约 0.04 秒/秒音频 | Qwen-Audio-ASR；≤300 秒单次，更长自动切片，带句级时间戳 |
 | `.png` `.jpg` `.webp` `.gif` `.bmp` | `MINDMAP_LLM_*` | 约 5–8 秒/张 | 与 PDF 逐页共用多模态调用；`demo` 模式或未配密钥时返回 422 |
 
 `demo` 模式下 PDF 会退回到文本层抽取（约 0.3 秒），扫描件则返回 422——因为视觉提取被模式检查拦下了。
@@ -76,28 +72,35 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 ## 6. 语音输入（F07）
 
-走阿里云**一句话识别**，不在部署机上跑本地模型。
+走阿里云百炼的 **Qwen-Audio-ASR**（`qwen-audio-3.1-asr-flash`），不在部署机上跑本地模型。
 
-**为什么不用本地模型**：实测 `sherpa-onnx` 的 paraformer-zh-small（78 MB 磁盘）在 2C2G 上常驻 143 MB、短音频 RTF 0.013，但吃不下长输入——33.8 秒整段 CER 86.4%，60 秒直接返回空串并抛 onnxruntime Reshape 错误。它只能安全处理 10 秒以内的片段。云端在同一批音频上 60 秒整段正常出字、CER 0%，代价是每次约 0.0035 元且依赖网络。
+**为什么选这个接口**：一次同步调用同时返回文本、句级时间戳和词级时间戳。之前用过 ISI 的「一句话识别」，只有整段文本、没有句子边界，节点无法指回「这句话在录音的第几秒」。同批音频实测：
+
+| | 一句话识别 | Qwen-Audio-ASR |
+|---|---|---|
+| 60 秒耗时 | 8.65 s | **3.1 s** |
+| 60 秒成本 | 0.0035 元 | **0.00091 元** |
+| 单次时长上限 | 60 秒 | **300 秒** |
+| 句子/词时间戳 | 无 | **有** |
+
+**不用本地模型的理由**：`sherpa-onnx` 的 paraformer-zh-small（78 MB）在 2C2G 上常驻 143 MB、短音频 RTF 0.013，但吃不下长输入——33.8 秒整段 CER 86.4%，60 秒直接返回空串并抛 onnxruntime Reshape 错误，只能处理 10 秒以内的片段。
 
 ### 开通与凭证
 
-1. 控制台搜索「智能语音交互」→ 开通（新用户 3 个月试用）
-2. 「全部项目」→ 创建项目 → 项目功能配置选「中文普通话 / 16kHz / 通用模型」
-3. 项目列表里抄下 **Appkey**，填进 `NLS_APPKEY`
-4. 建议建一个只授 `AliyunNLSFullAccess` 的 **RAM 子账号**，用它的 AccessKey
+1. 打开[百炼控制台](https://modelstudio.console.aliyun.com) → 创建 **API Key**（`sk-` 开头）
+2. 填进环境变量 `DASHSCOPE_API_KEY`
 
-三个变量缺任何一个，语音上传都会返回 422 并明确说明缺哪个。
+只需要这一个变量，缺了语音上传返回 422 并指明变量名。不需要 AccessKey，也不需要 Appkey——这套接口用 Bearer Token 鉴权。
 
-### 内网网关
+老域名 `dashscope.aliyuncs.com` 可直接用，不必迁到带 Workspace ID 的新域名。
 
-部署在阿里云北京 / 上海 / 深圳时设 `MINDMAP_ASR_INTERNAL=1`，语音改走
-`ws://nls-gateway-<region>-internal.aliyuncs.com:80`：
+### 时长边界（实测）
 
-- 不产生公网流量费
-- 绕开小带宽瓶颈——60 秒音频 1.83 MB，1 Mbps 公网要传 15 秒，内网 0.15 秒
+- **≤300 秒**：正常。300 秒音频 12.4 秒返回，文本 1074 字，与期望值差 3 字
+- **>300 秒**：返回 400 `AUDIO_DURATION_TOO_LONG`，明确报错不静默截断
+- 超过 300 秒的音频按 300 秒切片逐段识别，段间时间戳由服务层按偏移平移
 
-要求 VPC 网络，经典网络访问不到内网网关。其他地域没有内网地址，不要开这个开关。
+验证边界时**必须用内容多样的音频**。用同一句循环拼出来的长音频会让模型不停复读（实测 180 秒返回 11438 字，是期望值的 17 倍），那是测试素材的问题，不是接口的问题——这一点踩过坑，记在这里免得后来者重复误判。
 
 ### 前端录音必须走 HTTPS
 
@@ -107,7 +110,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 ### 成本
 
-一句话识别 3.50 元/千次（单次 ≤60 秒），1000 次 3.5 元。双声道且两路内容不同时会识别两路，成本翻倍；两路完全相同时后端只识别一路，不翻倍。
+按 token 计费，北京地域原价输入 0.113 / 输出 0.382 美元每百万 token。实测 60 秒音频约 0.00091 元，8.5 秒约 0.00014 元。双声道且两路内容不同时会识别两路，成本翻倍；两路完全相同时后端只识别一路，不翻倍。
 
 ### 隐私
 
@@ -164,10 +167,7 @@ export MINDMAP_LLM_BASE_URL=https://api.deepseek.com/v1
 export MINDMAP_LLM_MODEL=deepseek-chat
 export MINDMAP_LLM_API_KEY=<your-key>
 # 语音（可选，不配则语音上传返回 422，其余功能正常）
-export ALIYUN_AK_ID=<your-ak-id>
-export ALIYUN_AK_SECRET=<your-ak-secret>
-export NLS_APPKEY=<your-appkey>
-export MINDMAP_ASR_INTERNAL=1          # 阿里云同地域 ECS 才开
+export DASHSCOPE_API_KEY=<your-dashscope-key>
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 

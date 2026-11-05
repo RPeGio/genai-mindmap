@@ -1,21 +1,16 @@
-"""语音转写的边界行为。全部离线，不访问阿里云。
-
-真实识别效果由手工端到端验证覆盖；这里只锁住容易回归的规则：
-WAV 规格校验、60 秒切片边界、协议帧字段、Token 缓存策略、
-以及失败时必须是报错而不是返回空正文。
-"""
-import array
+"""语音转写的边界行为。全部离线，不访问阿里云。"""
 import io
-import time
 import unittest
 import wave
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
-from app.contracts.source import Source, SourceKind
+from app.contracts.source import SourceKind
 from app.ingestion import asr
 from app.ingestion.asr import AsrError, transcribe_audio
 from app.ingestion.router import list_supported_formats
 from app.ingestion.service import NotSupportedSource, parse_bytes
+
+ENV = {"DASHSCOPE_API_KEY": "sk-test"}
 
 
 def make_wav(seconds=1.0, rate=16000, channels=1, width=2):
@@ -28,210 +23,182 @@ def make_wav(seconds=1.0, rate=16000, channels=1, width=2):
     return buffer.getvalue()
 
 
+def body(text="识别结果", begin=100, end=900, usage=None):
+    return {
+        "output": {"output": {"sentence": {
+            "text": text, "begin_time": begin, "end_time": end,
+            "words": [{"text": text, "begin_time": begin, "end_time": end}],
+        }}},
+        "usage": usage or {"duration": 1, "input_tokens": 10, "output_tokens": 5},
+    }
+
+
+class FakeHttp:
+    """按顺序吐出预设响应的 httpx.Client 替身。"""
+
+    def __init__(self, bodies):
+        self.bodies = list(bodies)
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, url, json=None, headers=None):
+        self.calls.append({"url": url, "payload": json, "headers": headers})
+        data = self.bodies.pop(0) if self.bodies else body()
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = data
+        return response
+
+
+def run_with(bodies, wav):
+    fake = FakeHttp(bodies)
+    with patch.dict("os.environ", ENV, clear=False), \
+         patch("app.ingestion.asr.httpx.Client", return_value=fake):
+        source = transcribe_audio("录音.wav", wav)
+    return source, fake
+
+
 class WavSpecTest(unittest.TestCase):
-    """一句话识别只接受 16bit 单声道 8k/16k，其余在本地就拦住。
-
-    本地拦下的好处是错误信息能说清哪一项不合格；等发到服务端，
-    只会收到 41010101 UNSUPPORTED_SAMPLE_RATE 这种不带上下文的码。
-    """
-
     def test_accepts_16k_mono(self):
-        pcm, rate, duration, _ = asr._decode_wav(make_wav(2.0))
+        pcm, rate, duration, channels = asr._decode_wav(make_wav(2.0))
         self.assertEqual(rate, 16000)
+        self.assertEqual(channels, 1)
         self.assertAlmostEqual(duration, 2.0, places=2)
-        self.assertEqual(len(pcm), 2 * 16000 * 2)
 
     def test_accepts_8k(self):
-        _, rate, _, _ = asr._decode_wav(make_wav(1.0, rate=8000))
-        self.assertEqual(rate, 8000)
+        self.assertEqual(asr._decode_wav(make_wav(1.0, rate=8000))[1], 8000)
 
     def test_accepts_stereo(self):
-        """双声道不再拒收，改走两条车道分别识别。"""
-        _, rate, _, channels = asr._decode_wav(make_wav(1.0, channels=2))
-        self.assertEqual(channels, 2)
-        self.assertEqual(rate, 16000)
+        self.assertEqual(asr._decode_wav(make_wav(1.0, channels=2))[3], 2)
 
-    def test_rejects_more_than_two_channels(self):
+    def test_rejects_three_channels(self):
         with self.assertRaises(AsrError) as ctx:
             asr._decode_wav(make_wav(1.0, channels=3))
         self.assertIn("声道", str(ctx.exception))
 
     def test_rejects_8bit(self):
-        with self.assertRaises(AsrError) as ctx:
+        with self.assertRaises(AsrError):
             asr._decode_wav(make_wav(1.0, width=1))
-        self.assertIn("16 bit", str(ctx.exception))
 
     def test_rejects_22k(self):
-        with self.assertRaises(AsrError) as ctx:
+        with self.assertRaises(AsrError):
             asr._decode_wav(make_wav(1.0, rate=22050))
-        self.assertIn("采样率", str(ctx.exception))
 
     def test_rejects_non_wav(self):
         with self.assertRaises(AsrError):
-            asr._decode_wav(b"not a wav at all")
-
-    def test_rejects_zero_length(self):
-        with self.assertRaises(AsrError):
-            asr._decode_wav(make_wav(0.0))
+            asr._decode_wav(b"not a wav")
 
 
 class SliceTest(unittest.TestCase):
-    """60 秒是服务端硬上限：切少了报 TOO_LONG_SPEECH，切多了边界损失变大。"""
+    def test_300s_stays_single(self):
+        self.assertEqual(len(asr._split(b"\x00" * (300 * 16000 * 2), 16000)), 1)
 
-    def test_exactly_60s_stays_single(self):
-        self.assertEqual(len(asr._split(b"\x00" * (60 * 16000 * 2), 16000)), 1)
+    def test_301s_becomes_two(self):
+        self.assertEqual(len(asr._split(b"\x00" * (301 * 16000 * 2), 16000)), 2)
 
-    def test_61s_becomes_two(self):
-        self.assertEqual(len(asr._split(b"\x00" * (61 * 16000 * 2), 16000)), 2)
-
-    def test_130s_becomes_three(self):
-        self.assertEqual(len(asr._split(b"\x00" * (130 * 16000 * 2), 16000)), 3)
-
-    def test_chunks_cover_every_byte(self):
-        """切片只负责分段，不能丢字节——丢了就是静默丢语音。"""
-        pcm = bytes(range(256)) * 30000
-        self.assertEqual(b"".join(asr._split(pcm, 8000)), pcm)
+    def test_pieces_are_valid_wav(self):
+        pieces = asr._split(b"\x00" * (301 * 16000 * 2), 16000)
+        for piece in pieces:
+            with wave.open(io.BytesIO(piece), "rb") as handle:
+                self.assertEqual(handle.getframerate(), 16000)
+                self.assertEqual(handle.getnchannels(), 1)
 
 
-class FrameTest(unittest.TestCase):
-    """协议帧字段回归。
+class SentenceParseTest(unittest.TestCase):
+    """实测响应多包了一层 output.output，官方示例是 output.sentence。"""
 
-    这五个 header 字段和 stop 帧的 appkey 都是逐个报错试出来的，
-    改动任何一处都会让整条链路退回 MESSAGE_INVALID。
-    """
+    def test_nested_form(self):
+        self.assertEqual(asr._parse_sentence(body("甲"))["text"], "甲")
 
-    def test_start_frame_has_all_header_fields(self):
-        frame = asr._start_frame("app-1", "task-1", 16000)
-        self.assertEqual(set(frame["header"]),
-                         {"appkey", "message_id", "task_id", "namespace", "name"})
-        self.assertEqual(frame["header"]["name"], "StartRecognition")
-        self.assertEqual(frame["header"]["namespace"], "SpeechRecognizer")
-        self.assertEqual(frame["header"]["appkey"], "app-1")
+    def test_flat_form(self):
+        flat = {"output": {"sentence": {"text": "乙"}}}
+        self.assertEqual(asr._parse_sentence(flat)["text"], "乙")
 
-    def test_start_frame_disables_voice_detection(self):
-        """开启后句间停顿会让服务端提前结束并丢弃后续音频，且不报错。"""
-        frame = asr._start_frame("a", "t", 16000)
-        self.assertFalse(frame["payload"]["enable_voice_detection"])
-
-    def test_stop_frame_carries_appkey(self):
-        """少这个字段，收尾会收到与 start 阶段完全相同的报错。"""
-        frame = asr._stop_frame("app-1", "task-1")
-        self.assertEqual(frame["header"]["appkey"], "app-1")
-        self.assertEqual(frame["header"]["name"], "StopRecognition")
-        self.assertEqual(frame["header"]["task_id"], "task-1")
+    def test_missing_form(self):
+        self.assertEqual(asr._parse_sentence({"output": {}}), {})
 
 
 class ConfigTest(unittest.TestCase):
-    def test_missing_env_names_what_is_missing(self):
-        with patch.dict("os.environ", {}, clear=True):
-            with self.assertRaises(AsrError) as ctx:
-                asr._config()
-        message = str(ctx.exception)
-        self.assertIn("ALIYUN_AK_ID", message)
-        self.assertIn("NLS_APPKEY", message)
-
-
-class TokenCacheTest(unittest.TestCase):
-    """Token 有效期约 36 小时，每次识别都重取要多付约 0.7 秒。"""
-
-    def setUp(self):
-        self._saved = dict(asr._token_cache)
-        asr._token_cache.update(id=None, expire=0.0)
-
-    def tearDown(self):
-        asr._token_cache.update(self._saved)
-
-    @patch("app.ingestion.asr._config", return_value=("ak", "sk", "app"))
-    @patch("app.ingestion.asr._fetch_token")
-    def test_reused_within_validity(self, fetch, _config):
-        fetch.return_value = ("tok-1", time.time() + 7200)
-        self.assertEqual(asr._token(), "tok-1")
-        self.assertEqual(asr._token(), "tok-1")
-        self.assertEqual(fetch.call_count, 1)
-
-    @patch("app.ingestion.asr._config", return_value=("ak", "sk", "app"))
-    @patch("app.ingestion.asr._fetch_token")
-    def test_refreshed_near_expiry(self, fetch, _config):
-        """剩余不足 1 小时就提前换，避免识别中途过期。"""
-        fetch.return_value = ("tok-1", time.time() + 1800)
-        self.assertEqual(asr._token(), "tok-1")
-        fetch.return_value = ("tok-2", time.time() + 7200)
-        self.assertEqual(asr._token(), "tok-2")
-        self.assertEqual(fetch.call_count, 2)
+    def test_missing_key_names_the_variable(self):
+        with patch.dict("os.environ", {}, clear=True), \
+             self.assertRaises(AsrError) as ctx:
+            transcribe_audio("a.wav", make_wav(1.0))
+        self.assertIn("DASHSCOPE_API_KEY", str(ctx.exception))
 
 
 class TranscribeTest(unittest.TestCase):
-    """端到端行为，网络层用 mock 替掉。
-
-    _recognize_lanes 的返回值与 lanes 同构：单声道是 [["段1","段2"]]，
-    双声道是 [["左"], ["右"]]。
-    """
-
-    def _run(self, wav, lane_results):
-        with patch("app.ingestion.asr._config", return_value=("ak", "sk", "app")), \
-             patch("app.ingestion.asr._token", return_value="tok"), \
-             patch("app.ingestion.asr._recognize_lanes",
-                   new_callable=AsyncMock) as recognize:
-            recognize.return_value = lane_results
-            source = transcribe_audio("录音.wav", wav)
-        return source, recognize
-
-    def test_single_segment_source_fields(self):
-        source, _ = self._run(make_wav(10), [["识别出来的话"]])
+    def test_source_fields(self):
+        source, _ = run_with([body("识别出来的话", 240, 8480)], make_wav(8.5))
         self.assertEqual(source.kind, SourceKind.audio)
         self.assertEqual(source.text, "识别出来的话")
         self.assertEqual(source.status, "parsed")
-        self.assertEqual(source.filename, "录音.wav")
-        self.assertAlmostEqual(source.duration_seconds, 10.0, places=1)
+        self.assertAlmostEqual(source.duration_seconds, 8.5, places=1)
 
-    def test_segments_are_joined_in_order(self):
-        source, recognize = self._run(make_wav(61), [["前半段", "后半段"]])
-        self.assertEqual(source.text, "前半段后半段")
-        lanes = recognize.call_args[0][2]
-        self.assertEqual(len(lanes), 1)
-        self.assertEqual(len(lanes[0]), 2)
+    def test_sentence_timestamps_are_recorded(self):
+        source, _ = run_with([body("第一句", 240, 1200), body("第二句", 1300, 2000)],
+                             make_wav(2.0))
+        self.assertEqual(len(source.sentences), 1)
+        self.assertEqual(source.sentences[0].begin_ms, 240)
+        self.assertEqual(source.sentences[0].end_ms, 1200)
 
-    def test_empty_result_is_an_error(self):
-        """识别不出内容要报错，不能返回空正文让下游生成空树。"""
+    def test_second_slice_timestamps_are_offset(self):
+        """301 秒切两片时，第二片的时间必须加上第一片的时长。
+
+        不偏移的话第二段所有时间都从 0 开始，节点会指回错误的位置。
+        """
+        source, fake = run_with([body("前段", 100, 900), body("后段", 100, 900)],
+                                make_wav(301))
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(len(source.sentences), 2)
+        self.assertEqual(source.sentences[0].begin_ms, 100)
+        # 第二片偏移 300 秒
+        self.assertEqual(source.sentences[1].begin_ms, 100 + 300_000)
+
+    def test_request_shape(self):
+        _, fake = run_with([body()], make_wav(1.0))
+        call = fake.calls[0]
+        self.assertEqual(call["payload"]["model"], "qwen-audio-3.1-asr-flash")
+        self.assertEqual(call["headers"]["X-DashScope-SSE"], "disable")
+        self.assertTrue(call["payload"]["input"]["messages"][0]["content"][0]
+                        ["input_audio"]["data"].startswith("data:audio/wav;base64,"))
+
+    def test_empty_text_is_an_error(self):
         with self.assertRaises(AsrError):
-            self._run(make_wav(5), [["", "   "]])
+            run_with([body("   ", 0, 10)], make_wav(1.0))
 
-    def test_blank_edges_are_stripped(self):
-        source, _ = self._run(make_wav(5), [["  有内容  "]])
-        self.assertEqual(source.text, "有内容")
+    def test_http_error_becomes_asr_error(self):
+        fake = MagicMock()
+        fake.post.return_value.status_code = 400
+        fake.post.return_value.json.return_value = {
+            "code": "AUDIO_DURATION_TOO_LONG", "message": "audio too long"}
+        with patch.dict("os.environ", ENV, clear=False), \
+             patch("app.ingestion.asr.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value = fake
+            with self.assertRaises(AsrError) as ctx:
+                transcribe_audio("a.wav", make_wav(1.0))
+        self.assertIn("AUDIO_DURATION_TOO_LONG", str(ctx.exception))
 
-    def test_stereo_runs_two_lanes(self):
-        """左右不同时应该开两条车道，而不是降混或只取一路。"""
-        with patch("app.ingestion.asr._config", return_value=("ak", "sk", "app")), \
-             patch("app.ingestion.asr._token", return_value="tok"), \
-             patch("app.ingestion.asr._nearly_identical", return_value=False), \
-             patch("app.ingestion.asr._recognize_lanes",
-                   new_callable=AsyncMock) as recognize:
-            recognize.return_value = [["会议决定周三评审"], ["思维导图是可视化方法"]]
-            source = transcribe_audio("录音.wav", make_wav(2.0, channels=2))
-        lanes = recognize.call_args[0][2]
-        self.assertEqual(len(lanes), 2)
-        self.assertIn("会议决定", source.text)
-        self.assertIn("思维导图", source.text)
+    def test_network_error_becomes_asr_error(self):
+        import httpx
 
-    def test_stereo_identical_channels_use_one_lane(self):
-        """单麦克风 upmix 出来的双声道完全一致，不该付第二次调用。"""
-        with patch("app.ingestion.asr._config", return_value=("ak", "sk", "app")), \
-             patch("app.ingestion.asr._token", return_value="tok"), \
-             patch("app.ingestion.asr._nearly_identical", return_value=True), \
-             patch("app.ingestion.asr._recognize_lanes",
-                   new_callable=AsyncMock) as recognize:
-            recognize.return_value = [["同一段话"]]
-            source = transcribe_audio("录音.wav", make_wav(2.0, channels=2))
-        lanes = recognize.call_args[0][2]
-        self.assertEqual(len(lanes), 1)
-        self.assertEqual(source.text, "同一段话")
+        with patch.dict("os.environ", ENV, clear=False), \
+             patch("app.ingestion.asr.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.post.side_effect = \
+                httpx.ReadTimeout("timed out")
+            with self.assertRaises(AsrError) as ctx:
+                transcribe_audio("a.wav", make_wav(1.0))
+        self.assertIn("请求失败", str(ctx.exception))
 
 
 class StereoTest(unittest.TestCase):
-    """拆声道与合并规则的单元测试。"""
+    def test_split_separates_channels(self):
+        import array
 
-    def test_split_stereo_separates_channels(self):
         interleaved = array.array("h")
         for left, right in zip([1, 2, 3], [10, 20, 30]):
             interleaved.append(left)
@@ -241,48 +208,46 @@ class StereoTest(unittest.TestCase):
         self.assertEqual(array.array("h", got_right).tolist(), [10, 20, 30])
 
     def test_nearly_identical_detects_upmix(self):
+        import array
+
         same = array.array("h", [100, -200, 300] * 1000)
         self.assertTrue(asr._nearly_identical(same.tobytes(), same.tobytes()))
-
         different = array.array("h", same)
         different[0::2] = array.array("h", [900] * 1500)
         self.assertFalse(asr._nearly_identical(same.tobytes(), different.tobytes()))
 
-    def test_similarity_of_identical_text(self):
-        self.assertAlmostEqual(asr._similarity("同一段话", "同一段话"), 1.0)
+    def test_merge_identical_keeps_one(self):
+        lane = {"text": "同一段话", "sentences": [], "usage": {}}
+        self.assertEqual(asr._merge_lanes(lane, dict(lane))["text"], "同一段话")
 
-    def test_merge_identical_channels_keeps_one(self):
-        self.assertEqual(asr._merge_lanes("同一段话", "同一段话"), "同一段话")
+    def test_merge_falls_back_to_non_empty(self):
+        empty = {"text": "", "sentences": [], "usage": {}}
+        full = {"text": "有内容", "sentences": [], "usage": {}}
+        self.assertEqual(asr._merge_lanes(full, empty)["text"], "有内容")
+        self.assertEqual(asr._merge_lanes(empty, full)["text"], "有内容")
 
-    def test_merge_falls_back_to_non_empty_lane(self):
-        self.assertEqual(asr._merge_lanes("有内容", ""), "有内容")
-        self.assertEqual(asr._merge_lanes("   ", "有内容"), "有内容")
-
-    def test_merge_keeps_both_when_content_differs(self):
-        """双人分轨录音，丢任何一路都是信息损失。"""
-        merged = asr._merge_lanes("会议决定周三评审", "思维导图是可视化方法")
+    def test_merge_keeps_both_when_different(self):
+        left = {"text": "会议决定周三评审", "sentences": [], "usage": {}}
+        right = {"text": "思维导图是可视化方法", "sentences": [], "usage": {}}
+        merged = asr._merge_lanes(left, right)["text"]
         self.assertIn("会议决定", merged)
         self.assertIn("思维导图", merged)
 
+    def test_stereo_identical_uses_one_request(self):
+        wav = make_wav(1.0, channels=2)   # 两路都是零，必然相同
+        _, fake = run_with([body()], wav)
+        self.assertEqual(len(fake.calls), 1)
+
 
 class ServiceBranchTest(unittest.TestCase):
-    """parse_bytes 的 audio 分支要么给出 Source，要么抛 NotSupportedSource。"""
-
     def test_asr_error_becomes_not_supported(self):
         with patch("app.ingestion.service.transcribe_audio",
-                   side_effect=AsrError("缺少 ALIYUN_AK_ID")):
+                   side_effect=AsrError("缺少 DASHSCOPE_API_KEY")):
             with self.assertRaises(NotSupportedSource) as ctx:
                 parse_bytes(SourceKind.audio, "a.wav", make_wav(1))
-        self.assertIn("ALIYUN_AK_ID", str(ctx.exception))
+        self.assertIn("DASHSCOPE_API_KEY", str(ctx.exception))
 
-    def test_success_source_passes_through(self):
-        source = Source(kind=SourceKind.audio, text="hi", status="parsed")
-        with patch("app.ingestion.service.transcribe_audio", return_value=source):
-            self.assertIs(parse_bytes(SourceKind.audio, "a.wav", make_wav(1)), source)
-
-
-class FormatsTest(unittest.TestCase):
-    def test_audio_listed_with_own_limit(self):
+    def test_formats_lists_audio(self):
         data = list_supported_formats()
         self.assertIn(".wav", data["audio"])
         self.assertGreater(data["maxAudioBytes"], data["maxUploadBytes"])

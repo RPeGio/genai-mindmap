@@ -28,6 +28,22 @@ class SourceSpan(BaseModel):
     end: int | None = None
 
 
+class AudioSentence(BaseModel):
+    """音频里的一句话，以及它在**原始录音**中的位置。
+
+    时间是从整段录音开头算的毫秒偏移，不是相对于某个切片。切片识别时
+    由服务层按段的起点平移过——否则第二段的所有时间会从 0 重新开始，
+    节点会指回错误的位置。
+
+    只保留句级粒度。词级时间戳接口也返回，但节点引用用不到那么细，
+    存下来只会让契约和前端都变重。
+    """
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=500)
+    begin_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+
+
 class Source(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(default_factory=lambda: str(uuid4()), min_length=1, max_length=100)
@@ -54,6 +70,9 @@ class Source(BaseModel):
     # 语音用时长更贴切：转写结果没有页的概念，用户关心的是"这段录音多长"。
     # 其余模态留 None。
     duration_seconds: float | None = None
+    # 逐句时间戳。只有语音来源会填，供节点引用指回"这句话在第几秒"。
+    # 其余模态为空列表，不要用 None——前端少一个空值判断。
+    sentences: list[AudioSentence] = Field(default_factory=list)
 
 
 class SourceUsage(BaseModel):
