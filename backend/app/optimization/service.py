@@ -3,8 +3,8 @@
 位置：pipeline 的 verify 阶段调用 check()；
       optimization/router 的 suggest() 面向用户产出可确认的修改建议。
 
-当前 check() 检查单子节点、达到深度上限及同一父节点下的重复标签。
-这些只是结构提示，不等于事实核验或语义重复判断。
+check() 检查单子节点、达到深度上限及同一父节点下的重复标签；
+提供 sources 时还会核验引用原文。这不等于事实核验或语义蕴含判断。
 
 重要：建议是候选，必须由用户确认后应用，不能自动覆盖手工编辑。
 """
@@ -17,6 +17,8 @@ from app.contracts.diagnostic import (
     SuggestionKind,
 )
 from app.contracts.mindmap import MindMapContent, Node
+from app.contracts.source import Source
+from app.optimization.source_refs import verify_source_refs
 
 # 与契约保持一致的硬限制，诊断时复用
 MAX_DEPTH = 8
@@ -28,8 +30,8 @@ def _iter_nodes(node: Node, depth: int = 1):
         yield from _iter_nodes(child, depth + 1)
 
 
-def check(content: MindMapContent) -> list[Diagnostic]:
-    """结构诊断。当前只实现确定性的两条规则。"""
+def check(content: MindMapContent, sources: list[Source] | None = None) -> list[Diagnostic]:
+    """结构诊断；只有显式提供原文时才执行第三层引用校验。"""
     diagnostics: list[Diagnostic] = []
 
     # 规则 1：单节点分支（只有一个子节点，通常是层级没展开）
@@ -65,7 +67,8 @@ def check(content: MindMapContent) -> list[Diagnostic]:
             else:
                 seen[key] = node.id
 
-    # TODO(F15): UNSOURCED_NODE —— 需要来源文本，接 RAG 后再实现
+    if sources is not None:
+        diagnostics.extend(verify_source_refs(content, sources))
     return diagnostics
 
 

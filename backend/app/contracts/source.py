@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SourceKind(str, Enum):
@@ -63,6 +63,39 @@ class SourceUsage(BaseModel):
     kind: SourceKind
     filename: str | None = None
     char_count: int = Field(ge=1)
+
+
+class SourceRef(BaseModel):
+    """节点引用。字符区间以原始 Source.text 为准，使用从零开始的 [start, end)。
+
+    第一层只校验字段；来源关联和原文匹配分别由导图契约与服务层校验。
+    """
+    model_config = ConfigDict(extra="forbid")
+    source_id: str = Field(min_length=1, max_length=100)
+    page: int | None = Field(default=None, ge=1, strict=True)
+    start: int | None = Field(default=None, ge=0, strict=True)
+    end: int | None = Field(default=None, ge=0, strict=True)
+    quote: str | None = Field(default=None, max_length=300)
+
+    @field_validator("source_id")
+    @classmethod
+    def source_id_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("引用的来源 ID 不能为空白")
+        return value
+
+    @field_validator("quote")
+    @classmethod
+    def blank_quote_as_none(cls, value: str | None) -> str | None:
+        return value if value and value.strip() else None
+
+    @model_validator(mode="after")
+    def validate_range(self) -> SourceRef:
+        if (self.start is None) != (self.end is None):
+            raise ValueError("引用的 start 和 end 必须同时提供")
+        if self.start is not None and self.end is not None and self.end <= self.start:
+            raise ValueError("引用的 end 必须大于 start")
+        return self
 
 
 class CreateTextSourceRequest(BaseModel):

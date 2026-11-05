@@ -19,16 +19,13 @@ import re
 import time
 from collections.abc import AsyncIterator
 
-from pydantic import ValidationError
-
-from app.contracts.mindmap import MindMapContent
 from app.generation.service import (
     DETAIL_PROMPT,
     MAX_OUTPUT_TOKENS,
-    MIN_BRANCHES,
     GenerationError,
     _config,
     _demo_content,
+    validate_generated_content,
 )
 
 _PARSE_INTERVAL_SECONDS = 0.15   # 两次尝试解析之间的最小间隔，避免每个 chunk 都全量解析
@@ -249,14 +246,9 @@ async def _stream_events(text: str) -> AsyncIterator[str]:
     # 收尾：必须拿到完整合法结构，否则说明这次生成不可用
     try:
         raw = json.loads(_strip_fence(buffer))
-        content = MindMapContent.model_validate(raw)
-    except (json.JSONDecodeError, ValidationError) as exc:
+    except json.JSONDecodeError as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
-    content.source_usage = []
-
-    # 光有根节点不算生成成功：F01 要的是层次结构，不是一条标题。
-    if len(content.root.children) < MIN_BRANCHES:
-        raise GenerationError("模型只返回了一个根节点，没有任何分支，请换一种说法重试")
+    content, _ = validate_generated_content(raw)
 
     latency = int((time.monotonic() - started) * 1000)
     yield _sse({"type": "done", "mode": "model", "content": content.model_dump(),

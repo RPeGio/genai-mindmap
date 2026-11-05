@@ -4,13 +4,17 @@ from __future__ import annotations
 import json
 import os
 import re
+from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
 import httpx
 from pydantic import ValidationError
 
+from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import GenerateResponse, MindMapContent, Node
+from app.contracts.source import Source, SourceUsage
+from app.optimization.source_refs import verify_source_refs
 
 # 单次模型调用的超时（秒）与响应体上限（字节）：超时避免请求无限挂起，
 # 上限避免异常响应把内存读满。
@@ -29,6 +33,15 @@ DETAIL_PROMPT = (
     "格式为 {\"title\":\"标题\",\"root\":{\"id\":\"唯一id\","
     "\"label\":\"节点文字\",\"children\":[]}}。每个节点均含 id、label、children，"
     "ID 全局唯一，层级不超过 8，节点不超过 300。不要捏造输入中没有的具体事实。"
+)
+
+SOURCED_DETAIL_PROMPT = DETAIL_PROMPT + (
+    "用户输入为 sources 数组，每项含 source_id 和 text，text 是待整理的原文。"
+    "每个有原文依据的节点增加 source_refs 数组，格式为"
+    '[{"source_id":"输入中已有的来源ID","quote":"逐字摘录的原文片段"}]。'
+    "quote 不超过 300 字，必须出自对应来源的 text，不得改写、拼接或跨来源引用。"
+    "没有直接依据时 source_refs 留空，不要编造引用。"
+    "不要输出 source_usage；不要猜测 page、start、end。"
 )
 
 
@@ -226,19 +239,71 @@ def _demo_content(text: str) -> MindMapContent:
         children=[Node(id=str(uuid4()), label="请编辑此演示节点")]))
 
 
-def generate(text: str) -> GenerateResponse:
-    mode = os.getenv("MINDMAP_LLM_MODE", "demo").strip().lower()
-    if mode == "demo":
-        return GenerateResponse(mode="demo", content=_demo_content(text))
-    if mode != "model":
-        raise GenerationError("MINDMAP_LLM_MODE 只能是 demo 或 model")
-    result = chat(DETAIL_PROMPT, text)
+def validate_generated_content(
+    result: Any, *, sources: list[Source] | None = None,
+) -> tuple[MindMapContent, list[Diagnostic]]:
+    """以真实输入重建来源摘要，剔除模型伪造的关联，再执行契约与原文校验。
+
+    无 Source 的同步和 SSE 入口共用此出口：在契约校验之前清空所有节点的
+    来源声明，避免伪造摘要与引用互相背书，也不让错误的引用拖垮有效的树。
+    """
+    raw = deepcopy(result)
+    diagnostics: list[Diagnostic] = []
+    allowed_ids = {source.id for source in sources or []}
+    if isinstance(raw, dict):
+        raw["source_usage"] = [
+            SourceUsage(source_id=source.id, kind=source.kind, filename=source.filename,
+                        char_count=len((source.text or "").strip())).model_dump()
+            for source in sources or []
+        ]
+        stack = [raw.get("root")]
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            if sources is None:
+                node["source_refs"] = []
+            elif isinstance(node.get("source_refs"), list):
+                kept = []
+                for ref in node["source_refs"]:
+                    if (isinstance(ref, dict) and isinstance(ref.get("source_id"), str)
+                            and ref["source_id"] not in allowed_ids):
+                        diagnostics.append(Diagnostic(
+                            level=DiagnosticLevel.warn, code="UNKNOWN_SOURCE_REF",
+                            node_id=node.get("id") if isinstance(node.get("id"), str) else None,
+                            message=f"已移除引用：来源 {ref['source_id']} 不在本次输入中",
+                        ))
+                    else:
+                        kept.append(ref)
+                node["source_refs"] = kept
+            children = node.get("children")
+            if isinstance(children, list):
+                stack.extend(reversed(children))
     try:
-        content = MindMapContent.model_validate(result)
+        content = MindMapContent.model_validate(raw)
     except ValidationError as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
-    # 单文本接口无可验证的来源记录，不接受模型虚构的来源元数据。
-    content.source_usage = []
     if len(content.root.children) < MIN_BRANCHES:
         raise GenerationError("模型只返回了一个根节点，没有任何分支，请换一种说法重试")
-    return GenerateResponse(mode="model", content=content)
+    if sources is not None:
+        diagnostics.extend(verify_source_refs(content, sources, remove_invalid=True))
+    return content, diagnostics
+
+
+def generate(text: str, *, sources: list[Source] | None = None) -> GenerateResponse:
+    mode = os.getenv("MINDMAP_LLM_MODE", "demo").strip().lower()
+    if mode == "demo":
+        result = _demo_content(text.strip()).model_dump()
+    elif mode == "model":
+        if sources is None:
+            result = chat(DETAIL_PROMPT, text)
+        else:
+            # 保留原始空白，引用区间才能与 Source.text 对齐；JSON 保持来源边界。
+            prompt_input = json.dumps({"sources": [
+                {"source_id": source.id, "text": source.text} for source in sources
+            ]}, ensure_ascii=False)
+            result = chat(SOURCED_DETAIL_PROMPT, prompt_input)
+    else:
+        raise GenerationError("MINDMAP_LLM_MODE 只能是 demo 或 model")
+    content, diagnostics = validate_generated_content(result, sources=sources)
+    return GenerateResponse(mode=mode, content=content, diagnostics=diagnostics)

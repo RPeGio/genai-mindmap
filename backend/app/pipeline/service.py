@@ -1,15 +1,15 @@
-﻿"""生成流水线（F01 / F02 / F03 / F15 / F16）。
+"""生成流水线（F01 / F02 / F03 / F15 / F16）。
 
 把"素材 → 导图"分成四个阶段，当前只提供同步整体调用：
 
     understand  →  outline  →  validate  →  verify
-    合并多来源    调用模型     契约校验      结构诊断
+    合并多来源    调用模型     契约校验      引文与结构诊断
 
 当前实现：
     understand  合并已解析文本；来源不可用或输入过长时明确报错
     outline     复用 generation.service.generate（demo / model 两种模式）
-    validate    由 MindMapContent 自身校验，失败抛 GenerationError
-    verify      调用 optimization.service.check 执行基础结构诊断
+    validate    字段与来源关联校验，失败抛 GenerationError
+    verify      原文引用核验与基础结构诊断；无依据只提示，不删除节点
 
 demo 模式返回占位导图和结构诊断，不代表 AI 已经可用。
 """
@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 from app.contracts.diagnostic import Diagnostic
 from app.contracts.mindmap import MindMapContent
-from app.contracts.source import Source, SourceUsage
+from app.contracts.source import Source
 from app.generation.service import GenerationError, generate
 from app.optimization.service import check
 
@@ -60,7 +60,7 @@ class PipelineGenerationError(PipelineError):
 def _understand(sources: list[Source]) -> str:
     """合并多个来源。
 
-    只拼接正文；来源摘要会附在导图上，不声称节点级溯源已实现。
+    合并文本用于限长和 demo；模型输入另带来源 ID，原始空白保持不变。
     """
     if not sources:
         raise PipelineInputError("请先提供至少一个来源")
@@ -69,7 +69,7 @@ def _understand(sources: list[Source]) -> str:
     for index, source in enumerate(sources, start=1):
         if source.status != "parsed" or not (source.text or "").strip():
             raise PipelineInputError(f"第 {index} 个来源尚未解析成功或内容为空")
-    merged = "\n\n".join((s.text or "").strip() for s in sources)
+    merged = "\n\n".join(s.text or "" for s in sources)
     if len(merged) > MAX_INPUT_CHARS:
         raise PipelineInputError(f"合并后内容为 {len(merged)} 字，超过当前 {MAX_INPUT_CHARS} 字限制；请缩短或分批处理")
     return merged
@@ -82,20 +82,24 @@ def run(sources: list[Source]) -> PipelineResult:
     stages.append(StageTrace("understand", True, f"{len(sources)} 个来源，{len(text)} 字"))
 
     try:
-        response = generate(text)
+        response = generate(text, sources=sources)
     except GenerationError as exc:
         stages.append(StageTrace("outline", False, str(exc)))
         raise PipelineGenerationError(str(exc)) from exc
     stages.append(StageTrace("outline", True, f"mode={response.mode}"))
 
     # generate() 内部已经做过 MindMapContent 校验，这里只记录结果
-    stages.append(StageTrace("validate", True, "契约校验通过"))
+    stages.append(StageTrace("validate", True, "引用字段与来源关联校验通过"))
 
-    # 服务端根据实际参与的来源填写摘要，不采信模型自行生成的来源信息。
-    source_usage = [SourceUsage(source_id=s.id, kind=s.kind, filename=s.filename,
-                                char_count=len((s.text or "").strip())) for s in sources]
-    content = response.content.model_copy(update={"source_usage": source_usage})
-    diagnostics = check(content)
+    # generate 已用真实来源重建摘要，并完成引文核验；这里合并结构诊断。
+    content = response.content
+    diagnostics = response.diagnostics + check(content)
+
+    # 第三层（可选，默认关）：对已通过前两层的引用做语义蕴含打分。
+    # 未启用时 annotate_nli 立即返回空列表，不 import onnxruntime。
+    from app.optimization.source_refs import annotate_nli
+
+    diagnostics.extend(annotate_nli(content, sources))
     stages.append(StageTrace("verify", True, f"{len(diagnostics)} 条诊断"))
 
     return PipelineResult(content=content, mode=response.mode,

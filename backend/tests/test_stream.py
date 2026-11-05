@@ -123,6 +123,21 @@ class PartialStreamTest(unittest.TestCase):
         self.assertFalse(done["degraded"])
         self.assertEqual(len(done["content"]["root"]["children"]), 2)
 
+    def test_stream_never_exposes_fabricated_references(self):
+        payload = json.dumps({"title": "引用", "root": {
+            "id": "r", "label": "根", "source_refs": [{"source_id": "fake", "quote": "编造"}],
+            "children": [{"id": "b", "label": "分支", "source_refs": {"invalid": True}}],
+        }, "source_usage": [{"invalid": True}]}, ensure_ascii=False)
+        parsed = self._run(payload)
+        done = next(p for kind, p in parsed if kind == "done")
+        self.assertEqual(done["content"]["source_usage"], [])
+        self.assertEqual(done["content"]["root"]["source_refs"], [])
+        self.assertEqual(done["content"]["root"]["children"][0]["source_refs"], [])
+        for kind, event in parsed:
+            if kind == "node":
+                self.assertFalse(event["node"].get("source_refs"))
+        self.assertEqual(parsed[-1][0], "__done__")
+
     def test_bad_mode_returns_error_frame(self):
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "nonsense"}):
             kinds = [k for k, _ in parse_frames(collect(generate_stream_partial("x")))]

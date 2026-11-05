@@ -84,10 +84,15 @@ class GenerationTest(unittest.TestCase):
 
     def test_model_cannot_claim_unverified_source_metadata(self):
         tree = {"title": "测试", "root": {"id": "1", "label": "测试",
-                "children": [{"id": "b1", "label": "分支", "children": []}]},
+                "source_refs": [{"source_id": "fake", "quote": "编造"}],
+                "children": [{"id": "b1", "label": "分支", "children": [],
+                              "source_refs": [{"source_id": "another-fake", "page": -1}]}]},
                 "source_usage": [{"source_id": "fake", "kind": "text", "filename": None, "char_count": 3}]}
         self.use_client(MockStreamResponse(self.body_of(tree)))
-        self.assertEqual(generate("测试").content.source_usage, [])
+        content = generate("测试").content
+        self.assertEqual(content.source_usage, [])
+        self.assertEqual(content.root.source_refs, [])
+        self.assertEqual(content.root.children[0].source_refs, [])
 
     def test_root_only_tree_is_rejected(self):
         """光杆根节点不算生成成功：同步接口与流式接口用的是同一个下限。"""

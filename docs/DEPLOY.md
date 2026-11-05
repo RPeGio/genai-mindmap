@@ -45,6 +45,9 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `ALIYUN_AK_SECRET` | — | 语音转写的 AccessKey Secret |
 | `NLS_APPKEY` | — | 智能语音交互项目的 Appkey |
 | `MINDMAP_ASR_INTERNAL` | 空 | 部署在阿里云北京/上海/深圳时设为 `1`，语音走内网网关 |
+| `MINDMAP_NLI_ENABLED` | 空（关） | 引用核验的第三层（语义蕴含打分）。需同时配 `MINDMAP_NLI_MODEL_DIR` |
+| `MINDMAP_NLI_MODEL_DIR` | — | 含 `model.onnx` / `tokenizer.json` / `config.json` 的目录 |
+| `MINDMAP_NLI_MIN_FREE_MB` | `700` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_ASR_CONCURRENCY` | `2` | 账号的一句话识别并发额度，调大不会变快只会报错 |
 
 ## 4. 各格式的依赖与耗时
@@ -110,7 +113,29 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 录音会上传到阿里云做转写。教育场景若涉及学生发言，需要在上传前取得同意，并确认数据留存策略。
 
-## 7. 启动
+## 7. 引用核验（可选，默认关闭）
+
+节点引用做三层校验，前两层是纯代码、零成本：
+
+1. **字段与来源关联**：`source_id` 必须出现在本次 `sources` 里，`page` 不能超出总页数，也不能指向解析失败的页。
+2. **引文逐字匹配**：模型必须给出 `quote`（声称的原文片段），程序在来源原文里做子串查找。对不上就把整条引用丢掉。
+
+第三层是**可选的语义蕴含打分**，需要额外部署一个 NLI 模型：
+
+```bash
+export MINDMAP_NLI_ENABLED=1
+export MINDMAP_NLI_MODEL_DIR=/opt/models/nli   # 含 model.onnx + tokenizer.json + config.json
+```
+
+它补的是前两层管不住的一种情况：引文逐字对得上，但节点论断与原文语义相反（原文说「只在小数据集上验证」，节点写成「已在大规模数据上验证」）。
+
+**这一层只产出诊断，绝不改变引用的有无。** 理由是它是概率模型，自己也会错；让概率模型推翻可复核的机械判据，等于把「诚实性来自判据的机械性」这条原则反过来用。判定矛盾时引用保留、同时给一条 warn 诊断，由人判断。
+
+**默认关闭**，因为模型加载约需 100 MB 峰值（25.7 MB 权重的 int8 量化版 + onnxruntime 运行时），2C2G 上要和 Docling、语音模块抢内存。关闭时连 `onnxruntime` 都不会 import。
+
+模型选择上有实测约束：本机验证用的是 `typeform/mobilebert-uncased-mnli`（ONNX int8，25.7 MB），英文判断准确（entailment 0.98 / contradiction 0.81），但**中文的 contradiction 识别偏弱**——「完全不能识别图像」对上「识别图像」被判成 neutral 0.55 而非 contradiction。中文场景建议换中文 NLI 模型（如 Erlangshen-Roberta-NLI 系列）并自行导出 ONNX。
+
+## 8. 启动
 
 ```bash
 cd backend
