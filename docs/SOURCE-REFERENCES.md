@@ -59,10 +59,16 @@
 `MINDMAP_NLI_MODEL_DIR` 指向含 `model.onnx` / `tokenizer.json` / `config.json`
 的目录。加载前有内存闸门（默认 700 MB，Linux 可检测）。
 
-实测参考：`typeform/mobilebert-uncased-mnli`（ONNX int8，25.7 MB）加载 2.4 秒，
-单次推理 11–23 ms；英文判断准确（entailment 0.98 / contradiction 0.81），
-**中文的 contradiction 偏弱**——「完全不能识别图像」对上「识别图像」被判成
-neutral 0.55。中文场景需换中文 NLI 模型自行导出。
+实测参考：
+
+| 模型 | 文件 | 内存增量 | 加载 | 单次推理 | 中文准确率 |
+|---|---|---|---|---|---|
+| `typeform/mobilebert-uncased-mnli` int8 | 25.7 MB | +83.5 MB | 9.9 s | 11–23 ms | 0/4 |
+| `IDEA-CCNL/Erlangshen-Roberta-110M-NLI` int8 | 98.3 MB | +140.3 MB | 1.4 s | 15–44 ms | 6/6 |
+
+**英文模型对中文完全失效**，不是「偏弱」：它对「完全不能识别图像」vs「本系统可以识别图像」给 `entailment 0.52`，对「数据库采用主从架构」这种无关内容给 `entailment 0.65`——四条中文用例全判成蕴含，说明它只在数词汇重叠，没有识别否定结构。中文场景必须用中文模型。
+
+`id2label` 顺序各模型不同（mobilebert 是 `0=ENTAILMENT / 2=CONTRADICTION`，Erlangshen 是 `0=CONTRADICTION / 2=ENTAILMENT`），代码从 `config.json` 读，写死会整体错位。
 
 ## 各接口的行为
 

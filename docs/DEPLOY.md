@@ -47,7 +47,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_ASR_INTERNAL` | 空 | 部署在阿里云北京/上海/深圳时设为 `1`，语音走内网网关 |
 | `MINDMAP_NLI_ENABLED` | 空（关） | 引用核验的第三层（语义蕴含打分）。需同时配 `MINDMAP_NLI_MODEL_DIR` |
 | `MINDMAP_NLI_MODEL_DIR` | — | 含 `model.onnx` / `tokenizer.json` / `config.json` 的目录 |
-| `MINDMAP_NLI_MIN_FREE_MB` | `700` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
+| `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_ASR_CONCURRENCY` | `2` | 账号的一句话识别并发额度，调大不会变快只会报错 |
 
 ## 4. 各格式的依赖与耗时
@@ -131,9 +131,29 @@ export MINDMAP_NLI_MODEL_DIR=/opt/models/nli   # 含 model.onnx + tokenizer.json
 
 **这一层只产出诊断，绝不改变引用的有无。** 理由是它是概率模型，自己也会错；让概率模型推翻可复核的机械判据，等于把「诚实性来自判据的机械性」这条原则反过来用。判定矛盾时引用保留、同时给一条 warn 诊断，由人判断。
 
-**默认关闭**，因为模型加载约需 100 MB 峰值（25.7 MB 权重的 int8 量化版 + onnxruntime 运行时），2C2G 上要和 Docling、语音模块抢内存。关闭时连 `onnxruntime` 都不会 import。
+**默认关闭**，因为模型加载需要实打实的内存。实测两组（USS，空白进程基线约 7.5 MB）：
 
-模型选择上有实测约束：本机验证用的是 `typeform/mobilebert-uncased-mnli`（ONNX int8，25.7 MB），英文判断准确（entailment 0.98 / contradiction 0.81），但**中文的 contradiction 识别偏弱**——「完全不能识别图像」对上「识别图像」被判成 neutral 0.55 而非 contradiction。中文场景建议换中文 NLI 模型（如 Erlangshen-Roberta-NLI 系列）并自行导出 ONNX。
+| 模型 | 文件 | 加载后增量 | 峰值 | 加载耗时 | 中文准确率 |
+|---|---|---|---|---|---|
+| `typeform/mobilebert-uncased-mnli` int8 | 25.7 MB | +83.5 MB | 91 MB | 9.9 s | **0/4** |
+| `IDEA-CCNL/Erlangshen-Roberta-110M-NLI` int8 | 98.3 MB | **+140.3 MB** | 148 MB | 1.4 s | **6/6** |
+
+`onnxruntime` 本身占 21 MB，且**卸载不掉**（`reset()` 只能丢掉模型引用，降到 36 MB）。真正的「关闭」只能是进程启动时就不 import。
+
+**必须用中文模型。** 上表第一行是英文 MNLI 模型，对中文完全失效——「完全不能识别图像」对上「本系统可以识别图像」被判成 `entailment 0.52`，「数据库采用主从架构」这种无关内容也被判成 `entailment 0.65`。四条中文用例全错，包括明确的否定句。它只是在对词汇重叠打分，没有理解否定结构。换成 Erlangshen 后六条全对，矛盾判定的置信度在 0.76–0.98。
+
+中文模型的 fp32 权重 390 MB，需要自己导 ONNX 并量化：
+
+```bash
+python -c "
+from onnxruntime.quantization import quantize_dynamic, QuantType
+quantize_dynamic('model.onnx', 'model.int8.onnx', weight_type=QuantType.QInt8)
+"
+```
+
+导出后 `model.int8.onnx` 98.3 MB，配合 `tokenizer.json` 和 `config.json` 放进 `MINDMAP_NLI_MODEL_DIR`。注意 **`id2label` 顺序各模型不同**（mobilebert 是 `0=ENTAILMENT`，Erlangshen 是 `0=CONTRADICTION`），代码从 `config.json` 读，写死会整体错位。
+
+2C2G 上的账：后端基线约 350 MB + NLI 140 MB ≈ 490 MB，语音转写峰值 250 MB 与之不同时发生，2 GB 内存够用。
 
 ## 8. 启动
 

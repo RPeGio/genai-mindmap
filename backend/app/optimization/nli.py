@@ -40,9 +40,11 @@ ENABLED_ENV = "MINDMAP_NLI_ENABLED"
 MODEL_DIR_ENV = "MINDMAP_NLI_MODEL_DIR"
 MIN_FREE_MB_ENV = "MINDMAP_NLI_MIN_FREE_MB"
 
-# 2C2G 上 Docling 常驻约 350 MB、语音转写峰值约 250 MB。留 700 MB 余量
-# 再加载 NLI，避免把部署机推到 OOM。
-DEFAULT_MIN_FREE_MB = 700
+# 实测占用：英文 mobilebert-uncased-mnli（25.7 MB int8）加载后 +83.5 MB；
+# 中文 Erlangshen-Roberta-110M-NLI（98.3 MB int8）加载后 +140.3 MB。
+# 闸门按最大的那个留两倍余量，同时给 Docling（常驻约 350 MB）和语音模块
+# （峰值约 250 MB，与 NLI 不同时发生）留出空间。
+DEFAULT_MIN_FREE_MB = 300
 
 # cross-encoder 的位置编码上限是 512 token，中文约 1:1.5，截到 1200 字符
 # 既能覆盖一页正文的主体，又不会让单次推理拖到秒级。
