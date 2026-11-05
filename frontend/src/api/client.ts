@@ -233,6 +233,46 @@ export async function uploadDocument(file: File): Promise<Source> {
   return body.source;
 }
 
+// ---- 导出 ----
+
+/** 后端三种格式都是纯文本响应，不能走 request()——它固定按 JSON 解析。 */
+export type ExportFormat = 'puml' | 'markdown' | 'opml';
+
+const EXPORT_META: Record<ExportFormat, { label: string; extension: string }> = {
+  puml: { label: 'PlantUML', extension: 'puml' },
+  markdown: { label: 'Markdown', extension: 'md' },
+  opml: { label: 'OPML', extension: 'opml' },
+};
+
+export function exportLabel(format: ExportFormat): string {
+  return EXPORT_META[format].label;
+}
+
+/** 文件名用导图标题，但要去掉路径分隔符等非法字符——标题是模型生成的自由文本。 */
+export function exportFilename(format: ExportFormat, title: string): string {
+  const safe = title.replace(/[\\/:*?"<>|\r\n]/g, '_').trim() || '导图';
+  return `${safe}.${EXPORT_META[format].extension}`;
+}
+
+export async function exportMindMap(
+  format: ExportFormat,
+  content: MindMapContent,
+): Promise<string> {
+  let response: Response;
+  try {
+    response = await fetch(`${BASE}/export/${format}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    });
+  } catch {
+    throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
+  }
+
+  if (!response.ok) throw await toApiError(response);
+  return response.text();
+}
+
 /** 把解析好的来源原样送回流水线生成导图。不做裁剪：后端 Source 是 extra="forbid"，少字段才安全。 */
 export function generateFromSources(sources: Source[]): Promise<PipelineResponse> {
   return request<PipelineResponse>('/pipeline/generate', {

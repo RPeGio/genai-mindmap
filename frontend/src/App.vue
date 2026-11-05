@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
 import RecordButton from './components/RecordButton.vue';
+import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
 import type { SampleMap } from './dev/samples';
 import { displayBody, useMindMapStore } from './stores/mindmap';
 
@@ -101,6 +102,39 @@ function saveNow() {
 function confirmDiscard(action: string): boolean {
   if (!store.dirty) return true;
   return window.confirm(`当前有未保存的修改，${action}会丢掉这些修改，继续？`);
+}
+
+const exporting = ref(false);
+
+/** 浏览器端落盘：三种导出都是纯文本，不需要后端再跑一趟。 */
+function saveTextFile(filename: string, text: string): void {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+async function onExport(event: Event): Promise<void> {
+  const select = event.target as HTMLSelectElement;
+  const format = select.value as ExportFormat;
+  // 复位，否则连着导同一种格式时 change 不会再次触发，看起来像"点了没反应"
+  select.value = '';
+  const content = store.content;
+  if (!content || !format) return;
+
+  exporting.value = true;
+  try {
+    const text = await exportMindMap(format, content);
+    saveTextFile(exportFilename(format, content.title), text);
+    store.status = `已导出 ${exportLabel(format)}（${content.title}）`;
+  } catch (error) {
+    store.status = error instanceof ApiError ? error.message : '导出失败，请重试。';
+  } finally {
+    exporting.value = false;
+  }
 }
 
 function newMap() {
@@ -221,6 +255,17 @@ async function copyBody() {
         >
           新建
         </button>
+        <select
+          class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 disabled:opacity-40"
+          :disabled="!store.content || exporting"
+          title="导出为文本格式"
+          @change="onExport"
+        >
+          <option value="" disabled>{{ exporting ? '导出中…' : '导出' }}</option>
+          <option value="puml">PlantUML</option>
+          <option value="markdown">Markdown</option>
+          <option value="opml">OPML（XMind）</option>
+        </select>
         <p>
           <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
             演示模式（非 AI 生成）

@@ -178,6 +178,22 @@ class SkeletonTest(unittest.TestCase):
         self.assertIn("* 根\n", text)
         self.assertNotIn("* 测试导图\n", text)
 
+    def test_export_markdown(self):
+        status, raw = request("POST", "/api/export/markdown", {"content": MAP})
+        self.assertEqual(status, 200)
+        text = raw.decode()
+        self.assertTrue(text.startswith("# 测试导图"))
+        self.assertIn("- 根", text)
+        self.assertIn("  - 重复项", text)
+
+    def test_export_opml(self):
+        status, raw = request("POST", "/api/export/opml", {"content": MAP})
+        self.assertEqual(status, 200)
+        text = raw.decode()
+        self.assertTrue(text.startswith('<?xml version="1.0"'))
+        self.assertIn('version="2.0"', text)
+        self.assertIn('text="根"', text)
+
     def test_knowledge_reports_not_implemented(self):
         status, raw = request("POST", "/api/knowledge/search", {"query": "碳中和"})
         self.assertEqual(status, 200)

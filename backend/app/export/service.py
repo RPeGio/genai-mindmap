@@ -1,7 +1,9 @@
 """导出（F20 / F10）。
 
-已实现：MindMapContent → PlantUML `@startmindmap` 文本。
-待实现：Markdown 大纲、OPML（都是纯映射，工作量很小，可随时补）。
+三种格式，都是 MindMapContent → 文本的纯映射，不调模型也不读盘：
+    PUML      PlantUML `@startmindmap`，能贴进语雀 / Typora / Confluence
+    Markdown  缩进大纲，最通用的中间格式
+    OPML      能直接导入 XMind 等导图工具
 
 关于 PUML 的定位（与 docs/ARCHITECTURE.md 第 5 条一致）：
     puml 只作**导出格式**，不作为渲染主链路。
@@ -11,6 +13,8 @@
 """
 from __future__ import annotations
 
+from xml.sax.saxutils import escape, quoteattr
+
 from app.contracts.mindmap import MindMapContent, Node
 
 
@@ -19,11 +23,18 @@ def _depth_marks(depth: int) -> str:
     return "*" * max(1, depth)
 
 
-def to_puml(content: MindMapContent) -> str:
-    """把导图转成 PlantUML mindmap 语法。
+def _one_line(text: str) -> str:
+    """压成单行。导出格式里换行会破坏缩进与 XML 结构。"""
+    return " ".join(text.split())
 
-    节点文字里的换行与星号会破坏语法，统一替换成空格。
-    """
+
+def _sanitize(text: str) -> str:
+    """PUML 专用：星号在 mindmap 语法里是层级标记，出现在正文会被解析成新节点。"""
+    return _one_line(text).replace("*", "·")
+
+
+def to_puml(content: MindMapContent) -> str:
+    """把导图转成 PlantUML mindmap 语法。"""
     lines: list[str] = ["@startmindmap"]
     lines.append(f"* {_sanitize(content.root.label)}")
 
@@ -38,5 +49,47 @@ def to_puml(content: MindMapContent) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _sanitize(text: str) -> str:
-    return text.replace("\r", " ").replace("\n", " ").replace("*", "·").strip()
+def to_markdown(content: MindMapContent) -> str:
+    """导出 Markdown 大纲：标题 + 缩进列表。
+
+    根节点也写成列表项而不是跳过——否则 `title` 和 `root.label` 不一致时
+    （生成器允许不同），根节点的文字会在导出结果里消失。
+    """
+    lines: list[str] = [f"# {_one_line(content.title)}", ""]
+    lines.append(f"- {_one_line(content.root.label)}")
+
+    def walk(node: Node, depth: int) -> None:
+        for child in node.children:
+            lines.append(f"{'  ' * depth}- {_one_line(child.label)}")
+            walk(child, depth + 1)
+
+    walk(content.root, 1)
+    return "\n".join(lines) + "\n"
+
+
+def to_opml(content: MindMapContent) -> str:
+    """导出 OPML 2.0，XMind / MindManager / 幕布都能直接导入。
+
+    节点文字用 quoteattr 转义：模型生成的标签里出现引号或尖括号时，手写
+    字符串拼接会产出非法 XML，导入端只会报"文件格式错误"，很难追到根因。
+    """
+
+    def outline(node: Node, depth: int) -> list[str]:
+        pad = "  " * depth
+        parts = [f"{pad}<outline text={quoteattr(_one_line(node.label))}>"]
+        for child in node.children:
+            parts.extend(outline(child, depth + 1))
+        parts.append(f"{pad}</outline>")
+        return parts
+
+    lines: list[str] = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<opml version="2.0">',
+        "  <head>",
+        f"    <title>{escape(_one_line(content.title))}</title>",
+        "  </head>",
+        "  <body>",
+    ]
+    lines.extend(outline(content.root, 2))
+    lines.extend(("  </body>", "</opml>"))
+    return "\n".join(lines) + "\n"

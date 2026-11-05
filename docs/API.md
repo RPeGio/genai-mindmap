@@ -42,6 +42,8 @@
 | `POST /api/optimization/check` | `{"content":导图}` | 结构诊断列表 | 结构无效 422 |
 | `POST /api/optimization/suggest` | `{"content":导图}` | 诊断与候选建议 | 结构无效 422；建议需用户判断 |
 | `POST /api/export/puml` | `{"content":导图}` | PlantUML 文本；根节点来自 `root.label` | 结构无效 422 |
+| `POST /api/export/markdown` | `{"content":导图}` | Markdown 大纲：标题 + 缩进列表 | 结构无效 422 |
+| `POST /api/export/opml` | `{"content":导图}` | OPML 2.0，可导入 XMind | 结构无效 422 |
 | `POST /api/ingestion/files` | multipart，字段名 `file` | `{"source": 来源}`，`source.text` 是解析出的正文 | 扩展名不在白名单 422；文档/图片超 10MB 或音频超 20MB 413；扫描件无文本层、音频无人声、图片视觉不可用、缺语音凭证 422 |
 | `GET /api/ingestion/formats` | 无 | `{"document":[…],"audio":[".wav"],"image":[".png",…],"maxUploadBytes":…,"maxAudioBytes":…,"maxImageBytes":…}` | — |
 | `GET /api/mindmaps` | 无 | 导图记录数组 | — |
