@@ -6,7 +6,7 @@
 当前实现状态：
     text / markdown   已实现（解码 + 空白规整）
     document          PDF 走 pymupdf；DOCX / PPTX / XLSX / HTML 走 Docling
-    image             待实现：视觉模型生成结构化描述
+    image             视觉模型直接转 Markdown，与 PDF 逐页共用多模态调用
     audio             阿里云一句话识别，超 60 秒自动切片，见 app/ingestion/asr.py
 
 **PDF 为什么不用 Docling**：它的版面模型常驻 1.2GB、实测峰值 1.6–2.8GB，
@@ -61,6 +61,11 @@ LEGACY_RENDER_SUFFIXES = {".doc", ".ppt"}
 # 要拖进 ffmpeg（2C2G 上又多一个系统依赖），而浏览器录音和 decodeAudioData
 # 都能直接产出 16k 单声道 WAV，没必要为边缘格式付出这个代价。
 AUDIO_SUFFIXES = {".wav"}
+
+# 图片只收视觉模型能解码的常见位图。SVG 故意不收：它是矢量描述，模型收到的
+# 是一段 XML 而不是画面，识别不出任何东西，收进来只会让用户困惑为什么解析
+# 结果是空的。
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 _converter = None
 _converter_lock = threading.Lock()
@@ -353,8 +358,16 @@ def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
         return parse_document_bytes(filename, raw)
 
     if kind is SourceKind.image:
-        # TODO(F06): 视觉模型输出结构化描述，保留"上图分为几个区域"这类空间关系
-        raise NotSupportedSource("图片理解待实现")
+        # 和 PDF 逐页走同一个多模态调用，只是提示词不同。图片没有文本层可以
+        # 兜底，所以视觉不可用时只能报错——返回空正文会让下游生成一棵空树。
+        from app.ingestion import vision_pdf
+
+        try:
+            text = vision_pdf.describe_image(raw)
+        except vision_pdf.VisionUnavailable as exc:
+            raise NotSupportedSource(str(exc)) from exc
+        return Source(kind=SourceKind.image, filename=filename, text=text,
+                      status="parsed")
 
     if kind is SourceKind.audio:
         try:

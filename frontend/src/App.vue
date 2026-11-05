@@ -305,14 +305,14 @@ async function copyBody() {
             <input
               type="file"
               class="sr-only"
-              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc,.wav"
+              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc,.wav,.png,.jpg,.jpeg,.webp,.gif,.bmp"
               :disabled="store.uploadBusy || store.busy"
               @change="onPickFile"
             />
-            {{ store.uploadBusy ? '处理中…' : '选择文件：PDF / Word / PPT / Excel / HTML / WAV' }}
+            {{ store.uploadBusy ? '处理中…' : '选择文件：PDF / Word / PPT / Excel / HTML / 图片 / WAV' }}
           </label>
           <p class="text-xs leading-relaxed text-slate-400">
-            选完自动上传解析，文档上限 10MB，WAV 音频上限 20MB。PDF 逐页识别，扫描件也能读，最多 20 页。
+            选完自动上传解析：文档 10MB，图片 10MB，WAV 音频 20MB。PDF 逐页识别，扫描件也能读，最多 20 页。
           </p>
 
           <p v-if="store.uploadState === 'parsing'" class="text-xs text-slate-600">

@@ -41,6 +41,27 @@ PAGE_PROMPT = (
     "只输出这一页的 Markdown，不要解释，不要代码围栏。"
 )
 
+# 图片用的提示。和 PDF 单页的差别在于图片没有"页"的概念，可能是草图、
+# 截图、白板照或照片，需要模型自己判断形态再决定怎么组织内容。
+IMAGE_PROMPT = (
+    "把这张图片转成 Markdown。按内容形态选择处理方式：\n"
+    "1. 思维导图或手绘草图：按层级还原成缩进列表，保留父子关系\n"
+    "2. 幻灯片或界面截图：提取标题、正文、列表，表格用 Markdown 表格\n"
+    "3. 白板或照片：提取所有可辨认的文字，按空间位置组织\n"
+    "4. 图表：保留坐标轴、图例与数据标签，数据写成 Markdown 表格\n"
+    "只输出内容，不要解释，不要代码围栏。看不清的地方留空，不要猜。"
+)
+
+# 图片魔数 → MIME。模型要的是正确的 data URL 前缀，写错会让服务端解码失败，
+# 而错误信息只有一句"识别失败"，很难查回根因。
+_MIME_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+
 
 class VisionUnavailable(Exception):
     """视觉提取整体不可用（未配置模型、网络不通、全部页失败）。"""
@@ -73,8 +94,13 @@ def _strip_fence(text: str) -> str:
     return s.strip()
 
 
-def _page_to_markdown(image_png: bytes, page_no: int) -> str:
-    """单页转 Markdown；失败抛异常，由调用方决定怎么兜。"""
+def _call_vision(image_bytes: bytes, mime: str, prompt: str, label: str) -> str:
+    """把一张图交给多模态模型，返回纯文本。失败抛 VisionUnavailable。
+
+    PDF 逐页和单张图片走同一条路径：都是 OpenAI 兼容的 `image_url` +
+    base64 data URL。模型换成不支持图片的那个时，两处会一起坏掉——这是
+    有意的，免得只在一条路径上发现问题。
+    """
     import httpx
 
     base, key, model = _config()
@@ -83,10 +109,10 @@ def _page_to_markdown(image_png: bytes, page_no: int) -> str:
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": PAGE_PROMPT},
+                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {
-                    "url": "data:image/png;base64," +
-                           base64.b64encode(image_png).decode()}},
+                    "url": f"data:{mime};base64," +
+                           base64.b64encode(image_bytes).decode()}},
             ],
         }],
         "temperature": 0.1,
@@ -97,20 +123,48 @@ def _page_to_markdown(image_png: bytes, page_no: int) -> str:
                            headers={"Authorization": f"Bearer {key}"})
         if resp.status_code != 200:
             raise VisionUnavailable(
-                f"第 {page_no} 页识别失败：HTTP {resp.status_code}")
+                f"{label}识别失败：HTTP {resp.status_code}")
         body = resp.json()
     choice = body["choices"][0]
-    # finish_reason=length 表示输出撞上了 max_tokens 被硬切。半页内容如果当成
-    # 成功收下，这一页的正文就永久缺了一截，而整份结果还报"解析完整"。
-    # 当成该页失败处理，上层会用同一页的文本层补。
+    # finish_reason=length 表示输出撞上了 max_tokens 被硬切。半个结果如果当成
+    # 成功收下，内容就永久缺了一截，而整体还报"解析完整"。
     if (choice.get("finish_reason") or "").lower() == "length":
-        raise VisionUnavailable(
-            f"第 {page_no} 页输出被截断（达到单页 token 上限）")
+        raise VisionUnavailable(f"{label}输出被截断（达到 token 上限）")
     content = choice["message"].get("content") or ""
     text = _strip_fence(content)
     if not text:
-        raise VisionUnavailable(f"第 {page_no} 页没有返回内容")
+        raise VisionUnavailable(f"{label}没有返回内容")
     return text
+
+
+def _page_to_markdown(image_png: bytes, page_no: int) -> str:
+    """单页转 Markdown；失败抛异常，由调用方决定怎么兜。"""
+    return _call_vision(image_png, "image/png", PAGE_PROMPT, f"第 {page_no} 页")
+
+
+def _guess_mime(raw: bytes) -> str:
+    for magic, mime in _MIME_MAGIC:
+        if raw.startswith(magic):
+            return mime
+    # WebP 的头部是 RIFF....WEBP，魔数不在开头，单独判
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    raise VisionUnavailable(
+        "无法识别的图片格式（支持 PNG / JPEG / GIF / WebP / BMP）")
+
+
+def describe_image(raw: bytes) -> str:
+    """单张图片 → Markdown。失败抛 VisionUnavailable，不返回空内容。
+
+    走的是和 PDF 逐页完全相同的多模态调用，所以模型不支持图片输入时，
+    这两条路径会一起坏——有意为之，免得只在一条上发现问题。
+    """
+    # 配置预检放在最前：demo 模式、缺密钥必须立刻暴露，不能被后面的
+    # 单页兜底逻辑吞掉，留下"上传成功但内容是空的"这种更难查的状态。
+    _config()
+    if not raw:
+        raise VisionUnavailable("图片内容为空")
+    return _call_vision(raw, _guess_mime(raw), IMAGE_PROMPT, "这张图片")
 
 
 def extract_pages(raw: bytes) -> tuple[list[str], int, int, list[int]]:
