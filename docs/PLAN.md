@@ -52,7 +52,7 @@
 |---|---|---|
 | F05 | PDF / DOCX / PPTX 导入 | 只取文本层；扫描件走 F06 兜底；50 页上限 |
 | F06 | 图片/草图 → 导图 | **已实现基础链路**：单图经 `MINDMAP_LLM_MODEL` 多模态直转 Markdown（与 PDF 逐页共用调用），不收 SVG；「识别结果先给候选、人工修正」未做 |
-| F07 | 语音 → 导图 | **已实现（与原计划不同）**：不用 sidecar，走阿里云一句话识别；≤60 秒单次、更长自动切片；双声道分路识别后合并。原计划的 MOSS / faster-whisper 降级档放弃，理由见 10.2 与 [部署文档](DEPLOY.md) 第 6 节 |
+| F07 | 语音 → 导图 | **已实现（与原计划两度不同）**：先放弃 sidecar 改走云端，再把 ISI 一句话识别换成百炼 `qwen-audio-3.1-asr-flash`。当前能力：≤300 秒单次、句级时间戳、双声道分路识别后合并。见 [部署文档](DEPLOY.md) 第 6 节 |
 | F08 | 混合输入（文本+图+音） | 复用 `Source[]` 合并，保留来源标签 |
 | F03 | 会议纪要/碎片文本整理 | 专用 prompt + 2 个测试 |
 | F02 | 目标驱动框架生成（AI 代理） | 四阶段可见，产出导图，不承诺多轮代理 |
@@ -90,7 +90,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 2. **存储换 PG 不再保留 SQLite 双轨**：部署要求"含数据库"，协作快照、`llm_calls`、pgvector 都要真库；双轨会让测试与迁移分叉。开发与 CI 都用 compose 起的 PG，单测用事务回滚隔离。
 3. **协作必须真 CRDT**：现有乐观锁只能防覆盖，无法合并并发编辑。Yjs 单房间 + 房间 token（api 签发）+ 30s 快照。映射层（`MindMapContent` ↔ `Y.Map`）自研，这是能讲清的技术点。
 4. **视觉直接用 `deepseek-flash`，不引入第二家**：该模型原生支持图片输入，三种传法（base64 内联 / 外链 / Files API `file_id`），单图上限 32 MiB（base64）或 64 MiB（file_id），请求体 48 MiB，每图最多计 1024 token，且图片只能出现在 `user` 消息中。我们走**前端压缩到 1600px → base64 内联**，草图为一次性输入，不需要 Files API 复用。
-5. ~~**ASR 做成可插拔 sidecar**~~ **（已推翻，2026-11-04）**：原计划 `moss`（默认，带说话人分离）/ `aliyun`（线上备选）/ `faster-whisper`（降级档 + 评测基线），线上 2C2G 不常驻 MOSS 模型。实测后改为**只用阿里云一句话识别**：本地方案用 `sherpa-onnx` paraformer-zh-small 在 2C2G 上常驻 143 MB、短音频 RTF 0.013，但架构吃不下长输入——33.8 秒整段 CER 86.4%，60 秒直接返回空串并抛 onnxruntime Reshape 错误，只能安全处理 10 秒以内的片段；云端同批音频 60 秒整段 CER 0%。多后端抽象因此没有价值：只有一条路能跑通，留着切换开关等于给自己维护三个都用不上的分支。数字见 [部署文档](DEPLOY.md) 第 6 节。
+5. ~~**ASR 做成可插拔 sidecar**~~ **（已推翻，2026-11-04；后续又换过一次实现）**：原计划 `moss`（默认，带说话人分离）/ `aliyun`（线上备选）/ `faster-whisper`（降级档 + 评测基线），线上 2C2G 不常驻 MOSS 模型。第一次实测后排除了本地方案——`sherpa-onnx` paraformer-zh-small 在 2C2G 上常驻 143 MB、短音频 RTF 0.013，但架构吃不下长输入（33.8 秒整段 CER 86.4%，60 秒直接返回空串并抛 onnxruntime Reshape 错误）。第二次实测又把云端接口从 ISI 一句话识别换成百炼 Qwen-Audio-ASR：后者自带句级/词级时间戳、60 秒音频快 2.8 倍、便宜 3.9 倍、单次时长从 60 秒放宽到 300 秒（见 v1.7）。多后端抽象始终没有价值——每次都只有一条路能跑通，留着切换开关等于维护几个用不上的分支。数字见 [部署文档](DEPLOY.md) 第 6 节。
 6. **不做**：Celery/Redis、K8s、微服务拆分、Docling、本地 LLM、多租户 RBAC、OSS/CDN。
 
 **2C2G 内存预算（含 swap 2G）**
@@ -111,7 +111,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 |---|---|---|
 | **W1** 11/2–11/8 | 契约 v2 + 迁移 + OpenAPI 类型生成；Vue 前端重建；单次流式生成（SSE + 增量解析）+ 真实模型；后端地基（settings/httpx/pytest/alembic/错误体/日志/request_id）；CI；Compose 骨架；**IP:8080 上线空壳**；四份文档同步改 | 浏览器里输入一句话 → 画布上逐节点长出导图，刷新后能打开 |
 | **W2** 11/9–11/15 | 三布局；主题；四格式导出；PDF/DOCX/PPTX 导入；JWT + BYOK（画布编辑与撤销重做已由 R3 在 11/4 提前完成，本行不再占用 W2 工时） | 导入一份 PDF 出导图；同一导图在另一窗口打开后保存会提示版本冲突（409） |
-| **W3** 11/16–11/22 | 图片草图；语音 sidecar；RAG + pgvector + 节点引用；诊断/建议；AI 代理；翻译；评估脚本与首轮报告；（余量）Yjs 两窗口协作、PG 迁移 + 备份（Q35/Q36） | 上传一张手绘草图 → 导图；问知识库一个问题 → 导图节点带引用 |
+| **W3** 11/16–11/22 | 图片草图；语音转写接入（原计划 sidecar，实际走云端 API）；RAG + pgvector + 节点引用；诊断/建议；AI 代理；翻译；评估脚本与首轮报告；（余量）Yjs 两窗口协作、PG 迁移 + 备份（Q35/Q36） | 上传一张手绘草图 → 导图；问知识库一个问题 → 导图节点带引用 |
 | **W4** 11/23–11/29 | **功能冻结（11/22 24:00）**；Bug 修复；演示脚本彩排；20 题抽问；PPT + ADR + README 收尾；域名/CF 切换（可选）；`v1.0.0` tag | 5 分钟完整演示不卡壳，全部本地 + 线上双跑 |
 | **缓冲** 11/30–12/1 | 只修 P0；现场环境预热；静态截图与录屏备份 | 断网也能讲完 |
 
@@ -136,7 +136,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 | R1 | 域名备案 7–20 天不可控 | 高 | 中 | 11/15 未过审 | 全程 IP:8080 演示，域名只作 PPT 里的"已备案/已解析"截图 |
 | R2 | CF 代理国内访问波动 | 中 | 中 | 首包 >1s 或超时 | 演示脚本默认走 IP；CF 版仅作公开展示 |
 | R3 | 2C2G 内存吃紧（PG+api+ys） | 中 | 高 | OOM killer / swap 抖动 | swap 2G；PG 调参；asr 不常驻；必要时把 ys 与 api 合并进程 |
-| R4 | 语音质量/时长不达预期 | 中 | 中 | 60s 音频 >40s 转写 | 线上限 60s；演示用本地 MOSS；评估报告如实写 |
+| R4 | 语音质量/时长不达预期 | 中 | 中 | 单次 ≤300 秒，超出返回 400 | 已放宽到 300 秒（原计划 60 秒）；不用本地模型，无 MOSS 依赖 |
 | R5 | 草图识别质量差 | 中 | 中 | 20 张样本合格率 <60% | 改为"草图 → 候选节点列表，用户勾选后生成"，产品上更诚实 |
 | R6 | Vue 重建拖到 W2 | 中 | 高 | 11/6 画布不能拖 | 砍主题自定义与鱼骨，先保编辑与保存 |
 | R7 | Yjs 映射层比预期复杂 | 中 | 中 | 11/13 两窗口仍不同步 | 降级为"在线状态 + 最后写入者胜 + 冲突提示"，并在文档写明 |
@@ -192,7 +192,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `APP_ENV` | 区分 dev / prod | 未排期 |
 | `DATABASE_URL` | PostgreSQL 迁移 | Q35：顺延到验收之后 |
 | `JWT_SECRET` / `JWT_TTL_HOURS` / `FERNET_KEY` / `DAILY_LLM_QUOTA` | 登录签发、BYOK 加密、每日配额 | F12 为单用户单库，暂不需要 |
-| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` / `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | 语音转写（F07） | **已作废**。原计划的多后端（MOSS / faster-whisper / aliyun）没有落地，实际选了阿里云一句话识别单一路径，真正的变量是 `ALIYUN_AK_ID` / `ALIYUN_AK_SECRET` / `NLS_APPKEY` / `MINDMAP_ASR_INTERNAL` / `MINDMAP_ASR_CONCURRENCY`，见 [部署文档](DEPLOY.md) 第 6 节。原因是实测本地方案在 2C2G 上吃不下长输入（33.8 秒整段 CER 86.4%，60 秒直接返回空串），而云端 60 秒整段 CER 0%。 |
+| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` / `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | 语音转写（F07） | **已作废**。原计划的多后端（MOSS / faster-whisper / aliyun）没有落地。实际语音只用一个变量 `DASHSCOPE_API_KEY`（阿里云百炼），见 [部署文档](DEPLOY.md) 第 6 节。选型理由：本地方案在 2C2G 上吃不下长输入（33.8 秒整段 CER 86.4%），云端接口则自带时间戳且更便宜 |
 
 ### 10.3 不是环境变量，是代码常量
 
@@ -203,13 +203,13 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `MAX_INPUT_CHARS` | `backend/app/pipeline/service.py` | 20000 |
 | `MAX_UPLOAD_BYTES` | `backend/app/ingestion/router.py` | 10 MB（文档） |
 | `MAX_AUDIO_BYTES` | 同上；前端 `stores/mindmap.ts` 同口径 | 20 MB（WAV，约 11 分钟） |
-| `MAX_SLICE_SECONDS` | `backend/app/ingestion/asr.py` | 60（一句话识别的服务端硬限，改大只会收到 41010104） |
+| `MAX_SLICE_SECONDS` | `backend/app/ingestion/asr.py` | 300（Qwen-Audio-ASR 服务端硬限，360 秒返回 `AUDIO_DURATION_TOO_LONG`） |
 
 ## 11 决策记录（Q26–Q36）
 
 | # | 决策 | 理由 / 影响 |
 |---|---|---|
-| Q27 | ~~ASR 默认 MOSS，`faster-whisper` small-int8 为降级档~~ **已推翻**：改用阿里云一句话识别，不做 sidecar 也不保留多后端开关 | 原理由是"2C2G 上 large-v3 不可用"。实测后更彻底：本地方案连长一点都吃不下——33.8 秒整段 CER 86.4%、60 秒直接返回空串，只能处理 10 秒以内片段；云端同批音频 60 秒整段 CER 0%。只有一条路能跑通时，可插拔抽象只剩维护成本。见第 4 节第 5 条与 [部署文档](DEPLOY.md) 第 6 节 |
+| Q27 | ~~ASR 默认 MOSS，`faster-whisper` small-int8 为降级档~~ **已推翻**：改用云端 API，不做 sidecar 也不保留多后端开关。云端具体用哪家后来又换过一次（ISI 一句话识别 → 百炼 Qwen-Audio-ASR，见 v1.7） | 原理由是"2C2G 上 large-v3 不可用"。实测后更彻底：本地方案连长一点都吃不下——33.8 秒整段 CER 86.4%、60 秒直接返回空串，只能处理 10 秒以内片段。只有一条路能跑通时，可插拔抽象只剩维护成本。见第 4 节第 5 条与 [部署文档](DEPLOY.md) 第 6 节 |
 | Q28 | 全部服务跑在同一台 ECS，`IP:8080` 暴露 | 2C2G 无法拆机；单机 compose 也最符合"独立部署"的考核表述 |
 | Q29 | BYOK：用户自带 key、服务端 Fernet 加密存库、每用户每日 200 次、前端不落明文、演示账号单独限额 | 密钥不进代码库、不进日志；额度与滥用风险由 R11 兜底 |
 | Q30 | `main` ← `dev` ← `feat/*`·`fix/*`；PR 目标一律 `dev` | `dev` 已从 `main` 拉出（空提交起点），`docs/project-plan` 的 PR 目标改 `dev` |
@@ -229,5 +229,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.2 | 2026-11-02 | 补 Q33（Vue 生态 + 先做 D4）/ Q34（review 边界）；R1 已完成，R2–R3 进行中 |
 | v1.3 | 2026-11-03 | 补 Q35（后端地基压缩：错误体 + httpx，ORM/PG 顺延验收后）/ Q36（实时协作保留但延后，W2 去掉 Yjs 硬门）；分工与决策行改具名（RPeGio / 陈嘉涛），不再用"队友""双方" |
 | v1.4 | 2026-11-04 | R3 完成：画布编辑、撤销重做（整树快照 50 步）、保存与乐观锁 409、打开列表落地，W2 相应工时腾出；前端用例 81；新节点正文复用 v2 `Node.note`（H1，待陈嘉涛在 PR 审查确认） |
-| v1.5 | 2026-11-04 | F07 语音落地，推翻 Q27：改用阿里云一句话识别，放弃 MOSS / faster-whisper 与 sidecar 方案。补 `ALIYUN_*` / `NLS_APPKEY` / `MINDMAP_ASR_*` 变量、`MAX_AUDIO_BYTES` 与 `MAX_SLICE_SECONDS` 常量；前端录音受限于安全上下文，与 Q32「IP:8080 不做 TLS」冲突，已记入架构文档 |
+| v1.5 | 2026-11-04 | F07 语音落地，推翻 Q27：放弃 MOSS / faster-whisper 与 sidecar 方案，改走云端。补 `MAX_AUDIO_BYTES` 与 `MAX_SLICE_SECONDS` 常量；前端录音受限于安全上下文，与 Q32「IP:8080 不做 TLS」冲突，已记入架构文档 |
+| v1.6 | 2026-11-05 | F06 图片输入落地；F08 混合输入与节点级引用（三层校验 + 可选 NLI）；F20 三种导出接通前端 |
+| v1.7 | 2026-11-05 | 语音接口二次切换：ISI 一句话识别 → 百炼 `qwen-audio-3.1-asr-flash`。换来句级时间戳、300 秒单次上限、60 秒音频快 2.8 倍且便宜 3.9 倍；依赖 `websockets` 与 `aliyun-python-sdk-core` 一并移除，`MAX_SLICE_SECONDS` 60 → 300 |
 | v1.6 | 2026-11-04 | F06 图片输入落地：复用 PDF 逐页的多模态调用（`image_url` + base64），模型直接输出 Markdown，不收 SVG；`parse_bytes` 的 `image` 分支不再是 TODO |

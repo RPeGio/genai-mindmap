@@ -35,7 +35,7 @@ flowchart LR
 | 导图管理 | `backend/app/mindmaps/` | 导图 JSON + 版本 → 保存记录 | 当前 SQLite 本地存储；后续 PostgreSQL、用户权限、历史版本。 |
 | 生成与模型适配 | `backend/app/generation/` | 文本 → 导图 JSON | 演示适配器和基础模型适配；后续接入生成任务、提示词管理和重试策略。 |
 | 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 当前后端仍是 v1 契约（`docs/API.md`）；v2 已冻结候选、待 D2 落地，届时前端类型由 `openapi-typescript` 生成，不再手写。 |
-| 多模态输入（部分实现） | `backend/app/ingestion/` | 文本 / 文档 / 图片 / WAV 音频 → 来源 | JSON 文本、Markdown、文档上传（Docling + pymupdf，PDF/DOCX/PPTX/XLSX/HTML/旧格式）、图片理解（多模态视觉，与 PDF 逐页共用 `ingestion/vision_pdf.py` 的调用）与语音转写（阿里云一句话识别，`ingestion/asr.py`）均可用。 |
+| 多模态输入（部分实现） | `backend/app/ingestion/` | 文本 / 文档 / 图片 / WAV 音频 → 来源 | JSON 文本、Markdown、文档上传（Docling + pymupdf，PDF/DOCX/PPTX/XLSX/HTML/旧格式）、图片理解（多模态视觉，与 PDF 逐页共用 `ingestion/vision_pdf.py` 的调用）与语音转写（百炼 Qwen-Audio-ASR，带句级时间戳，`ingestion/asr.py`）均可用。 |
 | 知识增强（待实现） | `backend/app/knowledge/` | 文档 → 分块/向量；问题 → 有来源片段 | 当前只有明确标识为未实现的检索桩；真实知识库与引用待开发。 |
 | 逻辑优化（部分实现） | `backend/app/optimization/` | 当前导图 → 结构提示 | 单子节点、深度上限、同级重复提示可用；语义纠错等待实现。 |
 | AI 代理（待实现） | `backend/app/agent/` | 目标/协作内容 → 带依据的方案或建议 | 当前只返回固定阶段桩；多步骤规划等能力待实现。 |
