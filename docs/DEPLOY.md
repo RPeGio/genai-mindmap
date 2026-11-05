@@ -7,7 +7,7 @@ cd backend
 pip install -r requirements.txt
 ```
 
-八项全部是请求路径上的硬依赖，缺任何一项都会让对应功能不可用（`tests/test_dependencies.py` 会守住这一点）。
+十项全部是请求路径上的硬依赖，缺任何一项都会让对应功能不可用（`tests/test_dependencies.py` 会守住这一点）。语音转写的两项（`aliyun-python-sdk-core`、`websockets`）只在调用语音接口时导入，缺了不影响文档解析，但语音功能会报错并提示重装依赖。
 
 ## 2. 系统依赖：LibreOffice
 
@@ -41,6 +41,11 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_LLM_MODEL` | — | 模型名，当前用 `deepseek-chat` |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径 |
 | `MINDMAP_SOFFICE_CMD` | 自动探测 | 可选，LibreOffice 可执行文件路径 |
+| `ALIYUN_AK_ID` | — | 语音转写的 AccessKey ID |
+| `ALIYUN_AK_SECRET` | — | 语音转写的 AccessKey Secret |
+| `NLS_APPKEY` | — | 智能语音交互项目的 Appkey |
+| `MINDMAP_ASR_INTERNAL` | 空 | 部署在阿里云北京/上海/深圳时设为 `1`，语音走内网网关 |
+| `MINDMAP_ASR_CONCURRENCY` | `2` | 账号的一句话识别并发额度，调大不会变快只会报错 |
 
 ## 4. 各格式的依赖与耗时
 
@@ -50,6 +55,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `.docx` `.pptx` `.xlsx` `.html` `.md` | `docling` | 1–2 秒 | 读结构化格式，不加载版面模型 |
 | `.doc` `.ppt` | `docling` + LibreOffice + 模型 | 约 10–60 秒 | 先转 PDF 再视觉识别；**耗时按转换后的页数算**，重排版后页数会增加 |
 | `.xls` | `xlrd` | 0.1 秒 | 直接读单元格 |
+| `.wav` | `websockets` + 阿里云 | 约 0.14 秒/秒音频 | 一句话识别；≤60 秒单次，更长自动切片成多段 |
 
 `demo` 模式下 PDF 会退回到文本层抽取（约 0.3 秒），扫描件则返回 422——因为视觉提取被模式检查拦下了。
 
@@ -64,7 +70,46 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 2C2G 的机器上：不装 LibreOffice 可以跑，装了之后要留意 `.doc/.ppt` 转换时 `soffice` 进程会额外占 350–380 MB。
 
-## 6. 启动
+## 6. 语音输入（F07）
+
+走阿里云**一句话识别**，不在部署机上跑本地模型。
+
+**为什么不用本地模型**：实测 `sherpa-onnx` 的 paraformer-zh-small（78 MB 磁盘）在 2C2G 上常驻 143 MB、短音频 RTF 0.013，但吃不下长输入——33.8 秒整段 CER 86.4%，60 秒直接返回空串并抛 onnxruntime Reshape 错误。它只能安全处理 10 秒以内的片段。云端在同一批音频上 60 秒整段正常出字、CER 0%，代价是每次约 0.0035 元且依赖网络。
+
+### 开通与凭证
+
+1. 控制台搜索「智能语音交互」→ 开通（新用户 3 个月试用）
+2. 「全部项目」→ 创建项目 → 项目功能配置选「中文普通话 / 16kHz / 通用模型」
+3. 项目列表里抄下 **Appkey**，填进 `NLS_APPKEY`
+4. 建议建一个只授 `AliyunNLSFullAccess` 的 **RAM 子账号**，用它的 AccessKey
+
+三个变量缺任何一个，语音上传都会返回 422 并明确说明缺哪个。
+
+### 内网网关
+
+部署在阿里云北京 / 上海 / 深圳时设 `MINDMAP_ASR_INTERNAL=1`，语音改走
+`ws://nls-gateway-<region>-internal.aliyuncs.com:80`：
+
+- 不产生公网流量费
+- 绕开小带宽瓶颈——60 秒音频 1.83 MB，1 Mbps 公网要传 15 秒，内网 0.15 秒
+
+要求 VPC 网络，经典网络访问不到内网网关。其他地域没有内网地址，不要开这个开关。
+
+### 前端录音必须走 HTTPS
+
+浏览器只在**安全上下文**（HTTPS 或 localhost）下暴露 `navigator.mediaDevices`。用 `http://服务器IP:8080` 打开时这个对象是 `undefined`，录音按钮会报「当前页面无法访问麦克风：浏览器要求 HTTPS 或 localhost」。
+
+**文档上传和 WAV 文件上传不受影响**，只有浏览器内直接录音需要 HTTPS。要么配证书，要么让用户改用「上传音频文件」入口。
+
+### 成本
+
+一句话识别 3.50 元/千次（单次 ≤60 秒），1000 次 3.5 元。双声道且两路内容不同时会识别两路，成本翻倍；两路完全相同时后端只识别一路，不翻倍。
+
+### 隐私
+
+录音会上传到阿里云做转写。教育场景若涉及学生发言，需要在上传前取得同意，并确认数据留存策略。
+
+## 7. 启动
 
 ```bash
 cd backend
@@ -72,6 +117,11 @@ export MINDMAP_LLM_MODE=model
 export MINDMAP_LLM_BASE_URL=https://api.deepseek.com/v1
 export MINDMAP_LLM_MODEL=deepseek-chat
 export MINDMAP_LLM_API_KEY=<your-key>
+# 语音（可选，不配则语音上传返回 422，其余功能正常）
+export ALIYUN_AK_ID=<your-ak-id>
+export ALIYUN_AK_SECRET=<your-ak-secret>
+export NLS_APPKEY=<your-appkey>
+export MINDMAP_ASR_INTERNAL=1          # 阿里云同地域 ECS 才开
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 

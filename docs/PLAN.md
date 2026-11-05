@@ -52,7 +52,7 @@
 |---|---|---|
 | F05 | PDF / DOCX / PPTX 导入 | 只取文本层；扫描件走 F06 兜底；50 页上限 |
 | F06 | 图片/草图 → 导图 | 单图；`deepseek-flash` 视觉；识别结果先给候选 |
-| F07 | 语音 → 导图 | sidecar 可插拔后端（默认 MOSS；`faster-whisper` small-int8 为降级档）；线上 60s 上限 |
+| F07 | 语音 → 导图 | **已实现（与原计划不同）**：不用 sidecar，走阿里云一句话识别；≤60 秒单次、更长自动切片；双声道分路识别后合并。原计划的 MOSS / faster-whisper 降级档放弃，理由见 10.2 与 [部署文档](DEPLOY.md) 第 6 节 |
 | F08 | 混合输入（文本+图+音） | 复用 `Source[]` 合并，保留来源标签 |
 | F03 | 会议纪要/碎片文本整理 | 专用 prompt + 2 个测试 |
 | F02 | 目标驱动框架生成（AI 代理） | 四阶段可见，产出导图，不承诺多轮代理 |
@@ -90,7 +90,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 2. **存储换 PG 不再保留 SQLite 双轨**：部署要求"含数据库"，协作快照、`llm_calls`、pgvector 都要真库；双轨会让测试与迁移分叉。开发与 CI 都用 compose 起的 PG，单测用事务回滚隔离。
 3. **协作必须真 CRDT**：现有乐观锁只能防覆盖，无法合并并发编辑。Yjs 单房间 + 房间 token（api 签发）+ 30s 快照。映射层（`MindMapContent` ↔ `Y.Map`）自研，这是能讲清的技术点。
 4. **视觉直接用 `deepseek-flash`，不引入第二家**：该模型原生支持图片输入，三种传法（base64 内联 / 外链 / Files API `file_id`），单图上限 32 MiB（base64）或 64 MiB（file_id），请求体 48 MiB，每图最多计 1024 token，且图片只能出现在 `user` 消息中。我们走**前端压缩到 1600px → base64 内联**，草图为一次性输入，不需要 Files API 复用。
-5. **ASR 做成可插拔 sidecar**：`moss`（默认，带说话人分离）/ `aliyun`（线上备选，免费额度）/ `faster-whisper`（降级档 + 评测基线）。线上 2C2G 不常驻 MOSS 模型；faster-whisper 只上 `small` int8，且必须 `vad_filter=True`、`beam_size=1`、`num_workers=1`（2 核上 medium 起实时率 >2x，large-v3 等于不可用，且**没有**说话人分离）。W2 D1 用 3 分钟真实中文音频跑 RTF / 峰值内存 / 字错率，数字写进 `docs/API.md` 效果章节。
+5. ~~**ASR 做成可插拔 sidecar**~~ **（已推翻，2026-11-04）**：原计划 `moss`（默认，带说话人分离）/ `aliyun`（线上备选）/ `faster-whisper`（降级档 + 评测基线），线上 2C2G 不常驻 MOSS 模型。实测后改为**只用阿里云一句话识别**：本地方案用 `sherpa-onnx` paraformer-zh-small 在 2C2G 上常驻 143 MB、短音频 RTF 0.013，但架构吃不下长输入——33.8 秒整段 CER 86.4%，60 秒直接返回空串并抛 onnxruntime Reshape 错误，只能安全处理 10 秒以内的片段；云端同批音频 60 秒整段 CER 0%。多后端抽象因此没有价值：只有一条路能跑通，留着切换开关等于给自己维护三个都用不上的分支。数字见 [部署文档](DEPLOY.md) 第 6 节。
 6. **不做**：Celery/Redis、K8s、微服务拆分、Docling、本地 LLM、多租户 RBAC、OSS/CDN。
 
 **2C2G 内存预算（含 swap 2G）**
@@ -192,7 +192,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `APP_ENV` | 区分 dev / prod | 未排期 |
 | `DATABASE_URL` | PostgreSQL 迁移 | Q35：顺延到验收之后 |
 | `JWT_SECRET` / `JWT_TTL_HOURS` / `FERNET_KEY` / `DAILY_LLM_QUOTA` | 登录签发、BYOK 加密、每日配额 | F12 为单用户单库，暂不需要 |
-| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` / `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | 语音转写（F07） | 未实现，`backend/app/ingestion/service.py` 里是 `TODO(F07)` |
+| `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` / `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | 语音转写（F07） | **已作废**。原计划的多后端（MOSS / faster-whisper / aliyun）没有落地，实际选了阿里云一句话识别单一路径，真正的变量是 `ALIYUN_AK_ID` / `ALIYUN_AK_SECRET` / `NLS_APPKEY` / `MINDMAP_ASR_INTERNAL` / `MINDMAP_ASR_CONCURRENCY`，见 [部署文档](DEPLOY.md) 第 6 节。原因是实测本地方案在 2C2G 上吃不下长输入（33.8 秒整段 CER 86.4%，60 秒直接返回空串），而云端 60 秒整段 CER 0%。 |
 
 ### 10.3 不是环境变量，是代码常量
 
@@ -201,13 +201,15 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | 常量 | 位置 | 当前值 |
 |---|---|---|
 | `MAX_INPUT_CHARS` | `backend/app/pipeline/service.py` | 20000 |
-| `MAX_UPLOAD_BYTES` | `backend/app/ingestion/router.py` | 10 MB |
+| `MAX_UPLOAD_BYTES` | `backend/app/ingestion/router.py` | 10 MB（文档） |
+| `MAX_AUDIO_BYTES` | 同上；前端 `stores/mindmap.ts` 同口径 | 20 MB（WAV，约 11 分钟） |
+| `MAX_SLICE_SECONDS` | `backend/app/ingestion/asr.py` | 60（一句话识别的服务端硬限，改大只会收到 41010104） |
 
 ## 11 决策记录（Q26–Q36）
 
 | # | 决策 | 理由 / 影响 |
 |---|---|---|
-| Q27 | ASR 默认 MOSS，`faster-whisper` small-int8 为降级档 | 2C2G 上 large-v3 不可用且无说话人分离；保留 sidecar 接口即可随时切换，W2 benchmark 定档 |
+| Q27 | ~~ASR 默认 MOSS，`faster-whisper` small-int8 为降级档~~ **已推翻**：改用阿里云一句话识别，不做 sidecar 也不保留多后端开关 | 原理由是"2C2G 上 large-v3 不可用"。实测后更彻底：本地方案连长一点都吃不下——33.8 秒整段 CER 86.4%、60 秒直接返回空串，只能处理 10 秒以内片段；云端同批音频 60 秒整段 CER 0%。只有一条路能跑通时，可插拔抽象只剩维护成本。见第 4 节第 5 条与 [部署文档](DEPLOY.md) 第 6 节 |
 | Q28 | 全部服务跑在同一台 ECS，`IP:8080` 暴露 | 2C2G 无法拆机；单机 compose 也最符合"独立部署"的考核表述 |
 | Q29 | BYOK：用户自带 key、服务端 Fernet 加密存库、每用户每日 200 次、前端不落明文、演示账号单独限额 | 密钥不进代码库、不进日志；额度与滥用风险由 R11 兜底 |
 | Q30 | `main` ← `dev` ← `feat/*`·`fix/*`；PR 目标一律 `dev` | `dev` 已从 `main` 拉出（空提交起点），`docs/project-plan` 的 PR 目标改 `dev` |
@@ -227,3 +229,4 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.2 | 2026-11-02 | 补 Q33（Vue 生态 + 先做 D4）/ Q34（review 边界）；R1 已完成，R2–R3 进行中 |
 | v1.3 | 2026-11-03 | 补 Q35（后端地基压缩：错误体 + httpx，ORM/PG 顺延验收后）/ Q36（实时协作保留但延后，W2 去掉 Yjs 硬门）；分工与决策行改具名（RPeGio / 陈嘉涛），不再用"队友""双方" |
 | v1.4 | 2026-11-04 | R3 完成：画布编辑、撤销重做（整树快照 50 步）、保存与乐观锁 409、打开列表落地，W2 相应工时腾出；前端用例 81；新节点正文复用 v2 `Node.note`（H1，待陈嘉涛在 PR 审查确认） |
+| v1.5 | 2026-11-04 | F07 语音落地，推翻 Q27：改用阿里云一句话识别，放弃 MOSS / faster-whisper 与 sidecar 方案。补 `ALIYUN_*` / `NLS_APPKEY` / `MINDMAP_ASR_*` 变量、`MAX_AUDIO_BYTES` 与 `MAX_SLICE_SECONDS` 常量；前端录音受限于安全上下文，与 Q32「IP:8080 不做 TLS」冲突，已记入架构文档 |

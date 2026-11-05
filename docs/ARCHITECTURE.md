@@ -35,7 +35,7 @@ flowchart LR
 | 导图管理 | `backend/app/mindmaps/` | 导图 JSON + 版本 → 保存记录 | 当前 SQLite 本地存储；后续 PostgreSQL、用户权限、历史版本。 |
 | 生成与模型适配 | `backend/app/generation/` | 文本 → 导图 JSON | 演示适配器和基础模型适配；后续接入生成任务、提示词管理和重试策略。 |
 | 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 当前后端仍是 v1 契约（`docs/API.md`）；v2 已冻结候选、待 D2 落地，届时前端类型由 `openapi-typescript` 生成，不再手写。 |
-| 多模态输入（部分实现） | `backend/app/ingestion/` | 文本 / 文档文件 → 来源；图片与语音待实现 | JSON 文本、Markdown 与文档上传（Docling，PDF/DOCX/PPTX/XLSX/HTML）可用；图片与语音仍待实现。 |
+| 多模态输入（部分实现） | `backend/app/ingestion/` | 文本 / 文档文件 / WAV 音频 → 来源；图片待实现 | JSON 文本、Markdown、文档上传（Docling + pymupdf，PDF/DOCX/PPTX/XLSX/HTML/旧格式）与语音转写（阿里云一句话识别，见 `ingestion/asr.py`）可用；图片仍待实现。 |
 | 知识增强（待实现） | `backend/app/knowledge/` | 文档 → 分块/向量；问题 → 有来源片段 | 当前只有明确标识为未实现的检索桩；真实知识库与引用待开发。 |
 | 逻辑优化（部分实现） | `backend/app/optimization/` | 当前导图 → 结构提示 | 单子节点、深度上限、同级重复提示可用；语义纠错等待实现。 |
 | AI 代理（待实现） | `backend/app/agent/` | 目标/协作内容 → 带依据的方案或建议 | 当前只返回固定阶段桩；多步骤规划等能力待实现。 |
@@ -66,4 +66,8 @@ flowchart LR
 
 ## 安全与部署边界
 
-当前仅限本机与单机部署：没有用户认证、权限隔离、文件上传和生产日志策略。目标形态是**单台 2 核 2G ECS + Docker Compose**（nginx / api / web / postgres / y-websocket 五个容器，ASR 走 `profiles: [asr]` 不常驻），先以 `IP:8080` 暴露、不做 TLS，域名与 Cloudflare 推迟到 W3（理由与降级路径见 [执行计划](PLAN.md) 第 4 节与 R1/R3）。CORS 目前只放通 `localhost:5173`/`127.0.0.1:5173`，上线前必须改成部署地址白名单。最小登录（JWT）与每用户 BYOK 密钥加密（Fernet）在 W2 落地；在此之前不得开放公网注册，也不得上传敏感资料。接入文件、知识库和协作前，还需补上传大小与类型限制、恶意文件防护、外部请求限制、日志脱敏和备份。
+当前仅限本机与单机部署：没有用户认证、权限隔离、文件上传和生产日志策略。目标形态是**单台 2 核 2G ECS + Docker Compose**（nginx / api / web / postgres / y-websocket 五个容器；语音转写走云端 API，不占容器也不需要 sidecar），先以 `IP:8080` 暴露、不做 TLS，域名与 Cloudflare 推迟到 W3（理由与降级路径见 [执行计划](PLAN.md) 第 4 节与 R1/R3）。
+
+**这条与录音功能冲突**：浏览器只在安全上下文（HTTPS 或 localhost）下暴露 `navigator.mediaDevices`，`http://IP:8080` 打开时浏览器内录音不可用，只能上传音频文件。要开放录音必须先上 TLS，详见 [部署文档](DEPLOY.md) 第 6 节。
+
+CORS 目前只放通 `localhost:5173`/`127.0.0.1:5173`，上线前必须改成部署地址白名单。最小登录（JWT）与每用户 BYOK 密钥加密（Fernet）在 W2 落地；在此之前不得开放公网注册，也不得上传敏感资料。接入文件、知识库和协作前，还需补上传大小与类型限制、恶意文件防护、外部请求限制、日志脱敏和备份。

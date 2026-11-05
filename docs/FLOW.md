@@ -7,9 +7,9 @@
 ```mermaid
 flowchart TD
   A1[文本 / Markdown] --> S[ingestion.parse]
-  A2[PDF / Word / PPT] -.未实现.-> S
+  A2[PDF / Word / PPT / Excel / HTML] --> S
   A3[图片 / 手绘] -.未实现.-> S
-  A4[语音] -.未实现.-> S
+  A4[语音 / WAV 音频] --> S
 
   S --> SRC[Source<br/>统一来源模型]
   SRC --> U[understand<br/>合并多来源]
@@ -42,7 +42,7 @@ flowchart TD
 
 | 环节 | 模块 | 输入 | 输出 | 状态 |
 |---|---|---|---|---|
-| 来源解析 | `app/ingestion` | 文本 / Markdown 字符串 / 上传的文档 | `Source` | 文本与文档（Docling）均已实现；图片与语音仍待实现 |
+| 来源解析 | `app/ingestion` | 文本 / Markdown 字符串 / 上传的文档或 WAV / 浏览器录音 | `Source` | 文本、文档（Docling + pymupdf）、语音（阿里云一句话识别）均已实现；图片仍待实现 |
 | 合并理解 | `app/pipeline._understand` | `Source[]` | 单一文本 | 已实现；任一来源不可用或合并超 20000 字时拒绝，不截断 |
 | 大纲生成 | `app/generation` | 文本 | `MindMapContent` | 已实现（demo 占位 / model 调模型） |
 | 契约校验 | `app/contracts/mindmap.py` | 任何模型输出 | 合法树 / 异常 | 已实现（300 节点 / 8 层 / 50 子节点） |

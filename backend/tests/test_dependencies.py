@@ -11,6 +11,7 @@ REQUIREMENTS = Path(__file__).resolve().parents[1] / "requirements.txt"
 
 # 产线代码在每个请求路径上都会用到的包。加新依赖时同步更新这里。
 REQUIRED = {
+    "aliyun-python-sdk-core": "语音转写换 NLS Token（CreateToken 的 POP 签名）",
     "docling": "DOCX/PPTX/XLSX/HTML 解析",
     "fastapi": "Web 框架",
     "httpx": "模型调用",
@@ -18,6 +19,7 @@ REQUIRED = {
     "pymupdf": "PDF 文本层与页面渲染",
     "python-multipart": "multipart 上传（缺它时 FastAPI 起不来）",
     "uvicorn": "ASGI 服务器",
+    "websockets": "语音转写的一句话识别 WebSocket 通道",
     "xlrd": ".xls 单元格读取",
 }
 

@@ -42,8 +42,8 @@
 | `POST /api/optimization/check` | `{"content":导图}` | 结构诊断列表 | 结构无效 422 |
 | `POST /api/optimization/suggest` | `{"content":导图}` | 诊断与候选建议 | 结构无效 422；建议需用户判断 |
 | `POST /api/export/puml` | `{"content":导图}` | PlantUML 文本；根节点来自 `root.label` | 结构无效 422 |
-| `POST /api/ingestion/files` | multipart，字段名 `file` | `{"source": 来源}`，`source.text` 是解析出的正文 | 扩展名不在白名单 422；超过 10MB 413；扫描件无文本层 422 |
-| `GET /api/ingestion/formats` | 无 | 支持的扩展名列表与上传上限 | — |
+| `POST /api/ingestion/files` | multipart，字段名 `file` | `{"source": 来源}`，`source.text` 是解析出的正文 | 扩展名不在白名单 422；文档超 10MB 或音频超 20MB 413；扫描件无文本层、音频无人声、缺语音凭证 422 |
+| `GET /api/ingestion/formats` | 无 | `{"document":[...],"audio":[".wav"],"maxUploadBytes":…,"maxAudioBytes":…}` | — |
 | `GET /api/mindmaps` | 无 | 导图记录数组 | — |
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
 | `GET /api/mindmaps/{id}` | 无 | 导图记录 | 不存在 404 |
@@ -69,7 +69,7 @@
 
 | 模块 | 候选接口/契约 | 目的 |
 |---|---|---|
-| 多模态文件 | 文件接收与来源查询接口待确定 | 上传或解析 PDF、Word、PPT、图片、音频，返回来源状态及定位信息。 |
+| 多模态文件 | 已落地 `POST /api/ingestion/files`（文档 + WAV）；图片来源查询待确定 | 上传或解析 PDF、Word、PPT、WAV 音频已可用；图片与逐句时间戳定位仍待补。 |
 | 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。 |
 | 优化 | 已有 `/api/optimization/suggest`，持久化和应用接口待确定 | 未来补齐矛盾、缺失、重组、跨节点关系候选及依据，不直接覆盖。 |
 | 知识库 | `POST /api/knowledge-bases`、`POST .../{id}/sources`、`POST .../{id}/search` | 导入来源、切分、向量化、检索与引用。 |
