@@ -3,14 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
-import RecordButton from './components/RecordButton.vue';
+import SourceInputs from './components/SourceInputs.vue';
+import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
 import type { SampleMap } from './dev/samples';
 import { displayBody, useMindMapStore } from './stores/mindmap';
 
 const store = useMindMapStore();
 
-const prompt = ref('');
 const copied = ref('');
 
 // 开发期示例选择器：只在 dev 服务器下加载，生产构建里这段会被整体去掉。
@@ -42,42 +42,6 @@ const directions: { value: Direction; label: string }[] = [
 
 const selected = computed(() => store.selectedNode);
 const pathText = computed(() => store.breadcrumb.map(node => node.label.trim()).join(' / '));
-
-async function generate() {
-  // 生成会替换整棵树（并清掉 mapId，避免之后保存覆盖上一张图），先确认不丢未保存的修改。
-  if (!confirmDiscard('重新生成')) return;
-  await store.generate(prompt.value);
-}
-
-/** 选完文件立刻上传解析，不再要第二次确认；change 里拿不到文件说明用户取消了选择。 */
-async function onPickFile(event: Event) {
-  const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  // 清掉 value：否则再选同一个文件时 change 不会触发，看起来像"点了没反应"。
-  input.value = '';
-  if (!file) return;
-  await submitSource(file, '上传文件生成导图');
-}
-
-/** 录音产出的 File 和用户选的 File 走同一条路径，不另开一套确认与替换逻辑。 */
-async function onRecorded(file: File) {
-  await submitSource(file, '录音生成导图');
-}
-
-/** 上传成功会整体替换画布上的树，和「生成导图」一样先确认能不能丢掉未保存的修改。 */
-async function submitSource(file: File, action: string) {
-  if (!confirmDiscard(action)) return;
-  // 解析 + 生成可能几十秒，这期间用户还能改画布。结果回来时如果发现改过，
-  // 交给用户决定要不要替换——静默覆盖等于把这段时间的工作丢掉。
-  await store.uploadAndGenerate(file, {
-    confirmReplace: reason =>
-      window.confirm(
-        reason === 'switched'
-          ? '生成结果已就绪，但你已经切换到另一张导图。\n用新生成的导图替换当前画布吗？取消将保留当前内容。'
-          : '生成结果已就绪，但等待期间你修改过当前导图。\n用新生成的导图替换你的修改吗？取消将保留你的修改。',
-      ),
-  });
-}
 
 /** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
 const saveHint = computed(() => {
@@ -302,94 +266,7 @@ async function copyBody() {
           <p v-else class="text-xs text-slate-400">生成或新建之后可以改标题</p>
         </div>
 
-        <label for="prompt" class="text-xs font-medium text-slate-600">输入主题或文本</label>
-        <textarea
-          id="prompt"
-          v-model="prompt"
-          rows="6"
-          class="resize-none rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500"
-          placeholder="例如：机器学习的主要方向"
-        />
-        <div class="flex gap-2">
-          <button
-            type="button"
-            class="flex-1 rounded-md bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-            :disabled="store.busy"
-            @click="generate"
-          >
-            {{ store.busy ? '生成中…' : '生成导图' }}
-          </button>
-          <button
-            v-if="store.busy"
-            type="button"
-            class="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700"
-            @click="store.cancel(true)"
-          >
-            取消
-          </button>
-        </div>
-        <p role="status" class="text-xs leading-relaxed text-slate-500">
-          {{ store.status }}
-        </p>
-        <p v-if="store.stageText" class="text-xs text-slate-400">
-          {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
-        </p>
-
-        <RecordButton
-          :disabled="store.uploadBusy || store.busy"
-          @recorded="onRecorded"
-        />
-
-        <div class="flex items-center gap-2 text-xs">
-          <span class="h-px flex-1 bg-slate-200" />
-          <span class="text-slate-400">或者上传文档 / 音频</span>
-          <span class="h-px flex-1 bg-slate-200" />
-        </div>
-
-        <div class="flex flex-col gap-2">
-          <label
-            class="cursor-pointer rounded-md border border-dashed border-slate-300 px-3 py-2 text-center text-xs text-slate-600 hover:border-slate-400 hover:bg-slate-50 focus-within:border-slate-500 focus-within:ring-2 focus-within:ring-slate-200"
-            :class="store.uploadBusy ? 'pointer-events-none opacity-60' : ''"
-          >
-            <input
-              type="file"
-              class="sr-only"
-              accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc,.wav,.png,.jpg,.jpeg,.webp,.gif,.bmp"
-              :disabled="store.uploadBusy || store.busy"
-              @change="onPickFile"
-            />
-            {{ store.uploadBusy ? '处理中…' : '选择文件：PDF / Word / PPT / Excel / HTML / 图片 / WAV' }}
-          </label>
-          <p class="text-xs leading-relaxed text-slate-400">
-            选完自动上传解析：文档 10MB，图片 10MB，WAV 音频 20MB。PDF 逐页识别，扫描件也能读，最多 20 页。
-          </p>
-
-          <p v-if="store.uploadState === 'parsing'" class="text-xs text-slate-600">
-            正在解析…已等待 {{ store.parseSeconds }} 秒
-          </p>
-          <p v-if="store.uploadState === 'parsing'" class="text-xs leading-relaxed text-slate-400">
-            PDF 会逐页识别，页数越多越慢（约每页 5–10 秒，最多 20 页），请先别关页面。
-          </p>
-          <p v-if="store.uploadState === 'generating'" class="text-xs text-slate-600">
-            正在生成导图…
-          </p>
-
-          <p
-            v-if="store.truncateHint"
-            role="alert"
-            class="rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs leading-relaxed text-amber-800"
-          >
-            {{ store.truncateHint }}
-          </p>
-
-          <p
-            v-if="store.uploadError"
-            role="alert"
-            class="whitespace-pre-wrap break-words rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs leading-relaxed text-rose-700"
-          >
-            {{ store.uploadError }}
-          </p>
-        </div>
+        <SourceInputs :confirm-discard="confirmDiscard" />
 
         <p class="mt-auto text-xs leading-relaxed text-slate-400">
           双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销、Ctrl+Shift+Z 重做。
@@ -431,7 +308,7 @@ async function copyBody() {
         <MindMapCanvas />
       </section>
 
-      <aside class="flex w-80 shrink-0 flex-col gap-3 border-l border-slate-200 bg-white p-4">
+      <aside class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l border-slate-200 bg-white p-4">
         <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
           <h2 class="text-sm font-semibold">
@@ -488,6 +365,15 @@ async function copyBody() {
             点击画布上的任意节点查看完整内容与它所在的层级路径；双击节点可以直接改文字。
           </p>
         </template>
+        <details v-if="store.content?.source_usage?.length" class="mt-auto border-t border-slate-200 pt-3 text-xs text-slate-600" open>
+          <summary class="cursor-pointer font-medium">本图来源（{{ store.content.source_usage.length }}）</summary>
+          <ul class="mt-2 flex flex-col gap-2">
+            <li v-for="(source, index) in store.content.source_usage" :key="source.source_id" class="break-words">
+              {{ SOURCE_LABELS[source.kind] }} · {{ source.filename || `来源 ${index + 1}` }} · {{ source.char_count }} 字
+            </li>
+          </ul>
+          <p class="mt-2 leading-relaxed text-slate-400">整图来源摘要，不对应具体节点；原文未随导图保存。</p>
+        </details>
       </aside>
     </main>
 

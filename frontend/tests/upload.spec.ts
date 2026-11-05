@@ -3,12 +3,19 @@ import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
+import { startRecording } from '../src/audio/recorder';
 import type { MindMapContent, PipelineResponse, Source } from '../src/api/types';
-import { MAX_UPLOAD_BYTES, useMindMapStore } from '../src/stores/mindmap';
+import { useMindMapStore } from '../src/stores/mindmap';
+import { useSourcesStore } from '../src/stores/sources';
+import { MAX_UPLOAD_BYTES } from '../src/sources/input';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这里只验证上传入口与提示区。
 vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
   default: { name: 'MindMapCanvasStub', template: '<div data-test="canvas" />' },
+}));
+vi.mock('../src/audio/recorder', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/audio/recorder')>(),
+  startRecording: vi.fn(),
 }));
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -85,11 +92,25 @@ function hugeFile(name = '大文件.pdf'): File {
   return { name, size: MAX_UPLOAD_BYTES + 1 } as unknown as File;
 }
 
+const wrappers: VueWrapper[] = [];
+
+function buttonByText(wrapper: VueWrapper, text: string) {
+  const found = wrapper.findAll('button').find(button => button.text().includes(text));
+  if (!found) throw new Error(`找不到按钮：${text}`);
+  return found;
+}
+
+async function generateCollected(wrapper: VueWrapper) {
+  await vi.waitFor(() => expect(useSourcesStore().parsing).toBe(false));
+  await buttonByText(wrapper, '合并生成导图').trigger('click');
+}
+
 function mountApp() {
   const pinia = createPinia();
   setActivePinia(pinia);
   const wrapper = mount(App, { global: { plugins: [pinia] } });
-  return { wrapper, store: useMindMapStore() };
+  wrappers.push(wrapper);
+  return { wrapper, store: useMindMapStore(), sources: useSourcesStore() };
 }
 
 /** jsdom 不允许直接给 input.files 赋值，defineProperty 是塞进 FileList 的唯一办法。 */
@@ -107,15 +128,17 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  wrappers.splice(0).forEach(wrapper => wrapper.unmount());
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
-describe('上传期间用户改动不会被静默覆盖', () => {
+describe('多来源生成期间用户改动不会被静默覆盖', () => {
   /**
    * 让生成请求挂起，返回放行函数。
    *
-   * 直接调 store.uploadAndGenerate 而不 mount App：这里验证的是覆盖判定逻辑，
+   * 直接调 store.generateSources 而不 mount App：这里验证的是覆盖判定逻辑，
    * 走 UI 会引入 Vue Test Utils 的异步时序干扰（trigger 不等 async handler 结束），
    * 反而不稳定。界面层的 confirmDiscard 由其他用例覆盖。
    */
@@ -142,7 +165,7 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     store.commitLabel('c', '我改过的字');
 
     const gate = stubGeneratePending();
-    const running = store.uploadAndGenerate(smallFile());
+    const running = store.generateSources([source()]);
     await gate.waitUntilPending();
 
     // 生成请求在途时用户又改了内容
@@ -152,8 +175,8 @@ describe('上传期间用户改动不会被静默覆盖', () => {
 
     // 画布上仍是用户最后那次修改，生成结果没有盖上来
     expect(store.content?.root.children[0].label).toBe('等待期间又改了一次');
-    expect(store.uploadError).toContain('保留你的修改');
-    expect(store.uploadState).toBe('idle');
+    expect(store.sourceGenerationError).toContain('保留你的修改');
+    expect(store.sourceGenerating).toBe(false);
   });
 
   it('没有改动时正常落图', async () => {
@@ -162,14 +185,14 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     store.commitLabel('c', '我改过的字');
 
     const gate = stubGeneratePending();
-    const running = store.uploadAndGenerate(smallFile());
+    const running = store.generateSources([source()]);
     await gate.waitUntilPending();
     gate.release();
     await running;
 
     // 用户没动过，生成结果照常替换
     expect(store.content?.root.children[0].label).toBe('监督学习');
-    expect(store.uploadError).toBe('');
+    expect(store.sourceGenerationError).toBe('');
     expect(store.dirty).toBe(true);
   });
 
@@ -180,7 +203,7 @@ describe('上传期间用户改动不会被静默覆盖', () => {
 
     const gate = stubGeneratePending();
     const asked: string[] = [];
-    const running = store.uploadAndGenerate(smallFile(), {
+    const running = store.generateSources([source()], {
       confirmReplace: reason => {
         asked.push(reason);
         return true;
@@ -202,7 +225,7 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     store.preview(generated, 'right');
 
     const gate = stubGeneratePending();
-    const running = store.uploadAndGenerate(smallFile());
+    const running = store.generateSources([source()]);
     await gate.waitUntilPending();
 
     // 打开编辑器但不提交
@@ -212,7 +235,7 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     await running;
 
     expect(store.content?.root.children[0].label).toBe('监督学习');
-    expect(store.uploadError).toContain('保留你的修改');
+    expect(store.sourceGenerationError).toContain('保留你的修改');
   });
 
   it('等待期间标题框有未提交的输入：同样不落图', async () => {
@@ -222,7 +245,7 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     store.preview(generated, 'right');
 
     const gate = stubGeneratePending();
-    const running = store.uploadAndGenerate(smallFile());
+    const running = store.generateSources([source()]);
     await gate.waitUntilPending();
 
     store.setTitleDraft('我在改标题');
@@ -230,7 +253,7 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     await running;
 
     expect(store.content?.title).toBe('机器学习');
-    expect(store.uploadError).toContain('保留你的修改');
+    expect(store.sourceGenerationError).toContain('保留你的修改');
   });
 
   it('等待期间切换导图：不套到当前图上', async () => {
@@ -243,7 +266,7 @@ describe('上传期间用户改动不会被静默覆盖', () => {
     };
 
     const gate = stubGeneratePending();
-    const running = store.uploadAndGenerate(smallFile());
+    const running = store.generateSources([source()]);
     await gate.waitUntilPending();
 
     // 生成还没回来，用户打开了另一张导图
@@ -253,18 +276,21 @@ describe('上传期间用户改动不会被静默覆盖', () => {
 
     expect(store.mapId).toBe('m9');
     expect(store.content?.title).toBe('另一张图');
-    expect(store.uploadError).toContain('切换到别的导图');
+    expect(store.sourceGenerationError).toContain('切换到别的导图');
   });
 });
 
 describe('上传文档生成导图', () => {
-  it('解析成功后自动送进生成流水线，第一次请求是 multipart', async () => {
+  it('解析成功仅加入列表，点击合并才生成；上传使用 multipart', async () => {
     stubFetch(call =>
       call.url === UPLOAD_URL ? jsonResponse({ source: source() }) : jsonResponse(pipelineReply()),
     );
     const { wrapper } = mountApp();
 
     await pickFile(wrapper, smallFile());
+    await vi.waitFor(() => expect(useSourcesStore().readySources).toHaveLength(1));
+    expect(calls).toHaveLength(1);
+    await generateCollected(wrapper);
     await vi.waitFor(() => expect(calls).toHaveLength(2));
 
     expect(calls.map(call => call.method)).toEqual(['POST', 'POST']);
@@ -286,15 +312,16 @@ describe('上传文档生成导图', () => {
     expect(sent.sources[0].text).toContain('第一章');
   });
 
-  it('生成结果放到画布上，状态栏说明来源是上传的文档', async () => {
+  it('统一生成结果放到画布上，状态栏说明来源数量', async () => {
     stubFetch(call =>
       call.url === UPLOAD_URL ? jsonResponse({ source: source() }) : jsonResponse(pipelineReply()),
     );
     const { wrapper } = mountApp();
 
     await pickFile(wrapper, smallFile());
+    await generateCollected(wrapper);
     await vi.waitFor(() =>
-      expect(wrapper.get('[role="status"]').text()).toContain('已根据上传的「手册.pdf」'));
+      expect(wrapper.get('[role="status"]').text()).toContain('已合并 1 个来源'));
 
     expect(wrapper.text()).toContain('2 个节点');
     // preview() 之后按真实来源改回来的：生成的图还没保存过。
@@ -319,16 +346,16 @@ describe('上传文档生成导图', () => {
     });
     stubFetch(call => (call.url === UPLOAD_URL ? pending : jsonResponse(pipelineReply())));
 
-    const store = useMindMapStore();
-    const done = store.uploadAndGenerate(smallFile());
+    const sources = useSourcesStore();
+    const done = sources.addFiles([smallFile()]);
 
     await vi.advanceTimersByTimeAsync(3000);
-    expect(store.uploadState).toBe('parsing');
-    expect(store.parseSeconds).toBe(3);
+    expect(sources.items[0].state).toBe('parsing');
+    expect(sources.items[0].seconds).toBe(3);
 
     release(jsonResponse({ source: source() }));
     await done;
-    expect(store.uploadState).toBe('idle');
+    expect(sources.parsing).toBe(false);
   });
 
   it('截断时明确提示总页数与已处理页数', async () => {
@@ -413,14 +440,15 @@ describe('上传文档生成导图', () => {
   it('生成失败（超字数）时显示后端 detail，解析结果不丢', async () => {
     const detail = '合并后内容为 51762 字，超过当前 20000 字限制；请缩短或分批处理';
     stubFetch(call => (call.url === UPLOAD_URL ? jsonResponse({ source: source() }) : jsonResponse({ detail }, 422)));
-    const { wrapper, store } = mountApp();
+    const { wrapper, store, sources } = mountApp();
 
     await pickFile(wrapper, smallFile());
+    await generateCollected(wrapper);
     await vi.waitFor(() => expect(wrapper.get('[role="alert"]').text()).toBe(detail));
 
     // 来源留着：页数与截断信息仍要在界面上，不能因为生成失败就清空。
-    expect(store.uploadSource?.id).toBe('s1');
-    expect(store.uploadState).toBe('idle');
+    expect(sources.readySources[0]?.id).toBe('s1');
+    expect(store.sourceGenerating).toBe(false);
   });
 
   it('连不上后端时说清是网络问题', async () => {
@@ -431,5 +459,138 @@ describe('上传文档生成导图', () => {
 
     await pickFile(wrapper, smallFile());
     await vi.waitFor(() => expect(wrapper.text()).toContain('无法连接后端'));
+  });
+});
+
+describe('多来源输入界面', () => {
+  it('多文件、已添加文本和未添加的补充文本一次提交，保留每份来源的元数据', async () => {
+    const docs = [
+      source({ id: 'doc', truncated: true, span: { page: 30, start: null, end: null }, parsed_pages: 20 }),
+      source({ id: 'image', kind: 'image', filename: '草图.png', text: '图里的关系', parsed_pages: null }),
+      source({ id: 'audio', kind: 'audio', filename: '讨论.wav', text: '会议记录', parsed_pages: null, duration_seconds: 10 }),
+    ];
+    let index = 0;
+    stubFetch(call => call.url === UPLOAD_URL
+      ? jsonResponse({ source: docs[index++] })
+      : jsonResponse(pipelineReply()));
+    const { wrapper, sources } = mountApp();
+    await wrapper.get('#prompt').setValue('先加入的说明');
+    await buttonByText(wrapper, '添加文本到来源').trigger('click');
+    expect((wrapper.get('#prompt').element as HTMLTextAreaElement).value).toBe('');
+    const input = wrapper.get('input[type="file"]');
+    expect(input.attributes('multiple')).toBeDefined();
+    Object.defineProperty(input.element, 'files', {
+      value: [smallFile(), smallFile('草图.png'), smallFile('讨论.wav')], configurable: true,
+    });
+    await input.trigger('change');
+    await vi.waitFor(() => expect(sources.readySources).toHaveLength(4));
+    expect(calls).toHaveLength(3);
+    await wrapper.get('#prompt').setValue('还没点添加的补充');
+    await generateCollected(wrapper);
+
+    await vi.waitFor(() => expect(calls).toHaveLength(4));
+    const sent = JSON.parse(String(calls[3].body)).sources as Source[];
+    expect(sent.map(item => item.kind)).toEqual(['text', 'document', 'image', 'audio', 'text']);
+    expect(sent.slice(1, 4)).toEqual(docs);
+    expect(sent[0].text).toBe('先加入的说明');
+    expect(sent[4].text).toBe('还没点添加的补充');
+    expect(sent.every(item => !('state' in item) && !('seconds' in item))).toBe(true);
+    expect(wrapper.text()).toContain('共 30 页，仅处理前 20 页');
+    expect(sources.items).toHaveLength(5);
+  });
+
+  it('录音结束仅添加语音来源；录音期间不能提前生成', async () => {
+    const audioFile = smallFile('浏览器录音.wav');
+    vi.mocked(startRecording).mockResolvedValue({
+      elapsedSeconds: () => 1, stop: async () => audioFile, cancel: vi.fn(),
+    });
+    stubFetch(() => jsonResponse({ source: source({ kind: 'audio', filename: audioFile.name }) }));
+    const { wrapper, sources } = mountApp();
+    sources.addText('讨论主题');
+    await buttonByText(wrapper, '录音添加来源').trigger('click');
+    await vi.waitFor(() => expect(buttonByText(wrapper, '停止并添加')).toBeTruthy());
+    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeDefined();
+    await buttonByText(wrapper, '停止并添加').trigger('click');
+    await vi.waitFor(() => expect(sources.readySources).toHaveLength(2));
+    expect(sources.readySources[1].kind).toBe('audio');
+    expect(calls.map(call => call.url)).toEqual([UPLOAD_URL]);
+  });
+
+  it('存在失败项时阻止生成，移除后可使用剩余来源', async () => {
+    stubFetch(call => call.url === UPLOAD_URL
+      ? jsonResponse({ detail: '图片识别失败' }, 422)
+      : jsonResponse(pipelineReply()));
+    const { wrapper, sources } = mountApp();
+    sources.addText('有效的文本');
+    await pickFile(wrapper, smallFile('失败.png'));
+    await vi.waitFor(() => expect(wrapper.text()).toContain('图片识别失败'));
+    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeDefined();
+    await wrapper.get('[aria-label="移除 失败.png"]').trigger('click');
+    await generateCollected(wrapper);
+    const sent = JSON.parse(String(calls[1].body)).sources as Source[];
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toBe('有效的文本');
+  });
+
+  it('合并长度包含输入框草稿，超限时禁用生成并保留全部输入', async () => {
+    stubFetch(() => jsonResponse({}));
+    const { wrapper, sources } = mountApp();
+    sources.addText('字'.repeat(19998));
+    await wrapper.get('#prompt').setValue('补');
+    expect(wrapper.text()).toContain('20001 / 20000 字');
+    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeDefined();
+    expect(calls).toHaveLength(0);
+    expect(sources.items).toHaveLength(1);
+    await wrapper.get('#prompt').setValue('');
+    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeUndefined();
+  });
+
+  it('采集来源不询问是否丢弃导图，只在合并生成前确认', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    stubFetch(() => jsonResponse({ source: source() }));
+    const { wrapper, store, sources } = mountApp();
+    store.preview(generated, 'right');
+    store.commitLabel('c', '未保存的修改');
+    await pickFile(wrapper, smallFile());
+    await vi.waitFor(() => expect(sources.readySources).toHaveLength(1));
+    expect(confirm).not.toHaveBeenCalled();
+    await generateCollected(wrapper);
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(calls).toHaveLength(1);
+    expect(store.content?.root.children[0].label).toBe('未保存的修改');
+    expect(sources.items).toHaveLength(1);
+  });
+
+  it('生成时冻结来源列表，取消后可继续管理来源', async () => {
+    let release!: (response: Response) => void;
+    stubFetch(() => new Promise(resolve => { release = resolve; }));
+    const { wrapper, sources, store } = mountApp();
+    sources.addText('文本');
+    await generateCollected(wrapper);
+    expect(store.sourceGenerating).toBe(true);
+    expect(wrapper.get('input[type="file"]').attributes('disabled')).toBeDefined();
+    expect(buttonByText(wrapper, '清空来源').attributes('disabled')).toBeDefined();
+    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeDefined();
+    await buttonByText(wrapper, '取消').trigger('click');
+    expect(store.sourceGenerating).toBe(false);
+    expect(sources.items).toHaveLength(1);
+    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeUndefined();
+    release(jsonResponse(pipelineReply()));
+    await vi.waitFor(() => expect(store.content).toBeNull());
+  });
+
+  it('打开带来源摘要的导图显示本图来源，兼容旧导图', async () => {
+    const { wrapper, store } = mountApp();
+    store.loadMap({ ...generated, source_usage: [
+      { source_id: 'image', kind: 'image', filename: '结构.png', char_count: 100 },
+      { source_id: 'text', kind: 'text', filename: null, char_count: 5 },
+    ] }, { id: 'saved', version: 1, updated_at: '2026-11-05' });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get('aside').text()).toContain('本图来源（2）');
+    expect(wrapper.get('aside').text()).toContain('图片 · 结构.png · 100 字');
+    expect(wrapper.get('aside').text()).toContain('不对应具体节点');
+    store.loadMap(generated, { id: 'legacy', version: 1, updated_at: '2026-11-05' });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get('aside').text()).not.toContain('本图来源');
   });
 });

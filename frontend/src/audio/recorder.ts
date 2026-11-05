@@ -2,7 +2,7 @@
  * 麦克风录音，产出一个 16kHz 单声道 WAV 的 File 对象。
  *
  * 出口是 File，所以调用方拿到的东西和「用户选了文件」完全一样，
- * 后面的 confirmDiscard / uploadAndGenerate 一行都不用改。
+ * 后面复用文件来源的上传与解析流程。
  *
  * **为什么用 ScriptProcessorNode 而不是 MediaRecorder**：后者只能产出
  * webm/opus（Chrome）或 mp4/aac（Safari），后端只解析 WAV，解码那些

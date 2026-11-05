@@ -8,6 +8,7 @@ const props = defineProps<{ disabled?: boolean }>();
 const emit = defineEmits<{
   recorded: [file: File];
   failed: [message: string];
+  active: [value: boolean];
 }>();
 
 // 一句话识别单次上限 60 秒。超过会切成多段识别，耗时线性上升，
@@ -23,12 +24,13 @@ const error = ref('');
 
 let recording: ActiveRecording | null = null;
 let ticker: number | undefined;
+let disposed = false;
 
 const label = computed(() => {
   if (state.value === 'starting') return '正在启动麦克风…';
   if (state.value === 'finishing') return '正在整理音频…';
-  if (state.value === 'recording') return `停止并生成（${format(seconds.value)}）`;
-  return '录音生成导图';
+  if (state.value === 'recording') return `停止并添加（${format(seconds.value)}）`;
+  return '录音添加来源';
 });
 
 function format(total: number): string {
@@ -47,8 +49,14 @@ function stopTicker(): void {
 async function begin(): Promise<void> {
   error.value = '';
   state.value = 'starting';
+  emit('active', true);
   try {
     recording = await startRecording();
+    if (disposed) {
+      recording.cancel();
+      recording = null;
+      return;
+    }
     state.value = 'recording';
     seconds.value = 0;
     // 用 500ms 轮询而不是每秒 +1：标签页切到后台时 setInterval 会被节流，
@@ -61,6 +69,7 @@ async function begin(): Promise<void> {
     state.value = 'idle';
     error.value = err instanceof RecordingError ? err.message : '录音启动失败';
     emit('failed', error.value);
+    emit('active', false);
   }
 }
 
@@ -78,6 +87,8 @@ async function finish(): Promise<void> {
     state.value = 'idle';
     error.value = err instanceof RecordingError ? err.message : '录音处理失败';
     emit('failed', error.value);
+  } finally {
+    emit('active', false);
   }
 }
 
@@ -90,6 +101,7 @@ function toggle(): void {
 }
 
 onBeforeUnmount(() => {
+  disposed = true;
   stopTicker();
   recording?.cancel();
   recording = null;
@@ -104,14 +116,14 @@ onBeforeUnmount(() => {
       :class="state === 'recording'
         ? 'border-red-300 bg-red-50 text-red-700 hover:bg-red-100'
         : 'border-slate-300 text-slate-600 hover:border-slate-400 hover:bg-slate-50'"
-      :disabled="props.disabled || state === 'starting' || state === 'finishing'"
+      :disabled="(props.disabled && state === 'idle') || state === 'starting' || state === 'finishing'"
       @click="toggle"
     >
       {{ label }}
     </button>
 
     <p v-if="state === 'recording' && seconds >= HINT_SECONDS" class="text-xs text-amber-700">
-      已超过 60 秒，将分段识别，生成会慢一些
+      已超过 60 秒，将分段识别，转写会慢一些
     </p>
     <p v-if="state === 'recording'" class="text-xs text-slate-400">
       录音在本地进行，停止后才会上传转写。

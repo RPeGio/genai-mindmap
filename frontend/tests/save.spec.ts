@@ -68,6 +68,34 @@ afterEach(() => {
 });
 
 describe('保存', () => {
+  it('来源摘要随首次保存、编辑保存和重新打开保留，原文不会写进导图', async () => {
+    const store = useMindMapStore();
+    const sourceUsage = [
+      { source_id: 'image-1', kind: 'image' as const, filename: '草图.png', char_count: 20 },
+      { source_id: 'text-1', kind: 'text' as const, filename: null, char_count: 10 },
+    ];
+    store.preview({ ...sample(), source_usage: sourceUsage }, 'right');
+    let saved: MapRecord;
+    stubFetch(call => {
+      if (call.method === 'GET') return jsonResponse(saved);
+      const content = (call.body as { content: MindMapContent }).content;
+      saved = { id: 'mixed', version: call.method === 'POST' ? 1 : 2, content, updated_at: '2026-11-05' };
+      return jsonResponse(saved);
+    });
+    await store.save();
+    store.commitLabel('a', '编辑后的节点');
+    await store.save();
+    store.newMap();
+    await store.openMap('mixed');
+
+    expect(calls.map(call => call.method)).toEqual(['POST', 'PUT', 'GET']);
+    expect((calls[0].body as { content: MindMapContent }).content.source_usage).toEqual(sourceUsage);
+    expect((calls[1].body as { content: MindMapContent }).content.source_usage).toEqual(sourceUsage);
+    expect(store.content?.source_usage).toEqual(sourceUsage);
+    expect(store.content?.root.children[0].label).toBe('编辑后的节点');
+    expect(store.version).toBe(2);
+  });
+
   it('第一次保存走 POST，存完记住 id 与版本号', async () => {
     const store = useMindMapStore();
     store.preview(sample(), 'right');

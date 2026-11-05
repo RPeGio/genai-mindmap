@@ -98,7 +98,11 @@ function toContractV1(content: MindMapContent): MindMapContent {
     label: node.label,
     children: node.children.map(strip),
   });
-  return { title: content.title, root: strip(content.root) };
+  return {
+    title: content.title,
+    root: strip(content.root),
+    ...(content.source_usage ? { source_usage: content.source_usage } : {}),
+  };
 }
 
 /** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
@@ -212,13 +216,13 @@ export async function generateMindMapStream(
  * boundary 必须由浏览器自己生成。手动设头的结果是后端拆不出 file 字段，
  * 所以这里只给 method 和 body，让 fetch 自己填类型。
  */
-export async function uploadDocument(file: File): Promise<Source> {
+export async function uploadDocument(file: File, signal?: AbortSignal): Promise<Source> {
   const form = new FormData();
   form.append('file', file);
 
   let response: Response;
   try {
-    response = await fetch(`${BASE}/ingestion/files`, { method: 'POST', body: form });
+    response = await fetch(`${BASE}/ingestion/files`, { method: 'POST', body: form, signal });
   } catch {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
   }
@@ -274,9 +278,10 @@ export async function exportMindMap(
 }
 
 /** 把解析好的来源原样送回流水线生成导图。不做裁剪：后端 Source 是 extra="forbid"，少字段才安全。 */
-export function generateFromSources(sources: Source[]): Promise<PipelineResponse> {
+export function generateFromSources(sources: Source[], signal?: AbortSignal): Promise<PipelineResponse> {
   return request<PipelineResponse>('/pipeline/generate', {
     method: 'POST',
     body: JSON.stringify({ sources }),
+    signal,
   });
 }

@@ -2,8 +2,9 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, updateMindMap, uploadDocument } from '../api/client';
+import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, updateMindMap } from '../api/client';
 import type { MapRecord, MindMapContent, MindNode, Source } from '../api/types';
+import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -22,26 +23,6 @@ export const TRUNCATE_CHARS = 24;
 
 /** 撤销栈上限。整树快照一步几 KB，50 步封顶，内存与手感都够用。 */
 export const HISTORY_LIMIT = 50;
-
-/**
- * 上传上限，与后端 `ingestion/router.py` 的 MAX_UPLOAD_BYTES 同一口径。
- * 前端先拦一道：超过上限的文件传一遍必定 413，白等一趟网络还占着带宽。
- */
-export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-
-/**
- * 音频单独一档，对应后端 MAX_AUDIO_BYTES。
- *
- * 20MB 约合 11 分钟 16kHz 单声道 WAV。音频比文档占地方得多——60 秒
- * 就是 1.83MB——沿用 10MB 会让超过 5 分钟的录音传不上去，而用户
- * 在录音界面上看不出这个上限是从哪来的。
- */
-export const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
-
-/** 按扩展名挑上限。后端也是这么分的，两边不能各说各话。 */
-function uploadLimitFor(file: File): number {
-  return file.name.toLowerCase().endsWith('.wav') ? MAX_AUDIO_BYTES : MAX_UPLOAD_BYTES;
-}
 
 /** 保存的结果分类：界面据此决定提示什么，而不是把所有失败都说成"保存失败"。 */
 export type SaveResult = 'saved' | 'conflict' | 'invalid' | 'empty' | 'busy' | 'failed';
@@ -757,6 +738,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     active?.abort();
     busy.value = false;
     stageText.value = '';
+    sourceGenerationError.value = '';
     if (restorePrevious && pendingRestore) {
       pendingRestore();
     }
@@ -770,7 +752,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = '请输入主题或文本。';
       return;
     }
-    if (busy.value) return;
+    if (busy.value || sourceGenerating.value) return;
+    sourceGenerationError.value = '';
 
     // 先把上一份结果存起来：新请求失败时恢复它，而不是让用户白等一场还丢了旧图。
     const previous = content.value;
@@ -900,178 +883,71 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
   }
 
-  // ---- 上传文档 → 解析 → 生成 ----
+  // ---- 多来源统一生成；收集与解析在 sources store 中完成 ----
 
-  /** 上传链路的进度。idle 之外的两种状态界面各有各的提示，不能并成一个布尔值。 */
-  const uploadState = ref<'idle' | 'parsing' | 'generating'>('idle');
-  /** 解析已等待的秒数：首次解析 DOCX 要加载模型，实测 47 秒，只转圈用户会以为卡死。 */
-  const parseSeconds = ref(0);
-  const uploadError = ref('');
-  /** 最近一次解析出的来源：截断提示要从它身上取总页数与已解析页数。 */
-  const uploadSource = ref<Source | null>(null);
+  const sourceGenerating = ref(false);
+  const sourceGenerationError = ref('');
+  let sourceController: AbortController | null = null;
 
-  const uploadBusy = computed(() => uploadState.value !== 'idle');
-
-  /**
-   * 截断提示。后端最多解析 50 页，正文缺了尾巴；界面若只说"解析成功"，
-   * 用户看导图时会以为后面那些章节本来就没有内容。
-   */
-  const truncateHint = computed(() => {
-    const source = uploadSource.value;
-    if (!source) return '';
-
-    const parts: string[] = [];
-
-    // 中间有洞：处理过但没拿到内容。必须报出具体页码，否则用户对着导图
-    // 找不到那一页的内容也不知道为什么。
-    const failed = source.failed_pages ?? [];
-    if (failed.length > 0) {
-      const shown = failed.slice(0, 5).map(n => `第 ${n} 页`).join('、');
-      const rest = failed.length > 5 ? ` 等 ${failed.length} 页` : '';
-      parts.push(`${shown}${rest} 识别失败，这些页的内容不在导图里`);
-    }
-
-    // 缺了尾巴：页数超过上限，后面的根本没处理
-    if (source.truncated) {
-      const total = source.span?.page;
-      const parsed = source.parsed_pages;
-      if (typeof total === 'number' && typeof parsed === 'number') {
-        parts.push(`本文档共 ${total} 页，仅处理前 ${parsed} 页`);
-      } else {
-        // 拿不到总页数时也不能让提示消失，否则截断又变回静默行为。
-        parts.push('文档较长，本次只处理了一部分内容');
-      }
-    }
-
-    return parts.join('；');
-  });
-
-  let parseTimer: ReturnType<typeof setInterval> | null = null;
-
-  function stopParseTimer() {
-    if (parseTimer !== null) {
-      clearInterval(parseTimer);
-      parseTimer = null;
-    }
+  function cancelSourceGeneration() {
+    sourceController?.abort();
+    sourceController = null;
+    sourceGenerating.value = false;
+    sourceGenerationError.value = '';
+    status.value = '已取消生成，来源和当前导图已保留。';
   }
 
-  function startParseTimer() {
-    stopParseTimer();
-    parseSeconds.value = 0;
-    parseTimer = setInterval(() => {
-      parseSeconds.value += 1;
-    }, 1000);
-  }
-
-  /**
-   * 上传 → 解析 → 生成一条龙。选完文件直接调，不再要第二次确认。
-   *
-   * 失败时不动画布上的旧图：解析失败和生成失败都只提示原因。
-   * 用户手上那张导图仍在，比清成白板更接近预期，也免得无谓地丢掉未保存的修改。
-   *
-   * 解析 + 生成可能持续几十秒（PDF 逐页识别尤其慢）。这期间画布仍然可编辑，
-   * 用户在等待过程中改的东西不能被结果静默盖掉，所以落图前要检查：
-   *   - 导图身份变了（切到别的图或点了新建）→ 结果属于上一张，不能套到当前图上
-   *   - 内容变过（用户改了节点）→ 尊重用户的改动，先问一句
-   * 两种情形都交给 confirmReplace 决定，没提供回调时一律保留现状。
-   */
-  async function uploadAndGenerate(
-    file: File,
+  async function generateSources(
+    sources: Source[],
     options?: { confirmReplace?: (reason: 'edited' | 'switched') => boolean },
   ): Promise<void> {
-    // 同一时刻只走一条链路：preview() 会掐掉在途的流式请求，反过来流式结束也会顶掉新结果。
-    if (uploadState.value !== 'idle' || busy.value) return;
+    if (sourceGenerating.value || busy.value) return;
+    sourceGenerationError.value = sourceInputError(sources);
+    if (sourceGenerationError.value) {
+      status.value = sourceGenerationError.value;
+      return;
+    }
 
-    // 记录等待开始时的状态，生成回来时用来判断用户有没有动过
     const sessionAtStart = mapSession;
     const contentAtStart = content.value;
-
-    uploadError.value = '';
-    uploadSource.value = null;
-    parseSeconds.value = 0;
-
-    const limit = uploadLimitFor(file);
-    if (file.size > limit) {
-      const label = limit >= MAX_AUDIO_BYTES ? '20MB' : '10MB';
-      uploadError.value = `「${file.name}」超过 ${label} 上限，请压缩或拆分后再上传。`;
-      status.value = uploadError.value;
-      return;
-    }
-
-    uploadState.value = 'parsing';
-    status.value = `正在解析「${file.name}」…`;
-    startParseTimer();
-
-    let source: Source;
-    try {
-      source = await uploadDocument(file);
-    } catch (error) {
-      stopParseTimer();
-      uploadState.value = 'idle';
-      // 后端的 detail 已经写清了原因（旧版二进制格式、扫描件没有文本层、内容为空），
-      // 原样展示即可；统一成"上传失败"用户就不知道该改什么了。
-      uploadError.value = error instanceof ApiError ? error.message : '上传失败，请重试。';
-      status.value = uploadError.value;
-      return;
-    }
-
-    stopParseTimer();
-    uploadSource.value = source;
-
-    const text = source.text?.trim() ?? '';
-    if (!text) {
-      // 后端对空正文会走 422，这里再兜一层：真收下空来源也不该送去生成。
-      uploadState.value = 'idle';
-      uploadError.value = source.error?.trim() || '这份文档没有解析出任何文字。';
-      status.value = uploadError.value;
-      return;
-    }
-
-    uploadState.value = 'generating';
-    status.value = `已解析「${source.filename ?? file.name}」，正在生成导图…`;
+    const ctrl = new AbortController();
+    sourceController = ctrl;
+    sourceGenerating.value = true;
+    status.value = `正在合并 ${sources.length} 个来源生成导图…`;
 
     try {
-      const result = await generateFromSources([source]);
+      const result = await generateFromSources(sources, ctrl.signal);
+      if (sourceController !== ctrl) return;
 
-      // 落图之前先看用户在这几十秒里做了什么
+      // 生成期间仍可编辑旧图；包括还没有提交的节点或标题草稿。
       const switched = sessionAtStart !== mapSession;
-      // editingId 非空时，用户正在节点输入框里打字，文字还在组件的本地 draft 里，
-      // content 引用根本没变——只比引用会漏掉这种"输入到一半"的修改。
-      // 标题框同理：它走 :value + @change，打字期间 content 也不变，
-      // 只能靠 titleDraft 感知。
       const edited = content.value !== contentAtStart
         || editingId.value !== null
         || titleDraft.value !== null;
-      if (switched || edited) {
-        const reason = switched ? 'switched' : 'edited';
-        const replace = options?.confirmReplace?.(reason) ?? false;
-        if (!replace) {
-          uploadError.value = switched
-            ? '生成结果已就绪，但期间已切换到别的导图，已保留当前内容。'
-            : '生成结果已就绪，但期间你修改过当前导图，已保留你的修改。';
-          status.value = uploadError.value;
-          return;
-        }
+      if ((switched || edited) && !options?.confirmReplace?.(switched ? 'switched' : 'edited')) {
+        sourceGenerationError.value = switched
+          ? '生成结果已就绪，但期间已切换到别的导图，已保留当前内容。'
+          : '生成结果已就绪，但期间你修改过当前导图，已保留你的修改。';
+        status.value = sourceGenerationError.value;
+        return;
       }
 
-      // preview() 会把模式与脏标记按"本地示例"重置，所以调完再按真实来源改回来。
       preview(result.content, direction.value);
       mode.value = result.mode;
-      // 生成结果还没存过，标脏：离开页面要提醒，保存时走"创建"。
       dirty.value = true;
-
-      const label = source.filename ?? file.name;
-      const cut = source.truncated ? '（正文已截断）' : '';
-      status.value =
-        result.mode === 'demo'
-          ? `已根据上传的「${label}」生成演示导图（固定结构，非 AI 生成）${cut}，记得保存。`
-          : `已根据上传的「${label}」生成导图${cut}，可直接编辑，记得保存。`;
+      status.value = result.mode === 'demo'
+        ? `已合并 ${sources.length} 个来源生成演示导图（固定结构，非 AI 生成），记得保存。`
+        : `已合并 ${sources.length} 个来源生成导图，可直接编辑，记得保存。`;
     } catch (error) {
-      // 生成失败不要把解析结果也一并吞掉：来源还留着，界面才能继续显示页数与截断提示。
-      uploadError.value = error instanceof ApiError ? error.message : '生成失败，请重试。';
-      status.value = uploadError.value;
+      if (sourceController !== ctrl) return;
+      sourceGenerationError.value = error instanceof ApiError ? error.message : '生成失败，请重试。';
+      status.value = sourceGenerationError.value;
     } finally {
-      uploadState.value = 'idle';
+      // 取消之后马上重试时，迟到的旧响应不能清掉新一轮状态。
+      if (sourceController === ctrl) {
+        sourceController = null;
+        sourceGenerating.value = false;
+      }
     }
   }
 
@@ -1131,12 +1007,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     openList,
     closeList,
     openMap,
-    uploadState,
-    uploadBusy,
-    parseSeconds,
-    uploadError,
-    uploadSource,
-    truncateHint,
-    uploadAndGenerate,
+    sourceGenerating,
+    sourceGenerationError,
+    generateSources,
+    cancelSourceGeneration,
   };
 });

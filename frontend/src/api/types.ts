@@ -18,6 +18,8 @@ export interface MindNode {
 export interface MindMapContent {
   title: string;
   root: MindNode;
+  /** 整图来源摘要；旧导图可以省略，不代表节点级引用。 */
+  source_usage?: SourceUsage[];
 }
 
 /** 同步生成接口的响应：mode 说明内容来自演示规则还是模型。 */
@@ -36,8 +38,15 @@ export interface MapRecord {
 
 // ---- 来源（文档解析）----
 
-/** 来源模态。后端 SourceKind 的镜像，目前只有 document 走得通。 */
+/** 来源模态，镜像后端 SourceKind。 */
 export type SourceKind = 'text' | 'markdown' | 'document' | 'image' | 'audio';
+
+export interface SourceUsage {
+  source_id: string;
+  kind: SourceKind;
+  filename: string | null;
+  char_count: number;
+}
 
 /** 来源定位，供节点溯源。 */
 export interface SourceSpan {
@@ -71,6 +80,8 @@ export interface Source {
    * 合并成一个布尔值会给出"共 3 页，仅处理前 3 页"这种自相矛盾的提示。
    */
   failed_pages: number[];
+  /** 音频时长（秒）；兼容未返回此字段的旧响应。 */
+  duration_seconds?: number | null;
 }
 
 export interface CreateTextSourceResponse {
