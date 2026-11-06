@@ -1,0 +1,216 @@
+﻿<p align="center">
+    <a href="https://github.com/OpenSourceAGI/qwksearch-research-agent"><img  src="https://i.imgur.com/ZMY9Xy7.png" width="750px" /></a>
+    <br />
+   <a href="https://doi.org/10.5281/zenodo.20320687"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.20320687.svg" alt="DOI" /></a>
+    <a href="https://deepwiki.com/OpenSourceAGI/qwksearch-research-agent"><img src="https://img.shields.io/badge/Ask_DeepWiki-000?logo=github" alt="Ask DeepWiki" /></a>
+    <a href="https://qwksearch.com"><img height="20px" src="https://img.shields.io/badge/App-blueviolet?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Website" /></a>
+    <a href="https://qwksearch.com/docs"><img src="https://img.shields.io/badge/Docs-blue?logo=ReadTheDocs&logoColor=white" alt="Documentation" /></a>
+    <a href="https://qwksearch.com/api"><img src="https://img.shields.io/badge/API-blue?logo=fastapi&logoColor=white" alt="API" /></a>
+    <a href="https://youtu.be/DzykBAdrw6s"><img height="20px" src="https://img.shields.io/badge/YouTube-red?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube" /></a>
+   <a href="https://drive.google.com/file/d/1P5U5NdnyRqeoBzgEw0fP_fHVdSTL4Kba/view?usp=drive_link">
+      <img
+        src="https://img.shields.io/badge/%F0%9F%96%BC%EF%B8%8F_Pitch_Deck-DB2777?style=for-the-badge"
+        alt="Pitch Deck"
+        height="20px"
+      >
+    </a>
+    <br />
+    <a href="https://github.com/OpenSourceAGI/qwksearch-research-agent/stargazers"><img src="https://img.shields.io/github/stars/OpenSourceAGI/qwksearch-research-agent" alt="GitHub Stars" /></a>
+    <a href="https://www.npmjs.com/package/qwksearch-api-client"><img src="https://img.shields.io/npm/dm/qwksearch-api-client.svg" alt="NPM Monthly Downloads" /></a>
+    <a href="https://www.npmjs.com/package/qwksearch-api-client"><img src="https://img.shields.io/npm/v/qwksearch-api-client.svg" alt="npm version" /></a>
+    <a href="https://www.npmjs.com/package/qwksearch-api-client"><img src="https://img.shields.io/npm/dt/qwksearch-api-client.svg" alt="NPM Total Downloads" /></a>
+    <a href="https://packagephobia.com/result?p=qwksearch-api-client"><img src="https://packagephobia.com/badge?p=qwksearch-api-client" alt="Install size" /></a>
+    <a href="https://codecov.io/gh/OpenSourceAGI/qwksearch-research-agent"><img src="https://codecov.io/gh/OpenSourceAGI/qwksearch-research-agent/graph/badge.svg" alt="Coverage" /></a>
+    <a href="https://github.com/OpenSourceAGI/qwksearch-research-agent/actions/workflows/test-web-api.yml"><img src="https://github.com/OpenSourceAGI/qwksearch-research-agent/actions/workflows/test-web-api.yml/badge.svg?branch=master" alt="CI status" /></a>
+    <br />
+       <a href="https://github.com/OpenSourceAGI/qwksearch-research-agent/graphs/contributors"><img src="https://img.shields.io/github/commit-activity/m/OpenSourceAGI/qwksearch-research-agent" alt="Commit activity" /></a>
+    <a href="https://github.com/OpenSourceAGI/qwksearch-research-agent/commits/master/"><img src="https://img.shields.io/github/last-commit/OpenSourceAGI/qwksearch-research-agent.svg" alt="GitHub last commit" /></a>
+    <a href="https://github.com/OpenSourceAGI/qwksearch-research-agent/graphs/contributors"><img src="https://img.shields.io/github/contributors/OpenSourceAGI/qwksearch-research-agent" alt="Contributors" /></a>
+   <a href="https://app.codecov.io/gh/OpenSourceAGI/ai-broker-investing-agent"><img src="https://img.shields.io/badge/%EB%AA%A8%20lines-17k-yellow" /></a>
+    <a href="https://github.com/OpenSourceAGI/qwksearch-research-agent/pulls?q=is%3Apr+is%3Aclosed"><img src="https://img.shields.io/github/issues-pr-closed/OpenSourceAGI/qwksearch-research-agent?logo=github&label=PRs%20merged&color=8957e5" alt="Merged Pull Requests" /></a>
+    <a href="https://discord.gg/SJdBqBz3tV"><img src="https://img.shields.io/discord/1110227955554209923.svg?label=Chat&logo=Discord&colorB=7289da&style=flat" alt="Join Discord" /></a>
+    <br />
+    <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/OpenSourceAGI/qwksearch-research-agent"><img height="24px" src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare Workers" /></a>
+        <a href="https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/creating-a-pull-request"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" /></a>
+<img src="https://img.shields.io/badge/Claude-D97757?logo=claude&logoColor=white" alt="Claude" /> <img src="https://img.shields.io/badge/Bun-14151A?logo=bun&logoColor=white" alt="Bun" />  <img src="https://img.shields.io/badge/Next.js-black?logo=nextdotjs&logoColor=white" alt="Next.js" /> <img src="https://img.shields.io/badge/Cloudflare-F38020?logo=cloudflareworkers&logoColor=white" alt="Cloudflare Workers" /> <img src="https://img.shields.io/badge/shadcn%2Fui-000000?logo=shadcnui&logoColor=white" alt="shadcn/ui" /> <a href="https://grab.js.org"><img src="https://img.shields.io/badge/%F0%9F%91%8F%20grab--url-beige" alt="grab.js.org" /></a>
+</p>
+<!-- template-git-repo:badges:end -->
+
+## 🧠💻 Reimagine the Internet as Self-Organizing Mind Map
+
+<p align="center">
+ <img  src="https://i.imgur.com/Z9OJMwd.gif" />
+</p>
+
+Critical times call for critical thinkers to create a crowdsourced argument reasoning dataset, for AI models to recommend research quotes, to evolve crowdsourced chain-of-thought reasoning, to unlock faster ways to read long articles, to monitor developments by topic modeling a knowledge base graph, and to provide a public service of answers to research. Language Models can distill the essence of collective thought into a vector space where every point has a weighted value representing its contribution to the overall decision-making process. AI will show its reasoning based on what sentences and cites it used from the collective research, so that people can see it is aligned with our interests. Research Agents recommend articles for human researchers working alongside AI to develop a summarized topic outline as a public service. The agents monitor for any related articles via web searches for keywords associated with that Topic Model. Imagine uploading a research paper, then the app extracts full text of reference cites and creates topic model and keyword summaries, then monitors that literature base and stores highlights. People will make personal knowledge bases of what influences them to create AI assistants cloning their mind-uploaded perspective and interests in a self-organizing mind map.
+
+```bash
+# Download Source
+bun x git0 vtempest/qwksearch-research-agent
+```
+
+```bash
+# Import API Client
+bun i qwksearch-api-client
+```
+
+<img src="https://github.com/TutteInstitute/datamapplot/raw/main/examples/ArXiv_example.gif" width="800px"/>
+
+## 🤖🔎 STREAM: Search with Top Result Extraction & Answer Model
+
+<p align="center">
+    <img width="350px" src="https://i.imgur.com//LJ5hBjh.png" /> 
+</p>
+
+**Reimagine The Web as Self-Organizing Mind Map**
+
+- 🔍 **Web Search** - 100+ popular sites search across 10 categories: Web Search, Academic, Videos, Images, Files, News, etc
+- 📝 **Article Preview** - Extract, format with APA cite, and summarize articles, PDFs, Youtube, and URLs before reading them
+- 🤖 **Choice of Language Model** -  Claude, GPT, Gemini, Grok, Llama, Chinese LLMs, etc
+- 📄 **File Upload Support** - Ask questions about PDFs, URLs, DOCX, Google Docs, and Youtube
+- 📚 **Search History** - All searches saved with memories, except for privacy mode
+- ❓ **Follow-up Questions** - Generate follow-up questions to ask language models
+
+
+## REASON Writing Agent
+
+<p align="center">
+    <img width="400px" src="https://i.imgur.com/pDvMC1Q.png" />
+</p>
+
+#### Research Editor for Annotated Summaries in Outline Notation
+
+- 📝 **Complex Rich Text Editor**: full featured alternative to Google Docs based on Meta's Lexical with easy minimalist UI
+- 📂 **Nested Document Tree**: organize research notes with a nested document organizer with drag-and-drop, tabs, and custom storage sources
+- 🖱️ **Context Menu**: right-click to access quick actions for seamless document management
+- 🔍 **Full-Text Search**: instantly find documents by title or content with full-text search
+- ✨ **AI Rewriting**: leverage AI to rewrite and improve your text directly within the editor
+- 👥 **Team Management**: collaborate with team members and manage access rights
+- 🔄 **View Modes**: switch between Formatted, parsing HTML, and Markdown views for versatile editing
+- 🛠️ **Find & Replace**: powerful search and replace functionality with match highlighting
+- 📥 **Google Docs Integration**: seamless export, import, and sharing capabilities
+- 💾 **Persistent Storage**: reliable SQLite storage ensures your data is safe and accessible
+- ⌨️ **Keyboard Navigation**: efficient keyboard shortcuts for power users
+- 💬 **Research Quotes**: capture and organize key quotes and insights from your research
+- 🏗️ **Built with**: [Claude Code](https://claude.com/code), [Lexical Editor](https://lexical.dev/), [shadcn/ui](https://ui.shadcn.com/docs/components), [Cloudflare](https://developers.cloudflare.com/), [Next.js](https://nextjs.org/docs/app/getting-started), [Google Docs API](https://developers.google.com/workspace/docs/api/how-tos/overview)
+
+### 🚜📜 Tractor the Text Extractor
+
+<p align="center">
+<img width="350px"  src="https://i.imgur.com/TrF7dYz.png" /> 
+</p>
+
+1. **Main Content Detection**: Extract the main content from a URL by combining Mozilla Readability and Postlight Mercury algorithms, utilizing over 100 custom adapters for major sites for article, author, date HTML classes.
+2. **YouTube Transcript Processing**: When a YouTube video URL is detected, retrieve the complete video transcript including both manual captions and auto-generated subtitles, maintaining proper timestamp synchronization.
+3. **PDF to HTML**: Extracts formatted text from PDF with parsing of linebreaks , page headers, footnotes, and section headings. Supports fonts, links, bold, italics, lists, headings, headers, footnotes, and Table of Contents, Quotes, and Code Blocks. Removes repeated headers, links footnote anchors to the footnote, and preserves number of the PDF page with invisible I element. This function uses [pdfjs-serverless](https://github.com/johannschopplich/pdfjs-serverless) to work in more environments than PDF.js-based tools: Cloudflare workers, serverless, node.js, and front-end only.
+4. **Basic HTML Standardization**: Transform complex HTML into a simplified reading-mode format of basic HTML, making it ideal for research note archival and focused reading, with headings, images and links.
+5. **Cite**: Identify and extract citation metadata including author names, publication dates, sources, and titles using HTML meta tags and common class name patterns. The system validates author names against a comprehensive database of 90,000 first and last names, distinguishing between personal and organizational authors to properly format citations.
+
+## 🖥️ Desktop App
+
+**QwkSearch Desktop** — Built with Tauri. Select any text on screen, press `` ` `` to instantly search the web without leaving your workflow.
+
+## 🧩 Browser Extension
+
+**QwkSearch Tab Manager AI** — AI-powered tab manager that organizes, searches, and manages browser tabs intelligently.
+
+## 🧠 VS Code Extension
+
+**[QwkSearch for VS Code](apps/qwk-vscode-ext)** — Ask cited research questions from a sidebar in your editor, backed by the same QwkSearch API. Sign in with your account's API key, or use it signed-out as a guest.
+
+## 📦 Packages
+
+- <a href="https://www.npmjs.com/package/ads-in-chat-answers"><img src="https://img.shields.io/npm/dm/ads-in-chat-answers.svg" alt="Monthly Downloads"></a> **ads-in-chat-answers** — Sponsored placements for AI chat answers: a labelled product-carousel ad under an answer and one sponsored "Learn more about …" follow-up question, chosen by a relevance-gated, second-price keyword auction that runs after the answer is written. Ships the React components, a self-serve advertiser panel where an LLM proposes the keywords to buy, a Worker-safe handler, and a Vercel demo of how the placements work.
+- <a href="https://www.npmjs.com/package/chat-agent-toolkit"><img src="https://img.shields.io/npm/dm/chat-agent-toolkit.svg" alt="Monthly Downloads"></a> **chat-agent-toolkit** — A multi-provider AI agent toolkit that generates language responses, searches the web, extracts content, and manages memory across 10+ LLM providers. It integrates the Vercel AI SDK, Mastra framework, and MCP protocol to orchestrate research agent workflows.
+
+- <a href="https://www.npmjs.com/package/domain-rank"><img src="https://img.shields.io/npm/dm/domain-rank.svg" alt="Monthly Downloads"></a> **domain-rank** — Looks up top-ranked domains from the Tranco List and CommonCrawl backlink data to retrieve their human-readable source label, influence rank, and favicon. Useful for search/URL autocomplete, bookmark launchers, and domain reputation scoring.
+
+- <a href="https://www.npmjs.com/package/extract-pdf"><img src="https://img.shields.io/npm/dm/extract-pdf.svg" alt="Monthly Downloads"></a> **extract-pdf** — Converts a PDF from a URL or ArrayBuffer into clean HTML with structural tagging including headings, lists, footnotes, and code blocks. Slim by default — PDF.js loads at runtime from the pdfjs-serverless CDN build — with optional OCR via IBM's granite-docling-258M model: run all pages through the frontend JS parser, all through Docling, hybrid (a regex scan flags pages with infographics/tables and OCRs only those), or point at the URL of another docling-compatible processor. Ships the Hono HTTP OCR service in its `server/` folder. Works in Node.js, Cloudflare Workers, and browser environments.
+
+- <a href="https://www.npmjs.com/package/extract-cite"><img src="https://img.shields.io/npm/dm/extract-cite.svg" alt="Monthly Downloads"></a> **extract-cite** — Cites any webpage: fast regex/metadata extraction of author, date, title and source, plus an LLM pass (OpenRouter by default) that completes the full APA citation, scores confidence per part, flags parts for review, extracts author qualifications, and formats APA, MLA, Chicago, Harvard, IEEE and BibTeX.
+
+- <a href="https://www.npmjs.com/package/extract-human-name"><img src="https://img.shields.io/npm/dm/extract-human-name.svg" alt="Monthly Downloads"></a> **extract-human-name** — Extracts, characterizes, and structures human author names from arbitrary text: tells a person ("Dr. John Doe") from an organization ("The New York Times"), parses name parts (title, first, middle, last, honorific), splits multi-author bylines, and formats APA-style citations. Ships a compact built-in name list by default; the 92k-entry names database (~1.1 MB) loads lazily from a CDN or via the `/full` entry.
+- <a href="https://www.npmjs.com/package/extract-webpage"><img src="https://img.shields.io/npm/dm/extract-webpage.svg" alt="Monthly Downloads"></a> **extract-webpage** — Searches, extracts, cites, and outlines web content for a topic using an AI Research Agent. Combines PDF extraction, YouTube transcript extraction, DOM parsing, and LLM-based summarization to produce structured content from arbitrary web pages.
+
+- <a href="https://www.npmjs.com/package/extract-youtube"><img src="https://img.shields.io/npm/dm/extract-youtube.svg" alt="Monthly Downloads"></a> **extract-youtube** — A fast, no-browser, serverless-optimized YouTube transcript extractor that fetches subtitles and captions without requiring a headless browser. Supports multiple output formats (SRT, WebVTT) and runs on edge/serverless platforms. Also ships a video library admin API (D1 or in-memory) and React UI: a floating player, a transcript modal, video grid and list components and admin screens, with docs, a live demo and Storybook at [youtube.js.org](https://youtube.js.org), one Cloudflare Worker built from [packages/extract-youtube/site](packages/extract-youtube/site).
+
+- <a href="https://www.npmjs.com/package/html-renderer-api"><img src="https://img.shields.io/npm/dm/html-renderer-api.svg" alt="Monthly Downloads"></a> **html-renderer-api** — A Cloudflare Worker that renders pages with Puppeteer via Browser Rendering. A Durable Object keeps the browser warm and persists cookies per session id, so pages behind a login or a Cloudflare challenge can be scraped, with Swagger UI and an OpenAPI spec on the worker itself.
+
+- <a href="https://www.npmjs.com/package/notebooklm-api-client"><img src="https://img.shields.io/npm/dm/notebooklm-api-client.svg" alt="Monthly Downloads"></a> **notebooklm-api-client** — A Cloudflare Worker and on-demand Python container that drive Google's NotebookLM, which has no public API. One authenticated POST endpoint covers list/create/ask/summarize/delete, and a Puppeteer login flow captures the Google session for the container. The container sleeps after 5 minutes idle to conserve cost.
+
+- <a href="https://www.npmjs.com/package/qwksearch-api-client"><img src="https://img.shields.io/npm/dm/qwksearch-api-client.svg" alt="Monthly Downloads"></a> **qwksearch-api-client** — An auto-generated TypeScript API client for the QwkSearch platform, built from an OpenAPI specification. Provides typed fetch-based bindings for interacting with the QwkSearch backend API.
+
+- <a href="https://www.npmjs.com/package/qwksearch-mcp-server"><img src="https://img.shields.io/npm/dm/qwksearch-mcp-server.svg" alt="Monthly Downloads"></a> **qwksearch-mcp-server** — An MCP server that exposes web search, page extraction and JavaScript rendering as tools over stdio, so any MCP client — Claude Desktop, Claude Code, or your own — can search and read the web through QwkSearch.
+
+- <a href="https://www.npmjs.com/package/react-reason-editor"><img src="https://img.shields.io/npm/dm/react-reason-editor.svg" alt="Monthly Downloads"></a> **reason-editor** — A formatted text editor built on Tiptap and Plate (React), published as `react-reason-editor`, with a toolbar, documents manager, and note outlines. Ships 59 editor extensions on individual subpath exports, 21 locales, remappable shortcuts, drag-and-drop, and collaborative editing via Yjs.
+
+- <a href="https://www.npmjs.com/package/react-reason-editor-sidebar"><img src="https://img.shields.io/npm/dm/react-reason-editor-sidebar.svg" alt="Monthly Downloads"></a> **reason-editor-sidebar** — The REASON editor's file/folder tree, open-tabs panel, outline and split-view menu as a standalone package, published as `react-reason-editor-sidebar`. Includes the file-source layer for local, SSH, S3, R2, B2, Google Docs and Turso backends.
+
+- **render-url-to-html** — A collection of URL-to-HTML rendering strategies using Cloudflare Browser Rendering, Puppeteer with stealth plugins, and JSDOM. Fetches URLs and returns fully-rendered DOM as HTML, capable of bypassing bot-detection on JavaScript-rendered pages.
+
+- <a href="https://www.npmjs.com/package/research-agent-ui"><img src="https://img.shields.io/npm/dm/research-agent-ui.svg" alt="Monthly Downloads"></a> **research-agent-ui** — The chat research agent UI: conversation window, article reader, search config, file uploads, and chat history, along with the shadcn primitives and icons it depends on. Drops into a Next.js app behind a small config/injection surface for auth, branding, and media-search preferences.
+
+- <a href="https://www.npmjs.com/package/search-autocomplete"><img src="https://img.shields.io/npm/dm/search-autocomplete.svg" alt="Monthly Downloads"></a> **search-autocomplete** — The QwkSearch search box and its autocomplete: query completion from the single fastest search-engine suggest API (picked by a bundled latency benchmark), site suggestions from a ranked domain list, a React `SearchBox`, dropdown and `useAutocomplete` hook, and a Worker-safe HTTP handler.
+
+- <a href="https://www.npmjs.com/package/search-web-api"><img src="https://img.shields.io/npm/dm/search-web-api.svg" alt="Monthly Downloads"></a> **search-web-api** — Provides access to 70+ search engines across 10 categories (web, academic, news, images, etc.) plus a scrape/extract API served via a Hono HTTP server. Includes Hugging Face Transformers integration for AI-powered processing.
+
+- **searxng-search-cloudflare** — A deployment configuration for running a private SearXNG metasearch engine proxy in Docker. Aggregates results from multiple search engines without tracking the user, providing a privacy-respecting search backend.
+
+- <a href="https://www.npmjs.com/package/shadcn-app-dock"><img src="https://img.shields.io/npm/dm/shadcn-app-dock.svg" alt="Monthly Downloads"></a> **shadcn-app-dock** — A prop-driven, macOS-style category dock React component with icon magnification on hover and a built-in shadcn theme switcher. Uses Framer Motion for animations and integrates with next-themes for light/dark mode toggling.
+
+- <a href="https://www.npmjs.com/package/shadcn-settings"><img src="https://img.shields.io/npm/dm/shadcn-settings.svg" alt="Monthly Downloads"></a> **shadcn-settings** — A schema-driven settings form renderer built on shadcn/ui. Feed it plain-data field declarations and value/commit callbacks and it renders string, password, textarea, select and switch controls in card, inline or ghost layouts, with custom field types supplied as renderers.
+
+- **language-model-training** — A from-scratch GPT-style transformer implementation built on Tinygrad that trains a next-word-prediction language model with a full Wikipedia pipeline. Ships with a FastAPI control API, Docker Compose orchestration, and a Next.js dashboard for monitoring training jobs.
+
+- <a href="https://www.npmjs.com/package/trending-news-api"><img src="https://img.shields.io/npm/dm/trending-news-api.svg" alt="Monthly Downloads"></a> **trending-news-api** — A React trending-news widget backed by Wikipedia's daily pageviews joined to The News API through a bundled Cloudflare Worker proxy, with a 10-minute client cache.
+
+- <a href="https://www.npmjs.com/package/use-weather-forecast"><img src="https://img.shields.io/npm/dm/use-weather-forecast.svg" alt="Monthly Downloads"></a> **react-weather-forecast** — A React weather forecast widget using Open-Meteo, published as `use-weather-forecast`. Resolves the viewer's location from explicit coordinates, a bundled Cloudflare geo Worker, or IP geolocation.
+
+- <a href="https://www.npmjs.com/package/use-voice-control"><img src="https://img.shields.io/npm/dm/use-voice-control.svg" alt="Monthly Downloads"></a> **use-voice-control** — React voice control with speech transcription, vocalization and interruption (STT/TTS/VAD), plus a CLI that reads Markdown and text files aloud to audio files.
+
+- **qwksearch-help-docs** — The user-facing help documentation served at `/docs` in the web app via Fumadocs. Content is inlined at build time so the docs run on Cloudflare Workers, where there is no filesystem to scan.
+
+- <a href="https://www.npmjs.com/package/write-language"><img src="https://img.shields.io/npm/dm/write-language.svg" alt="Monthly Downloads"></a> **write-language** — A multi-provider language generation toolkit using the Vercel AI SDK that generates text responses via 10+ LLM providers including OpenAI, Anthropic, Google, Groq, and more. Provides a unified interface for streaming and non-streaming text generation.
+
+## 🧠 Agent Skills
+
+Every package has a matching [Agent Skill](skills/) — setup, the calls worth knowing, recipes, and a troubleshooting table, written from the source rather than the README. Install all of them, or just the one you need:
+
+```bash
+npx skills@latest add https://github.com/OpenSourceAGI/qwksearch-research-agent
+npx skills@latest add https://github.com/OpenSourceAGI/qwksearch-research-agent --skill search-web-api
+```
+
+See [skills/README.md](skills/README.md) for the full index.
+
+## Further Research
+
+- [ThoughtSource Reasoning Datasets](https://github.com/OpenBioLink/ThoughtSource)
+- [Awesome-LLMs-Datasets](https://github.com/lmmlzn/Awesome-LLMs-Datasets)
+- [GPT Researcher](https://github.com/assafelovic/gpt-researcher)
+- [NLP Papers Latest Updates](https://index.quantumstat.com)
+- [Anthropic Persuasion Overview](https://www.anthropic.com/research/measuring-model-persuasiveness)
+- [NLP Research Progress](https://github.com/sebastianruder/NLP-progress/)
+- [NLP Datasets](https://github.com/niderhoff/nlp-datasets?tab=readme-ov-file)
+- [Google Search Algorithm](https://searchengineland.com/google-search-document-leak-ranking-442617)
+- [Can LLMs Generate Novel Research Ideas?](https://arxiv.org/html/2409.04109v1)
+- [Graph Algorithms Playground](https://playground.memgraph.com)
+- [CommonCrawl C4 Download](https://huggingface.co/datasets/allenai/c4)
+- [Knowledge Graphs Prompts Papers](https://github.com/zjunlp/PromptKG)
+- [Paper - Iterative Research Idea Generation](https://arxiv.org/abs/2404.07738)
+- [Open Deep Search](https://arxiv.org/html/2503.20201v1)
+- [LangChain Hub](https://smith.langchain.com/hub)
+
+
+🌟 Star this repo so it will grow new features!
+
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
+
+## LobeHub foundation (`apps/qwk-in-lobe/`)
+
+`apps/qwk-in-lobe/` holds a copy of the [LobeHub](https://github.com/lobehub/lobehub) monorepo adapted to
+run qwksearch.com on the same Cloudflare stack as this repo's Worker (Workers + D1 + KV + R2 +
+Email Routing + Better Auth). It ships all LobeHub features plus the QwkSearch article-extract side
+panel and D1-backed Docs. It is a separate pnpm workspace; see
+[`apps/qwk-in-lobe/README.md`](apps/qwk-in-lobe/README.md) for build, deploy and the list of changes.
+
