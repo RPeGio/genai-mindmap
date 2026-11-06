@@ -25,23 +25,30 @@ interface ToolRow {
   ms: number;
 }
 
-const calls = computed<ToolRow[]>(() =>
-  store.agentEvents.flatMap<ToolRow>(event => {
+const calls = computed<ToolRow[]>(() => {
+  // 按 call_id 归并：一次调用会先收到 tool_start 再收到 tool_end，
+  // 直接映射成两行的话，界面上会出现"同一次调用既是执行中又已完成"。
+  const order: string[] = [];
+  const byId = new Map<string, ToolRow>();
+  for (const event of store.agentEvents) {
     if (event.type === 'tool_start') {
-      return [{ key: `${event.call_id}-start`, name: event.name, state: 'running', ok: true, ms: 0 }];
-    }
-    if (event.type === 'tool_end') {
-      return [{
-        key: `${event.call_id}-end`,
+      if (!byId.has(event.call_id)) order.push(event.call_id);
+      byId.set(event.call_id, {
+        key: event.call_id, name: event.name, state: 'running', ok: true, ms: 0,
+      });
+    } else if (event.type === 'tool_end') {
+      if (!byId.has(event.call_id)) order.push(event.call_id);
+      byId.set(event.call_id, {
+        key: event.call_id,
         name: event.name,
         state: 'done',
         ok: event.ok,
         ms: event.latency_ms ?? 0,
-      }];
+      });
     }
-    return [];
-  }),
-);
+  }
+  return order.map(id => byId.get(id)!);
+});
 
 const canAccept = computed(() => store.candidate !== null && !store.agentRunning);
 
