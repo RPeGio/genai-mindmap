@@ -254,7 +254,9 @@ async function copyBody() {
     <main class="flex min-h-0 flex-1">
       <section class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-white p-4">
         <div class="flex flex-col gap-1">
-          <label for="title" class="text-xs font-medium text-slate-600">导图标题</label>
+          <label for="title" class="text-xs font-medium text-slate-600">
+            导图标题 <span class="font-normal text-slate-400">· 只改名，不重新生成</span>
+          </label>
           <input
             v-if="store.content"
             id="title"

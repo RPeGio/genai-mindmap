@@ -1004,7 +1004,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (busy.value || agentRunning.value) return;
     const prompt = goal.trim();
     if (!prompt) {
-      status.value = '请输入主题或文本。';
+      // 这里最容易踩的坑：用户把主题写进了「导图标题」（那个框只改名字、
+      // 不触发生成），然后点生成，界面毫无动静。所以提示必须指出是哪个框，
+      // 同时清掉上一次运行的进度——不清的话面板还挂着上一轮的失败卡片，
+      // 看起来像"这次又失败了"。
+      agentEvents.value = [];
+      agentError.value = '';
+      status.value = '请在下方「输入主题或文本」里写下要生成的内容；上面的「导图标题」只改名字，不会重新生成。';
       return;
     }
     if (intent !== 'create' && !content.value) {

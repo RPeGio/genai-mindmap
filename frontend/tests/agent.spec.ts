@@ -115,7 +115,9 @@ describe('agent 运行', () => {
     await store.runGeneration('   ', 'create');
 
     expect(calls).toHaveLength(0);
-    expect(store.status).toContain('请输入');
+    // 提示必须指出是哪个框：用户把主题写进「导图标题」时，只说"请输入主题"
+    // 会让他以为系统坏了。
+    expect(store.status).toContain('输入主题或文本');
   });
 
   it('没有导图时不允许 edit', async () => {
