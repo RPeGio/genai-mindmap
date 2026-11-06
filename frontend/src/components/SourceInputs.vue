@@ -37,6 +37,16 @@ async function onPickFiles(event: Event) {
 async function generate() {
   if (generating.value || sources.parsing || recording.value || problem.value) return;
   if (!props.confirmDiscard('重新生成')) return;
+
+  // agent 路径：输入框内容直接作为目标交给模型，由它自己决定查资料还是生成。
+  // 是否新建取决于当前有没有导图——有图就是在改图，没图才是新建。
+  if (store.agentEnabled) {
+    const goal = prompt.value.trim()
+      || sources.readySources.map(item => item.text ?? '').join('\n\n').slice(0, 1000);
+    await store.runGeneration(goal, store.content ? 'edit' : 'create');
+    return;
+  }
+
   if (!sources.items.length) {
     await store.generate(prompt.value);
     return;

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
+import AgentPanel from './components/AgentPanel.vue';
 import SourceInputs from './components/SourceInputs.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
@@ -309,6 +310,7 @@ async function copyBody() {
       </section>
 
       <aside class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l border-slate-200 bg-white p-4">
+        <AgentPanel />
         <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
           <h2 class="text-sm font-semibold">
