@@ -361,8 +361,13 @@ class OutlineTest(unittest.TestCase):
 
 
 class RegistryTest(unittest.TestCase):
-    def test_empty_registry_reports_no_tools(self):
-        registry = build_registry()
+    def test_fresh_registry_starts_empty(self):
+        """注册表的初始状态是空的；业务工具由 build_registry() 填进去。
+
+        这里断言的是 ToolRegistry 本身，不是 build_registry()——后者会随
+        工具集演进，拿它当"空表"用迟早失效。
+        """
+        registry = ToolRegistry()
         self.assertEqual(registry.names(), [])
         self.assertEqual(registry.specs(), [])
 
