@@ -93,10 +93,16 @@ export function getMindMap(id: string): Promise<MapRecord> {
  * 所以这里显式按 v1 序列化：本地留着 `note` 供界面显示正文，但不把后端还不认识的字段发出去。
  */
 function toContractV1(content: MindMapContent): MindMapContent {
+  // 只裁 note —— 它是契约 v2 字段，v1 后端的 Node 是 extra="forbid"，
+  // 带着它发出去必然 422。
+  //
+  // source_refs 必须保留：它在 v1 契约里本来就有（contracts/mindmap.py 的 Node），
+  // 之前这里一并裁掉，表现是保存后引用全部消失、刷新后再也读不回来。
   const strip = (node: MindNode): MindNode => ({
     id: node.id,
     label: node.label,
     children: node.children.map(strip),
+    ...(node.source_refs?.length ? { source_refs: node.source_refs } : {}),
   });
   return {
     title: content.title,

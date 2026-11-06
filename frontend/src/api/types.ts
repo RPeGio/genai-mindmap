@@ -13,6 +13,26 @@ export interface MindNode {
    * 必须与契约 v2 同批上线：v1 的 `Node` 是 `extra="forbid"`，提前出现会 422。
    */
   note?: string | null;
+  /**
+   * 节点级引用，镜像后端 `Node.source_refs`（v1 契约里**已经存在**，不是 v2 预告）。
+   *
+   * 之前前端缺这个字段，`client.ts::toContractV1()` 只保留 id/label/children，
+   * 于是引用在保存时被整批删掉——刷新后永远看不到引用，跟渲染层无关。
+   * 字符区间以 `Source.text` 为准，用 Unicode 码点计（不是 UTF-16 下标）。
+   */
+  source_refs?: SourceRef[];
+}
+
+/** 节点引用。与 backend/app/contracts/source.py 的 `SourceRef` 对应。 */
+export interface SourceRef {
+  source_id: string;
+  /** 页码，1 起；非分页来源为 null。 */
+  page?: number | null;
+  /** 字符区间 [start, end)，按码点计；两项必须同时给出。 */
+  start?: number | null;
+  end?: number | null;
+  /** 逐字摘录的原文，≤300 字。 */
+  quote?: string | null;
 }
 
 export interface MindMapContent {
