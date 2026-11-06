@@ -1,0 +1,115 @@
+{
+  "_comment": "跨端 op 契约一致性用例。backend/tests/test_ops_contract_sync.py 与 frontend/tests/ops-contract.spec.ts 共读本文件，任何一端行为漂移都会让另一端红。expect_tree 用前序遍历的 [id, label] 序列表示结果，避免整棵 JSON 的噪音。",
+  "base_tree": {
+    "title": "示例",
+    "root": {
+      "id": "root",
+      "label": "根",
+      "children": [
+        {
+          "id": "a",
+          "label": "甲",
+          "children": [
+            { "id": "a1", "label": "甲一", "children": [] },
+            { "id": "a2", "label": "甲二", "children": [] }
+          ]
+        },
+        { "id": "b", "label": "乙", "children": [] }
+      ]
+    },
+    "source_usage": [
+      { "source_id": "s1", "kind": "text", "filename": null, "char_count": 4 }
+    ]
+  },
+  "base_revision": 0,
+  "cases": [
+    {
+      "name": "add 追加到根末尾",
+      "ops": [{ "op": "add", "id": "n_new", "parent_id": "root", "index": 2, "label": "丙" }],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["a1", "甲一"], ["a2", "甲二"], ["b", "乙"], ["n_new", "丙"]]
+    },
+    {
+      "name": "add 插到子列表头部",
+      "ops": [{ "op": "add", "id": "n_head", "parent_id": "a", "index": 0, "label": "甲零" }],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["n_head", "甲零"], ["a1", "甲一"], ["a2", "甲二"], ["b", "乙"]]
+    },
+    {
+      "name": "add 顺序依赖：先建父再挂子",
+      "ops": [
+        { "op": "add", "id": "n_p", "parent_id": "b", "index": 0, "label": "父" },
+        { "op": "add", "id": "n_c", "parent_id": "n_p", "index": 0, "label": "子" }
+      ],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["a1", "甲一"], ["a2", "甲二"], ["b", "乙"], ["n_p", "父"], ["n_c", "子"]]
+    },
+    {
+      "name": "update 改 label",
+      "ops": [{ "op": "update", "id": "b", "changes": { "label": "乙改" } }],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["a1", "甲一"], ["a2", "甲二"], ["b", "乙改"]]
+    },
+    {
+      "name": "remove 连子树一起删",
+      "ops": [{ "op": "remove", "id": "a" }],
+      "expect_tree": [["root", "根"], ["b", "乙"]]
+    },
+    {
+      "name": "move 跨父移动，子树跟着走",
+      "ops": [{ "op": "move", "id": "a", "new_parent_id": "b", "index": 0 }],
+      "expect_tree": [["root", "根"], ["b", "乙"], ["a", "甲"], ["a1", "甲一"], ["a2", "甲二"]]
+    },
+    {
+      "name": "move 同父内换位：index 上界按摘除后算",
+      "ops": [{ "op": "move", "id": "a1", "new_parent_id": "a", "index": 1 }],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["a2", "甲二"], ["a1", "甲一"], ["b", "乙"]]
+    },
+    {
+      "name": "add 到不存在的父节点",
+      "ops": [{ "op": "add", "id": "n_x", "parent_id": "ghost", "index": 0, "label": "孤" }],
+      "expect_error": "parent_not_found"
+    },
+    {
+      "name": "add 的 index 越界",
+      "ops": [{ "op": "add", "id": "n_x", "parent_id": "b", "index": 5, "label": "越界" }],
+      "expect_error": "index_out_of_range"
+    },
+    {
+      "name": "add 重复 id",
+      "ops": [{ "op": "add", "id": "b", "parent_id": "root", "index": 0, "label": "撞车" }],
+      "expect_error": "duplicate_id"
+    },
+    {
+      "name": "remove 根节点",
+      "ops": [{ "op": "remove", "id": "root" }],
+      "expect_error": "cannot_remove_root"
+    },
+    {
+      "name": "move 到自己",
+      "ops": [{ "op": "move", "id": "b", "new_parent_id": "b", "index": 0 }],
+      "expect_error": "cycle_detected"
+    },
+    {
+      "name": "move 到自己的子孙",
+      "ops": [{ "op": "move", "id": "a", "new_parent_id": "a1", "index": 0 }],
+      "expect_error": "cycle_detected"
+    },
+    {
+      "name": "批量中途失败时原树零变化",
+      "ops": [
+        { "op": "update", "id": "b", "changes": { "label": "先改成功" } },
+        { "op": "remove", "id": "ghost" }
+      ],
+      "expect_error": "node_not_found",
+      "expect_base_unchanged": true
+    },
+    {
+      "name": "label 纯空白由整树校验拦下",
+      "ops": [{ "op": "update", "id": "b", "changes": { "label": "   " } }],
+      "expect_error": "tree_invalid"
+    },
+    {
+      "name": "update 的 changes 不能为空",
+      "ops": [{ "op": "update", "id": "b", "changes": {} }],
+      "expect_error": "empty_changes",
+      "note": "后端在契约层（UpdateChanges.at_least_one）就拒绝，构造不出该 op；前端在执行器里抛 empty_changes。两端都拒绝即算一致。"
+    }
+  ]
+}
