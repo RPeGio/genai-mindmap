@@ -126,6 +126,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 候选产出时的 clientRevision，接受时用来判过时。 */
   let candidateBaseRevision = 0;
 
+  /**
+   * 候选产出时所在的导图会话号（见 `mapSession`）。
+   *
+   * `clientRevision` 只在编辑时递增，切图（loadMap / newMap / preview）不碰它。
+   * 只看 revision 的话："生成候选 A → 打开另一张图 B → 点接受"会把 A 的内容
+   * 装进 B，还沿用 B 的 mapId 与 version，下次保存就把 A 写进 B 的记录。
+   */
+  let candidateSession = 0;
+
   /** 给面板显示的工具进度与阶段。 */
   const agentEvents = ref<AgentEvent[]>([]);
   const agentRunning = ref(false);
@@ -490,6 +499,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function loadMap(next: MindMapContent, record: { id: string; version: number; updated_at: string }) {
     cancel();
     mapSession += 1;
+    // 换了一张图，上一张图算出来的候选没有任何意义：留着它，一次误点就会把
+    // 那张图的内容装进这张图。
+    candidate.value = null;
     saving.value = false;
     titleDraft.value = null;
     content.value = next;
@@ -508,6 +520,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function newMap() {
     cancel();
     mapSession += 1;
+    // 同上：新建之后旧候选不再属于画布上的任何一张图。
+    candidate.value = null;
     saving.value = false;
     titleDraft.value = null;
     content.value = null;
@@ -724,6 +738,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 会因为会话号没变而把它的 id 写进 mapId——画布上是新图、身份却是旧图，
     // 下次保存就把新内容 PUT 到旧记录上。
     mapSession += 1;
+    // 换图即作废旧候选（preview 也被「多来源生成」复用，它同样会换掉整棵树）。
+    candidate.value = null;
     titleDraft.value = null;
     // 上一张图在途的保存到这里就作废了：它的 finally 因为会话不匹配不会
     // 清理 saving，这里必须自己复位，否则新图永远卡在"保存中"，点保存
@@ -999,8 +1015,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentError.value = '';
     agentEvents.value = [];
     candidate.value = null;
-    // 记下候选所依据的版本：接受时用它判断期间有没有被改过
+    // 记下候选所依据的版本与所在的图：接受时用它判断期间有没有被改过、有没有换了图
     candidateBaseRevision = clientRevision.value;
+    candidateSession = mapSession;
 
     const ctrl = new AbortController();
     controller = ctrl;
@@ -1010,6 +1027,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     status.value = '正在与模型协作…';
     waitedMs.value = 0;
 
+    // 流只在 done / error 帧上才算有了明确结局；两者都没到就 EOF，说明连接被掐断了，
+    // 不能当成正常结束——否则面板会停在「正在与模型协作…」，工具行永远显示「执行中…」。
+    let settled = false;
+
     try {
       await runAgentStream({
         goal: prompt,
@@ -1018,6 +1039,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
         snapshot: intent === 'create' ? null : content.value,
         selected_ids: intent === 'expand' && selectedId.value ? [selectedId.value] : [],
       }, event => {
+        // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，
+        // 否则旧回调会把新请求刚设好的 stageText / status / candidate 覆盖掉。
+        if (controller !== ctrl) return;
         agentEvents.value = [...agentEvents.value, event];
         switch (event.type) {
           case 'stage':
@@ -1030,6 +1054,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
             stageText.value = event.ok ? `${event.name} 完成` : `${event.name} 未成功`;
             break;
           case 'done':
+            settled = true;
             if (event.content) {
               // 只放进候选，不动 content：用户确认之前画布保持原样
               candidate.value = event.content;
@@ -1039,33 +1064,52 @@ export const useMindMapStore = defineStore('mindmap', () => {
             }
             break;
           case 'error':
+            settled = true;
             agentError.value = event.message;
             status.value = event.message;
             break;
         }
       }, ctrl.signal);
+
+      // 已经被后来的请求接管：这个旧请求无论成功、失败还是被取消，都不许再改状态。
+      if (controller !== ctrl) return;
+      if (!settled && !ctrl.signal.aborted) {
+        // 流正常结束但没有终态帧：中途断了，不能假装成功。
+        agentError.value = '连接中断，结果可能不完整，请重试。';
+        status.value = '连接中断，结果可能不完整，请重试。';
+      }
     } catch (error) {
+      if (controller !== ctrl) return;
       const message = error instanceof ApiError ? error.message : '运行失败，请重试。';
       agentError.value = message;
       status.value = message;
     } finally {
+      // 取消后立刻重新运行、或换图后新请求已接管时，旧请求的收尾不能清掉新请求的状态。
       if (controller === ctrl) {
         controller = null;
         agentRunning.value = false;
         busy.value = false;
+        stageText.value = '';
       }
-      stageText.value = '';
     }
   }
 
   /**
    * 把候选应用到画布。
    *
-   * 三道校验缺一不可：有候选、没有未提交的输入、树没被改过。少任何一条，
-   * 用户手打了一半的标题或刚做的编辑都会被候选静默覆盖——那正是这次改造
-   * 要解决的问题，不能在新路径上重演。
+   * 四道校验缺一不可：候选属于当前这张图、有候选、没有未提交的输入、树没被改过。
+   * 少任何一条，用户手打了一半的标题、刚做的编辑，或另一张图的内容都会被候选
+   * 静默覆盖——那正是这次改造要解决的问题，不能在新路径上重演。
    */
   function acceptCandidate(): 'applied' | 'stale' | 'invalid' {
+    // 换图判在"有没有候选"之前：切图会把 candidate 清成 null，但 candidateSession
+    // 还留着上一张图的号码。两者不等就说明这次候选属于另一张图，装上去等于把
+    // 那张图的内容写进当前记录。
+    if (candidateSession !== mapSession) {
+      candidate.value = null;
+      status.value = '候选是在另一张导图上生成的，已失效，请重新运行。';
+      return 'stale';
+    }
     if (!candidate.value) return 'invalid';
     if (editingId.value !== null || titleDraft.value !== null) {
       status.value = '请先提交或取消正在编辑的内容。';
@@ -1074,6 +1118,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (clientRevision.value !== candidateBaseRevision) {
       status.value = '候选生成之后这张图被改过，已失效，请重新运行。';
       return 'stale';
+    }
+    // 装进画布之前必须整树校验一次。候选是模型产出的外部数据，它的 label
+    // 长度、引用区间、节点数都可能越界；不在这里拦，脏数据会先进画布、
+    // 直到用户点保存才被后端 422 拒绝，而那时他已经在上面改了半天。
+    const invalid = validateDraft(candidate.value);
+    if (invalid) {
+      status.value = `候选不合法，已丢弃：${invalid}`;
+      candidate.value = null;
+      return 'invalid';
     }
     // 一次 agent 运行只记一条撤销记录，而不是每个 op 一条
     pushHistory();

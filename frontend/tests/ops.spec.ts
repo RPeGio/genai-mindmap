@@ -438,6 +438,67 @@ describe('整树校验', () => {
 
     expect(findDeep(result.content.root, 'r')?.label).toBe('根改');
   });
+
+  it('label 恰好 200 字再加一个尾随空格报 tree_invalid（后端按原始值量长度）', () => {
+    // trim 之后正好 200 字：只按 trim 判的话这里会放行，保存时才被后端 422。
+    const error = opError(() =>
+      applyOps(
+        content(tree()),
+        batch([{ op: 'update', id: 'a1', changes: { label: `${'长'.repeat(200)} ` } }]),
+      ),
+    );
+
+    expect(error.code).toBe('tree_invalid');
+    expect(error.path).toBe('ops');
+  });
+
+  it('引用 end 等于 start 报 tree_invalid', () => {
+    const error = opError(() =>
+      applyOps(
+        content(tree()),
+        batch([
+          {
+            op: 'update',
+            id: 'a1',
+            changes: { source_refs: [{ source_id: 's1', start: 4, end: 4, quote: '空区间' }] },
+          },
+        ]),
+      ),
+    );
+
+    expect(error.code).toBe('tree_invalid');
+    expect(error.path).toBe('ops');
+  });
+
+  it('引用只给 start 不给 end 报 tree_invalid', () => {
+    const error = opError(() =>
+      applyOps(
+        content(tree()),
+        batch([
+          {
+            op: 'update',
+            id: 'a1',
+            changes: { source_refs: [{ source_id: 's1', start: 2, quote: '缺 end' }] },
+          },
+        ]),
+      ),
+    );
+
+    expect(error.code).toBe('tree_invalid');
+    expect(error.path).toBe('ops');
+  });
+});
+
+describe('未知 op', () => {
+  it('契约外的 op 类型报 unknown_op，而不是静默跳过', () => {
+    // 类型断言绕过 TS 的穷尽检查，模拟后端将来加了新 op、或模型自己编了一个。
+    const bogus = { op: 'rename', id: 'a', label: '改名' } as unknown as MindMapOp;
+
+    const error = opError(() => applyOps(content(tree()), batch([bogus])));
+
+    expect(error.code).toBe('unknown_op');
+    expect(error.path).toBe('ops.0.op');
+  });
 });
 
 describe('changed_ids', () => {

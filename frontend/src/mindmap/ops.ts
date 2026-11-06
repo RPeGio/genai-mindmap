@@ -130,16 +130,30 @@ function assertTreeValid(root: MindNode, sourceUsage: SourceUsage[]): void {
     if (seen.size > LIMITS.nodes) invalid(`导图最多 ${LIMITS.nodes} 个节点`);
     if (depth > LIMITS.depth) invalid(`导图最多 ${LIMITS.depth} 层`);
 
-    // 与 `validateDraft` 同口径：先 trim 再算长度，emoji 按码点计。
+    // 非空按 trim 后的值判；长度按**原始** label 算——后端 `Field(max_length=200)`
+    // 量的也是原始值，前端用 trim 后的长度会把「200 字 + 一个尾随空格」放过去，
+    // 下一次保存就被 422 打回。
     const label = node.label.trim();
     if (!label) invalid(`节点 ${node.id} 的标题不能为空`);
-    if (charLength(label) > LIMITS.label) invalid(`节点 ${node.id} 的标题超过 ${LIMITS.label} 个字`);
+    if (charLength(node.label) > LIMITS.label) {
+      invalid(`节点 ${node.id} 的标题超过 ${LIMITS.label} 个字`);
+    }
     if (node.children.length > LIMITS.children) {
       invalid(`节点 ${node.id} 最多 ${LIMITS.children} 个子节点`);
     }
     for (const ref of node.source_refs ?? []) {
       if (!allowedSources.has(ref.source_id)) {
         invalid(`节点 ${node.id} 引用的来源 ${ref.source_id} 不在 source_usage 中`);
+      }
+      // 与 SourceRef.validate_range 同口径：start / end 要么都给、要么都不给，
+      // 且区间不能为空（end 必须严格大于 start）。
+      const start = ref.start ?? null;
+      const end = ref.end ?? null;
+      if ((start === null) !== (end === null)) {
+        invalid(`节点 ${node.id} 的引用 start 和 end 必须同时提供`);
+      }
+      if (start !== null && end !== null && end <= start) {
+        invalid(`节点 ${node.id} 的引用 end 必须大于 start`);
       }
     }
 
@@ -277,6 +291,13 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         // 旧父节点的子列表也变了，局部刷新要能重排它的分支。
         if (oldParent) changed.add(oldParent.id);
         break;
+      }
+
+      default: {
+        // 契约外的 op 类型（后端将来加新 op，或模型自己编了一个）：静默跳过等于
+        // 假装成功，模型会拿着"已生效"的反馈继续往下改。必须明确报错。
+        const unknown = op as { op: string };
+        throw new OpError('unknown_op', path('op'), `未知的 op 类型 ${unknown.op}`);
       }
     }
   });

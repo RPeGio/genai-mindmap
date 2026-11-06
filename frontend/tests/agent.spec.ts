@@ -127,6 +127,23 @@ describe('agent 运行', () => {
     expect(calls).toHaveLength(0);
     expect(store.status).toContain('还没有导图');
   });
+
+  it('流只发 tool_start 就 EOF：报中断，不留「正在与模型协作」', async () => {
+    stubFetch(() => agentReply([
+      { type: 'tool_start', seq: 1, call_id: 'c1', name: 'mindmap_generate' },
+    ]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('做一张导图', 'create');
+
+    // 既没有 done 也没有 error，不能当成正常结束
+    expect(store.agentError).not.toBe('');
+    expect(store.agentError).toContain('中断');
+    expect(store.status).toContain('中断');
+    expect(store.agentRunning).toBe(false);
+    expect(store.busy).toBe(false);
+    expect(store.candidate).toBeNull();
+  });
 });
 
 describe('候选接受', () => {
@@ -180,6 +197,25 @@ describe('候选接受', () => {
     expect(useMindMapStore().acceptCandidate()).toBe('invalid');
   });
 
+  it('候选本身不合法时拒绝应用并清掉', async () => {
+    // 候选是模型产出的外部数据：label 长度、引用区间、节点数都可能越界。
+    // 不在装上画布之前拦一次，脏数据会先入画布，直到用户点保存才被后端 422
+    // 拒绝——那时他已经在这棵树上改了半天。
+    const dirty = content('脏候选');
+    dirty.root.children[0].label = '超'.repeat(201);
+    stubFetch(() => agentReply([doneFrame(dirty)]));
+    const store = useMindMapStore();
+    store.preview(content('原图'), 'right');
+
+    await store.runGeneration('做一张图', 'create');
+    expect(store.candidate).not.toBeNull();
+
+    expect(store.acceptCandidate()).toBe('invalid');
+    expect(store.candidate).toBeNull();
+    expect(store.content?.root.label).toBe('原图');
+    expect(store.status).toContain('候选不合法');
+  });
+
   it('丢弃清空候选但不动画布', async () => {
     const store = await prepare();
 
@@ -187,5 +223,52 @@ describe('候选接受', () => {
 
     expect(store.candidate).toBeNull();
     expect(store.content?.root.label).toBe('原图');
+  });
+});
+
+describe('候选与换图', () => {
+  const record = (id: string) => ({ id, version: 1, updated_at: '2024-01-01T00:00:00Z' });
+
+  /** 先在同一张图上产出候选，返回 store，供各用例接上"换图"这一步。 */
+  async function prepared() {
+    stubFetch(() => agentReply([doneFrame(content('候选'))]));
+    const store = useMindMapStore();
+    store.loadMap(content('原图'), record('map-a'));
+    await store.runGeneration('做一张图', 'create');
+    expect(store.candidate?.root.label).toBe('候选');
+    return store;
+  }
+
+  it('生成候选后 loadMap 打开另一张图，候选被清掉', async () => {
+    const store = await prepared();
+
+    store.loadMap(content('另一张'), record('map-b'));
+
+    expect(store.candidate).toBeNull();
+    expect(store.content?.root.label).toBe('另一张');
+    expect(store.mapId).toBe('map-b');
+  });
+
+  it('生成候选后切图，接受要判过时', async () => {
+    const store = await prepared();
+
+    // 关键：切图不会递增 clientRevision，只有会话号能区分"这是另一张图"
+    const revisionBefore = store.clientRevision;
+    store.newMap();
+    expect(store.clientRevision).toBe(revisionBefore);
+
+    expect(store.acceptCandidate()).toBe('stale');
+    // 画布必须保持切图后的样子，候选不能借道 mapId 写进新记录
+    expect(store.content).toBeNull();
+    expect(store.mapId).toBeNull();
+  });
+
+  it('preview 换图同样作废旧候选', async () => {
+    const store = await prepared();
+
+    store.preview(content('示例'), 'right');
+
+    expect(store.candidate).toBeNull();
+    expect(store.acceptCandidate()).toBe('stale');
   });
 });
