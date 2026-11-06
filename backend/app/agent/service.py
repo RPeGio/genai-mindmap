@@ -103,17 +103,31 @@ def outline_text(content: MindMapContent | None, limit: int = 200) -> str:
     return "\n".join(lines)
 
 
-def _initial_messages(request: AgentRunRequest) -> list[dict[str, Any]]:
-    system = "\n".join([
+def _system_text(request: AgentRunRequest, content: MindMapContent | None) -> str:
+    return "\n".join([
         _SYSTEM_BASE,
         _INTENT_RULES.get(request.intent, ""),
         "当前导图：",
-        outline_text(request.snapshot),
+        outline_text(content),
     ]).strip()
+
+
+def _initial_messages(request: AgentRunRequest) -> list[dict[str, Any]]:
     return [
-        {"role": "system", "content": system},
+        {"role": "system", "content": _system_text(request, request.snapshot)},
         {"role": "user", "content": request.goal},
     ]
+
+
+def _refresh_outline(messages: list[dict[str, Any]], ctx: RunContext) -> None:
+    """每轮把第一条 system 消息换成最新的树。
+
+    不刷新的话，模型看到的大纲始终是请求开始时的快照：它刚生成的那些节点
+    根本没有 id 可引用，于是下一轮只能整张重来——那正是这次改造要消灭的行为。
+    原地替换而不是追加，是因为追加会让消息历史随轮数线性增长，几轮之后
+    光大纲就把上下文吃满了。
+    """
+    messages[0] = {"role": "system", "content": _system_text(ctx.request, ctx.candidate)}
 
 
 def _dedupe_key(call: ToolCall) -> str:
@@ -143,12 +157,16 @@ def _merge_usage(total: dict[str, Any], usage: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+def _remaining_seconds(budget: RunBudget, started: float) -> float:
+    return budget.max_seconds - (time.monotonic() - started)
+
+
 def _budget_limit(budget: RunBudget, model_calls: int, tool_calls: int, started: float) -> str | None:
     if model_calls >= budget.max_model_calls:
         return "max_model_calls"
     if tool_calls >= budget.max_tool_calls:
         return "max_tool_calls"
-    if time.monotonic() - started > budget.max_seconds:
+    if _remaining_seconds(budget, started) <= 0:
         return "max_seconds"
     return None
 
@@ -167,19 +185,37 @@ async def _execute_once(call: ToolCall, ctx: RunContext, registry: ToolRegistry)
     参数级去重是防"同一轮里两个不同 id 但参数完全一样"的调用——实测模型
     并行发起两个 node_expand(n1) 是会发生的事，执行两次就会加两遍子节点。
     """
+    key = _dedupe_key(call)
+
     cached = ctx.executed.get(call.call_id)
     if cached is not None:
-        return cached
+        cached_key, cached_result = cached
+        if cached_key != key:
+            # 同一个 call_id 换了参数是协议违规。返回旧结果会让模型以为新参数
+            # 生效了，而实际上没有任何改动发生。
+            return ToolResult(
+                ok=False,
+                content=f"call_id {call.call_id} 已经用于另一次参数不同的调用，请换一个新的 call_id 重试。",
+                data={"code": "call_id_conflict"},
+            )
+        return cached_result
 
-    key = _dedupe_key(call)
-    cached = ctx.dedupe.get(key)
-    if cached is not None:
-        ctx.executed[call.call_id] = cached
-        return cached
+    spec = registry.get(call.name)
+    readonly = spec is not None and spec.readonly
+    if readonly:
+        # 只读工具按参数去重是安全的：同样的查询必然得到同样的结果。
+        # 写操作不能这样——即使参数一字不差，第二次执行时树已经变了，
+        # 返回上次的结果等于谎报成功（实测：改成 X、Y、再改回 X，第三次被
+        # 缓存吃掉，模型以为改成功了，实际停在 Y）。
+        hit = ctx.dedupe.get(key)
+        if hit is not None:
+            ctx.executed[call.call_id] = (key, hit)
+            return hit
 
     result = await registry.execute(call, ctx)
-    ctx.executed[call.call_id] = result
-    ctx.dedupe[key] = result
+    ctx.executed[call.call_id] = (key, result)
+    if readonly:
+        ctx.dedupe[key] = result
     return result
 
 
@@ -208,6 +244,7 @@ async def run(
     started = time.monotonic()
     model_calls = 0
     tool_calls = 0
+    failures = 0
     usage_total: dict[str, Any] = {}
 
     yield StageEvent(
@@ -217,7 +254,7 @@ async def run(
     )
 
     while True:
-        limit = _budget_limit(budget, model_calls, tool_calls, started)
+        limit = _budget_limit(budget, model_calls + ctx.extra_model_calls, tool_calls, started)
         if limit is not None:
             yield ErrorEvent(
                 seq=next(seq), code="budget_exhausted",
@@ -225,14 +262,25 @@ async def run(
             )
             return
 
+        # 每轮刷新大纲：模型必须看到上一轮产出节点的真实 id，否则它无法精确改
+        _refresh_outline(messages, ctx)
         model_calls += 1
         try:
-            completion = await active_provider.complete_tools(
-                messages, registry.specs(), budget=budget,
+            # 用剩余时间做超时，而不是让单次调用跑到 provider 自己的 60 秒上限：
+            # 否则总时限形同虚设，一轮慢调用就能把预算耗尽而循环还在等。
+            completion = await asyncio.wait_for(
+                active_provider.complete_tools(messages, registry.specs(), budget=budget),
+                timeout=max(0.1, _remaining_seconds(budget, started)),
             )
         except asyncio.CancelledError:
             # 必须原样抛出：吞掉它会让"用户点了取消"变成一次正常结束
             raise
+        except (asyncio.TimeoutError, TimeoutError):
+            yield ErrorEvent(
+                seq=next(seq), code="budget_exhausted",
+                message=_BUDGET_HINT["max_seconds"], limit="max_seconds",
+            )
+            return
         except GenerationError as exc:
             yield ErrorEvent(seq=next(seq), code="generation_failed", message=str(exc))
             return
@@ -263,8 +311,29 @@ async def run(
                 args_summary=_args_summary(call),
             )
             begun = time.monotonic()
-            result = await _execute_once(call, ctx, registry)
+            try:
+                result = await asyncio.wait_for(
+                    _execute_once(call, ctx, registry),
+                    timeout=max(0.1, _remaining_seconds(budget, started)),
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                yield ErrorEvent(
+                    seq=next(seq), code="budget_exhausted",
+                    message=_BUDGET_HINT["max_seconds"], limit="max_seconds",
+                )
+                return
             tool_calls += 1
+            if not result.ok:
+                # 模型给错参数是常态，它看到错误后下一轮通常能改对；但一直错下去
+                # 就是在烧调用，超过容忍次数直接收尾。
+                failures += 1
+                if failures > budget.max_repairs:
+                    yield ErrorEvent(
+                        seq=next(seq), code="too_many_failures",
+                        message=f"工具连续失败 {failures} 次仍未成功，已停止。",
+                        limit="max_repairs",
+                    )
+                    return
             yield ToolEndEvent(
                 seq=next(seq), call_id=call.call_id, name=call.name, ok=result.ok,
                 result_summary=result.data,

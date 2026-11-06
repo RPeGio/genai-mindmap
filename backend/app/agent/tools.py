@@ -55,6 +55,9 @@ class ToolRegistry:
     def __contains__(self, name: str) -> bool:
         return name in self._specs
 
+    def get(self, name: str) -> ToolSpec | None:
+        return self._specs.get(name)
+
     def names(self) -> list[str]:
         return sorted(self._specs)
 
@@ -215,6 +218,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             raw = await chat_async(SOURCED_DETAIL_PROMPT, _understand(sources))
         else:
             raw = await chat_async(DETAIL_PROMPT, args.topic)
+        # 这是一次真实的模型调用，只是发生在工具内部。不计入的话
+        # max_model_calls 只约束了外层轮数，实际花费可以翻好几倍。
+        ctx.extra_model_calls += 1
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
 
@@ -246,6 +252,11 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     node = find_node(content.root, args.node_id)
     if node is None:
         return _fail("node_not_found", f"节点 {args.node_id} 不存在。", path=f"node_id={args.node_id}")
+    # 展开只能作用于用户选中的那个节点。参数里虽然有 node_id，但它是模型填的——
+    # 不校验的话，用户选中 A 而模型去改 B 也会“成功”，而他根本没同意改 B。
+    if ctx.request.selected_ids and args.node_id not in ctx.request.selected_ids:
+        allowed = "、".join(ctx.request.selected_ids)
+        return _fail("not_selected", f"只能展开当前选中的节点（{allowed}），不能改 {args.node_id}。")
     if len(node.children) + args.count > MAX_CHILDREN:
         return _fail(
             "no_room",
@@ -259,6 +270,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
 
     try:
         raw = await chat_async(EXPAND_PROMPT, ask)
+        ctx.extra_model_calls += 1
     except GenerationError as exc:
         return _fail("generation_failed", f"展开失败：{exc}")
 
@@ -267,17 +279,21 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
         return _fail("invalid_points", "模型没有返回可用的子要点，请重试。")
 
     drafts = []
-    for offset, point in enumerate(points[: args.count]):
+    for point in points:
         label = str(point).strip()
         if not label:
             continue
+        # 索引用**已接受的数量**而不是原始下标：模型返回 [" ", "有效"] 时，
+        # 第一条被跳过，用原始下标会往空父节点的 index 1 插，整批 index_out_of_range。
         drafts.append({
             "op": "add",
-            "id": f"$e{offset}",
+            "id": f"$e{len(drafts)}",
             "parent_id": node.id,
-            "index": len(node.children) + offset,
+            "index": len(node.children) + len(drafts),
             "label": label[:200],
         })
+        if len(drafts) >= args.count:
+            break
     if not drafts:
         return _fail("invalid_points", "模型返回的子要点都是空的，请重试。")
 
@@ -331,6 +347,9 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
         return content
 
     drafts: list[dict[str, Any]] = []
+    # 同一批里对同一个父节点连续 add 时，缺省 index 必须按“前面几条已经加进去之后”
+    # 的长度算。直接用执行前的长度会让「先 first 后 second」变成「second、first」。
+    pending: dict[str, int] = {}
     for item in args.ops:
         draft: dict[str, Any] = {"op": item.op, "id": item.id}
         if item.parent_id is not None:
@@ -349,16 +368,24 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
             # 几秒等待。两种写法都能表达同一件事，就在入口吸收掉。
             draft["changes"] = {"label": item.label}
 
+        # 显式 index 对所有 op 都必须保留。之前只有 add 分支复制了它，
+        # move 给了合法 index 反而在契约层报 move.index: Field required。
+        if item.index is not None:
+            draft["index"] = item.index
+
         if item.op == "add":
             # 草案允许省略 index，补成追加到末尾：模型经常只给 parent_id 和 label，
             # 这不该被判成参数错误。
             parent_id = item.parent_id
             if parent_id is None:
                 return _fail("invalid_ops", "add 必须给出 parent_id。", path=f"ops.{item.id}.parent_id")
-            parent = None if parent_id.startswith("$") else find_node(content.root, parent_id)
-            draft["index"] = item.index if item.index is not None else (len(parent.children) if parent else 0)
+            if "index" not in draft:
+                parent = None if parent_id.startswith("$") else find_node(content.root, parent_id)
+                base = len(parent.children) if parent else 0
+                draft["index"] = base + pending.get(parent_id, 0)
+                pending[parent_id] = pending.get(parent_id, 0) + 1
             draft.setdefault("source_refs", [])
-        if item.op == "move" and item.index is None:
+        if item.op == "move" and "index" not in draft:
             draft["index"] = 0
 
         drafts.append(draft)
@@ -430,6 +457,7 @@ def build_registry() -> ToolRegistry:
         description="在本次请求附带的资料里检索相关原文片段。回答关于资料的问题之前先调用它。",
         args_model=RagArgs,
         fn=_rag,
+        readonly=True,
     ))
     registry.register(ToolSpec(
         name="mindmap_edit",

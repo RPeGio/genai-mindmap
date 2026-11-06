@@ -36,7 +36,11 @@ class RunBudget(BaseModel):
     max_model_calls: int = Field(default=5, ge=1, le=20)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
     max_seconds: float = Field(default=120.0, gt=0, le=600)
+    # 这是**单次**模型调用的输出上限，不是整轮累计——它直接作为 provider 的
+    # max_tokens 发出去。整轮累计的上界是它乘以调用次数，不需要另一个字段。
     max_output_tokens: int = Field(default=32768, ge=1024, le=131072)
+    # 容忍几次工具执行失败。模型第一次把 label 写错位置是常态，它看到错误后
+    # 下一轮会改对；超过这个次数说明它卡住了，继续烧调用没有意义。
     max_repairs: int = Field(default=1, ge=0, le=5)
 
 
@@ -117,6 +121,9 @@ class ToolSpec:
     description: str
     args_model: type[BaseModel]
     fn: Callable[[Any, "RunContext"], Any]
+    # 只读工具才允许按参数去重。写操作（改树）即使参数完全相同，第二次执行时
+    # 树的状态已经变了，返回上次的结果等于谎报成功。
+    readonly: bool = False
 
     def schema(self) -> dict[str, Any]:
         """转成 OpenAI tools 格式。"""
@@ -143,10 +150,14 @@ class RunContext:
     revision: int = 0
     batches: list[OpBatch] = field(default_factory=list)
     sources_by_id: dict[str, Source] = field(default_factory=dict)
-    # call_id -> 结果：同一轮里模型重复给同一个 id 时直接返回缓存
-    executed: dict[str, ToolResult] = field(default_factory=dict)
-    # (工具名, 规范化参数) -> 结果：不同 call_id 但参数完全相同时复用
-    dedupe: dict[str, ToolResult] = field(default_factory=dict)
+    # call_id -> (参数指纹, 结果)。存指纹是为了识别"同一个 id 换了参数"这种协议违规，
+    # 那必须报错而不是返回旧结果。
+    executed: dict[str, tuple[str, "ToolResult"]] = field(default_factory=dict)
+    # (工具名, 规范化参数) -> 结果。只对只读工具生效。
+    dedupe: dict[str, "ToolResult"] = field(default_factory=dict)
+    # 工具内部直接调模型的次数（生成、展开）。它们不经过循环那一层，
+    # 但同样是真实花费，必须计入总预算，否则 max_model_calls 形同虚设。
+    extra_model_calls: int = 0
 
 
 # ---------------------------------------------------------------- 请求

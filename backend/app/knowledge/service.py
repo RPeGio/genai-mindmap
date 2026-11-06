@@ -105,8 +105,10 @@ def search_sources(sources: list[Source], query: str, top_k: int = 5) -> list[Ev
 
     hits: list[EvidenceHit] = []
     for source in sources:
-        text = (source.text or "").strip()
-        if not text:
+        # 不能先 strip 再切块：偏移会整体前移，调用方拿它去切 Source.text
+        # 得到的不是 quote 那段文字。空判断用 strip，切块用原文。
+        text = source.text or ""
+        if not text.strip():
             continue
         for start, end, chunk in _chunks(text):
             overlap = question & _bigrams(chunk)

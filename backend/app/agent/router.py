@@ -67,19 +67,26 @@ async def _frames(body: AgentRunRequest) -> AsyncIterator[str]:
     "网络断了"；所以这里把异常收成一条 error 帧，让前端拿到明确的失败原因。
     """
     seq = 0
+    # 只在正常收尾或已处理过的错误之后补 [DONE]。放在 finally 里会在 aclose()
+    # 触发 GeneratorExit 时也去 yield，Python 直接抛
+    # "async generator ignored GeneratorExit"，底层生成器的清理也被跳过。
+    finished = False
     try:
         async for event in run(body):
             seq = max(seq, getattr(event, "seq", 0))
             yield encode_event(event)
+        finished = True
     except GenerationError as exc:
         yield encode_event(ErrorEvent(seq=seq + 1, code="generation_failed", message=str(exc)))
+        finished = True
     except Exception as exc:  # noqa: BLE001 — 兜底：任何未预期异常都要变成可读的一帧
         yield encode_event(ErrorEvent(
             seq=seq + 1,
             code="agent_failed",
             message=f"生成过程中出错：{type(exc).__name__}: {exc}",
         ))
-    finally:
+        finished = True
+    if finished:
         yield DONE_FRAME
 
 

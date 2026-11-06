@@ -81,9 +81,11 @@ def _collect(request: AgentRunRequest, provider, registry: ToolRegistry | None =
     return asyncio.run(drain())
 
 
-def _registry(handler, args_model=EchoArgs, name: str = "echo") -> ToolRegistry:
+def _registry(handler, args_model=EchoArgs, name: str = "echo",
+              readonly: bool = False) -> ToolRegistry:
     registry = ToolRegistry()
-    registry.register(ToolSpec(name=name, description="测试工具", args_model=args_model, fn=handler))
+    registry.register(ToolSpec(name=name, description="测试工具", args_model=args_model,
+                               fn=handler, readonly=readonly))
     return registry
 
 
@@ -211,10 +213,10 @@ class IdempotencyTest(unittest.TestCase):
         _collect(_request(), provider, _registry(handler))
         self.assertEqual(executed, ["一次"])
 
-    def test_same_arguments_different_ids_runs_once(self):
-        """不同 call_id 但参数完全一致（模型并行发两次同请求）：也只执行一次。
+    def test_readonly_tool_dedupes_same_arguments(self):
+        """只读工具按参数去重：同样的查询必然得到同样的结果，重复执行没有意义。
 
-        实测模型会并行发起两个 node_expand(n1)，执行两次就会加两遍子节点。
+        实测模型会并行发起两个检索请求，去重能省掉一次真实的网络往返。
         """
         executed: list[str] = []
 
@@ -225,8 +227,46 @@ class IdempotencyTest(unittest.TestCase):
         first = ToolCall(call_id="c1", name="echo", arguments={"text": "同样"})
         second = ToolCall(call_id="c2", name="echo", arguments={"text": "同样"})
         provider = ScriptedProvider([_completion([first, second], finish="tool_calls"), _completion()])
-        _collect(_request(), provider, _registry(handler))
+        _collect(_request(), provider, _registry(handler, readonly=True))
         self.assertEqual(executed, ["同样"])
+
+    def test_write_tool_is_never_deduped(self):
+        """写操作绝不能按参数去重。
+
+        模型完全可能先改成 X、再改成 Y、再改回 X，第三次参数与第一次相同，
+        但那时树的状态已经不是第一次的样子。走上缓存会直接返回旧结果，
+        模型以为改成功了，实际停在 Y——比报错危险得多。
+        """
+        executed: list[str] = []
+
+        def handler(args, ctx):
+            executed.append(args.text)
+            return ToolResult(ok=True, content="ok")
+
+        calls = [ToolCall(call_id=f"c{index}", name="echo", arguments={"text": "同样"})
+                 for index in range(2)]
+        provider = ScriptedProvider([_completion(calls, finish="tool_calls"), _completion()])
+        _collect(_request(), provider, _registry(handler, readonly=False))
+        self.assertEqual(executed, ["同样", "同样"])
+
+    def test_same_call_id_with_different_arguments_is_conflict(self):
+        """同一个 call_id 换参数是协议违规，必须报错而不是返回旧结果。"""
+        executed: list[str] = []
+
+        def handler(args, ctx):
+            executed.append(args.text)
+            return ToolResult(ok=True, content="ok")
+
+        first = ToolCall(call_id="same", name="echo", arguments={"text": "甲"})
+        second = ToolCall(call_id="same", name="echo", arguments={"text": "乙"})
+        provider = ScriptedProvider([_completion([first, second], finish="tool_calls"), _completion()])
+        events = _collect(_request(), provider, _registry(handler))
+
+        self.assertEqual(executed, ["甲"])
+        ends = [event for event in events if event.type == "tool_end"]
+        self.assertTrue(ends[0].ok)
+        self.assertFalse(ends[1].ok)
+        self.assertEqual(ends[1].result_summary["code"], "call_id_conflict")
 
     def test_dedupe_key_ignores_key_order(self):
         """参数键序不同但内容相同，指纹必须一致。"""
@@ -269,6 +309,58 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(len(executed), 2)
         self.assertEqual(events[-1].code, "budget_exhausted")
         self.assertEqual(events[-1].limit, "max_tool_calls")
+
+
+class OutlineRefreshTest(unittest.TestCase):
+    def test_second_turn_sees_nodes_created_in_first_turn(self):
+        """第二轮必须看到上一轮产出的节点 id。
+
+        不刷新大纲的话，模型拿到的大纲永远是请求开始时的快照：它刚生成的节点
+        没有 id 可引用，于是只能整张重来——那正是这次改造要消灭的行为。
+        """
+        seen: list[str] = []
+
+        class Recorder(ScriptedProvider):
+            async def complete_tools(self, messages, tools, *, budget):
+                seen.append(messages[0]["content"])
+                return await super().complete_tools(messages, tools, budget=budget)
+
+        def generate(args, ctx):
+            ctx.candidate = MindMapContent.model_validate({
+                "title": "新图",
+                "root": {"id": "root", "label": "根", "children": [
+                    {"id": "fresh-node", "label": "刚生成的", "children": []},
+                ]},
+            })
+            return ToolResult(ok=True, content="已生成")
+
+        call = ToolCall(call_id="c1", name="echo", arguments={"text": "生成"})
+        provider = Recorder([_completion([call], finish="tool_calls"), _completion()])
+        _collect(_request(), provider, _registry(generate))
+
+        self.assertEqual(len(seen), 2)
+        self.assertNotIn("fresh-node", seen[0])
+        self.assertIn("[fresh-node] 刚生成的", seen[1])
+
+    def test_tool_internal_model_calls_count_against_budget(self):
+        """工具内部直接调模型也要计入总预算。
+
+        生成和展开工具各自会再调一次模型。不计数的话 max_model_calls 只约束了
+        外层轮数，实际花费可以翻好几倍。
+        """
+        def costly(args, ctx):
+            ctx.extra_model_calls += 1
+            return ToolResult(ok=True, content="ok")
+
+        calls = [ToolCall(call_id=f"c{index}", name="echo", arguments={"text": str(index)})
+                 for index in range(3)]
+        script = [_completion([call], finish="tool_calls") for call in calls]
+        events = _collect(
+            _request(budget=RunBudget(max_model_calls=2, max_tool_calls=50)),
+            ScriptedProvider(script), _registry(costly),
+        )
+        self.assertEqual(events[-1].type, "error")
+        self.assertEqual(events[-1].limit, "max_model_calls")
 
 
 class ProviderParsingTest(unittest.TestCase):
