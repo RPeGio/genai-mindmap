@@ -35,6 +35,57 @@ export interface SourceRef {
   quote?: string | null;
 }
 
+// ---- 导图操作契约（与 backend/app/contracts/ops.py 逐字段对应）----
+//
+// 放在 types.ts 而不是 mindmap/ops.ts：agent 事件流要引用 OpBatch，而
+// ops.ts 已经反过来依赖本文件，再让本文件依赖它就成了循环。契约归契约，
+// 执行器归执行器。字段一律 snake_case，这些结构会原样跨端传输。
+
+/** 挂一个新节点。`id` 由服务端规范化时分配，模型草案里用 `$tmp1` 这类临时名。 */
+export interface AddOp {
+  op: 'add';
+  id: string;
+  parent_id: string;
+  index: number;
+  label: string;
+  source_refs?: SourceRef[];
+}
+
+/**
+ * 改节点。
+ *
+ * `label` 与 `source_refs` 缺省（undefined）表示"这一项不动"，与"清空"区分开：
+ * `source_refs: []` 是显式清空。这个区别丢不得。
+ */
+export interface UpdateOp {
+  op: 'update';
+  id: string;
+  changes: { label?: string; source_refs?: SourceRef[] };
+}
+
+/** 删节点及整棵子树。根节点不可删。 */
+export interface RemoveOp {
+  op: 'remove';
+  id: string;
+}
+
+/** 改变拓扑：把节点连同子树挂到新父节点下。唯一可能造环的 op。 */
+export interface MoveOp {
+  op: 'move';
+  id: string;
+  new_parent_id: string;
+  index: number;
+}
+
+export type MindMapOp = AddOp | UpdateOp | RemoveOp | MoveOp;
+
+/** 整批原子生效。 */
+export interface OpBatch {
+  batch_id: string;
+  base_revision: number;
+  ops: MindMapOp[];
+}
+
 export interface MindMapContent {
   title: string;
   root: MindNode;
@@ -115,3 +166,42 @@ export interface PipelineResponse {
   diagnostics: unknown[];
   stages: unknown[];
 }
+
+// ---- agent 运行 ----
+
+/**
+ * 一次 agent 运行。字段与 backend/app/agent/contracts.py 的 `AgentRunRequest` 对应。
+ *
+ * `create` 不能带 snapshot、`expand`/`edit` 必须带——那条约束在后端开流前校验，
+ * 这里不重复，因为报错文案由后端统一给。
+ */
+export interface AgentRunRequest {
+  goal: string;
+  intent: 'create' | 'expand' | 'edit';
+  snapshot?: MindMapContent | null;
+  selected_ids?: string[];
+}
+
+/**
+ * agent 事件流。`seq` 从 1 连续递增，前端靠它判断丢帧与乱序。
+ *
+ * 与旧流式生成的 `StreamEvent` 分开：后者是「边生成边吐节点」，这里是
+ * 「边跑边报工具进度」，两者的状态机完全不同，硬塞进一个联合类型会让
+ * store 里的 switch 变成一团。
+ */
+export type AgentEvent =
+  | { type: 'stage'; seq: number; stage: string; detail?: string }
+  | { type: 'tool_start'; seq: number; call_id: string; name: string; args_summary?: Record<string, unknown> }
+  | {
+      type: 'tool_end';
+      seq: number;
+      call_id: string;
+      name: string;
+      ok: boolean;
+      result_summary?: Record<string, unknown>;
+      latency_ms?: number;
+    }
+  | { type: 'ops'; seq: number; call_id: string; batch: OpBatch }
+  | { type: 'snapshot'; seq: number; content: MindMapContent }
+  | { type: 'done'; seq: number; content?: MindMapContent | null; usage?: Record<string, unknown> }
+  | { type: 'error'; seq: number; code: string; message: string; limit?: string };

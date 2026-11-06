@@ -1,4 +1,6 @@
 import type {
+  AgentEvent,
+  AgentRunRequest,
   CreateTextSourceResponse,
   GenerateResponse,
   MapRecord,
@@ -146,22 +148,27 @@ export type StreamEvent =
   | { type: 'error'; code: string; message: string };
 
 /**
- * 流式生成：先收骨架再收细节，回调按到达顺序触发。
+ * 通用 SSE 读取：POST 一个 JSON，按帧回调。
  *
- * 不用 EventSource 是因为它只能发 GET，而输入文本可能很长；这里用 fetch
- * 的 ReadableStream 自己切帧。SSE 的帧以空行分隔，每帧取第一条 `data: ` 行。
+ * 不用 EventSource 是因为它只能发 GET，而输入文本可能很长。这里用 fetch 的
+ * ReadableStream 自己切帧：SSE 的帧以空行分隔，每帧取第一条 `data: ` 行。
+ *
+ * 抽成公共函数是因为流式生成和 agent 运行都要用；两份各写一遍的话，某天
+ * 一边修了分片边界处理、另一边没修，就会出现"同样的网络条件下只有一个接口
+ * 偶发丢帧"这种极难复现的问题。
  */
-export async function generateMindMapStream(
-  text: string,
-  onEvent: (event: StreamEvent) => void,
+async function postSse<T>(
+  url: string,
+  body: unknown,
+  onEvent: (event: T) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   let response: Response;
   try {
-    response = await fetch(`${BASE}/generations/stream`, {
+    response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(body),
       signal,
     });
   } catch (error) {
@@ -170,9 +177,9 @@ export async function generateMindMapStream(
   }
 
   if (!response.ok || !response.body) {
-    const body = (await response.json().catch(() => ({}))) as ErrorBody;
-    throw new ApiError(response.status, body.code ?? `http_${response.status}`,
-      errorMessage(response.status, body), body.request_id);
+    const errorBody = (await response.json().catch(() => ({}))) as ErrorBody;
+    throw new ApiError(response.status, errorBody.code ?? `http_${response.status}`,
+      errorMessage(response.status, errorBody), errorBody.request_id);
   }
 
   const reader = response.body.getReader();
@@ -186,7 +193,7 @@ export async function generateMindMapStream(
     // 终止帧沿用 OpenAI 的 [DONE] 约定，不是 JSON，遇到即表示流正常结束。
     if (data === '[DONE]') return;
     try {
-      onEvent(JSON.parse(data) as StreamEvent);
+      onEvent(JSON.parse(data) as T);
     } catch {
       // 单帧解析失败不该打断整条流，跳过即可。
     }
@@ -211,6 +218,22 @@ export async function generateMindMapStream(
     if ((error as Error).name === 'AbortError') return;
     throw new ApiError(0, 'stream_interrupted', '连接中断，请重试。');
   }
+}
+
+export function generateMindMapStream(
+  text: string,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return postSse<StreamEvent>(`${BASE}/generations/stream`, { text }, onEvent, signal);
+}
+
+export function runAgentStream(
+  body: AgentRunRequest,
+  onEvent: (event: AgentEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return postSse<AgentEvent>(`${BASE}/agent/runs/stream`, body, onEvent, signal);
 }
 
 // ---- 文档上传与多来源生成 ----
