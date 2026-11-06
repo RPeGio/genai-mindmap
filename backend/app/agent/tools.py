@@ -337,10 +337,17 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
             draft["parent_id"] = item.parent_id
         if item.new_parent_id is not None:
             draft["new_parent_id"] = item.new_parent_id
-        if item.label is not None:
+        # update 的 label 只能进 changes：顶层再放一份会被 UpdateOp 的
+        # extra="forbid" 拒掉，那个错误信息对模型毫无指导意义。
+        if item.label is not None and item.op != "update":
             draft["label"] = item.label
         if item.changes is not None:
             draft["changes"] = {"label": item.changes.label}
+        elif item.op == "update" and item.label is not None:
+            # 实测模型会把 label 直接写在 op 顶层而不是 changes 里。它被拒之后
+            # 下一轮能自己改对（错误反馈是有效的），但那要多花一次模型调用和
+            # 几秒等待。两种写法都能表达同一件事，就在入口吸收掉。
+            draft["changes"] = {"label": item.label}
 
         if item.op == "add":
             # 草案允许省略 index，补成追加到末尾：模型经常只给 parent_id 和 label，
