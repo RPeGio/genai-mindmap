@@ -2,8 +2,8 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, updateMindMap } from '../api/client';
-import type { MapRecord, MindMapContent, MindNode, Source } from '../api/types';
+import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
+import type { AgentEvent, MapRecord, MindMapContent, MindNode, Source } from '../api/types';
 import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
@@ -113,6 +113,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const future = ref<string[]>([]);
 
   const saving = ref(false);
+
+  /**
+   * 每次已提交的编辑都递增。agent 的接受动作靠它判断"候选是不是基于一棵已经
+   * 被改过的树算出来的"——用 revision 比比较整树引用更便宜，也比比 dirty 更准
+   * （dirty 只说明"有改动"，不说明"改动发生在候选生成之后"）。
+   */
+  const clientRevision = ref(0);
+
+  /** agent 算出来的候选。它**不是** content：用户确认之前不写进画布。 */
+  const candidate = ref<MindMapContent | null>(null);
+  /** 候选产出时的 clientRevision，接受时用来判过时。 */
+  let candidateBaseRevision = 0;
+
+  /** 给面板显示的工具进度与阶段。 */
+  const agentEvents = ref<AgentEvent[]>([]);
+  const agentRunning = ref(false);
+  const agentError = ref('');
+
   /** 保存撞上 409 时置位，由界面弹窗让用户选"重新加载 / 另存为新导图 / 取消"。 */
   const conflict = ref<{ message: string } | null>(null);
   /** 打开列表用的缓存。 */
@@ -276,6 +294,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (history) pushHistory();
     content.value = next;
     dirty.value = true;
+    clientRevision.value += 1;
     return true;
   }
 
@@ -737,6 +756,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     controller = null;
     active?.abort();
     busy.value = false;
+    agentRunning.value = false;
     stageText.value = '';
     sourceGenerationError.value = '';
     if (restorePrevious && pendingRestore) {
@@ -951,6 +971,130 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
   }
 
+  // ---- agent 运行与候选接受 ----
+
+  /**
+   * 是否走 agent 新路径。
+   *
+   * 默认关闭：现有两条生成通道（流式 / 批量）已经过端到端验证，新路径要能被
+   * 一条环境变量关掉退回旧行为，而不是靠回滚代码。
+   */
+  const agentEnabled = String(import.meta.env?.VITE_MINDMAP_AGENT ?? '') === '1';
+
+  async function runGeneration(
+    goal: string,
+    intent: 'create' | 'expand' | 'edit' = 'create',
+  ): Promise<void> {
+    if (busy.value || agentRunning.value) return;
+    const prompt = goal.trim();
+    if (!prompt) {
+      status.value = '请输入主题或文本。';
+      return;
+    }
+    if (intent !== 'create' && !content.value) {
+      status.value = '当前还没有导图，无法在此基础上修改。';
+      return;
+    }
+
+    agentError.value = '';
+    agentEvents.value = [];
+    candidate.value = null;
+    // 记下候选所依据的版本：接受时用它判断期间有没有被改过
+    candidateBaseRevision = clientRevision.value;
+
+    const ctrl = new AbortController();
+    controller = ctrl;
+    agentRunning.value = true;
+    busy.value = true;
+    stageText.value = '正在连接';
+    status.value = '正在与模型协作…';
+    waitedMs.value = 0;
+
+    try {
+      await runAgentStream({
+        goal: prompt,
+        intent,
+        // create 不能带 snapshot（后端开流前会 422）；另外两种必须带
+        snapshot: intent === 'create' ? null : content.value,
+        selected_ids: intent === 'expand' && selectedId.value ? [selectedId.value] : [],
+      }, event => {
+        agentEvents.value = [...agentEvents.value, event];
+        switch (event.type) {
+          case 'stage':
+            stageText.value = event.detail || event.stage;
+            break;
+          case 'tool_start':
+            stageText.value = `正在调用 ${event.name}`;
+            break;
+          case 'tool_end':
+            stageText.value = event.ok ? `${event.name} 完成` : `${event.name} 未成功`;
+            break;
+          case 'done':
+            if (event.content) {
+              // 只放进候选，不动 content：用户确认之前画布保持原样
+              candidate.value = event.content;
+              status.value = '模型给出了候选导图，确认后才会应用到画布。';
+            } else {
+              status.value = '模型这次没有产出导图。';
+            }
+            break;
+          case 'error':
+            agentError.value = event.message;
+            status.value = event.message;
+            break;
+        }
+      }, ctrl.signal);
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : '运行失败，请重试。';
+      agentError.value = message;
+      status.value = message;
+    } finally {
+      if (controller === ctrl) {
+        controller = null;
+        agentRunning.value = false;
+        busy.value = false;
+      }
+      stageText.value = '';
+    }
+  }
+
+  /**
+   * 把候选应用到画布。
+   *
+   * 三道校验缺一不可：有候选、没有未提交的输入、树没被改过。少任何一条，
+   * 用户手打了一半的标题或刚做的编辑都会被候选静默覆盖——那正是这次改造
+   * 要解决的问题，不能在新路径上重演。
+   */
+  function acceptCandidate(): 'applied' | 'stale' | 'invalid' {
+    if (!candidate.value) return 'invalid';
+    if (editingId.value !== null || titleDraft.value !== null) {
+      status.value = '请先提交或取消正在编辑的内容。';
+      return 'stale';
+    }
+    if (clientRevision.value !== candidateBaseRevision) {
+      status.value = '候选生成之后这张图被改过，已失效，请重新运行。';
+      return 'stale';
+    }
+    // 一次 agent 运行只记一条撤销记录，而不是每个 op 一条
+    pushHistory();
+    content.value = candidate.value;
+    candidate.value = null;
+    mode.value = 'model';
+    dirty.value = true;
+    clientRevision.value += 1;
+    editingId.value = null;
+    ensureSelection();
+    status.value = '已应用模型的修改，记得保存。';
+    return 'applied';
+  }
+
+  function discardCandidate(): void {
+    const had = candidate.value !== null;
+    candidate.value = null;
+    agentError.value = '';
+    status.value = had ? '已丢弃候选，画布未变。' : '没有待处理的候选。';
+  }
+
   return {
     content,
     mode,
@@ -1011,5 +1155,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     sourceGenerationError,
     generateSources,
     cancelSourceGeneration,
+    // agent 路径
+    clientRevision,
+    candidate,
+    agentEvents,
+    agentRunning,
+    agentError,
+    agentEnabled,
+    runGeneration,
+    acceptCandidate,
+    discardCandidate,
   };
 });
