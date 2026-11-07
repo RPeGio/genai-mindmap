@@ -22,6 +22,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -34,6 +37,7 @@ from app.agent.ops import (
     new_node_id,
     normalize_ops,
 )
+from app.contracts import mindmap as mindmap_contract
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.ops import OpBatch, OpError
@@ -61,11 +65,33 @@ MAX_CHILDREN = 50
 # 前端图片/音频解析还有一路并发 2，最坏叠加 2+8=10，仍在实测范围内。
 DEEP_CONCURRENCY = 10
 
+# 分片生成的默认深度与上限，**按 root 之下算层数**：
+#   2 = root → 一级 → 二级（改多级之前的行为）
+#   3 = 再加一层"三级"，也就是默认值
+#   4 = 允许的最后一段
+# 深度不是承载能力而是可读性约束：超过四层，用户在画布上要先缩到看不清字才看得见
+# 结构，多出来的那一层换不到信息。上限卡在 4 也是同样的理由，不是实现做不到更深。
+DEEP_DEFAULT_DEPTH = 3
+DEEP_MAX_DEPTH = 4
+
+# 二级及以下每个父节点最多几个子节点。一级分支由 `GenerateDeepArgs.branches`
+# 控制（上限 `DEEP_MAX_BRANCHES`），往下的每一层必须收窄：20 × 5 × 5 × 5 连 1000
+# 节点的契约都装不下，而且每层 5 个正是"一屏能扫完"的量。
+DEEP_FANOUT = 5
+
+# 一级分支的硬上限。参数模型用 `le=DEEP_MAX_BRANCHES` 引用它，骨架那里也用它截断，
+# 两处同源——否则模型无视"最多 N 条"时，一级节点会一直长到契约的单节点上限（50）。
+DEEP_MAX_BRANCHES = 20
+
+# 一次展开至少要能挂下 2 个子节点才值得发一次调用。额度只剩 1 个节点时直接按
+# "被节点预算截断"处理——花一次调用只为了挂一个节点，是把额度换成噪音。
+DEEP_MIN_BREADTH = 2
+
 # 工具内单次模型调用的输出上限。这个数必须与 `app.agent.provider._MAX_TOKENS_CAP`
 # 一致：provider 是外层轮次的出口，工具里的 `chat_async` 是另一条出口，两边不同
 # 时 `RunBudget.max_output_tokens` 只约束了其中一半的调用。不去 import 那个私有
 # 常量，是为了不让「工具」反向依赖「适配层」——适配层是可替换的。
-MAX_OUTPUT_TOKENS_CAP = 16384
+MAX_OUTPUT_TOKENS_CAP = 65536
 
 # 单个来源喂给模型的字符上限。超出的部分截断并显式注明——不注明的话，模型
 # 会以为自己看到的是全文，然后为"结尾那段"写引用，而那些引用在原文里
@@ -166,8 +192,14 @@ class GenerateDeepArgs(BaseModel):
     # 300 节点理论能放 100 支；真正限制它的是可读性——超过二十条一级分支，
     # 图会宽到没法看。原来的 8 没有任何依据，长材料（比如二十几节的讲义）
     # 天然会有更多一级节点，卡在 8 等于逼模型把不相关的东西塞进同一支。
-    branches: int = Field(default=5, ge=3, le=20, description="一级分支数量上限")
+    branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
     points_per_branch: int = Field(default=3, ge=2, le=5, description="每条一级分支下至少要有几个要点")
+    # 深度同样只是**预算**而不是硬契约：额度不够时会被截短并标 `partial`，
+    # 而不是把整次生成判成失败。
+    max_depth: int = Field(
+        default=DEEP_DEFAULT_DEPTH, ge=2, le=DEEP_MAX_DEPTH,
+        description="往下展开到第几层（root 之下算起）：2 只有两层，3 可到三级节点",
+    )
 
 
 class ExpandArgs(BaseModel):
@@ -234,6 +266,12 @@ def _fail(code: str, message: str, **extra: Any) -> ToolResult:
     return ToolResult(ok=False, content=message, data={"code": code, **extra})
 
 
+def _reason_text(exc: BaseException, limit: int = 200) -> str:
+    """异常的可读摘要。有些异常（如 TimeoutError）没有 message，只用类名也比空串可读。"""
+    text = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    return text[:limit]
+
+
 def _max_tokens(ctx: RunContext) -> int:
     """工具内一次模型调用的输出上限。
 
@@ -282,45 +320,133 @@ def _skeleton_titles(raw: Any) -> list[str]:
     return titles
 
 
-def _point_labels(raw: Any, limit: int) -> list[str]:
-    """从展开响应里取出要点标题，最多 `limit` 条。
+@dataclass
+class _Slot:
+    """展开出来、还没进树的一个候选节点。
 
-    截到 `limit` 而不是全收：多出来的要点会让单支子节点数失控，而这张图的上限是
-    按 `points_per_branch` 做的预算。
+    `declared_leaf` 记的是「模型自己说这一支到头了」：旧格式 `{"points":[...]}`
+    是一串扁平字符串，语义就是列到这里的叶子。把它当成还能继续追问的节点，
+    下一层只会拿到重复内容，还会白花一次调用，所以这类节点不进入待展开队列。
+
+    `children` 是模型**多给**的一层（新格式里容忍，见 `_candidate_slots`）：
+    一次调用只要求它写一层，给了两层就收下，比再追问一次便宜。
+    """
+
+    label: str
+    children: list["_Slot"] = field(default_factory=list)
+    declared_leaf: bool = False
+
+
+def _candidate_slots(raw: Any, limit: int, depth_left: int = 0) -> list[_Slot]:
+    """从一次展开响应里取出候选子节点，最多 `limit` 个。
+
+    接受两种形状：
+      - `{"children":[{"label":"要点一","children":[{"label":"细节 A"}]}]}`：新格式。
+        `children` 里再嵌一层会被收下，但最多 `depth_left` 层——**不主动要求**
+        模型一次写两层，实测那样写到后面会被输出上限截断。
+      - `{"points":["要点一","要点二"]}`：旧格式，纯字符串。语义是「这支到此
+        为止」，收下的节点标 `declared_leaf`，不再往下追问。
+
+    只认字符串和带 `label` 的 dict：`{"children":[{"name":"x"}]}` 说明模型没照
+    格式写，硬转字符串会把整个 dict 的 repr 当成节点标题挂到树上——那种"成功"
+    比失败更难发现。
     """
     if not isinstance(raw, dict) or limit <= 0:
         return []
-    items = raw.get("points")
+    items = raw.get("children")
+    legacy = False
+    if not isinstance(items, list):
+        items = raw.get("points")
+        legacy = True
     if not isinstance(items, list):
         return []
-    labels: list[str] = []
+    slots: list[_Slot] = []
     for item in items:
-        if not isinstance(item, str):
-            continue
-        label = item.strip()
-        if not label:
-            continue
-        labels.append(label[:200])
-        if len(labels) >= limit:
+        if len(slots) >= limit:
             break
-    return labels
+        slot = _slot_from(item, limit, depth_left, legacy)
+        if slot is not None:
+            slots.append(slot)
+    return slots
 
 
-def _merge_labels(existing: list[str], incoming: list[str]) -> tuple[list[str], int]:
-    """把新要点并入已有列表，丢掉重复项，返回 `(留下的, 丢掉几条)`。
+def _slot_from(item: Any, limit: int, depth_left: int, declared_leaf: bool) -> _Slot | None:
+    """单个候选项 → `_Slot`。空标签、非字符串/非 dict 的项一律丢掉。"""
+    if isinstance(item, str):
+        label = item.strip()
+        return _Slot(label[:200], declared_leaf=declared_leaf) if label else None
+    if not isinstance(item, dict):
+        return None
+    label = item.get("label")
+    if not isinstance(label, str) or not label.strip():
+        return None
+    slot = _Slot(label.strip()[:200])
+    nested = item.get("children")
+    if depth_left > 0 and isinstance(nested, list):
+        for child in nested[:limit]:
+            child_slot = _slot_from(child, limit, depth_left - 1, False)
+            if child_slot is not None:
+                slot.children.append(child_slot)
+    return slot
+
+
+def _keep_new_slots(existing: list[_Slot], incoming: list[_Slot]) -> tuple[list[_Slot], int]:
+    """把新候选并入已有列表，丢掉重复项，返回 `(留下的, 丢掉几个)`。
 
     去重是**验收**的一部分而不是洁癖：提示词里写了「不要重复」，模型仍会重复
     （实测同一要点返回两次）。不去重的话「点数够不够」会被重复项骗过去——
     数量验收通过，用户看到的却是同一句话挂在两个节点上。
     """
-    seen = set(existing)
-    kept: list[str] = []
-    for label in incoming:
-        if label in seen:
+    seen = {slot.label for slot in existing}
+    kept: list[_Slot] = []
+    for slot in incoming:
+        if slot.label in seen:
             continue
-        seen.add(label)
-        kept.append(label)
+        seen.add(slot.label)
+        kept.append(slot)
     return kept, len(incoming) - len(kept)
+
+
+def _trim_slots(slots: list[_Slot], allowance: int) -> tuple[list[_Slot], int]:
+    """把候选子树裁到 `allowance` 个节点以内，返回 `(留下的, 实际节点数)`。
+
+    模型多给一层时可能一次吐出远超额度的节点。不裁的话「按层预分配」就只是一句
+    口头承诺，实际节点数会随模型心情漂，最后在 `apply_ops` 的整树校验上炸掉——
+    那时候已经花完所有调用了。
+    """
+    kept: list[_Slot] = []
+    used = 0
+    for slot in slots:
+        if used + 1 > allowance:
+            break
+        slot.children, nested = _trim_slots(slot.children, allowance - used - 1)
+        used += 1 + nested
+        kept.append(slot)
+    return kept, used
+
+
+def _count_slots(slots: list[_Slot]) -> int:
+    return sum(1 + _count_slots(slot.children) for slot in slots)
+
+
+def _nested_capacity(fanout: int, levels: int) -> int:
+    """一次响应里最多容忍多少个"多给的下层"节点。`levels = 0` 时一个都不容忍。"""
+    return sum(fanout**level for level in range(1, max(0, levels) + 1))
+
+
+def _walk_slots(slots: list[_Slot], depth: int, path: str, max_depth: int):
+    """列出还能继续展开的节点：`(节点, 它现在在第几层, 到它为止的路径)`。
+
+    带 `children` 的节点已经长出下一层了，它自己不再追问，但它的子节点要在
+    `depth + 1` 层接着排——否则"模型一次多给了一层"会让这一支就此停住。
+    `declared_leaf` 的节点按模型的意思留在原地。
+    """
+    for slot in slots:
+        here = f"{path} > {slot.label}" if path else slot.label
+        if slot.children:
+            yield from _walk_slots(slot.children, depth + 1, here, max_depth)
+        elif not slot.declared_leaf and depth < max_depth:
+            yield slot, depth, here
 
 
 def _audit_branches(
@@ -344,6 +470,127 @@ def _audit_branches(
         if count > MAX_CHILDREN:
             overfull.append(branch.label)
     return sparse, overfull
+
+
+# 契约模块里承载节点上限的常量名。名字对不上时退到源码里的数字，再不行就用
+# 真实的校验行为把它试出来——三条路都不写死数字：契约刚把上限从 300 改成 1000，
+# 工具里的额度预分配必须跟着那个数走，否则「按层分配」分的是个过期预算。
+_NODE_LIMIT_CONSTANTS = ("MAX_TREE_NODES", "MAX_NODES", "MAX_NODE_COUNT", "NODE_LIMIT")
+# 校验器里的两种写法：直接比较数字，或比较常量再拼进错误文案。
+_NODE_LIMIT_PATTERNS = (r"len\(\s*seen\s*\)\s*>\s*(\d+)", r"最多\s*(\d+)\s*个节点")
+
+
+@lru_cache(maxsize=1)
+def _node_limit() -> int:
+    """整树节点上限（契约口径）。
+
+    为什么不直接 `from app.contracts.mindmap import MAX_TREE_NODES`：常量名会随
+    重构改，而"改了之后这里还静默用旧值"是最难发现的错——多出来的节点要到
+    `apply_ops` 的整树校验才被拒，那时调用额度已经花完了，用户拿到的是失败
+    而不是一棵稍小的树。所以这里按「常量 → 源码 → 行为」三级退让，全都不是
+    硬编码的数字。
+    """
+    for name in _NODE_LIMIT_CONSTANTS:
+        value = getattr(mindmap_contract, name, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    source = _validator_source()
+    for pattern in _NODE_LIMIT_PATTERNS:
+        match = re.search(pattern, source)
+        if match:
+            return int(match.group(1))
+    return _probe_node_limit()
+
+
+def _validator_source() -> str:
+    """契约里那段整树校验的源码；拿不到（打包/动态生成）时返回空串。"""
+    try:
+        return inspect.getsource(mindmap_contract.MindMapContent.validate_tree)
+    except (OSError, TypeError):  # pragma: no cover — 源码不可得是环境问题
+        return ""
+
+
+def _probe_node_limit() -> int:  # pragma: no cover — 只在名字与源码都读不到时用
+    """最后一条路：拿契约自己的校验器当尺子，二分出它能接受的最大节点数。
+
+    只在常量名与源码都读不到时才会走到（例如校验器改成动态计算上限）。树用
+    扇出 50 广度优先铺开，深度压在 3 层以内：这样先撞上的一定是节点上限而不是
+    深度上限——两个上限混在一起就分不清是哪一个在拒。
+    """
+
+    def accepts(nodes: int) -> bool:
+        try:
+            mindmap_contract.MindMapContent.model_validate(_wide_tree(nodes))
+        except ValidationError:
+            return False
+        return True
+
+    low, high = 1, 1
+    while accepts(high) and high < 200_000:
+        low, high = high, high * 2
+    while low + 1 < high:
+        middle = (low + high) // 2
+        if accepts(middle):
+            low = middle
+        else:
+            high = middle
+    return low
+
+
+def _wide_tree(nodes: int) -> dict[str, Any]:
+    """造一棵有 `nodes` 个节点、扇出不超过 50、深度不超过 3 的树（给探针用）。"""
+    root: dict[str, Any] = {"id": "n0", "label": "x", "children": []}
+    frontier = [root]
+    made = 1
+    while made < nodes and frontier:
+        next_frontier: list[dict[str, Any]] = []
+        for parent in frontier:
+            while len(parent["children"]) < 50 and made < nodes:
+                child = {"id": f"n{made}", "label": "x", "children": []}
+                parent["children"].append(child)
+                next_frontier.append(child)
+                made += 1
+        frontier = next_frontier
+    return {"title": "x", "root": root}
+
+
+@dataclass
+class _TreeAudit:
+    """整树验收结果。全部来自纯代码遍历，一次模型调用都不发。"""
+
+    depths: dict[int, int]  # 层号（root 为 0）-> 该层节点数
+    total: int
+    deepest: int  # 最深一层是第几层（root 为 0）
+    blank: list[str]  # label 为空白的节点 id
+    missing: list[int]  # 本该有、实际一个节点都没有的层
+
+
+def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
+    """确定性验收：总节点、层级覆盖、空节点。
+
+    三条都是"结构错误"而不是"模型质量波动"，但处理方式不同——只看总量与空标签
+    （那两样连契约都存不进去，必须判失败）；层级缺失是**报告项**：某一层没有节点
+    可能是额度不够、模型没给出可用的下一层，此时该交出一棵浅一点的树并说清楚，
+    而不是把已经生成好的部分整张作废。
+
+    `expected` 只传本次真的尝试展开过的层号。没试过的层不该被算成"缺失"：
+    旧格式（纯字符串要点）本来就表示这一支到此为止，把它的下一层记成缺失等于
+    为一件没发生的事报警。
+    """
+    depths: dict[int, int] = {}
+    blank: list[str] = []
+    stack: list[tuple[Node, int]] = [(root, 0)]
+    total = 0
+    while stack:
+        node, depth = stack.pop()
+        total += 1
+        depths[depth] = depths.get(depth, 0) + 1
+        if not node.label.strip():
+            blank.append(node.id)
+        stack.extend((child, depth + 1) for child in node.children)
+    deepest = max(depths) if depths else 0
+    missing = [depth for depth in sorted(expected) if not depths.get(depth)]
+    return _TreeAudit(depths=depths, total=total, deepest=deepest, blank=blank, missing=missing)
 
 
 def _source_prompt_input(sources: list[Source]) -> str:
@@ -462,11 +709,29 @@ def _plan_ask(topic: str, branches: int) -> str:
 # 分片生成第二步：按骨架逐支展开。与 `EXPAND_PROMPT` 的差别只有上下文——
 # 那个服务于"用户选中某个节点再展开"，语义保持不动；这个要额外告诉模型它写的是
 # 哪一支、以及别越到同级别的分支上去（并发展开时它看不到其他分支写了什么）。
+#
+# 格式从 `{"points":[字符串]}` 改成 `{"children":[{"label":...}]}`：纯字符串数组
+# 里没有层级，产出永远是两层。即便这一层不再往下长，对象形式也让"这一支还有下级"
+# 有地方表达（见 `_candidate_slots`）。旧格式仍被接受，只是收下的节点按叶子处理。
 BRANCH_EXPAND_PROMPT = (
     "你在给思维导图的一条一级分支补充子要点。只返回一个 JSON 对象，不要代码围栏，"
-    '格式为 {"points":["要点一","要点二"]}。'
-    "每个要点必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
+    '格式为 {"children":[{"label":"要点一"},{"label":"要点二"}]}。'
+    "只写一层，不要在 children 里再套 children。"
+    "每个 label 必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
     "只写这条分支范围内的内容，不要重复同级其他分支，不要编造具体数据、人名或文献。"
+)
+
+# 分片生成第三层往下：展开一个已经有上下文的节点。与上面的差别只在"它是谁"——
+# 这一层并发展开时，模型看不到兄弟节点写了什么，只给一个 label 会让它写出与上一级
+# 同一句话的内容，所以 user 里要带一条从一级分支到这里的路径。
+# 同样只要求一层：实测一次要三层，写到第二段之后就开始敷衍甚至被输出上限截断。
+SUBNODE_EXPAND_PROMPT = (
+    "你在给思维导图里一个已有的节点补充下一层子节点。只返回一个 JSON 对象，"
+    '不要代码围栏，格式为 {"children":[{"label":"要点一"},{"label":"要点二"}]}。'
+    "只写一层，不要在 children 里再套 children。"
+    "每个 label 必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
+    "只写这个节点范围内的内容，不要重复同一父节点下其他节点的说法，"
+    "不要编造具体数据、人名或文献。"
 )
 
 
@@ -529,13 +794,28 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
 
 
 async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
-    """分片生成：先出骨架，再并发展开每支，最后确定性验收并只补不合格的那几支。
+    """分片生成：先出骨架，再按层并发展开，最后确定性验收并只补不合格的那一支。
 
-    为什么要拆：整图生成的契约允许 300 节点 × 200 字标签，最坏约 4.4 万 token，
-    而单次调用的输出上限只有 16384——大图只能靠模型自己收敛，收敛不住就是截断。
+    为什么要拆：整图生成的契约允许上千节点 × 200 字标签，最坏是十几万 token，
+    而单次调用再高的输出上限也有尽头——大图只能靠模型自己收敛，收敛不住就是截断。
     分片后每次调用只装自己那一支，单次输出量就与整图上限脱钩了。
     第二个收益是质量：一次调用同时要求「定框架 + 每支展开」，模型会把注意力
     花在先写出来的分支上；把骨架单列成一次调用，它只需要回答「分成哪几块」。
+
+    递归怎么走（`args.max_depth` 按 root 之下算层数）：
+      - 第 2 层：并发展开每条一级分支，要点不足的单独补一次。这一段与改多级之前
+        逐行同义，`max_depth=2` 时的产出与老实现逐节点相同。
+      - 第 3 层往下：**层间串行、层内并发**。下一层有哪些节点，要等上一层全部落定
+        才知道，所以层是串的；同一层的父节点彼此无关，共用一个信号量限流。
+      - 每次展开只要求模型写一层。实测一次要三层，写到后面会被输出上限截断；
+        模型自愿多给一层就收下（`_candidate_slots`），代码不逼它一次吐到底。
+
+    预算怎么分（不这么分，前面几支会把额度吃光）：
+      - 接口层先扣：root + 一级分支 = 1 + branches
+      - 剩下的按该层的父节点数平分；每个父节点拿到的份额再与结构上限（扇出 ×
+        「本层 + 容忍的一层」）取小，得到这一次响应最多能落多少节点
+      - 额度不足就**停手**，已经展开的部分照常交出，标 `partial` 并说明原因。
+        少交一层不是失败，"报完整成功却少了半棵树"才是。
 
     四段都有各自的失败语义，不要合并：
       1. 骨架拿不到 → 整次失败（连框架都没有，没有可交付的东西）
@@ -554,6 +834,15 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
 
     need = min(args.points_per_branch, MAX_CHILDREN)
+    # 深度上限在参数层已经夹过一次（ge/le），这里再夹一次是防"绕过参数模型直接
+    # 调函数"：递归的每一层都要靠它判停，一个异常的 max_depth 会让循环失去上界。
+    max_depth = max(2, min(args.max_depth, DEEP_MAX_DEPTH))
+    # 二级及以下的扇出。`need` 本身是 2..5，再按 DEEP_FANOUT 兜一层——将来谁把
+    # `points_per_branch` 的上限调大，深度带来的节点膨胀也不会跟着翻倍。
+    fanout = max(2, min(need, DEEP_FANOUT))
+    # 节点上限从契约读，绝不在这里写死：契约刚从 300 涨到 1000，工具里若留着一个
+    # 旧数字，按层预分配分的就是个过期预算，多出来的节点要到整树校验才被拒。
+    node_limit = _node_limit()
     diagnostics: list[Diagnostic] = []
     # 思维模型两条路都要拼：骨架决定怎么分块，展开决定每块怎么拆。
     thinking = thinking_block(ctx.request.thinking_model)
@@ -577,7 +866,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             f"模型只给了 {len(titles)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
             branches=len(titles),
         )
-    titles = titles[:MAX_CHILDREN]
+    # 一级分支的条数上限与参数模型同一个常量：模型偶尔会无视"最多 N 条"，
+    # 这时最多留 20 条，再多的既不在一级分支的可读区间里，也挤占下层预算。
+    titles = titles[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)]
     # 数量只做宽容校验（允许 ±1）。为了一两条差异整张重来，成本是又一轮全额调用，
     # 而多一条少一条对这张图并不致命；即使超出宽容范围也用实际返回的继续，
     # 只记一条诊断说明"没按要求的条数走"。
@@ -598,11 +889,27 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         taken.add(branch_id)
         skeleton.append((title, branch_id))
 
+    # 额度预分配（第一层）：root + 一级分支是"接口层"，先从总节点里扣掉，剩下的
+    # 才轮到各支往下长。不先扣的话，一支自己就可能把额度吃到只剩两位数，后面
+    # 十九支全部只剩骨架——用户看到的是"第一支很丰满、其余都是空壳"。
+    branch_share = max(0, node_limit - (1 + len(skeleton))) // max(1, len(skeleton))
+    point_budget = min(need, branch_share)
+    if point_budget < 1:
+        return _fail(
+            "node_budget_too_small",
+            f"契约上限 {node_limit} 个节点，装不下中心主题 + {len(skeleton)} 条一级分支，无法分片生成。",
+            node_limit=node_limit,
+        )
+    # 一次响应最多容忍模型多给一层。`max_depth=2` 时零容忍：那时多给的任何一层
+    # 都会让产出与"改多级之前"不一致，而这正是 max_depth=2 要保证的事。
+    nested_levels = 1 if max_depth > 2 else 0
+    allowance = min(point_budget * (1 + _nested_capacity(fanout, nested_levels)), branch_share)
+
     # 第二步：并发展开。限流必须包住整个"占额度 + 发请求"，否则额度会被
     # 排队中的任务一次性预占，实际请求却还没发出去。
     semaphore = asyncio.Semaphore(DEEP_CONCURRENCY)
 
-    async def expand_branch(title: str) -> list[str] | None:
+    async def expand_branch(title: str) -> list[_Slot] | None:
         """展开一条分支。额度不够返回 None——那是"没展开"，与"展开失败"是两件事。"""
         async with semaphore:
             if not ctx.reserve_model_call():
@@ -616,7 +923,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             raw = await chat_async(
                 BRANCH_EXPAND_PROMPT + thinking, ask, max_tokens=_max_tokens(ctx),
             )
-            return _point_labels(raw, need)
+            kept, _ = _trim_slots(_candidate_slots(raw, point_budget, nested_levels), allowance)
+            return kept
 
     results = await asyncio.gather(
         *(expand_branch(title) for title, _ in skeleton),
@@ -624,7 +932,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     )
 
     # 异常不许扩散到其他分支：某支 429 / 超时，只该让那一支空着。
-    labels_by_branch: list[list[str]] = []
+    slots_by_branch: list[list[_Slot]] = []
     # 分支下标 -> 被丢掉的重复要点条数。首轮与补点都要记：重复是模型行为，
     # 只记补点那一轮会让「首轮就给了两条一样的」变成一次静默的少一条。
     duplicates: dict[int, int] = {}
@@ -633,29 +941,27 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     for index, (_, item) in enumerate(zip(skeleton, results)):
         if item is None:
             skipped.append(index)
-            labels_by_branch.append([])
+            slots_by_branch.append([])
         elif isinstance(item, BaseException):
-            # 有些异常（如 TimeoutError）没有 message，只用类名也比空串可读
-            reason = f"{type(item).__name__}: {item}" if str(item) else type(item).__name__
-            failed.append((index, reason[:200]))
-            labels_by_branch.append([])
+            failed.append((index, _reason_text(item)))
+            slots_by_branch.append([])
         else:
-            kept, dropped = _merge_labels([], list(item))
+            kept, dropped = _keep_new_slots([], list(item))
             if dropped:
                 duplicates[index] = dropped
-            labels_by_branch.append(kept)
+            slots_by_branch.append(kept)
 
     skipped_set = set(skipped)
     failed_set = {index for index, _ in failed}
 
-    # 第五步：局部重试。只补「要点数不足」的那几支，骨架不重来——一次质量波动
-    # 不该把已经展开好的分支一起作废。抛异常的分支不在此列：它已经花掉一次调用，
-    # 盲目再打一次更可能只是把 429 重放一遍。
+    # 第二步（续）：局部重试。只补「要点数不足」的那几支，骨架不重来——一次
+    # 质量波动不该把已经展开好的分支一起作废。抛异常的分支不在此列：它已经花掉
+    # 一次调用，盲目再打一次更可能只是把 429 重放一遍。
     retried: list[int] = []
     for index, (title, _) in enumerate(skeleton):
         if index in skipped_set or index in failed_set:
             continue
-        missing = need - len(labels_by_branch[index])
+        missing = need - len(slots_by_branch[index])
         if missing <= 0:
             continue
         if not ctx.reserve_model_call():
@@ -665,7 +971,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         retried.append(index)
         # 已有要点必须一起给：模型看不到自己已经写了什么，却被要求「不要重复」，
         # 那这条要求它根本没法执行——实测同一要点被返回两次，数量验收还通过了。
-        existing = "、".join(labels_by_branch[index]) or "（暂无）"
+        existing = "、".join(slot.label for slot in slots_by_branch[index]) or "（暂无）"
         ask = (
             f"整体主题：{args.topic}\n"
             f"本条一级分支：{title}\n"
@@ -678,14 +984,14 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             )
         except GenerationError:
             continue  # 补调失败只是"仍然不足"，不升级成整次失败
-        kept, dropped = _merge_labels(labels_by_branch[index], _point_labels(raw, missing))
+        kept, dropped = _keep_new_slots(slots_by_branch[index], _candidate_slots(raw, missing))
         if dropped:
             duplicates[index] = duplicates.get(index, 0) + dropped
-        labels_by_branch[index].extend(kept)
+        slots_by_branch[index].extend(kept)
 
     # 所有分支都没留下内容、且没有任何一支是因为额度被跳过 → 没有可交付的树。
     # 反过来，如果有分支是"额度不够没展开"，骨架本身仍然有效，照常交出。
-    if not any(labels_by_branch) and not skipped_set:
+    if not any(slots_by_branch) and not skipped_set:
         detail = "；".join(message for _, message in failed) or "模型没有返回可用的子要点"
         return _fail(
             "all_branches_failed",
@@ -693,8 +999,82 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             failed_branches=[skeleton[index][0] for index in sorted(failed_set)],
         )
 
-    # 第三步：合并。骨架先成树（分支 id 已在骨架里），再把所有要点作为一批 add
-    # 应用上去——整批原子，半截树不会进 ctx.candidate。
+    # 第三步：第三层往下，按层递归展开。层间串行、层内并发（理由见 docstring）。
+    # 每一层的额度都按"该层父节点数"重新平分，所以某一支长得再胖也不会把后面
+    # 的支挤成空壳；层内先算份额再发请求，是为了不让并发的调用各自以为自己有额度。
+    all_slots: list[_Slot] = [slot for slots in slots_by_branch for slot in slots]
+    # 实际尝试过的层号。验收只对"试过的层"报缺失：没试过的层本来就该是空的。
+    expected: set[int] = {2} if all_slots else set()
+    level_cut: dict[int, int] = {}  # 层 -> 因节点预算没展开的父节点数
+    level_skipped: dict[int, int] = {}  # 层 -> 因调用额度没展开的父节点数
+    level_failed: dict[int, int] = {}  # 层 -> 展开抛错的父节点数
+    level_reason: dict[int, str] = {}  # 层 -> 第一条失败原因（诊断里要能看出是什么错）
+    level_empty: dict[int, int] = {}  # 层 -> 模型答了但没给出可用子节点的父节点数
+
+    async def expand_node(
+        slot: _Slot, path: str, count: int, nested_left: int,
+    ) -> list[_Slot] | None:
+        """展开一层里的一个节点。额度不够返回 None（没展开），抛错则由调用方收拾。"""
+        async with semaphore:
+            if not ctx.reserve_model_call():
+                return None
+            ctx.extra_model_calls += 1
+            # 路径必须一起给：并发展开时它看不到同一个父节点下的兄弟写了什么，
+            # 没有"我在哪"的锚点就会写出与上一级同一句话的内容。
+            ask = (
+                f"整体主题：{args.topic}\n"
+                f"从一级分支到这里的路径：{path}\n"
+                f"本节点：{slot.label}\n"
+                f"请给出 {count} 个子要点。"
+            )
+            raw = await chat_async(
+                SUBNODE_EXPAND_PROMPT + thinking, ask, max_tokens=_max_tokens(ctx),
+            )
+            return _candidate_slots(raw, count, nested_left)
+
+    for depth in range(3, max_depth + 1):
+        # `depth` 是**这一轮要产出的层号**，父节点在它上面一层：第 3 层的父节点
+        # 是第 2 层的节点（一级分支的直接下级）。
+        parents = [
+            (slot, path) for slot, parent_depth, path
+            in _walk_slots(all_slots, 2, "", max_depth)
+            if parent_depth == depth - 1
+        ]
+        if not parents:
+            break
+        expected.add(depth)
+        used = 1 + len(skeleton) + _count_slots(all_slots)
+        share = max(0, node_limit - used) // len(parents)
+        breadth = min(fanout, share)
+        if breadth < DEEP_MIN_BREADTH:
+            # 剩下的额度连两个子节点都装不下：发一次调用只换到一个节点，不值。
+            # 记成"被节点预算截断"，已经展开的部分照常交出。
+            level_cut[depth] = len(parents)
+            break
+        nested_left = max(0, max_depth - depth)
+        # 这一次响应最多能落多少个节点：结构上限与额度份额取小，两者都不能破。
+        # 不取小的话，模型每层都多给一层时总节点会按扇出的幂次膨胀，最后撞在
+        # 整树校验上——那时额度已经花完了。
+        level_allowance = min(breadth * (1 + _nested_capacity(fanout, nested_left)), share)
+        level_results = await asyncio.gather(
+            *(expand_node(slot, path, breadth, nested_left) for slot, path in parents),
+            return_exceptions=True,
+        )
+        for (slot, _path), item in zip(parents, level_results):
+            if item is None:
+                level_skipped[depth] = level_skipped.get(depth, 0) + 1
+            elif isinstance(item, BaseException):
+                level_failed[depth] = level_failed.get(depth, 0) + 1
+                level_reason.setdefault(depth, _reason_text(item))
+            else:
+                kept, _ = _trim_slots(list(item), level_allowance)
+                if kept:
+                    slot.children = kept
+                else:
+                    level_empty[depth] = level_empty.get(depth, 0) + 1
+
+    # 第四步：合并。骨架先成树（分支 id 已在骨架里），再把所有节点按"父在子前"
+    # 的顺序作为一批 add 应用上去——整批原子，半截树不会进 ctx.candidate。
     label = args.topic.strip()[:200] or "思维导图"
     content = MindMapContent(
         title=label,
@@ -706,15 +1086,24 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     )
 
     drafts: list[dict[str, Any]] = []
-    for index, (_, branch_id) in enumerate(skeleton):
-        for point_index, point in enumerate(labels_by_branch[index]):
+
+    def emit(parent_id: str, key: str, slots: list[_Slot]) -> None:
+        """把候选子树摊平成 add 草案：父节点一定排在它自己的子节点前面。"""
+        for position, slot in enumerate(slots):
+            child_key = f"{key}-{position}"
+            child_id = f"{TEMP_ID_PREFIX}d{child_key}"
             drafts.append({
                 "op": "add",
-                "id": f"$d{index}-{point_index}",
-                "parent_id": branch_id,
-                "index": point_index,
-                "label": point,
+                "id": child_id,
+                "parent_id": parent_id,
+                "index": position,
+                "label": slot.label,
             })
+            if slot.children:
+                emit(child_id, child_key, slot.children)
+
+    for index, (_, branch_id) in enumerate(skeleton):
+        emit(branch_id, str(index), slots_by_branch[index])
 
     if drafts:
         ops, _ = normalize_ops(drafts, _node_ids(content.root))
@@ -724,7 +1113,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         except OpError as exc:
             return _fail(exc.code, f"{exc.path}：{exc.message}", path=exc.path)
 
-    # 第四步：确定性验收，全部用代码，不调模型。整树重跑一次契约校验——
+    # 第五步：确定性验收，全部用代码，不调模型。整树重跑一次契约校验——
     # `apply_ops` 内部也做了，但"骨架没有任何要点"时不会经过它（没有 op 可应用），
     # 只靠那边会把一棵只剩根和空分支的树放过去。
     try:
@@ -732,6 +1121,27 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     except ValidationError as exc:
         detail = "；".join(error["msg"] for error in exc.errors()[:3])
         return _fail("invalid_tree", f"合并后的导图不合法：{detail}")
+
+    audit = _audit_tree(content.root, expected)
+    # 总节点超契约上限 = 结构错误：这样的树连存都存不进去，不能当成功交出去。
+    # 预分配与逐层裁剪都是为了让它不发生，走到这里说明预算算术本身出了岔子。
+    if audit.total > node_limit:
+        return _fail(
+            "too_many_nodes",
+            f"生成的树有 {audit.total} 个节点，超过契约上限 {node_limit}。",
+            node_count=audit.total,
+            node_limit=node_limit,
+        )
+    # 深度超预算同理：每一层展开前都判过 `depth <= max_depth`，越界说明递归的
+    # 终止条件坏了。让它在这里硬失败，比交出一棵"悄悄多一层"的树更容易发现。
+    if audit.deepest > max_depth:
+        return _fail(
+            "too_deep",
+            f"生成的树深 {audit.deepest + 1} 层（含中心主题），超过本次的 {max_depth + 1} 层预算。",
+            depth_limit=max_depth,
+        )
+    if audit.blank:
+        return _fail("empty_label", f"有 {len(audit.blank)} 个节点的标题是空的，这张图不能落库。")
 
     sparse, overfull = _audit_branches(content, need)
     if overfull:
@@ -772,14 +1182,55 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             level=DiagnosticLevel.warn, code="DUPLICATE_POINT", node_id=skeleton[index][1],
             message=(
                 f"分支「{skeleton[index][0]}」返回了 {duplicates[index]} 条与已有要点重复的内容，"
-                f"已去重；去重后这一支有 {len(labels_by_branch[index])} 个要点"
+                f"已去重；去重后这一支有 {len(slots_by_branch[index])} 个要点"
+            ),
+        ))
+    for depth in sorted(level_cut):
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="NODE_BUDGET_CUT",
+            message=(
+                f"整树节点预算（契约上限 {node_limit}）在第 {depth} 层用尽，"
+                f"{level_cut[depth]} 个节点没有继续往下展开"
+            ),
+        ))
+    for depth in sorted(level_skipped):
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="LEVEL_SKIPPED_BUDGET",
+            message=(
+                f"因模型调用额度不足，第 {depth} 层有 {level_skipped[depth]} 个节点没有展开，已留空"
+            ),
+        ))
+    for depth in sorted(level_failed):
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="LEVEL_FAILED",
+            message=(
+                f"第 {depth} 层有 {level_failed[depth]} 个节点展开出错，已留空："
+                f"{level_reason.get(depth, '未知错误')}"
+            ),
+        ))
+    # 试过却一层都没长出来：这是"只展开第一层就停"的直接信号。因额度或抛错
+    # 而空的那几层不在此列——它们各自已经有上面那两条诊断，重复报告只会淹没原因。
+    for depth in audit.missing:
+        if level_skipped.get(depth) or level_failed.get(depth):
+            continue
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SHALLOW_LEVEL",
+            message=(
+                f"第 {depth} 层一个节点都没有：{level_empty.get(depth, 0)} 个父节点的展开"
+                "没有返回可用的子节点"
             ),
         ))
 
     expanded = len(skeleton) - len(skipped_set) - len(failed_set)
-    # 三种"没做满"都算 partial：额度跳过、展开抛错、补点后仍不足。
-    # 少第三种时实测某支 0 个要点仍报 partial=false、expanded_branches=3。
-    partial = bool(skipped_set) or bool(failed_set) or bool(short)
+    cut_total = sum(level_cut.values())
+    shallow = [item for item in audit.missing if not (level_skipped.get(item) or level_failed.get(item))]
+    # 五种"没做满"都算 partial：额度跳过、展开抛错、补点后仍不足、节点预算截断、
+    # 某一层没长出来。少最后两种时实测最贵的树仍报 partial=false——用户看不出
+    # 自己拿到的是"到顶了"还是"中间断了"。
+    partial = (
+        bool(skipped_set) or bool(failed_set) or bool(short)
+        or bool(cut_total) or bool(level_skipped) or bool(level_failed) or bool(shallow)
+    )
 
     ctx.candidate = content
     ctx.revision += 1
@@ -801,6 +1252,27 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         )
     if retried:
         content_parts.append(f"其中 {len(retried)} 个分支要点不足，已各补调一次模型。")
+    if cut_total:
+        content_parts.append(
+            f"整树节点数已到契约上限 {node_limit}，第 {min(level_cut)} 层起有 {cut_total} 个"
+            "节点没有继续往下展开。"
+        )
+    if level_skipped:
+        layers = "、".join(str(depth) for depth in sorted(level_skipped))
+        content_parts.append(
+            f"因模型调用额度不足，第 {layers} 层共 {sum(level_skipped.values())} 个节点没有展开，"
+            "已按现状交出。"
+        )
+    if level_failed:
+        layers = "、".join(str(depth) for depth in sorted(level_failed))
+        content_parts.append(f"第 {layers} 层共 {sum(level_failed.values())} 个节点展开出错，已留空。")
+    if shallow:
+        layers = "、".join(str(depth) for depth in shallow)
+        content_parts.append(f"第 {layers} 层没能展开：模型没有返回可用的下一层内容。")
+    content_parts.append(
+        f"按 {max_depth} 层预算展开，实际 {audit.deepest + 1} 层（含中心主题），各层节点数："
+        f"{' / '.join(str(audit.depths.get(depth, 0)) for depth in range(audit.deepest + 1))}。"
+    )
 
     return ToolResult(
         ok=True,
@@ -812,12 +1284,19 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             "planned_branches": len(skeleton),
             "expanded_branches": expanded,
             "partial": partial,
+            "depth_limit": max_depth,
+            "node_limit": node_limit,
+            "levels": [
+                {"depth": depth, "nodes": audit.depths.get(depth, 0)}
+                for depth in range(audit.deepest + 1)
+            ],
+            "cut_nodes": cut_total,
             "short_branches": [
                 {"id": skeleton[index][1], "label": title, "missing": missing}
                 for index, title, missing in short
             ],
             "branches": [
-                {"id": branch_id, "label": title, "points": len(labels_by_branch[index])}
+                {"id": branch_id, "label": title, "points": len(slots_by_branch[index])}
                 for index, (title, branch_id) in enumerate(skeleton)
             ],
             "diagnostics": [item.model_dump() for item in diagnostics],
@@ -1056,9 +1535,10 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
     "mindmap_generate_deep": lambda: ToolSpec(
         name="mindmap_generate_deep",
         description=(
-            "分片生成一张完整思维导图：先定一级骨架，再并发展开每条分支，"
-            "最后按代码验收并只补不合格的那几支。适合复杂主题——它每次只让模型"
-            "输出一支，不受单次输出上限挤压，因此比 mindmap_generate 更稳。"
+            "分片生成一张完整思维导图：先定一级骨架，再按层并发展开（默认到三级，"
+            "可用 max_depth 指定 2~4 层），最后按代码验收并只补不合格的那几支。"
+            "适合复杂主题——它每次只让模型输出一支，不受单次输出上限挤压，"
+            "因此比 mindmap_generate 更稳。"
             "简单主题用 mindmap_generate（一次调用就够，更快）。"
             "仅在没有附带材料时使用：它按主题自由展开，不读任何来源正文，"
             "有材料时请用 mindmap_generate 做忠实整理。"
