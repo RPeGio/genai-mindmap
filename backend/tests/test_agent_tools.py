@@ -18,7 +18,12 @@ from app.agent.contracts import AgentRunRequest, RunContext, ToolCall
 from app.agent.tools import MAX_SOURCE_CHARS, SOURCE_TRUNCATED_HINT, build_registry
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
-from app.generation.service import DETAIL_PROMPT, SOURCED_DETAIL_PROMPT
+from app.generation.service import (
+    DETAIL_PROMPT,
+    SOURCED_DETAIL_PROMPT,
+    SOURCED_THINKING_GUARD,
+    THINKING_MODELS,
+)
 
 # 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
 # 路径，`MIN_BRANCHES = 3` 会拦下更少的树。这里的 2 分支结构会直接变成一次
@@ -43,11 +48,12 @@ def _content() -> MindMapContent:
 
 def _ctx(intent: str = "create", candidate: MindMapContent | None = None,
          sources: list[Source] | None = None,
-         selected_ids: list[str] | None = None) -> RunContext:
+         selected_ids: list[str] | None = None,
+         thinking_model: str = "default") -> RunContext:
     sources = sources or []
     request = AgentRunRequest(
         goal="做一张导图", intent=intent, sources=sources,
-        selected_ids=selected_ids or [],
+        selected_ids=selected_ids or [], thinking_model=thinking_model,
     )
     return RunContext(
         request=request,
@@ -120,7 +126,8 @@ class GenerateToolTest(unittest.TestCase):
 
         self.assertTrue(result.ok, result.content)
         system, user = mocked.await_args.args
-        self.assertEqual(system, SOURCED_DETAIL_PROMPT)
+        # 思维模型块拼在基础提示词之后，所以只断言前缀：整串还带着「思考方式」那一段
+        self.assertTrue(system.startswith(SOURCED_DETAIL_PROMPT))
         self.assertIn(first.id, user)
         self.assertIn(second.id, user)
         self.assertEqual(
@@ -170,8 +177,61 @@ class GenerateToolTest(unittest.TestCase):
 
         self.assertTrue(result.ok, result.content)
         system, user = mocked.await_args.args
-        self.assertEqual(system, DETAIL_PROMPT)
+        self.assertTrue(system.startswith(DETAIL_PROMPT))
         self.assertEqual(user, "机器学习")
+
+    def test_thinking_model_feynman_reaches_the_prompt(self):
+        """选中的思维模型必须真的进到提示词里，否则下拉框只是个装饰。
+
+        断言用整段 prompt 而不是「费曼」三个字：表里 `label` 才是给人看的中文名，
+        `prompt` 才是给模型看的思考步骤——只有后者出现在提示词里才算生效。
+        """
+        ctx = _ctx(thinking_model="feynman")
+        mocked = AsyncMock(return_value=TREE)
+        with patch("app.agent.tools.chat_async", new=mocked):
+            result = _run(build_registry("create").execute(
+                _call("mindmap_generate", topic="机器学习"), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        system, _ = mocked.await_args.args
+        self.assertIn(THINKING_MODELS["feynman"]["prompt"], system)
+        self.assertIn("思考方式", system)
+        # 别的模型不该混进来
+        self.assertNotIn(THINKING_MODELS["critical"]["prompt"], system)
+
+    def test_thinking_model_defaults_to_general_when_omitted(self):
+        """缺省走 default：不选的时候也该有拆解步骤，而不是空一块。"""
+        ctx = _ctx()
+        self.assertEqual(ctx.request.thinking_model, "default")
+        mocked = AsyncMock(return_value=TREE)
+        with patch("app.agent.tools.chat_async", new=mocked):
+            result = _run(build_registry("create").execute(
+                _call("mindmap_generate", topic="机器学习"), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        system, _ = mocked.await_args.args
+        self.assertIn(THINKING_MODELS["default"]["prompt"], system)
+
+    def test_sourced_path_keeps_material_bounded(self):
+        """有来源时思维模型只改「整理角度」：限定句必须一起拼进去。
+
+        少了这句，费曼模型的「必须举反例」会被当成展开许可，模型开始补写
+        材料里根本没有的内容——那正是 `SOURCED_DETAIL_PROMPT` 要防的事。
+        """
+        ctx = _ctx(sources=[Source(kind=SourceKind.text, status="parsed", text="原文。")],
+                   thinking_model="feynman")
+        mocked = AsyncMock(return_value=TREE)
+        with patch("app.agent.tools.chat_async", new=mocked):
+            result = _run(build_registry("create").execute(
+                _call("mindmap_generate", topic="整理材料"), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        system, _ = mocked.await_args.args
+        self.assertIn(THINKING_MODELS["feynman"]["prompt"], system)
+        self.assertIn(SOURCED_THINKING_GUARD, system)
+        # 限定句在思维步骤之后：读起来是"按这个方式整理，但只限材料范围内"
+        self.assertGreater(system.index(SOURCED_THINKING_GUARD),
+                           system.index(THINKING_MODELS["feynman"]["prompt"]))
 
     def test_model_call_budget_blocks_before_calling_out(self):
         """额度用完后工具不再调用模型：省下的是真金白银。"""

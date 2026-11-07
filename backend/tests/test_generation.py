@@ -10,12 +10,15 @@ from app.generation.service import (
     MAX_OUTPUT_TOKENS,
     MIN_BRANCHES,
     SOURCED_DETAIL_PROMPT,
+    THINKING_MODELS,
     GenerationError,
     chat,
     chat_async,
     diagnose_density,
     generate,
     parse_model_json,
+    thinking_block,
+    thinking_options,
 )
 
 
@@ -423,6 +426,52 @@ class PromptQualityTest(unittest.TestCase):
         bad_quote = bad_line.split('quote="', 1)[1].split('"', 1)[0]
         # 反向示例是概括出来的话，原文里逐字找不到
         self.assertNotIn(bad_quote, original)
+
+
+class ThinkingModelTest(unittest.TestCase):
+    """思维模型表：同一句主题换一套拆解步骤，模型产出的结构就不同。
+
+    这里只测「拼装」这一段——真正有没有拆出不同的树取决于模型，没法在单测里断言；
+    能守住的是三件事：选中的那套步骤确实进了提示词、未知值不会炸、五套东西不重复。
+    """
+
+    def test_block_carries_the_selected_prompt(self):
+        block = thinking_block("first-principles")
+        self.assertIn("思考方式", block)
+        self.assertIn(THINKING_MODELS["first-principles"]["prompt"], block)
+        # 换行包裹：拼到提示词末尾时不能和上一句黏成一行
+        self.assertTrue(block.startswith("\n"))
+        self.assertTrue(block.endswith("\n"))
+
+    def test_unknown_value_falls_back_to_default(self):
+        """未知值回退 default 而不是抛错：前端版本不一致时多一个陌生值不该让生成失败。"""
+        self.assertEqual(thinking_block("不存在的值"), thinking_block("default"))
+        self.assertEqual(thinking_block(""), thinking_block("default"))
+        self.assertIn(THINKING_MODELS["default"]["prompt"], thinking_block("不存在的值"))
+
+    def test_default_is_not_empty(self):
+        """`default` 也是一种拆解方法，「通用」不等于「不加提示」。"""
+        self.assertNotEqual(thinking_block("default").strip(), "")
+
+    def test_options_expose_five_choices(self):
+        options = thinking_options()
+        self.assertEqual(len(options), 5)
+        for option in options:
+            self.assertEqual(set(option), {"value", "label"})
+            self.assertTrue(option["value"])
+            self.assertTrue(option["label"])
+        # 默认项排第一：前端不选时选中的那项必须与后端默认值一致
+        self.assertEqual(options[0]["value"], "default")
+        self.assertEqual([option["value"] for option in options],
+                         list(THINKING_MODELS))
+
+    def test_every_prompt_is_distinct(self):
+        """五份 prompt 必须互不相同：复制粘贴漏改时这条会红。"""
+        prompts = [entry["prompt"] for entry in THINKING_MODELS.values()]
+        self.assertEqual(len(prompts), len(set(prompts)))
+        labels = [entry["label"] for entry in THINKING_MODELS.values()]
+        self.assertEqual(len(labels), len(set(labels)))
+        self.assertEqual(labels, ["通用", "第一性原理", "费曼", "5W1H", "批判性"])
 
 
 class DensityDiagnosticTest(unittest.TestCase):
