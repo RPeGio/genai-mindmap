@@ -293,14 +293,14 @@ describe('来源收集', () => {
 });
 
 describe('合并生成边界', () => {
-  it('长度按 Unicode 码点并计入分隔换行，刚好 20000 可提交，超出拦截', async () => {
+  it('长度按 Unicode 码点并计入分隔换行，刚好到上限可提交，超出拦截', async () => {
     const valid = [textSource('😀'.repeat(MAX_INPUT_CHARS - 3)), textSource(' 字 ')];
     expect(mergedCharCount(valid)).toBe(MAX_INPUT_CHARS);
     expect(sourceInputError(valid)).toBe('');
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     await useMindMapStore().generateSources([...valid, textSource('多')]);
-    expect(useMindMapStore().sourceGenerationError).toContain('20003 字');
+    expect(useMindMapStore().sourceGenerationError).toContain(`${MAX_INPUT_CHARS + 3} 字`);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

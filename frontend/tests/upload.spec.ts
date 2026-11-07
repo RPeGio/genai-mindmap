@@ -7,7 +7,7 @@ import { startRecording } from '../src/audio/recorder';
 import type { MindMapContent, PipelineResponse, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
-import { MAX_UPLOAD_BYTES } from '../src/sources/input';
+import { MAX_INPUT_CHARS, MAX_UPLOAD_BYTES } from '../src/sources/input';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这里只验证上传入口与提示区。
 vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
@@ -438,7 +438,7 @@ describe('上传文档生成导图', () => {
   }
 
   it('生成失败（超字数）时显示后端 detail，解析结果不丢', async () => {
-    const detail = '合并后内容为 51762 字，超过当前 20000 字限制；请缩短或分批处理';
+    const detail = '材料约 380000 字，估算 240000 token，超过模型上下文上限 200000。请精简后重试，或分成多次生成。';
     stubFetch(call => (call.url === UPLOAD_URL ? jsonResponse({ source: source() }) : jsonResponse({ detail }, 422)));
     const { wrapper, store, sources } = mountApp();
 
@@ -535,9 +535,10 @@ describe('多来源输入界面', () => {
   it('合并长度包含输入框草稿，超限时禁用生成并保留全部输入', async () => {
     stubFetch(() => jsonResponse({}));
     const { wrapper, sources } = mountApp();
-    sources.addText('字'.repeat(19998));
+    // 正文留出分隔换行的两个字符，加上输入框草稿正好超出上限一个字
+    sources.addText('字'.repeat(MAX_INPUT_CHARS - 2));
     await wrapper.get('#prompt').setValue('补');
-    expect(wrapper.text()).toContain('20001 / 20000 字');
+    expect(wrapper.text()).toContain(`${MAX_INPUT_CHARS + 1} / ${MAX_INPUT_CHARS} 字`);
     expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeDefined();
     expect(calls).toHaveLength(0);
     expect(sources.items).toHaveLength(1);
