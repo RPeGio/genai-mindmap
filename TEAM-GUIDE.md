@@ -224,7 +224,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 ## 8 已知的坑
 
 - **两个文本入口的上限不同**：`/api/ingestion/text` 与 `/api/generations` 都是单段 10000 字，`/api/pipeline/generate` 合并后限 20000 字（`backend/app/pipeline/service.py:29`）。前端来源面板按 20000 字提示，所以 15000 字走 pipeline 没问题、走 `/api/generations` 会被 422 挡下。
-- **`source_refs` 目前只存在于数据层**：能生成、能校验、能保存，但界面上还没有任何展示入口——选中节点看不到"这句话出自哪一页/第几秒"。这是下一步的前端任务（见 F08）。
+- **引用的原文不落库**：`source_refs` 随导图一起保存（`source_id` + `quote` + 可选的页码与字符区间），但 `Source.text` 只活在本次会话的来源列表里（`frontend/src/stores/sources.ts`）。刷新后重新打开导图，节点角标、来源名与 `quote` 还在，抽屉里却没有前后文——界面会显示"原文没有随导图保存"。另外后端**只在生成/流水线时校验引用**，保存时不复检，所以手工改过节点文字之后，旧引用可能已经对不上原文。
 - **导出用根节点文字，不是标题**：`export/puml` 取的是 `root.label`。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
 - **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得用 SSE（`/api/generations/stream`、`/api/agent/runs/stream`）。
 - **前端还没接的接口**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check` 与 `/suggest`。上传格式白名单目前写死在 `frontend/src/sources/input.ts` 的 `FILE_ACCEPT`，与后端 `formats` 接口有漂移风险；诊断接口已有返回值但界面不渲染（`frontend/src/api/types.ts` 里 `diagnostics` 标注为"目前只用于排障"）。
@@ -239,11 +239,12 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 如果只有一个人有余力，按这个顺序：
 
-1. **把引用搬到界面上**（RPeGio，F08）：节点角标显示引用数，选中后在右侧详情面板列出来源与逐字引文，文档给页码、音频给秒数。后端已经算好并校验过，界面上一个字都没有，等于把最有说服力的功能藏起来了。
-2. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
-3. **契约 v2 定稿**（RPeGio 与陈嘉涛，见 `docs/HANDOFF.md` 的 H1/H2）：`note` 与 v2 同批上线；layout/theme/relations 再排期。
-4. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
-5. **部署骨架**（RPeGio，F22）：`Dockerfile` + `deploy/docker-compose.yml` + nginx，目标单台 2C2G、`IP:8080` 可访问；没有登录和权限之前只能内网演示。
+1. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
+2. **契约 v2 定稿**（RPeGio 与陈嘉涛，见 `docs/HANDOFF.md` 的 H1/H2）：`note` 与 v2 同批上线；layout/theme/relations 再排期。
+3. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
+4. **部署骨架**（RPeGio，F22）：`Dockerfile` + `deploy/docker-compose.yml` + nginx，目标单台 2C2G、`IP:8080` 可访问；没有登录和权限之前只能内网演示。
+
+已完成：**把引用搬到界面上**（F08，2026-11-07，`fc8f82f`）——节点右上角显示引用条数，选中后在右侧详情面板列出来源名与位置（`第 19–37 字`，有页码时一并给出），点一条在抽屉里看原文并把命中句标黄；原文不落库，跨会话只剩生成时记下的 `quote`。
 
 其余按 `FEATURES_AND_OWNERS.md` 的 F 编号推进，范围取舍以 `docs/PLAN.md` 第 2 节为准。
 

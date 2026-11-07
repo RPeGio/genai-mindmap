@@ -4,7 +4,7 @@
 
 **错误体已统一**：所有错误响应都是 `{code, message, detail, request_id}`（实现见 `backend/app/core/errors.py`）。`message` 是中文可读文案，`detail` 保留原始细节（校验错误为数组），`request_id` 优先沿用请求头 `X-Request-ID`、没有则生成，并同时通过响应头回传。前端 `src/api/client.ts` 的 `ApiError` 读 `message`，缺失时回退到 `detail`。
 
-**前端消费情况**（截至 2026-11-06）：`POST /api/generations`、`POST /api/generations/stream`、`POST /api/pipeline/generate`（`generateFromSources`）、`POST /api/ingestion/files`（`uploadDocument`）、`POST /api/agent/runs/stream`（`runAgentStream`）、`POST /api/export/{puml,markdown,opml}`、四个 `/api/mindmaps*` 端点。画布与编辑全部在 `src/canvas/`、`src/mindmap/{edits,ops}.ts` 里完成，只把整棵树发给后端。
+**前端消费情况**（截至 2026-11-07）：`POST /api/generations`、`POST /api/generations/stream`、`POST /api/pipeline/generate`（`generateFromSources`）、`POST /api/ingestion/files`（`uploadDocument`）、`POST /api/agent/runs/stream`（`runAgentStream`）、`POST /api/export/{puml,markdown,opml}`、四个 `/api/mindmaps*` 端点。画布与编辑全部在 `src/canvas/`、`src/mindmap/{edits,ops}.ts` 里完成，只把整棵树发给后端。节点引用（`node.source_refs`）已能展示：角标显示条数，详情面板列来源与位置，抽屉里看原文并高亮命中句，实现见 `src/mindmap/refs.ts`。
 
 **尚未封装**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check`、`POST /api/optimization/suggest`、`POST /api/knowledge/search`、`POST /api/agent/tasks`。其中前两个是小事，中间两个是"结构诊断还没进界面"，后两个仍是桩。
 
