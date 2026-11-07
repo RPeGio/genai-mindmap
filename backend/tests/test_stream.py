@@ -107,26 +107,61 @@ class PartialStreamTest(unittest.TestCase):
         self.assertEqual(kinds[-1], "__done__")
 
     def test_single_branch_is_accepted(self):
-        """只有一条分支也算层次结构，与同步接口保持一致（下限是 1）。"""
+        """用例名沿用「下限是 1」的时代，断言的却是**拒绝**。
+
+        一级分支下限从 1 提到 3（生成质量基线）之后，单分支就是一条链，不再算
+        层次结构；同步接口与流式接口共用同一个下限，这里必须一起改，否则同一个
+        模型结果会被一个入口判成功、另一个判失败。
+        """
         payload = ('{"title":"X","root":{"id":"r","label":"根","children":['
                    '{"id":"b1","label":"唯一","children":[]}]}}')
-        kinds = [k for k, _ in self._run(payload)]
-        self.assertIn("done", kinds)
-        self.assertNotIn("error", kinds)
+        parsed = self._run(payload)
+        kinds = [k for k, _ in parsed]
+        self.assertIn("error", kinds)
+        self.assertNotIn("done", kinds)
+        error = next(p for k, p in parsed if k == "error")
+        self.assertEqual(error["code"], "generation_failed")
+        self.assertIn("分支", error["message"])
+        self.assertEqual(kinds[-1], "__done__")
 
     def test_two_branches_pass(self):
+        """用例名沿用旧基线，断言同样改成拒绝：两条分支仍在下限之下。"""
         payload = ('{"title":"X","root":{"id":"r","label":"根","children":['
                    '{"id":"b1","label":"甲","children":[]},'
                    '{"id":"b2","label":"乙","children":[]}]}}')
+        kinds = [k for k, _ in self._run(payload)]
+        self.assertIn("error", kinds)
+        self.assertNotIn("done", kinds)
+        self.assertEqual(kinds[-1], "__done__")
+
+    def test_three_branches_pass(self):
+        payload = ('{"title":"X","root":{"id":"r","label":"根","children":['
+                   '{"id":"b1","label":"甲","children":[]},'
+                   '{"id":"b2","label":"乙","children":[]},'
+                   '{"id":"b3","label":"丙","children":[]}]}}')
         parsed = self._run(payload)
         done = next(p for k, p in parsed if k == "done")
         self.assertFalse(done["degraded"])
-        self.assertEqual(len(done["content"]["root"]["children"]), 2)
+        self.assertEqual(len(done["content"]["root"]["children"]), 3)
+
+    def test_demo_single_child_is_still_done(self):
+        """demo 是固定占位结构（一个子节点），不该被模型质量门槛打回。"""
+        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "demo"}), \
+             patch.object(partial_mod, "_stream_chat") as chat_mock:
+            parsed = parse_frames(collect(generate_stream_partial("测试输入")))
+        done = next(p for k, p in parsed if k == "done")
+        self.assertEqual(done["mode"], "demo")
+        self.assertEqual(len(done["content"]["root"]["children"]), 1)
+        chat_mock.assert_not_called()
 
     def test_stream_never_exposes_fabricated_references(self):
         payload = json.dumps({"title": "引用", "root": {
             "id": "r", "label": "根", "source_refs": [{"source_id": "fake", "quote": "编造"}],
-            "children": [{"id": "b", "label": "分支", "source_refs": {"invalid": True}}],
+            "children": [
+                {"id": "b", "label": "分支", "source_refs": {"invalid": True}},
+                {"id": "b2", "label": "分支二", "source_refs": []},
+                {"id": "b3", "label": "分支三", "source_refs": []},
+            ],
         }, "source_usage": [{"invalid": True}]}, ensure_ascii=False)
         parsed = self._run(payload)
         done = next(p for kind, p in parsed if kind == "done")
