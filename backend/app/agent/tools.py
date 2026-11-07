@@ -37,6 +37,7 @@ from app.agent.ops import (
     new_node_id,
     normalize_ops,
 )
+from app.agent.stream_items import StreamItem, closed_items
 from app.contracts import mindmap as mindmap_contract
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import MindMapContent, Node
@@ -479,8 +480,11 @@ def _nested_capacity(fanout: int, levels: int) -> int:
     return sum(fanout**level for level in range(1, max(0, levels) + 1))
 
 
-def _walk_slots(slots: list[_Slot], depth: int, path: str, max_depth: int):
-    """列出还能继续展开的节点：`(节点, 它现在在第几层, 到它为止的路径)`。
+def _walk_slots(
+    slots: list[_Slot], depth: int, path: str, max_depth: int,
+    prefix: tuple[int, ...] = (),
+):
+    """列出还能继续展开的节点：`(节点, 它现在在第几层, 到它为止的路径, 子索引链)`。
 
     每一层开始前都会再走一遍，所以这里就是「该不该继续拆」的筛选点：候选只包含
     `expandable=True` 且**没有** `children` 的节点。
@@ -489,13 +493,94 @@ def _walk_slots(slots: list[_Slot], depth: int, path: str, max_depth: int):
     `depth + 1` 层接着排——否则"模型一次多给了一层"会让这一支就此停住。
     `expandable=False` 的节点按模型的意思留在原地：它是最小可执行单元，再拆只会
     得到重复内容，还白花一次调用。`max_depth` 退化成兜底，不再替模型决定深浅。
+
+    `path` 是给人（也给模型）看的文字路径，末位的索引链是给 `node_grow` 用的：
+    两者由同一次遍历给出，免得调用方自己再走一遍树、两处口径慢慢分叉。索引链的
+    起点由 `prefix` 决定——它通常是"这条分支在根下面排第几"。
     """
-    for slot in slots:
+    for index, slot in enumerate(slots):
         here = f"{path} > {slot.label}" if path else slot.label
+        indices = (*prefix, index)
         if slot.children:
-            yield from _walk_slots(slot.children, depth + 1, here, max_depth)
+            yield from _walk_slots(slot.children, depth + 1, here, max_depth, indices)
         elif slot.expandable and depth < max_depth:
-            yield slot, depth, here
+            yield slot, depth, here, indices
+
+
+async def _emit_grow(
+    ctx: RunContext,
+    seen: set[tuple[tuple[int, ...] | None, str]],
+    path: tuple[int, ...] | None,
+    label: str,
+    expandable: bool | None,
+) -> None:
+    """上报一帧节点生长事件（预览用）。
+
+    `path` 指向父节点：`()` 是"挂在根上"，`None` 是根自己。两者不能都用 `()`——
+    那样就分不清第一个分支和中心主题，只能靠发送顺序兜着，顺序一乱前端就把分支
+    画成根，而且不报错。
+
+    同一 `(path, label)` 只报一次：同一个父节点下重复的 label 在最终树里本来就会
+    被 `_keep_new_slots` 丢掉，预览里也不该出现两遍。
+
+    通道为 None 时直接返回 —— 这条路上工具的行为必须与加生长事件之前逐字相同。
+    """
+    emit = ctx.emit
+    if emit is None:
+        return
+    key = (path, label)
+    if key in seen:
+        return
+    seen.add(key)
+    await emit({
+        "type": "node_grow",
+        "path": list(path) if path is not None else None,
+        "label": label,
+        "expandable": expandable,
+    })
+
+
+@dataclass
+class _GrowStream:
+    """一路展开调用的增量上报器：delta 喂进来，`node_grow` 发出去。
+
+    只在 `RunContext.emit` 不为 None 时才会被创建（见 `_generate_deep` 里的
+    `ask_model`），所以这里不判空 —— 判空只留一处，两处各判一遍迟早有一处写反。
+    """
+
+    ctx: RunContext
+    seen: set[tuple[tuple[int, ...] | None, str]]
+    parent: tuple[int, ...]     # 父节点在树里的子索引链
+    base_index: int = 0         # 这一路产出的第一个子项在父节点下的位置
+    buffer: str = ""
+    reported: int = 0
+
+    async def feed(self, delta: str) -> None:
+        """收到一段模型输出，把刚写完整的子项报出去。
+
+        `reported` 记的是**扫描到第几个**，与去重无关：同一个 label 被模型写了
+        两次时，第二次不该因为"没上报"而把后面的偏移整体错位。
+        """
+        self.buffer += delta
+        items = closed_items(self.buffer)
+        fresh = items[self.reported:]
+        self.reported = len(items)
+        for offset, item in enumerate(fresh):
+            await self._report(self.parent, self.base_index + offset, item)
+
+    async def _report(
+        self, parent: tuple[int, ...], index: int, item: StreamItem,
+    ) -> None:
+        """先报自己，再报模型额外给的下一层。
+
+        事件里的 `path` 指向**父节点**，所以同一路响应里的子项共用 `parent`；
+        `index` 是 item 自己在 `parent` 下面的位置，只用来给它的孩子拼路径——
+        模型多给的那一层，父节点就是这个 item。
+        """
+        await _emit_grow(self.ctx, self.seen, parent, item.label, item.expandable)
+        own = (*parent, index)
+        for position, child in enumerate(item.children):
+            await self._report(own, position, child)
 
 
 def _audit_branches(
@@ -890,6 +975,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
       3. 验收发现不足 → 只补那一支，骨架不重来（这是分片结构的全部价值）
       4. 额度不足 → 立刻停手，把已展开的部分交出去并显式标 `partial`
 
+    顺带往上推**节点生长预览**（`node_grow`）：`RunContext.emit` 不为 None 时，
+    展开调用改走流式请求，每写出一个完整的子项就上报一帧（根与一级分支在骨架
+    落定时先报）。它只是预览——最终树仍然是这里合并、校验后交给 `snapshot` 的
+    那一棵，两者不一致是正常的（预览可能多、可能少）。通道为 None 时这条路径
+    **一行都不走**，工具行为与加预览之前完全相同。
+
     **它不读来源正文**：`GenerateDeepArgs` 里没有来源字段，骨架与展开都只看
     主题。请求带材料时 `build_registry(has_sources=True)` 不会注册这个工具——
     那条路会产出一棵与材料无关的树，而且以 ok=True 成功返回，用户没有任何
@@ -914,15 +1005,40 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 思维模型两条路都要拼：骨架决定怎么分块，展开决定每块怎么拆。
     thinking = thinking_block(ctx.request.thinking_model)
 
+    # 根节点的标题在骨架之前就定了：它同时是树的 title，提前算出来还能在上报
+    # 根节点时直接用它，不必等到最后合并那一步。
+    root_label = args.topic.strip()[:200] or "思维导图"
+
+    # 已上报过的 `(父路径, label)`，全局一份：预览的去重口径是"同一个父节点下
+    # 同一句文字只出现一次"，跨路（不同展开调用）也成立。
+    reported_grow: set[tuple[tuple[int, ...] | None, str]] = set()
+
+    async def ask_model(
+        prompt: str, user: str, parent: tuple[int, ...] | None = None,
+        base_index: int = 0,
+    ) -> Any:
+        """发一次模型调用，顺带把「已经写完的子项」推给事件流。
+
+        `thinking` 统一在这里拼，四个调用点不再各拼一遍。
+
+        `parent` 只在开了上报通道时才有意义，也只有在有通道时才会传 `on_delta`：
+        通道为 None 时连流式请求都不发，这条路上工具的行为与加生长事件之前
+        **逐字相同**（现有测试全靠这一点保持有效）。
+        """
+        system = prompt + thinking
+        if ctx.emit is None or parent is None:
+            return await chat_async(system, user, max_tokens=_max_tokens(ctx))
+        stream = _GrowStream(ctx, reported_grow, parent, base_index)
+        return await chat_async(
+            system, user, max_tokens=_max_tokens(ctx), on_delta=stream.feed,
+        )
+
     # 第一步：出骨架。额度在调用**之前**占——请求一旦发出就是一次真实计费。
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
     ctx.extra_model_calls += 1
     try:
-        raw_plan = await chat_async(
-            PLAN_PROMPT + thinking, _plan_ask(args.topic, args.branches),
-            max_tokens=_max_tokens(ctx),
-        )
+        raw_plan = await ask_model(PLAN_PROMPT, _plan_ask(args.topic, args.branches))
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 
@@ -956,6 +1072,17 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         taken.add(branch_id)
         skeleton.append((title, branch_id))
 
+    # 骨架落定的这一刻就把根与一级分支报出去：它们不需要等任何展开调用，而
+    # 展开是并发的、动辄十几秒，先让用户看见框架比多等一个字段值不值的问题更值。
+    # 顺序必须是根在前——父节点一定先于子节点出现在流里，前端据此直接挂。
+    # 根用 `path=None`，一级分支用 `path=()`（挂在根上）：两者形态不同，前端不必
+    # 靠"谁是第一帧"去猜哪个是中心主题。
+    await _emit_grow(ctx, reported_grow, None, root_label, None)
+    for title, _ in skeleton:
+        # 骨架只有字符串，没有 expandable 可报：`None` 表示"模型没写"，
+        # 而不是"模型说不能再拆"。
+        await _emit_grow(ctx, reported_grow, (), title, None)
+
     # 额度预分配（第一层）：root + 一级分支是"接口层"，先从总节点里扣掉，剩下的
     # 才轮到各支往下长。不先扣的话，一支自己就可能把额度吃到只剩两位数，后面
     # 十九支全部只剩骨架——用户看到的是"第一支很丰满、其余都是空壳"。
@@ -976,7 +1103,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 排队中的任务一次性预占，实际请求却还没发出去。
     semaphore = asyncio.Semaphore(DEEP_CONCURRENCY)
 
-    async def expand_branch(title: str) -> list[_Slot] | None:
+    async def expand_branch(title: str, branch_index: int) -> list[_Slot] | None:
         """展开一条分支。额度不够返回 None——那是"没展开"，与"展开失败"是两件事。"""
         async with semaphore:
             if not ctx.reserve_model_call():
@@ -987,14 +1114,14 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 f"本条一级分支：{title}\n"
                 f"请给出 {need} 个子要点。"
             )
-            raw = await chat_async(
-                BRANCH_EXPAND_PROMPT + thinking, ask, max_tokens=_max_tokens(ctx),
-            )
+            # 这一路的产出挂在第 branch_index 条一级分支下面，所以父路径是
+            # `(branch_index,)`。
+            raw = await ask_model(BRANCH_EXPAND_PROMPT, ask, parent=(branch_index,))
             kept, _ = _trim_slots(_candidate_slots(raw, point_budget, nested_levels), allowance)
             return kept
 
     results = await asyncio.gather(
-        *(expand_branch(title) for title, _ in skeleton),
+        *(expand_branch(title, index) for index, (title, _) in enumerate(skeleton)),
         return_exceptions=True,
     )
 
@@ -1046,8 +1173,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             f"还差 {missing} 个子要点，请补齐，不要重复已有要点。"
         )
         try:
-            raw = await chat_async(
-                BRANCH_EXPAND_PROMPT + thinking, ask, max_tokens=_max_tokens(ctx),
+            # 补调出来的要点接在已有要点之后，所以这一路的子索引从"已有几个"起算；
+            # 不带上这个偏移，预览会把补出来的节点挂到已有节点的位置上。
+            raw = await ask_model(
+                BRANCH_EXPAND_PROMPT, ask, parent=(index,),
+                base_index=len(slots_by_branch[index]),
             )
         except GenerationError:
             continue  # 补调失败只是"仍然不足"，不升级成整次失败
@@ -1079,9 +1209,13 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     level_empty: dict[int, int] = {}  # 层 -> 模型答了但没给出可用子节点的父节点数
 
     async def expand_node(
-        slot: _Slot, path: str, count: int, nested_left: int,
+        slot: _Slot, path: str, indices: tuple[int, ...], count: int, nested_left: int,
     ) -> list[_Slot] | None:
-        """展开一层里的一个节点。额度不够返回 None（没展开），抛错则由调用方收拾。"""
+        """展开一层里的一个节点。额度不够返回 None（没展开），抛错则由调用方收拾。
+
+        `path` 是给人看的文字路径，`indices` 是同一次遍历给出的子索引链——上报
+        生长事件时后者才是指向"这是哪个节点"的东西。
+        """
         async with semaphore:
             if not ctx.reserve_model_call():
                 return None
@@ -1094,19 +1228,22 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 f"本节点：{slot.label}\n"
                 f"请给出 {count} 个子要点。"
             )
-            raw = await chat_async(
-                SUBNODE_EXPAND_PROMPT + thinking, ask, max_tokens=_max_tokens(ctx),
-            )
+            raw = await ask_model(SUBNODE_EXPAND_PROMPT, ask, parent=indices)
             return _candidate_slots(raw, count, nested_left)
 
     for depth in range(3, max_depth + 1):
         # `depth` 是**这一轮要产出的层号**，父节点在它上面一层：第 3 层的父节点
         # 是第 2 层的节点（一级分支的直接下级）。
-        parents = [
-            (slot, path) for slot, parent_depth, path
-            in _walk_slots(all_slots, 2, "", max_depth)
-            if parent_depth == depth - 1
-        ]
+        # 按分支分别遍历而不是先把第 2 层摊平：索引链的起点是"这条分支在根下面
+        # 排第几"，摊平之后就只剩一个混在一起的全局下标，再也拼不出父子路径。
+        parents: list[tuple[_Slot, str, tuple[int, ...]]] = []
+        for branch_index, slots in enumerate(slots_by_branch):
+            parents.extend(
+                (slot, path, indices)
+                for slot, parent_depth, path, indices
+                in _walk_slots(slots, 2, "", max_depth, (branch_index,))
+                if parent_depth == depth - 1
+            )
         if not parents:
             break
         expected.add(depth)
@@ -1124,10 +1261,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         # 整树校验上——那时额度已经花完了。
         level_allowance = min(breadth * (1 + _nested_capacity(fanout, nested_left)), share)
         level_results = await asyncio.gather(
-            *(expand_node(slot, path, breadth, nested_left) for slot, path in parents),
+            *(expand_node(slot, path, indices, breadth, nested_left)
+              for slot, path, indices in parents),
             return_exceptions=True,
         )
-        for (slot, _path), item in zip(parents, level_results):
+        for (slot, _path, _indices), item in zip(parents, level_results):
             if item is None:
                 level_skipped[depth] = level_skipped.get(depth, 0) + 1
             elif isinstance(item, BaseException):
@@ -1142,12 +1280,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     # 第四步：合并。骨架先成树（分支 id 已在骨架里），再把所有节点按"父在子前"
     # 的顺序作为一批 add 应用上去——整批原子，半截树不会进 ctx.candidate。
-    label = args.topic.strip()[:200] or "思维导图"
     content = MindMapContent(
-        title=label,
+        title=root_label,
         root=Node(
             id=root_id,
-            label=label,
+            label=root_label,
             children=[Node(id=branch_id, label=title, children=[]) for title, branch_id in skeleton],
         ),
     )

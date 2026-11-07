@@ -337,6 +337,33 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(events[-1].code, "budget_exhausted")
         self.assertEqual(events[-1].limit, "max_tool_calls")
 
+    def test_budget_ran_out_after_candidate_is_done_not_error(self):
+        """候选已经建好时预算用完：给 done，不把成果报成失败。
+
+        收尾那轮只是想问模型「还要不要继续」，问不了不影响已经建好的树。
+        真机上六支三层用掉 27 次而预算给 25 时，用户看到的是候选和一条
+        「模型调用次数已用完」同时出现，不知道该不该用那份候选。
+        """
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
+            return {"title": "主题", "root": {"id": "root", "label": "主题", "children": [
+                {"id": "a", "label": "分支一", "children": []},
+                {"id": "b", "label": "分支二", "children": []},
+                {"id": "c", "label": "分支三", "children": []},
+            ]}}
+
+        call = ToolCall(call_id="gen-1", name="mindmap_generate",
+                        arguments={"topic": "机器学习"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls")])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            # 2 次刚好够「外层发工具 + 工具内一次生成」，收尾那轮就没有了
+            events = _collect(
+                _request(budget=RunBudget(max_model_calls=2, max_tool_calls=50)),
+                provider, build_registry("create"))
+
+        self.assertEqual(events[-1].type, "done")
+        self.assertIsNotNone(events[-1].content)
+        self.assertEqual(events[-1].content.root.label, "主题")
+
     def test_repair_budget_limits_failed_tool_calls(self):
         """max_repairs 数的是工具失败次数，与模型调用次数无关。"""
         def broken(args, ctx):
@@ -450,7 +477,10 @@ class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
     """
 
     def test_six_branch_deep_run_finishes_with_done(self):
-        async def fake_chat(system, user, *, max_tokens=None):
+        # `on_delta` 是循环挂上上报通道后工具会传的回调。这条用例只关心预算与
+        # 收尾，所以收到就丢：不消费它意味着这条调用没有产生任何预览帧，
+        # 正好也证明"不上报不影响主流程"。
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
             if system.startswith(PLAN_PROMPT):
                 return {"branches": [f"分支{index}" for index in range(1, 7)]}
             return {"points": ["要点一", "要点二", "要点三"]}
@@ -475,6 +505,45 @@ class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
         end = next(event for event in events if event.type == "tool_end")
         self.assertTrue(end.ok, end.result_summary)
         self.assertFalse(end.result_summary["partial"])
+
+    def test_recursive_deep_run_fits_default_budget(self):
+        """递归展开（模型自报可展开性）在默认预算下也要走完。
+
+        上一条用的是 `points` 旧格式，语义就是叶子、根本不会递归，所以它证明
+        不了「模型自己说还能再拆」这条路要花多少次调用。真机上六支三层用掉
+        27 次，预算给 25 时收尾那轮必然报 budget_exhausted。
+        """
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
+            if system.startswith(PLAN_PROMPT):
+                return {"branches": [f"分支{index}" for index in range(1, 7)]}
+            # 两个点里只有一个说自己还能拆，另一支到底
+            return {"children": [
+                {"label": "还能拆", "expandable": True},
+                {"label": "到底了", "expandable": False},
+            ]}
+
+        call = ToolCall(
+            call_id="deep-1", name="mindmap_generate_deep",
+            arguments={"topic": "机器学习", "branches": 6,
+                       "points_per_branch": 2, "max_depth": 3},
+        )
+        provider = ScriptedProvider([
+            _completion([call], finish="tool_calls"),
+            _completion(),
+        ])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(_request(), provider, build_registry("create"))
+
+        self.assertEqual(events[-1].type, "done")
+        root = events[-1].content.root
+        self.assertEqual(len(root.children), 6)
+        for branch in root.children:
+            self.assertEqual(len(branch.children), 2)
+        # 递归确实发生了：至少有一支的「还能拆」自己又长出了子节点
+        self.assertTrue(any(child.children for branch in root.children
+                            for child in branch.children))
+        # 默认预算没被撞破，收尾轮照常发出 done
+        self.assertEqual(provider.calls, 2)
 
 
 class OutlineRefreshTest(unittest.TestCase):

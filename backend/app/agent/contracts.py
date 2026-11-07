@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Callable, Literal, Protocol, Union
+from typing import Annotated, Any, Awaitable, Callable, Literal, Protocol, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -42,13 +42,18 @@ class RunBudget(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    # 10 = 1 次外层轮 + 1 次骨架 + 8 次并发展开，剩下的差额留给补点重试。
-    # 算式必须按「六支分片」这个最常见上限来定：外层收尾还要 1 轮，所以一次
-    # 完整的六支分片是 1 + 1 + 6 + 1 = 9 次。给 8 的时候，骨架与六支展开就
-    # 用掉 7 次、外层第二轮再占 1 次，收尾那轮必然报 budget_exhausted——
-    # 树其实已经建好了，却连 done 帧都发不出来（已实测复现）。
-    # 8 支展开 + 重试余量再大就该由调用方显式放宽，而不是把默认值继续抬高。
-    max_model_calls: int = Field(default=25, ge=1, le=40)
+    # 40 = 1 次外层轮 + 1 次骨架 + B 次分支展开 + B×P 次二级展开 + 1 次收尾轮。
+    # 取 B=8、P=3 是 35，剩下 5 次留给补点重试。
+    #
+    # 这个账在深层生成改成「模型自己声明可展开性」之后变了：递归会让每层翻倍，
+    # 六支三层全展开的理论最坏是 1+1+6+18+54+1 = 81 次。按最坏定预算等于把默认值
+    # 抬到没人会用的规模，所以这里按常见规模定——真机实测六支三层用掉 27 次
+    # （模型对大部分末端节点标了 expandable: false），40 足够。
+    #
+    # 超过预算不再等于失败：工具内部会在额度不足时停止展开并记一条诊断，外层
+    # 则以已经建好的树收尾（见 `service._budget_stop`）。用户拿到的是「树 + 少
+    # 展开了几支」，不是「什么都没有 + 一条错误」。
+    max_model_calls: int = Field(default=40, ge=1, le=60)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
     # 时间上限从 120 提到 600：120 秒是照「一句话主题」的短路径拍的，实测
     # 12106 字材料出 526 个节点要 48.6 秒，慢速档 97 tok/s 时同样的材料光是
@@ -120,6 +125,11 @@ class ToolProvider(Protocol):
     ) -> Completion: ...
 
 
+# 工具 -> 循环的上报通道。用 dict 而不是具体的事件模型：工具不该依赖事件流的
+# 形状（事件模型与编号属于调用层），循环收到后自己校验、补 seq、丢掉不认识的帧。
+EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
+
+
 class ToolResult(BaseModel):
     """工具执行结果。
 
@@ -189,6 +199,13 @@ class RunContext:
     # 工具内部直接调模型的次数，由工具自己上报。它是对账兜底与观测值，
     # **不**参与判停：判停看 `model_calls_used`，只有它同时覆盖外层与工具内部。
     extra_model_calls: int = 0
+    # 工具内部的上报通道。`service.run()` 在执行工具期间挂上它，工具每产出一个
+    # 可以上屏的增量就 await 一次，由循环转成事件帧。
+    #
+    # 默认 None 是硬要求：单测与直接调工具的代码没有消费者，这条路上工具的行为
+    # 必须与加通道之前**逐字相同**（连流式请求都不发）。判空只在
+    # `tools._emit_grow` 与 `tools._GrowStream` 的入口处做一次。
+    emit: EmitFn | None = None
 
     def reserve_model_call(self) -> bool:
         """占掉一次模型调用额度，拿不到返回 False。
@@ -292,6 +309,31 @@ class SnapshotEvent(_EventBase):
     content: MindMapContent
 
 
+class NodeGrowEvent(_EventBase):
+    """深层生成还在工具内部跑的时候，逐个节点推出去的预览。
+
+    `path` 指向**父节点**：`[0, 2]` 是根的第 0 个孩子的第 2 个孩子，`[]` 是挂在
+    根上，`None` 是根自己。根必须与"挂在根上的孩子"在类型上就分开——两者都用
+    `[]` 时只能靠"根帧最先到"这个隐式顺序区分，顺序一变前端就把第一个分支当成
+    中心主题，而且不会报任何错。
+
+    因为展开响应里没有 id，父子关系也只能由工具层带上，不能像普通生成那样从
+    JSON 里读出来。
+
+    `expandable` 为 None 表示模型没写这个字段、或写的不是布尔值——与 `false`
+    （模型明确说这个节点不能再拆）不是一回事，前端要能分开显示。它与 `path` 的
+    None 各管各的，没有关系。
+    """
+
+    type: Literal["node_grow"] = "node_grow"
+    # 必填但可以为 null：根帧就是 path=null。层数上限是 4 层
+    # （`tools.DEEP_MAX_DEPTH`），索引链最长 3 位；留到 16 是给将来放宽层数
+    # 留余量，同时挡住畸形上报把帧撑大。
+    path: list[int] | None = Field(max_length=16)
+    label: str = Field(min_length=1, max_length=200)
+    expandable: bool | None = None
+
+
 class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
     content: MindMapContent | None = None
@@ -307,6 +349,9 @@ class ErrorEvent(_EventBase):
 
 
 AgentEvent = Annotated[
-    Union[StageEvent, ToolStartEvent, ToolEndEvent, OpsEvent, SnapshotEvent, DoneEvent, ErrorEvent],
+    Union[
+        StageEvent, ToolStartEvent, ToolEndEvent, OpsEvent, SnapshotEvent,
+        NodeGrowEvent, DoneEvent, ErrorEvent,
+    ],
     Field(discriminator="type"),
 ]

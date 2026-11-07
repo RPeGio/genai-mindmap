@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from typing import Any
 from uuid import uuid4
@@ -329,6 +330,15 @@ def parse_model_json(content: str) -> Any:
     raise ValueError("模型返回内容里没有可解析的 JSON")
 
 
+def _truncated_output_error() -> GenerationError:
+    """输出撞上 `max_tokens` 被硬切时的错误。
+
+    文案只有这一份：一次性响应与流式响应都会拦到同一种截断，两处各写一句的结果
+    是同一个事故在日志与界面上有两种说法。
+    """
+    return GenerationError("模型输出撞上长度上限被截断，结果不完整，请重试")
+
+
 def _choice_content(body: Any) -> str:
     """从响应体里取出模型 content，并拦住被长度上限截断的输出。
 
@@ -340,7 +350,7 @@ def _choice_content(body: Any) -> str:
     """
     choice = body["choices"][0]
     if isinstance(choice, dict) and choice.get("finish_reason") == "length":
-        raise GenerationError("模型输出撞上长度上限被截断，结果不完整，请重试")
+        raise _truncated_output_error()
     return choice["message"]["content"]
 
 
@@ -399,30 +409,105 @@ def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, 
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
 
 
-async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, Any]:
-    """`chat()` 的异步版本，供流式接口使用。
+def _stream_frame(data: str) -> tuple[str, str | None] | None:
+    """一帧 `data:` 里的 `(delta.content, finish_reason)`；形状不对返回 None。
 
-    流式接口必须能真正取消：客户端断开时 Starlette 会 cancel 生成器，
-    异步 httpx 会随之关闭连接、停止计费；同步 httpx 跑在线程里，
-    取消只能丢掉结果，请求本身仍会跑完并产生费用。
+    `content` 与 `finish_reason` 都可能只出现在其中一部分帧里（首帧常见
+    `role`、末帧才带 `finish_reason`），所以两者各自缺省，调用方不该指望
+    "一帧里同时拿到正文和结束原因"。
     """
-    import httpx
+    try:
+        choice = json.loads(data)["choices"][0] or {}
+        delta = choice.get("delta") or {}
+        text = delta.get("content")
+        reason = choice.get("finish_reason")
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return (text if isinstance(text, str) else "",
+            reason if isinstance(reason, str) else None)
 
-    base, key, model = _config()
-    # 与 `chat()` 同一道输入边界：工具内部的生成 / 展开也走这里，两条出口
-    # 各守一个数迟早会分叉。
-    ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
-    request_body: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.2,
-        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
-    }
+
+async def _chat_streamed(
+    base: str,
+    request_body: dict[str, Any],
+    headers: dict[str, str],
+    on_delta: Callable[[str], Awaitable[None]],
+) -> dict[str, Any] | None:
+    """试一次 `stream: true` 请求：成功返回与一次性路径同形的解析结果。
+
+    返回 None 表示**这次流式尝试不算数**，调用方应当退回一次性请求。只有两种
+    情况故意抛出，因为它们与流式无关、一次性路径同样会拒：响应体超限、输出被
+    长度截断——重来一遍只是多花一次钱。
+
+    其余一切（服务端不认 `stream` 直接回整包 JSON、流里一段正文都没有、流中途
+    断掉、拼起来的正文解析不出对象、网络层报错）都退回 None：预览少几帧可以，
+    整次生成不能因为预览机制而失败。
+    """
+    content = ""
+    finish_reason: str | None = None
+    ended = False          # 见到 `[DONE]` 或 finish_reason 才算这次流完整结束
+    callback: Callable[[str], Awaitable[None]] | None = on_delta
+    body = dict(request_body, stream=True)
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS,
+                                     follow_redirects=True) as client:
+            async with client.stream("POST", base + "/chat/completions",
+                                     content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                     headers=headers) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    # 有的兼容端点写 `data:{...}` 不带空格，两种都要认
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        ended = True
+                        break
+                    frame = _stream_frame(data)
+                    if frame is None:
+                        continue
+                    text, reason = frame
+                    if reason is not None:
+                        finish_reason = reason
+                        ended = True
+                    if not text:
+                        continue
+                    content += text
+                    # UTF-8 下一个字符至少占一个字节，按字符数卡上限只会比按字节
+                    # 更早放弃，不会放一个超限响应把内存读满。
+                    if len(content) > _MAX_RESPONSE_BYTES:
+                        raise GenerationError("模型响应过大")
+                    if callback is None:
+                        continue
+                    try:
+                        await callback(text)
+                    except Exception:  # noqa: BLE001 — 预览出错不能连累这次生成
+                        # 回调是上层做的增量解析，它自己坏了就让后续正文不再上报，
+                        # 但正文照收：返回值仍是一次性路径那份解析结果。
+                        callback = None
+    except GenerationError:
+        raise
+    except Exception:  # noqa: BLE001 — 含 httpx 各类错误，一律退回一次性请求
+        return None
+    # 截断判定与一次性路径同源：宁可报错，也不要把补齐括号后的半份结果当成功。
+    if finish_reason == "length":
+        raise _truncated_output_error()
+    # 没有结束标记说明这条流被切断了。此时半截正文交给 `parse_model_json` 会被
+    # 补齐括号"解析成功"，一棵缺了半边的树就这样当成功交出去——退回一次性请求，
+    # 由它按完整响应的规则判定。
+    if not ended or not content:
+        return None
+    try:
+        return parse_model_json(content)
+    except ValueError:
+        return None
+
+
+async def _chat_once(
+    base: str, request_body: dict[str, Any], headers: dict[str, str],
+) -> dict[str, Any]:
+    """一次性请求：收满整个响应体再解析。"""
     payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, follow_redirects=True) as client:
             async with client.stream("POST", base + "/chat/completions",
@@ -444,6 +529,50 @@ async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -
         raise GenerationError("无法连接模型服务或请求超时") from exc
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
+
+
+async def chat_async(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int | None = None,
+    on_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """`chat()` 的异步版本，供流式接口使用。
+
+    流式接口必须能真正取消：客户端断开时 Starlette 会 cancel 生成器，
+    异步 httpx 会随之关闭连接、停止计费；同步 httpx 跑在线程里，
+    取消只能丢掉结果，请求本身仍会跑完并产生费用。
+
+    `on_delta` 只服务「让上层边收边做预览」，返回的仍然是**同一份**解析结果：
+    每收到一段 `delta.content` 调一次回调，最后还是走 `parse_model_json`。
+    它不存在"另一套输出"——任何一步不成立（服务端不认 stream、流被切断、正文
+    拼不起来、回调自己抛错）都退回一次性请求。宁可少几帧预览，也不能让这次
+    生成失败。
+
+    这里没有复用 `generation/stream_partial._stream_chat`：那个函数按
+    `DETAIL_PROMPT` 那条出口的固定配置发请求，不接受 `max_tokens`，复用它会让
+    工具这条出口的输出上限与 `RunBudget` 分叉——预算里写着上限，请求里却是另一个数。
+    """
+    base, key, model = _config()
+    # 与 `chat()` 同一道输入边界：工具内部的生成 / 展开也走这里，两条出口
+    # 各守一个数迟早会分叉。
+    ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
+    request_body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if on_delta is not None:
+        streamed = await _chat_streamed(base, request_body, headers, on_delta)
+        if streamed is not None:
+            return streamed
+    return await _chat_once(base, request_body, headers)
 
 
 def _demo_content(text: str) -> MindMapContent:

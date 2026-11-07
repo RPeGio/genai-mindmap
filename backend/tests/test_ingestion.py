@@ -336,8 +336,6 @@ class LegacyOfficeTest(unittest.TestCase):
         """没装 LibreOffice 时要给出安装命令，而不是笼统的"解析失败"。"""
         from unittest.mock import patch
 
-        from app.ingestion.legacy_office import LegacyFormatUnavailable
-
         with patch("app.ingestion.legacy_office.soffice_cmd", return_value=None):
             with self.assertRaises(NotSupportedSource) as raised:
                 parse_document_bytes("a.doc", b"\xd0\xcf\x11\xe0fake")
