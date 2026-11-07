@@ -206,7 +206,6 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 
 | 常量 | 位置 | 当前值 |
 |---|---|---|
-| `MAX_INPUT_CHARS` | `backend/app/pipeline/service.py` | 20000 |
 | `MAX_UPLOAD_BYTES` | `backend/app/ingestion/router.py` | 10 MB（文档） |
 | `MAX_AUDIO_BYTES` | 同上；前端 `stores/mindmap.ts` 同口径 | 20 MB（WAV，约 11 分钟） |
 | `MAX_SLICE_SECONDS` | `backend/app/ingestion/asr.py` | 300（Qwen-Audio-ASR 服务端硬限，360 秒返回 `AUDIO_DURATION_TOO_LONG`） |
