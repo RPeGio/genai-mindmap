@@ -31,8 +31,12 @@ class RunBudget(BaseModel):
 
     `max_model_calls` 数的是**真实调用次数**，不是外层轮数：循环里每一轮 provider
     调用、以及工具内部的每一次 `chat_async` 调用都算一次，共用 `RunContext` 上
-    同一个账本。取 5 是实测值：探针显示一次响应能给出 2–3 个工具调用，
-    「查 → 建 → 改 → 修」四段用 5 轮足够；给 8 轮只是把跑飞的成本藏进去。
+    同一个账本。默认值按最贵的一条路（六支分片）算，算式见字段注释：
+    「查 → 建 → 改 → 修」这种多轮对话只用其中几次，多出来的余量不会被无故花掉。
+
+    `max_output_tokens` 同时约束两条出口：provider 那一轮，以及工具内部每一次
+    `chat_async`——参数由 `tools._max_tokens()` 夹到 provider 认的上限再发出去。
+    只约束前者时，工具内这条出口等于没有边界。
 
     `max_repairs` 约束的是**工具执行失败次数**（`ToolResult.ok == False` 的次数），
     与模型调用次数无关：一次成功的模型响应里发三个工具、其中两个失败，只消耗
@@ -41,11 +45,13 @@ class RunBudget(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    # 8 而不是 5。分片生成（mindmap_generate_deep）的一次调用量是
-    # 「1 次骨架 + N 次并发展开 + 最多 N 次补点重试」，N 默认 5 时最坏要 11 次；
-    # 给 5 的话外层先占 1、工具内只剩 4，骨架加三支就用完了，五支必然只展开三支。
-    # 8 覆盖「骨架 + 5 支 + 2 次重试」这个常见上界，再多就该由调用方显式放宽。
-    max_model_calls: int = Field(default=8, ge=1, le=20)
+    # 10 = 1 次外层轮 + 1 次骨架 + 8 次并发展开，剩下的差额留给补点重试。
+    # 算式必须按「六支分片」这个最常见上限来定：外层收尾还要 1 轮，所以一次
+    # 完整的六支分片是 1 + 1 + 6 + 1 = 9 次。给 8 的时候，骨架与六支展开就
+    # 用掉 7 次、外层第二轮再占 1 次，收尾那轮必然报 budget_exhausted——
+    # 树其实已经建好了，却连 done 帧都发不出来（已实测复现）。
+    # 8 支展开 + 重试余量再大就该由调用方显式放宽，而不是把默认值继续抬高。
+    max_model_calls: int = Field(default=10, ge=1, le=20)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
     max_seconds: float = Field(default=120.0, gt=0, le=600)
     # 这是**单次**模型调用的输出上限，不是整轮累计——它直接作为 provider 请求里

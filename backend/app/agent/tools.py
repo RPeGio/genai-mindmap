@@ -5,7 +5,9 @@
 五个工具的划分照「用户意图 + 作用域」而不是 CRUD 动词：
 - `mindmap_generate` 只在没有导图时可用，一次调用产出一整棵候选树
 - `mindmap_generate_deep` 同样只在没有导图时可用，但拆成「骨架 → 并发展开 →
-  验收 → 局部重试」四段，复杂主题用它（理由见该函数的 docstring）
+  验收 → 局部重试」四段，复杂主题用它（理由见该函数的 docstring）。它不读任何
+  来源正文，所以请求带材料时注册表根本不注册它——那条路会产出一棵与材料无关
+  的树，而且成功返回
 - `node_expand` 只能在已选中的节点下加子节点，不能删、不能移
 - `rag_query` 只读，且只能查本次请求带来的来源
 - `mindmap_edit` 才允许改/删/移，且必须按节点 id
@@ -56,6 +58,12 @@ MAX_CHILDREN = 50
 # 和"模型就是没给内容"一模一样。3 是保守值：足够让 5-8 条分支重叠跑，又不至于
 # 让服务端把它当成突发流量。
 DEEP_CONCURRENCY = 3
+
+# 工具内单次模型调用的输出上限。这个数必须与 `app.agent.provider._MAX_TOKENS_CAP`
+# 一致：provider 是外层轮次的出口，工具里的 `chat_async` 是另一条出口，两边不同
+# 时 `RunBudget.max_output_tokens` 只约束了其中一半的调用。不去 import 那个私有
+# 常量，是为了不让「工具」反向依赖「适配层」——适配层是可替换的。
+MAX_OUTPUT_TOKENS_CAP = 16384
 
 # 单个来源喂给模型的字符上限。超出的部分截断并显式注明——不注明的话，模型
 # 会以为自己看到的是全文，然后为"结尾那段"写引用，而那些引用在原文里
@@ -220,6 +228,16 @@ def _fail(code: str, message: str, **extra: Any) -> ToolResult:
     return ToolResult(ok=False, content=message, data={"code": code, **extra})
 
 
+def _max_tokens(ctx: RunContext) -> int:
+    """工具内一次模型调用的输出上限。
+
+    不显式传 `max_tokens` 时 `chat_async` 会回落到它自己的默认值，于是
+    `RunBudget.max_output_tokens` 只对 provider 那条路生效——预算里写了上限，
+    工具这条更大的输出口却没人守。
+    """
+    return min(ctx.request.budget.max_output_tokens, MAX_OUTPUT_TOKENS_CAP)
+
+
 def _require_candidate(ctx: RunContext) -> MindMapContent | ToolResult:
     if ctx.candidate is None:
         return _fail("no_candidate", "当前还没有导图，请先调用 mindmap_generate 生成。")
@@ -280,6 +298,23 @@ def _point_labels(raw: Any, limit: int) -> list[str]:
         if len(labels) >= limit:
             break
     return labels
+
+
+def _merge_labels(existing: list[str], incoming: list[str]) -> tuple[list[str], int]:
+    """把新要点并入已有列表，丢掉重复项，返回 `(留下的, 丢掉几条)`。
+
+    去重是**验收**的一部分而不是洁癖：提示词里写了「不要重复」，模型仍会重复
+    （实测同一要点返回两次）。不去重的话「点数够不够」会被重复项骗过去——
+    数量验收通过，用户看到的却是同一句话挂在两个节点上。
+    """
+    seen = set(existing)
+    kept: list[str] = []
+    for label in incoming:
+        if label in seen:
+            continue
+        seen.add(label)
+        kept.append(label)
+    return kept, len(incoming) - len(kept)
 
 
 def _audit_branches(
@@ -401,6 +436,22 @@ PLAN_PROMPT = (
     "按逻辑顺序排列；不要编号，不要解释，不要编造具体数据、人名或文献。"
 )
 
+
+def _plan_ask(topic: str, branches: int) -> str:
+    """骨架调用的 user 消息。
+
+    期望分支数必须写进 user：只靠 system 里的通用说明时，请求 3 支与 8 支的
+    模型输入一字不差，它只能按自己的直觉给一个数——而 `branches` 是用户在界面
+    上选的值，被无视了。单条长度、互不重叠、逻辑顺序三条也一起重申：system 里
+    虽有，但这是决定骨架质量的三条硬约束，重复一次便宜，骨架歪了整张图都歪。
+    """
+    return (
+        f"主题：{topic}\n"
+        f"请分成 {branches} 条一级分支。\n"
+        "每条不超过 20 字，互不重叠，按逻辑顺序排列。"
+    )
+
+
 # 分片生成第二步：按骨架逐支展开。与 `EXPAND_PROMPT` 的差别只有上下文——
 # 那个服务于"用户选中某个节点再展开"，语义保持不动；这个要额外告诉模型它写的是
 # 哪一支、以及别越到同级别的分支上去（并发展开时它看不到其他分支写了什么）。
@@ -441,9 +492,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             raw = await chat_async(
                 SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD,
                 _source_prompt_input(sources),
+                max_tokens=_max_tokens(ctx),
             )
         else:
-            raw = await chat_async(DETAIL_PROMPT + thinking, args.topic)
+            raw = await chat_async(
+                DETAIL_PROMPT + thinking, args.topic, max_tokens=_max_tokens(ctx),
+            )
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
 
@@ -481,6 +535,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
       2. 某支展开抛错 → 那一支留空，其余照常（一次 429 不该废掉整张图）
       3. 验收发现不足 → 只补那一支，骨架不重来（这是分片结构的全部价值）
       4. 额度不足 → 立刻停手，把已展开的部分交出去并显式标 `partial`
+
+    **它不读来源正文**：`GenerateDeepArgs` 里没有来源字段，骨架与展开都只看
+    主题。请求带材料时 `build_registry(has_sources=True)` 不会注册这个工具——
+    那条路会产出一棵与材料无关的树，而且以 ok=True 成功返回，用户没有任何
+    线索发现它错了。带材料的新建走 `mindmap_generate` 的忠实整理模式。
     """
     if ctx.request.intent != "create":
         return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
@@ -497,7 +556,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
     ctx.extra_model_calls += 1
     try:
-        raw_plan = await chat_async(PLAN_PROMPT + thinking, args.topic)
+        raw_plan = await chat_async(
+            PLAN_PROMPT + thinking, _plan_ask(args.topic, args.branches),
+            max_tokens=_max_tokens(ctx),
+        )
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 
@@ -544,7 +606,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 f"本条一级分支：{title}\n"
                 f"请给出 {need} 个子要点。"
             )
-            raw = await chat_async(BRANCH_EXPAND_PROMPT + thinking, ask)
+            raw = await chat_async(
+                BRANCH_EXPAND_PROMPT + thinking, ask, max_tokens=_max_tokens(ctx),
+            )
             return _point_labels(raw, need)
 
     results = await asyncio.gather(
@@ -554,6 +618,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     # 异常不许扩散到其他分支：某支 429 / 超时，只该让那一支空着。
     labels_by_branch: list[list[str]] = []
+    # 分支下标 -> 被丢掉的重复要点条数。首轮与补点都要记：重复是模型行为，
+    # 只记补点那一轮会让「首轮就给了两条一样的」变成一次静默的少一条。
+    duplicates: dict[int, int] = {}
     skipped: list[int] = []
     failed: list[tuple[int, str]] = []
     for index, (_, item) in enumerate(zip(skeleton, results)):
@@ -566,7 +633,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             failed.append((index, reason[:200]))
             labels_by_branch.append([])
         else:
-            labels_by_branch.append(list(item))
+            kept, dropped = _merge_labels([], list(item))
+            if dropped:
+                duplicates[index] = dropped
+            labels_by_branch.append(kept)
 
     skipped_set = set(skipped)
     failed_set = {index for index, _ in failed}
@@ -586,16 +656,25 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             break
         ctx.extra_model_calls += 1
         retried.append(index)
+        # 已有要点必须一起给：模型看不到自己已经写了什么，却被要求「不要重复」，
+        # 那这条要求它根本没法执行——实测同一要点被返回两次，数量验收还通过了。
+        existing = "、".join(labels_by_branch[index]) or "（暂无）"
         ask = (
             f"整体主题：{args.topic}\n"
             f"本条一级分支：{title}\n"
-            f"还差 {missing} 个子要点，请补齐，不要重复已经给出的内容。"
+            f"已有要点：{existing}\n"
+            f"还差 {missing} 个子要点，请补齐，不要重复已有要点。"
         )
         try:
-            raw = await chat_async(BRANCH_EXPAND_PROMPT + thinking, ask)
+            raw = await chat_async(
+                BRANCH_EXPAND_PROMPT + thinking, ask, max_tokens=_max_tokens(ctx),
+            )
         except GenerationError:
             continue  # 补调失败只是"仍然不足"，不升级成整次失败
-        labels_by_branch[index].extend(_point_labels(raw, missing))
+        kept, dropped = _merge_labels(labels_by_branch[index], _point_labels(raw, missing))
+        if dropped:
+            duplicates[index] = duplicates.get(index, 0) + dropped
+        labels_by_branch[index].extend(kept)
 
     # 所有分支都没留下内容、且没有任何一支是因为额度被跳过 → 没有可交付的树。
     # 反过来，如果有分支是"额度不够没展开"，骨架本身仍然有效，照常交出。
@@ -655,11 +734,16 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         )
 
     retried_set = set(retried)
+    # 收尾仍不足的分支：(下标, 标题, 差几个)。这是 `partial` 的第三个来源——
+    # 前两个（额度跳过、展开抛错）都在"展开阶段"就留了空，而这一种是"展开成功
+    # 但内容不够、补点也没补上"。只看前两个的话，某支 0 个要点也会报完整成功。
+    short: list[tuple[int, str, int]] = []
     for index, branch_id, title, count in sparse:
         # 因额度没展开、或因异常留空的分支已经由下面两条诊断说清楚了；
         # 这里再报一条「点数不足」等于对同一个原因告警两次。
         if index in skipped_set or index in failed_set:
             continue
+        short.append((index, title, need - count))
         tail = ("已补调一次模型，仍不足，按现状接受" if index in retried_set
                 else "模型调用额度不足，未能补调")
         diagnostics.append(Diagnostic(
@@ -676,9 +760,19 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             level=DiagnosticLevel.warn, code="BRANCH_SKIPPED_BUDGET", node_id=skeleton[index][1],
             message=f"因模型调用额度不足，分支「{skeleton[index][0]}」没有展开，已留空",
         ))
+    for index in sorted(duplicates):
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="DUPLICATE_POINT", node_id=skeleton[index][1],
+            message=(
+                f"分支「{skeleton[index][0]}」返回了 {duplicates[index]} 条与已有要点重复的内容，"
+                f"已去重；去重后这一支有 {len(labels_by_branch[index])} 个要点"
+            ),
+        ))
 
     expanded = len(skeleton) - len(skipped_set) - len(failed_set)
-    partial = bool(skipped_set) or bool(failed_set)
+    # 三种"没做满"都算 partial：额度跳过、展开抛错、补点后仍不足。
+    # 少第三种时实测某支 0 个要点仍报 partial=false、expanded_branches=3。
+    partial = bool(skipped_set) or bool(failed_set) or bool(short)
 
     ctx.candidate = content
     ctx.revision += 1
@@ -693,6 +787,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     if failed_set:
         names = "、".join(skeleton[index][0] for index in sorted(failed_set))
         content_parts.append(f"{len(failed_set)} 个分支展开出错，已留空：{names}。")
+    if short:
+        detail = "、".join(f"「{title}」差 {missing} 个" for _, title, missing in short)
+        content_parts.append(
+            f"{len(short)} 个分支要点不足（{detail}，要求每支 {need} 个），已按现状交出。"
+        )
     if retried:
         content_parts.append(f"其中 {len(retried)} 个分支要点不足，已各补调一次模型。")
 
@@ -706,6 +805,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             "planned_branches": len(skeleton),
             "expanded_branches": expanded,
             "partial": partial,
+            "short_branches": [
+                {"id": skeleton[index][1], "label": title, "missing": missing}
+                for index, title, missing in short
+            ],
             "branches": [
                 {"id": branch_id, "label": title, "points": len(labels_by_branch[index])}
                 for index, (title, branch_id) in enumerate(skeleton)
@@ -743,7 +846,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
         if not ctx.reserve_model_call():
             return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法展开。")
         ctx.extra_model_calls += 1
-        raw = await chat_async(EXPAND_PROMPT, ask)
+        raw = await chat_async(EXPAND_PROMPT, ask, max_tokens=_max_tokens(ctx))
     except GenerationError as exc:
         return _fail("generation_failed", f"展开失败：{exc}")
 
@@ -950,6 +1053,8 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
             "最后按代码验收并只补不合格的那几支。适合复杂主题——它每次只让模型"
             "输出一支，不受单次输出上限挤压，因此比 mindmap_generate 更稳。"
             "简单主题用 mindmap_generate（一次调用就够，更快）。"
+            "仅在没有附带材料时使用：它按主题自由展开，不读任何来源正文，"
+            "有材料时请用 mindmap_generate 做忠实整理。"
             "只有当前还没有导图时可用。"
         ),
         args_model=GenerateDeepArgs,
@@ -986,7 +1091,7 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
 
     裁剪规则：
       - `create` 给 `mindmap_generate` 与 `mindmap_generate_deep` 两个，由模型
-        按主题复杂度自选（描述里写清了两者的差别）
+        按主题复杂度自选（描述里写清了两者差别）
       - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
       - `edit` 给 `mindmap_edit`，请求带来源时再加 `rag_query`
 
@@ -994,13 +1099,21 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
     分片那条路的成本是 N+1 次调用，简单主题走它纯属浪费额度——这个判断
     只有拿到主题的模型能做。
 
+    **有来源时撤掉 `mindmap_generate_deep`**：它的入参里没有任何来源字段，
+    骨架与展开都只看主题，产出的树与材料无关，却会以 ok=True 成功返回。
+    带材料的新建走 `mindmap_generate` 的忠实整理模式（它给模型喂结构化来源、
+    还校验逐字引用）。这条不是"少给一个选项"，而是"少给一条会给出错误答案
+    的路"——模型看不到它，就不会选中它。
+
     `rag_query` 只在真有来源时才注册：没来源的检索必然返回「没有找到」，
     注册它只会诱导模型拿它当"思考"用。未知意图按 `create` 兜底——宁可少给
     工具，也不要把破坏性工具塞进一个没预期到的新意图里。
     """
     allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
-    if has_sources and intent in _SOURCE_AWARE_INTENTS:
-        allowed.add("rag_query")
+    if has_sources:
+        allowed.discard("mindmap_generate_deep")
+        if intent in _SOURCE_AWARE_INTENTS:
+            allowed.add("rag_query")
 
     registry = ToolRegistry()
     for name in _TOOL_ORDER:
