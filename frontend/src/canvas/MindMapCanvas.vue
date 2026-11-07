@@ -4,10 +4,11 @@ import { VueFlow, useVueFlow } from '@vue-flow/core';
 import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
+import { NODE_SIZE } from './layout/tidy';
 import MindNode from './MindNode.vue';
 
 const store = useMindMapStore();
-const { fitView, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
+const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
   useVueFlow();
 
 // 预览与候选节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
@@ -73,6 +74,20 @@ function scheduleFit() {
 
 watch(() => store.nodeCount, scheduleFit);
 watch(() => store.direction, scheduleFit);
+
+// 从引用列表跳过来时把目标挪到视野中心。位置就是布局算出的绝对坐标，
+// 中心点 = 左上角 + 半个节点；不需要访问 Vue Flow 内部的节点实例。
+// 跳转后关掉自动适配：用户按自己的意志看某一支，下一帧被拉回全图会很难受。
+watch(() => store.focusTick, () => {
+  const target = store.nodes.find(node => node.id === store.selectedId);
+  if (!target) return;
+  store.viewAdjusted = true;
+  void setCenter(
+    target.position.x + NODE_SIZE.width / 2,
+    target.position.y + NODE_SIZE.height / 2,
+    { duration: 250, zoom: 1 },
+  );
+});
 
 // 换方向会改掉每个节点的句柄位置（左 / 右 / 上 / 下）。Vue Flow 只在自己重新测量节点时
 // 才知道句柄动了，否则连线依旧按旧坐标绘制——表现为线头悬空、或从错误的一侧进出。

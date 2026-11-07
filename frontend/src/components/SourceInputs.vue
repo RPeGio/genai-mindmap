@@ -46,6 +46,22 @@ const problem = computed(() => {
   return sources.problem || sourceInputError(combined.value);
 });
 
+/**
+ * 有导图时才谈"这份来源有没有被引用"。
+ *
+ * 还没生成就摆一条 amber 提示，等于催用户去做他正要做的下一步；而且刚添加完
+ * 材料时所有来源都还没被引用，满屏黄字只会让人以为出了问题。
+ */
+const showRefState = computed(() => !!store.content);
+
+function refCount(sourceId: string): number {
+  return store.refIndex.counts[sourceId] ?? 0;
+}
+
+function refHits(sourceId: string) {
+  return store.refIndex.hits[sourceId] ?? [];
+}
+
 function addText() {
   if (sources.addText(prompt.value)) prompt.value = '';
 }
@@ -206,6 +222,25 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
             <summary class="cursor-pointer">查看正文</summary>
             <p class="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap break-words leading-relaxed">{{ item.source.text }}</p>
           </details>
+          <!-- 反向引用：这份材料被哪些节点用上了。没有导图时不提，否则等于在指责用户还没做的事。 -->
+          <template v-if="showRefState">
+            <details v-if="refCount(item.source.id)" class="mt-1 text-xs text-slate-600">
+              <summary class="cursor-pointer">被 {{ refCount(item.source.id) }} 个节点引用</summary>
+              <ul class="mt-1 flex flex-col gap-1">
+                <li v-for="hit in refHits(item.source.id)" :key="hit.id">
+                  <button
+                    type="button"
+                    class="break-words text-left underline decoration-slate-300 hover:text-slate-900"
+                    :title="hit.path.join(' / ')"
+                    @click="store.locate(hit.id)"
+                  >{{ hit.label }}</button>
+                </li>
+              </ul>
+            </details>
+            <p v-else class="mt-1 text-xs leading-relaxed text-amber-700">
+              这份来源没有被任何节点引用——生成时可能没用上。
+            </p>
+          </template>
         </template>
         <template v-else-if="item.state === 'failed'">
           <p role="alert" class="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-rose-700">{{ item.error }}</p>

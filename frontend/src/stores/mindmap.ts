@@ -4,6 +4,7 @@ import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, Source, SourceRef } from '../api/types';
+import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
@@ -705,6 +706,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 选中节点的引用。空节点也有自己的空数组，详情面板不必再判空。 */
   const selectedRefs = computed<SourceRef[]>(() => selectedNode.value?.node.source_refs ?? []);
 
+  /**
+   * 来源的反向索引。
+   *
+   * 只从 `content` 算：画布上可能正画着候选或预览节点，把它们算进引用统计会让
+   * 左侧说"被 5 个节点引用"、而其中 3 个根本不在导图里。
+   */
+  const refIndex = computed(() => buildRefIndex(content.value?.root ?? null));
+
+  /**
+   * "把某个节点挪到视野中心"的触发计数。
+   *
+   * 用计数器而不是监听 `selectedId`：在画布上手动点节点时也会改选中，若监听选中，
+   * 视图会把人刚拖到的位置又拽回中心。只有从引用列表主动跳转时才加一。
+   */
+  const focusTick = ref(0);
+
   /** 从根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
   const breadcrumb = computed<MindNode[]>(() => {
     const target = selectedId.value;
@@ -1253,6 +1270,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
     selectedId.value = id;
   }
 
+  /**
+   * 从引用列表跳到节点：选中它，并让画布把它移到视野中心。
+   *
+   * 与 `select()` 分开的原因见 `focusTick`：跳转是"我要看这个"，点选是"我在看这个"。
+   */
+  function locate(id: string) {
+    select(id);
+    if (selectedId.value !== id) return;
+    focusTick.value += 1;
+  }
+
   function setDirection(next: Direction) {
     direction.value = next;
     // 换方向后整体重排，视图必须重新适配，否则可能停在空白处。
@@ -1786,6 +1814,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     nodeCount,
     selectedNode,
     selectedRefs,
+    refIndex,
+    focusTick,
     breadcrumb,
     canUndo,
     canRedo,
@@ -1800,6 +1830,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     cancel,
     preview,
     select,
+    locate,
     setDirection,
     beginEdit,
     endEdit,

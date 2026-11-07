@@ -436,6 +436,11 @@ async function copyBody() {
           <ul class="mt-2 flex flex-col gap-2">
             <li v-for="(source, index) in store.content.source_usage" :key="source.source_id" class="break-words">
               {{ SOURCE_LABELS[source.kind] }} · {{ source.filename || `来源 ${index + 1}` }} · {{ source.char_count }} 字
+              <span
+                v-if="store.refIndex.counts[source.source_id]"
+                class="text-slate-400"
+              >· 被 {{ store.refIndex.counts[source.source_id] }} 个节点引用</span>
+              <span v-else class="text-amber-700">· 没有节点引用</span>
             </li>
           </ul>
           <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源（整图口径），具体出处见各节点的引用；原文未随导图保存。</p>
