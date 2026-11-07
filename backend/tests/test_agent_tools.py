@@ -19,8 +19,10 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
+from app.agent.provider import _MAX_TOKENS_CAP
 from app.agent.tools import (
     BRANCH_EXPAND_PROMPT,
+    MAX_OUTPUT_TOKENS_CAP,
     MAX_SOURCE_CHARS,
     PLAN_PROMPT,
     SOURCE_TRUNCATED_HINT,
@@ -61,12 +63,15 @@ def _ctx(intent: str = "create", candidate: MindMapContent | None = None,
          sources: list[Source] | None = None,
          selected_ids: list[str] | None = None,
          thinking_model: str = "default",
-         max_model_calls: int = 5) -> RunContext:
+         max_model_calls: int = 5,
+         max_output_tokens: int = 32768) -> RunContext:
     sources = sources or []
     request = AgentRunRequest(
         goal="做一张导图", intent=intent, sources=sources,
         selected_ids=selected_ids or [], thinking_model=thinking_model,
-        budget=RunBudget(max_model_calls=max_model_calls),
+        budget=RunBudget(
+            max_model_calls=max_model_calls, max_output_tokens=max_output_tokens,
+        ),
     )
     return RunContext(
         request=request,
@@ -287,7 +292,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         titles = ["范围", "原理", "实现", "评估", "风险"]
         systems: list[str] = []
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             systems.append(system)
             if system.startswith(PLAN_PROMPT):
                 return _plan(*titles)
@@ -324,7 +329,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         state = {"running": 0, "peak": 0}
         release = asyncio.Event()
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             if system.startswith(PLAN_PROMPT):
                 return _plan("甲", "乙", "丙")
             state["running"] += 1
@@ -350,7 +355,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         ctx = _ctx(max_model_calls=9)
         state = {"running": 0, "peak": 0}
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             if system.startswith(PLAN_PROMPT):
                 return _plan(*[f"分支{index}" for index in range(1, 9)])
             state["running"] += 1
@@ -385,7 +390,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         """骨架条数超出 ±1 的宽容范围也用实际返回：为条数整张重来等于再花一轮。"""
         ctx = _ctx(max_model_calls=10)
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             if system.startswith(PLAN_PROMPT):
                 return _plan("甲", "乙", "丙", "丁", "戊", "己", "庚")
             return _points(2, _branch_title(user))
@@ -404,7 +409,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         """某一支抛异常只该让那一支空着，其他分支照常建树。"""
         ctx = _ctx()
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             if system.startswith(PLAN_PROMPT):
                 return _plan("甲", "乙", "丙")
             title = _branch_title(user)
@@ -429,7 +434,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         ctx = _ctx(max_model_calls=8)
         calls = {"plan": 0, "乙": 0}
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             if system.startswith(PLAN_PROMPT):
                 calls["plan"] += 1
                 return _plan("甲", "乙", "丙")
@@ -458,7 +463,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         """额度只够骨架 + 一支：给出已展开的部分，并显式标 partial。"""
         ctx = _ctx(max_model_calls=2)
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             if system.startswith(PLAN_PROMPT):
                 return _plan("甲", "乙", "丙")
             return _points(2, _branch_title(user))
@@ -496,7 +501,7 @@ class GenerateDeepToolTest(unittest.TestCase):
     def test_all_branches_failing_is_reported(self):
         ctx = _ctx()
 
-        async def fake(system, user):
+        async def fake(system, user, *, max_tokens=None):
             if system.startswith(PLAN_PROMPT):
                 return _plan("甲", "乙", "丙")
             raise GenerationError("模型服务返回 HTTP 500")
@@ -509,6 +514,189 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertEqual(result.data["code"], "all_branches_failed")
         self.assertIsNone(ctx.candidate)
         self.assertEqual(ctx.revision, 0)
+
+    def test_every_internal_model_call_carries_the_output_token_cap(self):
+        """骨架与每支展开都要带 `max_tokens`，且等于 `min(budget, 16384)`。
+
+        不传的时候 `chat_async` 会用它自己的默认值，`RunBudget.max_output_tokens`
+        就只约束了 provider 那条路——工具内这条更大的出口完全没人守。
+        """
+        ctx = _ctx(max_model_calls=10)
+        seen: list[int | None] = []
+
+        async def fake(system, user, *, max_tokens=None):
+            seen.append(max_tokens)
+            if system.startswith(PLAN_PROMPT):
+                return _plan(*[f"分支{index}" for index in range(1, 7)])
+            return _points(3, _branch_title(user))
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=6,
+                points_per_branch=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        expected = min(ctx.request.budget.max_output_tokens, 16384)
+        self.assertEqual(len(seen), 7)  # 1 次骨架 + 6 支展开
+        self.assertEqual(seen, [expected] * 7)
+        # 16384 必须与 provider 的上限同值，否则两条出口各守一个数
+        self.assertEqual(MAX_OUTPUT_TOKENS_CAP, _MAX_TOKENS_CAP)
+
+    def test_output_cap_follows_the_smaller_budget_value(self):
+        """预算配得比上限更小时，发出去的必须是预算值，不能被上限抬高。"""
+        ctx = _ctx(max_model_calls=10, max_output_tokens=2048)
+        seen: list[int | None] = []
+
+        async def fake(system, user, *, max_tokens=None):
+            seen.append(max_tokens)
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            return _points(2, _branch_title(user))
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(seen, [2048] * 4)  # 1 骨架 + 3 展开
+
+    def test_branch_still_short_after_retry_marks_partial(self):
+        """补点后仍不足必须报 partial，并在 content 里点名哪一支、差几个。
+
+        实测缺陷：某支最终 0 个要点，`partial=false`、`expanded_branches=3`——
+        一次"完整成功"。少要点是质量波动可以接受，把它说成完整成功不行。
+        """
+        ctx = _ctx(max_model_calls=10)
+        calls = {"乙": 0}
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            title = _branch_title(user)
+            if title != "乙":
+                return _points(3, title)
+            calls["乙"] += 1
+            if calls["乙"] == 1:
+                return {"points": ["乙要点一"]}
+            return {"points": []}  # 补点也没补出来
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="x", branches=3,
+                points_per_branch=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(calls["乙"], 2)  # 首轮 + 一次补点
+        self.assertTrue(result.data["partial"])
+        self.assertEqual(
+            [(item["label"], item["missing"]) for item in result.data["short_branches"]],
+            [("乙", 2)],
+        )
+        self.assertIn("乙", result.content)
+        self.assertIn("差 2 个", result.content)
+        codes = [item["code"] for item in result.data["diagnostics"]]
+        self.assertIn("SPARSE_BRANCH", codes)
+
+    def test_retry_request_carries_the_points_already_written(self):
+        """补点请求要带上该分支已有的要点。
+
+        模型看不到自己已经写了什么，却被要求「不要重复」——那条要求它根本
+        没法执行，实测同一要点被返回两次。
+        """
+        ctx = _ctx(max_model_calls=10)
+        retry_users: list[str] = []
+        calls = {"乙": 0}
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            title = _branch_title(user)
+            if title != "乙":
+                return _points(3, title)
+            calls["乙"] += 1
+            if calls["乙"] == 1:
+                return {"points": ["乙要点一"]}
+            retry_users.append(user)
+            return {"points": ["乙要点二", "乙要点三"]}
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="x", branches=3,
+                points_per_branch=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(len(retry_users), 1)
+        self.assertIn("已有要点", retry_users[0])
+        self.assertIn("乙要点一", retry_users[0])
+        self.assertFalse(result.data["partial"])
+
+    def test_duplicate_points_are_dropped_and_break_completeness(self):
+        """重复要点去重后按实际数量验收，并留一条 DUPLICATE_POINT 诊断。
+
+        不按去重后的数量判的话，「返回同一句话两次」能骗过数量验收：
+        提示词要求补齐 2 个，实际树上只多了 0 个，而验收说够了。
+        """
+        ctx = _ctx(max_model_calls=10)
+        calls = {"乙": 0}
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            title = _branch_title(user)
+            if title != "乙":
+                return _points(3, title)
+            calls["乙"] += 1
+            if calls["乙"] == 1:
+                return {"points": ["乙要点一"]}
+            return {"points": ["乙要点一", "乙要点一"]}  # 同一要点返回两次
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="x", branches=3,
+                points_per_branch=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        branch = next(item for item in ctx.candidate.root.children if item.label == "乙")
+        self.assertEqual([child.label for child in branch.children], ["乙要点一"])
+        self.assertTrue(result.data["partial"])
+        duplicated = [item for item in result.data["diagnostics"]
+                      if item["code"] == "DUPLICATE_POINT"]
+        self.assertEqual(len(duplicated), 1)
+        self.assertIn("乙", duplicated[0]["message"])
+
+    def test_plan_request_states_the_requested_branch_count(self):
+        """骨架请求的 user 里要有期望分支数：3 支与 8 支的输入必须不同。
+
+        只写在 system 里的话，两次请求模型看到的东西一字不差，`branches`
+        这个用户选项等于没生效。
+        """
+        plan_users: dict[int, str] = {}
+        for branches in (3, 8):
+            ctx = _ctx(max_model_calls=12)
+            captured: list[str] = []
+
+            async def fake(system, user, *, max_tokens=None, _captured=captured):
+                if system.startswith(PLAN_PROMPT):
+                    _captured.append(user)
+                    return _plan(*[f"分支{index}" for index in range(1, branches + 1)])
+                return _points(2, _branch_title(user))
+
+            with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+                result = _run(build_registry("create").execute(_call(
+                    "mindmap_generate_deep", topic="机器学习", branches=branches,
+                    points_per_branch=2), ctx))
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(len(captured), 1)
+            plan_users[branches] = captured[0]
+
+        self.assertIn("3", plan_users[3])
+        self.assertIn("8", plan_users[8])
+        self.assertNotEqual(plan_users[3], plan_users[8])
+        for text in plan_users.values():
+            self.assertIn("20 字", text)
+            self.assertIn("互不重叠", text)
 
 
 class ExpandToolTest(unittest.TestCase):
@@ -716,6 +904,14 @@ class DeepBudgetFloorTest(unittest.TestCase):
         # 分片默认 5 支；常见上界是 1 骨架 + 5 展开 + 2 补点
         self.assertGreaterEqual(budget.max_model_calls, 2 + 5)
 
+    def test_default_budget_covers_eight_expansions(self):
+        """默认预算要覆盖「1 外层 + 1 骨架 + 8 展开」= 10 次调用。
+
+        这是实测缺陷的回归：六支分片是 1 + 1 + 6 + 1(收尾轮) = 9 次，默认给 8
+        时收尾那一轮必然 `budget_exhausted`——树已经建好了，却连 done 都发不出来。
+        """
+        self.assertGreaterEqual(RunBudget().max_model_calls, 1 + 1 + 8)
+
     def test_partial_is_reported_rather_than_faked(self):
         """额度不够时必须如实标注部分完成，不能装成完整成功。"""
         ctx = _ctx(intent="create", max_model_calls=2)
@@ -735,6 +931,19 @@ class RegistryTest(unittest.TestCase):
             build_registry("create").names(),
             ["mindmap_generate", "mindmap_generate_deep"],
         )
+
+    def test_deep_generate_is_absent_when_sources_are_attached(self):
+        """带材料时不给分片生成。
+
+        它的入参里没有任何来源字段，骨架与展开都只看主题：产出的树与材料无关，
+        却会以 ok=True 成功返回。看不到这个工具，模型就不会选中它。
+        """
+        with_sources = build_registry("create", has_sources=True).names()
+        self.assertNotIn("mindmap_generate_deep", with_sources)
+        self.assertIn("mindmap_generate", with_sources)
+
+        without_sources = build_registry("create", has_sources=False).names()
+        self.assertIn("mindmap_generate_deep", without_sources)
 
     def test_deep_generate_is_absent_for_expand_and_edit(self):
         """分片生成只在 create 里有：expand / edit 下连入口都不该出现。"""

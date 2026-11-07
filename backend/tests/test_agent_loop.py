@@ -24,7 +24,7 @@ from app.agent.contracts import (
 )
 from app.agent.provider import _parse_completion
 from app.agent.service import _dedupe_key, outline_text, run
-from app.agent.tools import ToolRegistry, build_registry
+from app.agent.tools import PLAN_PROMPT, ToolRegistry, build_registry
 from app.contracts.mindmap import MindMapContent
 from app.generation.service import GenerationError
 
@@ -352,6 +352,39 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(events[-1].code, "too_many_failures")
         self.assertEqual(events[-1].limit, "max_repairs")
 
+    def test_timed_out_tool_emits_paired_tool_end(self):
+        """时间预算耗尽时，每个 tool_start 都要有配对的 tool_end。
+
+        少了那一帧，事件序列是 `stage → tool_start → error`，前端那行工具永远
+        停在「执行中」——`max_repairs` 判停那条路径修过同一个问题，超时这里漏了。
+        """
+        async def slow(args, ctx):
+            await asyncio.sleep(2)
+            return ToolResult(ok=True, content="太慢了")
+
+        call = ToolCall(call_id="slow-1", name="echo", arguments={"text": "x"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls")])
+        events = _collect(
+            _request(budget=RunBudget(max_model_calls=5, max_tool_calls=5,
+                                      max_seconds=0.4)),
+            provider, _registry(slow),
+        )
+
+        types = [event.type for event in events]
+        self.assertEqual(types, ["stage", "tool_start", "tool_end", "error"])
+
+        starts = [event.call_id for event in events if event.type == "tool_start"]
+        ends = [event.call_id for event in events if event.type == "tool_end"]
+        self.assertEqual(starts, ends)
+        self.assertTrue(starts)  # 没有工具被调用的话这条测试什么都没证
+
+        end = next(event for event in events if event.type == "tool_end")
+        self.assertFalse(end.ok)
+        self.assertEqual(end.result_summary["code"], "tool_timeout")
+        self.assertEqual(events[-1].limit, "max_seconds")
+        # seq 仍然连续：补帧不能打断前端判断丢帧的依据
+        self.assertEqual([event.seq for event in events], list(range(1, len(events) + 1)))
+
     def test_budget_one_allows_exactly_one_real_model_call(self):
         """预算 1：外层调用 + 工具内部调用合计只能 1 次。
 
@@ -401,6 +434,42 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(provider.calls + len(chats), 2)
         snapshot = next(event for event in events if event.type == "snapshot")
         self.assertEqual(_node_ids(snapshot.content.root), {"root", "a", "b", "b1", "c"})
+
+
+class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
+    """六支分片在**默认预算**下要能走完整循环。
+
+    这条是端到端的回归：分片工具自己算得再对，只要默认 `max_model_calls` 不够，
+    收尾那轮就会把一次已经建好的树变成 `budget_exhausted`——用户拿不到 done，
+    前端也就拿不到最终内容。
+    """
+
+    def test_six_branch_deep_run_finishes_with_done(self):
+        async def fake_chat(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return {"branches": [f"分支{index}" for index in range(1, 7)]}
+            return {"points": ["要点一", "要点二", "要点三"]}
+
+        call = ToolCall(
+            call_id="deep-1", name="mindmap_generate_deep",
+            arguments={"topic": "机器学习", "branches": 6, "points_per_branch": 3},
+        )
+        provider = ScriptedProvider([
+            _completion([call], finish="tool_calls"),
+            _completion(),
+        ])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(_request(), provider, build_registry("create"))
+
+        self.assertEqual(events[-1].type, "done")
+        self.assertEqual(len(events[-1].content.root.children), 6)
+        for branch in events[-1].content.root.children:
+            self.assertEqual(len(branch.children), 3)
+        # 2 轮外层调用（第一轮发工具、第二轮收尾），工具内 7 次都记在同一个账本里
+        self.assertEqual(provider.calls, 2)
+        end = next(event for event in events if event.type == "tool_end")
+        self.assertTrue(end.ok, end.result_summary)
+        self.assertFalse(end.result_summary["partial"])
 
 
 class OutlineRefreshTest(unittest.TestCase):
