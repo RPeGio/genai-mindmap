@@ -44,6 +44,10 @@ def sources():
 
 @pytest.fixture
 def tree(sources):
+    # 一级分支必须是 3 条：走 `/api/pipeline/generate` 的用例经过
+    # `validate_generated_content` 的默认路径，`MIN_BRANCHES = 3` 会把 2 分支
+    # 的树判成 502。新增的 c 与其它分支一样带一条能逐字对上原文的引用，
+    # 这样它既不会引入新诊断，也让"某条诊断只出现在某个节点"的断言保持原意。
     return {
         "title": "材料摘要",
         "root": {"id": "r", "label": "材料摘要", "source_refs": [
@@ -55,6 +59,9 @@ def tree(sources):
             ]},
             {"id": "b", "label": "发布安排", "source_refs": [
                 {"source_id": "s2", "quote": "下周发布"},
+            ]},
+            {"id": "c", "label": "机器学习", "source_refs": [
+                {"source_id": "s1", "quote": "机器学习"},
             ]},
         ]},
         "source_usage": [
@@ -176,7 +183,7 @@ def test_missing_original_text_and_omitted_sources_are_distinguished(tree):
     assert check(content) == []
     diagnostics = check(content, [])
     assert {d.code for d in diagnostics} == {"SOURCE_TEXT_UNAVAILABLE", "UNSOURCED_NODE"}
-    assert {d.node_id for d in diagnostics if d.code == "UNSOURCED_NODE"} == {"r", "a", "b"}
+    assert {d.node_id for d in diagnostics if d.code == "UNSOURCED_NODE"} == {"r", "a", "b", "c"}
 
 
 @pytest.mark.parametrize("page,code", [(1, "SOURCE_PAGE_UNVERIFIED"), (2, "INVALID_SOURCE_PAGE"),

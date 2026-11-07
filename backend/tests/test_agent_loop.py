@@ -28,7 +28,9 @@ from app.agent.tools import ToolRegistry, build_registry
 from app.contracts.mindmap import MindMapContent
 from app.generation.service import GenerationError
 
-# 生成工具返回的树：4 个节点、两层。用于验证工具内调用与 snapshot 帧。
+# 生成工具返回的树：5 个节点、三层。用于验证工具内调用与 snapshot 帧。
+# 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
+# 路径，`MIN_BRANCHES = 3` 会把 2 分支的树判成 invalid_map。
 TREE = {
     "title": "示例",
     "root": {"id": "root", "label": "根", "children": [
@@ -36,6 +38,7 @@ TREE = {
         {"id": "b", "label": "乙", "children": [
             {"id": "b1", "label": "乙一", "children": []},
         ]},
+        {"id": "c", "label": "丙", "children": []},
     ]},
 }
 
@@ -397,7 +400,7 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(len(chats), 1)
         self.assertEqual(provider.calls + len(chats), 2)
         snapshot = next(event for event in events if event.type == "snapshot")
-        self.assertEqual(_node_ids(snapshot.content.root), {"root", "a", "b", "b1"})
+        self.assertEqual(_node_ids(snapshot.content.root), {"root", "a", "b", "b1", "c"})
 
 
 class OutlineRefreshTest(unittest.TestCase):
@@ -477,7 +480,7 @@ class SnapshotEmissionTest(unittest.TestCase):
         # 整树校验：能重新走一遍契约（id 唯一、层数、children 上限）才算完整，
         # 补括号拼出来的半棵树过不了这一关
         replay = MindMapContent.model_validate(snapshot.content.model_dump())
-        self.assertEqual(_node_ids(replay.root), {"root", "a", "b", "b1"})
+        self.assertEqual(_node_ids(replay.root), {"root", "a", "b", "b1", "c"})
         # snapshot 与 done 必须是同一棵树：两个来源不一致会让前端闪一下
         self.assertEqual(events[-1].content.model_dump(), snapshot.content.model_dump())
 

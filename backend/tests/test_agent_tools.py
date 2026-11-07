@@ -20,6 +20,9 @@ from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
 from app.generation.service import DETAIL_PROMPT, SOURCED_DETAIL_PROMPT
 
+# 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
+# 路径，`MIN_BRANCHES = 3` 会拦下更少的树。这里的 2 分支结构会直接变成一次
+# invalid_map，测的就不再是"生成成功之后怎么落候选树"了。
 TREE = {
     "title": "示例",
     "root": {
@@ -28,6 +31,7 @@ TREE = {
                 {"id": "a1", "label": "甲一", "children": []},
             ]},
             {"id": "b", "label": "乙", "children": []},
+            {"id": "c", "label": "丙", "children": []},
         ],
     },
 }
@@ -86,7 +90,7 @@ class GenerateToolTest(unittest.TestCase):
         self.assertIsNotNone(ctx.candidate)
         self.assertEqual(ctx.candidate.root.id, "root")
         self.assertEqual(ctx.revision, 1)
-        self.assertEqual(result.data["node_count"], 4)
+        self.assertEqual(result.data["node_count"], 5)
 
     def test_invalid_model_output_is_reported_not_raised(self):
         ctx = _ctx()
@@ -274,7 +278,7 @@ class EditToolTest(unittest.TestCase):
         result = _run(build_registry("edit").execute(
             _call("mindmap_edit", ops=[{"op": "remove", "id": "a"}]), ctx))
         self.assertTrue(result.ok, result.content)
-        self.assertEqual([child.id for child in ctx.candidate.root.children], ["b"])
+        self.assertEqual([child.id for child in ctx.candidate.root.children], ["b", "c"])
 
     def test_move_into_own_descendant_is_rejected(self):
         ctx = _ctx(intent="edit", candidate=_content())
