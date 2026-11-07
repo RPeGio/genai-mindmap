@@ -605,7 +605,7 @@ class BudgetTest(unittest.TestCase):
         """
         chats: list[str] = []
 
-        async def fake_chat(system, user, *, max_tokens=None):
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
             chats.append(user)
             return TREE
 
@@ -760,7 +760,7 @@ class SnapshotEmissionTest(unittest.TestCase):
     """
 
     def test_generate_success_emits_snapshot_with_valid_tree(self):
-        async def fake_chat(system, user, *, max_tokens=None):
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
             return TREE
 
         call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
@@ -781,6 +781,31 @@ class SnapshotEmissionTest(unittest.TestCase):
         self.assertEqual(_node_ids(replay.root), {"root", "a", "b", "b1", "c"})
         # snapshot 与 done 必须是同一棵树：两个来源不一致会让前端闪一下
         self.assertEqual(events[-1].content.model_dump(), snapshot.content.model_dump())
+
+    def test_sourced_generate_emits_growth_before_tool_end_and_snapshot(self):
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
+            self.assertIsNotNone(on_delta)
+            text = json.dumps(TREE, ensure_ascii=False)
+            for start in range(0, len(text), 7):
+                await on_delta(text[start:start + 7])
+            return TREE
+
+        source = Source(id="s1", kind="document", status="parsed", text="论文原文。")
+        request = AgentRunRequest(goal="整理论文", intent="create", sources=[source])
+        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "论文"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(request, provider)
+
+        self.assertEqual([event.type for event in events],
+                         ["stage", "tool_start"] + ["node_grow"] * 5
+                         + ["tool_end", "snapshot", "done"])
+        self.assertEqual([event.seq for event in events], list(range(1, 11)))
+        growth = [event for event in events if event.type == "node_grow"]
+        self.assertEqual([(event.path, event.label) for event in growth],
+                         [(None, "根"), ([], "甲"), ([], "乙"), ([1], "乙一"), ([], "丙")])
+        self.assertTrue(events[-3].ok)
+        self.assertEqual(events[-2].content, events[-1].content)
 
     def test_snapshot_is_not_emitted_when_candidate_already_exists(self):
         """expand / edit 一开始就有候选树：不重复发 snapshot。"""

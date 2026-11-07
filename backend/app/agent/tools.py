@@ -56,6 +56,7 @@ from app.generation.service import (
     thinking_block,
     validate_generated_content,
 )
+from app.generation.stream_partial import collect_new_nodes, parse_partial
 from app.knowledge.service import search_sources
 
 # 与 backend/app/contracts/mindmap.py 的 Node.children max_length 同口径
@@ -601,6 +602,48 @@ class _GrowStream:
             await self._report(own, position, child)
 
 
+@dataclass
+class _GenerateGrowStream:
+    """整树响应自带 id，需要把父 id 转成预览协议里的父节点索引链。"""
+
+    ctx: RunContext
+    buffer: str = ""
+    seen: dict[str, str] = field(default_factory=dict)
+    reported: set[tuple[tuple[int, ...] | None, str]] = field(default_factory=set)
+    path_of: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    child_counts: dict[str, int] = field(default_factory=dict)
+    pending: dict[str, list[dict]] = field(default_factory=dict)
+
+    async def feed(self, delta: str) -> None:
+        self.buffer += delta
+        obj = parse_partial(self.buffer)
+        if obj is None:
+            return
+        for parent_id, node in collect_new_nodes(obj, self.seen, self.buffer):
+            await self._report(parent_id, node)
+
+    async def _report(self, parent_id: str | None, node: dict) -> None:
+        if parent_id is not None and parent_id not in self.path_of:
+            # 增量提取顺序异常时可能先拿到孩子；提取器已记住孩子的 id，
+            # 这里若直接跳过，后续 delta 就再也不会返回这些孩子。
+            self.pending.setdefault(parent_id, []).append(node)
+            return
+
+        path: tuple[int, ...] | None = None
+        own: tuple[int, ...] = ()
+        if parent_id is not None:
+            path = self.path_of[parent_id]
+            index = self.child_counts.get(parent_id, 0)
+            self.child_counts[parent_id] = index + 1
+            own = (*path, index)
+
+        # 整树提取器只保留 id/label，不能把它补出的空 children 当作不可展开。
+        await _emit_grow(self.ctx, self.reported, path, node["label"].strip()[:200], None)
+        self.path_of[node["id"]] = own
+        for child in self.pending.pop(node["id"], []):
+            await self._report(node["id"], child)
+
+
 def _audit_branches(
     content: MindMapContent, minimum: int,
 ) -> tuple[list[tuple[int, str, str, int]], list[str]]:
@@ -957,16 +1000,22 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 之前（来源在 user 消息里）。有来源时要多带一句限定，否则「必须举反例」
         # 这类要求会被当成展开许可，模型开始补写材料里没有的内容。
         thinking = thinking_block(ctx.request.thinking_model)
+        # 无消费者时连 on_delta=None 都不传，保留原来的一次性调用约定。
+        # 回调失败的隔离与流式退回仍交给 chat_async，预览不参与候选树校验。
+        stream_kwargs = {}
+        if ctx.emit is not None:
+            stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
         if sources:
             # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
             system = SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
             raw = await chat_async(
                 system, _source_prompt_input(sources, system=system),
-                max_tokens=_max_tokens(ctx),
+                max_tokens=_max_tokens(ctx), **stream_kwargs,
             )
         else:
             raw = await chat_async(
                 DETAIL_PROMPT + thinking, args.topic, max_tokens=_max_tokens(ctx),
+                **stream_kwargs,
             )
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")

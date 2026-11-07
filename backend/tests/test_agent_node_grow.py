@@ -39,7 +39,16 @@ from app.agent.tools import (
     ToolRegistry,
     build_registry,
 )
-from app.generation.service import GenerationError, chat_async
+from app.contracts.mindmap import MindMapContent
+from app.contracts.source import Source
+from app.generation.service import (
+    DETAIL_PROMPT,
+    SOURCED_DETAIL_PROMPT,
+    SOURCED_THINKING_GUARD,
+    GenerationError,
+    chat_async,
+    thinking_block,
+)
 
 TOPIC = "考研数学复习计划"
 
@@ -529,6 +538,238 @@ def _sse(chunks: list[str], finish_reason: str | None = None,
     if done:
         parts.append("data: [DONE]\n\n")
     return "".join(parts).encode()
+
+
+class GenerateGrowTest(unittest.TestCase):
+    """带 id 的整树响应也必须在候选树完成前上报，而且不能影响最终生成。"""
+
+    def _ctx(self, emit=None, *, with_sources=True):
+        sources = [Source(id="s1", kind="document", status="parsed", text="论文原文。")]
+        if not with_sources:
+            sources = []
+        request = AgentRunRequest(
+            goal="整理论文", intent="create", sources=sources,
+            budget=RunBudget(max_output_tokens=1234),
+        )
+        return RunContext(
+            request=request, emit=emit,
+            sources_by_id={source.id: source for source in sources},
+        )
+
+    def _tree(self):
+        return {"title": "论文", "root": {"id": "root", "label": "论文", "children": [
+            {"id": "a", "label": "架构", "children": [
+                {"id": "a1", "label": "注意力", "children": []},
+            ]},
+            {"id": "b", "label": "训练", "children": [
+                {"id": "b1", "label": "优化器", "children": [
+                    {"id": "b11", "label": "参数", "children": []},
+                ]},
+            ]},
+            {"id": "c", "label": "效果", "children": []},
+        ]}}
+
+    def _execute(self, ctx):
+        registry = build_registry("create", has_sources=bool(ctx.request.sources))
+        if ctx.request.sources:
+            self.assertNotIn("mindmap_generate_deep", registry)
+        call = ToolCall(call_id="generate-1", name="mindmap_generate",
+                        arguments={"topic": "整理论文"})
+        return _run(registry.execute(call, ctx))
+
+    def test_sourced_generate_streams_paths_before_candidate_is_ready(self):
+        frames, emit = _collector()
+        ctx = self._ctx(emit)
+        tree = self._tree()
+        tree["root"]["source_refs"] = [{"source_id": "s1", "quote": "论文原文。"}]
+
+        async def chat(system, user, *, max_tokens, on_delta):
+            self.assertTrue(system.startswith(SOURCED_DETAIL_PROMPT))
+            self.assertEqual(json.loads(user.split("\n", 1)[1]),
+                             [{"source_id": "s1", "text": "论文原文。"}])
+            self.assertEqual(max_tokens, 1234)
+            text = json.dumps(tree, ensure_ascii=False)
+            for start in range(0, len(text), 7):
+                await on_delta(text[start:start + 7])
+            self.assertIsNone(ctx.candidate)
+            self.assertEqual(_keys(frames), [
+                (None, "论文"), ((), "架构"), ((0,), "注意力"),
+                ((), "训练"), ((1,), "优化器"), ((1, 0), "参数"), ((), "效果"),
+            ])
+            self.assertTrue(all(frame["expandable"] is None for frame in frames))
+            return tree
+
+        with patch("app.agent.tools.chat_async", new=chat):
+            result = self._execute(ctx)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["node_count"], 7)
+        self.assertEqual(ctx.candidate.root.source_refs[0].quote, "论文原文。")
+        self.assertEqual(ctx.candidate.source_usage[0].source_id, "s1")
+        self.assertEqual((ctx.revision, ctx.extra_model_calls, ctx.model_calls_used), (1, 1, 1))
+
+    def test_topic_only_generate_also_receives_delta_callback(self):
+        frames, emit = _collector()
+        ctx = self._ctx(emit, with_sources=False)
+        tree = self._tree()
+
+        async def chat(system, user, *, max_tokens, on_delta):
+            self.assertEqual(system, DETAIL_PROMPT + thinking_block("default"))
+            self.assertEqual(user, "整理论文")
+            await on_delta(json.dumps(tree, ensure_ascii=False))
+            return tree
+
+        with patch("app.agent.tools.chat_async", new=chat):
+            result = self._execute(ctx)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(len(frames), 7)
+
+    def test_children_wait_for_late_parent_and_flush_in_arrival_order(self):
+        frames, emit = _collector()
+        ctx = self._ctx(emit)
+        batches = [
+            [("a", {"id": "a1", "label": "甲一", "children": []})],
+            [("a", {"id": "a2", "label": "甲二", "children": []})],
+            [("root", {"id": "a", "label": "甲", "children": []}),
+             ("root", {"id": "b", "label": "乙", "children": []})],
+            [(None, {"id": "root", "label": "论文", "children": []}),
+             ("root", {"id": "c", "label": "丙", "children": []})],
+        ]
+
+        async def chat(system, user, *, max_tokens, on_delta):
+            # 注入提取顺序异常：正常解析器会先给父节点，不能靠正常顺序覆盖缓存。
+            for chunk in ("{}", " ", " "):
+                await on_delta(chunk)
+                self.assertEqual(frames, [])
+            await on_delta(" ")
+            return self._tree()
+
+        with (patch("app.agent.tools.chat_async", new=chat),
+              patch("app.agent.tools.collect_new_nodes", side_effect=batches)):
+            result = self._execute(ctx)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(_keys(frames), [
+            (None, "论文"), ((), "甲"), ((0,), "甲一"), ((0,), "甲二"),
+            ((), "乙"), ((), "丙"),
+        ])
+
+    def test_partial_label_and_id_are_not_reported(self):
+        frames, emit = _collector()
+        chunks = [
+            '{"title":"论文","root":{"id":"root","label":',
+            '"中心主题',
+            '","children":[{"id":"a","label":"架构',
+            '","children":[{"label":"注意力","id":"a',
+            '1","children":[]}]},{"id":"b","label":"训练","children":[]},'
+            '{"id":"c","label":"效果","children":[]}]}}',
+        ]
+
+        async def chat(system, user, *, max_tokens, on_delta):
+            expected = [[], [], ["中心主题"], ["中心主题", "架构"],
+                        ["中心主题", "架构", "注意力", "训练", "效果"]]
+            for chunk, labels in zip(chunks, expected):
+                await on_delta(chunk)
+                self.assertEqual([frame["label"] for frame in frames], labels)
+            return json.loads("".join(chunks))
+
+        with patch("app.agent.tools.chat_async", new=chat):
+            result = self._execute(self._ctx(emit))
+        self.assertTrue(result.ok, result.content)
+
+    def test_deduplicates_parent_path_and_normalized_label(self):
+        frames, emit = _collector()
+        tree = self._tree()
+        tree["root"]["children"][0]["label"] = " 重复 "
+        tree["root"]["children"][1]["label"] = "重复"
+        tree["root"]["children"][2]["children"] = [
+            {"id": "c1", "label": "重复", "children": []},
+        ]
+
+        async def chat(system, user, *, max_tokens, on_delta):
+            for char in json.dumps(tree, ensure_ascii=False):
+                await on_delta(char)
+            # 多次解析同一缓冲区也不能重发，重复标题仍占到达顺序中的位置。
+            await on_delta("")
+            return tree
+
+        with patch("app.agent.tools.chat_async", new=chat):
+            result = self._execute(self._ctx(emit))
+        self.assertTrue(result.ok, result.content)
+        keys = _keys(frames)
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(keys.count(((), "重复")), 1)
+        self.assertIn(((2,), "重复"), keys)
+
+    def test_no_emitter_preserves_both_one_shot_call_signatures(self):
+        for with_sources in (True, False):
+            with self.subTest(with_sources=with_sources):
+                ctx = self._ctx(with_sources=with_sources)
+                calls = []
+
+                # 故意不接 on_delta：传 None 也会让旧调用约定失效。
+                async def chat(system, user, *, max_tokens):
+                    calls.append((system, user, max_tokens))
+                    return self._tree()
+
+                with patch("app.agent.tools.chat_async", new=chat):
+                    result = self._execute(ctx)
+                self.assertTrue(result.ok, result.content)
+                self.assertEqual(len(calls), 1)
+                system, user, max_tokens = calls[0]
+                expected_system = DETAIL_PROMPT + thinking_block("default")
+                if with_sources:
+                    expected_system = (SOURCED_DETAIL_PROMPT + thinking_block("default")
+                                       + SOURCED_THINKING_GUARD)
+                    self.assertEqual(json.loads(user.split("\n", 1)[1]),
+                                     [{"source_id": "s1", "text": "论文原文。"}])
+                else:
+                    self.assertEqual(user, "整理论文")
+                self.assertEqual(system, expected_system)
+                self.assertEqual(max_tokens, 1234)
+                self.assertEqual(ctx.candidate.root, MindMapContent.model_validate(self._tree()).root)
+
+    def test_stream_failures_keep_sourced_generation_successful(self):
+        text = json.dumps(self._tree(), ensure_ascii=False)
+        payload = {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}
+        for failure in ("ignored", "empty", "interrupted", "invalid_json"):
+            with self.subTest(failure=failure):
+                bodies = []
+                frames, emit = _collector()
+                ctx = self._ctx(emit)
+
+                def handler(request):
+                    body = json.loads(request.content)
+                    bodies.append(body)
+                    if not body.get("stream") or failure == "ignored":
+                        return httpx.Response(200, json=payload)
+                    if failure == "empty":
+                        return httpx.Response(200, content=_sse([]))
+                    if failure == "interrupted":
+                        return httpx.Response(200, content=_sse([text[:90]], done=False))
+                    return httpx.Response(200, content=_sse(["不是 JSON"]))
+
+                with patch.dict(os.environ, BASE_ENV), _mock_client(handler):
+                    result = self._execute(ctx)
+                self.assertTrue(result.ok, result.content)
+                self.assertEqual(ctx.candidate.root.id, "root")
+                self.assertEqual(len(bodies), 2)
+                self.assertTrue(bodies[0]["stream"])
+                self.assertNotIn("stream", bodies[1])
+                self.assertEqual({key: value for key, value in bodies[0].items()
+                                  if key != "stream"}, bodies[1])
+
+    def test_emitter_failure_does_not_fail_sourced_generation(self):
+        emit = AsyncMock(side_effect=RuntimeError("预览通道失效"))
+        ctx = self._ctx(emit)
+        text = json.dumps(self._tree(), ensure_ascii=False)
+
+        def handler(request):
+            return httpx.Response(200, content=_sse([text[:90], text[90:]]))
+
+        with patch.dict(os.environ, BASE_ENV), _mock_client(handler):
+            result = self._execute(ctx)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["node_count"], 7)
+        emit.assert_awaited_once()
 
 
 class ChatAsyncStreamingTest(unittest.TestCase):
