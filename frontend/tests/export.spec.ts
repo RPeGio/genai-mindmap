@@ -61,6 +61,7 @@ describe('exportMindMap', () => {
     vi.unstubAllGlobals();
   });
 
+
   it('失败时抛出带后端文案的错误', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,
@@ -79,8 +80,9 @@ describe('exportMindMap', () => {
     vi.unstubAllGlobals();
   });
 
-  it('发出前裁掉 v2 的 note，否则后端 extra="forbid" 直接 422', async () => {
-    // 样例导图里的节点带 note（正文），v1 的 Node 不认这个字段。
+  it('把 note 折进 label 再发，字段本身不带 v2 的 note', async () => {
+    // 样例导图里的节点带 note（正文）：v1 的 Node 不认这个字段，直接发会 422；
+    // 但也不能一裁了之——导出的成品只剩短标题就看不懂了。
     const withNote = {
       title: '季度规划',
       root: { id: 'root', label: '产品', note: '正文放在 note 里', children: [] },
@@ -93,7 +95,28 @@ describe('exportMindMap', () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     const sent = JSON.parse(String(init.body)) as { content: { root: Record<string, unknown> } };
     expect(sent.content.root).not.toHaveProperty('note');
-    expect(sent.content.root.label).toBe('产品');
+    // note 自己就以标题开头时不再重复拼一遍（实际数据里很常见）
+    expect(sent.content.root.label).toBe('产品：正文放在 note 里');
+  });
+
+  it('正文已经以标题开头时不再重复标题', async () => {
+    const content = {
+      title: '机器学习',
+      root: {
+        id: 'root',
+        label: '分类',
+        note: '分类：输出离散标签。',
+        children: [],
+      },
+    } as MindMapContent;
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => '' });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await exportMindMap('markdown', content);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const sent = JSON.parse(String(init.body)) as { content: { root: Record<string, unknown> } };
+    expect(sent.content.root.label).toBe('分类：输出离散标签。');
     vi.unstubAllGlobals();
   });
 });
