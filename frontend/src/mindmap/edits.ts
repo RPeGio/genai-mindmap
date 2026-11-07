@@ -6,7 +6,7 @@ import type { MindMapContent, MindNode } from '../api/types';
  * 前端先拦一次，省掉一次必然失败的请求；服务端仍是最终裁判（422）。
  */
 export const LIMITS = {
-  nodes: 300,
+  nodes: 1000,
   depth: 8,
   children: 50,
   label: 200,

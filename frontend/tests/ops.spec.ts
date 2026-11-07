@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MindMapContent, MindNode, SourceRef } from '../src/api/types';
-import { cloneTree } from '../src/mindmap/edits';
+import { cloneTree, LIMITS } from '../src/mindmap/edits';
 import type { MindMapOp, OpBatch } from '../src/mindmap/ops';
 import {
   applyOps,
@@ -347,15 +347,17 @@ describe('整批原子性', () => {
 });
 
 describe('整树校验', () => {
-  it('超 300 个节点报 tree_invalid，path 指整批', () => {
-    // 50 个分支 × 5 个叶子 + 根 = 301 个节点，正好越过上限。
+  it('超节点上限报 tree_invalid，path 指整批', () => {
+    // 按 LIMITS.nodes 现算：上限会调（300 → 1000），写死数字会让调参数变成改测试。
+    const perBranch = 5;
+    const branches = Math.ceil(LIMITS.nodes / perBranch);
     const root: MindNode = {
       id: 'r',
       label: '根',
-      children: Array.from({ length: 50 }, (_, i) => ({
+      children: Array.from({ length: branches }, (_, i) => ({
         id: `c${i}`,
         label: `子${i}`,
-        children: Array.from({ length: 5 }, (_, j) => leaf(`c${i}-${j}`)),
+        children: Array.from({ length: perBranch }, (_, j) => leaf(`c${i}-${j}`)),
       })),
     };
 
