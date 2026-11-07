@@ -11,6 +11,7 @@ const data: MindNodeData = {
   depth: 1,
   out: ['right'],
   in: ['left'],
+  refs: 0,
 };
 
 function render(props: Record<string, unknown> = {}) {
@@ -115,6 +116,23 @@ describe('节点内联编辑', () => {
     await input.trigger('blur');
 
     expect(wrapper.emitted('commit')).toEqual([['失焦提交']]);
+    wrapper.unmount();
+  });
+});
+
+describe('引用角标', () => {
+  it('没有引用时不画角标', () => {
+    const wrapper = render();
+
+    expect(wrapper.find('[title="0 处来源引用"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('有引用时显示条数', () => {
+    const wrapper = render({ data: { ...data, refs: 3 } });
+
+    const badge = wrapper.get('[title="3 处来源引用"]');
+    expect(badge.text()).toBe('3');
     wrapper.unmount();
   });
 });
