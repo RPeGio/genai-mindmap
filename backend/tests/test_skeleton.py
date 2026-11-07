@@ -125,16 +125,17 @@ class SkeletonTest(unittest.TestCase):
                             {"sources": [{"kind": "text", "status": "failed"}]})
         self.assertEqual(status, 422)
 
-    def test_pipeline_rejects_truncation_and_unparsed_sources(self):
+    def test_pipeline_rejects_unparsed_and_duplicate_sources(self):
+        """来源不可用与 ID 重复仍在开流前 422。
+
+        「材料超过 20000 字」那条断言已经随字数上限一起删掉：长度不再是
+        pipeline 的判断依据，装不装得进上下文由生成前的 token 估算决定
+        （口径与状态码都不同，见 `test_source_refs`）。
+        """
         sources = [
-            {"id": "one", "kind": "text", "text": "a" * 20001, "status": "parsed"},
-            {"id": "two", "kind": "text", "text": "important second source", "status": "parsed"},
+            {"id": "one", "kind": "text", "text": "第一份材料", "status": "parsed"},
+            {"id": "two", "kind": "text", "text": "important second source", "status": "failed"},
         ]
-        status, raw = request("POST", "/api/pipeline/generate", {"sources": sources})
-        self.assertEqual(status, 422)
-        self.assertIn("超过", json.loads(raw)["detail"])
-        sources[0]["text"] = "short"
-        sources[1]["status"] = "failed"
         status, raw = request("POST", "/api/pipeline/generate", {"sources": sources})
         self.assertEqual(status, 422)
         self.assertIn("第 2 个来源", json.loads(raw)["detail"])

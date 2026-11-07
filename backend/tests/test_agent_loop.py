@@ -26,7 +26,12 @@ from app.agent.provider import _parse_completion
 from app.agent.service import _dedupe_key, outline_text, run
 from app.agent.tools import PLAN_PROMPT, ToolRegistry, build_registry
 from app.contracts.mindmap import MindMapContent
-from app.generation.service import GenerationError
+from app.contracts.source import Source
+from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
+    GenerationError,
+    estimate_input_tokens,
+)
 
 # 生成工具返回的树：5 个节点、三层。用于验证工具内调用与 snapshot 帧。
 # 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
@@ -693,6 +698,58 @@ class RegistryTest(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             asyncio.run(scenario())
+
+
+class BudgetDefaultsTest(unittest.TestCase):
+    """默认预算按实测数据定，不按「一句话主题」的场景拍。
+
+    这两个默认值是整条 agent 路径的物理边界：时间上限决定了模型能不能把
+    65536 token 的输出写完，输出上限决定了树能不能长到契约允许的规模。
+    """
+
+    def test_defaults_match_the_measured_limits(self):
+        budget = RunBudget()
+        self.assertEqual(budget.max_seconds, 600.0)
+        self.assertEqual(budget.max_output_tokens, 65536)
+
+    def test_seconds_ceiling_admits_an_hour(self):
+        RunBudget(max_seconds=3600)          # 一小时是允许的物理上界
+        with self.assertRaises(ValidationError):
+            RunBudget(max_seconds=3601)
+
+
+class SourcesContextTest(unittest.TestCase):
+    """来源正文的边界是模型上下文，不再是「合计 20000 字」。
+
+    20000 那个数没有实测依据，而且与 pipeline 的同名常量互相抄写——两处
+    一起错。现在两处都改判 token：装得下就放行，装不下就在开流前说清楚。
+    """
+
+    def test_long_material_within_the_context_is_accepted(self):
+        # 30000 汉字 ≈ 20000 token：字数上限删掉之后必须放行
+        text = "字" * 30000
+        request = AgentRunRequest(
+            goal="整理材料",
+            sources=[Source(kind="text", status="parsed", text=text)],
+        )
+        self.assertEqual(len(request.sources), 1)
+        # 这份样本必须真的装得下，否则"放行"断言会因为限额变小而失去意义
+        self.assertLess(estimate_input_tokens(text), CONTEXT_TOKEN_LIMIT)
+
+    def test_material_over_the_context_is_rejected_while_parsing_the_request(self):
+        """必须抛 ValueError：只有它会被 FastAPI 收成 422 并把文案带回前端。
+
+        样本按 `CONTEXT_TOKEN_LIMIT` 现算：限额是可调参数，写死字数的样本在
+        调阈值之后就不再超限，用例会从"超限被拒"悄悄退化成"普通材料被接收"。
+        """
+        with self.assertRaises(ValidationError) as raised:
+            AgentRunRequest(
+                goal="整理材料",
+                sources=[Source(kind="text", status="parsed",
+                                text="字" * int(CONTEXT_TOKEN_LIMIT * 1.6))],
+            )
+        self.assertIn("超过模型上下文上限", str(raised.exception))
+        self.assertIn("请精简后重试，或分成多次生成", str(raised.exception))
 
 
 if __name__ == "__main__":
