@@ -56,9 +56,14 @@ import threading
 from app.contracts.source import Source, SourceKind, SourceSpan
 from app.ingestion.asr import AsrError, transcribe_audio
 
-# 单份文档最多解析的页数。超过就截断，理由见 docs/PLAN.md 的 F05 边界：
-# 导图本身容纳不了几百页的细节。
-MAX_PAGES = 50
+# 单份文档最多交给 Docling 解析的页数。
+#
+# 原来定 50，理由是「导图容纳不了几百页的细节」——那个理由现在不成立了：
+# 契约已经放到 1000 节点，模型上下文实测能吞 60 万 token。所以这里不再是
+# 内容边界，只是**防止 Docling 转换本身跑太久**的护栏：它是本地 CPU 密集
+# 转换，几百页要几分钟，而且内存随页数线性涨。
+# 真正的长度限制在下游（`ensure_input_within_context`），按 token 算。
+MAX_PAGES = 300
 
 # 接受解析的文档扩展名。
 #

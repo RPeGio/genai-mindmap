@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from copy import deepcopy
@@ -12,20 +13,40 @@ import httpx
 from pydantic import ValidationError
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
-from app.contracts.mindmap import GenerateResponse, MindMapContent, Node
+from app.contracts.mindmap import (
+    MAX_TREE_DEPTH,
+    MAX_TREE_NODES,
+    GenerateResponse,
+    MindMapContent,
+    Node,
+)
 from app.contracts.source import Source, SourceUsage
 from app.optimization.source_refs import verify_source_refs
 
 # 单次模型调用的超时（秒）与响应体上限（字节）：超时避免请求无限挂起，
 # 上限避免异常响应把内存读满。
-_TIMEOUT_SECONDS = 60.0
+#
+# 超时 60 → 600。60 秒是照「一句话主题」的短输出拍的：实测 12106 字材料
+# → 13243 token 输出 → 48.6 秒，已经贴着上限；慢速档 97 tok/s 时同样的材料
+# 要 136 秒。超时的代价是整次请求报废（不是"稍后重试"），而模型本身仍在
+# 计费，所以它必须由物理时间决定，不能由产品口味决定。
+_TIMEOUT_SECONDS = 600.0
 _MAX_RESPONSE_BYTES = 2_000_000
 
-# 输出 token 上限。模型服务默认 8192，而实测一棵 240 节点的树要 7578 tok、
-# 输出文本约 1.3 万字符；DETAIL_PROMPT 允许 300 节点，必然超出上限被截断，
-# 而截断的 JSON 解析不出来，整次请求报废（实测 20000 字符的输入就撞过一次，
-# finish_reason=length、输出正好 8192）。服务端接受更大的值，取 16384 留余量。
-MAX_OUTPUT_TOKENS = 16384
+# 输出 token 上限。服务端默认 8192，实测 12106 字材料 → 13243 token 输出，
+# 16384 只剩 3000 token 余量；而 DeepSeek 接受 max_tokens=65536（HTTP 200）。
+# 按每节点约 25 token 算，65536 装得下 2600 个节点，高于契约允许的 1000 个，
+# 所以输出上限不再是内容被截断的原因——真被截断时 `finish_reason=length`
+# 会明确报错，不会静默交付半棵树。
+MAX_OUTPUT_TOKENS = 65536
+
+# 模型上下文（输入侧）上限，单位 token。**这是保守值，不是实测边界**：
+# 探测 api.deepseek.com 需要密钥，而本机没有可用密钥（占位密钥只拿到 401），
+# 无法把输入压到边界看它在哪个 token 数上返回 400。DeepSeek 标称 128K，
+# 但"标称窗口"与"扣掉系统提示词、输出预算之后还能塞多少"不是一回事，
+# 取不到一半留足余量。60000 token 约合 9 万汉字，实测 12106 字材料只用到
+# 一万多输入 token，正常材料离这条线很远。
+CONTEXT_TOKEN_LIMIT = 200000
 
 # 一次性生成完整导图的提示词（非流式接口、流式接口的第二段都用它）。
 #
@@ -39,7 +60,9 @@ DETAIL_PROMPT = (
     "把用户输入变成一张思维导图。只返回一个 JSON 对象，不要代码围栏。"
     "格式为 {\"title\":\"标题\",\"root\":{\"id\":\"唯一id\","
     "\"label\":\"节点文字\",\"children\":[]}}。每个节点均含 id、label、children，"
-    "ID 全局唯一，层级不超过 8，节点不超过 300。\n"
+    # 这里的两个数字取自契约常量：写死过一次，结果契约从 300 放到 1000 之后
+    # 提示词还在叫模型"不超过 300"，模型自我设限，契约放宽等于没生效。
+    f"ID 全局唯一，层级不超过 {MAX_TREE_DEPTH}，节点不超过 {MAX_TREE_NODES}。\n"
     "输入分两种，按情况处理：\n"
     "1) 完整材料（会议纪要、文章、笔记）：忠实整理它的结构，不要添加材料里"
     "没有的内容。每个可分解的分支至少 2 个要点，目标 2-4 个；依据不足时宁可"
@@ -172,6 +195,55 @@ class GenerationError(Exception):
     pass
 
 
+def estimate_input_tokens(text: str) -> int:
+    """估算一段文本的 token 数，用于在**发请求之前**判断它装不装得进上下文。
+
+    汉字约 1.5 字/token、ASCII 约 4 字符/token。这是离线可算的粗估，不是
+    分词器的真值：为了一次边界判断去接一份词表（还要跟模型版本同步）不划算，
+    而这里要回答的只是「离 6 万还差得远不远」。两个方向都偏向保守——汉字按
+    1.5 字/token 折算比真实中文 tokenizer 更费 token，ASCII 按 4 字符折算与
+    BPE 的经验值一致；高估会在边界上多拒一点，低估则是请求真的打到 400 上。
+    """
+    if not text:
+        return 0
+    # 0x2E80 起是 CJK 部首扩展：汉字、假名、全角标点都在这个区间之上，
+    # 它们的 token 密度与 ASCII 差四倍，必须分开算。
+    cjk = sum(1 for ch in text if ord(ch) >= 0x2E80)
+    return math.ceil(cjk / 1.5 + (len(text) - cjk) / 4)
+
+
+def context_overflow_error(
+    *, chars: int, tokens: int, limit: int, label: str = "材料",
+) -> GenerationError:
+    """上下文超限的错误对象。文案只有这一份实现。
+
+    多个入口（同步生成、工具内生成、agent 循环）都在守同一道边界，各写一句
+    文案的结果是同一件事故在界面上有三种说法。文案必须可操作：现在多长、
+    换算成多少 token、上限多少、用户能做什么。
+    """
+    return GenerationError(
+        f"{label}约 {chars} 字，估算 {tokens} token，超过模型上下文上限 {limit}。"
+        "请精简后重试，或分成多次生成。")
+
+
+def ensure_input_within_context(
+    text: str, *, label: str = "材料", limit: int = CONTEXT_TOKEN_LIMIT,
+    extra_tokens: int = 0,
+) -> int:
+    """输入装不进模型上下文时抛一条能直接展示给用户的错误；否则返回估算值。
+
+    这是**物理**边界，不是产品口径：超了模型不会给你半份结果，只会返回 400
+    并把整次请求作废。
+
+    `extra_tokens` 是同一次请求里除 `text` 之外的固定开销（系统提示词等），
+    只参与判断，不改变文案里那个用户看得见的长度。
+    """
+    tokens = estimate_input_tokens(text) + extra_tokens
+    if tokens <= limit:
+        return tokens
+    raise context_overflow_error(chars=len(text), tokens=tokens, limit=limit, label=label)
+
+
 # 模型偶尔无视「不要代码围栏」的指示，把 JSON 包进 ```json … ``` 里。
 # 裸 json.loads 会因此直接抛错，用户侧表现为随机失败 —— 实测 18 次调用里
 # 撞到 1 次。解析前先剥干净，比要求模型「务必听话」可靠。
@@ -288,6 +360,9 @@ def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, 
     只负责传输与 JSON 解析；结构是否符合契约由调用方用 MindMapContent 校验。
     """
     base, key, model = _config()
+    # 输入侧的物理边界，位置在 `_config()` 之后：配置缺失是部署问题，必须
+    # 先暴露，否则用户会按「精简材料」的提示白折腾一轮。
+    ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
     request_body: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -334,6 +409,9 @@ async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -
     import httpx
 
     base, key, model = _config()
+    # 与 `chat()` 同一道输入边界：工具内部的生成 / 展开也走这里，两条出口
+    # 各守一个数迟早会分叉。
+    ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
     request_body: dict[str, Any] = {
         "model": model,
         "messages": [

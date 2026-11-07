@@ -17,10 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.contracts.mindmap import MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
-
-# 与 pipeline/service.py::MAX_INPUT_CHARS 同口径。前端不再把材料截成 1000 字，
-# 改走 sources 整体传，这条是唯一的边界。
-MAX_SOURCE_CHARS = 20000
+from app.generation.service import GenerationError, ensure_input_within_context
 
 
 # ---------------------------------------------------------------- 预算
@@ -51,14 +48,23 @@ class RunBudget(BaseModel):
     # 用掉 7 次、外层第二轮再占 1 次，收尾那轮必然报 budget_exhausted——
     # 树其实已经建好了，却连 done 帧都发不出来（已实测复现）。
     # 8 支展开 + 重试余量再大就该由调用方显式放宽，而不是把默认值继续抬高。
-    max_model_calls: int = Field(default=10, ge=1, le=20)
+    max_model_calls: int = Field(default=25, ge=1, le=40)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
-    max_seconds: float = Field(default=120.0, gt=0, le=600)
+    # 时间上限从 120 提到 600：120 秒是照「一句话主题」的短路径拍的，实测
+    # 12106 字材料出 526 个节点要 48.6 秒，慢速档 97 tok/s 时同样的材料光是
+    # 输出就要 136 秒，多轮工具循环必然超时。上限放到一小时：这是"卡住不动"
+    # 的物理边界，不是给正常路径设的目标值。
+    max_seconds: float = Field(default=600.0, gt=0, le=3600)
     # 这是**单次**模型调用的输出上限，不是整轮累计——它直接作为 provider 请求里
     # 的 `max_tokens` 发出去，每次调用都按这个值重新计。整轮累计的上界是
     # 「这个值 × 实际调用次数」，而调用次数由 `max_model_calls` 约束，因此
     # 不需要再加一个"累计输出"字段：两个上界相乘已经封顶。
-    max_output_tokens: int = Field(default=32768, ge=1024, le=131072)
+    #
+    # 默认值 65536 = 实测 DeepSeek 接受的最大 max_tokens（HTTP 200）。按每节点
+    # 25 token 算装得下 2600 个节点，高于契约允许的 1000 个。上界仍是 131072
+    # ——它比默认值宽，不构成瓶颈；真正发出去的值还会被 provider 的
+    # `_MAX_TOKENS_CAP` 夹一次。
+    max_output_tokens: int = Field(default=65536, ge=1024, le=131072)
     # 容忍几次工具执行失败。模型第一次把 label 写错位置是常态，它看到错误后
     # 下一轮会改对；超过这个次数说明它卡住了，继续烧调用没有意义。
     # 计的是累计失败数，不是"连续失败数"：成功的工具调用不会把计数清零。
@@ -222,17 +228,25 @@ class AgentRunRequest(BaseModel):
     budget: RunBudget = Field(default_factory=RunBudget)
 
     @model_validator(mode="after")
-    def sources_within_budget(self) -> "AgentRunRequest":
-        """来源正文合计要有个上限。
+    def sources_within_context(self) -> "AgentRunRequest":
+        """来源正文合计要装得进模型上下文。
 
-        前端不再把材料截断成 1000 字（那会丢绝大部分内容），改走 `sources`
-        整体传过来；但整份传过来就没有任何边界了——`Source.text` 本身没有
-        长度限制。这里用与 pipeline 同一口径的 20000 字兜住，超了在开流前
-        就拒绝，而不是等模型那边炸掉。
+        原先这里卡的是「合计 20000 字」。那个数按一句话主题拍的，没有实测依据，
+        而且与 pipeline 的同一口径互相抄写——两处一起错、一起被当成边界。真正
+        的边界只有一条：模型的上下文窗口装不装得下。所以改判 token，超了仍然
+        在开流之前拒绝，文案给出两条出路（精简 / 分批）。
+
+        这里必须抛 `ValueError`：它发生在 FastAPI 解析请求体的时候，只有
+        ValidationError 才会被收成 422 并把文案带回前端；`GenerationError`
+        冒出去会变成 500，用户看到的是"服务器内部错误"。
         """
-        total = sum(len(source.text or "") for source in self.sources)
-        if total > MAX_SOURCE_CHARS:
-            raise ValueError(f"来源正文合计 {total} 字，超过 {MAX_SOURCE_CHARS} 字上限，请精简后重试")
+        text = "\n".join(source.text or "" for source in self.sources)
+        if not text:
+            return self
+        try:
+            ensure_input_within_context(text, label="来源正文合计")
+        except GenerationError as exc:
+            raise ValueError(str(exc)) from exc
         return self
 
 

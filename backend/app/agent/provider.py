@@ -17,16 +17,50 @@ from typing import Any
 import httpx
 
 from app.agent.contracts import Completion, RunBudget, ToolCall
-from app.generation.service import GenerationError, _config
+from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
+    GenerationError,
+    _config,
+    context_overflow_error,
+    estimate_input_tokens,
+)
 
 # 单次响应上限。与 generation 那边同口径：超过这个体积说明模型跑飞了，
 # 读进内存只会把进程拖垮。
 _MAX_RESPONSE_BYTES = 2_000_000
-_TIMEOUT_SECONDS = 60.0
+# 与 generation.service._TIMEOUT_SECONDS 同口径。60 秒是照短输出拍的：一轮
+# 带 8 支展开的调用实测就要一分多钟，慢速档更久，超时即整次 run 报废。
+_TIMEOUT_SECONDS = 600.0
 
-# 实测可用的输出上限。RunBudget 允许配到 131072，但当前部署的服务端对
-# 更大的值会直接 400，所以这里再夹一层；要放开得先实测服务端接受度。
-_MAX_TOKENS_CAP = 16384
+# 实测可用的输出上限：DeepSeek 接受 max_tokens=65536（HTTP 200）。RunBudget
+# 允许配到 131072，超过实测值的部分本来也只会拿到 400，所以这里夹一层；
+# 要再放开得先重新实测服务端接受度。
+_MAX_TOKENS_CAP = 65536
+
+
+def _estimate_request_tokens(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+) -> int:
+    """估算一次请求的输入 token：消息正文 + 函数调用参数 + 工具定义。
+
+    消息历史随工具循环一路增长，它是 agent 这条路径上唯一会自己长大的输入，
+    所以边界必须在这里守一次——入口处的 `AgentRunRequest` 只挡住了材料，
+    挡不住"模型反复调工具把上下文喂爆"。工具定义每轮都在请求里，也要算。
+    """
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += estimate_input_tokens(content)
+        elif isinstance(content, list):  # 多模态内容：只算文本分片，图片另计
+            total += sum(estimate_input_tokens(str(part.get("text") or ""))
+                         for part in content if isinstance(part, dict))
+        for call in message.get("tool_calls") or []:
+            arguments = (call.get("function") or {}).get("arguments") or ""
+            total += estimate_input_tokens(str(arguments))
+    if tools:
+        total += estimate_input_tokens(json.dumps(tools, ensure_ascii=False))
+    return total
 
 
 class DeepSeekProvider:
@@ -40,6 +74,13 @@ class DeepSeekProvider:
         budget: RunBudget,
     ) -> Completion:
         base, key, model = _config()
+        # 输入侧的物理边界。放在发请求之前：装不下的请求只会拿回一个 400，
+        # 而 400 在事件流里只能被读成"模型服务出错"，用户无从知道该精简材料。
+        used = _estimate_request_tokens(messages, tools)
+        if used > CONTEXT_TOKEN_LIMIT:
+            raise context_overflow_error(
+                chars=sum(len(str(message.get("content") or "")) for message in messages),
+                tokens=used, limit=CONTEXT_TOKEN_LIMIT, label="本轮对话上下文")
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,

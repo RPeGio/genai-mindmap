@@ -6,14 +6,19 @@
 视觉模型能还原标题层级、Table 1 的四行数据（含 LaTeX 公式）以及正文。
 
 代价是慢和花钱：单页 5~7 秒、每份几分钱，且必须联网。所以：
-  - 页数封顶（MAX_VISION_PAGES），超出的页丢弃并在 Source.truncated 里说明
+  - 页数不再按固定值封顶：边界是「拼出来的正文装不装得进模型上下文」，
+    由 `plan_page_count()` 按预算逐页累加算出；被切掉的部分由调用方的
+    `Source.truncated` 说明
   - 渲染串行（pymupdf 的 Document 不是线程安全的），只把 API 调用并发
   - 任何一页失败都退回到该页的文本层（如果这份 PDF 有的话），不整份报废
 
 **并发模型（逐页仍然是并发的，别改回串行）**：一页 5~7 秒里绝大部分是在等
-模型回包，串行识别 20 页要一分半以上；渲染 20 页实测只要 0.5 秒，是纯 CPU
-且 pymupdf 不线程安全，所以顺序是「先串行渲染、再并发调模型」。并发度见
-CONCURRENCY。
+模型回包。渲染是纯 CPU 且 pymupdf 不线程安全，所以顺序是「串行渲染一批、
+再并发调模型」。并发度见 CONCURRENCY。
+
+**分批而不是一次性渲染全稿**：页数不封顶之后，一份 500 页的扫描件如果先把
+500 张 PNG 都渲出来再调模型，峰值内存是几百 MB；按 CONCURRENCY 分批，峰值
+恒为 CONCURRENCY 张图，总耗时不变（每批里的网络往返照样并发）。
 
 **结果必须按页码就位**：下游节点靠页码引用来源，错位不会报错，只会让引用
 静默指到错误的页。所以并发写法上只能「按索引回填」，不能「按完成顺序追加」
@@ -28,11 +33,20 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
+    estimate_input_tokens,
+)
+
 logger = logging.getLogger(__name__)
 
-# 最多渲染多少页。渲染 + 逐页调模型的开销是线性的，不封顶的话一份 541 页的
-# 专著能把请求挂十几分钟，前端早超时了。
-MAX_VISION_PAGES = 20
+# 每页转成 Markdown 后的字数先验值（实测 379 字/页）。只在没有文本层可数的
+# 扫描页上使用：有文本层的页直接数实际字符数，比先验准得多。
+PER_PAGE_CHARS = 379
+
+# 一页扫描页折算成多少 token。用估算函数而不是写死一个数：折算口径
+# （汉字约 1.5 字/token）必须与真实的上下文判断同源，否则两处会漂。
+_SCANNED_PAGE_TOKENS = estimate_input_tokens("字" * PER_PAGE_CHARS)
 
 # 渲染分辨率。150 对正文、表格、公式足够，200 以上体积和耗时涨得快而识别率提升有限。
 RENDER_DPI = 150
@@ -43,7 +57,6 @@ RENDER_DPI = 150
 # 8 路。原值 3 的依据是「再高容易触发 429」，但那是推测不是实测。
 # 实测（2026-11-07，8 页 PDF）：3 路 6.1s、6 路 4.7s、8 路 3.0s、10 路 3.3s，
 # 四组全部 8/8 成功，没有一次 429。8 路是测到的拐点，10 路反而略慢（噪声）。
-# 20 页上限下 8 路只需 3 批，约 9 秒；3 路要 7 批，约 21 秒。
 # 真机若观测到持续 429，先降到 4 再排查，别直接退回 3。
 CONCURRENCY = 8
 
@@ -193,15 +206,43 @@ def describe_image(raw: bytes) -> str:
     return _call_vision(raw, _guess_mime(raw), IMAGE_PROMPT, "这张图片")
 
 
+def plan_page_count(doc, page_count: int) -> int:
+    """按上下文预算算出这次最多处理到第几页。
+
+    页数不再按固定值（原先 20）封顶：那是个凭感觉定的数，一份 30 页的讲义
+    会被砍掉三分之一，而 300 页的专著本来也不可能塞进一次生成。真正的边界
+    只有一条——拼出来的正文能不能装进下游生成请求的上下文。逐页累加估算，
+    装不下的那一页起就不再处理：后面那些页即使识别出来，也会让整份材料的
+    生成请求被模型 400 拒掉，等于白花钱还把整份作废。
+
+    有文本层的页直接数实际字符数（最准）；扫描页没有文本层，用实测的
+    379 字/页 作为先验值。返回 0 表示第一页就装不下。
+    """
+    used = 0
+    for index in range(page_count):
+        try:
+            text = doc[index].get_text("text") or ""
+        except Exception:  # noqa: BLE001 - 单页读不到就按扫描页估
+            text = ""
+        cost = estimate_input_tokens(text) if text.strip() else _SCANNED_PAGE_TOKENS
+        if used + cost > CONTEXT_TOKEN_LIMIT:
+            return index
+        used += cost
+    return page_count
+
+
 def extract_pages(raw: bytes) -> tuple[list[str], int, int, list[int]]:
     """把 PDF 逐页转成 Markdown。
 
     返回 (逐页 markdown 列表, 总页数, 实际处理页数, 失败的页码列表)。
     失败的页在列表里对应空串，调用方可以用文本层补。
+
+    处理到第几页由 `plan_page_count()` 按上下文预算算出来，不再是固定值；
+    没处理到的部分由调用方的 `Source.truncated` 说明。
     """
     # 配置预检放在渲染之前：demo 模式、密钥缺失这类问题必须立刻暴露，
-    # 否则会被下面「单页失败不拖垮整份」的兜底吞掉，变成渲染 20 页、
-    # 每页都失败、最后静默回落——用户看不到真实原因，还白烧一遍 CPU。
+    # 否则会被下面「单页失败不拖垮整份」的兜底吞掉，变成每页都失败、
+    # 最后静默回落——用户看不到真实原因，还白烧一遍 CPU。
     _config()
 
     import pymupdf
@@ -209,43 +250,50 @@ def extract_pages(raw: bytes) -> tuple[list[str], int, int, list[int]]:
     doc = pymupdf.open(stream=raw, filetype="pdf")
     try:
         page_count = doc.page_count
-        limit = min(page_count, MAX_VISION_PAGES)
-        # pymupdf 的 Document 不是线程安全的：先把图渲染出来，再并发调 API。
-        images: list[bytes] = []
-        for index in range(limit):
+        if page_count <= 0:
+            raise VisionUnavailable("这份 PDF 没有可渲染的页面")
+        limit = plan_page_count(doc, page_count)
+        if limit <= 0:
+            raise VisionUnavailable(
+                "这份 PDF 的第一页就超过模型上下文上限，请拆分后再上传")
+
+        pages = [""] * limit
+        failed: list[int] = []
+        images: dict[int, bytes] = {}
+
+        def work(index: int) -> tuple[int, str, bool]:
+            """识别第 index 页。异常不外抛——一页失败只影响这一页。"""
+            image = images.get(index, b"")
+            if not image:
+                return index, "", False
             try:
-                images.append(doc[index].get_pixmap(dpi=RENDER_DPI).tobytes("png"))
-            except Exception:  # noqa: BLE001 - 单页渲染失败留空位，后面按失败处理
-                images.append(b"")
+                return index, _page_to_markdown(image, index + 1), True
+            except Exception as exc:  # noqa: BLE001 - 单页失败不该拖垮整份文档
+                # 只记页码和异常类型：正文可能含整页原文，不适合进日志。
+                # 少了这一行，429 / 超时 / 输出截断在线上完全无从区分。
+                logger.warning("第 %d 页视觉识别失败：%s", index + 1, type(exc).__name__)
+                return index, "", False
+
+        # 每一批：先串行渲染（pymupdf 的 Document 不是线程安全的），再并发调模型。
+        for start in range(0, limit, CONCURRENCY):
+            batch = range(start, min(start + CONCURRENCY, limit))
+            images.clear()
+            for index in batch:
+                try:
+                    images[index] = doc[index].get_pixmap(dpi=RENDER_DPI).tobytes("png")
+                except Exception:  # noqa: BLE001 - 单页渲染失败留空位，按失败处理
+                    images[index] = b""
+
+            with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+                for index, text, ok in pool.map(work, batch):
+                    # 按返回的 index 回填，不按到达顺序追加：顺序错位会让下游节点
+                    # 引用指到错误的页，而且不会报错。
+                    if ok:
+                        pages[index] = text
+                    else:
+                        failed.append(index + 1)
     finally:
         doc.close()
-
-    if not images:
-        raise VisionUnavailable("这份 PDF 没有可渲染的页面")
-
-    pages = [""] * len(images)
-    failed: list[int] = []
-
-    def work(index: int) -> tuple[int, str, bool]:
-        """识别第 index 页。异常不外抛——一页失败只影响这一页。"""
-        if not images[index]:
-            return index, "", False
-        try:
-            return index, _page_to_markdown(images[index], index + 1), True
-        except Exception as exc:  # noqa: BLE001 - 单页失败不该拖垮整份文档
-            # 只记页码和异常类型：正文可能含整页原文，不适合进日志。
-            # 少了这一行，429 / 超时 / 输出截断在线上完全无从区分。
-            logger.warning("第 %d 页视觉识别失败：%s", index + 1, type(exc).__name__)
-            return index, "", False
-
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        for index, text, ok in pool.map(work, range(len(images))):
-            # 按返回的 index 回填，不按到达顺序追加：顺序错位会让下游节点
-            # 引用指到错误的页，而且不会报错。
-            if ok:
-                pages[index] = text
-            else:
-                failed.append(index + 1)
 
     # 页码升序对外：调用方拿它和文本层逐页对齐，乱序会被误读。
     return pages, page_count, limit, sorted(failed)

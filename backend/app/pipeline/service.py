@@ -6,7 +6,7 @@
     合并多来源    调用模型     契约校验      引文与结构诊断
 
 当前实现：
-    understand  合并已解析文本；来源不可用或输入过长时明确报错
+    understand  合并已解析文本；来源不可用时明确报错（长度不在这里卡，见下）
     outline     复用 generation.service.generate（demo / model 两种模式）
     validate    字段与来源关联校验，失败抛 GenerationError
     verify      原文引用核验与基础结构诊断；无依据只提示，不删除节点
@@ -23,10 +23,11 @@ from app.contracts.source import Source
 from app.generation.service import GenerationError, generate
 from app.optimization.service import check
 
-# 单次生成允许的输入上限。定 20000 是因为文档解析（Docling）出来的正文
-# 动辄上万字，8000 会把正常的一份讲义直接挡在门外；20000 字符约合
-# 一万出头 token，deepseek-chat 的上下文完全吃得下。
-MAX_INPUT_CHARS = 20000
+# 输入长度**不再在这里按字数封顶**。原先的 `MAX_INPUT_CHARS = 20000` 是照
+# 「一张导图装不下几百页细节」拍的，没有实测依据，而且它管的是下游模型的
+# 上下文——那件事已经由 `generation.service.ensure_input_within_context()`
+# 用 token 口径守住了（真的装不下时给出可操作的错误）。两处各设一个数只会
+# 出现「这边放过、那边 400」的分叉。
 
 
 @dataclass
@@ -50,7 +51,7 @@ class PipelineError(Exception):
 
 
 class PipelineInputError(PipelineError):
-    """来源无法处理或超过当前输入限制。"""
+    """来源无法处理（缺失、未解析、内容为空、ID 重复）。"""
 
 
 class PipelineGenerationError(PipelineError):
@@ -60,7 +61,9 @@ class PipelineGenerationError(PipelineError):
 def _understand(sources: list[Source]) -> str:
     """合并多个来源。
 
-    合并文本用于限长和 demo；模型输入另带来源 ID，原始空白保持不变。
+    合并文本用于阶段轨迹与 demo；模型输入另带来源 ID，原始空白保持不变。
+    这里不判断长度：装不装得进模型上下文由 `generation.generate()` 里那次
+    真实调用前的 token 估算决定，那里才知道要发给哪个模型。
     """
     if not sources:
         raise PipelineInputError("请先提供至少一个来源")
@@ -69,10 +72,7 @@ def _understand(sources: list[Source]) -> str:
     for index, source in enumerate(sources, start=1):
         if source.status != "parsed" or not (source.text or "").strip():
             raise PipelineInputError(f"第 {index} 个来源尚未解析成功或内容为空")
-    merged = "\n\n".join(s.text or "" for s in sources)
-    if len(merged) > MAX_INPUT_CHARS:
-        raise PipelineInputError(f"合并后内容为 {len(merged)} 字，超过当前 {MAX_INPUT_CHARS} 字限制；请缩短或分批处理")
-    return merged
+    return "\n\n".join(s.text or "" for s in sources)
 
 
 def run(sources: list[Source]) -> PipelineResult:
