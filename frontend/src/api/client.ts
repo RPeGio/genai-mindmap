@@ -296,7 +296,8 @@ export async function exportMindMap(
     response = await fetch(`${BASE}/export/${format}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      // 导出接口收的也是 v1 的 MindMapContent，带着 v2 的 note 一样会 422。
+      body: JSON.stringify({ content: toContractV1(content) }),
     });
   } catch {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');

@@ -78,4 +78,22 @@ describe('exportMindMap', () => {
     await expect(exportMindMap('markdown', CONTENT)).rejects.toThrow(/无法连接后端/);
     vi.unstubAllGlobals();
   });
+
+  it('发出前裁掉 v2 的 note，否则后端 extra="forbid" 直接 422', async () => {
+    // 样例导图里的节点带 note（正文），v1 的 Node 不认这个字段。
+    const withNote = {
+      title: '季度规划',
+      root: { id: 'root', label: '产品', note: '正文放在 note 里', children: [] },
+    } as MindMapContent;
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => '' });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await exportMindMap('markdown', withNote);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const sent = JSON.parse(String(init.body)) as { content: { root: Record<string, unknown> } };
+    expect(sent.content.root).not.toHaveProperty('note');
+    expect(sent.content.root.label).toBe('产品');
+    vi.unstubAllGlobals();
+  });
 });
