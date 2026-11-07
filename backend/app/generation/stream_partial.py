@@ -208,7 +208,10 @@ async def _stream_events(text: str) -> AsyncIterator[str]:
     if mode == "demo":
         yield _sse({"type": "stage", "stage": "demo", "progress": 0.5,
                     "detail": "演示模式，不调用模型"})
-        content = _demo_content(text)
+        # 演示内容是固定占位结构，只有一个子节点；质量门槛（一级分支不少于 3 条）
+        # 针对的是模型产出，所以这里显式关掉，别让 demo 被自己打回。
+        content, _ = validate_generated_content(
+            _demo_content(text).model_dump(), enforce_min_branches=False)
         yield _sse({"type": "skeleton", "content": content.model_dump()})
         yield _sse({"type": "done", "mode": "demo", "content": content.model_dump(),
                     "latencyMs": 0, "degraded": False})

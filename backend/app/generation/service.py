@@ -42,11 +42,13 @@ DETAIL_PROMPT = (
     "ID 全局唯一，层级不超过 8，节点不超过 300。\n"
     "输入分两种，按情况处理：\n"
     "1) 完整材料（会议纪要、文章、笔记）：忠实整理它的结构，不要添加材料里"
-    "没有的内容。\n"
+    "没有的内容。每个可分解的分支至少 2 个要点，目标 2-4 个；依据不足时宁可"
+    "少给，不要为了凑数补写。\n"
     "2) 简短的主题或目标（如「机器学习」「帮我规划毕业论文」）：围绕它展开成 "
     "3-6 个一级分支，每个分支再给 2-4 个要点。这是框架展开，不算捏造；"
     "但不要编造具体的数据、人名、文献或引用。\n"
-    "两种情况下根节点都必须有子节点，只有根节点的结果不合格。"
+    "两种情况下所有一级分支加起来不少于 3 条，根节点都必须有子节点，"
+    "只有根节点的结果不合格。"
 )
 
 SOURCED_DETAIL_PROMPT = DETAIL_PROMPT + (
@@ -55,16 +57,23 @@ SOURCED_DETAIL_PROMPT = DETAIL_PROMPT + (
     "用户输入为 sources 数组，每项含 source_id 和 text，text 是待整理的原文。"
     "每个有原文依据的节点增加 source_refs 数组，格式为"
     '[{"source_id":"输入中已有的来源ID","quote":"逐字摘录的原文片段"}]。'
-    "quote 不超过 300 字，必须出自对应来源的 text，不得改写、拼接或跨来源引用。"
+    "quote 不超过 300 字，必须出自对应来源的 text：可以只截取原文里的一段，"
+    "但不能改写、概括、拼接或跨来源引用。\n"
+    "原文：会议决定在十月十七日发布二点零版本。\n"
+    '❌ quote="计划近期上线" —— 这是概括，原文里逐字找不到这句\n'
+    '✅ quote="十月十七日发布二点零版本" —— 原文里的连续片段\n'
     "没有直接依据时 source_refs 留空，不要编造引用。"
     "不要输出 source_usage；不要猜测 page、start、end。"
 )
 
 
-# 一级分支下限：只要有一条分支就已经是「层次结构」，光杆根节点才算失败。
-# 同步接口与流式接口两处共用这一个值，改一处就全改 ——
+# 一级分支下限：少于这个数说明模型把一棵树压成了一条链 —— 那是「层次结构」
+# 最差的一种形态，比光杆根节点好不了多少。下限只加在**模型整图生成**这条路径上，
+# 而且是质量要求、不是合法性要求：`MindMapContent.validate_tree()` 不设门槛，
+# 旧图和用户手工删到一条分支的图照常能存能开；demo 是固定占位结构（本来就只有
+# 一个子节点），也显式跳过。同步接口、流式接口共用这一个值，改一处就全改 ——
 # 否则同一个模型结果会被一个入口判成功、另一个判失败。
-MIN_BRANCHES = 1
+MIN_BRANCHES = 3
 
 
 class GenerationError(Exception):
@@ -274,13 +283,31 @@ def _demo_content(text: str) -> MindMapContent:
         children=[Node(id=str(uuid4()), label="请编辑此演示节点")]))
 
 
+def _branch_shortfall(count: int) -> GenerationError:
+    """一级分支不足时的错误文案：说清现状、下限与下一步怎么做。
+
+    只说「不合格」用户没法行动；这里给出两条出路——换个说法重问，或者补充材料，
+    因为这两种情况正是模型给不出分支的两大原因（主题太窄、材料太少）。
+    """
+    if count == 0:
+        return GenerationError(
+            "模型只返回了一个根节点，没有任何分支，请换一种说法或补充材料后重试")
+    return GenerationError(
+        f"模型只给了 {count} 条一级分支，少于要求的 {MIN_BRANCHES} 条；"
+        "请换一种说法，或补充更多材料后重试")
+
+
 def validate_generated_content(
     result: Any, *, sources: list[Source] | None = None,
+    enforce_min_branches: bool = True,
 ) -> tuple[MindMapContent, list[Diagnostic]]:
     """以真实输入重建来源摘要，剔除模型伪造的关联，再执行契约与原文校验。
 
     无 Source 的同步和 SSE 入口共用此出口：在契约校验之前清空所有节点的
     来源声明，避免伪造摘要与引用互相背书，也不让错误的引用拖垮有效的树。
+
+    `enforce_min_branches` 是**质量**门槛而不是契约门槛：模型整图生成要求一级
+    分支不少于 `MIN_BRANCHES` 条，demo 占位结构与用户已保存的旧图不走这道关。
     """
     raw = deepcopy(result)
     diagnostics: list[Diagnostic] = []
@@ -318,18 +345,41 @@ def validate_generated_content(
         content = MindMapContent.model_validate(raw)
     except ValidationError as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
-    if len(content.root.children) < MIN_BRANCHES:
-        raise GenerationError("模型只返回了一个根节点，没有任何分支，请换一种说法重试")
+    if enforce_min_branches and len(content.root.children) < MIN_BRANCHES:
+        raise _branch_shortfall(len(content.root.children))
     if sources is not None:
         diagnostics.extend(verify_source_refs(content, sources, remove_invalid=True))
     return content, diagnostics
+
+
+def diagnose_density(content: MindMapContent, *, minimum: int = 2) -> list[Diagnostic]:
+    """标出要点过少的分支。
+
+    只作为提示，不构成失败：材料本身稀疏时，某个分支只有一个要点是合理的，
+    强行要求补写会逼模型编造。所以它产出 warn 级诊断，由调用方决定怎么用。
+    """
+    diagnostics: list[Diagnostic] = []
+    for branch in content.root.children:
+        count = len(branch.children)
+        if count >= minimum:
+            continue
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SPARSE_BRANCH", node_id=branch.id,
+            message=(f"分支「{branch.label}」只有 {count} 个要点，"
+                     f"少于建议的 {minimum} 个；材料稀疏时可以保留，不必强行补写"),
+        ))
+    return diagnostics
 
 
 def generate(text: str, *, sources: list[Source] | None = None) -> GenerateResponse:
     mode = os.getenv("MINDMAP_LLM_MODE", "demo").strip().lower()
     if mode == "demo":
         result = _demo_content(text.strip()).model_dump()
+        # demo 是固定占位结构（根节点 + 一个可编辑的子节点），它不伪装成模型
+        # 产物，自然也不该被「模型要给够分支」这条质量门槛打回。
+        enforce_min_branches = False
     elif mode == "model":
+        enforce_min_branches = True
         if sources is None:
             result = chat(DETAIL_PROMPT, text)
         else:
@@ -340,5 +390,6 @@ def generate(text: str, *, sources: list[Source] | None = None) -> GenerateRespo
             result = chat(SOURCED_DETAIL_PROMPT, prompt_input)
     else:
         raise GenerationError("MINDMAP_LLM_MODE 只能是 demo 或 model")
-    content, diagnostics = validate_generated_content(result, sources=sources)
+    content, diagnostics = validate_generated_content(
+        result, sources=sources, enforce_min_branches=enforce_min_branches)
     return GenerateResponse(mode=mode, content=content, diagnostics=diagnostics)
