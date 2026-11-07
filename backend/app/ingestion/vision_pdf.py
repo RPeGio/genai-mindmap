@@ -9,13 +9,26 @@
   - 页数封顶（MAX_VISION_PAGES），超出的页丢弃并在 Source.truncated 里说明
   - 渲染串行（pymupdf 的 Document 不是线程安全的），只把 API 调用并发
   - 任何一页失败都退回到该页的文本层（如果这份 PDF 有的话），不整份报废
+
+**并发模型（逐页仍然是并发的，别改回串行）**：一页 5~7 秒里绝大部分是在等
+模型回包，串行识别 20 页要一分半以上；渲染 20 页实测只要 0.5 秒，是纯 CPU
+且 pymupdf 不线程安全，所以顺序是「先串行渲染、再并发调模型」。并发度见
+CONCURRENCY。
+
+**结果必须按页码就位**：下游节点靠页码引用来源，错位不会报错，只会让引用
+静默指到错误的页。所以并发写法上只能「按索引回填」，不能「按完成顺序追加」
+——`pool.map` 本身保序，但下面的代码只依赖返回值里带回的 index，不依赖迭代
+顺序，两重保险。
 """
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
 
 # 最多渲染多少页。渲染 + 逐页调模型的开销是线性的，不封顶的话一份 541 页的
 # 专著能把请求挂十几分钟，前端早超时了。
@@ -24,8 +37,13 @@ MAX_VISION_PAGES = 20
 # 渲染分辨率。150 对正文、表格、公式足够，200 以上体积和耗时涨得快而识别率提升有限。
 RENDER_DPI = 150
 
-# 并发调用数。模型服务对并发有速率限制，3 路是实测下比较稳的一档；
-# 再高容易触发 429，反而拖慢整体。
+# 并发调用数。视觉调用是纯网络往返，4 路足以把往返延迟藏掉（20 页从串行的
+# 两分多钟压到 5 轮 ≈ 半分钟），这也是本模块唯一值得并发的地方。
+#
+# 保持 3。这个值是之前实测定的：再高容易触发 429，而 429 的代价是这一页
+# 记进 failed_pages —— 扫描件没有文本层可以补回，用户看到的是一份静默缺页的
+# 正文，比慢几十秒难发现得多。要提速先解决前端一次只解析一份文件的排队，
+# 那条路径的收益比这里加一路大得多。
 CONCURRENCY = 3
 
 # 单页输出上限。一页正文 + 表格通常 600~900 token，留足余量。
@@ -208,18 +226,25 @@ def extract_pages(raw: bytes) -> tuple[list[str], int, int, list[int]]:
     failed: list[int] = []
 
     def work(index: int) -> tuple[int, str, bool]:
+        """识别第 index 页。异常不外抛——一页失败只影响这一页。"""
         if not images[index]:
             return index, "", False
         try:
             return index, _page_to_markdown(images[index], index + 1), True
-        except Exception:  # noqa: BLE001 - 单页失败不该拖垮整份文档
+        except Exception as exc:  # noqa: BLE001 - 单页失败不该拖垮整份文档
+            # 只记页码和异常类型：正文可能含整页原文，不适合进日志。
+            # 少了这一行，429 / 超时 / 输出截断在线上完全无从区分。
+            logger.warning("第 %d 页视觉识别失败：%s", index + 1, type(exc).__name__)
             return index, "", False
 
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         for index, text, ok in pool.map(work, range(len(images))):
+            # 按返回的 index 回填，不按到达顺序追加：顺序错位会让下游节点
+            # 引用指到错误的页，而且不会报错。
             if ok:
                 pages[index] = text
             else:
                 failed.append(index + 1)
 
-    return pages, page_count, limit, failed
+    # 页码升序对外：调用方拿它和文本层逐页对齐，乱序会被误读。
+    return pages, page_count, limit, sorted(failed)

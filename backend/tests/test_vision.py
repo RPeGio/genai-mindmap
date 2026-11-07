@@ -3,6 +3,8 @@
 这里不联网。真实识别效果由手工端到端验证覆盖，测试锁住的是格式判定、
 配置预检、以及失败时必须是报错而不是空正文。
 """
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -132,6 +134,102 @@ class FormatsTest(unittest.TestCase):
         # SVG 是矢量描述，模型看到的是 XML，不该收
         self.assertNotIn(".svg", data["image"])
         self.assertIn("maxImageBytes", data)
+
+
+def make_pdf(pages: int) -> bytes:
+    """生成一份多页 PDF，只为提供可渲染的页面。
+
+    逐页识别本身被 patch 掉：这里要验证的是「谁先完成」和「结果落在第几页」，
+    跟页面上写了什么无关。
+    """
+    import pymupdf
+
+    doc = pymupdf.open()
+    for index in range(pages):
+        doc.new_page().insert_text((72, 72), f"page {index + 1}")
+    raw = doc.tobytes()
+    doc.close()
+    return raw
+
+
+class PdfPageConcurrencyTest(unittest.TestCase):
+    """PDF 逐页视觉识别是并发的，但结果必须按页码就位。
+
+    顺序错位的后果不是"正文顺序乱了"——下游节点靠页码引用来源，错位会让
+    引用静默指到错误的页：不报错，也看不出来。
+    """
+
+    def _extract(self, pages: int, fake):
+        """用 fake 顶掉真实的多模态调用，其余（渲染、线程池、回填）都是真的。"""
+        with patch("app.ingestion.vision_pdf._config",
+                   return_value=("http://example.invalid/v1", "k", "m")), \
+             patch("app.ingestion.vision_pdf._page_to_markdown", side_effect=fake):
+            return vision_pdf.extract_pages(make_pdf(pages))
+
+    def test_page_order_survives_shuffled_completion(self):
+        finished: list[int] = []
+        lock = threading.Lock()
+
+        def fake(image_png, page_no):
+            # 页码越小的页故意越慢：完成顺序与页码顺序完全相反
+            time.sleep((7 - page_no) * 0.03)
+            with lock:
+                finished.append(page_no)
+            return f"第 {page_no} 页正文"
+
+        # 并发度必须 ≥ 页数，否则分批执行会让「第 1 页最慢、所以最后完成」这个
+        # 前提失效：3 路时前 3 页一批，第 1 页只是这一批里最后完成，后面几页
+        # 会接着起来。这条测试验的是「结果按页码就位」，不该依赖并发度取值。
+        with patch.object(vision_pdf, "CONCURRENCY", 6):
+            pages, total, limit, failed = self._extract(6, fake)
+
+        self.assertEqual(total, 6)
+        self.assertEqual(limit, 6)
+        self.assertEqual(failed, [])
+        # 结果按页码就位，而不是按完成先后拼接
+        self.assertEqual(pages, [f"第 {page_no} 页正文" for page_no in range(1, 7)])
+        # 顺带证明这份测试是有意义的：第 1 页最慢、最后才完成
+        self.assertEqual(finished[-1], 1)
+        self.assertNotEqual(finished[0], 1)
+
+    def test_concurrency_never_exceeds_limit(self):
+        lock = threading.Lock()
+        state = {"inflight": 0, "peak": 0, "calls": 0}
+
+        def fake(image_png, page_no):
+            with lock:
+                state["inflight"] += 1
+                state["calls"] += 1
+                state["peak"] = max(state["peak"], state["inflight"])
+            time.sleep(0.02)
+            with lock:
+                state["inflight"] -= 1
+            return f"第 {page_no} 页正文"
+
+        total_pages = vision_pdf.CONCURRENCY * 2
+        self._extract(total_pages, fake)
+
+        self.assertEqual(state["calls"], total_pages)
+        # 上限就是 CONCURRENCY：线程池只有一个，不会因为页多而膨胀
+        self.assertLessEqual(state["peak"], vision_pdf.CONCURRENCY)
+        # 但也必须真的并发，退化成串行会让 20 页扫描件慢上一分多钟
+        self.assertGreater(state["peak"], 1)
+
+    def test_one_failed_page_keeps_the_others(self):
+        def fake(image_png, page_no):
+            if page_no == 2:
+                raise RuntimeError("模型返回 500")
+            return f"第 {page_no} 页正文"
+
+        pages, total, limit, failed = self._extract(4, fake)
+
+        # 失败只落在自己那一格：其余页照常返回，失败页记页码
+        self.assertEqual(failed, [2])
+        self.assertEqual(pages[1], "")
+        self.assertEqual(pages[0], "第 1 页正文")
+        self.assertEqual(pages[2], "第 3 页正文")
+        self.assertEqual(pages[3], "第 4 页正文")
+        self.assertEqual((total, limit), (4, 4))
 
 
 if __name__ == "__main__":
