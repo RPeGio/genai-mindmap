@@ -278,6 +278,57 @@ class PdfVisionTest(unittest.TestCase):
         self.assertTrue(source.truncated)
 
 
+class PdfVisionConcurrencyTest(unittest.TestCase):
+    """逐页识别并发之后，Source 这一层仍按页码拼正文、按页码报失败。
+
+    这两件事是下游引用正确性的前提：页码对不上，节点就会指到错误的页，
+    而导图本身看起来完全正常。
+    """
+
+    def _parse_scan(self, pages: int, fake):
+        """把一份 PDF 当扫描件解析：没有文本层可用，逐页结果由 fake 决定。"""
+        from unittest.mock import patch
+
+        with patch("app.ingestion.vision_pdf._config",
+                   return_value=("http://example.invalid/v1", "k", "m")), \
+             patch("app.ingestion.service._parse_pdf",
+                   return_value=([""] * pages, pages)), \
+             patch("app.ingestion.vision_pdf._page_to_markdown", side_effect=fake):
+            return parse_document_bytes("scan.pdf", make_pdf(pages))
+
+    def test_pages_are_joined_in_page_order(self):
+        import time
+
+        def fake(image_png, page_no):
+            # 页码越小越慢：完成顺序与页码顺序相反
+            time.sleep((7 - page_no) * 0.01)
+            return f"# 第 {page_no} 页标题"
+
+        source = self._parse_scan(6, fake)
+
+        positions = [source.text.index(f"# 第 {page_no} 页标题") for page_no in range(1, 7)]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(source.failed_pages, [])
+        self.assertEqual(source.parsed_pages, 6)
+        self.assertFalse(source.truncated)
+
+    def test_failed_page_is_reported_others_survive(self):
+        def fake(image_png, page_no):
+            if page_no == 2:
+                raise RuntimeError("模型返回 500")
+            return f"# 第 {page_no} 页标题"
+
+        source = self._parse_scan(4, fake)
+
+        self.assertEqual(source.failed_pages, [2])
+        self.assertIn("# 第 1 页标题", source.text)
+        self.assertIn("# 第 4 页标题", source.text)
+        self.assertNotIn("# 第 2 页标题", source.text)
+        # 4 页都处理过，所以不是"截断"；缺的是第 2 页，由 failed_pages 表达
+        self.assertEqual(source.parsed_pages, 4)
+        self.assertFalse(source.truncated)
+
+
 class LegacyOfficeTest(unittest.TestCase):
     """旧格式的三条链路：.doc/.ppt 转 PDF 后走视觉，.xls 用 xlrd。"""
 

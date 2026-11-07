@@ -30,6 +30,23 @@
 
 未实现的格式统一抛 NotSupportedSource，由路由层转成 422，
 不要返回空 Source 假装成功。
+
+**并发模型（改这里之前先看这段）**：
+
+    靠网络的（PDF 逐页视觉识别、语音转写）并发
+    本地 CPU 的（pymupdf 抽文本层、Docling 转结构化格式）串行
+
+分工理由很简单：网络调用绝大部分时间在等回包，并发能把延迟叠起来；
+本地 CPU 在 2C2G 上并起来只会互相抢核，总耗时不变而上下文切换变多。
+
+具体落点：
+    - PDF 逐页视觉   vision_pdf.extract_pages 内部按页并发（CONCURRENCY 路），
+                     渲染仍在同一函数里串行（pymupdf 的 Document 非线程安全）
+    - 语音           asr.transcribe_audio 内部双声道并发（MAX_WORKERS 路）
+    - 图片           单张没有内部并行；多张之间的并发由调用方负责
+                     （前端上传队列按类型分组，见 frontend/src/stores/sources.ts）
+    - Docling        _parse_lock 串行：DocumentConverter 是进程内单例，
+                     多线程同时调用它内部状态不安全
 """
 from __future__ import annotations
 
@@ -345,6 +362,9 @@ def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
       1. markdown/text → 直接解码
       2. document      → PDF 用 pymupdf，其余用 Docling
       3. image/audio   → 交给模型或多模态服务
+
+    一次只处理一个文件：多文件之间的并发属于上传队列（前端）的职责，
+    这一层不该再套一层线程池——那会和 vision / asr 内部的并发叠成 N×N。
     """
     if kind in (SourceKind.text, SourceKind.markdown):
         try:
