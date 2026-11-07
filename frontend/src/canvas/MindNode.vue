@@ -161,6 +161,18 @@ onBeforeUnmount(() => clearTimeout(timer));
       <span v-else class="line-clamp-2 break-words">{{ data.label }}</span>
     </div>
 
+    <!--
+      引用角标：只给"有引用"的节点画，没引用的节点保持干净。
+      用 pointer-events-none 让它不挡节点点击（角标压在节点边缘上）。
+    -->
+    <div
+      v-if="data.refs > 0"
+      class="pointer-events-none absolute -right-1.5 -top-1.5 flex h-5 min-w-5 items-center justify-center rounded-full border border-slate-300 bg-white px-1 text-[10px] font-medium leading-none text-slate-600 shadow-sm"
+      :title="`${data.refs} 处来源引用`"
+    >
+      {{ data.refs }}
+    </div>
+
     <div
       v-if="card && !editing"
       class="absolute bottom-full left-1/2 z-30 mb-2 w-72 -translate-x-1/2 rounded-md border border-slate-300 bg-white p-3 text-left shadow-lg"

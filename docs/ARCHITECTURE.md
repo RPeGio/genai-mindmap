@@ -2,7 +2,7 @@
 
 ## 目标与当前边界
 
-申报书涉及文本、图片、语音、PPT/文档、多模态融合、布局与风格、知识库、知识图谱、逻辑优化、协作、AI 代理和评估。这些都保留在架构与 [功能清单](FEATURES_AND_OWNERS.md) 中。截至 2026-11-06，文本到导图的整条链路、多来源解析（文档 / 图片 / 语音）、节点级引用、三种导出与 Agent 工具循环已经落地；知识库、知识图谱、协作、多布局与主题、容器化部署仍是设计。列表中的“待实现”不代表已经可用。
+申报书涉及文本、图片、语音、PPT/文档、多模态融合、布局与风格、知识库、知识图谱、逻辑优化、协作、AI 代理和评估。这些都保留在架构与 [功能清单](FEATURES_AND_OWNERS.md) 中。截至 2026-11-07，文本到导图的整条链路、多来源解析（文档 / 图片 / 语音）、节点级引用及其界面展示、三种导出与 Agent 工具循环已经落地；知识库、知识图谱、协作、多布局与主题、容器化部署仍是设计。列表中的“待实现”不代表已经可用。
 
 ```mermaid
 flowchart LR
@@ -36,7 +36,7 @@ flowchart LR
 | 生成与模型适配 | `backend/app/generation/` | 文本 → 导图 JSON | 演示适配器和基础模型适配；后续接入生成任务、提示词管理和重试策略。 |
 | 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 当前后端仍是 v1 契约（`docs/API.md`）；v2 已冻结候选、待 D2 落地，届时前端类型由 `openapi-typescript` 生成，不再手写。 |
 | 多模态输入 | `backend/app/ingestion/`、`frontend/src/sources/`、`frontend/src/audio/` | 文本 / 文档 / 图片 / WAV 音频 → 来源 | 文本、Markdown、文档上传（PDF 逐页渲染交模型视觉识别；DOCX/PPTX/XLSX/HTML/MD 走 Docling；`.doc`/`.ppt` 经 LibreOffice 转换；`.xls` 走 `xlrd`）、图片理解（与 PDF 共用 `ingestion/vision_pdf.py` 的调用）与语音转写（百炼 Qwen-Audio-ASR，带句级时间戳，`ingestion/asr.py`）均可用。 |
-| 来源引用 | `backend/app/optimization/source_refs.py`、`backend/app/optimization/nli.py` | 节点 + 来源 → 校验后的 `source_refs` | 节点级引用随导图保存：机械核验（引文能在来源里找到）为主，可选中文 NLI（`MINDMAP_NLI_*`）复核。**界面尚未展示**，只在数据层可用。 |
+| 来源引用 | `backend/app/optimization/source_refs.py`、`backend/app/optimization/nli.py`（展示在 `frontend/src/mindmap/refs.ts`） | 节点 + 来源 → 校验后的 `source_refs` | 节点级引用随导图保存：机械核验（引文能在来源里找到）为主，可选中文 NLI（`MINDMAP_NLI_*`）复核。**界面已接入**（2026-11-07，`fc8f82f`）：角标显示条数，详情面板列来源与位置，抽屉里看原文并高亮命中句；原文不落库，跨会话只能看 `quote`。 |
 | 知识增强（待实现） | `backend/app/knowledge/` | 文档 → 分块/向量；问题 → 有来源片段 | 当前只有明确标识为未实现的检索桩；真实知识库与引用待开发。 |
 | 逻辑优化（部分实现） | `backend/app/optimization/` | 当前导图 → 结构提示 | 单子节点、深度上限、同级重复提示可用；语义纠错等待实现。 |
 | AI 代理（部分实现） | `backend/app/agent/` | 目标 + 来源 + 当前树 → 候选 op 批次 | 受限 tool-calling 循环已可用（`/api/agent/runs/stream`，四个工具、预算上限、SSE v2 事件、前端候选确认）；`/api/agent/tasks` 仍是固定阶段桩，任务化长跑与多角色未做。 |
@@ -49,7 +49,7 @@ flowchart LR
 
 1. 当前树以 `MindMapContent` 为唯一数据结构，节点 ID 唯一。后端限制最多 300 节点、8 层、每节点最多 50 个孩子；前端与后端需按 [API 契约](API.md) 联调。
 2. 将来树以外的因果/引用连接应在版本化 schema 中新增独立 `relations`，包含来源节点、目标节点、关系类型及可追溯证据，不能通过重复节点冒充。布局、节点样式与语义结构分离，并规划迁移。
-3. 当前多来源流水线将实际使用的来源 ID、类型、文件名及字符数写入 `MindMapContent.source_usage`，节点级的 `source_refs`（来源 ID、页码、字符区间、引文）随导图保存；这两者是摘要与定位信息，**不保存原文**，所以引用只能在本次请求内回查。原文持久化、跨请求回查与页码/时间戳在界面上的展示仍待补。
+3. 当前多来源流水线将实际使用的来源 ID、类型、文件名及字符数写入 `MindMapContent.source_usage`，节点级的 `source_refs`（来源 ID、页码、字符区间、引文）随导图保存；这两者是摘要与定位信息，**不保存原文**，所以引用只能在本次请求内回查（界面在本次会话里回查原文，重新打开后只剩 `quote`）。原文持久化、跨请求回查与页码/时间戳在界面上的展示仍待补。
 4. AI 返回的是候选内容：服务端校验后返回；Agent 产物是 op 批次、挂在候选副本上，逻辑优化只给建议，都必须由用户确认，避免覆盖手工编辑。模型密钥只在服务端保存。
 5. 当前生成用同步请求或 SSE 流式，适合原型。导入、长文本、语音识别仍可能跑很久：持久任务（`pending → running → succeeded/failed`，支持超时、重试、状态查询）只在 `docs/ARCHITECTURE_ADDENDUM.md` 里设计过，代码里没有队列，也没有可断线重放的任务事件接口。
 6. 当前保存使用乐观锁。多人实时协作需要单独的 CRDT 同步与持久化，不应将当前版本号机制当作实时合并方案。

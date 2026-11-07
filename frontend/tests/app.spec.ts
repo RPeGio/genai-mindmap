@@ -3,6 +3,8 @@ import { createPinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
+import { useMindMapStore } from '../src/stores/mindmap';
+import { useSourcesStore } from '../src/stores/sources';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；
 // 界面测试只关心输入区与详情面板，画布替换成占位元素。
@@ -222,5 +224,69 @@ describe('App', () => {
     await vi.waitFor(() =>
       expect(wrapper.get('[role="status"]').text()).toContain('已打开导图，版本 2'));
     expect(wrapper.text()).toContain('2 个节点');
+  });
+});
+
+describe('节点引用', () => {
+  const withRefs = (sourceRefs: { source_id: string; page?: number; start?: number; end?: number; quote?: string }[]) => ({
+    title: '带引用',
+    root: {
+      id: 'r',
+      label: '根',
+      children: [{ id: 'a', label: '甲', children: [], source_refs: sourceRefs }],
+    },
+  });
+
+  it('选中带引用的节点时，详情面板列出它的引用', async () => {
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(withRefs([{ source_id: 's1', page: 2, quote: '矩阵的秩' }]), 'right');
+    store.select('a');
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).toContain('来源引用（1）');
+    expect(wrapper.text()).toContain('第 2 页');
+    expect(wrapper.text()).toContain('矩阵的秩');
+  });
+
+  it('没有引用的节点明确说明没有，而不是留一片空白', async () => {
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(withRefs([]), 'right');
+    store.select('r');
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).toContain('这个节点没有来源引用');
+  });
+
+  it('点引用打开右侧抽屉；手边没有原文时说明只能看摘录', async () => {
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(withRefs([{ source_id: 's1', page: 2, quote: '矩阵的秩' }]), 'right');
+    store.select('a');
+    await wrapper.vm.$nextTick();
+
+    await buttonByText(wrapper, '矩阵的秩').trigger('click');
+    const drawer = wrapper.find('[aria-labelledby="ref-title"]');
+    expect(drawer.exists()).toBe(true);
+    expect(drawer.text()).toContain('矩阵的秩');
+    expect(drawer.text()).toContain('原文没有随导图保存');
+  });
+
+  it('本次会话解析过的来源能在抽屉里高亮命中句', async () => {
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    sources.addText('矩阵的秩等于行向量组的极大线性无关组的个数。');
+    const sourceId = sources.readySources[0].id;
+
+    const store = useMindMapStore();
+    store.preview(withRefs([{ source_id: sourceId, start: 0, end: 6, quote: '矩阵的秩等于' }]), 'right');
+    store.select('a');
+    await wrapper.vm.$nextTick();
+
+    await buttonByText(wrapper, '矩阵的秩等于').trigger('click');
+    const drawer = wrapper.find('[aria-labelledby="ref-title"]');
+    expect(drawer.find('mark').text()).toBe('矩阵的秩等于');
+    expect(drawer.text()).not.toContain('原文没有随导图保存');
   });
 });

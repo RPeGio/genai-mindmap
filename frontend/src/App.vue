@@ -9,8 +9,24 @@ import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
 import type { SampleMap } from './dev/samples';
 import { displayBody, useMindMapStore } from './stores/mindmap';
+import { useSourcesStore } from './stores/sources';
+import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 
 const store = useMindMapStore();
+const sources = useSourcesStore();
+
+/**
+ * 选中节点的引用，解析成"能直接画"的形状。
+ *
+ * 原文取自 sources store：本次会话里解析过的来源才能回查，从已保存导图打开时
+ * readySources 是空的，解析结果里 source 为 null，抽屉会据此降级成"只看摘录"。
+ */
+const selectedRefs = computed(() =>
+  resolveRefs(store.selectedRefs, sources.readySources, store.content?.source_usage ?? []),
+);
+
+/** 正在右侧抽屉里查看的引用；null 表示抽屉关着。 */
+const activeRef = ref<ResolvedRef | null>(null);
 
 const copied = ref('');
 
@@ -321,6 +337,29 @@ async function copyBody() {
           <p class="flex-1 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
             {{ displayBody(selected.node) }}
           </p>
+
+          <section v-if="selectedRefs.length" class="flex flex-col gap-2 border-t border-slate-200 pt-3">
+            <h3 class="text-xs font-medium text-slate-500">来源引用（{{ selectedRefs.length }}）</h3>
+            <ul class="flex flex-col gap-1.5">
+              <li v-for="(item, index) in selectedRefs" :key="`${item.ref.source_id}-${index}`">
+                <button
+                  type="button"
+                  class="w-full rounded-md border border-slate-200 px-2 py-1.5 text-left hover:border-slate-300 hover:bg-slate-50"
+                  @click="activeRef = item"
+                >
+                  <span class="block truncate text-xs text-slate-600">
+                    {{ item.name }}<span v-if="item.where"> · {{ item.where }}</span>
+                  </span>
+                  <span class="mt-0.5 line-clamp-2 block text-xs leading-relaxed text-slate-500">
+                    {{ item.quote || '（这条引用没有摘录）' }}
+                  </span>
+                </button>
+              </li>
+            </ul>
+          </section>
+          <p v-else class="border-t border-slate-200 pt-3 text-xs text-slate-400">
+            这个节点没有来源引用。
+          </p>
           <div class="grid grid-cols-2 gap-2">
             <button
               type="button"
@@ -376,10 +415,50 @@ async function copyBody() {
               {{ SOURCE_LABELS[source.kind] }} · {{ source.filename || `来源 ${index + 1}` }} · {{ source.char_count }} 字
             </li>
           </ul>
-          <p class="mt-2 leading-relaxed text-slate-400">整图来源摘要，不对应具体节点；原文未随导图保存。</p>
+          <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源（整图口径），具体出处见各节点的引用；原文未随导图保存。</p>
         </details>
       </aside>
     </main>
+
+    <!--
+      原文抽屉：从右侧滑出，不挤掉详情面板。只有本次会话解析过的来源才有原文，
+      从已保存导图打开时只能看摘录——这一点在底部明确写出来，别让用户以为功能坏了。
+    -->
+    <aside
+      v-if="activeRef"
+      class="fixed inset-y-0 right-0 z-40 flex w-[480px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ref-title"
+    >
+      <header class="flex items-start justify-between gap-3 border-b border-slate-200 p-4">
+        <div class="min-w-0">
+          <h2 id="ref-title" class="truncate text-sm font-semibold">{{ activeRef.name }}</h2>
+          <p class="mt-0.5 text-xs text-slate-500">{{ activeRef.where || '未标注位置' }}</p>
+        </div>
+        <button
+          type="button"
+          class="shrink-0 text-xs text-slate-500 hover:text-slate-900"
+          @click="activeRef = null"
+        >
+          关闭
+        </button>
+      </header>
+      <div class="flex-1 overflow-y-auto p-4">
+        <p v-if="activeRef.excerpt" class="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
+          {{ activeRef.before }}<mark class="rounded bg-amber-200 px-0.5 text-slate-900">{{ activeRef.hit }}</mark>{{ activeRef.after }}
+        </p>
+        <p v-else-if="activeRef.quote" class="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
+          {{ activeRef.quote }}
+        </p>
+        <p v-else class="text-sm text-slate-400">这条引用没有摘录，也没有可回查的原文。</p>
+
+        <p v-if="!activeRef.source" class="mt-4 rounded-md bg-slate-50 p-3 text-xs leading-relaxed text-slate-500">
+          原文没有随导图保存，这里只能看到生成时记下的摘录。
+          {{ activeRef.start != null ? '打开这张图时重新解析同一份来源，才能回到原文。' : '' }}
+        </p>
+      </div>
+    </aside>
 
     <div
       v-if="store.listOpen"
