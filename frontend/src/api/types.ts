@@ -180,6 +180,13 @@ export interface AgentRunRequest {
   intent: 'create' | 'expand' | 'edit';
   snapshot?: MindMapContent | null;
   selected_ids?: string[];
+  /**
+   * 本次请求附带的来源，镜像后端 `AgentRunRequest.sources`（max_length=50）。
+   *
+   * 材料正文走这里，不拼进 goal：拼进去会被当成"用户的主题"，
+   * 而模型需要的是带 source_id 的结构化数据——否则它写不出合法的引用。
+   */
+  sources?: Source[];
 }
 
 /**
