@@ -233,3 +233,70 @@ describe('保存状态', () => {
     expect(store.content?.title).toBe('新标题');
   });
 });
+
+describe('节点引用', () => {
+  const withRefs = (): MindMapContent => ({
+    title: '带引用',
+    root: {
+      id: 'root',
+      label: '根',
+      children: [
+        {
+          id: 'a',
+          label: '甲',
+          children: [],
+          source_refs: [
+            { source_id: 's1', page: 1, quote: '矩阵的秩' },
+            { source_id: 's1', page: 2 },
+          ],
+        },
+        { id: 'b', label: '乙', children: [] },
+      ],
+    },
+  });
+
+  it('引用条数进画布节点数据，没有引用的节点是 0', () => {
+    const store = useMindMapStore();
+    store.preview(withRefs(), 'right');
+
+    const counts = new Map(store.nodes.map(node => [node.id, node.data.refs]));
+    expect(counts.get('root')).toBe(0);
+    expect(counts.get('a')).toBe(2);
+    expect(counts.get('b')).toBe(0);
+  });
+
+  it('选中节点后能拿到它的引用，未选中或节点没有引用时是空数组', () => {
+    const store = useMindMapStore();
+    store.preview(withRefs(), 'right');
+
+    store.select('a');
+    expect(store.selectedRefs.map(ref => ref.page ?? 0)).toEqual([1, 2]);
+
+    store.select('b');
+    expect(store.selectedRefs).toEqual([]);
+
+    store.select(null);
+    expect(store.selectedRefs).toEqual([]);
+  });
+
+  it('删掉节点后它的引用一起消失', () => {
+    const store = useMindMapStore();
+    store.preview(withRefs(), 'right');
+
+    store.select('a');
+    store.deleteNode('a');
+
+    expect(store.selectedRefs).toEqual([]);
+    expect(store.nodes.some(node => node.id === 'a')).toBe(false);
+  });
+
+  it('改文字不动引用：引用说的是来源，不是节点标题', () => {
+    const store = useMindMapStore();
+    store.preview(withRefs(), 'right');
+
+    store.commitLabel('a', '改过的甲');
+    expect(store.selectedRefs.length).toBe(0); // 没选中时为空
+    store.select('a');
+    expect(store.selectedRefs.length).toBe(2);
+  });
+});

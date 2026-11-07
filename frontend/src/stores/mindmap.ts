@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, Source } from '../api/types';
+import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, Source, SourceRef } from '../api/types';
 import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
@@ -132,6 +132,8 @@ export interface MindNodeData {
   out: ChildSide[];
   /** 需要渲染的目标句柄：连线从父节点进来时落在哪一侧 */
   in: ChildSide[];
+  /** 这个节点有几条来源引用；画布角标用，0 时不显示角标 */
+  refs: number;
 }
 
 export interface FlatNode {
@@ -334,6 +336,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
           depth,
           out: outSides,
           in: inSides,
+          refs: node.source_refs?.length ?? 0,
         },
       } satisfies MindFlowNode;
     });
@@ -368,6 +371,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const selectedNode = computed<FlatNode | null>(
     () => flatNodes.value.find(entry => entry.node.id === selectedId.value) ?? null,
   );
+
+  /** 选中节点的引用。空节点也有自己的空数组，详情面板不必再判空。 */
+  const selectedRefs = computed<SourceRef[]>(() => selectedNode.value?.node.source_refs ?? []);
 
   /** 从根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
   const breadcrumb = computed<MindNode[]>(() => {
@@ -1397,6 +1403,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     edges,
     nodeCount,
     selectedNode,
+    selectedRefs,
     breadcrumb,
     canUndo,
     canRedo,
