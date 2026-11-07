@@ -41,7 +41,11 @@ class RunBudget(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    max_model_calls: int = Field(default=5, ge=1, le=20)
+    # 8 而不是 5。分片生成（mindmap_generate_deep）的一次调用量是
+    # 「1 次骨架 + N 次并发展开 + 最多 N 次补点重试」，N 默认 5 时最坏要 11 次；
+    # 给 5 的话外层先占 1、工具内只剩 4，骨架加三支就用完了，五支必然只展开三支。
+    # 8 覆盖「骨架 + 5 支 + 2 次重试」这个常见上界，再多就该由调用方显式放宽。
+    max_model_calls: int = Field(default=8, ge=1, le=20)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
     max_seconds: float = Field(default=120.0, gt=0, le=600)
     # 这是**单次**模型调用的输出上限，不是整轮累计——它直接作为 provider 请求里
