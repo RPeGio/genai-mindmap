@@ -103,7 +103,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 前端
 
-前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
+前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图；输入侧支持文本、文档、图片与浏览器录音（`src/components/SourceInputs.vue`、`src/audio/`），导出走 PUML / Markdown / OPML 三种格式，Agent 面板（`src/components/AgentPanel.vue`）把工具循环产出的候选挂到副本上、点接受才落到画布。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
 
 | 位置 | 选型 |
 |---|---|
@@ -120,7 +120,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 后端
 
-FastAPI + Pydantic v2。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。8 组路由统一挂在 `/api` 下，**未实现的接口返回 501 并带 `implemented: false`，不返回空对象冒充成功**。模型调用集中在 `backend/app/generation/`：默认 `demo` 模式不联网，设 `MINDMAP_LLM_MODE=model` 后才走 Chat Completions 兼容接口。生成结果不自动保存，保存是带版本号的乐观锁（冲突返回 409）。
+FastAPI + Pydantic v2，8 组路由、19 个端点统一挂在 `/api` 下。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `knowledge/search` 与 `agent/tasks` 两个桩），没有返回 501 的路由。模型调用集中在 `backend/app/generation/` 与 `backend/app/agent/`：默认 `demo` 模式不联网，设 `MINDMAP_LLM_MODE=model` 后才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`。生成结果不自动保存，保存是带版本号的乐观锁（冲突返回 409）。
 
 ### 核心模块开发
 

@@ -4,7 +4,9 @@
 
 **错误体已统一**：所有错误响应都是 `{code, message, detail, request_id}`（实现见 `backend/app/core/errors.py`）。`message` 是中文可读文案，`detail` 保留原始细节（校验错误为数组），`request_id` 优先沿用请求头 `X-Request-ID`、没有则生成，并同时通过响应头回传。前端 `src/api/client.ts` 的 `ApiError` 读 `message`，缺失时回退到 `detail`。
 
-**前端消费情况**：已封装 `POST /api/generations`（`generateMindMap`）、`POST /api/generations/stream`（`generateMindMapStream`，页面默认走这条）、`GET /api/mindmaps`、`GET /api/mindmaps/{id}`、`POST /api/mindmaps`、`PUT /api/mindmaps/{id}`（后四个构成 R3 的保存与打开）；画布与编辑全部在 `src/canvas/` 与 `src/mindmap/edits.ts` 里完成，只把整棵树发给后端。pipeline / optimization / export / ingestion 尚未封装。
+**前端消费情况**（截至 2026-11-06）：`POST /api/generations`、`POST /api/generations/stream`、`POST /api/pipeline/generate`（`generateFromSources`）、`POST /api/ingestion/files`（`uploadDocument`）、`POST /api/agent/runs/stream`（`runAgentStream`）、`POST /api/export/{puml,markdown,opml}`、四个 `/api/mindmaps*` 端点。画布与编辑全部在 `src/canvas/`、`src/mindmap/{edits,ops}.ts` 里完成，只把整棵树发给后端。
+
+**尚未封装**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check`、`POST /api/optimization/suggest`、`POST /api/knowledge/search`、`POST /api/agent/tasks`。其中前两个是小事，中间两个是"结构诊断还没进界面"，后两个仍是桩。
 
 ## 导图格式 v1（当前）与 v2（候选）
 
@@ -24,9 +26,17 @@
 }
 ```
 
-每个节点需要非空 `id`、非空 `label`；省略 `children` 时默认为空。整棵树 ID 唯一，最多 300 节点、8 层、每个节点最多 50 个子节点。标题和节点文字长度不超过 200。
+每个节点需要非空 `id`、非空 `label`；省略 `children` 时默认为空。节点还可以带可选的 `source_refs`（**属于 v1，不是 v2 预告**）：
 
-**v2 候选**在 v1 之上新增 `schema_version`、`layout`、`theme`、`relations[]` 以及节点的 `note`/`collapsed`/`style`/`source_refs`/`pos`，详见 [CONTRACT_V2](CONTRACT_V2.md)。**后端尚未实现 v2**，前端当前按 v1 对接，v2 字段只留扩展位。
+```json
+"source_refs": [{"source_id": "source-1", "quote": "原文里的逐字片段", "start": 12, "end": 25, "page": 3}]
+```
+
+`quote` 必须能在本次请求提供的原文里逐字匹配，`source_id` 必须出现在 `source_usage` 里；不合规的引用在生成/保存时被剔除，原因通过 `diagnostics`（带 `node_id`）返回，节点本身保留。规则见 [节点来源引用](SOURCE-REFERENCES.md)。
+
+整棵树 ID 唯一，最多 300 节点、8 层、每个节点最多 50 个子节点，每节点最多 20 条引用。标题和节点文字长度不超过 200。
+
+**v2 候选**在 v1 之上新增 `schema_version`、`layout`、`theme`、`relations[]` 以及节点的 `note`/`collapsed`/`style`/`pos`，详见 [CONTRACT_V2](CONTRACT_V2.md)。**后端尚未实现 v2**（`extra="forbid"`，提前发送 v2 字段会 422），前端当前按 v1 对接。
 
 `source_usage` 是可选的**整张导图来源摘要**：多来源流水线根据实际输入填写，保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。直接文本生成时该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
 
@@ -50,12 +60,14 @@
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
 | `GET /api/mindmaps/{id}` | 无 | 导图记录 | 不存在 404 |
 | `PUT /api/mindmaps/{id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
+| `POST /api/agent/runs/stream` | `{"goal":"…","intent":"create / expand / edit","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：`{v:2,runId,seq,type}`，`type` ∈ `stage` / `heartbeat` / `tool_start` / `ops` / `tool_end` / `snapshot` / `done` / `error`，产物是**候选** | 目标为空 422；预算用尽或模型失败以 `error` 事件下发 |
 
-**流式接口的帧格式**：每帧 `data: <json>`，`type` 字段区分事件；`node` 事件的节点只有 `id`/`label`（不含 children），前端按 id 插入或覆盖；收到 `done` 后前端应用完整 `content` 对齐；`data: [DONE]` 表示流正常结束，不是 JSON。事件定义与生成逻辑见 `backend/app/generation/stream_partial.py`。
+**流式接口有两套帧格式。** 生成链路（`/api/generations/stream`）每帧 `data: <json>`，`type` 区分 `stage` / `node` / `heartbeat` / `done` / `error` / `skeleton`；`node` 事件的节点只有 `id`/`label`（不含 children），前端按 id 插入或覆盖；收到 `done` 后前端应用完整 `content` 对齐；`data: [DONE]` 表示流正常结束，不是 JSON。事件定义与生成逻辑见 `backend/app/generation/stream_partial.py`。
+Agent 链路（`/api/agent/runs/stream`）用 v2 信封 `{v:2,runId,seq,baseClientRevision,candidateRevision,type}`，产物是 `ops` 操作批次而不是增量节点；前端把它挂在候选副本上，用户点接受才落到画布。协议见 `docs/AGENT_PLAN.md`。
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。流水线目前同步返回，`stages` 是完成后的阶段记录，不是实时进度。
 
-**文档解析**用 Docling，输出保留标题层级与表格结构（表格会变成 Markdown 表格）。PDF 需要版面模型，首次解析要在有网环境下下载并缓存到 `~/.cache/docling/models`；离线环境缺缓存时返回 422 并说明如何预置。DOCX/PPTX/XLSX/HTML 不需要模型。单份文档最多解析 50 页。扫描件解析结果为空时同样返回 422，不返回空内容。`.doc/.ppt/.xls` 旧格式不支持，需另存为新格式。
+**文档解析按格式走不同链路**（详见 [部署文档](DEPLOY.md)）。`.pdf` 逐页渲染后交模型视觉识别（demo 模式回落文本层，扫描件则 422），单份最多 50 页；`.docx`/`.pptx`/`.xlsx`/`.html`/`.md` 走 Docling 读结构化格式，不加载版面模型、离线可用；`.doc`/`.ppt` 要先经 LibreOffice 转 PDF 再视觉识别，没装 LibreOffice 时 422 并附安装命令；`.xls` 用 `xlrd` 直读单元格；`.png`/`.jpg`/`.webp`/`.gif`/`.bmp` 复用多模态调用；`.wav` 走百炼 Qwen-Audio-ASR（≤300 秒，更长自动切片）。解析失败或拿不到正文时返回 422，不返回空内容。
 
 `source` 是 `/api/ingestion/text` 返回的对象，也可按 `/docs` 中的 Source 结构提交；每次流水线最多 50 个来源，必须均为非空且已解析，ID 不可重复。当前超长会报错，不会静默截断或丢弃来源。
 
@@ -64,19 +76,18 @@
 | 路由 | 当前行为 |
 |---|---|
 | `POST /api/knowledge/search` | 返回空列表与 `implemented: false`，没有接入检索。 |
-| `POST /api/agent/tasks` | 返回固定阶段与 `implemented: false`，不会生成导图。 |
-| `POST /api/export/markdown`、`POST /api/export/opml` | 返回 501。 |
+| `POST /api/agent/tasks` | 返回固定阶段与 `implemented: false`，不会生成导图；真正能跑的是 `/api/agent/runs/stream`。 |
 
 ## 功能接口规划（均未实现）
 
 | 模块 | 候选接口/契约 | 目的 |
 |---|---|---|
-| 多模态文件 | 已落地 `POST /api/ingestion/files`（文档 + 图片 + WAV）；来源查询接口待确定 | 上传或解析 PDF、Word、PPT、图片、WAV 音频已可用；逐句时间戳与节点级来源定位仍待补。 |
-| 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。 |
+| 多模态文件 | 已落地 `POST /api/ingestion/files`（文档 + 图片 + WAV）；来源查询接口待确定 | 上传或解析 PDF、Word、PPT、图片、WAV 音频已可用；音频已有逐句时间戳，但节点引用还不能指回"第几秒"，页码级定位也缺。 |
+| 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。当前是同步请求 + SSE 秒级流，没有持久任务。 |
 | 优化 | 已有 `/api/optimization/suggest`，持久化和应用接口待确定 | 未来补齐矛盾、缺失、重组、跨节点关系候选及依据，不直接覆盖。 |
 | 知识库 | `POST /api/knowledge-bases`、`POST .../{id}/sources`、`POST .../{id}/search` | 导入来源、切分、向量化、检索与引用。 |
-| AI 代理 | 以 `/api/agent/tasks` 桩为起点 | 目标规划、多步生成、讨论总结与翻译，记录过程和来源。 |
+| AI 代理 | `POST /api/agent/runs/stream` 已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环与候选确认已可用；任务化长跑、过程记录落库与多角色仍待设计。 |
 | 协作 | 房间授权接口 + Yjs WebSocket | 房间鉴权、实时同步、在线状态、恢复；最终协议由协作负责人完成设计。 |
-| 更多导出 | `/api/export/markdown`、`/api/export/opml` | Markdown 和 OPML 目前返回 501；图像导出待开发。 |
+| 更多导出 | `/api/export/puml`、`/markdown`、`/opml` 均已实现；图像导出待开发 | PNG/SVG 渲染要额外依赖，优先用浏览器端截图或交给 PlantUML 服务。 |
 
 未来接口的请求、响应、权限、错误和任务生命周期需在实现前由 RPeGio 与陈嘉涛共同评审，不能将候选路径视为已实现承诺。

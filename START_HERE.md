@@ -4,11 +4,11 @@
 
 ## 当前可运行范围
 
-- 前端 Vue 3 + TypeScript：输入文字 → 流式生成 → `@vue-flow/core` 画布（平移、缩放、点选节点看全文，支持向右 / 向左 / 向下 / 双向四种布局）→ 双击改文字 / Tab 加子节点 / Enter 加兄弟 / Delete 删子树 / 撤销重做 / Ctrl+S 保存（`version` 乐观锁，409 时三选弹层）→ 打开已保存导图（旧 React 骨架已打 tag `v0.1.0-react-scaffold` 存档）。
-- 后端 FastAPI：生成接口（同步与 SSE 流式）、结构校验、SQLite 保存和读取、版本冲突检测、文本多来源流水线、文档上传（Docling）、统一错误体、基础结构提示及 PUML 文本导出。
+- 前端 Vue 3 + TypeScript：文本 / 文档 / 图片 / 录音多来源输入 → 流式或流水线生成 → `@vue-flow/core` 画布（平移、缩放、点选节点看全文，支持向右 / 向左 / 向下 / 双向四种布局）→ 双击改文字 / Tab 加子节点 / Enter 加兄弟 / Delete 删子树 / 撤销重做 / Ctrl+S 保存（`version` 乐观锁，409 时三选弹层）→ 打开已保存导图 → PUML / Markdown / OPML 三种导出 → Agent 面板（候选需点接受才落到画布，旧 React 骨架已打 tag `v0.1.0-react-scaffold` 存档）。
+- 后端 FastAPI：生成接口（同步与 SSE 流式）、结构校验、SQLite 保存和读取、版本冲突检测、多来源流水线（文本 / 文档 / 图片 / 语音）、文档上传（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、`xlrd` 读 `.xls`、百炼 Qwen-Audio-ASR 转写 WAV）、节点级来源引用与三层校验、PUML / Markdown / OPML 导出、Agent 工具循环（`/api/agent/runs/stream`，产物是候选）、统一错误体、基础结构提示。
 - 默认 `demo` 生成固定结构，用于联调，**不会调用 AI**。可配置 Chat Completions 兼容模型服务，实际能力取决于服务商和模型。模型调用尚未在真实密钥环境验收。
-- 可视化编辑、图片/语音处理、知识库、知识图谱、协作、翻译、模型评估等尚未实现，详见功能清单。
-- 多来源流水线记录整图来源摘要并可随导图保存；原文持久化和节点级来源引用尚未实现。合并超过 8000 字会报错，不会悄悄丢弃内容。
+- 尚未实现：知识库检索与持久知识库（`/api/knowledge/search` 是桩）、知识图谱、协作、翻译、模型评估、多布局与主题风格（v2 契约未落地）、容器化部署。图片与语音处理已在 2026-11-05 落地，别再按"尚未实现"处理。
+- 多来源流水线记录整图来源摘要与节点级引用（`source_refs`，机械核验 + 可选 NLI），都能随导图保存；**界面还没展示引用**，数据只在接口层。原文不持久化。合并后文本超过 20000 字会报错，不会悄悄丢弃内容。
 
 **当前只有本地单用户开发能力，没有登录、授权、访问隔离或生产安全加固，不要直接部署到公网或用于敏感数据。**
 
@@ -49,6 +49,18 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 请以供应商实际文档为准，不同供应商的 URL、参数、区域和模型能力可能不同。不要把密钥提交进仓库；`backend/.env.example` 仅为变量清单，程序不会自动读取 `.env`。切回演示模式：`$env:MINDMAP_LLM_MODE = 'demo'`。调用真实模型会产生外部请求和可能的费用，避免上传未经授权的资料。
+
+### 另外几个可选变量
+
+| 变量 | 用途 |
+|---|---|
+| `DASHSCOPE_API_KEY` | 语音转写（百炼 Qwen-Audio-ASR），没配时 `.wav` 上传返回 422 |
+| `MINDMAP_SOFFICE_CMD` | 指到 LibreOffice 的 `soffice` 路径，处理 `.doc`/`.ppt`/`.xls` 之外的老格式；不配则从 `PATH` 里找 |
+| `MINDMAP_AGENT_ENABLED` | 设为 `0` 关闭 `/api/agent/runs/stream` |
+| `MINDMAP_DB_PATH` | SQLite 文件位置，默认 `backend/data/mindmaps.db` |
+| `MINDMAP_NLI_ENABLED`、`MINDMAP_NLI_MODEL_DIR`、`MINDMAP_NLI_MIN_FREE_MB` | 可选的引用语义校验（ONNX 模型），不配时只做机械核验 |
+
+PDF 视觉识别复用上面的 `MINDMAP_LLM_*`，并要求 `MINDMAP_LLM_MODE=model`；`demo` 模式下 PDF 只回落到文本层，扫描件会返回 422。
 
 ## 团队从这里开始
 
