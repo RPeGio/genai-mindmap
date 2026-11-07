@@ -341,6 +341,17 @@ async def run(
                     timeout=max(0.1, _remaining_seconds(budget, started)),
                 )
             except (asyncio.TimeoutError, TimeoutError):
+                # 超时也是一次「工具结束了」。少了这一帧，事件序列就是
+                # `stage → tool_start → error`，前端那行工具永远停在「执行中」——
+                # `max_repairs` 判停那条路径修过同一个问题，超时这里当时漏了。
+                yield ToolEndEvent(
+                    seq=next(seq), call_id=call.call_id, name=call.name, ok=False,
+                    result_summary={
+                        "code": "tool_timeout",
+                        "message": _BUDGET_HINT["max_seconds"],
+                    },
+                    latency_ms=int((time.monotonic() - begun) * 1000),
+                )
                 yield ErrorEvent(
                     seq=next(seq), code="budget_exhausted",
                     message=_BUDGET_HINT["max_seconds"], limit="max_seconds",
