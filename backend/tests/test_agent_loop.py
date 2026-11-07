@@ -12,6 +12,7 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agent.contracts import (
@@ -23,7 +24,7 @@ from app.agent.contracts import (
     ToolSpec,
 )
 from app.agent.provider import _parse_completion
-from app.agent.service import _dedupe_key, outline_text, run
+from app.agent.service import MAX_LOG_MESSAGE_CHARS, _dedupe_key, outline_text, run
 from app.agent.tools import PLAN_PROMPT, ToolRegistry, build_registry
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source
@@ -119,6 +120,160 @@ def _registry(handler, args_model=EchoArgs, name: str = "echo",
 def _request(intent: str = "create", budget: RunBudget | None = None) -> AgentRunRequest:
     return AgentRunRequest(goal="给机器学习做一张导图", intent=intent,
                            budget=budget or RunBudget())
+
+
+def _failure_logs(caplog) -> list[dict]:
+    return [json.loads(record.args[0]) for record in caplog.records
+            if record.name == "app.agent.service"]
+
+
+def test_tool_failure_logs_reason_and_usage_without_material_or_tree(caplog):
+    private_text = "不应出现在日志里的原文" * 100
+    private_tree = {"root": {"label": "不应出现在日志里的树"}}
+
+    def broken(args, ctx):
+        ctx.reserve_model_call()
+        return ToolResult(ok=False, content=private_text, data={
+            "code": "invalid_map", "message": "引用与原文不匹配",
+            "tree": private_tree, "diagnostics": [{"text": private_text}],
+        })
+
+    call = ToolCall(call_id="failure-1", name="echo", arguments={"text": private_text})
+    request = AgentRunRequest(goal="整理", sources=[Source(kind="text", text=private_text)])
+    events = _collect(request, ScriptedProvider([
+        _completion([call], finish="tool_calls"), _completion(),
+    ]), _registry(broken))
+    end = next(event for event in events if event.type == "tool_end")
+    assert end.result_summary["code"] == "invalid_map"
+    assert end.result_summary["message"] == "引用与原文不匹配"
+    assert _failure_logs(caplog) == [{
+        "call_id": "failure-1", "tool": "echo", "code": "invalid_map",
+        "message": "引用与原文不匹配", "model_calls_used": 2, "tool_calls_used": 1,
+    }]
+    assert private_text not in caplog.text
+    assert private_tree["root"]["label"] not in caplog.text
+
+
+def test_failure_without_code_or_message_reaches_events_and_logs(caplog):
+    call = ToolCall(call_id="missing-summary", name="echo", arguments={"text": "x"})
+    events = _collect(_request(), ScriptedProvider([
+        _completion([call], finish="tool_calls"), _completion(),
+    ]), _registry(lambda args, ctx: ToolResult(
+        ok=False, content="这次没有可用分支", data={"diagnostics": [], "failed_branches": ["甲"]},
+    )))
+    end = next(event for event in events if event.type == "tool_end")
+    assert end.result_summary["code"] == "tool_failed"
+    assert end.result_summary["message"] == "这次没有可用分支"
+    assert end.result_summary["failed_branches"] == ["甲"]
+    assert _failure_logs(caplog)[0]["message"] == end.result_summary["message"]
+
+
+def test_long_failure_message_is_only_a_bounded_log_summary(caplog):
+    reason = "模型校验失败\n" + "过长的模型输出" * MAX_LOG_MESSAGE_CHARS
+    events = _collect(_request(), ScriptedProvider([GenerationError(reason)]))
+    assert events[-1].message == reason
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == "generation_failed"
+    assert len(log["message"]) <= MAX_LOG_MESSAGE_CHARS
+    assert reason not in caplog.text
+
+
+@pytest.mark.parametrize("failure,code", [
+    (GenerationError("模型服务返回 HTTP 429"), "generation_failed"),
+    (RuntimeError("适配器意外失败"), "agent_failed"),
+    (asyncio.TimeoutError(), "budget_exhausted"),
+])
+def test_provider_failure_is_logged_with_usage(caplog, failure, code):
+    provider = ScriptedProvider([failure])
+    if type(failure) is RuntimeError:
+        with pytest.raises(RuntimeError, match="适配器意外失败"):
+            _collect(_request(), provider)
+    else:
+        events = _collect(_request(), provider)
+        assert events[-1].code == code
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == code
+    assert log["message"]
+    assert log["call_id"] is None and log["tool"] is None
+    assert log["model_calls_used"] == 1 and log["tool_calls_used"] == 0
+
+
+@pytest.mark.parametrize("failure,code", [
+    (GenerationError("工具上游失败"), "generation_failed"),
+    (RuntimeError("工具意外失败"), "agent_failed"),
+])
+def test_tool_exception_is_logged_before_propagating(caplog, failure, code):
+    def broken(args, ctx):
+        ctx.reserve_model_call()
+        raise failure
+
+    call = ToolCall(call_id="raised-1", name="echo", arguments={"text": "x"})
+    provider = ScriptedProvider([_completion([call], finish="tool_calls")])
+    with pytest.raises(type(failure), match=str(failure)):
+        _collect(_request(), provider, _registry(broken))
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == code and str(failure) in log["message"]
+    assert log["call_id"] == call.call_id and log["tool"] == call.name
+    assert log["model_calls_used"] == 2 and log["tool_calls_used"] == 1
+
+
+@pytest.mark.parametrize("limit", ["max_model_calls", "max_tool_calls"])
+def test_budget_stop_is_logged_with_last_call_and_usage(caplog, limit):
+    call = ToolCall(call_id="budget-1", name="echo", arguments={"text": "x"})
+    provider = ScriptedProvider([_completion([call], finish="tool_calls")])
+    events = _collect(_request(budget=RunBudget(**{limit: 1})), provider, _registry(_echo))
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == events[-1].code == "budget_exhausted"
+    assert log["message"] == events[-1].message
+    assert log["call_id"] == call.call_id and log["tool"] == call.name
+    assert log["model_calls_used"] == 1 and log["tool_calls_used"] == 1
+
+
+def test_tool_timeout_logs_the_started_call_and_pairs_the_events(caplog):
+    async def slow(args, ctx):
+        ctx.reserve_model_call()
+        await asyncio.Event().wait()
+
+    call = ToolCall(call_id="timeout-1", name="echo", arguments={"text": "x"})
+    events = _collect(
+        _request(budget=RunBudget(max_seconds=0.1)),
+        ScriptedProvider([_completion([call], finish="tool_calls")]), _registry(slow),
+    )
+    end = next(event for event in events if event.type == "tool_end")
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == end.result_summary["code"] == "tool_timeout"
+    assert log["message"] == end.result_summary["message"]
+    assert log["call_id"] == call.call_id and log["tool"] == call.name
+    assert log["model_calls_used"] == 2 and log["tool_calls_used"] == 1
+    assert events[-1].limit == "max_seconds"
+
+
+def test_excess_tool_calls_in_one_completion_are_logged_before_execution(caplog):
+    first = ToolCall(call_id="allowed", name="echo", arguments={"text": "x"})
+    second = ToolCall(call_id="blocked", name="echo", arguments={"text": "y"})
+    events = _collect(
+        _request(budget=RunBudget(max_tool_calls=1)),
+        ScriptedProvider([_completion([first, second], finish="tool_calls")]), _registry(_echo),
+    )
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == "budget_exhausted"
+    assert log["call_id"] == second.call_id and log["tool"] == second.name
+    assert log["model_calls_used"] == 1 and log["tool_calls_used"] == 1
+    assert [event.call_id for event in events if event.type == "tool_start"] == [first.call_id]
+
+
+def test_repair_budget_logs_both_the_tool_failure_and_the_stop_reason(caplog):
+    call = ToolCall(call_id="repair-1", name="echo", arguments={"text": "x"})
+    events = _collect(
+        _request(budget=RunBudget(max_repairs=0)),
+        ScriptedProvider([_completion([call], finish="tool_calls")]),
+        _registry(lambda args, ctx: ToolResult(ok=False, content="参数不合法")),
+    )
+    logs = _failure_logs(caplog)
+    assert [log["code"] for log in logs] == ["tool_failed", "too_many_failures"]
+    assert logs[-1]["message"] == events[-1].message
+    assert all(log["call_id"] == call.call_id and log["tool"] == call.name for log in logs)
+    assert all(log["model_calls_used"] == 1 and log["tool_calls_used"] == 1 for log in logs)
 
 
 class BasicFlowTest(unittest.TestCase):

@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import itertools
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -44,6 +45,10 @@ from app.contracts.mindmap import MindMapContent
 from app.generation.service import GenerationError
 
 DEFAULT_STAGES = ["目标澄清", "要点拆解", "分支展开", "风险与验证"]
+logger = logging.getLogger(__name__)
+
+# 校验异常可能带上模型输出，日志只需足够定位的摘要，不能随材料或树的大小增长。
+MAX_LOG_MESSAGE_CHARS = 500
 
 
 class AgentPlan(BaseModel):
@@ -186,6 +191,41 @@ _BUDGET_HINT = {
 }
 
 
+def _log_failure(
+    ctx: RunContext,
+    tool_calls: int,
+    *,
+    code: str,
+    message: str,
+    call: ToolCall | None = None,
+    level: int = logging.WARNING,
+) -> None:
+    # 不记录参数、result.data 或异常堆栈：它们可能夹带整份正文或整棵树。
+    # JSON 转义换行，防止多行错误把一次失败拆成难以关联的多条日志。
+    logger.log(level, "agent 运行异常 %s", json.dumps({
+        "call_id": call.call_id if call else None,
+        "tool": call.name if call else None,
+        "code": code,
+        "message": message[:MAX_LOG_MESSAGE_CHARS],
+        "model_calls_used": ctx.model_calls_used,
+        "tool_calls_used": tool_calls,
+    }, ensure_ascii=False))
+
+
+def _result_summary(result: ToolResult) -> dict[str, Any]:
+    if result.ok:
+        return result.data
+    # 注册表的旧错误只把原因写在 content 中；补给事件流后界面与日志才能说同一件事。
+    summary = dict(result.data)
+    for key, fallback in (
+        ("code", "tool_failed"),
+        ("message", result.content or "工具未返回具体失败原因。"),
+    ):
+        if not isinstance(summary.get(key), str) or not summary[key].strip():
+            summary[key] = fallback
+    return summary
+
+
 @dataclass
 class _ToolOutcome:
     """一次工具执行的去向。
@@ -204,6 +244,8 @@ def _budget_stop(
     seq: "itertools.count[int]",
     usage_total: dict[str, Any],
     limit: str,
+    tool_calls: int,
+    call: ToolCall | None = None,
 ) -> DoneEvent | ErrorEvent:
     """预算用尽时的收尾帧：已经有候选就当作完成，没有才算失败。
 
@@ -215,6 +257,9 @@ def _budget_stop(
     真的一份候选都没有（第一轮就没额度、工具失败前没产出）时仍然报错，
     那种情况下用户确实什么都没拿到。
     """
+    _log_failure(
+        ctx, tool_calls, call=call, code="budget_exhausted", message=_BUDGET_HINT[limit],
+    )
     if ctx.candidate is not None:
         return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total)
     return ErrorEvent(
@@ -390,6 +435,7 @@ async def run(
     tool_calls = 0
     failures = 0
     usage_total: dict[str, Any] = {}
+    last_call: ToolCall | None = None
 
     yield StageEvent(
         seq=next(seq),
@@ -400,13 +446,13 @@ async def run(
     while True:
         limit = _budget_limit(budget, tool_calls, started)
         if limit is not None:
-            yield _budget_stop(ctx, seq, usage_total, limit)
+            yield _budget_stop(ctx, seq, usage_total, limit, tool_calls, last_call)
             return
 
         # 先占额度、再发请求。反过来做（调用成功后才记账）时，一旦工具内部
         # 也要调模型，额度会在工具执行期间被用掉而循环还不知道。
         if not ctx.reserve_model_call():
-            yield _budget_stop(ctx, seq, usage_total, "max_model_calls")
+            yield _budget_stop(ctx, seq, usage_total, "max_model_calls", tool_calls, last_call)
             return
 
         # 每轮刷新大纲：模型必须看到上一轮产出节点的真实 id，否则它无法精确改
@@ -422,11 +468,18 @@ async def run(
             # 必须原样抛出：吞掉它会让"用户点了取消"变成一次正常结束
             raise
         except (asyncio.TimeoutError, TimeoutError):
-            yield _budget_stop(ctx, seq, usage_total, "max_seconds")
+            yield _budget_stop(ctx, seq, usage_total, "max_seconds", tool_calls)
             return
         except GenerationError as exc:
+            _log_failure(ctx, tool_calls, code="generation_failed", message=str(exc))
             yield ErrorEvent(seq=next(seq), code="generation_failed", message=str(exc))
             return
+        except Exception as exc:  # noqa: BLE001 — 留下摘要后仍交给路由处理，不改变异常语义
+            _log_failure(
+                ctx, tool_calls, code="agent_failed",
+                message=f"{type(exc).__name__}: {exc}", level=logging.ERROR,
+            )
+            raise
 
         messages.append(completion.message)
         usage_total = _merge_usage(usage_total, completion.usage)
@@ -435,14 +488,20 @@ async def run(
             if completion.finish_reason == "stop":
                 yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total)
             else:
+                message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
+                _log_failure(ctx, tool_calls, code="unexpected_finish", message=message)
                 yield ErrorEvent(
                     seq=next(seq), code="unexpected_finish",
-                    message=f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具",
+                    message=message,
                 )
             return
 
         for call in completion.tool_calls:
             if tool_calls >= budget.max_tool_calls:
+                _log_failure(
+                    ctx, tool_calls, call=call, code="budget_exhausted",
+                    message=_BUDGET_HINT["max_tool_calls"],
+                )
                 yield ErrorEvent(
                     seq=next(seq), code="budget_exhausted",
                     message=_BUDGET_HINT["max_tool_calls"], limit="max_tool_calls",
@@ -453,6 +512,9 @@ async def run(
                 seq=next(seq), call_id=call.call_id, name=call.name,
                 args_summary=_args_summary(call),
             )
+            # 已发起但超时或抛错的工具同样消耗一次调用，日志不能把它们记成零次。
+            tool_calls += 1
+            last_call = call
             ledger_before = ctx.model_calls_used
             extra_before = ctx.extra_model_calls
             had_candidate = ctx.candidate is not None
@@ -472,6 +534,10 @@ async def run(
                 async for event in tool_events:
                     yield event
             if outcome.timed_out:
+                _log_failure(
+                    ctx, tool_calls, call=call, code="tool_timeout",
+                    message=_BUDGET_HINT["max_seconds"],
+                )
                 # 超时也是一次「工具结束了」。少了这一帧，事件序列就是
                 # `stage → tool_start → error`，前端那行工具永远停在「执行中」——
                 # `max_repairs` 判停那条路径修过同一个问题，超时这里当时漏了。
@@ -491,11 +557,20 @@ async def run(
             if outcome.error is not None:
                 # 工具内部抛异常时原样上抛，交给路由那个兜底把它变成一帧可读错误；
                 # 在这里转成 ToolResult 等于替工具谎报"执行完了"。
+                _log_failure(
+                    ctx, tool_calls, call=call,
+                    code="generation_failed" if isinstance(outcome.error, GenerationError) else "agent_failed",
+                    message=f"{type(outcome.error).__name__}: {outcome.error}",
+                    level=logging.ERROR,
+                )
                 raise outcome.error
             if outcome.result is None:  # pragma: no cover — 三种出路必命中一种
+                _log_failure(
+                    ctx, tool_calls, call=call, code="agent_failed",
+                    message="工具执行既没有结果也没有异常", level=logging.ERROR,
+                )
                 raise RuntimeError("工具执行既没有结果也没有异常")
             result = outcome.result
-            tool_calls += 1
             # 对账：工具有没有自己调了模型却没先占额度（新写的工具最容易漏这一步，
             # 漏一次就多一次免费调用）。只在账本这一轮没动过时按 extra 增量补记，
             # 避免与 reserve 的正常记账重复计数——宁可多记，不可漏记。
@@ -503,11 +578,17 @@ async def run(
                     and ctx.model_calls_used == ledger_before):
                 ctx.model_calls_used += ctx.extra_model_calls - extra_before
 
+            summary = _result_summary(result)
+            if not result.ok:
+                _log_failure(
+                    ctx, tool_calls, call=call, code=summary["code"], message=summary["message"],
+                )
+
             # ToolEnd 必须在这个函数返回之前发出去，且要在失败判停**之前**：
             # 否则那一次 tool_start 永远等不到配对帧，前端会一直显示"执行中"。
             yield ToolEndEvent(
                 seq=next(seq), call_id=call.call_id, name=call.name, ok=result.ok,
-                result_summary=result.data,
+                result_summary=summary,
                 latency_ms=int((time.monotonic() - begun) * 1000),
             )
             if not result.ok:
@@ -516,12 +597,16 @@ async def run(
                 # 成功的工具调用不会把它清零。
                 failures += 1
                 if failures > budget.max_repairs:
+                    message = (
+                        f"工具执行已累计失败 {failures} 次（上限 {budget.max_repairs} 次），"
+                        "继续重试没有意义，已停止。"
+                    )
+                    _log_failure(
+                        ctx, tool_calls, call=call, code="too_many_failures", message=message,
+                    )
                     yield ErrorEvent(
                         seq=next(seq), code="too_many_failures",
-                        message=(
-                            f"工具执行已累计失败 {failures} 次（上限 {budget.max_repairs} 次），"
-                            "继续重试没有意义，已停止。"
-                        ),
+                        message=message,
                         limit="max_repairs",
                     )
                     return

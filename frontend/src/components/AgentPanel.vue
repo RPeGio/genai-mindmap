@@ -32,6 +32,13 @@ function rowText(name: string, state: 'running' | 'done', ok: boolean, ms: numbe
   return ok ? `${agentToolLabel(name, 'done')} · ${seconds(ms)}` : `${name} 未成功`;
 }
 
+function failureReason(summary?: Record<string, unknown>): string {
+  // 工具的摘要结构不同，只展示可读字段，避免把诊断对象或缺失值直接插进界面。
+  const parts = [summary?.code, summary?.message]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  return parts.join('：') || '工具未返回具体失败原因。';
+}
+
 /** 只把工具调用摘出来显示；stage 文案已经有单独的状态行了。 */
 interface ToolRow {
   key: string;
@@ -39,6 +46,7 @@ interface ToolRow {
   ok: boolean;
   /** 已经翻成人话的整行文案，模板不再拼字符串 */
   text: string;
+  detail: string;
 }
 
 const calls = computed<ToolRow[]>(() => {
@@ -54,6 +62,7 @@ const calls = computed<ToolRow[]>(() => {
         state: 'running',
         ok: true,
         text: rowText(event.name, 'running', true, 0),
+        detail: '',
       });
     } else if (event.type === 'tool_end') {
       if (!byId.has(event.call_id)) order.push(event.call_id);
@@ -62,6 +71,7 @@ const calls = computed<ToolRow[]>(() => {
         state: 'done',
         ok: event.ok,
         text: rowText(event.name, 'done', event.ok, event.latency_ms ?? 0),
+        detail: event.ok ? '' : failureReason(event.result_summary),
       });
     }
   }
@@ -181,6 +191,9 @@ function cancel() {
         <span :class="call.state === 'running' ? 'text-slate-500' : call.ok ? 'text-emerald-700' : 'text-rose-700'">
           {{ call.text }}
         </span>
+        <p v-if="call.detail" class="mt-0.5 break-words text-[11px] leading-relaxed text-rose-700">
+          {{ call.detail }}
+        </p>
       </li>
     </ol>
 
