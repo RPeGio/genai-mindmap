@@ -1,4 +1,4 @@
-import { mount, type VueWrapper } from '@vue/test-utils';
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -288,5 +288,59 @@ describe('节点引用', () => {
     const drawer = wrapper.find('[aria-labelledby="ref-title"]');
     expect(drawer.find('mark').text()).toBe('矩阵的秩等于');
     expect(drawer.text()).not.toContain('原文没有随导图保存');
+  });
+});
+
+describe('导出提示', () => {
+  const CONTENT = {
+    title: '季度规划',
+    root: { id: 'r', label: '产品', children: [] },
+  };
+
+  /** 真实导出会建 blob 链接并点一次 <a>，jsdom 没有这两样。 */
+  function stubDownload() {
+    Object.defineProperty(URL, 'createObjectURL', { value: () => 'blob:stub', configurable: true });
+    Object.defineProperty(URL, 'revokeObjectURL', { value: () => {}, configurable: true });
+  }
+
+  async function pickFormat(wrapper: VueWrapper, format: string) {
+    await wrapper.find('select[title="导出为文本格式"]').setValue(format);
+    // onExport 是 async：请求落地、浮层渲染都要等一轮微任务。
+    await flushPromises();
+  }
+
+  it('后端拒绝时底部浮层给出后端文案，而不是只有左侧小字', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 422,
+      json: async () => ({ code: 'validation_error', message: '请求参数校验失败' }),
+    }));
+    const wrapper = mountApp();
+    useMindMapStore().preview(CONTENT, 'right');
+    await wrapper.vm.$nextTick();
+
+    await pickFormat(wrapper, 'markdown');
+
+    const alert = wrapper.find('[role="alert"]');
+    expect(alert.exists()).toBe(true);
+    expect(alert.text()).toContain('请求参数校验失败');
+  });
+
+  it('导出成功时给出成功浮层', async () => {
+    stubDownload();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => '@startmindmap\n@endmindmap\n',
+    }));
+    const wrapper = mountApp();
+    useMindMapStore().preview(CONTENT, 'right');
+    await wrapper.vm.$nextTick();
+
+    await pickFormat(wrapper, 'puml');
+
+    const status = wrapper.find('[role="status"]');
+    expect(status.exists()).toBe(true);
+    expect(wrapper.text()).toContain('已导出 PlantUML');
   });
 });
