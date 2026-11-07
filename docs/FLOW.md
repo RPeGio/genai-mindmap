@@ -22,7 +22,7 @@ flowchart TD
   MAP --> CANVAS[Vue 画布（R2/R3）]
   CANVAS --> EDIT[人工编辑<br/>改名 / 增删 / 撤销]
   EDIT --> SAVE
-  MAP --> EXP[导出 puml，其他格式待实现]
+  MAP --> EXP[导出 puml / markdown / opml]
   SAVE --> SUG[optimization<br/>候选建议]
   SUG -.用户确认.-> EDIT
 ```
@@ -33,10 +33,11 @@ flowchart TD
 |---|---|---|---|---|
 | 快速生成（同步） | `POST /api/generations` | 一段文本 | 导图 | 已实现（demo / model） |
 | 流式生成（主路径） | `POST /api/generations/stream` | 一段文本 | SSE：节点逐个下发 | 已实现，页面默认走这条 |
-| 多来源流水线 | `POST /api/pipeline/generate` | `Source[]` | 导图 + 阶段轨迹 + 诊断 | 已实现（文本来源） |
+| 多来源流水线 | `POST /api/pipeline/generate` | `Source[]` | 导图 + 阶段轨迹 + 诊断 + 引用 | 已实现（文本 / 文档 / 图片 / 语音） |
 | 目标驱动 | `POST /api/agent/tasks` | 一句目标 | 阶段骨架 | 桩（不产生导图） |
+| 目标驱动（工具循环） | `POST /api/agent/runs/stream` | 目标 + 来源 + 当前树 | SSE v2：工具进度 + 候选 op 批次 | 已实现（产物是候选，需用户接受） |
 
-前两条最终都落到 `MindMapContent`，第三条目前只返回阶段列表。
+前两条最终都落到 `MindMapContent`，第三条只返回阶段列表，第四条走 op 批次改候选副本。
 
 ## 3 每个环节的输入输出
 
@@ -49,7 +50,7 @@ flowchart TD
 | 结构诊断 | `app/optimization.check` | 导图 | `Diagnostic[]` | 单子节点、深度上限、同级重复标签三种结构提示 |
 | 候选建议 | `app/optimization.suggest` | 导图 | `Suggestion[]` | 同级重复标签 → dedupe 候选，可信度未评估 |
 | 知识检索 | `app/knowledge.search` | 查询串 | `KnowledgeHit[]` | 桩（返回空 + implemented=false） |
-| 导出 | `app/export` | 导图 | puml 文本 | puml 已实现，md / opml 待实现 |
+| 导出 | `app/export` | 导图 | puml / markdown / opml 文本 | 三种格式均已实现（2026-11-05） |
 | 持久化 | `app/mindmaps` | 导图 + 版本号 | 记录 | 已实现（SQLite + 乐观锁） |
 
 ## 4 状态约定
@@ -68,10 +69,13 @@ flowchart TD
 | 画布（R2） | 无请求 | **已接入**：`src/canvas/MindMapCanvas.vue` 消费 `content`，坐标由 `src/canvas/layout/tidy.ts` 计算；可平移缩放点选，双击内联改文字，Tab / Enter / Delete 建树，撤销栈最多 50 步 |
 | 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | **已接入**：首次保存 POST 建新图，之后 PUT 带 `version`；409 弹三选（重新加载服务端版本 / 另存为新导图 / 取消）；Ctrl+S 触发，`beforeunload` 拦未保存离开 |
 | 打开列表（R3） | `GET /api/mindmaps` / `GET /api/mindmaps/{id}` | **已接入**：顶部"打开"弹层列出已保存导图，点开替换画布并清空撤销栈 |
-| 上传面板（待接入） | `POST /api/ingestion/files` | 已实现：multipart 上传，Docling 解析后返回 `source`，再传给 `/api/pipeline/generate` |
-| 多来源生成（待接入） | `POST /api/pipeline/generate` | 拿 `content` 渲染，`stages` 仅作完成记录展示 |
-| 诊断面板（待接入） | `POST /api/optimization/suggest` | 显示建议，用户点确认后再改 |
-| 导出按钮（待接入） | `POST /api/export/puml` | 下载文本文件 |
+| 上传面板 | `POST /api/ingestion/files` | **已接入**：`src/components/SourceInputs.vue` 上传文档 / 图片 / WAV，解析后进来源列表，再一起提交给流水线 |
+| 多来源生成 | `POST /api/pipeline/generate` | **已接入**：`src/stores/mindmap.ts` 的 `generateFromSources`，`stages` 只作完成记录展示 |
+| 录音输入 | `POST /api/ingestion/files` | **已接入**：`src/components/RecordButton.vue` + `src/audio/recorder.ts` 采集 16kHz WAV 后走同一条上传链路 |
+| 导出按钮 | `POST /api/export/{puml,markdown,opml}` | **已接入**：标题栏下拉菜单，浏览器端落盘 |
+| Agent 面板 | `POST /api/agent/runs/stream` | **已接入**：`src/components/AgentPanel.vue` 显示工具进度，候选需点接受才落到画布 |
+| 诊断面板（待接入） | `POST /api/optimization/check` / `/suggest` | 接口已实现，界面还没渲染 `diagnostics`；建议需用户确认后再改 |
+| 引用展示（待接入） | 无请求（读 `node.source_refs`） | 数据层已就绪（能生成、能校验、能保存），界面还没有展示入口 |
 
 `stages` 随同步响应一次性返回，只能展示完成后的阶段记录，不能显示生成中的实时进度；实时进度需要未来的任务状态接口或 SSE。
 

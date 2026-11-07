@@ -173,7 +173,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 
 ## 10 配置项
 
-### 10.1 已实现（代码经 `os.getenv` 读取，共 5 项）
+### 10.1 已实现（代码经 `os.getenv` 读取，共 11 项）
 
 `.env` 文件不会自动加载，须在启动服务前设入进程环境变量；样例见 `backend/.env.example`。
 
@@ -182,8 +182,14 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `MINDMAP_LLM_MODE` | `demo` | `demo` 不联网、返回本地占位；`model` 才调 Chat Completions 兼容接口。写成其他值会被拒 |
 | `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
 | `MINDMAP_LLM_API_KEY` | — | 调用密钥，只从环境变量读，不进代码库与日志 |
-| `MINDMAP_LLM_MODEL` | — | 模型名（当前用 `deepseek-chat`；`deepseek-flash` 是推理模型，reasoning token 波动大，未采用） |
+| `MINDMAP_LLM_MODEL` | — | 模型名（当前用 `deepseek-chat`；`deepseek-flash` 是推理模型，reasoning token 波动大，未采用）。PDF 视觉识别与图片识别复用同一组变量 |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径，留空即取默认值 |
+| `DASHSCOPE_API_KEY` | — | 百炼语音转写（F07）。没配时 `.wav` 上传返回 422 |
+| `MINDMAP_SOFFICE_CMD` | — | `soffice` 完整路径；不配则从 `PATH` 找。`.doc`/`.ppt` 转换需要 |
+| `MINDMAP_AGENT_ENABLED` | `1` | 设为 `0` 关闭 `/api/agent/runs/stream` |
+| `MINDMAP_NLI_ENABLED` | `0` | 打开引用语义复核（ONNX 模型），否则只做机械核验 |
+| `MINDMAP_NLI_MODEL_DIR` | — | ONNX 模型目录（含 `model.onnx` / `tokenizer.json` / `config.json`） |
+| `MINDMAP_NLI_MIN_FREE_MB` | — | 加载模型前要求的最小可用内存，不够则跳过 NLI |
 
 ### 10.2 规划中（当前代码不读这些变量）
 
@@ -232,4 +238,5 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.5 | 2026-11-04 | F07 语音落地，推翻 Q27：放弃 MOSS / faster-whisper 与 sidecar 方案，改走云端。补 `MAX_AUDIO_BYTES` 与 `MAX_SLICE_SECONDS` 常量；前端录音受限于安全上下文，与 Q32「IP:8080 不做 TLS」冲突，已记入架构文档 |
 | v1.6 | 2026-11-05 | F06 图片输入落地；F08 混合输入与节点级引用（三层校验 + 可选 NLI）；F20 三种导出接通前端 |
 | v1.7 | 2026-11-05 | 语音接口二次切换：ISI 一句话识别 → 百炼 `qwen-audio-3.1-asr-flash`。换来句级时间戳、300 秒单次上限、60 秒音频快 2.8 倍且便宜 3.9 倍；依赖 `websockets` 与 `aliyun-python-sdk-core` 一并移除，`MAX_SLICE_SECONDS` 60 → 300 |
-| v1.6 | 2026-11-04 | F06 图片输入落地：复用 PDF 逐页的多模态调用（`image_url` + base64），模型直接输出 Markdown，不收 SVG；`parse_bytes` 的 `image` 分支不再是 TODO |
+| v1.8 | 2026-11-06 | 生成链路 Agent 化：受限 tool-calling 循环（四个工具、`RunBudget` 预算）、op 契约与两端共读用例、SSE v2 事件、前端候选确认（`docs/AGENT_PLAN.md`）。`/api/agent/tasks` 仍是桩；F02/F03/F16 转「部分实现」 |
+| v1.9 | 2026-11-07 | 文档对账：功能清单加实现日期、能力与端点按代码现状重写（19 个端点、无 501 路由、`source_refs` 属 v1）、配置项补 6 个变量；`NEXT-PLAN.md` 加日期同步说明 |

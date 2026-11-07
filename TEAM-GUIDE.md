@@ -68,7 +68,9 @@ npm test
 npm run build
 ```
 
-当前基线：后端 54 个测试（pytest）、前端 81 个 vitest 用例（9 个文件），全部通过。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-06）：后端 309 个测试（pytest）、前端 239 个 vitest 用例（16 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+
+本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
 开发服务器左上角有一排「布局示例」按钮（单节点 / 向右 / 向左 / 向下 / 双向）：点一下就能不经过后端装载一份示例导图，用来肉眼检查布局与文本截断。数据在 `frontend/src/dev/samples.ts`，只在 `npm run dev` 下按需加载，生产构建里不进包。
 
@@ -81,34 +83,40 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 8 组路由
+    main.py            应用装配，注册 8 组路由（19 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       MindMapContent / Node / 请求响应模型
-      source.py        Source / SourceUsage
+      source.py        Source / SourceUsage / SourceRef（节点引用）
       diagnostic.py    Diagnostic / Suggestion
-    ingestion/         多模态输入 → Source        （只有文本可用）
-    pipeline/          四段流水线编排             （可用）
-    generation/        模型调用（demo / model）  （可用）
-    optimization/      结构诊断与建议             （三条规则）
-    knowledge/         知识检索                   （桩）
-    agent/             AI 代理                    （桩）
-    export/            导出 puml                  （puml 可用）
-    mindmaps/          保存 / 读取 / 版本冲突     （可用）
-  tests/               54 个测试
+      ops.py           导图操作（add / update / remove / move）
+    ingestion/         多模态输入 → Source（文本 / 文档 / 图片 / WAV）
+    pipeline/          四段流水线编排
+    generation/        模型调用（demo / model，同步 + SSE 流式）
+    optimization/      结构诊断与建议（三条结构规则 + 引用核验）
+    knowledge/         知识检索（桩）
+    agent/             AI 代理（工具循环 / op 执行器 / SSE v2）
+    export/            导出 puml / markdown / opml
+    mindmaps/          保存 / 读取 / 版本冲突
+  tests/               309 个测试
 frontend/
   src/
-    App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层）
+    App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
     main.ts            入口（挂 Pinia 与 Vue Flow 样式）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（生成 2 个、导图 CRUD 4 个）
+    api/client.ts      fetch 封装 + ApiError（生成 3 个、导图 CRUD 4 个、上传 1 个、导出 1 个、agent 1 个）
     api/types.ts       与后端契约 v1 对应的 TS 类型（`note` 为 v2 预留）
     canvas/MindMapCanvas.vue  Vue Flow 容器：平移 / 缩放 / 点选 / 键盘建树
     canvas/MindNode.vue       自定义节点：截断 + 悬停看全文 + 内联编辑
     canvas/layout/tidy.ts     自研紧凑树布局（向右 / 向左 / 向下 / 双向）
     mindmap/edits.ts   纯函数：改名 / 加子节点 / 加兄弟 / 删子树 / 提交前校验
-    stores/mindmap.ts   Pinia：内容、布局、选中、编辑、撤销重做、保存状态
+    mindmap/ops.ts     纯函数：applyOps（与后端 agent/ops.py 共读同一份用例）
+    sources/input.ts   来源收集常量与校验（格式白名单、字数与大小上限）
+    audio/             浏览器录音（16kHz WAV）与 WAV 头处理
+    components/        AgentPanel / RecordButton / SourceInputs
+    stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
+    stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               81 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面）
+  tests/               239 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / agent）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -126,43 +134,64 @@ START_HERE.md          原始的骨架说明
 
 ## 4 现在到底有什么
 
-**能用的**：文本生成导图（demo 或真实模型，同步与流式两条接口）、文档导入（PDF/Word/PPT/Excel/HTML 经 Docling 解析）、多来源流水线、结构诊断（单子节点 / 深度上限 / 同级重复标签）、候选建议、导出 PlantUML、保存与版本冲突检测。
+**能用的**：文本生成导图（demo 或真实模型，`/api/generations` 同步、`/stream` 流式）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 候选确认，`POST /api/agent/runs/stream`）。
 
-**是桩的**：知识检索（返回空 + `implemented:false`）、AI 代理（返回固定四阶段，不产生导图）。
+**是桩的**：知识检索（返回空 + `implemented:false`）、`POST /api/agent/tasks`（返回固定四阶段，不产生导图；真正的 agent 走 `/agent/runs/stream`）。
 
-**返回 501 的**：图片与语音输入（`/api/ingestion/files` 目前只处理文档，图片和语音走 `parse_bytes` 时仍抛待实现）、Markdown 导出、OPML 导出。
+**没有 501 的导出**：Markdown 与 OPML 在 2026-11-05 已实现，三种格式都从浏览器直接下载。
 
 这条规矩写在代码注释里，也写在 `docs/FLOW.md` 第 4 节：**不允许返回空对象假装成功**。桩接口必须带 `implemented:false`，让前端能据此禁用入口。
 
-### 文档解析的两个前提
+### 各格式解析的前提
 
-**PDF 要模型，DOCX/PPTX 不用。** Docling 处理 PDF 时会加载版面模型，第一次解析要在有网环境下自动下载（几百 MB），缓存到 `~/.cache/docling/models`。之后每次解析 1–2 秒。DOCX / PPTX / XLSX / HTML 走的是轻量路径，不碰模型，离线也能用。
+| 格式 | 走哪条路 | 前提 |
+|---|---|---|
+| `.pdf` | 逐页渲染后交模型视觉识别 | 要 `MINDMAP_LLM_MODE=model` 与密钥；≤20 页；demo 模式回落文本层、扫描件 422 |
+| `.docx` `.pptx` `.xlsx` `.html` `.md` | Docling 读结构化格式 | 不需要模型，离线可用 |
+| `.doc` `.ppt` | LibreOffice 转 PDF 再视觉识别 | 要装 LibreOffice（约 1.5 GB），没装时 422 并附安装命令 |
+| `.xls` | `xlrd` 直读单元格 | 要 `xlrd` 依赖 |
+| `.png` `.jpg` 等 | 复用多模态调用 | 同 PDF，demo 模式或未配密钥 422 |
+| `.wav` | 百炼 Qwen-Audio-ASR | 要 `DASHSCOPE_API_KEY`；≤300 秒，更长自动切片 |
 
-**离线部署要预置缓存。** 部署机如果没有外网，把开发机上那个 `~/.cache/docling/models` 目录整个拷过去；否则 PDF 会返回 422 并提示缺少模型缓存。另外 `.doc/.ppt/.xls` 这类旧格式**刻意不支持**——它们要 LibreOffice 才能读，那是几百 MB 的系统依赖，遇到旧格式请先另存为 `.docx/.pptx/.xlsx`。
+详细依赖、体积与耗时见 `docs/DEPLOY.md`；`.env` 不会自动加载，必须在启动前把变量设进进程环境。
 
 ---
 
-## 5 接口一览（16 个路径 / 18 个端点）
+## 5 接口一览（17 个路径 / 19 个端点）
 
 ```
+基础
 GET  /api/health
+
+生成
 POST /api/generations              文本 → 导图（一次性）
 POST /api/generations/stream       文本 → 导图（SSE 流式，页面默认走这条）
+
+输入（多来源）
 POST /api/ingestion/text           文本 → Source
-POST /api/ingestion/files          上传文档 → Source（multipart）
+POST /api/ingestion/files          上传文档 / 图片 / WAV → Source（multipart，≤10MB，音频 ≤20MB）
 GET  /api/ingestion/formats        支持的扩展名与上传上限
 POST /api/pipeline/generate        Source[] → 导图 + 阶段 + 诊断
-POST /api/optimization/check       导图 → 诊断
-POST /api/optimization/suggest     导图 → 候选建议
-POST /api/knowledge/search         检索（桩）
-POST /api/agent/tasks              目标 → 阶段骨架（桩）
+
+优化
+POST /api/optimization/check       导图 → 诊断（可带 sources 做引用核验）
+POST /api/optimization/suggest     导图 → 候选建议 + 诊断
+
+导出
 POST /api/export/puml              导图 → PlantUML 文本
-POST /api/export/markdown          501
-POST /api/export/opml              501
+POST /api/export/markdown          导图 → Markdown 文本
+POST /api/export/opml              导图 → OPML 文本
+
+保存
 GET  /api/mindmaps                 列表
-POST /api/mindmaps                 新建
+POST /api/mindmaps                 新建（version 从 1 起）
 GET  /api/mindmaps/{id}            读取
 PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
+
+代理与检索
+POST /api/agent/runs/stream        目标 + 来源 → SSE v2 事件与候选（可用）
+POST /api/agent/tasks              目标 → 阶段骨架（桩，implemented:false）
+POST /api/knowledge/search         检索（桩，返回空）
 ```
 
 ---
@@ -182,7 +211,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 ## 7 动手前必须知道的四件事
 
-**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children`，不是 `topic`、不是 `text`。上限 300 节点、8 层、每节点 50 个子节点，超了直接 422。
+**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children` / `source_refs`（后者可选，节点级引用），不是 `topic`、不是 `text`。上限 300 节点、8 层、每节点 50 个子节点、标题与节点文字各 200 字，超了直接 422。`note` 仍属 v2 预留，后端 v1 契约是 `extra="forbid"`，发过去就 422。
 
 **二、保存是乐观锁。** `PUT /api/mindmaps/{id}` 必须带上读到的 `version`，服务端版本号变了就返回 409，前端要提示用户重新打开，不能强行覆盖。
 
@@ -194,12 +223,14 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 ## 8 已知的坑
 
-- **两个上限不一致**：`/api/ingestion/text` 允许 10000 字，但 `/api/pipeline/generate` 合并后限 8000 字。9000 字的文本能存成 Source，却进不了流水线。要统一的话改 `MAX_INPUT_CHARS` 或 contract 里的 `max_length`。
+- **两个文本入口的上限不同**：`/api/ingestion/text` 与 `/api/generations` 都是单段 10000 字，`/api/pipeline/generate` 合并后限 20000 字（`backend/app/pipeline/service.py:29`）。前端来源面板按 20000 字提示，所以 15000 字走 pipeline 没问题、走 `/api/generations` 会被 422 挡下。
+- **`source_refs` 目前只存在于数据层**：能生成、能校验、能保存，但界面上还没有任何展示入口——选中节点看不到"这句话出自哪一页/第几秒"。这是下一步的前端任务（见 F08）。
 - **导出用根节点文字，不是标题**：`export/puml` 取的是 `root.label`。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
-- **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得等 SSE 或任务化改造。
-- **前端只封了生成与导图 CRUD**：`src/api/client.ts` 有 `generateMindMap` / `generateMindMapStream`、`listMindMaps` / `getMindMap` / `createMindMap` / `updateMindMap`；pipeline / optimization / export / ingestion 尚未封装。
+- **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得用 SSE（`/api/generations/stream`、`/api/agent/runs/stream`）。
+- **前端还没接的接口**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check` 与 `/suggest`。上传格式白名单目前写死在 `frontend/src/sources/input.ts` 的 `FILE_ACCEPT`，与后端 `formats` 接口有漂移风险；诊断接口已有返回值但界面不渲染（`frontend/src/api/types.ts` 里 `diagnostics` 标注为"目前只用于排障"）。
 - **编辑不记协作方**：保存以整棵树为单位（`version` 乐观锁），没有字段级合并；两个人同时编辑同一张图，后保存的会拿到 409，只能选择覆盖（重新加载）或另存为新导图。
 - **撤销栈只在内存**：刷新页面后撤销历史清空，最多 50 步；保存不写历史。
+- **旧格式要系统依赖**：`.doc` / `.ppt` 依赖 LibreOffice（约 1.5 GB），没装时 422 而不是降级；`.xls` 依赖 `xlrd`。部署机装不装，直接决定这几个格式能不能用。
 - **当前没有登录和权限**：所有接口裸奔，只能在本机跑，不要往公网放。
 
 ---
@@ -208,9 +239,12 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 如果只有一个人有余力，按这个顺序：
 
-1. 让真实模型跑通一条完整链路（目前只在 demo 模式验证过，真实密钥环境没验收）。
-2. 前端画布与编辑已可用（R2 只读画布、R3 编辑 / 撤销 / 保存 / 打开）；下一步是拖拽调结构、v2 的 layout/theme 与导出（W3）。
-3. PDF / Word / PPT 解析已接入（Docling），补页码与节点级来源引用。
-4. 其余按 `FEATURES_AND_OWNERS.md` 的 F 编号推进，范围取舍以 `docs/PLAN.md` 第 2 节为准。
+1. **把引用搬到界面上**（RPeGio，F08）：节点角标显示引用数，选中后在右侧详情面板列出来源与逐字引文，文档给页码、音频给秒数。后端已经算好并校验过，界面上一个字都没有，等于把最有说服力的功能藏起来了。
+2. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
+3. **契约 v2 定稿**（RPeGio 与陈嘉涛，见 `docs/HANDOFF.md` 的 H1/H2）：`note` 与 v2 同批上线；layout/theme/relations 再排期。
+4. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
+5. **部署骨架**（RPeGio，F22）：`Dockerfile` + `deploy/docker-compose.yml` + nginx，目标单台 2C2G、`IP:8080` 可访问；没有登录和权限之前只能内网演示。
+
+其余按 `FEATURES_AND_OWNERS.md` 的 F 编号推进，范围取舍以 `docs/PLAN.md` 第 2 节为准。
 
 别急着上 Celery、Redis、Milvus 这些东西。当前是单进程同步架构，RPeGio 与陈嘉涛的时间花在功能上比花在运维上划算得多。
