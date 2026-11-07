@@ -124,6 +124,13 @@ def _children_with_grandchildren(prefix: str, count: int, per_child: int) -> dic
     ]}
 
 
+def _flagged(*items: tuple[str, bool]) -> dict:
+    """带 expandable 标记的展开响应：`("要点", False)` 表示模型说它不能再拆。"""
+    return {"children": [
+        {"label": label, "expandable": flag} for label, flag in items
+    ]}
+
+
 def _subnode_label(user: str) -> str:
     """从二级以下的展开消息里取出这次展开的是哪个节点。"""
     return user.split("本节点：", 1)[1].split("\n", 1)[0]
@@ -765,7 +772,10 @@ class GenerateDeepToolTest(unittest.TestCase):
              {"depth": 2, "nodes": 15}, {"depth": 3, "nodes": 30}],
         )
         self.assertFalse(result.data["partial"])
-        self.assertEqual([item["code"] for item in result.data["diagnostics"]], [])
+        # 这个 fake 一个字都没写 expandable：树顶到层数上限时必须明确报出
+        # 「标记被忽略」，否则「模型到底用没用这个字段」只能靠猜。
+        self.assertEqual([item["code"] for item in result.data["diagnostics"]],
+                         ["EXPAND_FLAG_IGNORED"])
         self.assertEqual(result.data["depth_limit"], 3)
 
     def test_depth_cap_stops_recursion(self):
@@ -1025,6 +1035,181 @@ class GenerateDeepToolTest(unittest.TestCase):
         finally:
             _node_limit.cache_clear()
         self.assertEqual(_node_limit(), mindmap_contract.MAX_TREE_NODES)
+
+    def test_mixed_expandable_flags_only_expand_the_true_half(self):
+        """一半子项标 false：只有标 true 的进入下一层，false 的停在原地。
+
+        `leaf_declared` 数「模型显式说不能再拆」的节点，`expandable_declared` 数
+        显式说还能继续拆的——两个数字合起来才证明模型真的读过这个字段，而不是被
+        代码的缺省值一路推着走。
+        """
+        ctx = _ctx(max_model_calls=20)
+        asked: list[str] = []
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            if "本条一级分支：" in user:
+                title = _branch_title(user)
+                return _flagged((f"{title}一", True), (f"{title}二", False))
+            asked.append(_subnode_label(user))
+            return _children(_subnode_label(user) + "·细节")
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2, max_depth=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        for branch in ctx.candidate.root.children:
+            self.assertEqual([child.label for child in branch.children],
+                             [f"{branch.label}一", f"{branch.label}二"])
+            # 标 false 的停在原地，标 true 的那个长出第三层
+            self.assertEqual([item.label for item in branch.children[0].children],
+                             [f"{branch.children[0].label}·细节"])
+            self.assertEqual(branch.children[1].children, [])
+        self.assertCountEqual(asked, ["甲一", "乙一", "丙一"])
+        self.assertEqual(result.data["leaf_declared"], 3)
+        self.assertEqual(result.data["expandable_declared"], 3)
+        self.assertEqual(mocked.await_count, 7)  # 1 骨架 + 3 支 + 3 个可展开节点
+        self.assertEqual([item["depth"] for item in result.data["levels"]], [0, 1, 2, 3])
+        self.assertFalse(result.data["partial"])
+
+    def test_all_false_stops_at_the_second_level(self):
+        """所有子项都标 false：只展开一层就停，不会硬拉到 max_depth。"""
+        ctx = _ctx(max_model_calls=20)
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            title = _branch_title(user)
+            return _flagged((f"{title}一", False), (f"{title}二", False))
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2, max_depth=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        # 深度预算是 3，但模型说每个要点都到头了：树只该有两层
+        self.assertEqual([item["depth"] for item in result.data["levels"]], [0, 1, 2])
+        for branch in ctx.candidate.root.children:
+            for point in branch.children:
+                self.assertEqual(point.children, [])
+        self.assertEqual(result.data["leaf_declared"], 6)
+        self.assertEqual(result.data["expandable_declared"], 0)
+        # 少一层是模型判断的结果，不是"没做满"：不该标 partial
+        self.assertFalse(result.data["partial"])
+        self.assertEqual(mocked.await_count, 4)  # 1 骨架 + 3 支，第三层一次都没发
+        self.assertNotIn("EXPAND_FLAG_IGNORED",
+                         [item["code"] for item in result.data["diagnostics"]])
+
+    def test_missing_flag_defaults_to_expandable(self):
+        """缺省 expandable 按 true 处理：模型偶尔忘写，不该因此让整支变成叶子。
+
+        同时验证可观测性：两个声明计数都是 0 时，content 要直说「标记没被用上」。
+        """
+        ctx = _ctx(max_model_calls=20)
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            if "本条一级分支：" in user:
+                title = _branch_title(user)
+                return _children(f"{title}一", f"{title}二")
+            return _children(_subnode_label(user) + "·细节")
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2, max_depth=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual([item["depth"] for item in result.data["levels"]], [0, 1, 2, 3])
+        for branch in ctx.candidate.root.children:
+            for point in branch.children:
+                self.assertEqual(len(point.children), 1)
+        self.assertEqual(result.data["leaf_declared"], 0)
+        self.assertEqual(result.data["expandable_declared"], 0)
+        self.assertIn("未使用可展开标记", result.content)
+        self.assertIn("EXPAND_FLAG_IGNORED",
+                      [item["code"] for item in result.data["diagnostics"]])
+        self.assertEqual(mocked.await_count, 10)  # 1 + 3 + 6 个二级节点
+
+    def test_legacy_points_are_leaves_without_flag_count(self):
+        """旧 `points` 格式：视为叶子，且不计入声明计数——那是格式决定的，不是模型判断。"""
+        ctx = _ctx(max_model_calls=20)
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            return _points(2, _branch_title(user))
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2, max_depth=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual([item["depth"] for item in result.data["levels"]], [0, 1, 2])
+        self.assertEqual(result.data["leaf_declared"], 0)
+        self.assertEqual(result.data["expandable_declared"], 0)
+        # 没到层数上限，所以不算"标记被忽略"——它只是没被用到
+        self.assertNotIn("EXPAND_FLAG_IGNORED",
+                         [item["code"] for item in result.data["diagnostics"]])
+        self.assertEqual(mocked.await_count, 4)
+
+    def test_flag_ignored_is_reported_when_depth_is_full(self):
+        """全标 true 等于没给出「到此为止」的判断：深度顶满同样报 EXPAND_FLAG_IGNORED。
+
+        验收只看 `leaf_declared`：模型把每一项都写成 true 时，树的深浅仍然完全由
+        `max_depth` 决定，这次改动等于没生效，这件事必须能从诊断里看出来。
+        """
+        ctx = _ctx(max_model_calls=20)
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            if "本条一级分支：" in user:
+                title = _branch_title(user)
+                return _flagged((f"{title}一", True), (f"{title}二", True))
+            return _flagged((_subnode_label(user) + "·细节", True))
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2, max_depth=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual([item["depth"] for item in result.data["levels"]], [0, 1, 2, 3])
+        self.assertEqual(result.data["leaf_declared"], 0)
+        self.assertEqual(result.data["expandable_declared"], 12)  # 6 个二级 + 6 个三级
+        codes = [item["code"] for item in result.data["diagnostics"]]
+        self.assertIn("EXPAND_FLAG_IGNORED", codes)
+        # 诊断不该把结果降级成 partial：树本身是完整的
+        self.assertFalse(result.data["partial"])
+
+    def test_leaf_nodes_do_not_consume_the_remaining_budget(self):
+        """标 false 的节点不再发调用：层数预算还剩两层，也不追问那一支。"""
+        ctx = _ctx(max_model_calls=20)
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙", "丙")
+            title = _branch_title(user)
+            return _flagged((f"{title}一", False), (f"{title}二", False))
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2, max_depth=4), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        # 只有 1 次骨架 + 3 支：层数预算还剩两层，但没有任何节点说要继续拆
+        self.assertEqual(mocked.await_count, 4)
+        self.assertLess(ctx.model_calls_used, 20)
+        self.assertEqual([item["depth"] for item in result.data["levels"]], [0, 1, 2])
+
 
 class ExpandToolTest(unittest.TestCase):
     def test_success_adds_children(self):

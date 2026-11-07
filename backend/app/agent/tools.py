@@ -324,28 +324,38 @@ def _skeleton_titles(raw: Any) -> list[str]:
 class _Slot:
     """展开出来、还没进树的一个候选节点。
 
-    `declared_leaf` 记的是「模型自己说这一支到头了」：旧格式 `{"points":[...]}`
-    是一串扁平字符串，语义就是列到这里的叶子。把它当成还能继续追问的节点，
-    下一层只会拿到重复内容，还会白花一次调用，所以这类节点不进入待展开队列。
+    `expandable` 记的是「模型自己说这个子项还能不能再拆」：新格式里每个子项可以
+    带一个 `expandable` 布尔字段，填 false 表示它已经是最小可执行单元。代码按它
+    决定还要不要发下一次调用——层数上限只是兜底，不再替模型决定某支该不该深挖。
+
+    `expandable_declared` 记的是模型**有没有真的写这个键**：`leaf_declared` 那类
+    统计必须能区分「模型说不能再拆」与「模型忘了写、代码按 true 兜底」，两者混在
+    一起，这个信号到底有没有被模型理解就统计不出来了。
+
+    旧格式 `{"points":[...]}` 是一串扁平字符串，语义就是列到这里的叶子：标
+    `expandable=False`，但 `expandable_declared` 保持 False——停在这里是格式决定
+    的，不是模型的判断，不该算进声明计数。
 
     `children` 是模型**多给**的一层（新格式里容忍，见 `_candidate_slots`）：
-    一次调用只要求它写一层，给了两层就收下，比再追问一次便宜。
+    一次调用只要求它写一层，给了两层就收下，比再追问一次便宜。自带 `children`
+    的节点已经有内容了，它自己不再被追问，它的子节点各按自己的标记决定。
     """
 
     label: str
     children: list["_Slot"] = field(default_factory=list)
-    declared_leaf: bool = False
+    expandable: bool = True
+    expandable_declared: bool = False
 
 
 def _candidate_slots(raw: Any, limit: int, depth_left: int = 0) -> list[_Slot]:
     """从一次展开响应里取出候选子节点，最多 `limit` 个。
 
     接受两种形状：
-      - `{"children":[{"label":"要点一","children":[{"label":"细节 A"}]}]}`：新格式。
+      - `{"children":[{"label":"要点一","expandable":false}]}`：新格式。
         `children` 里再嵌一层会被收下，但最多 `depth_left` 层——**不主动要求**
         模型一次写两层，实测那样写到后面会被输出上限截断。
       - `{"points":["要点一","要点二"]}`：旧格式，纯字符串。语义是「这支到此
-        为止」，收下的节点标 `declared_leaf`，不再往下追问。
+        为止」，收下的节点标 `expandable=False`，不再往下追问。
 
     只认字符串和带 `label` 的 dict：`{"children":[{"name":"x"}]}` 说明模型没照
     格式写，硬转字符串会把整个 dict 的 repr 当成节点标题挂到树上——那种"成功"
@@ -370,17 +380,32 @@ def _candidate_slots(raw: Any, limit: int, depth_left: int = 0) -> list[_Slot]:
     return slots
 
 
-def _slot_from(item: Any, limit: int, depth_left: int, declared_leaf: bool) -> _Slot | None:
-    """单个候选项 → `_Slot`。空标签、非字符串/非 dict 的项一律丢掉。"""
+def _slot_from(item: Any, limit: int, depth_left: int, legacy_leaf: bool) -> _Slot | None:
+    """单个候选项 → `_Slot`。空标签、非字符串/非 dict 的项一律丢掉。
+
+    `expandable` 只有**布尔值**才算一次声明：模型写成 `"false"` 字符串、写成 0、
+    或干脆没写，一律按可展开处理。缺省按 true 是有意的——模型偶尔漏写一个键，
+    不该因此让整支内容凭空变成叶子，那是一种代码替它做的决定。
+    """
     if isinstance(item, str):
         label = item.strip()
-        return _Slot(label[:200], declared_leaf=declared_leaf) if label else None
+        if not label:
+            return None
+        # 裸字符串没有任何层级信息：旧 points 里它是叶子，新格式里按缺省可展开，
+        # 与引入 `expandable` 之前的行为逐节点相同。
+        return _Slot(label[:200], expandable=not legacy_leaf)
     if not isinstance(item, dict):
         return None
     label = item.get("label")
     if not isinstance(label, str) or not label.strip():
         return None
-    slot = _Slot(label.strip()[:200])
+    flag = item.get("expandable")
+    declared = isinstance(flag, bool)
+    slot = _Slot(
+        label.strip()[:200],
+        expandable=flag if declared else True,
+        expandable_declared=declared,
+    )
     nested = item.get("children")
     if depth_left > 0 and isinstance(nested, list):
         for child in nested[:limit]:
@@ -429,6 +454,26 @@ def _count_slots(slots: list[_Slot]) -> int:
     return sum(1 + _count_slots(slot.children) for slot in slots)
 
 
+def _count_expand_flags(slots: list[_Slot]) -> tuple[int, int]:
+    """统计模型显式给出的展开标记：`(标为不可展开的, 标为可展开的)`。
+
+    这两个数字回答的是「模型到底有没有用这个字段」，所以缺省一律不计数：
+    没写 `expandable` 的节点按 true 展开，那是代码的兜底而不是模型的意思，算进
+    任何一边都会让统计失去意义。旧 `points` 格式同理——它停在叶子是格式决定的。
+    """
+    leaf = expandable = 0
+    stack = list(slots)
+    while stack:
+        slot = stack.pop()
+        if slot.expandable_declared:
+            if slot.expandable:
+                expandable += 1
+            else:
+                leaf += 1
+        stack.extend(slot.children)
+    return leaf, expandable
+
+
 def _nested_capacity(fanout: int, levels: int) -> int:
     """一次响应里最多容忍多少个"多给的下层"节点。`levels = 0` 时一个都不容忍。"""
     return sum(fanout**level for level in range(1, max(0, levels) + 1))
@@ -437,15 +482,19 @@ def _nested_capacity(fanout: int, levels: int) -> int:
 def _walk_slots(slots: list[_Slot], depth: int, path: str, max_depth: int):
     """列出还能继续展开的节点：`(节点, 它现在在第几层, 到它为止的路径)`。
 
+    每一层开始前都会再走一遍，所以这里就是「该不该继续拆」的筛选点：候选只包含
+    `expandable=True` 且**没有** `children` 的节点。
+
     带 `children` 的节点已经长出下一层了，它自己不再追问，但它的子节点要在
     `depth + 1` 层接着排——否则"模型一次多给了一层"会让这一支就此停住。
-    `declared_leaf` 的节点按模型的意思留在原地。
+    `expandable=False` 的节点按模型的意思留在原地：它是最小可执行单元，再拆只会
+    得到重复内容，还白花一次调用。`max_depth` 退化成兜底，不再替模型决定深浅。
     """
     for slot in slots:
         here = f"{path} > {slot.label}" if path else slot.label
         if slot.children:
             yield from _walk_slots(slot.children, depth + 1, here, max_depth)
-        elif not slot.declared_leaf and depth < max_depth:
+        elif slot.expandable and depth < max_depth:
             yield slot, depth, here
 
 
@@ -711,12 +760,19 @@ def _plan_ask(topic: str, branches: int) -> str:
 # 哪一支、以及别越到同级别的分支上去（并发展开时它看不到其他分支写了什么）。
 #
 # 格式从 `{"points":[字符串]}` 改成 `{"children":[{"label":...}]}`：纯字符串数组
-# 里没有层级，产出永远是两层。即便这一层不再往下长，对象形式也让"这一支还有下级"
-# 有地方表达（见 `_candidate_slots`）。旧格式仍被接受，只是收下的节点按叶子处理。
+# 里没有层级，产出永远是两层。对象形式让"这一支还有下级"有地方表达，也就是
+# `expandable`——它在模型写这次响应的同时顺手判一句，**不额外花任何调用**，代码
+# 按它决定还要不要追问下一层（见 `_walk_slots`）。旧格式仍被接受，只是收下的
+# 节点按叶子处理。
 BRANCH_EXPAND_PROMPT = (
     "你在给思维导图的一条一级分支补充子要点。只返回一个 JSON 对象，不要代码围栏，"
-    '格式为 {"children":[{"label":"要点一"},{"label":"要点二"}]}。'
+    '格式为 {"children":[{"label":"要点一","expandable":true},'
+    '{"label":"要点二","expandable":false}]}。'
     "只写一层，不要在 children 里再套 children。"
+    "每个子项都必须带 expandable 字段，它是布尔值：这个子项还能不能拆出更具体的"
+    "下级。如果它已经是最小可执行单元、再拆只会重复它自己，就填 false；"
+    "如果它还是一句概括、下面明显还有具体内容可写，就填 true。"
+    "如实判断，不要为了凑数硬拆，也不要一律填 true。"
     "每个 label 必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
     "只写这条分支范围内的内容，不要重复同级其他分支，不要编造具体数据、人名或文献。"
 )
@@ -725,10 +781,16 @@ BRANCH_EXPAND_PROMPT = (
 # 这一层并发展开时，模型看不到兄弟节点写了什么，只给一个 label 会让它写出与上一级
 # 同一句话的内容，所以 user 里要带一条从一级分支到这里的路径。
 # 同样只要求一层：实测一次要三层，写到第二段之后就开始敷衍甚至被输出上限截断。
+# `expandable` 与上一层同义：`max_depth` 大于 3 时，某一支该不该继续深挖同样由
+# 模型的判断决定，代码不再一律拉到上限。
 SUBNODE_EXPAND_PROMPT = (
     "你在给思维导图里一个已有的节点补充下一层子节点。只返回一个 JSON 对象，"
-    '不要代码围栏，格式为 {"children":[{"label":"要点一"},{"label":"要点二"}]}。'
+    '不要代码围栏，格式为 {"children":[{"label":"要点一","expandable":true},'
+    '{"label":"要点二","expandable":false}]}。'
     "只写一层，不要在 children 里再套 children。"
+    "每个子项都必须带 expandable 字段，它是布尔值：这个子项还能不能拆出更具体的"
+    "下级。已经是最小可执行单元、再拆只会重复它自己的填 false；"
+    "明显还有具体内容可写的填 true。如实判断，不要为了凑数硬拆。"
     "每个 label 必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
     "只写这个节点范围内的内容，不要重复同一父节点下其他节点的说法，"
     "不要编造具体数据、人名或文献。"
@@ -809,6 +871,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         才知道，所以层是串的；同一层的父节点彼此无关，共用一个信号量限流。
       - 每次展开只要求模型写一层。实测一次要三层，写到后面会被输出上限截断；
         模型自愿多给一层就收下（`_candidate_slots`），代码不逼它一次吐到底。
+      - **某支还要不要继续拆，由模型说**：每次展开的响应里，每个子项都带一个
+        `expandable`——它本来就在写这次响应，判一句不额外花任何调用。false 的节点
+        直接留作叶子，不再进入下一层的候选（`_walk_slots`）。`max_depth` 退回兜底
+        位置，默认值仍是 3：这次只验证模型会不会用这个标记（看 `leaf_declared`），
+        深度策略等真实运行的数据出来再定。
 
     预算怎么分（不这么分，前面几支会把额度吃光）：
       - 接口层先扣：root + 一级分支 = 1 + branches
@@ -1122,6 +1189,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         detail = "；".join(error["msg"] for error in exc.errors()[:3])
         return _fail("invalid_tree", f"合并后的导图不合法：{detail}")
 
+    # 整棵树的形状到这里才定下来，这时数「模型声明了什么」才准：第 2 层在
+    # `expand_branch` 里裁过一道，第 3 层往下是逐步挂到 children 上的，早一步数
+    # 会漏掉下层节点给出的标记。
+    leaf_declared, expandable_declared = _count_expand_flags(all_slots)
+
     audit = _audit_tree(content.root, expected)
     # 总节点超契约上限 = 结构错误：这样的树连存都存不进去，不能当成功交出去。
     # 预分配与逐层裁剪都是为了让它不发生，走到这里说明预算算术本身出了岔子。
@@ -1220,6 +1292,18 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "没有返回可用的子节点"
             ),
         ))
+    # 「模型到底会不会用 expandable」是这个改动唯一的成败判据，所以它必须在
+    # diagnostics 里可见：树已经顶到层数上限，却一个 false 都没收到，说明提示词
+    # 里的字段被无视了——此时树的深浅仍完全由 max_depth 决定，等于这次改动没生效。
+    # 只看 `leaf_declared`：模型把每一项都标成 true，同样等于没给出"到此为止"的判断。
+    if leaf_declared == 0 and audit.deepest >= max_depth:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="EXPAND_FLAG_IGNORED",
+            message=(
+                f"展开到第 {max_depth} 层，但模型没有把任何子项标为不可展开"
+                "（expandable: false）：可展开标记可能被忽略，深浅仍由层数上限决定"
+            ),
+        ))
 
     expanded = len(skeleton) - len(skipped_set) - len(failed_set)
     cut_total = sum(level_cut.values())
@@ -1269,6 +1353,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     if shallow:
         layers = "、".join(str(depth) for depth in shallow)
         content_parts.append(f"第 {layers} 层没能展开：模型没有返回可用的下一层内容。")
+    # 两个计数都是 0 = 提示词里的字段一次都没被回应。这件事不能只留在 data 里：
+    # 用户看到的是 content，排查的人第一眼看的也是它。
+    if leaf_declared == 0 and expandable_declared == 0:
+        content_parts.append(
+            "模型未使用可展开标记（expandable），本次按缺省全部可展开处理。"
+        )
     content_parts.append(
         f"按 {max_depth} 层预算展开，实际 {audit.deepest + 1} 层（含中心主题），各层节点数："
         f"{' / '.join(str(audit.depths.get(depth, 0)) for depth in range(audit.deepest + 1))}。"
@@ -1291,6 +1381,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 for depth in range(audit.deepest + 1)
             ],
             "cut_nodes": cut_total,
+            # 「模型到底有没有用上 expandable」的两个原始计数。缺省不计数：两个
+            # 都是 0 说明这个字段被完全无视，深浅只剩层数上限在决定。
+            "leaf_declared": leaf_declared,
+            "expandable_declared": expandable_declared,
             "short_branches": [
                 {"id": skeleton[index][1], "label": title, "missing": missing}
                 for index, title, missing in short
