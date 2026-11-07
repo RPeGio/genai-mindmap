@@ -19,6 +19,10 @@ export interface ResolvedRef {
   quote: string;
   /** 原文片段（带前后文）；没有原文时为空串。 */
   excerpt: string;
+  /** `excerpt` 的三段切分，界面据此把命中部分包进 <mark>；没有原文时都是空串。 */
+  before: string;
+  hit: string;
+  after: string;
   /** 高亮在原文里的码点区间；定位不到为 null。 */
   start: number | null;
   end: number | null;
@@ -79,11 +83,30 @@ export function locateInText(
 
 /** 取原文片段：高亮区间前后各留 `pad` 个字，截断处加省略号。 */
 export function excerptOf(text: string, start: number, end: number, pad = 60): string {
+  const { before, hit, after } = windowOf(text, start, end, pad);
+  return `${before}${hit}${after}`;
+}
+
+/**
+ * 同上的三段形式。
+ *
+ * 界面要在原文片段里把命中的那句标出来，只有一整串字符串就没法插 <mark>；
+ * 在这里切好，组件只负责摆放，不重复算下标。
+ */
+export function windowOf(
+  text: string,
+  start: number,
+  end: number,
+  pad = 60,
+): { before: string; hit: string; after: string } {
   const chars = Array.from(text);
   const from = Math.max(0, start - pad);
   const to = Math.min(chars.length, end + pad);
-  const body = chars.slice(from, to).join('');
-  return `${from > 0 ? '…' : ''}${body}${to < chars.length ? '…' : ''}`;
+  return {
+    before: `${from > 0 ? '…' : ''}${chars.slice(from, start).join('')}`,
+    hit: chars.slice(start, end).join(''),
+    after: `${chars.slice(end, to).join('')}${to < chars.length ? '…' : ''}`,
+  };
 }
 
 /** 来源显示名：文件名优先，没有就用 kind 的中文名加序号。 */
@@ -100,12 +123,16 @@ export function resolveRef(ref: SourceRef, sources: Source[], usage: SourceUsage
   const text = source?.text ?? '';
   const located = text ? locateInText(text, ref) : null;
   const quote = ref.quote?.trim() || (located ? Array.from(text).slice(located.start, located.end).join('') : '');
+  const window = located ? windowOf(text, located.start, located.end) : { before: '', hit: '', after: '' };
 
   return {
     ref,
     source,
     quote,
-    excerpt: located ? excerptOf(text, located.start, located.end) : '',
+    excerpt: `${window.before}${window.hit}${window.after}`,
+    before: window.before,
+    hit: window.hit,
+    after: window.after,
     start: located?.start ?? null,
     end: located?.end ?? null,
     where: refWhere(ref),

@@ -588,7 +588,7 @@ describe('多来源输入界面', () => {
     await wrapper.vm.$nextTick();
     expect(wrapper.get('aside').text()).toContain('本图来源（2）');
     expect(wrapper.get('aside').text()).toContain('图片 · 结构.png · 100 字');
-    expect(wrapper.get('aside').text()).toContain('不对应具体节点');
+    expect(wrapper.get('aside').text()).toContain('生成时用到的来源');
     store.loadMap(generated, { id: 'legacy', version: 1, updated_at: '2026-11-05' });
     await wrapper.vm.$nextTick();
     expect(wrapper.get('aside').text()).not.toContain('本图来源');

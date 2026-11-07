@@ -259,7 +259,7 @@ describe('节点引用', () => {
     const store = useMindMapStore();
     store.preview(withRefs(), 'right');
 
-    const counts = new Map(store.nodes.map(node => [node.id, node.data.refs]));
+    const counts = new Map(store.nodes.map(node => [node.id, node.data?.refs]));
     expect(counts.get('root')).toBe(0);
     expect(counts.get('a')).toBe(2);
     expect(counts.get('b')).toBe(0);

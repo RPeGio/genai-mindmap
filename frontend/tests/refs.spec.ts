@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Source, SourceRef, SourceUsage } from '../src/api/types';
-import { excerptOf, locateInText, refName, refWhere, resolveRef, resolveRefs } from '../src/mindmap/refs';
+import { excerptOf, locateInText, refName, refWhere, resolveRef, resolveRefs, windowOf } from '../src/mindmap/refs';
 
 const TEXT = '矩阵的秩等于行向量组的极大线性无关组的个数。初等变换不改变矩阵的秩。';
 
@@ -123,5 +123,20 @@ describe('解析成可绘制形状', () => {
     expect(text.startsWith('…')).toBe(true);
     expect(text.endsWith('…')).toBe(true);
     expect(Array.from(text).length).toBe(32);
+  });
+});
+
+describe('原文片段的三段切分', () => {
+  it('命中部分单独成段，前后各自带上下文', () => {
+    const { before, hit, after } = windowOf(TEXT, 22, 26, 4);
+    expect(hit).toBe('初等变换');
+    expect(before).toBe('…的个数。');
+    expect(after).toBe('不改变矩…');
+  });
+
+  it('三段拼起来等于整段摘录，不会有字被吃掉', () => {
+    const resolved = resolveRef({ source_id: 's1', start: 0, end: 6, quote: '矩阵的秩等于' }, [source()], usage);
+    expect(`${resolved.before}${resolved.hit}${resolved.after}`).toBe(resolved.excerpt);
+    expect(resolved.hit).toBe('矩阵的秩等于');
   });
 });
