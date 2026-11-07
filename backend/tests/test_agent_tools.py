@@ -18,25 +18,29 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.provider import _MAX_TOKENS_CAP
 from app.agent.tools import (
     BRANCH_EXPAND_PROMPT,
     DEEP_CONCURRENCY,
     MAX_OUTPUT_TOKENS_CAP,
-    MAX_SOURCE_CHARS,
     PLAN_PROMPT,
     SOURCE_TRUNCATED_HINT,
+    _source_prompt_input,
     build_registry,
 )
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
 from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
     SOURCED_DETAIL_PROMPT,
     SOURCED_THINKING_GUARD,
     THINKING_MODELS,
     GenerationError,
+    estimate_input_tokens,
 )
 
 # 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
@@ -200,20 +204,47 @@ class GenerateToolTest(unittest.TestCase):
         )
 
     def test_oversized_source_is_truncated_with_hint(self):
-        """单个来源过长时截断并注明，否则模型会为"看不到的结尾"写引用。"""
-        long_text = "字" * (MAX_SOURCE_CHARS + 50)
+        """正文刚好占满窗口时，还要给系统提示词、JSON 与截断提示留空间。"""
+        quote = "只在完整原文末尾出现的引文"
+        long_text = "字" * (int(CONTEXT_TOKEN_LIMIT * 1.5) - len(quote)) + quote
         source = Source(kind=SourceKind.text, status="parsed", text=long_text)
         ctx = _ctx(sources=[source])
-        mocked = AsyncMock(return_value=TREE)
+        tree = json.loads(json.dumps(TREE))
+        tree["root"]["source_refs"] = [{"source_id": source.id, "quote": quote}]
+        mocked = AsyncMock(return_value=tree)
         with patch("app.agent.tools.chat_async", new=mocked):
             result = _run(build_registry("create").execute(
                 _call("mindmap_generate", topic="整理"), ctx))
 
         self.assertTrue(result.ok, result.content)
-        _, user = mocked.await_args.args
+        system, user = mocked.await_args.args
         text = _prompt_payload(user)[0]["text"]
-        self.assertEqual(text, long_text[:MAX_SOURCE_CHARS] + SOURCE_TRUNCATED_HINT)
+        self.assertTrue(text.endswith(SOURCE_TRUNCATED_HINT))
         self.assertLess(len(text), len(long_text))
+        self.assertLessEqual(
+            estimate_input_tokens(system) + estimate_input_tokens(user), CONTEXT_TOKEN_LIMIT,
+        )
+        self.assertNotIn(quote, text)
+        # 模型输入被裁剪，不代表校验也能裁剪：末尾的合法原文引用必须仍然有效。
+        self.assertEqual(ctx.candidate.root.source_refs[0].quote, quote)
+        self.assertEqual(source.text, long_text)
+
+    def test_source_within_budget_is_sent_in_full(self):
+        unit = "英文原文 English material.\n"
+        long_text = unit * (CONTEXT_TOKEN_LIMIT // len(unit))
+        source = Source(kind=SourceKind.text, status="parsed", text=long_text)
+        mocked = AsyncMock(return_value=TREE)
+        with patch("app.agent.tools.chat_async", new=mocked):
+            result = _run(build_registry("create").execute(
+                _call("mindmap_generate", topic="整理"), _ctx(sources=[source])))
+
+        self.assertTrue(result.ok, result.content)
+        system, user = mocked.await_args.args
+        self.assertLessEqual(
+            estimate_input_tokens(system) + estimate_input_tokens(user), CONTEXT_TOKEN_LIMIT,
+        )
+        self.assertEqual(_prompt_payload(user), [{"source_id": source.id, "text": long_text}])
+        self.assertNotIn(SOURCE_TRUNCATED_HINT, user)
 
     def test_source_without_text_is_ignored_instead_of_breaking_generation(self):
         """空来源不该拖垮整次生成：它只是没正文，不是模型出错。"""
@@ -305,6 +336,42 @@ class GenerateToolTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.data["code"], "budget_exhausted")
         mocked.assert_not_called()
+
+
+@pytest.mark.parametrize("unit", ["a", "字", '中A\\"\n'])
+def test_source_clipping_keeps_the_longest_prefix_within_token_budget(unit):
+    text = unit * (CONTEXT_TOKEN_LIMIT * 4)
+    source = Source(id="long-source", kind=SourceKind.text, status="parsed", text=text)
+    system = SOURCED_DETAIL_PROMPT + SOURCED_THINKING_GUARD
+    user = _source_prompt_input([source], system=system)
+    payload = _prompt_payload(user)
+    clipped = payload[0]["text"]
+    assert clipped.endswith(SOURCE_TRUNCATED_HINT)
+    kept = clipped.removesuffix(SOURCE_TRUNCATED_HINT)
+    assert kept and text.startswith(kept)
+    assert estimate_input_tokens(user) + estimate_input_tokens(system) <= CONTEXT_TOKEN_LIMIT
+
+    # 不只断言「没超限」：再多保留一个原字符就放不下，才证明没有另一个字符上限。
+    payload[0]["text"] = text[:len(kept) + 1] + SOURCE_TRUNCATED_HINT
+    longer = user.split("\n", 1)[0] + "\n" + json.dumps(payload, ensure_ascii=False)
+    assert estimate_input_tokens(longer) + estimate_input_tokens(system) > CONTEXT_TOKEN_LIMIT
+    assert source.text == text
+
+
+def test_multiple_sources_share_one_token_budget():
+    sources = [
+        Source(id=f"s{index}", kind=SourceKind.text, status="parsed",
+               text="字" * CONTEXT_TOKEN_LIMIT)
+        for index in range(2)
+    ]
+    system = SOURCED_DETAIL_PROMPT
+    user = _source_prompt_input(sources, system=system)
+    payload = _prompt_payload(user)
+    assert estimate_input_tokens(user) + estimate_input_tokens(system) <= CONTEXT_TOKEN_LIMIT
+    assert [item["source_id"] for item in payload] == [source.id for source in sources]
+    assert payload[0]["text"] == sources[0].text
+    assert payload[1]["text"].endswith(SOURCE_TRUNCATED_HINT)
+    assert sources[1].text == "字" * CONTEXT_TOKEN_LIMIT
 
 
 class GenerateDeepToolTest(unittest.TestCase):

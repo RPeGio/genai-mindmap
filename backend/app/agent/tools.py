@@ -44,12 +44,15 @@ from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.ops import OpBatch, OpError
 from app.contracts.source import Source
 from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
     MIN_BRANCHES,
     SOURCED_DETAIL_PROMPT,
     SOURCED_THINKING_GUARD,
     GenerationError,
     chat_async,
+    ensure_input_within_context,
+    estimate_input_tokens,
     thinking_block,
     validate_generated_content,
 )
@@ -94,10 +97,8 @@ DEEP_MIN_BREADTH = 2
 # 常量，是为了不让「工具」反向依赖「适配层」——适配层是可替换的。
 MAX_OUTPUT_TOKENS_CAP = 65536
 
-# 单个来源喂给模型的字符上限。超出的部分截断并显式注明——不注明的话，模型
-# 会以为自己看到的是全文，然后为"结尾那段"写引用，而那些引用在原文里
-# 根本匹配不上。注意校验用的 sources 不截断：quote 要在完整原文里逐字核对。
-MAX_SOURCE_CHARS = 12000
+# 截断必须让模型知情，否则它会把半份材料当成全文来整理和引用。
+# 校验用的 sources 始终保留完整原文，只有提示词里的副本可以裁剪。
 SOURCE_TRUNCATED_HINT = "（原文过长，已截断）"
 
 
@@ -727,7 +728,7 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
     return _TreeAudit(depths=depths, total=total, deepest=deepest, blank=blank, missing=missing)
 
 
-def _source_prompt_input(sources: list[Source]) -> str:
+def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
     """把来源拼成 `SOURCED_DETAIL_PROMPT` 约定的 sources 数组。
 
     必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而
@@ -741,17 +742,50 @@ def _source_prompt_input(sources: list[Source]) -> str:
     items = [
         {
             "source_id": source.id,
-            "text": _clip_source_text(source.text or ""),
+            "text": source.text or "",
         }
         for source in sources
     ]
-    return "sources 数组（JSON）：\n" + json.dumps(items, ensure_ascii=False)
+
+    def render() -> str:
+        return "sources 数组（JSON）：\n" + json.dumps(items, ensure_ascii=False)
+
+    system_tokens = estimate_input_tokens(system)
+
+    def fits() -> bool:
+        return estimate_input_tokens(render()) + system_tokens <= CONTEXT_TOKEN_LIMIT
+
+    if fits():
+        return render()
+
+    # 预算属于整次请求：系统提示词、所有来源的 JSON 转义与截断提示都要算。
+    # 先给后续来源留出标识与提示，再按原顺序用剩余额度，避免每份各占一整窗。
+    for item in items:
+        item["text"] = SOURCE_TRUNCATED_HINT if item["text"] else ""
+    ensure_input_within_context(
+        render(), limit=CONTEXT_TOKEN_LIMIT, extra_tokens=system_tokens,
+    )
+    for source, item in zip(sources, items):
+        def fits_source(text: str) -> bool:
+            item["text"] = text
+            return fits()
+
+        item["text"] = _clip_source_text(source.text or "", fits=fits_source)
+    return render()
 
 
-def _clip_source_text(text: str) -> str:
-    if len(text) <= MAX_SOURCE_CHARS:
+def _clip_source_text(text: str, *, fits: Callable[[str], bool]) -> str:
+    """用实际提示词的 token 估算找最长前缀，避免中英文共用一个字符闸。"""
+    if fits(text):
         return text
-    return text[:MAX_SOURCE_CHARS] + SOURCE_TRUNCATED_HINT
+    low, high = 0, len(text) - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(text[:middle] + SOURCE_TRUNCATED_HINT):
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + SOURCE_TRUNCATED_HINT
 
 
 def _selection_scope_error(
@@ -908,9 +942,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         thinking = thinking_block(ctx.request.thinking_model)
         if sources:
             # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
+            system = SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
             raw = await chat_async(
-                SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD,
-                _source_prompt_input(sources),
+                system, _source_prompt_input(sources, system=system),
                 max_tokens=_max_tokens(ctx),
             )
         else:
