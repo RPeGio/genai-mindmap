@@ -10,6 +10,7 @@ import asyncio
 import json
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -26,6 +27,24 @@ from app.agent.service import _dedupe_key, outline_text, run
 from app.agent.tools import ToolRegistry, build_registry
 from app.contracts.mindmap import MindMapContent
 from app.generation.service import GenerationError
+
+# 生成工具返回的树：4 个节点、两层。用于验证工具内调用与 snapshot 帧。
+TREE = {
+    "title": "示例",
+    "root": {"id": "root", "label": "根", "children": [
+        {"id": "a", "label": "甲", "children": []},
+        {"id": "b", "label": "乙", "children": [
+            {"id": "b1", "label": "乙一", "children": []},
+        ]},
+    ]},
+}
+
+
+def _node_ids(root) -> set[str]:
+    ids = {root.id}
+    for child in root.children:
+        ids |= _node_ids(child)
+    return ids
 
 
 def _completion(calls: list[ToolCall] | None = None, finish: str = "stop",
@@ -97,14 +116,14 @@ def _request(intent: str = "create", budget: RunBudget | None = None) -> AgentRu
 class BasicFlowTest(unittest.TestCase):
     def test_stop_without_tools_ends_with_done(self):
         """模型直接给文字收尾：只发 done，不发工具事件。"""
-        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry())
+        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry("create"))
         types = [event.type for event in events]
         self.assertEqual(types, ["stage", "done"])
         self.assertEqual(events[-1].content, None)  # create 且没有快照
 
     def test_seq_is_continuous_from_one(self):
         """seq 必须从 1 连续递增：前端靠它判断丢帧和乱序。"""
-        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry())
+        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry("create"))
         self.assertEqual([event.seq for event in events], [1, 2])
 
     def test_tool_result_is_filled_back_by_call_id(self):
@@ -132,7 +151,7 @@ class BasicFlowTest(unittest.TestCase):
     def test_finish_without_stop_and_without_tools_is_error(self):
         """既没有工具调用、finish_reason 又不是 stop：这是异常路径，不能当成功。"""
         events = _collect(_request(), ScriptedProvider([_completion(finish="content_filter")]),
-                          build_registry())
+                          build_registry("create"))
         self.assertEqual(events[-1].type, "error")
         self.assertEqual(events[-1].code, "unexpected_finish")
 
@@ -310,6 +329,76 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(events[-1].code, "budget_exhausted")
         self.assertEqual(events[-1].limit, "max_tool_calls")
 
+    def test_repair_budget_limits_failed_tool_calls(self):
+        """max_repairs 数的是工具失败次数，与模型调用次数无关。"""
+        def broken(args, ctx):
+            return ToolResult(ok=False, content="参数不对", data={"code": "nope"})
+
+        calls = [ToolCall(call_id=f"c{index}", name="echo", arguments={"text": str(index)})
+                 for index in range(4)]
+        script = [_completion([call], finish="tool_calls") for call in calls]
+        events = _collect(
+            _request(budget=RunBudget(max_model_calls=10, max_tool_calls=50, max_repairs=1)),
+            ScriptedProvider(script), _registry(broken),
+        )
+        failures = [event for event in events if event.type == "tool_end" and not event.ok]
+        # 容忍 1 次，第 2 次就停。两次失败都必须有配对的 tool_end，
+        # 否则前端会一直停在"执行中"。
+        self.assertEqual(len(failures), 2)
+        self.assertEqual([event.type for event in events].count("tool_start"), 2)
+        self.assertEqual(events[-1].code, "too_many_failures")
+        self.assertEqual(events[-1].limit, "max_repairs")
+
+    def test_budget_one_allows_exactly_one_real_model_call(self):
+        """预算 1：外层调用 + 工具内部调用合计只能 1 次。
+
+        这是实测缺陷的回归：判停只看外层轮数时，预算 1 的 run 仍然发出了
+        4 次真实请求——外层 1 次，`mindmap_generate` 内部又调了 3 次。
+        """
+        chats: list[str] = []
+
+        async def fake_chat(system, user, *, max_tokens=None):
+            chats.append(user)
+            return TREE
+
+        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(
+                _request(budget=RunBudget(max_model_calls=1)),
+                provider, build_registry("create"),
+            )
+
+        self.assertEqual(provider.calls + len(chats), 1)
+        # 唯一那次额度被外层用掉，工具必须直接失败而不是先花掉再上报
+        self.assertEqual(chats, [])
+        self.assertEqual(events[-1].type, "error")
+        self.assertEqual(events[-1].limit, "max_model_calls")
+
+    def test_budget_two_lets_the_tool_spend_the_second_call(self):
+        """对照：预算 2 时工具能拿到第二次额度并真的生成。
+
+        没有这一条，预算 1 的"工具内部零次调用"可能只是因为工具永远不调模型。
+        """
+        chats: list[str] = []
+
+        async def fake_chat(system, user, *, max_tokens=None):
+            chats.append(user)
+            return TREE
+
+        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(
+                _request(budget=RunBudget(max_model_calls=2)),
+                provider, build_registry("create"),
+            )
+
+        self.assertEqual(len(chats), 1)
+        self.assertEqual(provider.calls + len(chats), 2)
+        snapshot = next(event for event in events if event.type == "snapshot")
+        self.assertEqual(_node_ids(snapshot.content.root), {"root", "a", "b", "b1"})
+
 
 class OutlineRefreshTest(unittest.TestCase):
     def test_second_turn_sees_nodes_created_in_first_turn(self):
@@ -361,6 +450,50 @@ class OutlineRefreshTest(unittest.TestCase):
         )
         self.assertEqual(events[-1].type, "error")
         self.assertEqual(events[-1].limit, "max_model_calls")
+
+
+class SnapshotEmissionTest(unittest.TestCase):
+    """snapshot 帧定义了就必须真的发出来。
+
+    只定义不发射时，前端只能在 done 时一次性拿到内容，"边生成边看"无从谈起。
+    """
+
+    def test_generate_success_emits_snapshot_with_valid_tree(self):
+        async def fake_chat(system, user, *, max_tokens=None):
+            return TREE
+
+        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(_request(), provider, build_registry("create"))
+
+        types = [event.type for event in events]
+        # 顺序即契约：tool_end 之后、done 之前；generate 不产生 op 批次，
+        # 所以这里看不到 ops 帧
+        self.assertEqual(types, ["stage", "tool_start", "tool_end", "snapshot", "done"])
+        self.assertEqual([event.seq for event in events], [1, 2, 3, 4, 5])
+
+        snapshot = next(event for event in events if event.type == "snapshot")
+        # 整树校验：能重新走一遍契约（id 唯一、层数、children 上限）才算完整，
+        # 补括号拼出来的半棵树过不了这一关
+        replay = MindMapContent.model_validate(snapshot.content.model_dump())
+        self.assertEqual(_node_ids(replay.root), {"root", "a", "b", "b1"})
+        # snapshot 与 done 必须是同一棵树：两个来源不一致会让前端闪一下
+        self.assertEqual(events[-1].content.model_dump(), snapshot.content.model_dump())
+
+    def test_snapshot_is_not_emitted_when_candidate_already_exists(self):
+        """expand / edit 一开始就有候选树：不重复发 snapshot。"""
+        tree = MindMapContent.model_validate(TREE)
+
+        def handler(args, ctx):
+            ctx.candidate = tree.model_copy(deep=True)
+            return ToolResult(ok=True, content="ok")
+
+        call = ToolCall(call_id="c1", name="echo", arguments={"text": "改"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
+        request = AgentRunRequest(goal="展开节点", intent="edit", snapshot=tree)
+        events = _collect(request, provider, _registry(handler))
+        self.assertNotIn("snapshot", [event.type for event in events])
 
 
 class ProviderParsingTest(unittest.TestCase):
@@ -424,7 +557,7 @@ class CancelTest(unittest.TestCase):
         """取消必须穿透循环，不能被吞成一次正常结束。"""
         async def scenario():
             provider = ScriptedProvider([asyncio.CancelledError()])
-            async for _ in run(_request(), provider=provider, tools=build_registry()):
+            async for _ in run(_request(), provider=provider, tools=build_registry("create")):
                 pass
 
         with self.assertRaises(asyncio.CancelledError):

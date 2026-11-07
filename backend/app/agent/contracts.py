@@ -12,11 +12,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Callable, Literal, Protocol, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.contracts.mindmap import MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
+
+# 与 pipeline/service.py::MAX_INPUT_CHARS 同口径。前端不再把材料截成 1000 字，
+# 改走 sources 整体传，这条是唯一的边界。
+MAX_SOURCE_CHARS = 20000
 
 
 # ---------------------------------------------------------------- 预算
@@ -25,10 +29,14 @@ from app.contracts.source import Source
 class RunBudget(BaseModel):
     """一次 run 的资源上限。
 
-    `max_model_calls` 取 5 是实测值：探针显示一次响应能给出 2–3 个工具调用，
+    `max_model_calls` 数的是**真实调用次数**，不是外层轮数：循环里每一轮 provider
+    调用、以及工具内部的每一次 `chat_async` 调用都算一次，共用 `RunContext` 上
+    同一个账本。取 5 是实测值：探针显示一次响应能给出 2–3 个工具调用，
     「查 → 建 → 改 → 修」四段用 5 轮足够；给 8 轮只是把跑飞的成本藏进去。
 
-    `max_repairs` 全轮共享而不是按轮重置：按轮重置等于给模型无限次重试，
+    `max_repairs` 约束的是**工具执行失败次数**（`ToolResult.ok == False` 的次数），
+    与模型调用次数无关：一次成功的模型响应里发三个工具、其中两个失败，只消耗
+    这里两次。全轮共享而不是按轮重置——按轮重置等于给模型无限次重试，
     每次重试都照样计费。
     """
 
@@ -36,11 +44,14 @@ class RunBudget(BaseModel):
     max_model_calls: int = Field(default=5, ge=1, le=20)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
     max_seconds: float = Field(default=120.0, gt=0, le=600)
-    # 这是**单次**模型调用的输出上限，不是整轮累计——它直接作为 provider 的
-    # max_tokens 发出去。整轮累计的上界是它乘以调用次数，不需要另一个字段。
+    # 这是**单次**模型调用的输出上限，不是整轮累计——它直接作为 provider 请求里
+    # 的 `max_tokens` 发出去，每次调用都按这个值重新计。整轮累计的上界是
+    # 「这个值 × 实际调用次数」，而调用次数由 `max_model_calls` 约束，因此
+    # 不需要再加一个"累计输出"字段：两个上界相乘已经封顶。
     max_output_tokens: int = Field(default=32768, ge=1024, le=131072)
     # 容忍几次工具执行失败。模型第一次把 label 写错位置是常态，它看到错误后
     # 下一轮会改对；超过这个次数说明它卡住了，继续烧调用没有意义。
+    # 计的是累计失败数，不是"连续失败数"：成功的工具调用不会把计数清零。
     max_repairs: int = Field(default=1, ge=0, le=5)
 
 
@@ -155,9 +166,25 @@ class RunContext:
     executed: dict[str, tuple[str, "ToolResult"]] = field(default_factory=dict)
     # (工具名, 规范化参数) -> 结果。只对只读工具生效。
     dedupe: dict[str, "ToolResult"] = field(default_factory=dict)
-    # 工具内部直接调模型的次数（生成、展开）。它们不经过循环那一层，
-    # 但同样是真实花费，必须计入总预算，否则 max_model_calls 形同虚设。
+    # 模型调用的**权威账本**：外层每一轮 provider 调用与工具内部每一次 chat_async
+    # 调用共用这一个计数。额度必须在请求发出**之前**通过 `reserve_model_call()`
+    # 占掉——事后记账等于先花钱后记账，工具执行期间预算就会被超支使用。
+    model_calls_used: int = 0
+    # 工具内部直接调模型的次数，由工具自己上报。它是对账兜底与观测值，
+    # **不**参与判停：判停看 `model_calls_used`，只有它同时覆盖外层与工具内部。
     extra_model_calls: int = 0
+
+    def reserve_model_call(self) -> bool:
+        """占掉一次模型调用额度，拿不到返回 False。
+
+        循环与工具都走这里，所以这段判断只该有一份实现：两处各写一份判断、
+        各记一份数，迟早出现「判的时候以为还有额度、记的时候又多记一次」的
+        分叉——预算为 1 的 run 实测发出过 4 次真实请求，就是这么来的。
+        """
+        if self.model_calls_used >= self.request.budget.max_model_calls:
+            return False
+        self.model_calls_used += 1
+        return True
 
 
 # ---------------------------------------------------------------- 请求
@@ -177,6 +204,20 @@ class AgentRunRequest(BaseModel):
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=50)
     budget: RunBudget = Field(default_factory=RunBudget)
+
+    @model_validator(mode="after")
+    def sources_within_budget(self) -> "AgentRunRequest":
+        """来源正文合计要有个上限。
+
+        前端不再把材料截断成 1000 字（那会丢绝大部分内容），改走 `sources`
+        整体传过来；但整份传过来就没有任何边界了——`Source.text` 本身没有
+        长度限制。这里用与 pipeline 同一口径的 20000 字兜住，超了在开流前
+        就拒绝，而不是等模型那边炸掉。
+        """
+        total = sum(len(source.text or "") for source in self.sources)
+        if total > MAX_SOURCE_CHARS:
+            raise ValueError(f"来源正文合计 {total} 字，超过 {MAX_SOURCE_CHARS} 字上限，请精简后重试")
+        return self
 
 
 # ---------------------------------------------------------------- 事件流

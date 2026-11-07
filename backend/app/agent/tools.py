@@ -10,19 +10,22 @@
 
 这样切是为了把「改错地方」的风险压到协议层：`node_expand` 的入参里没有
 `parent_id` 的自由度（只能是你当前选中的那个），模型想乱挂也挂不了。
+`build_registry(intent)` 再按意图只放出该用的那几个——看不到的工具，
+模型不会反复试着调。
 """
 from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agent.contracts import RunContext, ToolCall, ToolResult, ToolSpec
-from app.agent.ops import apply_ops, find_node, normalize_ops
+from app.agent.ops import TEMP_ID_PREFIX, apply_ops, find_node, normalize_ops
 from app.contracts.mindmap import MindMapContent
 from app.contracts.ops import OpBatch, OpError
+from app.contracts.source import Source
 from app.generation.service import (
     DETAIL_PROMPT,
     SOURCED_DETAIL_PROMPT,
@@ -31,10 +34,15 @@ from app.generation.service import (
     validate_generated_content,
 )
 from app.knowledge.service import search_sources
-from app.pipeline.service import _understand
 
 # 与 backend/app/contracts/mindmap.py 的 Node.children max_length 同口径
 MAX_CHILDREN = 50
+
+# 单个来源喂给模型的字符上限。超出的部分截断并显式注明——不注明的话，模型
+# 会以为自己看到的是全文，然后为"结尾那段"写引用，而那些引用在原文里
+# 根本匹配不上。注意校验用的 sources 不截断：quote 要在完整原文里逐字核对。
+MAX_SOURCE_CHARS = 12000
+SOURCE_TRUNCATED_HINT = "（原文过长，已截断）"
 
 
 class ToolRegistry:
@@ -195,6 +203,84 @@ def _node_ids(root) -> set[str]:
     return seen
 
 
+def _source_prompt_input(sources: list[Source]) -> str:
+    """把来源拼成 `SOURCED_DETAIL_PROMPT` 约定的 sources 数组。
+
+    必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而
+    `_understand()` 返回的是纯文本合并，里面一个 id 都没有——模型看不见 id
+    就永远写不出合法引用，引用功能等于从来没通。那个函数服务于 pipeline 的
+    限长与 demo 路径，语义不同，不能在这里复用。
+
+    用 `ensure_ascii=False`：中文原样传输，模型看到的 token 更少，
+    也免得它把 `\\u4e2d` 这种转义当成正文抄进 quote。
+    """
+    items = [
+        {
+            "source_id": source.id,
+            "text": _clip_source_text(source.text or ""),
+        }
+        for source in sources
+    ]
+    return "sources 数组（JSON）：\n" + json.dumps(items, ensure_ascii=False)
+
+
+def _clip_source_text(text: str) -> str:
+    if len(text) <= MAX_SOURCE_CHARS:
+        return text
+    return text[:MAX_SOURCE_CHARS] + SOURCE_TRUNCATED_HINT
+
+
+def _selection_scope_error(
+    content: MindMapContent, args: EditArgs, ctx: RunContext,
+) -> ToolResult | None:
+    """把可改范围收窄到用户选中节点的子树。
+
+    注册表已经按意图裁掉了 expand 下的 `mindmap_edit`，但那是**一层**防线：
+    注册表被误配、或被调用方直接传进一个全量 registry 时，这一层就没了。
+    所以执行层自己再判一次——改错节点是不可逆的（用户手写的分支会被删）。
+
+    两处口径说明：
+      - `add` 比的是 `parent_id` 而不是 `id`。新节点的 id 是本批临时名
+        （`$tmp1`），它根本不在树里，"落在谁的子树内"对它没有意义；
+        真正决定"改到哪去"的是父节点。
+      - 同批新建的父节点（`$` 开头）放行：它自己会被"它挂靠在谁下面"
+        那条检查约束住，放行不会漏出范围。
+    """
+    if not ctx.request.selected_ids:
+        return None
+
+    scope: set[str] = set()
+    for selected in ctx.request.selected_ids:
+        node = find_node(content.root, selected)
+        if node is not None:
+            scope |= _node_ids(node)
+    allowed = "、".join(ctx.request.selected_ids)
+
+    for index, item in enumerate(args.ops):
+        if item.op == "add":
+            if item.parent_id is None:
+                # 缺 parent_id 由后面的 invalid_ops 给更准确的错误，这里不抢答
+                continue
+            target, field = item.parent_id, "parent_id"
+            if target.startswith(TEMP_ID_PREFIX):
+                continue
+        else:
+            target, field = item.id, "id"
+        if target not in scope:
+            return _fail(
+                "out_of_selection",
+                f"只能改当前选中节点及其子树（{allowed}），第 {index} 条操作指向 {target}。",
+                path=f"ops.{index}.{field}",
+            )
+        if item.op == "move" and item.new_parent_id not in scope:
+            return _fail(
+                "out_of_selection",
+                f"移动的目标父节点 {item.new_parent_id} 不在选中范围（{allowed}）内。",
+                path=f"ops.{index}.new_parent_id",
+            )
+    return None
+
+
 EXPAND_PROMPT = (
     "你在给思维导图的一个节点补充子要点。只返回一个 JSON 对象，不要代码围栏。"
     '格式为 {"points":["要点一","要点二"]}。'
@@ -212,15 +298,22 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if ctx.candidate is not None and ctx.candidate.root.children:
         return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
 
-    sources = _pick_sources(ctx, [])
+    # 只喂真的有正文的来源：`status` 是给界面看的，模型能用的是 text。
+    # 不过滤的话，一个还没解析成功的空来源会让 validate_generated_content
+    # 重建 source_usage 时撞上 char_count >= 1，把整次生成判成失败——
+    # 用户只是多勾了一个空文件，却得到"模型返回的导图不合法"。
+    sources = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
+    # 额度在调用**之前**占：请求一旦发出就是一次真实计费，哪怕它随后抛错。
+    # 只在成功后记账会让预算在工具执行期间被超支使用（预算 1 实测跑出 4 次）。
+    if not ctx.reserve_model_call():
+        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图。")
+    ctx.extra_model_calls += 1
     try:
         if sources:
-            raw = await chat_async(SOURCED_DETAIL_PROMPT, _understand(sources))
+            # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
+            raw = await chat_async(SOURCED_DETAIL_PROMPT, _source_prompt_input(sources))
         else:
             raw = await chat_async(DETAIL_PROMPT, args.topic)
-        # 这是一次真实的模型调用，只是发生在工具内部。不计入的话
-        # max_model_calls 只约束了外层轮数，实际花费可以翻好几倍。
-        ctx.extra_model_calls += 1
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
 
@@ -269,8 +362,10 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
         ask += f"\n补充要求：{args.instruction}"
 
     try:
-        raw = await chat_async(EXPAND_PROMPT, ask)
+        if not ctx.reserve_model_call():
+            return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法展开。")
         ctx.extra_model_calls += 1
+        raw = await chat_async(EXPAND_PROMPT, ask)
     except GenerationError as exc:
         return _fail("generation_failed", f"展开失败：{exc}")
 
@@ -345,6 +440,12 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
     content = _require_candidate(ctx)
     if isinstance(content, ToolResult):
         return content
+
+    # 纵深防御：注册表已经按意图裁剪过，这里再按"用户选中了哪些节点"收窄一次。
+    # 注册表配错时这条仍然拦得住，被测过（expand 意图下删除选中节点之外的分支）。
+    scope_error = _selection_scope_error(content, args, ctx)
+    if scope_error is not None:
+        return scope_error
 
     drafts: list[dict[str, Any]] = []
     # 同一批里对同一个父节点连续 add 时，缺省 index 必须按“前面几条已经加进去之后”
@@ -432,37 +533,72 @@ def _batch_id(ctx: RunContext) -> str:
 # ---------------------------------------------------------------- 注册
 
 
-def build_registry() -> ToolRegistry:
-    """本次可用的工具集。
+# 意图 -> 允许的工具。这张表就是"模型这条路能走多远"的唯一声明。
+_ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
+    "create": ("mindmap_generate",),
+    "expand": ("node_expand",),
+    "edit": ("mindmap_edit",),
+}
 
-    四个工具都注册，但各自用 intent / 候选状态做前置校验——注册表不按意图裁剪，
-    因为模型看到"工具存在但你不能用"并收到一句解释，比看不到这个工具却不知道
-    为什么更好调试。
-    """
-    registry = ToolRegistry()
-    registry.register(ToolSpec(
+# 会读来源的意图。`create` 不在里面：整张从零生成时不给检索入口，
+# 否则模型会把"先查一下"当成规定动作（实测 10 次里 10 次都先查一遍）。
+_SOURCE_AWARE_INTENTS = ("expand", "edit")
+
+# 注册顺序固定，便于日志与测试对照；用工厂而不是共享实例，避免一个 registry
+# 上的改动影响到另一个（ToolSpec 目前不可变，但这个保证不该靠约定维持）。
+_TOOL_ORDER = ("mindmap_generate", "node_expand", "rag_query", "mindmap_edit")
+
+_TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
+    "mindmap_generate": lambda: ToolSpec(
         name="mindmap_generate",
         description="为主题生成一张完整思维导图。只有当前还没有导图时可用。",
         args_model=GenerateArgs,
         fn=_generate,
-    ))
-    registry.register(ToolSpec(
+    ),
+    "node_expand": lambda: ToolSpec(
         name="node_expand",
         description="把当前大纲里的某个节点展开成若干子要点，只新增子节点，不改动其他节点。",
         args_model=ExpandArgs,
         fn=_expand,
-    ))
-    registry.register(ToolSpec(
+    ),
+    "rag_query": lambda: ToolSpec(
         name="rag_query",
         description="在本次请求附带的资料里检索相关原文片段。回答关于资料的问题之前先调用它。",
         args_model=RagArgs,
         fn=_rag,
         readonly=True,
-    ))
-    registry.register(ToolSpec(
+    ),
+    "mindmap_edit": lambda: ToolSpec(
         name="mindmap_edit",
         description="按节点 id 精确修改已有导图：增删改节点或移动子树。不要用它整张重建。",
         args_model=EditArgs,
         fn=_edit,
-    ))
+    ),
+}
+
+
+def build_registry(intent: str = "create", *, has_sources: bool = False) -> ToolRegistry:
+    """本次可用的工具集，按意图裁剪。
+
+    早先是「四个全注册 + 各自内部校验意图」。那样做的问题是模型看得到工具、
+    却每次调用都被拒：实测 expand 意图下它坚持调 `mindmap_edit` 删节点，
+    失败三次才转向，白白烧掉调用额度。看不到这个工具，它就只能走对的那条路。
+
+    裁剪规则：
+      - `create` 只给 `mindmap_generate`（还没有树，别的工具都无从下手）
+      - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
+      - `edit` 给 `mindmap_edit`，请求带来源时再加 `rag_query`
+
+    `rag_query` 只在真有来源时才注册：没来源的检索必然返回「没有找到」，
+    注册它只会诱导模型拿它当"思考"用。未知意图按 `create` 兜底——宁可少给
+    工具，也不要把破坏性工具塞进一个没预期到的新意图里。
+    """
+    allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
+    if has_sources and intent in _SOURCE_AWARE_INTENTS:
+        allowed.add("rag_query")
+
+    registry = ToolRegistry()
+    for name in _TOOL_ORDER:
+        if name in allowed:
+            registry.register(_TOOL_SPECS[name]())
     return registry

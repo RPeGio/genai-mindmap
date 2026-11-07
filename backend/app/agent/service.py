@@ -27,6 +27,7 @@ from app.agent.contracts import (
     OpsEvent,
     RunBudget,
     RunContext,
+    SnapshotEvent,
     StageEvent,
     ToolCall,
     ToolProvider,
@@ -161,9 +162,13 @@ def _remaining_seconds(budget: RunBudget, started: float) -> float:
     return budget.max_seconds - (time.monotonic() - started)
 
 
-def _budget_limit(budget: RunBudget, model_calls: int, tool_calls: int, started: float) -> str | None:
-    if model_calls >= budget.max_model_calls:
-        return "max_model_calls"
+def _budget_limit(budget: RunBudget, tool_calls: int, started: float) -> str | None:
+    """时间与工具次数两种预算的判停。
+
+    **模型调用额度不在这里判**：它由 `RunContext.reserve_model_call()` 统一裁决。
+    外层轮次与工具内部的 `chat_async` 必须共用同一个账本，而这里只看得见外层，
+    在这里判就成了第二份真相——预算 1 实测发出 4 次请求，正是这么来的。
+    """
     if tool_calls >= budget.max_tool_calls:
         return "max_tool_calls"
     if _remaining_seconds(budget, started) <= 0:
@@ -227,12 +232,21 @@ async def run(
 ) -> AsyncIterator[AgentEvent]:
     """跑一次多轮工具循环，边跑边发事件。
 
-    终止只有三种：模型以 stop 收尾（done）、预算耗尽（error）、上游失败（error）。
+    终止只有四种：模型以 stop 收尾（done）、预算耗尽（error）、上游失败（error）、
+    工具累计失败超过 `max_repairs`（error）。
     不存在"静默截断后假装成功"——那会让前端拿到一棵看起来正常、实际缺了一半
     的树，比直接报错难排查得多。
+
+    预算记账只有一个账本（`RunContext.model_calls_used`）：外层 provider 调用与
+    工具内部的 `chat_async` 调用共用它，且都在**请求发出之前**占位。分两处判、
+    两处记，就会出现"判的时候以为还有额度"的超支。
     """
     active_provider = provider or default_provider()
-    registry = tools if tools is not None else build_registry()
+    # 意图决定模型看得到哪些工具：expand 下根本没有 mindmap_edit，
+    # 它也就不会去试"删掉另一个分支"。
+    registry = tools if tools is not None else build_registry(
+        request.intent, has_sources=bool(request.sources),
+    )
     budget = request.budget
     ctx = RunContext(
         request=request,
@@ -242,7 +256,6 @@ async def run(
     messages = _initial_messages(request)
     seq = itertools.count(1)
     started = time.monotonic()
-    model_calls = 0
     tool_calls = 0
     failures = 0
     usage_total: dict[str, Any] = {}
@@ -254,7 +267,7 @@ async def run(
     )
 
     while True:
-        limit = _budget_limit(budget, model_calls + ctx.extra_model_calls, tool_calls, started)
+        limit = _budget_limit(budget, tool_calls, started)
         if limit is not None:
             yield ErrorEvent(
                 seq=next(seq), code="budget_exhausted",
@@ -262,9 +275,17 @@ async def run(
             )
             return
 
+        # 先占额度、再发请求。反过来做（调用成功后才记账）时，一旦工具内部
+        # 也要调模型，额度会在工具执行期间被用掉而循环还不知道。
+        if not ctx.reserve_model_call():
+            yield ErrorEvent(
+                seq=next(seq), code="budget_exhausted",
+                message=_BUDGET_HINT["max_model_calls"], limit="max_model_calls",
+            )
+            return
+
         # 每轮刷新大纲：模型必须看到上一轮产出节点的真实 id，否则它无法精确改
         _refresh_outline(messages, ctx)
-        model_calls += 1
         try:
             # 用剩余时间做超时，而不是让单次调用跑到 provider 自己的 60 秒上限：
             # 否则总时限形同虚设，一轮慢调用就能把预算耗尽而循环还在等。
@@ -310,6 +331,9 @@ async def run(
                 seq=next(seq), call_id=call.call_id, name=call.name,
                 args_summary=_args_summary(call),
             )
+            ledger_before = ctx.model_calls_used
+            extra_before = ctx.extra_model_calls
+            had_candidate = ctx.candidate is not None
             begun = time.monotonic()
             try:
                 result = await asyncio.wait_for(
@@ -323,22 +347,46 @@ async def run(
                 )
                 return
             tool_calls += 1
-            if not result.ok:
-                # 模型给错参数是常态，它看到错误后下一轮通常能改对；但一直错下去
-                # 就是在烧调用，超过容忍次数直接收尾。
-                failures += 1
-                if failures > budget.max_repairs:
-                    yield ErrorEvent(
-                        seq=next(seq), code="too_many_failures",
-                        message=f"工具连续失败 {failures} 次仍未成功，已停止。",
-                        limit="max_repairs",
-                    )
-                    return
+            # 对账：工具有没有自己调了模型却没先占额度（新写的工具最容易漏这一步，
+            # 漏一次就多一次免费调用）。只在账本这一轮没动过时按 extra 增量补记，
+            # 避免与 reserve 的正常记账重复计数——宁可多记，不可漏记。
+            if (ctx.extra_model_calls > extra_before
+                    and ctx.model_calls_used == ledger_before):
+                ctx.model_calls_used += ctx.extra_model_calls - extra_before
+
+            # ToolEnd 必须在这个函数返回之前发出去，且要在失败判停**之前**：
+            # 否则那一次 tool_start 永远等不到配对帧，前端会一直显示"执行中"。
             yield ToolEndEvent(
                 seq=next(seq), call_id=call.call_id, name=call.name, ok=result.ok,
                 result_summary=result.data,
                 latency_ms=int((time.monotonic() - begun) * 1000),
             )
+            if not result.ok:
+                # 模型给错参数是常态，它看到错误后下一轮通常能改对；但一直错下去
+                # 就是在烧调用，超过容忍次数直接收尾。计的是累计失败数（不是连续），
+                # 成功的工具调用不会把它清零。
+                failures += 1
+                if failures > budget.max_repairs:
+                    yield ErrorEvent(
+                        seq=next(seq), code="too_many_failures",
+                        message=(
+                            f"工具执行已累计失败 {failures} 次（上限 {budget.max_repairs} 次），"
+                            "继续重试没有意义，已停止。"
+                        ),
+                        limit="max_repairs",
+                    )
+                    return
+
+            # 候选树从"没有"变成"有"（只可能是 mindmap_generate 成功）时补一帧
+            # snapshot：前端立刻就能渲染候选内容，不必等到 done。
+            # 位置选在 ToolEnd 之后、OpsEvent 之前：前端收到 tool_end 会先把工具
+            # 结果落进状态，紧随其后的整树快照与它一致；若放到 OpsEvent 之后，
+            # 同一批改动会先在增量里应用一次、再被整树覆盖一次。
+            # content 一定是完整校验过的树：ctx.candidate 只由
+            # validate_generated_content 与 apply_ops 的整树兜底写入，
+            # 半成品进不来。
+            if not had_candidate and ctx.candidate is not None:
+                yield SnapshotEvent(seq=next(seq), content=ctx.candidate)
 
             # 工具若产生了 op 批次，单独发帧：前端据此增量应用，不必等整棵树。
             # 用 data 而不是解析 content，省掉一次 JSON 往返，也避免把回给模型的
