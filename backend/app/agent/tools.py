@@ -1,9 +1,11 @@
-"""工具注册表与四个业务工具。
+"""工具注册表与五个业务工具。
 
 注册表只负责分派与参数校验，业务逻辑在各个 `_xxx` 函数里。
 
-四个工具的划分照「用户意图 + 作用域」而不是 CRUD 动词：
-- `mindmap_generate` 只在没有导图时可用，产出一整棵候选树
+五个工具的划分照「用户意图 + 作用域」而不是 CRUD 动词：
+- `mindmap_generate` 只在没有导图时可用，一次调用产出一整棵候选树
+- `mindmap_generate_deep` 同样只在没有导图时可用，但拆成「骨架 → 并发展开 →
+  验收 → 局部重试」四段，复杂主题用它（理由见该函数的 docstring）
 - `node_expand` 只能在已选中的节点下加子节点，不能删、不能移
 - `rag_query` 只读，且只能查本次请求带来的来源
 - `mindmap_edit` 才允许改/删/移，且必须按节点 id
@@ -15,6 +17,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from typing import Any, Callable, Literal
@@ -22,12 +25,20 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agent.contracts import RunContext, ToolCall, ToolResult, ToolSpec
-from app.agent.ops import TEMP_ID_PREFIX, apply_ops, find_node, normalize_ops
-from app.contracts.mindmap import MindMapContent
+from app.agent.ops import (
+    TEMP_ID_PREFIX,
+    apply_ops,
+    find_node,
+    new_node_id,
+    normalize_ops,
+)
+from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
+from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.ops import OpBatch, OpError
 from app.contracts.source import Source
 from app.generation.service import (
     DETAIL_PROMPT,
+    MIN_BRANCHES,
     SOURCED_DETAIL_PROMPT,
     SOURCED_THINKING_GUARD,
     GenerationError,
@@ -39,6 +50,12 @@ from app.knowledge.service import search_sources
 
 # 与 backend/app/contracts/mindmap.py 的 Node.children max_length 同口径
 MAX_CHILDREN = 50
+
+# 分片生成的并发上限。外部模型服务通常有并发上限：一次把 8 个请求全打出去很
+# 容易被限流，而限流的表现是超时或 429——比"慢"更难排查，因为失败的分支看上去
+# 和"模型就是没给内容"一模一样。3 是保守值：足够让 5-8 条分支重叠跑，又不至于
+# 让服务端把它当成突发流量。
+DEEP_CONCURRENCY = 3
 
 # 单个来源喂给模型的字符上限。超出的部分截断并显式注明——不注明的话，模型
 # 会以为自己看到的是全文，然后为"结尾那段"写引用，而那些引用在原文里
@@ -125,6 +142,20 @@ class GenerateArgs(BaseModel):
     topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
 
 
+class GenerateDeepArgs(BaseModel):
+    """分片生成的入参。
+
+    `branches` 与 `points_per_branch` 是**期望值**而不是硬约束：骨架给多给少一条
+    都继续，展开不足只补那一支。把它们写成严格契约，等于把模型的一次抖动
+    升级成整次失败。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
+    branches: int = Field(default=5, ge=3, le=8, description="一级分支数量")
+    points_per_branch: int = Field(default=3, ge=2, le=5, description="每条一级分支下至少要有几个要点")
+
+
 class ExpandArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     node_id: str = Field(min_length=1, max_length=100, description="要展开的节点 id，取自当前大纲")
@@ -203,6 +234,75 @@ def _node_ids(root) -> set[str]:
         seen.add(node.id)
         stack.extend(node.children)
     return seen
+
+
+def _skeleton_titles(raw: Any) -> list[str]:
+    """从骨架响应里取出分支标题，剔除空项，超长截到 50 字。
+
+    只接受字符串：`{"branches":[{"label":"x"}]}` 说明模型没照格式写，硬转字符串
+    会把一整个 dict 的 repr 当成节点标题挂到树上——那种"成功"比失败更难发现。
+    """
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("branches")
+    if not isinstance(items, list):
+        return []
+    titles: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        title = item.strip()
+        if not title:
+            continue
+        titles.append(title[:50])
+    return titles
+
+
+def _point_labels(raw: Any, limit: int) -> list[str]:
+    """从展开响应里取出要点标题，最多 `limit` 条。
+
+    截到 `limit` 而不是全收：多出来的要点会让单支子节点数失控，而这张图的上限是
+    按 `points_per_branch` 做的预算。
+    """
+    if not isinstance(raw, dict) or limit <= 0:
+        return []
+    items = raw.get("points")
+    if not isinstance(items, list):
+        return []
+    labels: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        label = item.strip()
+        if not label:
+            continue
+        labels.append(label[:200])
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def _audit_branches(
+    content: MindMapContent, minimum: int,
+) -> tuple[list[tuple[int, str, str, int]], list[str]]:
+    """确定性验收：只用代码看合并后的树，一次模型调用都不发。
+
+    返回 `(要点不足的分支 (下标, id, 标题, 实际点数), 要点超过上限的分支标题)`。
+    两者性质不同：不足是模型质量的正常波动，接受现状并记诊断；超过
+    `MAX_CHILDREN` 是结构错误——那样的树连契约都存不进去，必须判失败。
+
+    带下标是因为同一支可能既"点数不足"又"根本没展开成"：调用方要靠下标把
+    重复的告警剔掉，否则一个因额度被跳过的分支会同时得到两条诊断。
+    """
+    sparse: list[tuple[int, str, str, int]] = []
+    overfull: list[str] = []
+    for index, branch in enumerate(content.root.children):
+        count = len(branch.children)
+        if count < minimum:
+            sparse.append((index, branch.id, branch.label, count))
+        if count > MAX_CHILDREN:
+            overfull.append(branch.label)
+    return sparse, overfull
 
 
 def _source_prompt_input(sources: list[Source]) -> str:
@@ -290,6 +390,27 @@ EXPAND_PROMPT = (
     "不要重复已有子节点，不要编造具体数据、人名或文献。"
 )
 
+# 分片生成第一步：只定骨架，不写内容。一次调用同时要求模型「定框架 + 每支展开」，
+# 它会把注意力放在先写出来的那几支上，后面的分支越写越敷衍——这是质量不稳的
+# 直接来源。骨架单独一次调用，模型只需回答「分成哪几块」。
+PLAN_PROMPT = (
+    "你在为一张思维导图只定一级骨架，不写任何子要点。"
+    "只返回一个 JSON 对象，不要代码围栏，格式为 "
+    '{"branches":["分支一","分支二"]}。'
+    "每条分支是一个能独立成立的短标题，不超过 20 字；彼此覆盖的范围不重叠，"
+    "按逻辑顺序排列；不要编号，不要解释，不要编造具体数据、人名或文献。"
+)
+
+# 分片生成第二步：按骨架逐支展开。与 `EXPAND_PROMPT` 的差别只有上下文——
+# 那个服务于"用户选中某个节点再展开"，语义保持不动；这个要额外告诉模型它写的是
+# 哪一支、以及别越到同级别的分支上去（并发展开时它看不到其他分支写了什么）。
+BRANCH_EXPAND_PROMPT = (
+    "你在给思维导图的一条一级分支补充子要点。只返回一个 JSON 对象，不要代码围栏，"
+    '格式为 {"points":["要点一","要点二"]}。'
+    "每个要点必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
+    "只写这条分支范围内的内容，不要重复同级其他分支，不要编造具体数据、人名或文献。"
+)
+
 
 # ---------------------------------------------------------------- 工具实现
 
@@ -341,6 +462,254 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "root_id": content.root.id,
             "node_count": count,
             "revision": ctx.revision,
+            "diagnostics": [item.model_dump() for item in diagnostics],
+        },
+    )
+
+
+async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
+    """分片生成：先出骨架，再并发展开每支，最后确定性验收并只补不合格的那几支。
+
+    为什么要拆：整图生成的契约允许 300 节点 × 200 字标签，最坏约 4.4 万 token，
+    而单次调用的输出上限只有 16384——大图只能靠模型自己收敛，收敛不住就是截断。
+    分片后每次调用只装自己那一支，单次输出量就与整图上限脱钩了。
+    第二个收益是质量：一次调用同时要求「定框架 + 每支展开」，模型会把注意力
+    花在先写出来的分支上；把骨架单列成一次调用，它只需要回答「分成哪几块」。
+
+    四段都有各自的失败语义，不要合并：
+      1. 骨架拿不到 → 整次失败（连框架都没有，没有可交付的东西）
+      2. 某支展开抛错 → 那一支留空，其余照常（一次 429 不该废掉整张图）
+      3. 验收发现不足 → 只补那一支，骨架不重来（这是分片结构的全部价值）
+      4. 额度不足 → 立刻停手，把已展开的部分交出去并显式标 `partial`
+    """
+    if ctx.request.intent != "create":
+        return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
+    if ctx.candidate is not None and ctx.candidate.root.children:
+        return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
+
+    need = min(args.points_per_branch, MAX_CHILDREN)
+    diagnostics: list[Diagnostic] = []
+    # 思维模型两条路都要拼：骨架决定怎么分块，展开决定每块怎么拆。
+    thinking = thinking_block(ctx.request.thinking_model)
+
+    # 第一步：出骨架。额度在调用**之前**占——请求一旦发出就是一次真实计费。
+    if not ctx.reserve_model_call():
+        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
+    ctx.extra_model_calls += 1
+    try:
+        raw_plan = await chat_async(PLAN_PROMPT + thinking, args.topic)
+    except GenerationError as exc:
+        return _fail("generation_failed", f"骨架生成失败：{exc}")
+
+    titles = _skeleton_titles(raw_plan)
+    if len(titles) < MIN_BRANCHES:
+        return _fail(
+            "too_few_branches",
+            f"模型只给了 {len(titles)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
+            branches=len(titles),
+        )
+    titles = titles[:MAX_CHILDREN]
+    # 数量只做宽容校验（允许 ±1）。为了一两条差异整张重来，成本是又一轮全额调用，
+    # 而多一条少一条对这张图并不致命；即使超出宽容范围也用实际返回的继续，
+    # 只记一条诊断说明"没按要求的条数走"。
+    if not args.branches - 1 <= len(titles) <= args.branches + 1:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SKELETON_SIZE_OFF",
+            message=f"请求 {args.branches} 条一级分支，模型给了 {len(titles)} 条，已按实际条数继续。",
+        ))
+
+    # 分支节点的 id 在骨架阶段就定好：展开是并发跑的，合并时要按 id 把要点挂回去，
+    # 而树这时还不存在——只能先分配 id，合并时一次性落进树里。
+    taken: set[str] = set()
+    root_id = new_node_id(taken)
+    taken.add(root_id)
+    skeleton: list[tuple[str, str]] = []
+    for title in titles:
+        branch_id = new_node_id(taken)
+        taken.add(branch_id)
+        skeleton.append((title, branch_id))
+
+    # 第二步：并发展开。限流必须包住整个"占额度 + 发请求"，否则额度会被
+    # 排队中的任务一次性预占，实际请求却还没发出去。
+    semaphore = asyncio.Semaphore(DEEP_CONCURRENCY)
+
+    async def expand_branch(title: str) -> list[str] | None:
+        """展开一条分支。额度不够返回 None——那是"没展开"，与"展开失败"是两件事。"""
+        async with semaphore:
+            if not ctx.reserve_model_call():
+                return None
+            ctx.extra_model_calls += 1
+            ask = (
+                f"整体主题：{args.topic}\n"
+                f"本条一级分支：{title}\n"
+                f"请给出 {need} 个子要点。"
+            )
+            raw = await chat_async(BRANCH_EXPAND_PROMPT + thinking, ask)
+            return _point_labels(raw, need)
+
+    results = await asyncio.gather(
+        *(expand_branch(title) for title, _ in skeleton),
+        return_exceptions=True,
+    )
+
+    # 异常不许扩散到其他分支：某支 429 / 超时，只该让那一支空着。
+    labels_by_branch: list[list[str]] = []
+    skipped: list[int] = []
+    failed: list[tuple[int, str]] = []
+    for index, (_, item) in enumerate(zip(skeleton, results)):
+        if item is None:
+            skipped.append(index)
+            labels_by_branch.append([])
+        elif isinstance(item, BaseException):
+            # 有些异常（如 TimeoutError）没有 message，只用类名也比空串可读
+            reason = f"{type(item).__name__}: {item}" if str(item) else type(item).__name__
+            failed.append((index, reason[:200]))
+            labels_by_branch.append([])
+        else:
+            labels_by_branch.append(list(item))
+
+    skipped_set = set(skipped)
+    failed_set = {index for index, _ in failed}
+
+    # 第五步：局部重试。只补「要点数不足」的那几支，骨架不重来——一次质量波动
+    # 不该把已经展开好的分支一起作废。抛异常的分支不在此列：它已经花掉一次调用，
+    # 盲目再打一次更可能只是把 429 重放一遍。
+    retried: list[int] = []
+    for index, (title, _) in enumerate(skeleton):
+        if index in skipped_set or index in failed_set:
+            continue
+        missing = need - len(labels_by_branch[index])
+        if missing <= 0:
+            continue
+        if not ctx.reserve_model_call():
+            # 额度用完就停手：继续调只会全部失败，不如把已展开的部分交出去
+            break
+        ctx.extra_model_calls += 1
+        retried.append(index)
+        ask = (
+            f"整体主题：{args.topic}\n"
+            f"本条一级分支：{title}\n"
+            f"还差 {missing} 个子要点，请补齐，不要重复已经给出的内容。"
+        )
+        try:
+            raw = await chat_async(BRANCH_EXPAND_PROMPT + thinking, ask)
+        except GenerationError:
+            continue  # 补调失败只是"仍然不足"，不升级成整次失败
+        labels_by_branch[index].extend(_point_labels(raw, missing))
+
+    # 所有分支都没留下内容、且没有任何一支是因为额度被跳过 → 没有可交付的树。
+    # 反过来，如果有分支是"额度不够没展开"，骨架本身仍然有效，照常交出。
+    if not any(labels_by_branch) and not skipped_set:
+        detail = "；".join(message for _, message in failed) or "模型没有返回可用的子要点"
+        return _fail(
+            "all_branches_failed",
+            f"{len(skeleton)} 个分支全都展开失败：{detail}",
+            failed_branches=[skeleton[index][0] for index in sorted(failed_set)],
+        )
+
+    # 第三步：合并。骨架先成树（分支 id 已在骨架里），再把所有要点作为一批 add
+    # 应用上去——整批原子，半截树不会进 ctx.candidate。
+    label = args.topic.strip()[:200] or "思维导图"
+    content = MindMapContent(
+        title=label,
+        root=Node(
+            id=root_id,
+            label=label,
+            children=[Node(id=branch_id, label=title, children=[]) for title, branch_id in skeleton],
+        ),
+    )
+
+    drafts: list[dict[str, Any]] = []
+    for index, (_, branch_id) in enumerate(skeleton):
+        for point_index, point in enumerate(labels_by_branch[index]):
+            drafts.append({
+                "op": "add",
+                "id": f"$d{index}-{point_index}",
+                "parent_id": branch_id,
+                "index": point_index,
+                "label": point,
+            })
+
+    if drafts:
+        ops, _ = normalize_ops(drafts, _node_ids(content.root))
+        batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
+        try:
+            content = apply_ops(content, batch)
+        except OpError as exc:
+            return _fail(exc.code, f"{exc.path}：{exc.message}", path=exc.path)
+
+    # 第四步：确定性验收，全部用代码，不调模型。整树重跑一次契约校验——
+    # `apply_ops` 内部也做了，但"骨架没有任何要点"时不会经过它（没有 op 可应用），
+    # 只靠那边会把一棵只剩根和空分支的树放过去。
+    try:
+        content = MindMapContent.model_validate(content.model_dump())
+    except ValidationError as exc:
+        detail = "；".join(error["msg"] for error in exc.errors()[:3])
+        return _fail("invalid_tree", f"合并后的导图不合法：{detail}")
+
+    sparse, overfull = _audit_branches(content, need)
+    if overfull:
+        return _fail(
+            "too_many_points",
+            f"分支「{'、'.join(overfull)}」的要点数超过上限 {MAX_CHILDREN}，这张图不能落库。",
+        )
+
+    retried_set = set(retried)
+    for index, branch_id, title, count in sparse:
+        # 因额度没展开、或因异常留空的分支已经由下面两条诊断说清楚了；
+        # 这里再报一条「点数不足」等于对同一个原因告警两次。
+        if index in skipped_set or index in failed_set:
+            continue
+        tail = ("已补调一次模型，仍不足，按现状接受" if index in retried_set
+                else "模型调用额度不足，未能补调")
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SPARSE_BRANCH", node_id=branch_id,
+            message=f"分支「{title}」只有 {count} 个要点，少于要求的 {need} 个；{tail}",
+        ))
+    for index, message in failed:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="BRANCH_FAILED", node_id=skeleton[index][1],
+            message=f"分支「{skeleton[index][0]}」展开失败，已留空：{message}",
+        ))
+    for index in skipped:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="BRANCH_SKIPPED_BUDGET", node_id=skeleton[index][1],
+            message=f"因模型调用额度不足，分支「{skeleton[index][0]}」没有展开，已留空",
+        ))
+
+    expanded = len(skeleton) - len(skipped_set) - len(failed_set)
+    partial = bool(skipped_set) or bool(failed_set)
+
+    ctx.candidate = content
+    ctx.revision += 1
+    count = _count_nodes(content.root)
+
+    content_parts = [f"已生成导图「{content.title}」，共 {count} 个节点。"]
+    if skipped_set:
+        content_parts.append(
+            f"因模型调用额度不足，只展开了 {expanded}/{len(skeleton)} 个分支，"
+            "其余分支只保留了骨架。"
+        )
+    if failed_set:
+        names = "、".join(skeleton[index][0] for index in sorted(failed_set))
+        content_parts.append(f"{len(failed_set)} 个分支展开出错，已留空：{names}。")
+    if retried:
+        content_parts.append(f"其中 {len(retried)} 个分支要点不足，已各补调一次模型。")
+
+    return ToolResult(
+        ok=True,
+        content="".join(content_parts),
+        data={
+            "root_id": content.root.id,
+            "node_count": count,
+            "revision": ctx.revision,
+            "planned_branches": len(skeleton),
+            "expanded_branches": expanded,
+            "partial": partial,
+            "branches": [
+                {"id": branch_id, "label": title, "points": len(labels_by_branch[index])}
+                for index, (title, branch_id) in enumerate(skeleton)
+            ],
             "diagnostics": [item.model_dump() for item in diagnostics],
         },
     )
@@ -544,7 +913,7 @@ def _batch_id(ctx: RunContext) -> str:
 
 # 意图 -> 允许的工具。这张表就是"模型这条路能走多远"的唯一声明。
 _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
-    "create": ("mindmap_generate",),
+    "create": ("mindmap_generate", "mindmap_generate_deep"),
     "expand": ("node_expand",),
     "edit": ("mindmap_edit",),
 }
@@ -555,14 +924,36 @@ _SOURCE_AWARE_INTENTS = ("expand", "edit")
 
 # 注册顺序固定，便于日志与测试对照；用工厂而不是共享实例，避免一个 registry
 # 上的改动影响到另一个（ToolSpec 目前不可变，但这个保证不该靠约定维持）。
-_TOOL_ORDER = ("mindmap_generate", "node_expand", "rag_query", "mindmap_edit")
+_TOOL_ORDER = (
+    "mindmap_generate",
+    "mindmap_generate_deep",
+    "node_expand",
+    "rag_query",
+    "mindmap_edit",
+)
 
 _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
     "mindmap_generate": lambda: ToolSpec(
         name="mindmap_generate",
-        description="为主题生成一张完整思维导图。只有当前还没有导图时可用。",
+        description=(
+            "一次调用生成一张完整思维导图，适合分支少、内容浅的简单主题。"
+            "只有当前还没有导图时可用；复杂主题（分支多、每支都要展开几个要点）"
+            "改用 mindmap_generate_deep，它更慢但更不容易被单次输出上限截断。"
+        ),
         args_model=GenerateArgs,
         fn=_generate,
+    ),
+    "mindmap_generate_deep": lambda: ToolSpec(
+        name="mindmap_generate_deep",
+        description=(
+            "分片生成一张完整思维导图：先定一级骨架，再并发展开每条分支，"
+            "最后按代码验收并只补不合格的那几支。适合复杂主题——它每次只让模型"
+            "输出一支，不受单次输出上限挤压，因此比 mindmap_generate 更稳。"
+            "简单主题用 mindmap_generate（一次调用就够，更快）。"
+            "只有当前还没有导图时可用。"
+        ),
+        args_model=GenerateDeepArgs,
+        fn=_generate_deep,
     ),
     "node_expand": lambda: ToolSpec(
         name="node_expand",
@@ -594,9 +985,14 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
     失败三次才转向，白白烧掉调用额度。看不到这个工具，它就只能走对的那条路。
 
     裁剪规则：
-      - `create` 只给 `mindmap_generate`（还没有树，别的工具都无从下手）
+      - `create` 给 `mindmap_generate` 与 `mindmap_generate_deep` 两个，由模型
+        按主题复杂度自选（描述里写清了两者的差别）
       - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
       - `edit` 给 `mindmap_edit`，请求带来源时再加 `rag_query`
+
+    两个生成工具必须同时在场：只留一个，等于替用户决定了"这张图多大"。而
+    分片那条路的成本是 N+1 次调用，简单主题走它纯属浪费额度——这个判断
+    只有拿到主题的模型能做。
 
     `rag_query` 只在真有来源时才注册：没来源的检索必然返回「没有找到」，
     注册它只会诱导模型拿它当"思考"用。未知意图按 `create` 兜底——宁可少给
