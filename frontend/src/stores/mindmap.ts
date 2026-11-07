@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, MapRecord, MindMapContent, MindNode, Source } from '../api/types';
+import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, Source } from '../api/types';
 import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
@@ -41,6 +41,40 @@ export function displayBody(node: MindNode): string {
   const note = node.note?.trim();
   return note && note.length > 0 ? note : node.label.trim();
 }
+
+/**
+ * agent 工具名 → 用户读得懂的说法。
+ *
+ * 映射只此一份：面板（要带耗时）与状态行（不带）都从这里取。两处各写一份的话，
+ * 同一件事迟早出现两种措辞，用户在两个位置读到不同的词。
+ */
+const AGENT_TOOL_LABELS: Record<string, { running: string; done: string }> = {
+  mindmap_generate: { running: '正在定框架', done: '已定好框架' },
+  node_expand: { running: '正在展开分支', done: '已展开分支' },
+  rag_query: { running: '正在查资料', done: '已查好资料' },
+  mindmap_edit: { running: '正在改结构', done: '已改好结构' },
+};
+
+/**
+ * 工具进度的人话文案。
+ *
+ * 未知工具名原样返回，不硬翻：模型新接一个工具时，界面出现英文也比出现一个
+ * 编出来的中文词强——至少排查时能直接对上后端日志。
+ */
+export function agentToolLabel(name: string, phase: 'running' | 'done'): string {
+  const pair = AGENT_TOOL_LABELS[name];
+  if (!pair) return name;
+  return phase === 'running' ? pair.running : pair.done;
+}
+
+/**
+ * agent 请求体：在契约的 `AgentRunRequest` 上补一个 `sources`。
+ *
+ * 后端已经接受这个字段（`list[Source]`），但 `api/types.ts` 的镜像还没跟上；
+ * 本次改动范围不含那个文件，所以用交叉类型在 store 侧补上。契约同步后可以
+ * 把这一行并回 types.ts。
+ */
+type AgentRunBody = AgentRunRequest & { sources?: Source[] };
 
 export interface MindNodeData {
   /** 截断后的短标题，画在节点框里 */
@@ -134,6 +168,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 装进 B，还沿用 B 的 mapId 与 version，下次保存就把 A 写进 B 的记录。
    */
   let candidateSession = 0;
+
+  /**
+   * 候选是在哪种意图下产出的。
+   *
+   * 接受时要按它区分两件事：`create` 是一份新作品，不能继承上一张图的
+   * `mapId` / `version` / 历史；`expand` / `edit` 改的就是当前这张图，身份必须留着。
+   */
+  let candidateIntent: 'create' | 'expand' | 'edit' = 'create';
 
   /** 给面板显示的工具进度与阶段。 */
   const agentEvents = ref<AgentEvent[]>([]);
@@ -281,6 +323,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function resetHistory() {
     past.value = [];
+    future.value = [];
+  }
+
+  /**
+   * create 意图接受候选后的那一步撤销。
+   *
+   * 与 `pushHistory()` 只差一处：画布本来是空白时也要留下一步（`'null'` 就是
+   * JSON 里的空画布），否则用户点了「应用到画布」就再也退不回接受之前的样子。
+   */
+  function pushHistoryOrEmpty() {
+    past.value.push(snapshot() ?? 'null');
+    if (past.value.length > HISTORY_LIMIT) past.value.shift();
+    // 树从这里长出新的分支了，重做栈必须失效。
     future.value = [];
   }
 
@@ -464,6 +519,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (current) future.value.push(current);
     content.value = JSON.parse(snap) as MindMapContent;
     dirty.value = true;
+    // 撤销改的就是画布本身，必须让「候选基于哪个版本算出来」的判断看见这一步。
+    // 不递增的话，用户撤销一步再点「应用到画布」，撤销白做、候选照样落地。
+    clientRevision.value += 1;
     ensureSelection();
     editingId.value = null;
     status.value = '已撤销。';
@@ -480,6 +538,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (current) past.value.push(current);
     content.value = JSON.parse(snap) as MindMapContent;
     dirty.value = true;
+    // 同 undo：重做同样把画布换成了另一棵树，候选再不成立。
+    clientRevision.value += 1;
     ensureSelection();
     editingId.value = null;
     status.value = '已重做。';
@@ -1000,6 +1060,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   async function runGeneration(
     goal: string,
     intent: 'create' | 'expand' | 'edit' = 'create',
+    sources?: Source[],
   ): Promise<void> {
     if (busy.value || agentRunning.value) return;
     const prompt = goal.trim();
@@ -1021,9 +1082,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentError.value = '';
     agentEvents.value = [];
     candidate.value = null;
-    // 记下候选所依据的版本与所在的图：接受时用它判断期间有没有被改过、有没有换了图
+    // 记下候选所依据的版本与所在的图：接受时用它判断期间有没有被改过、有没有换了图。
+    // 意图也要记：接受时得知道这份内容算「新作品」还是「改现有这张图」。
     candidateBaseRevision = clientRevision.value;
     candidateSession = mapSession;
+    candidateIntent = intent;
 
     const ctrl = new AbortController();
     controller = ctrl;
@@ -1038,13 +1101,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
     let settled = false;
 
     try {
-      await runAgentStream({
+      const body: AgentRunBody = {
         goal: prompt,
         intent,
         // create 不能带 snapshot（后端开流前会 422）；另外两种必须带
         snapshot: intent === 'create' ? null : content.value,
         selected_ids: intent === 'expand' && selectedId.value ? [selectedId.value] : [],
-      }, event => {
+      };
+      // 来源原样送去，一个字都不截：材料是"依据"，goal 是"要做什么"。
+      // 把正文拼进 goal 会同时踩两个坑——被截断的材料丢掉大半，且模型分不清
+      // 目标与素材。空数组不发：旧后端对多出来的字段是 extra="forbid"。
+      if (sources && sources.length > 0) body.sources = sources;
+
+      await runAgentStream(body, event => {
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，
         // 否则旧回调会把新请求刚设好的 stageText / status / candidate 覆盖掉。
         if (controller !== ctrl) return;
@@ -1054,10 +1123,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
             stageText.value = event.detail || event.stage;
             break;
           case 'tool_start':
-            stageText.value = `正在调用 ${event.name}`;
+            // 状态行显示的也是人话：用户读不到 `mindmap_generate` 这种函数名。
+            stageText.value = agentToolLabel(event.name, 'running');
             break;
           case 'tool_end':
-            stageText.value = event.ok ? `${event.name} 完成` : `${event.name} 未成功`;
+            stageText.value = event.ok
+              ? agentToolLabel(event.name, 'done')
+              : `${event.name} 未成功`;
+            break;
+          case 'snapshot':
+            // 后端整树校验通过后先推一帧 snapshot：done 之前用户就该看得见候选长什么样。
+            // 只放候选、不碰 content——没经用户确认的内容不许进画布。
+            candidate.value = event.content;
+            status.value = '候选已就绪，确认后才会应用到画布。';
             break;
           case 'done':
             settled = true;
@@ -1065,7 +1143,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
               // 只放进候选，不动 content：用户确认之前画布保持原样
               candidate.value = event.content;
               status.value = '模型给出了候选导图，确认后才会应用到画布。';
-            } else {
+            } else if (!candidate.value) {
+              // 已经收到过 snapshot 的候选就留着：这一帧只是没重复带内容。
               status.value = '模型这次没有产出导图。';
             }
             break;
@@ -1134,8 +1213,25 @@ export const useMindMapStore = defineStore('mindmap', () => {
       candidate.value = null;
       return 'invalid';
     }
-    // 一次 agent 运行只记一条撤销记录，而不是每个 op 一条
-    pushHistory();
+    // 到这里候选可以落地了。先按意图处理"这份内容是谁"：
+    // create 是一份新作品，绝不能继承上一张图的身份——否则接受之后点保存会走
+    // PUT，把刚打开的那条旧记录整条覆盖掉。
+    if (candidateIntent === 'create') {
+      mapId.value = null;
+      version.value = 0;
+      savedAt.value = null;
+      // 上一张图在途的保存响应回来时不能再把它的 id 写回 mapId（那是"新图挂旧身份"
+      // 的另一条路径），所以会话跟着换；saving 也自己复位——那一轮请求的 finally
+      // 会因为会话不匹配跳过清理，不复位就会永远卡在"保存中"。
+      mapSession += 1;
+      saving.value = false;
+      resetHistory();
+      // 新作品不接上一张图的历史：撤销栈里只留「接受之前」这一步。
+      pushHistoryOrEmpty();
+    } else {
+      // 改的是现有这张图：身份、版本、历史都沿用，撤销回到改动前的那棵树。
+      pushHistory();
+    }
     content.value = candidate.value;
     candidate.value = null;
     mode.value = 'model';

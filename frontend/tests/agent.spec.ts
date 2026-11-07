@@ -1,7 +1,9 @@
+import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { MindMapContent } from '../src/api/types';
+import AgentPanel from '../src/components/AgentPanel.vue';
+import type { MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 
 /** 把若干事件包成 SSE 帧，模拟后端 /api/agent/runs/stream。 */
@@ -37,12 +39,53 @@ function stubFetch(reply: () => Response) {
 
 const doneFrame = (payload: MindMapContent) => ({ type: 'done', seq: 4, content: payload });
 
+/** 一次性 JSON 响应：openMap / save 走 request()，只读 json，不读流。 */
+function jsonReply(payload: unknown): Response {
+  return { ok: true, status: 200, body: null, json: async () => payload } as unknown as Response;
+}
+
+/** 已保存导图的记录，字段与 MapRecord 一致。 */
+function mapRecord(id: string, payload: MindMapContent) {
+  return { id, version: 3, content: payload, updated_at: '2024-01-01T00:00:00Z' };
+}
+
+/** 先把一张有 id 的导图打开，供"接受候选之后身份怎么变"的用例起手。 */
+async function openExisting(id: string) {
+  vi.stubGlobal('fetch', vi.fn(async () => jsonReply(mapRecord(id, content('原图')))));
+  const store = useMindMapStore();
+  await store.openMap(id);
+  return store;
+}
+
+/**
+ * 手动控制节奏的 SSE 响应：状态行这些"只在流进行中才有值"的字段，
+ * 用一次性返回的流测不到——流一结束收尾就把它们清空了。
+ */
+function controllableReply() {
+  const encoder = new TextEncoder();
+  let push: (frame: unknown) => void = () => {};
+  let finish: () => void = () => {};
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      push = (frame) => { controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`)); };
+      finish = () => {
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      };
+    },
+  });
+  const response = { ok: true, status: 200, body, json: async () => ({}) } as unknown as Response;
+  return { response, push, finish };
+}
+
 beforeEach(() => {
   setActivePinia(createPinia());
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // agent 路径要开着面板才渲染，用例会临时改环境变量，别让它漏到下一个文件。
+  vi.unstubAllEnvs();
 });
 
 describe('agent 运行', () => {
@@ -145,6 +188,23 @@ describe('agent 运行', () => {
     expect(store.agentRunning).toBe(false);
     expect(store.busy).toBe(false);
     expect(store.candidate).toBeNull();
+  });
+
+  it('状态行显示的是人话，不是工具名', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'tool_start', seq: 1, call_id: 'c1', name: 'rag_query' });
+    await vi.waitFor(() => expect(store.stageText).toBe('正在查资料'));
+
+    stream.push({ type: 'tool_end', seq: 2, call_id: 'c1', name: 'rag_query', ok: true, latency_ms: 900 });
+    await vi.waitFor(() => expect(store.stageText).toBe('已查好资料'));
+
+    stream.push(doneFrame(content()));
+    stream.finish();
+    await running;
   });
 });
 
@@ -272,5 +332,200 @@ describe('候选与换图', () => {
 
     expect(store.candidate).toBeNull();
     expect(store.acceptCandidate()).toBe('stale');
+  });
+});
+
+describe('撤销 / 重做与候选', () => {
+  /** 先留一步可撤销的历史，再产出候选：这样撤销与重做都真的动到画布。 */
+  async function preparedWithHistory() {
+    stubFetch(() => agentReply([doneFrame(content('候选'))]));
+    const store = useMindMapStore();
+    store.preview(content('原图'), 'right');
+    // 改一次节点：撤销栈里才有可撤的那一步
+    store.commitLabel('a', '改过的甲');
+    await store.runGeneration('做一张图', 'create');
+    expect(store.candidate).not.toBeNull();
+    return store;
+  }
+
+  it('候选就绪后撤销一次，接受要判过时', async () => {
+    const store = await preparedWithHistory();
+
+    store.undo();
+    // 撤销确实生效：内容回到改之前那棵树
+    expect(store.content?.root.children[0].label).toBe('甲');
+
+    // 画布已经退出候选所依据的版本，接受必须被拦下，不能把撤销白做掉
+    expect(store.acceptCandidate()).toBe('stale');
+    expect(store.content?.root.children[0].label).toBe('甲');
+    expect(store.candidate).not.toBeNull();
+  });
+
+  it('候选就绪后重做一次，接受同样要判过时', async () => {
+    const store = await preparedWithHistory();
+
+    // 先撤销再重做，制造出可重做的状态
+    store.undo();
+    store.redo();
+    expect(store.content?.root.children[0].label).toBe('改过的甲');
+
+    expect(store.acceptCandidate()).toBe('stale');
+    expect(store.content?.root.children[0].label).toBe('改过的甲');
+  });
+});
+
+describe('候选接受之后的身份', () => {
+  it('create 意图接受候选后清空 mapId，撤销只回到接受之前', async () => {
+    const store = await openExisting('map-a');
+    expect(store.mapId).toBe('map-a');
+
+    stubFetch(() => agentReply([doneFrame(content('新建的图'))]));
+    await store.runGeneration('做一张新图', 'create');
+    expect(store.acceptCandidate()).toBe('applied');
+
+    // 新作品不能顶着上一张图的身份：否则下一次保存会走 PUT，把 map-a 整条覆盖
+    expect(store.mapId).toBeNull();
+    expect(store.version).toBe(0);
+    expect(store.savedAt).toBeNull();
+    expect(store.mode).toBe('model');
+    expect(store.dirty).toBe(true);
+
+    // 撤销栈里只有一步：撤销回到接受之前的画布，再撤也没有了
+    expect(store.canUndo).toBe(true);
+    store.undo();
+    expect(store.content?.root.label).toBe('原图');
+    expect(store.canUndo).toBe(false);
+  });
+
+  it('edit 意图接受候选后沿用原记录的身份', async () => {
+    const store = await openExisting('map-a');
+
+    stubFetch(() => agentReply([doneFrame(content('改后'))]));
+    await store.runGeneration('把根改名', 'edit');
+    expect(store.acceptCandidate()).toBe('applied');
+
+    // 改的就是这张图：保存仍打 map-a 的 PUT，版本还是开图时看到的那个
+    expect(store.mapId).toBe('map-a');
+    expect(store.version).toBe(3);
+    expect(store.savedAt).toBe('2024-01-01T00:00:00Z');
+  });
+});
+
+describe('候选可见性', () => {
+  it('收到 snapshot 帧时候选立刻有值，画布不变', async () => {
+    stubFetch(() => agentReply([
+      // 后端整树校验通过后先推一帧 snapshot：done 之前候选就该看得见
+      { type: 'snapshot', seq: 1, content: content('快照图') },
+      // done 故意不带内容：候选只可能来自上面那一帧 snapshot
+      { type: 'done', seq: 2 },
+    ]));
+    const store = useMindMapStore();
+    store.preview(content('原图'), 'right');
+
+    await store.runGeneration('做一张图', 'create');
+
+    expect(store.candidate?.root.label).toBe('快照图');
+    // snapshot 只进候选，绝不写画布
+    expect(store.content?.root.label).toBe('原图');
+    expect(store.agentEvents.map(event => event.type)).toEqual(['snapshot', 'done']);
+  });
+});
+
+describe('来源进入请求体', () => {
+  it('来源随请求原样送出，不塞进 goal', async () => {
+    // 远超原来 1000 字的截断线：材料必须整份送到，一个字都不在本地裁
+    const material = '材料正文'.repeat(400);
+    const source: Source = {
+      id: 's1',
+      kind: 'text',
+      filename: null,
+      text: material,
+      span: null,
+      status: 'parsed',
+      error: null,
+      parsed_pages: null,
+      truncated: false,
+      failed_pages: [],
+    };
+    const calls = stubFetch(() => agentReply([doneFrame(content())]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('请基于附带的 1 份材料生成导图', 'create', [source]);
+
+    const body = calls[0].body as Record<string, unknown>;
+    const sent = body.sources as Source[];
+    expect(sent).toHaveLength(1);
+    expect(Array.from(sent[0].text ?? '')).toHaveLength(Array.from(material).length);
+    // goal 是"要做什么"，一个字材料正文都不许混进去
+    expect(body.goal).toBe('请基于附带的 1 份材料生成导图');
+    expect(String(body.goal)).not.toContain('材料正文');
+  });
+
+  it('没有来源时请求体不带 sources', async () => {
+    const calls = stubFetch(() => agentReply([doneFrame(content())]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('做一张导图', 'create');
+
+    // 空数组也不发：旧后端对多出来的字段是 extra="forbid"
+    expect((calls[0].body as Record<string, unknown>).sources).toBeUndefined();
+  });
+});
+
+describe('面板文案与候选骨架', () => {
+  /**
+   * 面板只在 agent 路径下可见，所以先打开开关、把状态铺好再挂载，
+   * 这样首帧渲染就带着内容，不用等 nextTick 再断言。
+   */
+  function panel(seed: (store: ReturnType<typeof useMindMapStore>) => void) {
+    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
+    const store = useMindMapStore();
+    seed(store);
+    return mount(AgentPanel);
+  }
+
+  it('工具进度显示人话与耗时，不显示工具名', () => {
+    const wrapper = panel((store) => {
+      store.agentEvents = [
+        { type: 'tool_start', seq: 1, call_id: 'c1', name: 'mindmap_generate' },
+        { type: 'tool_end', seq: 2, call_id: 'c1', name: 'mindmap_generate', ok: true, latency_ms: 4341 },
+        { type: 'tool_start', seq: 3, call_id: 'c2', name: 'node_expand' },
+      ];
+    });
+
+    const text = wrapper.text();
+    expect(text).toContain('已定好框架 · 4.3 秒');
+    // 进行中的那一条不带耗时
+    expect(text).toContain('正在展开分支');
+    // 工程名不该露给用户
+    expect(text).not.toContain('mindmap_generate');
+    expect(text).not.toContain('node_expand');
+  });
+
+  it('候选骨架列出根标题与一级分支，超过 12 条时截断', () => {
+    const wrapper = panel((store) => {
+      store.candidate = {
+        title: '候选',
+        root: {
+          id: 'root',
+          label: '机器学习',
+          children: Array.from({ length: 14 }, (_, index) => ({
+            id: `n${index}`,
+            label: `分支 ${index}`,
+            children: [{ id: `n${index}c`, label: '子节点', children: [] }],
+          })),
+        },
+      };
+    });
+
+    const text = wrapper.text();
+    // 标题要写明"未应用"，否则用户会以为画布已经变了
+    expect(text).toContain('候选（未应用）');
+    expect(text).toContain('机器学习');
+    expect(text).toContain('（1 个子节点）');
+    // 只列前 12 条，剩下的折成一句话
+    expect(text).toContain('分支 11');
+    expect(text).not.toContain('分支 12');
+    expect(text).toContain('……还有 2 个分支');
   });
 });
