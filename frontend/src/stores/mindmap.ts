@@ -9,6 +9,7 @@ import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type 
 import {
   addChild,
   addSibling,
+  charLength,
   countNodes,
   findNode,
   findParent,
@@ -85,6 +86,28 @@ export interface AgentWarning {
 
 /** 告警上限：面板只显示前几条并折叠，这里防的是后端一路刷屏。 */
 const AGENT_WARNING_LIMIT = 20;
+
+/**
+ * 预览树里一个节点。
+ *
+ * 没有 id：`node_grow` 那一侧的事件里本来就没有 id（展开调用的响应只有 label
+ * 和 expandable），位置全靠路径。为了渲染顺手编一个假 id 没有意义——它一旦
+ * 混进 content 就会变成一个后端不认识的节点。
+ */
+export interface PreviewNode {
+  label: string;
+  /** 模型写出的可展开性；null 表示还没写到，界面不显示任何标记。 */
+  expandable: boolean | null;
+  children: PreviewNode[];
+}
+
+/**
+ * 等待父节点的帧最多攒几条。
+ *
+ * 正常运行时并发展开的 slot 只有个位数；攒到几百条只可能是父节点的帧一直没来
+ * （丢帧或后端换了语义），这时继续攒只是把内存和重放成本一起拖长。
+ */
+const PREVIEW_PENDING_LIMIT = 200;
 
 /**
  * 从 `tool_end` 的 `result_summary` 里摘出"这次结果不完整"的告警。
@@ -233,6 +256,186 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 只认 `ok` 的时候，这三条信息一条都没地方落。
    */
   const agentWarnings = ref<AgentWarning[]>([]);
+
+  /**
+   * 生成过程中正在长出来的预览树。
+   *
+   * 与 `candidate` 分开存，不共用一份状态：预览没有经过整树校验，也不保证和
+   * 最终候选一致（某一路失败被裁掉、去重丢掉重复项，都会让预览多出几个节点）。
+   * 一旦让它顶替 `candidate`，用户点「应用到画布」就会把半成品装进画布。
+   */
+  const agentPreview = ref<PreviewNode | null>(null);
+
+  /**
+   * 已经收下的 `(父路径, label)`。
+   *
+   * 协议说同一组合只发一次，但那是在一条完整的连接上；重连重放、后端补发都会
+   * 打破它，而界面上多出两个同名兄弟是看得见的错。
+   */
+  const previewSeen = new Set<string>();
+
+  /** 父节点还没到的帧，按父路径攒着等它出现。 */
+  const previewPending = new Map<string, PreviewNode[]>();
+
+  /** 被真正丢掉的预览帧数。界面不显示，排障时用它回答"少的那几个节点去哪了"。 */
+  const agentPreviewDropped = ref(0);
+
+  /**
+   * 预览整棵作废。
+   *
+   * 新一轮开始、收到 snapshot / done / error、换图，都要走这里：上一轮的残留
+   * 一旦留到下一轮，用户看到的就是两棵树拼在一起的幻影。
+   */
+  function clearAgentPreview() {
+    agentPreview.value = null;
+    previewSeen.clear();
+    previewPending.clear();
+    agentPreviewDropped.value = 0;
+  }
+
+  /** 不可能合法的帧直接丢掉，但别静默：留一条调试线索，否则少节点时无从下手。 */
+  function dropPreviewFrame(reason: string) {
+    agentPreviewDropped.value += 1;
+    previewDebug(`[agent] 丢弃 node_grow 帧：${reason}`);
+  }
+
+  /**
+   * 预览帧的调试线索只在开发/测试里输出。
+   *
+   * 它回答的是"少的那几个节点去哪了"，属于排障信息；用户不该在控制台看到这些。
+   */
+  function previewDebug(message: string) {
+    if (import.meta.env.DEV) console.debug(message);
+  }
+
+  /** 路径 → 键。索引只可能是非负整数，用 '.' 连接不会撞。 */
+  function previewPathKey(path: number[]): string {
+    return path.join('.');
+  }
+
+  /**
+   * 沿 path 找父节点；找不到返回 null。
+   *
+   * 返回 null 不代表这一帧有问题：索引超出当前子节点数量，更常见的原因是中间
+   * 某个父节点的帧还没到（丢帧、重连后只接上了后半段）。调用方该把它攒起来。
+   */
+  function findPreviewParent(path: number[]): PreviewNode | null {
+    let node: PreviewNode | null = agentPreview.value;
+    for (const index of path) {
+      if (!node) return null;
+      const child: PreviewNode | undefined = node.children[index];
+      if (!child) return null;
+      node = child;
+    }
+    return node;
+  }
+
+  /**
+   * 把帧挂到预览树上；父节点还不在就返回 false。
+   *
+   * 新节点自己也可能正是别人在等的父节点，所以挂上之后立刻放一批缓存出来。
+   */
+  function mountPreviewNode(path: number[], node: PreviewNode): boolean {
+    const parent = findPreviewParent(path);
+    if (!parent) return false;
+    parent.children.push(node);
+    // 自己的完整路径 = 父路径 + 自己在末尾的下标：追加到末尾，下标就是新的长度 - 1。
+    flushPreviewPending([...path, parent.children.length - 1]);
+    return true;
+  }
+
+  /** 收下还挂不上的帧，等它的父节点出现。 */
+  function queuePreviewNode(path: number[], node: PreviewNode) {
+    const key = previewPathKey(path);
+    const queued = previewPending.get(key) ?? [];
+    if (queued.length >= PREVIEW_PENDING_LIMIT) {
+      dropPreviewFrame(`父路径 ${key} 下待挂帧超过 ${PREVIEW_PENDING_LIMIT} 条`);
+      return;
+    }
+    queued.push(node);
+    previewPending.set(key, queued);
+    // 协议保证的顺利路径上永远不会走到这里，所以只留调试信息，不打扰用户。
+    previewDebug(`[agent] node_grow 父节点还没到，暂存：path=${key} label=${node.label}`);
+  }
+
+  /**
+   * 某个节点挂上之后，把它名下等着挂的帧放出来。
+   *
+   * 先整批取走再挂：挂的过程中会继续 flush 同一批键，边遍历边删会漏掉后半截。
+   */
+  function flushPreviewPending(path: number[]) {
+    const key = previewPathKey(path);
+    const queued = previewPending.get(key);
+    if (!queued) return;
+    previewPending.delete(key);
+    for (const node of queued) {
+      // 仍然挂不上说明它等的其实是更深的父节点，放回去继续等。
+      if (!mountPreviewNode(path, node)) queuePreviewNode(path, node);
+    }
+  }
+
+  /**
+   * 消费一帧 `node_grow`。
+   *
+   * 顺序上后端保证父先于子，这里仍然按"可能乱序"处理：预览是纯展示，宁可多花
+   * 一点缓存的代价，也不能因为一次丢帧就让整支子树静默消失。
+   */
+  function growPreviewNode(path: number[] | null, label: string, expandable: boolean | null) {
+    const text = label.trim();
+    if (!text) {
+      dropPreviewFrame('label 为空');
+      return;
+    }
+    if (charLength(text) > LIMITS.label) {
+      dropPreviewFrame(`label 超过 ${LIMITS.label} 字`);
+      return;
+    }
+    // 根帧的 `path` 是 null，不走索引校验；只有真正带路径的帧才需要。
+    if (path !== null) {
+      // 负索引、小数、超深路径都不是"父节点还没到"，是数据本身坏了。
+      if (!path.every(index => Number.isInteger(index) && index >= 0)) {
+        dropPreviewFrame(`path 不是有效的索引链：${path.join(',')}`);
+        return;
+      }
+      if (path.length >= LIMITS.depth) {
+        dropPreviewFrame(`path 深过 ${LIMITS.depth} 层：${path.join(',')}`);
+        return;
+      }
+    }
+
+    // 根用单独的键前缀：根没有路径，`[]` 已经被"挂在根上的孩子"占着了。
+    const key = `${path === null ? 'root' : previewPathKey(path)}|${text}`;
+    if (previewSeen.has(key)) return;
+    if (previewSeen.size >= LIMITS.nodes) {
+      dropPreviewFrame(`预览节点数超过 ${LIMITS.nodes}`);
+      return;
+    }
+    // 收下就记，重放过来的同一帧到此为止；挂不上时它已经进了缓存，也不该再收一次。
+    previewSeen.add(key);
+
+    const node: PreviewNode = { label: text, expandable, children: [] };
+
+    if (path === null) {
+      // 根已经立起来又来了第二帧：只在标签不同时才算数据出错。同一个标签的重复
+      // 帧上面已经被 previewSeen 挡掉，走到这里就说明后端给了两个不同的根。
+      if (agentPreview.value) {
+        dropPreviewFrame(`重复的根帧：${text}`);
+        return;
+      }
+      agentPreview.value = node;
+      // 根一到，之前攒着等它的分支（`[]`）立刻可以挂了。
+      flushPreviewPending([]);
+      return;
+    }
+
+    if (!agentPreview.value) {
+      // 根还没到：带路径的帧全是孤儿，攒着等根。它们不会被误当成根——那是根
+      // 帧丢失时唯一能察觉到的信号。
+      queuePreviewNode(path, node);
+      return;
+    }
+    if (!mountPreviewNode(path, node)) queuePreviewNode(path, node);
+  }
 
   /** 记下这一帧的告警：同 kind + code + message 只留一条，两个工具报同一件事时不重复刷屏。 */
   function recordWarnings(next: AgentWarning[]) {
@@ -935,6 +1138,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentRunning.value = false;
     // 这一轮就此作废：告警跟着一起清，否则取消之后面板还挂着"部分分支未完成"。
     agentWarnings.value = [];
+    // 取消/换图同理：长到一半的预览属于已经结束的那一次运行。
+    clearAgentPreview();
     stageText.value = '';
     sourceGenerationError.value = '';
     if (restorePrevious && pendingRestore) {
@@ -1175,6 +1380,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       agentEvents.value = [];
       agentError.value = '';
       agentWarnings.value = [];
+      clearAgentPreview();
       status.value = '请在下方「输入主题或文本」里写下要生成的内容；上面的「导图标题」只改名字，不会重新生成。';
       return;
     }
@@ -1188,6 +1394,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。
     agentWarnings.value = [];
     candidate.value = null;
+    // 上一轮长到一半的预览同样不能留：它的节点属于上一次运行，混进这一轮的
+    // 面板里，用户会以为新任务已经长出了这些分支。
+    clearAgentPreview();
     // 记下候选所依据的版本与所在的图：接受时用它判断期间有没有被改过、有没有换了图。
     // 意图也要记：接受时得知道这份内容算「新作品」还是「改现有这张图」。
     candidateBaseRevision = clientRevision.value;
@@ -1251,14 +1460,23 @@ export const useMindMapStore = defineStore('mindmap', () => {
             }
             break;
           }
+          case 'node_grow':
+            // 只进预览树。真正可采纳的内容在 snapshot / done 的 `content` 里，
+            // 两者可能不一致——把预览当候选，等于把一棵没校验过的树交给用户应用。
+            growPreviewNode(event.path, event.label, event.expandable);
+            break;
           case 'snapshot':
             // 后端整树校验通过后先推一帧 snapshot：done 之前用户就该看得见候选长什么样。
+            // 完整候选一到，预览就没有存在意义了，整棵作废（含还等着挂的缓存）。
+            clearAgentPreview();
             // 只放候选、不碰 content——没经用户确认的内容不许进画布。
             candidate.value = event.content;
             status.value = candidateStatus('候选已就绪');
             break;
           case 'done':
             settled = true;
+            // 终态已到，预览再留着只会让人以为还有节点在路上。
+            clearAgentPreview();
             if (event.content) {
               // 只放进候选，不动 content：用户确认之前画布保持原样
               candidate.value = event.content;
@@ -1270,6 +1488,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
             break;
           case 'error':
             settled = true;
+            // 失败时预览同样作废：它可能正好停在半截，留着会被当成"这次的结果"。
+            clearAgentPreview();
             agentError.value = event.message;
             status.value = event.message;
             break;
@@ -1437,6 +1657,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // agent 路径
     clientRevision,
     candidate,
+    agentPreview,
+    agentPreviewDropped,
     agentEvents,
     agentWarnings,
     agentRunning,
