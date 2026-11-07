@@ -29,8 +29,10 @@ from app.contracts.source import Source
 from app.generation.service import (
     DETAIL_PROMPT,
     SOURCED_DETAIL_PROMPT,
+    SOURCED_THINKING_GUARD,
     GenerationError,
     chat_async,
+    thinking_block,
     validate_generated_content,
 )
 from app.knowledge.service import search_sources
@@ -309,11 +311,18 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图。")
     ctx.extra_model_calls += 1
     try:
+        # 思维模型只改「怎么拆」，不改「拆什么」：拼在基础提示词之后、来源输入
+        # 之前（来源在 user 消息里）。有来源时要多带一句限定，否则「必须举反例」
+        # 这类要求会被当成展开许可，模型开始补写材料里没有的内容。
+        thinking = thinking_block(ctx.request.thinking_model)
         if sources:
             # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
-            raw = await chat_async(SOURCED_DETAIL_PROMPT, _source_prompt_input(sources))
+            raw = await chat_async(
+                SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD,
+                _source_prompt_input(sources),
+            )
         else:
-            raw = await chat_async(DETAIL_PROMPT, args.topic)
+            raw = await chat_async(DETAIL_PROMPT + thinking, args.topic)
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
 

@@ -200,6 +200,12 @@ class AgentRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     goal: str = Field(min_length=1, max_length=1000)
     intent: Literal["create", "expand", "edit"] = "create"
+    # 同一句主题换一种拆解方法，结构就不同（表在 `generation.service.THINKING_MODELS`）。
+    # 用 Literal 而不是自由字符串：拼错的值会被 `model_config` 挡在开流之前，
+    # 否则它会静默退化成 default，用户在下拉里选的东西等于没生效。
+    thinking_model: Literal[
+        "default", "first-principles", "feynman", "systematic", "critical"
+    ] = "default"
     snapshot: MindMapContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=50)
