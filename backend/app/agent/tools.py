@@ -162,7 +162,11 @@ class GenerateDeepArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
-    branches: int = Field(default=5, ge=3, le=8, description="一级分支数量")
+    # 上限 20 是按契约反推的，不是拍的：最少每支 2 个要点，一个分支占 3 个节点，
+    # 300 节点理论能放 100 支；真正限制它的是可读性——超过二十条一级分支，
+    # 图会宽到没法看。原来的 8 没有任何依据，长材料（比如二十几节的讲义）
+    # 天然会有更多一级节点，卡在 8 等于逼模型把不相关的东西塞进同一支。
+    branches: int = Field(default=5, ge=3, le=20, description="一级分支数量上限")
     points_per_branch: int = Field(default=3, ge=2, le=5, description="每条一级分支下至少要有几个要点")
 
 
@@ -449,7 +453,8 @@ def _plan_ask(topic: str, branches: int) -> str:
     """
     return (
         f"主题：{topic}\n"
-        f"请分成 {branches} 条一级分支。\n"
+        f"根据内容实际包含的方面来定一级分支数量，最多 {branches} 条。\n"
+        "材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。\n"
         "每条不超过 20 字，互不重叠，按逻辑顺序排列。"
     )
 
