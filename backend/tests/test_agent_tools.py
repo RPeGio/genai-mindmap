@@ -1560,5 +1560,49 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("mindmap_generate", result.content)
 
 
+class LimitAlignmentTest(unittest.TestCase):
+    """工具自己的上限不能与契约各写一个数。"""
+
+    def test_depth_limit_equals_contract(self):
+        """递归深度上限必须等于契约的树深上限。
+
+        两处各写一个数时，工具那个更小的值会**静默**盖过契约：模型说「这支还能
+        拆」，代码却以层数不够为由不再问，没有任何地方会报错。真机上的表现就是
+        「模型明明还能拆，导图却停在第四层」，而所有人都以为上限是契约里写的那
+        个数。
+        """
+        from app.agent.tools import DEEP_DEFAULT_DEPTH, DEEP_MAX_DEPTH
+        from app.contracts.mindmap import MAX_TREE_DEPTH
+
+        self.assertEqual(DEEP_MAX_DEPTH, MAX_TREE_DEPTH)
+        # 默认值也不该自己收窄：要不要继续拆由模型的 expandable 决定，工具只在
+        # 它说「还能拆」时继续问；嫌深可以显式传一个更小的 max_depth。
+        self.assertEqual(DEEP_DEFAULT_DEPTH, MAX_TREE_DEPTH)
+
+    def test_op_batch_holds_a_whole_tree(self):
+        """一整棵树的 add 要能放进同一批。
+
+        深层生成是一次性提交整棵树的。批次上限小于节点上限时，稍微宽一点的图就
+        会抛 ValidationError——而那道限制不表达任何真实边界，只在放开生成规模
+        之后才暴露出来（实测 152 个节点时炸）。
+        """
+        from pydantic import ValidationError
+
+        from app.contracts.mindmap import MAX_TREE_NODES
+        from app.contracts.ops import AddOp, OpBatch
+
+        def batch(count: int) -> OpBatch:
+            return OpBatch(batch_id="b1", base_revision=0, ops=[
+                AddOp(op="add", id=f"n{index}", parent_id="root", index=index,
+                      label=f"节点{index}")
+                for index in range(count)
+            ])
+
+        self.assertEqual(len(batch(MAX_TREE_NODES).ops), MAX_TREE_NODES)
+        # 仍然守着节点上限：批次能装一整棵树，不等于能装一片森林
+        with self.assertRaises(ValidationError):
+            batch(MAX_TREE_NODES + 1)
+
+
 if __name__ == "__main__":
     unittest.main()
