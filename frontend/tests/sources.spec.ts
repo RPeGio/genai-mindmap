@@ -27,6 +27,25 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+/** 等一拍：fetch → json() → 状态落盘要跨好几个微任务。 */
+const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+
+/** 上传时用的文件名。并发下 fetch 的调用先后不稳定，不能靠 mockResolvedValueOnce 排队。 */
+function uploadName(init?: RequestInit): string {
+  const form = init?.body as FormData;
+  return (form.get('file') as File).name;
+}
+
+/** 按文件名路由响应，与调用顺序无关。 */
+function routedFetch(routes: Record<string, () => Response | Promise<Response>>) {
+  return vi.fn(async (_url: string, init?: RequestInit) => {
+    const name = uploadName(init);
+    const route = routes[name];
+    if (!route) throw new Error(`未预期的上传：${name}`);
+    return route();
+  });
+}
+
 let pinia: Pinia;
 beforeEach(() => {
   pinia = createPinia();
@@ -98,7 +117,7 @@ describe('来源收集', () => {
     const fetchMock = vi.fn().mockReturnValue(pending.promise);
     vi.stubGlobal('fetch', fetchMock);
     const store = useSourcesStore();
-    const task = store.addFiles([file(), file('排队.png')]);
+    const task = store.addFiles([file(), file('排队.pdf')]);
     const signal = fetchMock.mock.calls[0][1].signal as AbortSignal;
     expect(store.parsing).toBe(true);
     expect(store.items.map(item => item.state)).toEqual(['parsing', 'queued']);
@@ -129,6 +148,94 @@ describe('来源收集', () => {
     pending.resolve(json({ source: parsed('first') }));
     await Promise.all([first, second]);
     expect(store.readySources.map(source => source.id)).toEqual(['first', 'second']);
+  });
+
+  it('两份文档 + 两张图片同时添加：文档串行，图片并发', async () => {
+    const running = deferred<Response>();
+    const fetchMock = routedFetch({
+      '第一份.pdf': () => running.promise,
+      '第二份.pdf': () => Promise.resolve(json({ source: parsed('doc-2') })),
+      '图一.png': () => Promise.resolve(json({ source: parsed('img-1', { kind: 'image' }) })),
+      '图二.png': () => Promise.resolve(json({ source: parsed('img-2', { kind: 'image' }) })),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const store = useSourcesStore();
+
+    const task = store.addFiles([file('第一份.pdf'), file('第二份.pdf'), file('图一.png'), file('图二.png')]);
+    const started = fetchMock.mock.calls.map(([, init]) => uploadName(init as RequestInit));
+    // 第二份文档被第一份挡住（本地 CPU 串行），两张图片则已经各自发出
+    expect(started).not.toContain('第二份.pdf');
+    expect(new Set(started)).toEqual(new Set(['第一份.pdf', '图一.png', '图二.png']));
+    expect(store.items.map(item => item.state)).toEqual(['parsing', 'queued', 'parsing', 'parsing']);
+
+    running.resolve(json({ source: parsed('doc-1') }));
+    await task;
+    expect(store.items.map(item => item.state)).toEqual(['ready', 'ready', 'ready', 'ready']);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('图片并发：两张图片的解析请求同时在途', async () => {
+    const both = [deferred<Response>(), deferred<Response>()];
+    const fetchMock = routedFetch({
+      '图一.png': () => both[0].promise,
+      '图二.png': () => both[1].promise,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const store = useSourcesStore();
+
+    const task = store.addFiles([file('图一.png'), file('图二.png')]);
+    // 第一张还没回来，第二张已经发出去了——两个请求的时间区间是重叠的
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(store.items.map(item => item.state)).toEqual(['parsing', 'parsing']);
+
+    both[1].resolve(json({ source: parsed('img-2', { kind: 'image', filename: '图二.png' }) }));
+    both[0].resolve(json({ source: parsed('img-1', { kind: 'image', filename: '图一.png' }) }));
+    await task;
+    expect(store.items.map(item => item.state)).toEqual(['ready', 'ready']);
+  });
+
+  it('items 顺序始终等于添加顺序，后加的图片先解析完也不重排', async () => {
+    const slowDoc = deferred<Response>();
+    const slowImage = deferred<Response>();
+    const fetchMock = routedFetch({
+      '资料.pdf': () => slowDoc.promise,
+      '慢图.png': () => slowImage.promise,
+      '快图.png': () => Promise.resolve(json({ source: parsed('fast', { kind: 'image', filename: '快图.png' }) })),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const store = useSourcesStore();
+
+    const task = store.addFiles([file('资料.pdf'), file('慢图.png'), file('快图.png')]);
+    const order = store.items.map(item => item.label);
+    await flush();
+    // 第三项已经就绪、第二项还在解析，列表位置不能因此调换
+    expect(store.items.map(item => item.state)).toEqual(['parsing', 'parsing', 'ready']);
+    expect(store.items.map(item => item.label)).toEqual(order);
+
+    slowImage.resolve(json({ source: parsed('slow', { kind: 'image', filename: '慢图.png' }) }));
+    slowDoc.resolve(json({ source: parsed('doc') }));
+    await task;
+    expect(store.items.map(item => item.label)).toEqual(order);
+    // 解析完成的先后不影响交给流水线的顺序
+    expect(store.readySources.map(source => source.id)).toEqual(['doc', 'slow', 'fast']);
+  });
+
+  it('单个条目失败只影响自己：文档队列继续，图片互不牵连', async () => {
+    const fetchMock = routedFetch({
+      '坏.pdf': () => Promise.resolve(json({ detail: '文档解析失败' }, 422)),
+      '好.pdf': () => Promise.resolve(json({ source: parsed('doc-2') })),
+      '坏图.png': () => Promise.resolve(json({ detail: '图片识别暂不可用' }, 422)),
+      '好图.png': () => Promise.resolve(json({ source: parsed('img-2', { kind: 'image' }) })),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const store = useSourcesStore();
+
+    await store.addFiles([file('坏.pdf'), file('好.pdf'), file('坏图.png'), file('好图.png')]);
+
+    expect(store.items.map(item => item.state)).toEqual(['failed', 'ready', 'failed', 'ready']);
+    expect(store.items[0].error).toBe('文档解析失败');
+    expect(store.items[2].error).toBe('图片识别暂不可用');
+    expect(store.readySources.map(source => source.id)).toEqual(['doc-2', 'img-2']);
   });
 
   it.each([

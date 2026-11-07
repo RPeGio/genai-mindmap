@@ -16,6 +16,25 @@ export interface SourceItem {
   seconds: number;
 }
 
+/** 解析泳道：文档在本地 CPU 上跑，图片/语音是网络往返。 */
+type Lane = 'document' | 'media';
+
+/**
+ * 文档泳道并发度 1，保持串行。
+ *
+ * 文档走 Docling / pymupdf，是本地 CPU 且 Docling 内部有进程级单例锁，
+ * 并发只会互相等锁并把内存叠上去，总耗时不会变好。
+ */
+const DOCUMENT_CONCURRENCY = 1;
+
+/**
+ * 图片 / 语音泳道并发度 2。
+ *
+ * 两者都是网络往返（视觉识别、云端语音转写），2 路足以把一张图的等待时间
+ * 藏在另一张的处理过程里，又不会把识别服务打到限流。
+ */
+const MEDIA_CONCURRENCY = 2;
+
 /** 本页的输入工作区；File、计时器和 UI 状态不属于 Source 契约。 */
 export const useSourcesStore = defineStore('sources', () => {
   const items = ref<SourceItem[]>([]);
@@ -94,16 +113,54 @@ export const useSourcesStore = defineStore('sources', () => {
     }
   }
 
-  /** 串行解析，避免一次选中多个 PDF 时同时占满识别服务。失败只影响对应条目。 */
+  /**
+   * 判泳道用本地文件的类型：item.kind 在解析成功后会改成后端返回的 kind。
+   *
+   * 只有图片 / 语音走并发泳道，其余（含文本）都归到串行泳道——宁可慢一点，
+   * 也不让本地 CPU 的解析两路抢核。
+   */
+  function laneOf(item: SourceItem): Lane {
+    const file = files.get(item.id);
+    const kind = file ? fileKind(file) : item.kind;
+    return kind === 'image' || kind === 'audio' ? 'media' : 'document';
+  }
+
+  /**
+   * 跑一条泳道：最多 limit 个解析同时进行，取队时按 items 顺序。
+   *
+   * 每次都重新找下一个 queued，而不是起跑前切一份快照：解析期间用户可能
+   * 追加文件或点重试，它们要能被已经跑起来的泳道接走，而不是等下一轮 drain。
+   */
+  async function runLane(lane: Lane, limit: number): Promise<void> {
+    const skipped = new Set<string>();
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const next = items.value.find(item =>
+          item.state === 'queued' && !skipped.has(item.id) && laneOf(item) === lane);
+        if (!next) return;
+        await parseItem(next);
+        // 没有对应 File 的异常条目不会进入任何终态，不跳过的话同一个 find
+        // 会在原地转圈。
+        if (next.state === 'queued') skipped.add(next.id);
+      }
+    };
+    await Promise.all(Array.from({ length: limit }, () => worker()));
+  }
+
+  /**
+   * 按类型分两条泳道：文档串行，图片 / 语音并发 2 路。
+   *
+   * 只并发「解析过程」：条目入列后就地更新状态，从不按完成顺序重排，
+   * 所以 items 的顺序始终等于添加顺序，用户不会看到列表因后加的图片先解析
+   * 完而跳动。单条失败只影响它自己——parseItem 内部捕获异常写进 item.error，
+   * 泳道继续跑下一项。
+   */
   function drain(): Promise<void> {
     if (draining) return draining;
-    draining = (async () => {
-      for (;;) {
-        const next = items.value.find(item => item.state === 'queued');
-        if (!next) break;
-        await parseItem(next);
-      }
-    })().finally(() => { draining = null; });
+    draining = Promise.all([
+      runLane('document', DOCUMENT_CONCURRENCY),
+      runLane('media', MEDIA_CONCURRENCY),
+    ]).then(() => undefined).finally(() => { draining = null; });
     return draining;
   }
 
