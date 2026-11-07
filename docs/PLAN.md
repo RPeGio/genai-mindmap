@@ -50,7 +50,7 @@
 
 | 编号 | 内容 | 薄切片的边界 |
 |---|---|---|
-| F05 | PDF / DOCX / PPTX 导入 | 只取文本层；扫描件走 F06 兜底；50 页上限 |
+| F05 | PDF / DOCX / PPTX 导入 | **已实现（与原计划不同）**：PDF 不再是「只取文本层」，改为逐页渲染交模型视觉识别，扫描件同样适用，视觉不可用时才回落文本层；页数由上下文预算动态算出（另有 300 页护栏），不再有固定页数上限。DOCX/PPTX/XLSX/HTML/MD 走 Docling，`.doc`/`.ppt` 经 LibreOffice 转 PDF，`.xls` 用 xlrd 直读。见 [部署文档](DEPLOY.md) |
 | F06 | 图片/草图 → 导图 | **已实现基础链路**：单图经 `MINDMAP_LLM_MODEL` 多模态直转 Markdown（与 PDF 逐页共用调用），不收 SVG；「识别结果先给候选、人工修正」未做 |
 | F07 | 语音 → 导图 | **已实现（与原计划两度不同）**：先放弃 sidecar 改走云端，再把 ISI 一句话识别换成百炼 `qwen-audio-3.1-asr-flash`。当前能力：≤300 秒单次、句级时间戳、双声道分路识别后合并。见 [部署文档](DEPLOY.md) 第 6 节 |
 | F08 | 混合输入（文本+图+音） | 复用 `Source[]` 合并，保留来源标签 |
@@ -206,7 +206,6 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 
 | 常量 | 位置 | 当前值 |
 |---|---|---|
-| `MAX_INPUT_CHARS` | `backend/app/pipeline/service.py` | 20000 |
 | `MAX_UPLOAD_BYTES` | `backend/app/ingestion/router.py` | 10 MB（文档） |
 | `MAX_AUDIO_BYTES` | 同上；前端 `stores/mindmap.ts` 同口径 | 20 MB（WAV，约 11 分钟） |
 | `MAX_SLICE_SECONDS` | `backend/app/ingestion/asr.py` | 300（Qwen-Audio-ASR 服务端硬限，360 秒返回 `AUDIO_DURATION_TOO_LONG`） |

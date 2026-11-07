@@ -13,15 +13,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.agent.contracts import (
-    AgentRunRequest,
     DoneEvent,
-    ErrorEvent,
     StageEvent,
     ToolEndEvent,
     ToolStartEvent,
 )
 from app.agent.router import router
-from app.agent.stream import DONE_FRAME, encode_event
+from app.agent.stream import encode_event
 from app.core.errors import register_error_handlers
 from app.generation.service import GenerationError
 

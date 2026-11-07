@@ -309,21 +309,28 @@ class TreeValidationTest(unittest.TestCase):
     """op 全部执行成功不等于结果合法：整树上限在最后统一收口。"""
 
     @staticmethod
-    def build_300_node_tree() -> MindMapContent:
-        """正好 300 个节点：根 + 6 个分支 + 293 个叶子，每个分支都 ≤50 子。"""
+    def build_max_node_tree() -> MindMapContent:
+        """正好 1000 个节点（契约上限）：根 + 20 个分支 + 979 个叶子，每个分支 ≤50 子。
+
+        上限从 300 放到 1000 之后，这里构造的规模必须跟着变：一份 12106 字的
+        材料实测就能长出 526 个节点，用 300 当边界的用例连"合法树"都造不出来，
+        它证明的就不再是"超限被拒"。
+        """
+        per_branch = [50] * 19 + [29]        # 19×50 + 29 = 979
         branches = []
-        for branch, leaf_count in enumerate([50, 50, 50, 50, 50, 43]):
+        for branch, leaf_count in enumerate(per_branch):
             leaves = [Node(id=f"b{branch}_{leaf}", label="叶子") for leaf in range(leaf_count)]
             branches.append(Node(id=f"b{branch}", label="分支", children=leaves))
         tree = tree_of(*branches)
-        assert 1 + len(branches) + sum(len(node.children) for node in branches) == 300
+        assert 1 + len(branches) + sum(len(node.children) for node in branches) == 1000
         return tree
 
-    def test_超过_300_个节点报_tree_invalid(self):
-        tree = self.build_300_node_tree()  # 300 本身合法，能构造出来
+    def test_超过_1000_个节点报_tree_invalid(self):
+        tree = self.build_max_node_tree()  # 1000 本身合法，能构造出来
         with pytest.raises(OpError) as raised:
             apply_ops(tree, batch_of(
-                {"op": "add", "id": "n_第301个", "parent_id": "b5", "index": 0, "label": "第 301 个"}))
+                {"op": "add", "id": "n_第1001个", "parent_id": "b19", "index": 0,
+                 "label": "第 1001 个"}))
         assert raised.value.code == "tree_invalid"
         assert raised.value.path == "ops"
 

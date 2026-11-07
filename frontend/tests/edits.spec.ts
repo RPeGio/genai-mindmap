@@ -141,15 +141,18 @@ describe('提交前校验', () => {
     expect(validateDraft(content(root))).toBe(`节点「根」最多 ${LIMITS.children} 个子节点`);
   });
 
-  it('超 300 个节点拦下', () => {
-    // 50 × 6 = 300 个子节点，加上根是 301，正好越过上限
+  it('超节点上限时拦下', () => {
+    // 按 LIMITS.nodes 现算，别写死数字：上限是会调的（300 → 1000），
+    // 写死一次调参数就要改一次测试。这里造「上限 + 1」个节点。
+    const perBranch = 50;
+    const branches = Math.ceil((LIMITS.nodes + 1 - 1) / perBranch);
     const root: MindNode = {
       id: 'r',
       label: '根',
-      children: Array.from({ length: 50 }, (_, i) => ({
+      children: Array.from({ length: branches }, (_, i) => ({
         id: `c${i}`,
         label: `子${i}`,
-        children: Array.from({ length: 6 }, (_, j) => leaf(`c${i}-${j}`)),
+        children: Array.from({ length: perBranch }, (_, j) => leaf(`c${i}-${j}`)),
       })),
     };
     expect(validateDraft(content(root))).toBe(`导图最多 ${LIMITS.nodes} 个节点`);

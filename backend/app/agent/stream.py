@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import json
 
-from app.agent.contracts import AgentEvent
+from app.agent.contracts import AgentEvent, NodeGrowEvent
 
 DONE_FRAME = "data: [DONE]\n\n"
+
+# node_grow 里含义为"空"的字段。它们的 null 不是"这个字段本来没有"：根帧的
+# path 就是 null，模型没写 expandable 时也必须是 null——缺键会让前端多出
+# "字段不存在"这第三种状态，与"明确为空"再也分不开。
+_NODE_GROW_NULLABLE = ("path", "expandable")
 
 
 def encode_event(event: AgentEvent) -> str:
@@ -21,7 +26,11 @@ def encode_event(event: AgentEvent) -> str:
 
     `ensure_ascii=False`：中文在 sse 里原样传输，体积小一半，日志里也能直接读。
     `exclude_none=True`：可选字段不出现，前端少一层"这个字段是本来没有还是被清空"
-    的判断。
+    的判断。`node_grow` 的两个例外见 `_NODE_GROW_NULLABLE`：那里的 null 本身带
+    信息，必须显式出现在帧里。
     """
     payload = event.model_dump(mode="json", exclude_none=True)
+    if isinstance(event, NodeGrowEvent):
+        for name in _NODE_GROW_NULLABLE:
+            payload.setdefault(name, None)
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"

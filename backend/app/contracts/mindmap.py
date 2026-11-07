@@ -5,6 +5,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.contracts.diagnostic import Diagnostic
 from app.contracts.source import SourceRef, SourceUsage
 
+# 整树节点上限。1000 是**承载能力**：前端渲染、保存、导出都还扛得住，所以它是
+# 契约的硬边界而不是产品口径。原先的 300 是照「一句话主题」场景拍的，一份
+# 12106 字的材料实测就能长出 526 个节点——上限比材料要求还低时，被砍掉的是
+# 用户的内容而不是模型的发挥。
+MAX_TREE_NODES = 1000
+
+# 层级上限。8 层是可读性约束（再深，横向滚动换来的信息量已经抵不过"看不见全貌"），
+# 不是承载能力，所以它保持不变。
+MAX_TREE_DEPTH = 8
+
 
 class Node(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -33,8 +43,9 @@ class MindMapContent(BaseModel):
             if node.id in seen:
                 raise ValueError("节点 ID 必须唯一")
             seen.add(node.id)
-            if len(seen) > 300 or depth > 8:
-                raise ValueError("导图最多 300 个节点，深度不超过 8 层")
+            if len(seen) > MAX_TREE_NODES or depth > MAX_TREE_DEPTH:
+                raise ValueError(
+                    f"导图最多 {MAX_TREE_NODES} 个节点，深度不超过 {MAX_TREE_DEPTH} 层")
             for ref in node.source_refs:
                 if ref.source_id not in source_ids:
                     raise ValueError(f"节点 {node.id} 引用的来源 {ref.source_id} 不在 source_usage 中")

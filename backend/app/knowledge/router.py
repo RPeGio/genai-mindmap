@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.knowledge.service import KnowledgeHit, SearchRequest, SearchResponse, search
+from app.knowledge.service import SearchRequest, SearchResponse, search
 
 router = APIRouter(prefix="/knowledge", tags=["知识增强"])
 

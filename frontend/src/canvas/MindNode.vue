@@ -29,6 +29,30 @@ const POSITIONS: Record<ChildSide, Position> = {
 /** 文字被截断时才有必要浮现卡片；没截断也照样允许悬停查看（标题本身可能就是全文）。 */
 const truncated = computed(() => props.data.label !== props.data.fullLabel);
 
+/**
+ * 节点框的样式。
+ *
+ * 三条真实分支原样保留——`content` 渲染出来必须和加预览之前逐像素一致。
+ * 未应用的树单独走一组草稿样式：
+ * - 候选：实线 + 略降不透明度，看得出「已经长完了」，但仍明显不是画布的一部分；
+ * - 预览：虚线 + 更淡，一眼就是还在长；
+ * - 预览里模型明确标了「不用再展开」的节点再淡一档。`null`（还没写到）不标记，
+ *   否则「明确不展开」和「还没决定」在画面上会变成同一件事。
+ */
+const boxClass = computed(() => {
+  if (props.data.draft === 'candidate') {
+    return 'border-slate-400 bg-white text-slate-600 opacity-80';
+  }
+  if (props.data.draft === 'preview') {
+    return props.data.previewLeaf
+      ? 'border-dashed border-slate-200 bg-white text-slate-400 opacity-40'
+      : 'border-dashed border-slate-300 bg-white text-slate-600 opacity-60';
+  }
+  if (props.selected) return 'border-slate-900 bg-white font-medium shadow-md';
+  if (props.data.depth === 0) return 'border-slate-900 bg-slate-900 font-medium text-white';
+  return 'border-slate-300 bg-white text-slate-700 hover:border-slate-400';
+});
+
 const card = ref(false);
 let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -136,13 +160,7 @@ onBeforeUnmount(() => clearTimeout(timer));
 
     <div
       class="flex h-12 w-[180px] items-center justify-center rounded-md border px-3 text-center text-sm leading-tight"
-      :class="
-        selected
-          ? 'border-slate-900 bg-white font-medium shadow-md'
-          : data.depth === 0
-            ? 'border-slate-900 bg-slate-900 font-medium text-white'
-            : 'border-slate-300 bg-white text-slate-700 hover:border-slate-400'
-      "
+      :class="boxClass"
       :title="data.fullLabel"
       tabindex="0"
     >
@@ -166,11 +184,11 @@ onBeforeUnmount(() => clearTimeout(timer));
       用 pointer-events-none 让它不挡节点点击（角标压在节点边缘上）。
     -->
     <div
-      v-if="data.refs > 0"
+      v-if="(data.refs ?? 0) > 0"
       class="pointer-events-none absolute -right-1.5 -top-1.5 flex h-5 min-w-5 items-center justify-center rounded-full border border-slate-300 bg-white px-1 text-[10px] font-medium leading-none text-slate-600 shadow-sm"
-      :title="`${data.refs} 处来源引用`"
+      :title="`${data.refs ?? 0} 处来源引用`"
     >
-      {{ data.refs }}
+      {{ data.refs ?? 0 }}
     </div>
 
     <div

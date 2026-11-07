@@ -12,6 +12,7 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agent.contracts import (
@@ -23,10 +24,15 @@ from app.agent.contracts import (
     ToolSpec,
 )
 from app.agent.provider import _parse_completion
-from app.agent.service import _dedupe_key, outline_text, run
+from app.agent.service import MAX_LOG_MESSAGE_CHARS, _dedupe_key, outline_text, run
 from app.agent.tools import PLAN_PROMPT, ToolRegistry, build_registry
 from app.contracts.mindmap import MindMapContent
-from app.generation.service import GenerationError
+from app.contracts.source import Source
+from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
+    GenerationError,
+    estimate_input_tokens,
+)
 
 # 生成工具返回的树：5 个节点、三层。用于验证工具内调用与 snapshot 帧。
 # 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
@@ -114,6 +120,160 @@ def _registry(handler, args_model=EchoArgs, name: str = "echo",
 def _request(intent: str = "create", budget: RunBudget | None = None) -> AgentRunRequest:
     return AgentRunRequest(goal="给机器学习做一张导图", intent=intent,
                            budget=budget or RunBudget())
+
+
+def _failure_logs(caplog) -> list[dict]:
+    return [json.loads(record.args[0]) for record in caplog.records
+            if record.name == "app.agent.service"]
+
+
+def test_tool_failure_logs_reason_and_usage_without_material_or_tree(caplog):
+    private_text = "不应出现在日志里的原文" * 100
+    private_tree = {"root": {"label": "不应出现在日志里的树"}}
+
+    def broken(args, ctx):
+        ctx.reserve_model_call()
+        return ToolResult(ok=False, content=private_text, data={
+            "code": "invalid_map", "message": "引用与原文不匹配",
+            "tree": private_tree, "diagnostics": [{"text": private_text}],
+        })
+
+    call = ToolCall(call_id="failure-1", name="echo", arguments={"text": private_text})
+    request = AgentRunRequest(goal="整理", sources=[Source(kind="text", text=private_text)])
+    events = _collect(request, ScriptedProvider([
+        _completion([call], finish="tool_calls"), _completion(),
+    ]), _registry(broken))
+    end = next(event for event in events if event.type == "tool_end")
+    assert end.result_summary["code"] == "invalid_map"
+    assert end.result_summary["message"] == "引用与原文不匹配"
+    assert _failure_logs(caplog) == [{
+        "call_id": "failure-1", "tool": "echo", "code": "invalid_map",
+        "message": "引用与原文不匹配", "model_calls_used": 2, "tool_calls_used": 1,
+    }]
+    assert private_text not in caplog.text
+    assert private_tree["root"]["label"] not in caplog.text
+
+
+def test_failure_without_code_or_message_reaches_events_and_logs(caplog):
+    call = ToolCall(call_id="missing-summary", name="echo", arguments={"text": "x"})
+    events = _collect(_request(), ScriptedProvider([
+        _completion([call], finish="tool_calls"), _completion(),
+    ]), _registry(lambda args, ctx: ToolResult(
+        ok=False, content="这次没有可用分支", data={"diagnostics": [], "failed_branches": ["甲"]},
+    )))
+    end = next(event for event in events if event.type == "tool_end")
+    assert end.result_summary["code"] == "tool_failed"
+    assert end.result_summary["message"] == "这次没有可用分支"
+    assert end.result_summary["failed_branches"] == ["甲"]
+    assert _failure_logs(caplog)[0]["message"] == end.result_summary["message"]
+
+
+def test_long_failure_message_is_only_a_bounded_log_summary(caplog):
+    reason = "模型校验失败\n" + "过长的模型输出" * MAX_LOG_MESSAGE_CHARS
+    events = _collect(_request(), ScriptedProvider([GenerationError(reason)]))
+    assert events[-1].message == reason
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == "generation_failed"
+    assert len(log["message"]) <= MAX_LOG_MESSAGE_CHARS
+    assert reason not in caplog.text
+
+
+@pytest.mark.parametrize("failure,code", [
+    (GenerationError("模型服务返回 HTTP 429"), "generation_failed"),
+    (RuntimeError("适配器意外失败"), "agent_failed"),
+    (asyncio.TimeoutError(), "budget_exhausted"),
+])
+def test_provider_failure_is_logged_with_usage(caplog, failure, code):
+    provider = ScriptedProvider([failure])
+    if type(failure) is RuntimeError:
+        with pytest.raises(RuntimeError, match="适配器意外失败"):
+            _collect(_request(), provider)
+    else:
+        events = _collect(_request(), provider)
+        assert events[-1].code == code
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == code
+    assert log["message"]
+    assert log["call_id"] is None and log["tool"] is None
+    assert log["model_calls_used"] == 1 and log["tool_calls_used"] == 0
+
+
+@pytest.mark.parametrize("failure,code", [
+    (GenerationError("工具上游失败"), "generation_failed"),
+    (RuntimeError("工具意外失败"), "agent_failed"),
+])
+def test_tool_exception_is_logged_before_propagating(caplog, failure, code):
+    def broken(args, ctx):
+        ctx.reserve_model_call()
+        raise failure
+
+    call = ToolCall(call_id="raised-1", name="echo", arguments={"text": "x"})
+    provider = ScriptedProvider([_completion([call], finish="tool_calls")])
+    with pytest.raises(type(failure), match=str(failure)):
+        _collect(_request(), provider, _registry(broken))
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == code and str(failure) in log["message"]
+    assert log["call_id"] == call.call_id and log["tool"] == call.name
+    assert log["model_calls_used"] == 2 and log["tool_calls_used"] == 1
+
+
+@pytest.mark.parametrize("limit", ["max_model_calls", "max_tool_calls"])
+def test_budget_stop_is_logged_with_last_call_and_usage(caplog, limit):
+    call = ToolCall(call_id="budget-1", name="echo", arguments={"text": "x"})
+    provider = ScriptedProvider([_completion([call], finish="tool_calls")])
+    events = _collect(_request(budget=RunBudget(**{limit: 1})), provider, _registry(_echo))
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == events[-1].code == "budget_exhausted"
+    assert log["message"] == events[-1].message
+    assert log["call_id"] == call.call_id and log["tool"] == call.name
+    assert log["model_calls_used"] == 1 and log["tool_calls_used"] == 1
+
+
+def test_tool_timeout_logs_the_started_call_and_pairs_the_events(caplog):
+    async def slow(args, ctx):
+        ctx.reserve_model_call()
+        await asyncio.Event().wait()
+
+    call = ToolCall(call_id="timeout-1", name="echo", arguments={"text": "x"})
+    events = _collect(
+        _request(budget=RunBudget(max_seconds=0.1)),
+        ScriptedProvider([_completion([call], finish="tool_calls")]), _registry(slow),
+    )
+    end = next(event for event in events if event.type == "tool_end")
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == end.result_summary["code"] == "tool_timeout"
+    assert log["message"] == end.result_summary["message"]
+    assert log["call_id"] == call.call_id and log["tool"] == call.name
+    assert log["model_calls_used"] == 2 and log["tool_calls_used"] == 1
+    assert events[-1].limit == "max_seconds"
+
+
+def test_excess_tool_calls_in_one_completion_are_logged_before_execution(caplog):
+    first = ToolCall(call_id="allowed", name="echo", arguments={"text": "x"})
+    second = ToolCall(call_id="blocked", name="echo", arguments={"text": "y"})
+    events = _collect(
+        _request(budget=RunBudget(max_tool_calls=1)),
+        ScriptedProvider([_completion([first, second], finish="tool_calls")]), _registry(_echo),
+    )
+    log = _failure_logs(caplog)[0]
+    assert log["code"] == "budget_exhausted"
+    assert log["call_id"] == second.call_id and log["tool"] == second.name
+    assert log["model_calls_used"] == 1 and log["tool_calls_used"] == 1
+    assert [event.call_id for event in events if event.type == "tool_start"] == [first.call_id]
+
+
+def test_repair_budget_logs_both_the_tool_failure_and_the_stop_reason(caplog):
+    call = ToolCall(call_id="repair-1", name="echo", arguments={"text": "x"})
+    events = _collect(
+        _request(budget=RunBudget(max_repairs=0)),
+        ScriptedProvider([_completion([call], finish="tool_calls")]),
+        _registry(lambda args, ctx: ToolResult(ok=False, content="参数不合法")),
+    )
+    logs = _failure_logs(caplog)
+    assert [log["code"] for log in logs] == ["tool_failed", "too_many_failures"]
+    assert logs[-1]["message"] == events[-1].message
+    assert all(log["call_id"] == call.call_id and log["tool"] == call.name for log in logs)
+    assert all(log["model_calls_used"] == 1 and log["tool_calls_used"] == 1 for log in logs)
 
 
 class BasicFlowTest(unittest.TestCase):
@@ -332,6 +492,33 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(events[-1].code, "budget_exhausted")
         self.assertEqual(events[-1].limit, "max_tool_calls")
 
+    def test_budget_ran_out_after_candidate_is_done_not_error(self):
+        """候选已经建好时预算用完：给 done，不把成果报成失败。
+
+        收尾那轮只是想问模型「还要不要继续」，问不了不影响已经建好的树。
+        真机上六支三层用掉 27 次而预算给 25 时，用户看到的是候选和一条
+        「模型调用次数已用完」同时出现，不知道该不该用那份候选。
+        """
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
+            return {"title": "主题", "root": {"id": "root", "label": "主题", "children": [
+                {"id": "a", "label": "分支一", "children": []},
+                {"id": "b", "label": "分支二", "children": []},
+                {"id": "c", "label": "分支三", "children": []},
+            ]}}
+
+        call = ToolCall(call_id="gen-1", name="mindmap_generate",
+                        arguments={"topic": "机器学习"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls")])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            # 2 次刚好够「外层发工具 + 工具内一次生成」，收尾那轮就没有了
+            events = _collect(
+                _request(budget=RunBudget(max_model_calls=2, max_tool_calls=50)),
+                provider, build_registry("create"))
+
+        self.assertEqual(events[-1].type, "done")
+        self.assertIsNotNone(events[-1].content)
+        self.assertEqual(events[-1].content.root.label, "主题")
+
     def test_repair_budget_limits_failed_tool_calls(self):
         """max_repairs 数的是工具失败次数，与模型调用次数无关。"""
         def broken(args, ctx):
@@ -418,7 +605,7 @@ class BudgetTest(unittest.TestCase):
         """
         chats: list[str] = []
 
-        async def fake_chat(system, user, *, max_tokens=None):
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
             chats.append(user)
             return TREE
 
@@ -445,7 +632,10 @@ class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
     """
 
     def test_six_branch_deep_run_finishes_with_done(self):
-        async def fake_chat(system, user, *, max_tokens=None):
+        # `on_delta` 是循环挂上上报通道后工具会传的回调。这条用例只关心预算与
+        # 收尾，所以收到就丢：不消费它意味着这条调用没有产生任何预览帧，
+        # 正好也证明"不上报不影响主流程"。
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
             if system.startswith(PLAN_PROMPT):
                 return {"branches": [f"分支{index}" for index in range(1, 7)]}
             return {"points": ["要点一", "要点二", "要点三"]}
@@ -470,6 +660,45 @@ class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
         end = next(event for event in events if event.type == "tool_end")
         self.assertTrue(end.ok, end.result_summary)
         self.assertFalse(end.result_summary["partial"])
+
+    def test_recursive_deep_run_fits_default_budget(self):
+        """递归展开（模型自报可展开性）在默认预算下也要走完。
+
+        上一条用的是 `points` 旧格式，语义就是叶子、根本不会递归，所以它证明
+        不了「模型自己说还能再拆」这条路要花多少次调用。真机上六支三层用掉
+        27 次，预算给 25 时收尾那轮必然报 budget_exhausted。
+        """
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
+            if system.startswith(PLAN_PROMPT):
+                return {"branches": [f"分支{index}" for index in range(1, 7)]}
+            # 两个点里只有一个说自己还能拆，另一支到底
+            return {"children": [
+                {"label": "还能拆", "expandable": True},
+                {"label": "到底了", "expandable": False},
+            ]}
+
+        call = ToolCall(
+            call_id="deep-1", name="mindmap_generate_deep",
+            arguments={"topic": "机器学习", "branches": 6,
+                       "points_per_branch": 2, "max_depth": 3},
+        )
+        provider = ScriptedProvider([
+            _completion([call], finish="tool_calls"),
+            _completion(),
+        ])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(_request(), provider, build_registry("create"))
+
+        self.assertEqual(events[-1].type, "done")
+        root = events[-1].content.root
+        self.assertEqual(len(root.children), 6)
+        for branch in root.children:
+            self.assertEqual(len(branch.children), 2)
+        # 递归确实发生了：至少有一支的「还能拆」自己又长出了子节点
+        self.assertTrue(any(child.children for branch in root.children
+                            for child in branch.children))
+        # 默认预算没被撞破，收尾轮照常发出 done
+        self.assertEqual(provider.calls, 2)
 
 
 class OutlineRefreshTest(unittest.TestCase):
@@ -531,7 +760,7 @@ class SnapshotEmissionTest(unittest.TestCase):
     """
 
     def test_generate_success_emits_snapshot_with_valid_tree(self):
-        async def fake_chat(system, user, *, max_tokens=None):
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
             return TREE
 
         call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
@@ -552,6 +781,31 @@ class SnapshotEmissionTest(unittest.TestCase):
         self.assertEqual(_node_ids(replay.root), {"root", "a", "b", "b1", "c"})
         # snapshot 与 done 必须是同一棵树：两个来源不一致会让前端闪一下
         self.assertEqual(events[-1].content.model_dump(), snapshot.content.model_dump())
+
+    def test_sourced_generate_emits_growth_before_tool_end_and_snapshot(self):
+        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
+            self.assertIsNotNone(on_delta)
+            text = json.dumps(TREE, ensure_ascii=False)
+            for start in range(0, len(text), 7):
+                await on_delta(text[start:start + 7])
+            return TREE
+
+        source = Source(id="s1", kind="document", status="parsed", text="论文原文。")
+        request = AgentRunRequest(goal="整理论文", intent="create", sources=[source])
+        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "论文"})
+        provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            events = _collect(request, provider)
+
+        self.assertEqual([event.type for event in events],
+                         ["stage", "tool_start"] + ["node_grow"] * 5
+                         + ["tool_end", "snapshot", "done"])
+        self.assertEqual([event.seq for event in events], list(range(1, 11)))
+        growth = [event for event in events if event.type == "node_grow"]
+        self.assertEqual([(event.path, event.label) for event in growth],
+                         [(None, "根"), ([], "甲"), ([], "乙"), ([1], "乙一"), ([], "丙")])
+        self.assertTrue(events[-3].ok)
+        self.assertEqual(events[-2].content, events[-1].content)
 
     def test_snapshot_is_not_emitted_when_candidate_already_exists(self):
         """expand / edit 一开始就有候选树：不重复发 snapshot。"""
@@ -693,6 +947,58 @@ class RegistryTest(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             asyncio.run(scenario())
+
+
+class BudgetDefaultsTest(unittest.TestCase):
+    """默认预算按实测数据定，不按「一句话主题」的场景拍。
+
+    这两个默认值是整条 agent 路径的物理边界：时间上限决定了模型能不能把
+    65536 token 的输出写完，输出上限决定了树能不能长到契约允许的规模。
+    """
+
+    def test_defaults_match_the_measured_limits(self):
+        budget = RunBudget()
+        self.assertEqual(budget.max_seconds, 600.0)
+        self.assertEqual(budget.max_output_tokens, 65536)
+
+    def test_seconds_ceiling_admits_an_hour(self):
+        RunBudget(max_seconds=3600)          # 一小时是允许的物理上界
+        with self.assertRaises(ValidationError):
+            RunBudget(max_seconds=3601)
+
+
+class SourcesContextTest(unittest.TestCase):
+    """来源正文的边界是模型上下文，不再是「合计 20000 字」。
+
+    20000 那个数没有实测依据，而且与 pipeline 的同名常量互相抄写——两处
+    一起错。现在两处都改判 token：装得下就放行，装不下就在开流前说清楚。
+    """
+
+    def test_long_material_within_the_context_is_accepted(self):
+        # 30000 汉字 ≈ 20000 token：字数上限删掉之后必须放行
+        text = "字" * 30000
+        request = AgentRunRequest(
+            goal="整理材料",
+            sources=[Source(kind="text", status="parsed", text=text)],
+        )
+        self.assertEqual(len(request.sources), 1)
+        # 这份样本必须真的装得下，否则"放行"断言会因为限额变小而失去意义
+        self.assertLess(estimate_input_tokens(text), CONTEXT_TOKEN_LIMIT)
+
+    def test_material_over_the_context_is_rejected_while_parsing_the_request(self):
+        """必须抛 ValueError：只有它会被 FastAPI 收成 422 并把文案带回前端。
+
+        样本按 `CONTEXT_TOKEN_LIMIT` 现算：限额是可调参数，写死字数的样本在
+        调阈值之后就不再超限，用例会从"超限被拒"悄悄退化成"普通材料被接收"。
+        """
+        with self.assertRaises(ValidationError) as raised:
+            AgentRunRequest(
+                goal="整理材料",
+                sources=[Source(kind="text", status="parsed",
+                                text="字" * int(CONTEXT_TOKEN_LIMIT * 1.6))],
+            )
+        self.assertIn("超过模型上下文上限", str(raised.exception))
+        self.assertIn("请精简后重试，或分成多次生成", str(raised.exception))
 
 
 if __name__ == "__main__":

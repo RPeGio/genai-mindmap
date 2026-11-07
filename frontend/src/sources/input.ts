@@ -4,7 +4,19 @@ import type { Source, SourceKind } from '../api/types';
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 export const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 export const MAX_SOURCES = 50;
-export const MAX_INPUT_CHARS = 20000;
+/**
+ * 合并后的字数上限，与后端 `CONTEXT_TOKEN_LIMIT`（200000 token）对齐。
+ *
+ * 后端按「汉字 1.5 字/token、ASCII 4 字符/token」估算，200000 token 对应纯中文
+ * 约 30 万字、纯英文约 80 万字符。这里取纯中文那个最费 token 的数字：中英混排
+ * 时前端会比后端更早拦一点，方向是保守的，不会出现"前端放行、后端 422"。
+ *
+ * 原先这里卡的是 20000 字。那个数是照一句话主题拍的，没有实测依据——一篇十五页
+ * 的论文（Attention Is All You Need 转成正文约 38000 字符）连一半都放不进去，
+ * 而它换算下来才九千多 token，离上限差二十倍。后端的字数闸早就删了，前端这道
+ * 一直留着，于是一篇正常论文在界面上就生成不了。
+ */
+export const MAX_INPUT_CHARS = 300000;
 export const FILE_ACCEPT = '.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc,.wav,.png,.jpg,.jpeg,.webp,.gif,.bmp';
 
 export const SOURCE_LABELS: Record<SourceKind, string> = {

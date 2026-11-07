@@ -50,7 +50,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 | 格式 | 依赖 | 耗时量级 | 说明 |
 |---|---|---|---|
-| `.pdf` | `pymupdf` + 模型 | 约 5–10 秒/页 | 逐页渲染后视觉识别；最多 20 页 |
+| `.pdf` | `pymupdf` + 模型 | 约 5–10 秒/页 | 逐页渲染后视觉识别；页数由上下文预算算出（`CONTEXT_TOKEN_LIMIT`），另有 300 页护栏 |
 | `.docx` `.pptx` `.xlsx` `.html` `.md` | `docling` | 1–2 秒 | 读结构化格式，不加载版面模型 |
 | `.doc` `.ppt` | `docling` + LibreOffice + 模型 | 约 10–60 秒 | 先转 PDF 再视觉识别；**耗时按转换后的页数算**，重排版后页数会增加 |
 | `.xls` | `xlrd` | 0.1 秒 | 直接读单元格 |

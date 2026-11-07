@@ -217,6 +217,22 @@ export type AgentEvent =
       latency_ms?: number;
     }
   | { type: 'ops'; seq: number; call_id: string; batch: OpBatch }
+  /**
+   * 节点级预览帧：深层生成的某一次展开调用产出了一个子节点。
+   *
+   * 与普通生成的 `node` 事件不是一回事：那条帧自带节点 id，父子关系在 JSON 里；
+   * 这里的展开调用响应里**根本没有 id**，父节点是谁只有工具层知道，所以位置靠
+   * `path` 描述。它也只是预览，可采纳的内容仍以 snapshot / done 的 `content` 为准。
+   */
+  | {
+      type: 'node_grow';
+      seq: number;
+      /** 从根出发的子节点索引链，指向**父节点**；`[]` 表示挂在根上，`null` 表示这一帧就是根。 */
+      path: number[] | null;
+      label: string;
+      /** 模型写出来的可展开性；`null` 表示还没写到，与 `false` 不是一回事。 */
+      expandable: boolean | null;
+    }
   | { type: 'snapshot'; seq: number; content: MindMapContent }
   | { type: 'done'; seq: number; content?: MindMapContent | null; usage?: Record<string, unknown> }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };

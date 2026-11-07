@@ -1,11 +1,13 @@
 import asyncio
+import inspect
 import json
 import os
 import unittest
 from unittest.mock import patch
 import httpx
-from app.contracts.mindmap import MindMapContent
+from app.contracts.mindmap import MAX_TREE_DEPTH, MAX_TREE_NODES, MindMapContent
 from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
     MAX_OUTPUT_TOKENS,
     MIN_BRANCHES,
@@ -15,11 +17,23 @@ from app.generation.service import (
     chat,
     chat_async,
     diagnose_density,
+    ensure_input_within_context,
+    estimate_input_tokens,
     generate,
     parse_model_json,
     thinking_block,
     thinking_options,
 )
+
+
+def _oversized(ratio: float = 1.6) -> str:
+    """按 `CONTEXT_TOKEN_LIMIT` 现算一份超限样本。
+
+    阈值是可调参数（60000 → 200000 就调整过一次），写死字数的样本会在每次
+    调整后变成"没超限"的普通材料，把用例的语义悄悄改掉。汉字约 1.5 字/token，
+    所以 1.6 倍字符数一定能换来超过上限的 token 数。
+    """
+    return "字" * int(CONTEXT_TOKEN_LIMIT * ratio)
 
 
 def _tree(branches: int) -> dict:
@@ -100,7 +114,7 @@ class GenerationTest(unittest.TestCase):
         self.assertEqual(result.mode, "model")
         self.assertEqual(result.content.root.label, "测试")
         self.assertEqual(len(result.content.root.children), 3)
-        self.assertEqual(client_class.call_args.kwargs["timeout"], 60.0)
+        self.assertEqual(client_class.call_args.kwargs["timeout"], 600.0)
         method, url, kwargs = client_class.return_value.calls[0]
         self.assertEqual(method, "POST")
         self.assertEqual(url, "https://example.com/v1/chat/completions")
@@ -158,11 +172,12 @@ class GenerationTest(unittest.TestCase):
         self.assertIn("模型响应过大", str(raised.exception))
 
     def test_request_carries_explicit_output_token_limit(self):
-        """必须显式给 max_tokens。
+        """必须显式给 max_tokens，且取到服务端实测接受的最大值。
 
-        服务端默认 8192，而 DETAIL_PROMPT 允许 300 个节点、实测 240 节点就要
-        7578 token，不抬高上限就会被静默截断成半截 JSON（实测 20000 字符的
-        输入撞过一次，finish_reason=length、输出正好 8192 后报废）。
+        服务端默认 8192；实测 12106 字材料 → 13243 token 输出，16384 只剩
+        3000 余量。DeepSeek 接受 max_tokens=65536（HTTP 200），按每节点约
+        25 token 算装得下 2600 个节点，高于契约允许的 1000 个——所以输出上限
+        不再是内容被截断的原因，真被截断时由 finish_reason=length 明确报错。
         """
         tree = _tree(3)
         client_class = self.use_client(MockStreamResponse(self.body_of(tree)))
@@ -170,7 +185,7 @@ class GenerationTest(unittest.TestCase):
         _, _, kwargs = client_class.return_value.calls[0]
         payload = json.loads(kwargs["content"])
         self.assertEqual(payload["max_tokens"], MAX_OUTPUT_TOKENS)
-        self.assertGreater(MAX_OUTPUT_TOKENS, 8192)
+        self.assertGreaterEqual(MAX_OUTPUT_TOKENS, 65536)
 
     def test_explicit_max_tokens_still_wins(self):
         """调用方显式指定时以调用方为准，便于个别短请求省钱。"""
@@ -272,6 +287,90 @@ class FinishReasonTest(unittest.TestCase):
         with self.assertRaises(GenerationError) as raised:
             chat("系统", "用户")
         self.assertIn("截断", str(raised.exception))
+
+
+class ContextBudgetTest(unittest.TestCase):
+    """输入侧只剩一道边界：模型的上下文窗口。
+
+    「材料不超过 20000 字」那种产品口径已经删掉——它是照一句话主题拍的，
+    与模型真正的拒收条件无关。这里守住替代它的那道物理边界：估算口径、
+    保守上限、以及"在发请求之前就拒"。
+    """
+
+    def test_estimate_counts_chinese_and_ascii_apart(self):
+        """汉字约 1.5 字/token、ASCII 约 4 字符/token，两种密度差四倍。"""
+        self.assertEqual(estimate_input_tokens(""), 0)
+        self.assertEqual(estimate_input_tokens("字" * 15), 10)
+        self.assertEqual(estimate_input_tokens("a" * 40), 10)
+        # 混合内容按各自密度分别累加，不能整体按一个折算率算
+        self.assertEqual(estimate_input_tokens("字" * 15 + "a" * 40), 20)
+
+    def test_limit_is_a_positive_context_budget(self):
+        """限额是可调参数，具体数字不是契约。
+
+        原先断言 `== 60000`：那个数既没有实测依据，又会把每次调阈值都变成一次
+        假失败。现在只守住"它是个像样的正数预算"，外加"默认边界确实由它决定"
+        ——签名里的默认值必须就是这个常量，否则调常量等于没调。
+        """
+        self.assertIsInstance(CONTEXT_TOKEN_LIMIT, int)
+        self.assertGreater(CONTEXT_TOKEN_LIMIT, 10_000)
+        default = inspect.signature(
+            ensure_input_within_context).parameters["limit"].default
+        self.assertEqual(default, CONTEXT_TOKEN_LIMIT)
+
+    def test_limit_covers_a_realistic_long_document(self):
+        """限额必须装得下一份真实的长材料。
+
+        只断言「大于一万」守不住量级——有人把它从 200000 悄悄改到 50000
+        照样能过。这里用「十二万字」这把尺子：它约合 8 万 token，是一份
+        五十页扫描件的量级，也是实测跑通过的长度（12106 字材料生成 526 节点）。
+        阈值低于这个数，就等于把那批已经能用的场景重新关到门外。
+        """
+        realistic = "字" * 120_000
+        self.assertGreater(CONTEXT_TOKEN_LIMIT, estimate_input_tokens(realistic))
+
+    def test_roomy_material_passes_and_returns_the_estimate(self):
+        self.assertEqual(ensure_input_within_context("字" * 1500), 1000)
+
+    def test_overflow_raises_a_message_the_ui_can_show(self):
+        text = _oversized()        # 约 1.07 倍上限的 token，必定超限
+        tokens = estimate_input_tokens(text)
+        self.assertGreater(tokens, CONTEXT_TOKEN_LIMIT)
+        with self.assertRaises(GenerationError) as raised:
+            ensure_input_within_context(text)
+        message = str(raised.exception)
+        self.assertIn(f"材料约 {len(text)} 字", message)
+        self.assertIn(f"{tokens} token", message)
+        self.assertIn(str(CONTEXT_TOKEN_LIMIT), message)
+        self.assertIn("请精简后重试，或分成多次生成", message)
+
+    def test_system_prompt_cost_counts_toward_the_limit(self):
+        """系统提示词也在同一个窗口里，不能只算用户正文。"""
+        text = "字" * 1500          # 1000 token
+        self.assertEqual(ensure_input_within_context(text, extra_tokens=100), 1100)
+        with self.assertRaises(GenerationError):
+            ensure_input_within_context(text, limit=1050, extra_tokens=100)
+
+    def test_chat_refuses_oversized_input_before_the_request_goes_out(self):
+        """超限的请求不该先花一次网络往返、再拿回一个 400。"""
+        env = {"MINDMAP_LLM_MODE": "model", "MINDMAP_LLM_BASE_URL": "https://example.com/v1",
+               "MINDMAP_LLM_MODEL": "test", "MINDMAP_LLM_API_KEY": "not-a-real-key"}
+        with patch.dict(os.environ, env), \
+             patch("app.generation.service.httpx.Client") as client:
+            with self.assertRaises(GenerationError) as raised:
+                chat("系统", _oversized())
+        client.assert_not_called()
+        self.assertIn("超过模型上下文上限", str(raised.exception))
+
+    def test_chat_async_refuses_oversized_input_before_the_request_goes_out(self):
+        """工具内部的生成 / 展开走 chat_async，这条出口必须守同一道边界。"""
+        env = {"MINDMAP_LLM_MODE": "model", "MINDMAP_LLM_BASE_URL": "https://example.com/v1",
+               "MINDMAP_LLM_MODEL": "test", "MINDMAP_LLM_API_KEY": "not-a-real-key"}
+        with patch.dict(os.environ, env), \
+             patch("app.generation.service.httpx.AsyncClient") as client:
+            with self.assertRaises(GenerationError):
+                asyncio.run(chat_async("系统", _oversized()))
+        client.assert_not_called()
 
 
 class ParseModelJsonTest(unittest.TestCase):
@@ -397,6 +496,14 @@ class BranchFloorTest(unittest.TestCase):
 class PromptQualityTest(unittest.TestCase):
     """prompt 里的数量约束与引用正反例：模型只照字面执行，不写就是没有。"""
 
+    # quote 示例段本身是「原文：…」引出的一句话。锚点落在这里而不是整段第一个
+    # ✅/❌：提示词里还有拆到底的形态对照（同样用 ❌/✅），按整段取首标记会被
+    # 那些行抢走，取出来的"引用"其实是结构示例。
+    QUOTE_ANCHOR = "原文：会议决定在十月十七日发布二点零版本。"
+
+    def _quote_examples(self) -> str:
+        return SOURCED_DETAIL_PROMPT.split(self.QUOTE_ANCHOR, 1)[1]
+
     def test_both_prompts_state_the_point_and_branch_floor(self):
         for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
             self.assertIn("至少 2 个要点", prompt)
@@ -410,6 +517,16 @@ class PromptQualityTest(unittest.TestCase):
         self.assertIn("不要为了凑数补写", DETAIL_PROMPT)
         self.assertIn("依据不足时宁可", DETAIL_PROMPT)
 
+    def test_prompt_node_ceiling_follows_the_contract(self):
+        """提示词里的节点/层级上限必须与契约同值。
+
+        这两个数曾经各自写死：契约从 300 放到 1000 之后提示词还在叫模型
+        「不超过 300」，模型自我设限，契约放宽等于没生效。
+        """
+        self.assertIn(f"节点不超过 {MAX_TREE_NODES}", DETAIL_PROMPT)
+        self.assertIn(f"层级不超过 {MAX_TREE_DEPTH}", DETAIL_PROMPT)
+        self.assertIn(f"节点不超过 {MAX_TREE_NODES}", SOURCED_DETAIL_PROMPT)
+
     def test_sourced_prompt_shows_verbatim_quote_example(self):
         """`quote` 退化成概括是最常见的一种坏引用，必须有正反例压住。"""
         original = "会议决定在十月十七日发布二点零版本。"
@@ -417,15 +534,61 @@ class PromptQualityTest(unittest.TestCase):
         self.assertIn("✅", SOURCED_DETAIL_PROMPT)
         self.assertIn(original, SOURCED_DETAIL_PROMPT)
 
-        good_line = SOURCED_DETAIL_PROMPT.split("✅", 1)[1].split("\n", 1)[0]
+        examples = self._quote_examples()
+        good_line = examples.split("✅", 1)[1].split("\n", 1)[0]
         good_quote = good_line.split('quote="', 1)[1].split('"', 1)[0]
         # 正向示例必须是原文里的连续片段，逐字可查
         self.assertIn(good_quote, original)
 
-        bad_line = SOURCED_DETAIL_PROMPT.split("❌", 1)[1].split("\n", 1)[0]
+        bad_line = examples.split("❌", 1)[1].split("\n", 1)[0]
         bad_quote = bad_line.split('quote="', 1)[1].split('"', 1)[0]
         # 反向示例是概括出来的话，原文里逐字找不到
         self.assertNotIn(bad_quote, original)
+
+
+class DepthPromptTest(unittest.TestCase):
+    """展开深度：判据是「还能不能再拆」，不是固定层数，也不是「越深越好」。
+
+    改这段之前，「每个分支再给 2-4 个要点」把结构暗示成根 → 分支 → 要点，
+    38036 字的论文实测只长到 4 层（103 个节点），`MAX_TREE_DEPTH = 8` 一次都
+    没被碰到；反过来写「越深越好」又会让模型为了凑层数制造节点。这两面都要守。
+    """
+
+    def test_no_prompt_suggests_a_fixed_number_of_levels(self):
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT,
+                       THINKING_MODELS["default"]["prompt"]):
+            self.assertNotIn("2-4", prompt)
+
+    def test_both_prompts_carry_the_split_until_rule(self):
+        """两条出口共用同一套深度规则：有来源时只换判据，不换「要不要继续拆」。"""
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
+            self.assertIn("还能不能再拆", prompt)
+            self.assertIn("不要停在两级", prompt)
+
+    def test_depth_ceiling_is_not_a_target(self):
+        """上限继续取自契约常量，并且明确写成可读性上限——数字不是目标。"""
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
+            self.assertIn(f"层级上限 {MAX_TREE_DEPTH}", prompt)
+            self.assertIn("不是要拆到的目标", prompt)
+
+    def test_stop_condition_is_stated(self):
+        """没有停止条件，「继续拆」就会变成造层级。"""
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
+            self.assertIn("最小可执行单元", prompt)
+            self.assertIn("单一概念", prompt)
+
+    def test_sourced_prompt_ties_depth_to_the_material(self):
+        """有来源时「继续拆」不能变成自由展开：判据必须落回原文。"""
+        self.assertIn("判据只看材料", SOURCED_DETAIL_PROMPT)
+        self.assertIn("必须能在原文里找到依据", SOURCED_DETAIL_PROMPT)
+        # 「拆得深」不许把「依据不足宁可少给」冲掉
+        self.assertIn("宁可少给", SOURCED_DETAIL_PROMPT)
+
+    def test_default_thinking_model_does_not_cap_depth(self):
+        """思考模型拼在生成提示词后面，它若给了层数区间就会被模型当成硬指标。"""
+        prompt = THINKING_MODELS["default"]["prompt"]
+        self.assertIn("不要停在两级", prompt)
+        self.assertIn("拆出更具体的内容", prompt)
 
 
 class ThinkingModelTest(unittest.TestCase):

@@ -722,4 +722,65 @@ describe('面板文案与候选骨架', () => {
     expect(text).not.toContain('分支 12');
     expect(text).toContain('……还有 2 个分支');
   });
+
+  it('工具失败时在对应进度行下方直接显示 code 与 message', () => {
+    const wrapper = panel((store) => {
+      store.agentEvents = [
+        { type: 'tool_start', seq: 1, call_id: 'c1', name: 'mindmap_generate' },
+        {
+          type: 'tool_end', seq: 2, call_id: 'c1', name: 'mindmap_generate', ok: false,
+          result_summary: {
+            code: 'invalid_map', message: '模型返回的导图不合法：引用与原文不匹配',
+            diagnostics: [{ code: 'QUOTE_MISMATCH' }], failed_branches: ['分支一'],
+          },
+        },
+      ];
+    });
+
+    const rows = wrapper.findAll('ol > li');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].text()).toContain('mindmap_generate 未成功');
+    expect(rows[0].find('p').text()).toBe('invalid_map：模型返回的导图不合法：引用与原文不匹配');
+    expect(rows[0].find('p').isVisible()).toBe(true);
+  });
+
+  it.each([
+    { summary: undefined, expected: '工具未返回具体失败原因。' },
+    { summary: {}, expected: '工具未返回具体失败原因。' },
+    { summary: { diagnostics: [], failed_branches: ['分支一'] }, expected: '工具未返回具体失败原因。' },
+    { summary: { code: 'generation_failed' }, expected: 'generation_failed' },
+    { summary: { message: '模型服务返回 HTTP 429' }, expected: '模型服务返回 HTTP 429' },
+    { summary: { code: null, message: { detail: '异常对象' } }, expected: '工具未返回具体失败原因。' },
+    { summary: { code: '', message: '  ' }, expected: '工具未返回具体失败原因。' },
+  ])('失败摘要缺字段或字段不可读时仍能渲染：$expected', ({ summary, expected }) => {
+    const wrapper = panel((store) => {
+      store.agentEvents = [{
+        type: 'tool_end', seq: 1, call_id: 'c1', name: 'mindmap_generate', ok: false,
+        result_summary: summary,
+      }];
+    });
+
+    expect(wrapper.find('ol > li > p').text()).toBe(expected);
+    expect(wrapper.text()).not.toContain('undefined');
+    expect(wrapper.text()).not.toContain('[object Object]');
+  });
+
+  it('成功工具不显示失败原因，重试成功不会盖掉之前失败的原因', () => {
+    const wrapper = panel((store) => {
+      store.agentEvents = [
+        {
+          type: 'tool_end', seq: 1, call_id: 'c1', name: 'mindmap_generate', ok: false,
+          result_summary: { code: 'generation_failed', message: '模型服务返回 HTTP 429' },
+        },
+        {
+          type: 'tool_end', seq: 2, call_id: 'c2', name: 'mindmap_generate', ok: true,
+          result_summary: { code: 'ok', message: '已恢复' },
+        },
+      ];
+    });
+
+    const rows = wrapper.findAll('ol > li');
+    expect(rows[0].find('p').text()).toContain('模型服务返回 HTTP 429');
+    expect(rows[1].find('p').exists()).toBe(false);
+  });
 });

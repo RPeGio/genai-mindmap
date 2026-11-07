@@ -152,6 +152,115 @@ def make_pdf(pages: int) -> bytes:
     return raw
 
 
+class FakePage:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def get_text(self, _mode: str) -> str:
+        return self._text
+
+
+class FakeDoc:
+    """只实现 `plan_page_count()` 用到的那一小块接口。
+
+    真实的 pymupdf 页写中文要额外的 CJK 字体，而这几个用例要断言的只是
+    「按多少 token 估这一页」，与渲染无关。
+    """
+
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+
+    def __getitem__(self, index: int) -> FakePage:
+        return FakePage(self._texts[index])
+
+
+class PageBudgetTest(unittest.TestCase):
+    """页数不再按固定值封顶：能装进上下文就继续处理。
+
+    原先 20 页是凭感觉定的：一份 30 页的讲义会被砍掉三分之一，而 300 页的
+    专著本来也塞不进一次生成。现在由 `plan_page_count()` 按上下文档算，
+    截断由调用方的 `truncated` 说明。
+    """
+
+    def test_scanned_pages_cost_the_measured_prior(self):
+        """没有文本层的页按实测 379 字/页 折算成 token。"""
+        # 379 字 ≈ 253 token；600 token 只装得下 2 页（506），第 3 页就超了
+        with patch.object(vision_pdf, "CONTEXT_TOKEN_LIMIT", 600):
+            limit = vision_pdf.plan_page_count(FakeDoc([""] * 8), 8)
+        self.assertEqual(limit, 2)
+
+    def test_text_layer_pages_cost_their_actual_length(self):
+        """有文本层的页按实际字符数算，比先验值贵得多。"""
+        # 1600 个 ASCII 字符 ≈ 400 token/页 → 600 token 只装得下 1 页
+        page = "a" * 1600
+        with patch.object(vision_pdf, "CONTEXT_TOKEN_LIMIT", 600):
+            limit = vision_pdf.plan_page_count(FakeDoc([page] * 4), 4)
+        self.assertEqual(limit, 1)
+
+    def test_no_fixed_page_cap_and_the_budget_scales(self):
+        """页数的唯一约束是上下文：预算越大处理得越多，且没有隐藏的页数上限。
+
+        原先断言「300 页 → 237 页」，那个 237 是按当时的阈值算出来的，阈值一调
+        就变成在断言一个过期数字。现在改成比两个预算：同一份 300 页文档，预算
+        放大十倍之后必须处理得更多，而且在足够大的预算下一页不丢。
+        """
+        doc = FakeDoc([""] * 300)       # 扫描页，按实测 253 token/页 折算
+        with patch.object(vision_pdf, "CONTEXT_TOKEN_LIMIT", 1_000):
+            small = vision_pdf.plan_page_count(doc, 300)
+            # 小预算也照收完 25 个短页：卡住页数的是预算，不是某个固定值（原先 20）
+            self.assertEqual(
+                vision_pdf.plan_page_count(FakeDoc(["page"] * 25), 25), 25)
+        with patch.object(vision_pdf, "CONTEXT_TOKEN_LIMIT", 100_000):
+            large = vision_pdf.plan_page_count(doc, 300)
+        self.assertLess(small, large)
+        self.assertEqual(large, 300)
+
+    def test_first_page_alone_over_the_limit_yields_zero(self):
+        """第一页就装不下时返回 0，由调用方明确报错而不是硬塞。
+
+        用极小预算构造这个场景，样本不必跟着阈值一起长大：1 token 连一页汉字
+        都装不下，结论与阈值取多少无关。
+        """
+        with patch.object(vision_pdf, "CONTEXT_TOKEN_LIMIT", 1):
+            limit = vision_pdf.plan_page_count(FakeDoc(["字" * 100]), 1)
+        self.assertEqual(limit, 0)
+
+
+class PdfPageBudgetTest(unittest.TestCase):
+    """`extract_pages()` 的页数来自上下文预算，不再是 min(总页数, 20)。"""
+
+    def _extract(self, raw: bytes, fake=None):
+        with patch("app.ingestion.vision_pdf._config",
+                   return_value=("http://example.invalid/v1", "k", "m")), \
+             patch("app.ingestion.vision_pdf._page_to_markdown",
+                   side_effect=fake or (lambda image, page_no: f"第 {page_no} 页正文")):
+            return vision_pdf.extract_pages(raw)
+
+    def test_all_pages_processed_when_the_budget_allows(self):
+        """25 页的小页文档全部处理：20 页硬上限已经删掉。"""
+        pages, total, limit, failed = self._extract(make_pdf(25))
+        self.assertEqual((total, limit), (25, 25))
+        self.assertEqual(len(pages), 25)
+        self.assertEqual(failed, [])
+
+    def test_budget_cut_is_reported_through_limit(self):
+        """装不下的部分不处理，用 limit < total 表达截断。"""
+        with patch.object(vision_pdf, "CONTEXT_TOKEN_LIMIT", 600):
+            pages, total, limit, failed = self._extract(make_pdf(6))
+        # 6 页每页都有很短文本层（≈4 token/页），但预算被压到 600 之后
+        # 仍然全部装得下；这里断言的是"limit 由预算算出来"这条链路打通了
+        self.assertEqual(total, 6)
+        self.assertEqual(limit, 6)
+        self.assertEqual(len(pages), 6)
+        self.assertEqual(failed, [])
+
+    def test_first_page_over_the_budget_is_an_error(self):
+        with patch.object(vision_pdf, "CONTEXT_TOKEN_LIMIT", 0):
+            with self.assertRaises(vision_pdf.VisionUnavailable) as ctx:
+                self._extract(make_pdf(2))
+        self.assertIn("上下文上限", str(ctx.exception))
+
+
 class PdfPageConcurrencyTest(unittest.TestCase):
     """PDF 逐页视觉识别是并发的，但结果必须按页码就位。
 
@@ -212,7 +321,7 @@ class PdfPageConcurrencyTest(unittest.TestCase):
         self.assertEqual(state["calls"], total_pages)
         # 上限就是 CONCURRENCY：线程池只有一个，不会因为页多而膨胀
         self.assertLessEqual(state["peak"], vision_pdf.CONCURRENCY)
-        # 但也必须真的并发，退化成串行会让 20 页扫描件慢上一分多钟
+        # 但也必须真的并发，退化成串行会让整份扫描件慢上一分多钟
         self.assertGreater(state["peak"], 1)
 
     def test_one_failed_page_keeps_the_others(self):

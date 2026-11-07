@@ -48,7 +48,7 @@
 | `POST /api/generations` | `{"text":"输入内容"}` | `{"mode":"demo 或 model","content":导图}` | 输入无效 422；模型配置或生成失败 502。 |
 | `POST /api/generations/stream` | `{"text":"输入内容"}` | SSE：`stage` / `node` / `done` / `error`，末尾 `data: [DONE]` | 流开始前校验失败走普通 JSON 422；开始后错误以 `{"type":"error"}` 事件下发 |
 | `POST /api/ingestion/text` | `{"text":"内容","kind":"text 或 markdown"}` | `{"source": 来源}` | 空文本或其他来源类型 422 |
-| `POST /api/pipeline/generate` | `{"sources":[来源]}` | `mode`、`content`、`diagnostics`、`stages` | 来源无效、重复或合并超过 20000 字 422；模型失败 502 |
+| `POST /api/pipeline/generate` | `{"sources":[来源]}` | `mode`、`content`、`diagnostics`、`stages` | 来源无效或重复 422；材料估算后超出模型上下文上限也 422（不再按固定字数卡）；模型失败 502 |
 | `POST /api/optimization/check` | `{"content":导图}` | 结构诊断列表 | 结构无效 422 |
 | `POST /api/optimization/suggest` | `{"content":导图}` | 诊断与候选建议 | 结构无效 422；建议需用户判断 |
 | `POST /api/export/puml` | `{"content":导图}` | PlantUML 文本；根节点来自 `root.label` | 结构无效 422 |
@@ -67,7 +67,7 @@ Agent 链路（`/api/agent/runs/stream`）用 v2 信封 `{v:2,runId,seq,baseClie
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。流水线目前同步返回，`stages` 是完成后的阶段记录，不是实时进度。
 
-**文档解析按格式走不同链路**（详见 [部署文档](DEPLOY.md)）。`.pdf` 逐页渲染后交模型视觉识别（demo 模式回落文本层，扫描件则 422），单份最多 50 页；`.docx`/`.pptx`/`.xlsx`/`.html`/`.md` 走 Docling 读结构化格式，不加载版面模型、离线可用；`.doc`/`.ppt` 要先经 LibreOffice 转 PDF 再视觉识别，没装 LibreOffice 时 422 并附安装命令；`.xls` 用 `xlrd` 直读单元格；`.png`/`.jpg`/`.webp`/`.gif`/`.bmp` 复用多模态调用；`.wav` 走百炼 Qwen-Audio-ASR（≤300 秒，更长自动切片）。解析失败或拿不到正文时返回 422，不返回空内容。
+**文档解析按格式走不同链路**（详见 [部署文档](DEPLOY.md)）。`.pdf` 逐页渲染后交模型视觉识别（demo 模式回落文本层，扫描件则 422），处理到第几页由上下文预算算出（`plan_page_count`，扫描页按 379 字/页折算），另有 300 页的转换护栏；`.docx`/`.pptx`/`.xlsx`/`.html`/`.md` 走 Docling 读结构化格式，不加载版面模型、离线可用；`.doc`/`.ppt` 要先经 LibreOffice 转 PDF 再视觉识别，没装 LibreOffice 时 422 并附安装命令；`.xls` 用 `xlrd` 直读单元格；`.png`/`.jpg`/`.webp`/`.gif`/`.bmp` 复用多模态调用；`.wav` 走百炼 Qwen-Audio-ASR（≤300 秒，更长自动切片）。解析失败或拿不到正文时返回 422，不返回空内容。
 
 `source` 是 `/api/ingestion/text` 返回的对象，也可按 `/docs` 中的 Source 结构提交；每次流水线最多 50 个来源，必须均为非空且已解析，ID 不可重复。当前超长会报错，不会静默截断或丢弃来源。
 

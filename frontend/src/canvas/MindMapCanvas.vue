@@ -10,6 +10,8 @@ const store = useMindMapStore();
 const { fitView, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
   useVueFlow();
 
+// 预览与候选节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
+// 画布这边不必自己判断来源，点不中就是点不中。
 onNodeClick(({ node }) => store.select(node.id));
 onNodeDoubleClick(({ node }) => store.beginEdit(node.id));
 onPaneClick(() => store.select(null));
@@ -121,14 +123,16 @@ onBeforeUnmount(() => {
       </template>
     </VueFlow>
 
+    <!-- 空态用「画布上一个节点都没有」判断，而不是「content 为空」：生成中预览
+         会长出节点，这时再压一条占位文字，正好盖住用户想看的生长过程。 -->
     <p
-      v-if="!store.content && !store.busy"
+      v-if="store.nodeCount === 0 && !store.busy"
       class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-slate-400"
     >
       还没有导图，先在左侧输入内容。
     </p>
     <p
-      v-else-if="!store.content && store.busy"
+      v-else-if="store.nodeCount === 0 && store.busy"
       class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-slate-400"
     >
       正在生成，稍候…

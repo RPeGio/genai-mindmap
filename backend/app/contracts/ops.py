@@ -18,6 +18,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.contracts.source import SourceRef
+from app.contracts.mindmap import MAX_TREE_NODES
 
 
 class OpError(Exception):
@@ -126,4 +127,11 @@ class OpBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     batch_id: str = Field(min_length=1, max_length=100)
     base_revision: int = Field(ge=0)
-    ops: list[MindMapOp] = Field(min_length=1, max_length=100)
+    # 上限取整树节点数：深层生成是**一次性提交整棵树**，一个节点对应一个 add，
+    # 所以一批的条数天然可以到节点上限。这里曾经固定 100，深一点的图直接抛
+    # ValidationError——而那道限制既不表达任何真实边界，也没人知道它存在，
+    # 只在放开生成深度之后才暴露出来。
+    #
+    # 不下放到 100 以下的理由：批次是原子的，拆成多批提交就不再是"整棵树一起
+    # 校验"，中途失败会留下半棵树。
+    ops: list[MindMapOp] = Field(min_length=1, max_length=MAX_TREE_NODES)

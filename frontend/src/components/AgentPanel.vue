@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
-import { agentToolLabel, useMindMapStore } from '../stores/mindmap';
+import { agentToolLabel, useMindMapStore, type PreviewNode } from '../stores/mindmap';
 
 /**
  * agent 运行面板：工具进度、候选骨架、候选确认、丢弃。
@@ -32,6 +32,13 @@ function rowText(name: string, state: 'running' | 'done', ok: boolean, ms: numbe
   return ok ? `${agentToolLabel(name, 'done')} · ${seconds(ms)}` : `${name} 未成功`;
 }
 
+function failureReason(summary?: Record<string, unknown>): string {
+  // 工具的摘要结构不同，只展示可读字段，避免把诊断对象或缺失值直接插进界面。
+  const parts = [summary?.code, summary?.message]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  return parts.join('：') || '工具未返回具体失败原因。';
+}
+
 /** 只把工具调用摘出来显示；stage 文案已经有单独的状态行了。 */
 interface ToolRow {
   key: string;
@@ -39,6 +46,7 @@ interface ToolRow {
   ok: boolean;
   /** 已经翻成人话的整行文案，模板不再拼字符串 */
   text: string;
+  detail: string;
 }
 
 const calls = computed<ToolRow[]>(() => {
@@ -54,6 +62,7 @@ const calls = computed<ToolRow[]>(() => {
         state: 'running',
         ok: true,
         text: rowText(event.name, 'running', true, 0),
+        detail: '',
       });
     } else if (event.type === 'tool_end') {
       if (!byId.has(event.call_id)) order.push(event.call_id);
@@ -62,6 +71,7 @@ const calls = computed<ToolRow[]>(() => {
         state: 'done',
         ok: event.ok,
         text: rowText(event.name, 'done', event.ok, event.latency_ms ?? 0),
+        detail: event.ok ? '' : failureReason(event.result_summary),
       });
     }
   }
@@ -90,6 +100,40 @@ const branches = computed<CandidateBranch[]>(() => {
 
 const shownBranches = computed(() => branches.value.slice(0, BRANCH_LIMIT));
 const hiddenBranches = computed(() => branches.value.length - shownBranches.value.length);
+
+/** 生长中的预览里的一行。层级摊平成缩进，模板里就不用递归组件。 */
+interface PreviewRow {
+  key: string;
+  label: string;
+  depth: number;
+  /** false 才做标记：null 是「模型还没写到」，画出来会和「明确不展开」混作一谈。 */
+  expandable: boolean | null;
+}
+
+/** 预览最多列几行：生成中它还会继续长，列到几十行就不再是"先看一眼"了。 */
+const PREVIEW_LIMIT = 24;
+
+function countPreview(node: PreviewNode): number {
+  return 1 + node.children.reduce((sum, child) => sum + countPreview(child), 0);
+}
+
+const previewRows = computed<PreviewRow[]>(() => {
+  const root = store.agentPreview;
+  if (!root) return [];
+  const rows: PreviewRow[] = [];
+  const walk = (node: PreviewNode, depth: number, key: string) => {
+    if (rows.length >= PREVIEW_LIMIT) return;
+    rows.push({ key, label: node.label, depth, expandable: node.expandable });
+    node.children.forEach((child, index) => walk(child, depth + 1, `${key}.${index}`));
+  };
+  walk(root, 0, '0');
+  return rows;
+});
+
+/** 根节点单独摆在标题行，列表从它的孩子开始。 */
+const previewBranchRows = computed(() => previewRows.value.filter(row => row.depth > 0));
+const previewTotal = computed(() => (store.agentPreview ? countPreview(store.agentPreview) : 0));
+const hiddenPreview = computed(() => previewTotal.value - previewRows.value.length);
 
 const canAccept = computed(() => store.candidate !== null && !store.agentRunning);
 
@@ -147,6 +191,9 @@ function cancel() {
         <span :class="call.state === 'running' ? 'text-slate-500' : call.ok ? 'text-emerald-700' : 'text-rose-700'">
           {{ call.text }}
         </span>
+        <p v-if="call.detail" class="mt-0.5 break-words text-[11px] leading-relaxed text-rose-700">
+          {{ call.detail }}
+        </p>
       </li>
     </ol>
 
@@ -173,6 +220,42 @@ function cancel() {
         还有 {{ hiddenDiagnostics }} 条
       </p>
     </div>
+
+    <!-- 生成中的预览：节点边跑边上屏，用户先看清树在往哪个方向长。
+         它和候选是两份内容——预览没经过整树校验，最终以候选为准。 -->
+    <details
+      v-if="store.agentPreview && !store.candidate"
+      open
+      class="mt-2 rounded bg-white px-2 py-1"
+    >
+      <summary class="cursor-pointer font-medium text-slate-700">
+        {{ store.agentRunning ? '生成中（预览）' : '上次生成中断时的预览' }}
+      </summary>
+      <p class="mt-1 break-words font-medium text-slate-700">{{ store.agentPreview.label }}</p>
+      <ul
+        v-if="previewBranchRows.length"
+        class="mt-1 flex flex-col gap-0.5 text-[11px] leading-relaxed text-slate-600"
+      >
+        <li
+          v-for="row in previewBranchRows"
+          :key="row.key"
+          class="break-words"
+          :style="{ paddingLeft: `${(row.depth - 1) * 12}px` }"
+        >
+          <!-- 只有模型明确写了「不用再拆」才加这个点；null 与 true 都不加。 -->
+          <span
+            v-if="row.expandable === false"
+            class="mr-1 inline-block h-1 w-1 rounded-full bg-slate-300 align-middle"
+            aria-hidden="true"
+          />
+          <span :class="row.expandable === false ? 'text-slate-400' : ''">{{ row.label }}</span>
+        </li>
+      </ul>
+      <p v-if="hiddenPreview > 0" class="mt-1 text-[11px] text-slate-400">
+        ……还有 {{ hiddenPreview }} 个节点
+      </p>
+      <p class="mt-1 text-[11px] text-slate-400">这是生成过程中的预览，以最终候选为准。</p>
+    </details>
 
     <!-- 候选骨架：让用户在点「应用」之前先看清这棵树长什么样，而不是盲点。 -->
     <details v-if="store.candidate" open class="mt-2 rounded bg-white px-2 py-1">

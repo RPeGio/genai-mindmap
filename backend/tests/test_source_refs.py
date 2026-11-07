@@ -11,7 +11,7 @@ import pytest
 
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.source import Source, SourceRef, SourceUsage
-from app.generation.service import generate
+from app.generation.service import CONTEXT_TOKEN_LIMIT, generate
 from app.main import app
 from app.mindmaps import repository
 from app.optimization.service import check
@@ -258,13 +258,42 @@ def test_demo_does_not_invent_references(monkeypatch, sources):
     assert [d.code for d in result.diagnostics] == ["UNSOURCED_NODE", "UNSOURCED_NODE"]
 
 
-def test_pipeline_limit_counts_original_whitespace(client):
-    with patch("app.generation.service.chat") as chat:
+def test_pipeline_no_longer_caps_character_count(client, tree):
+    """字数上限已删：20001 字（含大段空白）照常进入生成。
+
+    原先这里断言 422——`MAX_INPUT_CHARS = 20000`，而空白也算字数。那个数
+    没有实测依据，与"模型到底收不收"无关，现在只由 token 估算决定。
+    """
+    with patch("app.generation.service.chat", return_value=tree):
         response = client.post("/api/pipeline/generate", json={"sources": [
             {"id": "s1", "kind": "text", "status": "parsed", "text": " " * 20000 + "字"},
         ]})
-    assert response.status_code == 422
-    chat.assert_not_called()
+    assert response.status_code == 200, response.text
+
+
+def test_pipeline_rejects_material_over_context_tokens(client):
+    """替代字数上限的是上下文 token 边界：超了报 502 并带回可读文案。
+
+    502 而不是 422：这是模型拒绝服务的那一类失败（上游能力不足），
+    与"请求体不合法"是两回事——用户要改的是材料长度，不是请求格式。
+
+    样本按 `CONTEXT_TOKEN_LIMIT` 现算：限额是可调参数，写死字数的样本会在
+    调阈值之后掉进"装得下"的一侧，这条用例就从"超限必拒"退化成"正常生成"。
+    """
+    oversized = "字" * int(CONTEXT_TOKEN_LIMIT * 1.6)   # 汉字约 1.5 字/token
+    with patch("app.generation.service._config",
+               return_value=("https://example.com/v1", "k", "m")), \
+         patch("app.generation.service.httpx.Client") as http_client:
+        response = client.post("/api/pipeline/generate", json={"sources": [
+            {"id": "s1", "kind": "text", "status": "parsed", "text": oversized},
+        ]})
+
+    assert response.status_code == 502, response.text
+    detail = response.json()["detail"]
+    assert "超过模型上下文上限" in detail
+    assert "请精简后重试，或分成多次生成" in detail
+    # 超限的请求根本不该发出去
+    http_client.assert_not_called()
 
 
 @pytest.mark.parametrize("path", ["/api/optimization/check", "/api/optimization/suggest"])

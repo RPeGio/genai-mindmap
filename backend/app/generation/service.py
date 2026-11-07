@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from typing import Any
 from uuid import uuid4
@@ -12,20 +14,40 @@ import httpx
 from pydantic import ValidationError
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
-from app.contracts.mindmap import GenerateResponse, MindMapContent, Node
+from app.contracts.mindmap import (
+    MAX_TREE_DEPTH,
+    MAX_TREE_NODES,
+    GenerateResponse,
+    MindMapContent,
+    Node,
+)
 from app.contracts.source import Source, SourceUsage
 from app.optimization.source_refs import verify_source_refs
 
 # 单次模型调用的超时（秒）与响应体上限（字节）：超时避免请求无限挂起，
 # 上限避免异常响应把内存读满。
-_TIMEOUT_SECONDS = 60.0
+#
+# 超时 60 → 600。60 秒是照「一句话主题」的短输出拍的：实测 12106 字材料
+# → 13243 token 输出 → 48.6 秒，已经贴着上限；慢速档 97 tok/s 时同样的材料
+# 要 136 秒。超时的代价是整次请求报废（不是"稍后重试"），而模型本身仍在
+# 计费，所以它必须由物理时间决定，不能由产品口味决定。
+_TIMEOUT_SECONDS = 600.0
 _MAX_RESPONSE_BYTES = 2_000_000
 
-# 输出 token 上限。模型服务默认 8192，而实测一棵 240 节点的树要 7578 tok、
-# 输出文本约 1.3 万字符；DETAIL_PROMPT 允许 300 节点，必然超出上限被截断，
-# 而截断的 JSON 解析不出来，整次请求报废（实测 20000 字符的输入就撞过一次，
-# finish_reason=length、输出正好 8192）。服务端接受更大的值，取 16384 留余量。
-MAX_OUTPUT_TOKENS = 16384
+# 输出 token 上限。服务端默认 8192，实测 12106 字材料 → 13243 token 输出，
+# 16384 只剩 3000 token 余量；而 DeepSeek 接受 max_tokens=65536（HTTP 200）。
+# 按每节点约 25 token 算，65536 装得下 2600 个节点，高于契约允许的 1000 个，
+# 所以输出上限不再是内容被截断的原因——真被截断时 `finish_reason=length`
+# 会明确报错，不会静默交付半棵树。
+MAX_OUTPUT_TOKENS = 65536
+
+# 模型上下文（输入侧）上限，单位 token。**这是保守值，不是实测边界**：
+# 探测 api.deepseek.com 需要密钥，而本机没有可用密钥（占位密钥只拿到 401），
+# 无法把输入压到边界看它在哪个 token 数上返回 400。DeepSeek 标称 128K，
+# 但"标称窗口"与"扣掉系统提示词、输出预算之后还能塞多少"不是一回事，
+# 取不到一半留足余量。60000 token 约合 9 万汉字，实测 12106 字材料只用到
+# 一万多输入 token，正常材料离这条线很远。
+CONTEXT_TOKEN_LIMIT = 200000
 
 # 一次性生成完整导图的提示词（非流式接口、流式接口的第二段都用它）。
 #
@@ -39,21 +61,68 @@ DETAIL_PROMPT = (
     "把用户输入变成一张思维导图。只返回一个 JSON 对象，不要代码围栏。"
     "格式为 {\"title\":\"标题\",\"root\":{\"id\":\"唯一id\","
     "\"label\":\"节点文字\",\"children\":[]}}。每个节点均含 id、label、children，"
-    "ID 全局唯一，层级不超过 8，节点不超过 300。\n"
+    # 这里的两个数字取自契约常量：写死过一次，结果契约从 300 放到 1000 之后
+    # 提示词还在叫模型"不超过 300"，模型自我设限，契约放宽等于没生效。
+    f"ID 全局唯一，层级不超过 {MAX_TREE_DEPTH}，节点不超过 {MAX_TREE_NODES}。"
+    # 展开规则必须单独成段，判据只能是「还能不能再拆」。
+    #
+    # 早先这条规则被塞在分支数量里（「每个分支再给 2-4 个要点」），模型把它读成
+    # 结构定义：根 → 分支 → 要点，三级就收。实测一份 38036 字的论文只长到 4 层、
+    # 103 个节点——上限 8 一次都没被碰到，因为没有任何一句话在要求它往下走。
+    #
+    # 反向的坑同样要堵：写成「越深越好」模型会开始制造层级。所以这里给的是
+    # **停止条件**（最小可执行单元 / 单一概念），并把层数上限明确成可读性上限、
+    # 不是目标：深度由内容决定，不由数字决定。
+    f"层级上限 {MAX_TREE_DEPTH} 是可读性上限，不是要拆到的目标。"
+    "一个节点如果还能拆成更具体的子项，就继续拆；拆不动了就停："
+    "要么已经是最小可执行单元（能直接照着做），要么本身就是单一概念"
+    "（再拆只是把它自己换个说法重复一遍）。"
+    # 「单一概念」必须给出可判定的定义，否则模型容易把任何名词都当成概念就停手：
+    # 「多头注意力」「编码器堆栈」这类词背后明明还有组成部分和参数。
+    "判断「单一概念」只看一条：它还能不能分成两个并列的成分。"
+    "模块、流程、表格、公式这类有组成和参数的东西不算单一概念，"
+    "它们的组成部分就该是子节点。"
+    # 五套思考模型里都有「每个分支至少做什么」这类步骤。它们说的是**覆盖角度**，
+    # 不是深度终点；不点明这层区别，模型会把「每个分支配一个类比」当成「这一支
+    # 已经写完了」，深度规则就被它自己的思考步骤盖掉。
+    "思考方式里的步骤只决定按什么角度拆，不决定拆到哪一层。\n"
     "输入分两种，按情况处理：\n"
     "1) 完整材料（会议纪要、文章、笔记）：忠实整理它的结构，不要添加材料里"
-    "没有的内容。每个可分解的分支至少 2 个要点，目标 2-4 个；依据不足时宁可"
-    "少给，不要为了凑数补写。\n"
+    "没有的内容。每个可分解的分支至少 2 个要点，具体几个由内容决定；"
+    "依据不足时宁可少给，不要为了凑数补写。\n"
     "2) 简短的主题或目标（如「机器学习」「帮我规划毕业论文」）：围绕它展开成 "
-    "3-6 个一级分支，每个分支再给 2-4 个要点。这是框架展开，不算捏造；"
-    "但不要编造具体的数据、人名、文献或引用。\n"
+    "3-6 个一级分支，每个分支再按上面那条「还能不能再拆」继续往下拆。"
+    "这是框架展开，不算捏造；但不要编造具体的数据、人名、文献或引用。\n"
     "两种情况下所有一级分支加起来不少于 3 条，根节点都必须有子节点，"
     "只有根节点的结果不合格。"
+    # 正反例沿用手写示例的写法（下面 quote 那段也是 ❌/✅）：只说「更具体」时
+    # 模型每次都按自己的尺度解释，给一组形态对照它才有稳定的判据。
+    # 例子刻意不写任何领域内容——无来源时会被当成可抄的事实，有来源时又不在
+    # 材料里，两边都会变成凭空多出来的节点。
+    "\n拆到底还是提前停手，看这几组对照：\n"
+    "❌ 根 → 分支 → 要点，到此为止：这是两级结构，而那个要点下面明明还有可写的内容\n"
+    "✅ 根 → 分支 → 要点 → 具体做法或具体结论，直到每片叶子都能直接执行或直接成立\n"
+    "❌ 要点写得很长、下面却不再拆：那是把同一层写胖，不是把结构写深\n"
+    "✅ 每一层都比上一层更具体，父子不能是同一件事的两种说法\n"
+    "不要停在两级就收；也不要为了凑层数制造节点——拆不动的那一支到此为止是正常的。"
 )
 
 SOURCED_DETAIL_PROMPT = DETAIL_PROMPT + (
     "注意：这次输入的是带了来源的材料，按上面第 1 种形态处理，"
     "不要因为主题简短就自行展开——所有内容都必须能在 sources 里找到依据。"
+    # 深度规则在有来源时要换成「材料能支撑到多细」。不换的话会两错：
+    # 一是把上面那句「继续拆」当成自由展开的许可，拆出来的层级靠常识补；
+    # 二是反过来把「忠实整理」理解成只抄一层，材料里再多细节也不往下走。
+    # 判据必须落在原文上，这样「拆得深」和「依据不足宁可少给」才是同一条规则。
+    "「还能不能再拆」这条同样适用，判据只看材料：原文里还有更具体的表述支撑，"
+    "就继续拆一层；材料到这里就没有更细的说法了，就停。"
+    # 「更具体的表述」也要给形状。只说「更具体」时模型只去找正文句子，
+    # 而原文自带的分层（标题、编号、列表、表格行、公式步骤）同样是依据，
+    # 而且比「哪句更像细节」更稳定——它是原文写下的，不是模型判断出来的。
+    "原文自己的分层就是最直接的依据：标题、编号、列表项、表格的行、公式的每一步，"
+    "都是材料给出的分点——遇到它们就照原样落成一层，不要把一整节压进一个节点。"
+    "拆得深不等于写得满——每一层新增的节点都必须能在原文里找到依据，"
+    "材料里没有的内容一律不补，这一支宁可浅一点。"
     "用户输入为 sources 数组，每项含 source_id 和 text，text 是待整理的原文。"
     "每个有原文依据的节点增加 source_refs 数组，格式为"
     '[{"source_id":"输入中已有的来源ID","quote":"逐字摘录的原文片段"}]。'
@@ -80,7 +149,11 @@ THINKING_MODELS: dict[str, dict[str, str]] = {
         "prompt": (
             "1. 定中心：把输入浓缩成一句话放到根节点，不要用「XX 分析」这类空壳标题。\n"
             "2. 定骨架：挑 3-6 个互不重叠的大维度充当一级分支，并列或递进都行，但彼此不能是同一件事的两种说法。\n"
-            "3. 逐层细化：每个分支继续往下拆成做法、要点或例子，一般 2-4 层，越往下越具体。\n"
+            # 「一般 2-4 层」是同一个压深度的来源：它直接给了一个层数区间，
+            # 模型照抄区间，而 `DETAIL_PROMPT` 的深度规则是「能拆就拆、拆不动才停」。
+            # 两处口径打架时模型听具体的那个数字，所以这里只描述向下拆的条件。
+            "3. 逐层细化：每个分支继续往下拆成做法、要点或例子；只要某一项还能拆出更具体的内容"
+            "就再拆一层，拆到它成为能直接执行的动作或单一概念为止，不要停在两级。\n"
             "4. 校正：回头检查维度有没有缺、节点有没有放错层、有没有只剩标题没有内容的空分支；凑数的节点直接删掉。\n"
         ),
     },
@@ -172,6 +245,55 @@ class GenerationError(Exception):
     pass
 
 
+def estimate_input_tokens(text: str) -> int:
+    """估算一段文本的 token 数，用于在**发请求之前**判断它装不装得进上下文。
+
+    汉字约 1.5 字/token、ASCII 约 4 字符/token。这是离线可算的粗估，不是
+    分词器的真值：为了一次边界判断去接一份词表（还要跟模型版本同步）不划算，
+    而这里要回答的只是「离 6 万还差得远不远」。两个方向都偏向保守——汉字按
+    1.5 字/token 折算比真实中文 tokenizer 更费 token，ASCII 按 4 字符折算与
+    BPE 的经验值一致；高估会在边界上多拒一点，低估则是请求真的打到 400 上。
+    """
+    if not text:
+        return 0
+    # 0x2E80 起是 CJK 部首扩展：汉字、假名、全角标点都在这个区间之上，
+    # 它们的 token 密度与 ASCII 差四倍，必须分开算。
+    cjk = sum(1 for ch in text if ord(ch) >= 0x2E80)
+    return math.ceil(cjk / 1.5 + (len(text) - cjk) / 4)
+
+
+def context_overflow_error(
+    *, chars: int, tokens: int, limit: int, label: str = "材料",
+) -> GenerationError:
+    """上下文超限的错误对象。文案只有这一份实现。
+
+    多个入口（同步生成、工具内生成、agent 循环）都在守同一道边界，各写一句
+    文案的结果是同一件事故在界面上有三种说法。文案必须可操作：现在多长、
+    换算成多少 token、上限多少、用户能做什么。
+    """
+    return GenerationError(
+        f"{label}约 {chars} 字，估算 {tokens} token，超过模型上下文上限 {limit}。"
+        "请精简后重试，或分成多次生成。")
+
+
+def ensure_input_within_context(
+    text: str, *, label: str = "材料", limit: int = CONTEXT_TOKEN_LIMIT,
+    extra_tokens: int = 0,
+) -> int:
+    """输入装不进模型上下文时抛一条能直接展示给用户的错误；否则返回估算值。
+
+    这是**物理**边界，不是产品口径：超了模型不会给你半份结果，只会返回 400
+    并把整次请求作废。
+
+    `extra_tokens` 是同一次请求里除 `text` 之外的固定开销（系统提示词等），
+    只参与判断，不改变文案里那个用户看得见的长度。
+    """
+    tokens = estimate_input_tokens(text) + extra_tokens
+    if tokens <= limit:
+        return tokens
+    raise context_overflow_error(chars=len(text), tokens=tokens, limit=limit, label=label)
+
+
 # 模型偶尔无视「不要代码围栏」的指示，把 JSON 包进 ```json … ``` 里。
 # 裸 json.loads 会因此直接抛错，用户侧表现为随机失败 —— 实测 18 次调用里
 # 撞到 1 次。解析前先剥干净，比要求模型「务必听话」可靠。
@@ -257,6 +379,15 @@ def parse_model_json(content: str) -> Any:
     raise ValueError("模型返回内容里没有可解析的 JSON")
 
 
+def _truncated_output_error() -> GenerationError:
+    """输出撞上 `max_tokens` 被硬切时的错误。
+
+    文案只有这一份：一次性响应与流式响应都会拦到同一种截断，两处各写一句的结果
+    是同一个事故在日志与界面上有两种说法。
+    """
+    return GenerationError("模型输出撞上长度上限被截断，结果不完整，请重试")
+
+
 def _choice_content(body: Any) -> str:
     """从响应体里取出模型 content，并拦住被长度上限截断的输出。
 
@@ -268,7 +399,7 @@ def _choice_content(body: Any) -> str:
     """
     choice = body["choices"][0]
     if isinstance(choice, dict) and choice.get("finish_reason") == "length":
-        raise GenerationError("模型输出撞上长度上限被截断，结果不完整，请重试")
+        raise _truncated_output_error()
     return choice["message"]["content"]
 
 
@@ -288,6 +419,9 @@ def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, 
     只负责传输与 JSON 解析；结构是否符合契约由调用方用 MindMapContent 校验。
     """
     base, key, model = _config()
+    # 输入侧的物理边界，位置在 `_config()` 之后：配置缺失是部署问题，必须
+    # 先暴露，否则用户会按「精简材料」的提示白折腾一轮。
+    ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
     request_body: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -324,27 +458,105 @@ def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, 
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
 
 
-async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, Any]:
-    """`chat()` 的异步版本，供流式接口使用。
+def _stream_frame(data: str) -> tuple[str, str | None] | None:
+    """一帧 `data:` 里的 `(delta.content, finish_reason)`；形状不对返回 None。
 
-    流式接口必须能真正取消：客户端断开时 Starlette 会 cancel 生成器，
-    异步 httpx 会随之关闭连接、停止计费；同步 httpx 跑在线程里，
-    取消只能丢掉结果，请求本身仍会跑完并产生费用。
+    `content` 与 `finish_reason` 都可能只出现在其中一部分帧里（首帧常见
+    `role`、末帧才带 `finish_reason`），所以两者各自缺省，调用方不该指望
+    "一帧里同时拿到正文和结束原因"。
     """
-    import httpx
+    try:
+        choice = json.loads(data)["choices"][0] or {}
+        delta = choice.get("delta") or {}
+        text = delta.get("content")
+        reason = choice.get("finish_reason")
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return (text if isinstance(text, str) else "",
+            reason if isinstance(reason, str) else None)
 
-    base, key, model = _config()
-    request_body: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.2,
-        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
-    }
+
+async def _chat_streamed(
+    base: str,
+    request_body: dict[str, Any],
+    headers: dict[str, str],
+    on_delta: Callable[[str], Awaitable[None]],
+) -> dict[str, Any] | None:
+    """试一次 `stream: true` 请求：成功返回与一次性路径同形的解析结果。
+
+    返回 None 表示**这次流式尝试不算数**，调用方应当退回一次性请求。只有两种
+    情况故意抛出，因为它们与流式无关、一次性路径同样会拒：响应体超限、输出被
+    长度截断——重来一遍只是多花一次钱。
+
+    其余一切（服务端不认 `stream` 直接回整包 JSON、流里一段正文都没有、流中途
+    断掉、拼起来的正文解析不出对象、网络层报错）都退回 None：预览少几帧可以，
+    整次生成不能因为预览机制而失败。
+    """
+    content = ""
+    finish_reason: str | None = None
+    ended = False          # 见到 `[DONE]` 或 finish_reason 才算这次流完整结束
+    callback: Callable[[str], Awaitable[None]] | None = on_delta
+    body = dict(request_body, stream=True)
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS,
+                                     follow_redirects=True) as client:
+            async with client.stream("POST", base + "/chat/completions",
+                                     content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                     headers=headers) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    # 有的兼容端点写 `data:{...}` 不带空格，两种都要认
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        ended = True
+                        break
+                    frame = _stream_frame(data)
+                    if frame is None:
+                        continue
+                    text, reason = frame
+                    if reason is not None:
+                        finish_reason = reason
+                        ended = True
+                    if not text:
+                        continue
+                    content += text
+                    # UTF-8 下一个字符至少占一个字节，按字符数卡上限只会比按字节
+                    # 更早放弃，不会放一个超限响应把内存读满。
+                    if len(content) > _MAX_RESPONSE_BYTES:
+                        raise GenerationError("模型响应过大")
+                    if callback is None:
+                        continue
+                    try:
+                        await callback(text)
+                    except Exception:  # noqa: BLE001 — 预览出错不能连累这次生成
+                        # 回调是上层做的增量解析，它自己坏了就让后续正文不再上报，
+                        # 但正文照收：返回值仍是一次性路径那份解析结果。
+                        callback = None
+    except GenerationError:
+        raise
+    except Exception:  # noqa: BLE001 — 含 httpx 各类错误，一律退回一次性请求
+        return None
+    # 截断判定与一次性路径同源：宁可报错，也不要把补齐括号后的半份结果当成功。
+    if finish_reason == "length":
+        raise _truncated_output_error()
+    # 没有结束标记说明这条流被切断了。此时半截正文交给 `parse_model_json` 会被
+    # 补齐括号"解析成功"，一棵缺了半边的树就这样当成功交出去——退回一次性请求，
+    # 由它按完整响应的规则判定。
+    if not ended or not content:
+        return None
+    try:
+        return parse_model_json(content)
+    except ValueError:
+        return None
+
+
+async def _chat_once(
+    base: str, request_body: dict[str, Any], headers: dict[str, str],
+) -> dict[str, Any]:
+    """一次性请求：收满整个响应体再解析。"""
     payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, follow_redirects=True) as client:
             async with client.stream("POST", base + "/chat/completions",
@@ -366,6 +578,50 @@ async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -
         raise GenerationError("无法连接模型服务或请求超时") from exc
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
+
+
+async def chat_async(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int | None = None,
+    on_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """`chat()` 的异步版本，供流式接口使用。
+
+    流式接口必须能真正取消：客户端断开时 Starlette 会 cancel 生成器，
+    异步 httpx 会随之关闭连接、停止计费；同步 httpx 跑在线程里，
+    取消只能丢掉结果，请求本身仍会跑完并产生费用。
+
+    `on_delta` 只服务「让上层边收边做预览」，返回的仍然是**同一份**解析结果：
+    每收到一段 `delta.content` 调一次回调，最后还是走 `parse_model_json`。
+    它不存在"另一套输出"——任何一步不成立（服务端不认 stream、流被切断、正文
+    拼不起来、回调自己抛错）都退回一次性请求。宁可少几帧预览，也不能让这次
+    生成失败。
+
+    这里没有复用 `generation/stream_partial._stream_chat`：那个函数按
+    `DETAIL_PROMPT` 那条出口的固定配置发请求，不接受 `max_tokens`，复用它会让
+    工具这条出口的输出上限与 `RunBudget` 分叉——预算里写着上限，请求里却是另一个数。
+    """
+    base, key, model = _config()
+    # 与 `chat()` 同一道输入边界：工具内部的生成 / 展开也走这里，两条出口
+    # 各守一个数迟早会分叉。
+    ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
+    request_body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if on_delta is not None:
+        streamed = await _chat_streamed(base, request_body, headers, on_delta)
+        if streamed is not None:
+            return streamed
+    return await _chat_once(base, request_body, headers)
 
 
 def _demo_content(text: str) -> MindMapContent:
