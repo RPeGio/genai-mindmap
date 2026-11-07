@@ -102,6 +102,48 @@ export interface PreviewNode {
 }
 
 /**
+ * 预览节点 id 的前缀。
+ *
+ * 预览要进布局就得有 id（`layoutTidy` 用它做 memo 的键，扁平化用它建父子映射），
+ * 但 `node_grow` 帧里根本没有 id。前缀把派生 id 和真实 id 分开：真实 id 由模型或
+ * 后端给出，将来两者若出现在同一份数据里，靠前缀就能一眼认出哪些不可编辑。
+ */
+export const PREVIEW_ID_PREFIX = 'preview-';
+
+/**
+ * 预览节点的派生 id：根是 `preview-root`，其余按「从根出发的子节点索引链」拼。
+ *
+ * 不用递增计数器：帧是增量到达的，计数器会随插入顺序变化，同一棵树两次渲染就
+ * 会拿到不同的 id，布局缓存与 Vue 的 key 一起抖（节点闪一下、视图跳一下）。路径只
+ * 取决于节点在树里的位置，同一棵树永远得到同一套 id。
+ */
+export function previewNodeId(path: readonly number[]): string {
+  return path.length === 0 ? `${PREVIEW_ID_PREFIX}root` : `${PREVIEW_ID_PREFIX}${path.join('-')}`;
+}
+
+/**
+ * 预览树 → 布局能直接吃的 `MindNode` 树，顺手把可展开性收进 `expandable`。
+ *
+ * `note` / `source_refs` 一律不填：预览帧里没有正文与引用，编一份假的会让悬停卡片
+ * 和详情面板显示不存在的出处。两者都是契约里的可选字段，缺省时 `displayBody()`
+ * 回退到 `label`——预览节点显示的永远是它自己的文字。
+ */
+function previewSubtree(
+  node: PreviewNode,
+  path: number[],
+  expandable: Map<string, boolean | null>,
+): MindNode {
+  const id = previewNodeId(path);
+  expandable.set(id, node.expandable);
+  return {
+    id,
+    label: node.label,
+    children: node.children.map((child, index) =>
+      previewSubtree(child, [...path, index], expandable)),
+  };
+}
+
+/**
  * 等待父节点的帧最多攒几条。
  *
  * 正常运行时并发展开的 slot 只有个位数；攒到几百条只可能是父节点的帧一直没来
@@ -155,6 +197,13 @@ export interface MindNodeData {
   out: ChildSide[];
   /** 需要渲染的目标句柄：连线从父节点进来时落在哪一侧 */
   in: ChildSide[];
+  /**
+   * 这一帧画的是还没进画布的树：`preview` 是生成中，`candidate` 是已就绪但未应用。
+   * 缺省表示它就在 `content` 里，也就是用户的作品。画布据此弱化样式。
+   */
+  draft?: 'preview' | 'candidate';
+  /** 预览里模型明确标了「不用再展开」的节点，再弱一档；`null` 与 `true` 都不额外标记。 */
+  previewLeaf?: boolean;
 }
 
 export interface FlatNode {
@@ -168,6 +217,25 @@ export interface FlatNode {
  * 但 `:nodes` 变化时 applyChanges 会把 `selected` 同步进去，所以这里补上这个字段的类型。
  */
 export type MindFlowNode = FlowNode<MindNodeData> & { selected: boolean };
+
+/**
+ * 画布当前渲染的是哪棵树。
+ *
+ * 三级优先级：已应用的 `content` → 已就绪但未应用的 `candidate` → 生长中的
+ * `agentPreview`。前两级之外的一切（保存、导出、撤销、编辑、采纳）仍然只认
+ * `content`——渲染源只决定"画什么"，不决定"什么是用户的作品"。
+ */
+export type RenderKind = 'content' | 'candidate' | 'preview';
+
+interface RenderSource {
+  root: MindNode;
+  kind: RenderKind;
+  /** 预览节点的可展开性（派生 id → expandable）；非预览时是空表。 */
+  expandable: Map<string, boolean | null>;
+}
+
+/** 共用的空表：非预览来源不需要这份映射，别每次重算都新建一个。 */
+const NO_EXPANDABLE = new Map<string, boolean | null>();
 
 function flatten(root: MindNode): FlatNode[] {
   const out: FlatNode[] = [];
@@ -483,17 +551,51 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   let pendingRestore: (() => void) | null = null;
 
-  const layout = computed<LayoutResult | null>(() =>
-    content.value ? layoutTidy(content.value.root, { direction: direction.value }) : null,
-  );
+  /**
+   * 画布该画哪棵树。
+   *
+   * 三级优先级各有理由：
+   * 1. `content` 最优先。用户已经打开/生成了一张图时，让还没定稿的东西顶掉它，
+   *    看起来就是"我的图被改了"——而且失败或取消之后才发现内容消失过。
+   * 2. `candidate` 其次。`snapshot` 到达时预览会被整棵作废（那是必须的：不能再
+   *    挂着一棵没校验的树），如果这一级不存在，画布会在"预览→候选"之间空一帧，
+   *    退回到空态占位，用户还得点「应用」才看得见图。
+   * 3. `agentPreview` 垫底。节点一个一个到达，画布跟着长。
+   *
+   * 注意候选只是"看得见"：`acceptCandidate()` 的校验一步都没少，候选照样要用户
+   * 点「应用」才会写进 `content`。渲染与采纳是两件事。
+   */
+  const renderSource = computed<RenderSource | null>(() => {
+    if (content.value) {
+      return { root: content.value.root, kind: 'content', expandable: NO_EXPANDABLE };
+    }
+    if (candidate.value) {
+      return { root: candidate.value.root, kind: 'candidate', expandable: NO_EXPANDABLE };
+    }
+    if (agentPreview.value) {
+      const expandable = new Map<string, boolean | null>();
+      const root = previewSubtree(agentPreview.value, [], expandable);
+      return { root, kind: 'preview', expandable };
+    }
+    return null;
+  });
 
-  const flatNodes = computed<FlatNode[]>(() =>
-    content.value ? flatten(content.value.root) : [],
-  );
+  const layout = computed<LayoutResult | null>(() => {
+    const source = renderSource.value;
+    return source ? layoutTidy(source.root, { direction: direction.value }) : null;
+  });
+
+  const flatNodes = computed<FlatNode[]>(() => {
+    const source = renderSource.value;
+    return source ? flatten(source.root) : [];
+  });
 
   const nodes = computed<MindFlowNode[]>(() => {
     const current = layout.value;
-    if (!current) return [];
+    const source = renderSource.value;
+    if (!current || !source) return [];
+    // 只有已应用的树才可编辑：候选与预览都能画出来，但点不动、改不了。
+    const editable = source.kind === 'content';
 
     const parentOf = new Map<string, string | null>();
     for (const { node, parentId } of flatNodes.value) parentOf.set(node.id, parentId);
@@ -523,9 +625,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
         type: 'mind',
         draggable: false,
         connectable: false,
+        // 预览与候选都不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
+        // 空内容说话，expand 请求也会把后端不认识的 id 发回去。
+        selectable: editable,
         // 选中态由 store 说了算。只在点击时靠 Vue Flow 自己切换的话，代码里改选中
         // （加节点、删节点后跳到父节点）画布上看不出来，用户会以为还停在原来那个节点上。
-        selected: selectedId.value === node.id,
+        // 不可编辑时一律不显示选中：残留的 selectedId 可能正好撞上候选里的同名 id。
+        selected: editable && selectedId.value === node.id,
         position: {
           x: point.x - NODE_SIZE.width / 2,
           y: point.y - NODE_SIZE.height / 2,
@@ -537,6 +643,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
           depth,
           out: outSides,
           in: inSides,
+          draft: source.kind === 'content' ? undefined : source.kind,
+          previewLeaf: source.kind === 'preview' && source.expandable.get(node.id) === false,
         },
       } satisfies MindFlowNode;
     });
@@ -568,9 +676,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   const nodeCount = computed(() => flatNodes.value.length);
 
-  const selectedNode = computed<FlatNode | null>(
-    () => flatNodes.value.find(entry => entry.node.id === selectedId.value) ?? null,
-  );
+  /**
+   * 详情面板要显示的节点。
+   *
+   * 必须落在 `content` 里：画布上可能正画着候选或预览（`flatNodes` 跟着渲染源走），
+   * 而面板上的「改文字 / 加子节点 / 删除」全都写 `content`。没有已应用的树就没有
+   * 可编辑的节点，否则面板会摆出一排点了没反应的按钮。
+   */
+  const selectedNode = computed<FlatNode | null>(() => {
+    if (!content.value) return null;
+    return flatNodes.value.find(entry => entry.node.id === selectedId.value) ?? null;
+  });
 
   /** 从根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
   const breadcrumb = computed<MindNode[]>(() => {
@@ -801,6 +917,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = '根节点不能删除';
       return;
     }
+
+    // id 不在树上（预览的派生 id、候选的 id 都会走到这里）就直接退出。
+    // 交给 removeNode 的话它只会原样返回整棵树，而 applyContent 照样记一步历史、
+    // 递增 clientRevision——用户什么都没删，撤销栈和候选的新鲜度却被改脏了。
+    if (!findNode(content.value.root, id)) return;
 
     const parent = findParent(content.value.root, id);
     if (!applyContent({ ...content.value, root: removeNode(content.value.root, id) }, true)) return;
@@ -1081,7 +1202,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
   }
 
+  /**
+   * 选中一个节点。
+   *
+   * 只接受 `content` 里真实存在的节点。预览的派生 id 和候选的 id 都还没进画布：
+   * 选中它们会让右侧详情面板、面包屑，以及 `expand` 请求里的 `selected_ids` 一起
+   * 对着一个不存在的节点说话。画布那边同样给这些节点设了 `selectable: false`，
+   * 这里是不依赖渲染层的最后一道。
+   */
   function select(id: string | null) {
+    if (id !== null && !(content.value && findNode(content.value.root, id))) return;
     selectedId.value = id;
   }
 
