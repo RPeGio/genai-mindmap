@@ -156,6 +156,21 @@ def parse_model_json(content: str) -> Any:
     raise ValueError("模型返回内容里没有可解析的 JSON")
 
 
+def _choice_content(body: Any) -> str:
+    """从响应体里取出模型 content，并拦住被长度上限截断的输出。
+
+    `finish_reason == "length"` 表示输出在 max_tokens 处被硬切。不拦的话，
+    `parse_model_json` 里的 `_balance_brackets` 会把半截 JSON 的括号补齐，
+    让它"合法"——一棵缺了半边的树就这样被当成成功结果返回，比直接失败
+    难排查得多。`stop` 与字段缺失时照常解析：老版本的 mock、部分 OpenAI
+    兼容端点都不返回这个字段，那不是"被截断"，只是"没说原因"。
+    """
+    choice = body["choices"][0]
+    if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+        raise GenerationError("模型输出撞上长度上限被截断，结果不完整，请重试")
+    return choice["message"]["content"]
+
+
 def _config() -> tuple[str, str, str]:
     """读模型配置。缺失或格式不对时抛 GenerationError，让上层给出可读文案。"""
     base = os.getenv("MINDMAP_LLM_BASE_URL", "").strip().rstrip("/")
@@ -196,7 +211,9 @@ def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, 
                     if len(buffer) > _MAX_RESPONSE_BYTES:
                         raise GenerationError("模型响应过大")
         body = json.loads(buffer)
-        return parse_model_json(body["choices"][0]["message"]["content"])
+        # finish_reason 必须先看：被截断的 content 交给 parse_model_json 会被
+        # 补齐成"合法"的半棵树，那是最危险的一种成功。
+        return parse_model_json(_choice_content(body))
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         raise GenerationError(f"模型服务返回 HTTP {code}，请检查服务配置") from exc
@@ -238,7 +255,9 @@ async def chat_async(system: str, user: str, *, max_tokens: int | None = None) -
                     if len(buffer) > _MAX_RESPONSE_BYTES:
                         raise GenerationError("模型响应过大")
         body = json.loads(buffer)
-        return parse_model_json(body["choices"][0]["message"]["content"])
+        # agent 的工具（生成 / 展开）走这条路径，没有 provider 那层的
+        # finish_reason 检查，所以截断必须在这里拦住。
+        return parse_model_json(_choice_content(body))
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         raise GenerationError(f"模型服务返回 HTTP {code}，请检查服务配置") from exc
