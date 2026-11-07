@@ -22,6 +22,7 @@ from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.provider import _MAX_TOKENS_CAP
 from app.agent.tools import (
     BRANCH_EXPAND_PROMPT,
+    DEEP_CONCURRENCY,
     MAX_OUTPUT_TOKENS_CAP,
     MAX_SOURCE_CHARS,
     PLAN_PROMPT,
@@ -350,8 +351,13 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertTrue(result.ok, result.content)
         self.assertGreaterEqual(state["peak"], 2)
 
-    def test_concurrent_calls_are_capped_at_three(self):
-        """同时进行的展开调用不超过 3 个：一次打 8 个请求容易被服务端限流。"""
+    def test_concurrent_calls_are_capped_by_the_constant(self):
+        """同时进行的展开调用不超过 DEEP_CONCURRENCY。
+
+        上限值本身有实测依据（并发 3/5/8/10 全部成功，没有 429），所以这里
+        断言的是「不超过常量」，而不是某个写死的数字——否则调一次参数就要
+        改一次测试，等于测试在追着实现跑。
+        """
         ctx = _ctx(max_model_calls=9)
         state = {"running": 0, "peak": 0}
 
@@ -370,7 +376,7 @@ class GenerateDeepToolTest(unittest.TestCase):
                 points_per_branch=2), ctx))
 
         self.assertTrue(result.ok, result.content)
-        self.assertLessEqual(state["peak"], 3)
+        self.assertLessEqual(state["peak"], DEEP_CONCURRENCY)
         self.assertGreaterEqual(state["peak"], 2)
 
     def test_skeleton_with_two_branches_is_rejected(self):
