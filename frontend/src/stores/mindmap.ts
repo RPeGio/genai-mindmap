@@ -67,15 +67,6 @@ export function agentToolLabel(name: string, phase: 'running' | 'done'): string 
   return phase === 'running' ? pair.running : pair.done;
 }
 
-/**
- * agent 请求体：在契约的 `AgentRunRequest` 上补一个 `sources`。
- *
- * 后端已经接受这个字段（`list[Source]`），但 `api/types.ts` 的镜像还没跟上；
- * 本次改动范围不含那个文件，所以用交叉类型在 store 侧补上。契约同步后可以
- * 把这一行并回 types.ts。
- */
-type AgentRunBody = AgentRunRequest & { sources?: Source[] };
-
 export interface MindNodeData {
   /** 截断后的短标题，画在节点框里 */
   label: string;
@@ -1061,6 +1052,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     goal: string,
     intent: 'create' | 'expand' | 'edit' = 'create',
     sources?: Source[],
+    thinkingModel: string = 'default',
   ): Promise<void> {
     if (busy.value || agentRunning.value) return;
     const prompt = goal.trim();
@@ -1101,9 +1093,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
     let settled = false;
 
     try {
-      const body: AgentRunBody = {
+      const body: AgentRunRequest = {
         goal: prompt,
         intent,
+        // 始终显式带上：即使宿主页面没给值也发 default，而不是省略字段。
+        // 省略会把「前端没传」和「后端默认」两个概念混在一起，排查请求体时看不出
+        // 用户到底选了哪套拆解方式；值本身与后端默认一致，传了不影响结果。
+        thinking_model: thinkingModel || 'default',
         // create 不能带 snapshot（后端开流前会 422）；另外两种必须带
         snapshot: intent === 'create' ? null : content.value,
         selected_ids: intent === 'expand' && selectedId.value ? [selectedId.value] : [],

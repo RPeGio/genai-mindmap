@@ -10,6 +10,21 @@ const props = defineProps<{ confirmDiscard: (action: string) => boolean }>();
 const store = useMindMapStore();
 const sources = useSourcesStore();
 const prompt = ref('');
+
+/**
+ * 拆解方式（思维模型）。值与后端 `generation.service.THINKING_MODELS` 的键
+ * 一一对应；选项写死在这里而不是拉接口，是因为这一批不做那个接口，而写死的
+ * 五个值也正是后端 Literal 允许的全集——两边不一致时后端会 422，不会静默变形。
+ */
+const THINKING_MODEL_OPTIONS = [
+  { value: 'default', label: '通用' },
+  { value: 'first-principles', label: '第一性原理' },
+  { value: 'feynman', label: '费曼' },
+  { value: 'systematic', label: '5W1H' },
+  { value: 'critical', label: '批判性' },
+];
+const thinkingModel = ref('default');
+
 const recording = ref(false);
 const generating = computed(() => store.busy || store.sourceGenerating);
 const combined = computed(() => [
@@ -46,7 +61,7 @@ async function generate() {
     const ready = sources.readySources;
     // 只写了材料、没写目标时给一句占位，别把正文当目标塞进去。
     const goal = text || (ready.length ? `请基于附带的 ${ready.length} 份材料生成导图` : '');
-    await store.runGeneration(goal, store.content ? 'edit' : 'create', ready);
+    await store.runGeneration(goal, store.content ? 'edit' : 'create', ready, thinkingModel.value);
     return;
   }
 
@@ -88,6 +103,15 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       <span class="text-xs text-slate-400">文本 · 文档 · 图片 · 语音</span>
     </div>
     <label for="prompt" class="text-xs font-medium text-slate-600">输入主题或文本</label>
+    <label for="thinking-model" class="text-xs font-medium text-slate-600">拆解方式</label>
+    <select
+      id="thinking-model"
+      v-model="thinkingModel"
+      :disabled="generating"
+      class="rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
+    >
+      <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+    </select>
     <textarea
       id="prompt"
       v-model="prompt"

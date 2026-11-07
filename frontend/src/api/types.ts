@@ -178,6 +178,14 @@ export interface PipelineResponse {
 export interface AgentRunRequest {
   goal: string;
   intent: 'create' | 'expand' | 'edit';
+  /**
+   * 拆解方式：同一句主题换一套步骤，长出来的树结构就不同。
+   *
+   * 取值与后端 `generation.service.THINKING_MODELS` 的键一一对应；后端是
+   * Literal，拼错会被 422 拒（不是静默退化成 default），所以这里保持宽松的
+   * string，由下拉框保证只在五个值里出现。缺省即 `default`。
+   */
+  thinking_model?: string;
   snapshot?: MindMapContent | null;
   selected_ids?: string[];
   /**

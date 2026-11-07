@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import AgentPanel from '../src/components/AgentPanel.vue';
+import SourceInputs from '../src/components/SourceInputs.vue';
 import type { MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 
@@ -469,6 +470,52 @@ describe('来源进入请求体', () => {
 
     // 空数组也不发：旧后端对多出来的字段是 extra="forbid"
     expect((calls[0].body as Record<string, unknown>).sources).toBeUndefined();
+  });
+});
+
+describe('思维模型进入请求体', () => {
+  it('选中某一套拆解方式时，请求体带 thinking_model', async () => {
+    const calls = stubFetch(() => agentReply([doneFrame(content())]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('做一张导图', 'create', undefined, 'first-principles');
+
+    const body = calls[0].body as Record<string, unknown>;
+    expect(body.thinking_model).toBe('first-principles');
+  });
+
+  it('没有指定时请求体里是 default，与后端默认值一致', async () => {
+    const calls = stubFetch(() => agentReply([doneFrame(content())]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('做一张导图', 'create');
+
+    // 两种形态（省略字段 / 显式发 default）选后者并保持一致：排查请求体时
+    // 一眼能看出用户选了哪套拆解方式，不用去猜"没这个字段是什么意思"。
+    expect((calls[0].body as Record<string, unknown>).thinking_model).toBe('default');
+  });
+
+  it('下拉的五个选项与后端标识一致，默认选中通用', async () => {
+    const wrapper = mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+
+    const select = wrapper.get('#thinking-model');
+    const options = select.findAll('option');
+    expect(options.map(option => option.attributes('value'))).toEqual([
+      'default', 'first-principles', 'feynman', 'systematic', 'critical',
+    ]);
+    expect(options.map(option => option.text())).toEqual([
+      '通用', '第一性原理', '费曼', '5W1H', '批判性',
+    ]);
+    expect((select.element as HTMLSelectElement).value).toBe('default');
+    expect(select.attributes('disabled')).toBeUndefined();
+
+    // 生成期间与旁边的输入框行为一致：禁用，免得用户改了方式却看不到它生效
+    useMindMapStore().busy = true;
+    await wrapper.vm.$nextTick();
+    expect(select.attributes('disabled')).toBeDefined();
   });
 });
 
