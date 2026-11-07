@@ -209,6 +209,96 @@ describe('agent 运行', () => {
   });
 });
 
+describe('部分完成与诊断', () => {
+  it('tool_end 标了 partial 时，状态行说明部分分支未完成', async () => {
+    stubFetch(() => agentReply([
+      // 后端分片生成的真实形态：ok=true，但分支没展开完
+      {
+        type: 'tool_end',
+        seq: 1,
+        call_id: 'c1',
+        name: 'mindmap_generate',
+        ok: true,
+        latency_ms: 1200,
+        result_summary: { planned_branches: 4, expanded_branches: 1, partial: true, diagnostics: [] },
+      },
+      doneFrame(content('候选')),
+    ]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('做一张导图', 'create');
+
+    expect(store.agentWarnings.some(item => item.kind === 'partial')).toBe(true);
+    // 只看 ok 的话这里是「候选已就绪」，与全部成功一模一样——正是要修掉的
+    expect(store.status).toContain('候选');
+    expect(store.status).toContain('部分');
+  });
+
+  it('带 diagnostics 时面板列出诊断 message，超过三条折成计数', async () => {
+    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
+    const messages = [
+      '分支「神经网络」展开失败，已留空',
+      '因模型调用额度不足，分支「优化理论」没有展开，已留空',
+      '分支「概率图模型」只有 2 个要点，少于要求的 4 个',
+      '节点「过拟合」与「泛化误差」重复',
+    ];
+    stubFetch(() => agentReply([
+      {
+        type: 'tool_end',
+        seq: 1,
+        call_id: 'c1',
+        name: 'mindmap_generate',
+        ok: true,
+        latency_ms: 900,
+        result_summary: {
+          partial: true,
+          diagnostics: messages.map((message, index) => ({
+            level: 'warn',
+            code: `DIAG_${index}`,
+            message,
+          })),
+        },
+      },
+      doneFrame(content('候选')),
+    ]));
+    const store = useMindMapStore();
+    await store.runGeneration('做一张导图', 'create');
+
+    const wrapper = mount(AgentPanel);
+    const text = wrapper.text();
+    // 部分完成标记与诊断正文都要出现在候选区上方
+    expect(text).toContain('部分完成');
+    expect(text).toContain(messages[0]);
+    expect(text).toContain(messages[2]);
+    // 前三条之后折成一句计数
+    expect(text).not.toContain(messages[3]);
+    expect(text).toContain('还有 1 条');
+  });
+
+  it('接受候选后告警清空，不再挂在面板上', async () => {
+    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
+    stubFetch(() => agentReply([
+      {
+        type: 'tool_end',
+        seq: 1,
+        call_id: 'c1',
+        name: 'mindmap_generate',
+        ok: true,
+        result_summary: { partial: true, diagnostics: [] },
+      },
+      doneFrame(content('候选')),
+    ]));
+    const store = useMindMapStore();
+    await store.runGeneration('做一张导图', 'create');
+    expect(store.agentWarnings).toHaveLength(1);
+
+    expect(store.acceptCandidate()).toBe('applied');
+
+    // 候选已经落到画布上，"这份候选缺了什么"再挂着只会让用户以为画布有问题
+    expect(store.agentWarnings).toHaveLength(0);
+  });
+});
+
 describe('候选接受', () => {
   async function prepare() {
     stubFetch(() => agentReply([doneFrame(content('候选'))]));
@@ -373,6 +463,31 @@ describe('撤销 / 重做与候选', () => {
     expect(store.acceptCandidate()).toBe('stale');
     expect(store.content?.root.children[0].label).toBe('改过的甲');
   });
+
+  it('空画布接受候选后，撤销与重做都能回到空白', async () => {
+    stubFetch(() => agentReply([doneFrame(content('候选'))]));
+    const store = useMindMapStore();
+    expect(store.content).toBeNull();
+
+    await store.runGeneration('做一张图', 'create');
+    expect(store.acceptCandidate()).toBe('applied');
+    expect(store.content?.root.label).toBe('候选');
+
+    // 撤销回到接受之前的空画布：pushHistoryOrEmpty 压进去的是字符串 'null'
+    store.undo();
+    expect(store.content).toBeNull();
+    expect(store.selectedId).toBeNull();
+    expect(store.editingId).toBeNull();
+
+    // 重做回到候选。'null' 解析出来就是 null，不处理这条路径的话
+    // 这一步会把「空画布」从撤销栈里弄丢（缺陷 3）
+    store.redo();
+    expect(store.content?.root.label).toBe('候选');
+
+    // 于是再撤销仍然回得到空白
+    store.undo();
+    expect(store.content).toBeNull();
+  });
 });
 
 describe('候选接受之后的身份', () => {
@@ -496,6 +611,10 @@ describe('思维模型进入请求体', () => {
   });
 
   it('下拉的五个选项与后端标识一致，默认选中通用', async () => {
+    // 新行为：下拉只在「会真正生效」时渲染（agent 路径 + 画布为空 / create）。
+    // 旧的一次性生成接口与 edit 路径都不消费 thinking_model，所以这里先打开
+    // agent 开关，再断言选项；不打开的话下拉根本不出现（见下面两条用例）。
+    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
     const wrapper = mount(SourceInputs, {
       global: { plugins: [createPinia()] },
       props: { confirmDiscard: () => true },
@@ -511,11 +630,39 @@ describe('思维模型进入请求体', () => {
     ]);
     expect((select.element as HTMLSelectElement).value).toBe('default');
     expect(select.attributes('disabled')).toBeUndefined();
+    // 旁边那一行短说明：用户得知道选了它会影响什么
+    expect(wrapper.text()).toContain('按这种方式拆解主题');
 
     // 生成期间与旁边的输入框行为一致：禁用，免得用户改了方式却看不到它生效
     useMindMapStore().busy = true;
     await wrapper.vm.$nextTick();
     expect(select.attributes('disabled')).toBeDefined();
+  });
+
+  it('agent 路径关闭时下拉不渲染', () => {
+    // 关闭时走旧的一次性生成接口，它根本不接收 thinking_model：
+    // 把选不生效的控件摆在这里，用户会以为自己换过拆解方式了。
+    const wrapper = mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+
+    expect(wrapper.find('#thinking-model').exists()).toBe(false);
+  });
+
+  it('已有导图（edit 场景）时下拉不渲染', async () => {
+    // 有导图时点击生成走 edit 意图，后端的编辑路径同样不消费 thinking_model。
+    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
+    const wrapper = mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+    expect(wrapper.find('#thinking-model').exists()).toBe(true);
+
+    useMindMapStore().preview(content('原图'), 'right');
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find('#thinking-model').exists()).toBe(false);
   });
 });
 

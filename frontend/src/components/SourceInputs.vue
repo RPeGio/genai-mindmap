@@ -25,6 +25,15 @@ const THINKING_MODEL_OPTIONS = [
 ];
 const thinkingModel = ref('default');
 
+/**
+ * 拆解方式只在"会真正生效"的路径上出现。
+ *
+ * 两条路选了没用：`agentEnabled === false` 时走旧的一次性生成接口，它不接收
+ * `thinking_model`；已有导图时走 `edit` 意图，后端的编辑路径也不消费这个字段。
+ * 摆一个选了不起作用的控件，比不摆更糟——用户会以为自己换过拆法了。
+ */
+const thinkingModelVisible = computed(() => store.agentEnabled && !store.content);
+
 const recording = ref(false);
 const generating = computed(() => store.busy || store.sourceGenerating);
 const combined = computed(() => [
@@ -103,15 +112,19 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       <span class="text-xs text-slate-400">文本 · 文档 · 图片 · 语音</span>
     </div>
     <label for="prompt" class="text-xs font-medium text-slate-600">输入主题或文本</label>
-    <label for="thinking-model" class="text-xs font-medium text-slate-600">拆解方式</label>
-    <select
-      id="thinking-model"
-      v-model="thinkingModel"
-      :disabled="generating"
-      class="rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
-    >
-      <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
-    </select>
+    <template v-if="thinkingModelVisible">
+      <label for="thinking-model" class="text-xs font-medium text-slate-600">拆解方式</label>
+      <select
+        id="thinking-model"
+        v-model="thinkingModel"
+        :disabled="generating"
+        title="按这种方式拆解主题"
+        class="rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
+      >
+        <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+      </select>
+      <p class="text-xs leading-relaxed text-slate-400">按这种方式拆解主题</p>
+    </template>
     <textarea
       id="prompt"
       v-model="prompt"

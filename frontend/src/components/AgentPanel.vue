@@ -93,6 +93,22 @@ const hiddenBranches = computed(() => branches.value.length - shownBranches.valu
 
 const canAccept = computed(() => store.candidate !== null && !store.agentRunning);
 
+/**
+ * 结果不完整的证据：partial 标记单独摆在标题行，诊断逐条列 message。
+ *
+ * 后端在 `ok=true` 的同时给出这些信息，界面只认 ok 的话，「3 个分支失败」
+ * 和「全部成功」长得一模一样，用户点完接受才发现树缺了一块。
+ */
+const partialWarning = computed(
+  () => store.agentWarnings.find(item => item.kind === 'partial') ?? null,
+);
+const diagnostics = computed(() => store.agentWarnings.filter(item => item.kind === 'diagnostic'));
+
+/** 最多列三条诊断：再往下列就不是提个醒，而是让用户读长文了。 */
+const DIAGNOSTIC_LIMIT = 3;
+const shownDiagnostics = computed(() => diagnostics.value.slice(0, DIAGNOSTIC_LIMIT));
+const hiddenDiagnostics = computed(() => diagnostics.value.length - shownDiagnostics.value.length);
+
 function accept() {
   store.acceptCandidate();
 }
@@ -137,6 +153,26 @@ function cancel() {
     <p v-if="store.agentError" role="alert" class="mt-2 leading-relaxed text-rose-700">
       {{ store.agentError }}
     </p>
+
+    <!-- 部分完成与诊断：放在候选上方，用户先看到"这棵树不完整"，再决定接不接受。 -->
+    <div
+      v-if="store.agentWarnings.length"
+      role="status"
+      class="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 leading-relaxed text-amber-800"
+    >
+      <p v-if="partialWarning" class="font-medium">
+        部分完成<span class="font-normal">：{{ partialWarning.message }}</span>
+      </p>
+      <p v-else class="font-medium">这次生成有诊断提示</p>
+      <ul v-if="shownDiagnostics.length" class="mt-1 flex flex-col gap-0.5 text-[11px]">
+        <li v-for="item in shownDiagnostics" :key="`${item.code}|${item.message}`" class="break-words">
+          {{ item.message }}
+        </li>
+      </ul>
+      <p v-if="hiddenDiagnostics > 0" class="mt-1 text-[11px]">
+        还有 {{ hiddenDiagnostics }} 条
+      </p>
+    </div>
 
     <!-- 候选骨架：让用户在点「应用」之前先看清这棵树长什么样，而不是盲点。 -->
     <details v-if="store.candidate" open class="mt-2 rounded bg-white px-2 py-1">

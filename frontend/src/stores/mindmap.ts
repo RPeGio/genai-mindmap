@@ -67,6 +67,59 @@ export function agentToolLabel(name: string, phase: 'running' | 'done'): string 
   return phase === 'running' ? pair.running : pair.done;
 }
 
+/**
+ * 一次 agent 运行里后端报出来的告警。
+ *
+ * 分片生成可能返回 `ok=true` 但结果不完整：`result_summary.partial` 为真，
+ * 或带一串 `diagnostics`（BRANCH_FAILED / BRANCH_SKIPPED_BUDGET / DUPLICATE_POINT…）。
+ * 只看 ok 的话，「3 个分支失败」和「全部成功」在界面上长得一模一样，
+ * 用户点了接受才发现树缺一块。两种信号都收进同一个列表。
+ */
+export interface AgentWarning {
+  /** partial=分片没跑完；diagnostic=后端给的某条具体诊断 */
+  kind: 'partial' | 'diagnostic';
+  /** 诊断码（如 BRANCH_FAILED）；partial 项固定为 PARTIAL */
+  code: string;
+  message: string;
+}
+
+/** 告警上限：面板只显示前几条并折叠，这里防的是后端一路刷屏。 */
+const AGENT_WARNING_LIMIT = 20;
+
+/**
+ * 从 `tool_end` 的 `result_summary` 里摘出"这次结果不完整"的告警。
+ *
+ * `result_summary` 是后端 `ToolResult.data` 原样透传，键形态不走类型契约
+ * （`diagnostics` 在 types.ts 里就是 unknown[]），所以这里逐字段收窄，
+ * 不假设形状——模型工具换一版数据结构时，面板最多少显示几条，不会崩。
+ */
+function agentWarningsFrom(summary?: Record<string, unknown>): AgentWarning[] {
+  if (!summary) return [];
+  const out: AgentWarning[] = [];
+  if (summary.partial === true) {
+    out.push({
+      kind: 'partial',
+      code: 'PARTIAL',
+      message: '有分支没能生成完整，候选可能缺内容。',
+    });
+  }
+  const raw = summary.diagnostics;
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const entry = item as Record<string, unknown>;
+      const message = typeof entry.message === 'string' ? entry.message.trim() : '';
+      if (!message) continue;
+      out.push({
+        kind: 'diagnostic',
+        code: typeof entry.code === 'string' ? entry.code : '',
+        message,
+      });
+    }
+  }
+  return out;
+}
+
 export interface MindNodeData {
   /** 截断后的短标题，画在节点框里 */
   label: string;
@@ -172,6 +225,43 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const agentEvents = ref<AgentEvent[]>([]);
   const agentRunning = ref(false);
   const agentError = ref('');
+
+  /**
+   * 本轮运行里"结果不完整"的证据：部分完成标记 + 每条诊断。
+   *
+   * 面板在候选上方按琥珀色列出，`status` 也会因此改成「部分分支未完成」。
+   * 只认 `ok` 的时候，这三条信息一条都没地方落。
+   */
+  const agentWarnings = ref<AgentWarning[]>([]);
+
+  /** 记下这一帧的告警：同 kind + code + message 只留一条，两个工具报同一件事时不重复刷屏。 */
+  function recordWarnings(next: AgentWarning[]) {
+    if (!next.length) return;
+    const seen = new Set(agentWarnings.value.map(item => `${item.kind}|${item.code}|${item.message}`));
+    const merged = [...agentWarnings.value];
+    for (const item of next) {
+      const key = `${item.kind}|${item.code}|${item.message}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(item);
+    }
+    agentWarnings.value = merged.slice(0, AGENT_WARNING_LIMIT);
+  }
+
+  /**
+   * 「候选已就绪」这句的完整文案。
+   *
+   * 结果不完整时必须和全部成功区分开：只写「候选已就绪」，用户点接受之后
+   * 才发现某几支是空的。partial 与"只有诊断"分开说——「分支未完成」这种话
+   * 放在一棵只是有重复节点待合并的树上并不成立。
+   */
+  function candidateStatus(base: string): string {
+    if (agentWarnings.value.some(item => item.kind === 'partial')) {
+      return `${base}（部分分支未完成），确认后才会应用到画布。`;
+    }
+    if (agentWarnings.value.length) return `${base}（有诊断提示），确认后才会应用到画布。`;
+    return `${base}，确认后才会应用到画布。`;
+  }
 
   /** 保存撞上 409 时置位，由界面弹窗让用户选"重新加载 / 另存为新导图 / 取消"。 */
   const conflict = ref<{ message: string } | null>(null);
@@ -335,6 +425,23 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const target = selectedId.value;
     if (target && content.value && !findNode(content.value.root, target)) {
       selectedId.value = null;
+    }
+  }
+
+  /**
+   * 把一步历史快照装回画布。
+   *
+   * 快照可能是字符串 `'null'`——接受候选之前画布是空的时候，`pushHistoryOrEmpty()`
+   * 压的就是它。`JSON.parse('null')` 得到 null，正好是 `MindMapContent | null`
+   * 的另一半；但选中与编辑态还指着已经不存在的旧节点，必须一起清掉，
+   * 否则详情面板和编辑框会继续对着空白画布说话。
+   */
+  function restoreSnapshot(snap: string) {
+    const parsed = JSON.parse(snap) as MindMapContent | null;
+    content.value = parsed;
+    if (!parsed) {
+      selectedId.value = null;
+      editingId.value = null;
     }
   }
 
@@ -506,9 +613,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
     const snap = past.value.pop();
     if (!snap) return;
-    const current = snapshot();
-    if (current) future.value.push(current);
-    content.value = JSON.parse(snap) as MindMapContent;
+    // 当前是空画布时也要压一步 `'null'`，否则「空 → 候选 → 撤销 → 重做 → 撤销」
+    // 的最后一步会丢掉：重做那一次不记历史，再撤销就没得可撤，回不到空白。
+    future.value.push(snapshot() ?? 'null');
+    restoreSnapshot(snap);
     dirty.value = true;
     // 撤销改的就是画布本身，必须让「候选基于哪个版本算出来」的判断看见这一步。
     // 不递增的话，用户撤销一步再点「应用到画布」，撤销白做、候选照样落地。
@@ -525,9 +633,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
     const snap = future.value.pop();
     if (!snap) return;
-    const current = snapshot();
-    if (current) past.value.push(current);
-    content.value = JSON.parse(snap) as MindMapContent;
+    // 与 undo 对称：当前是空画布时把空画布压进撤销栈，这样重做之后仍能撤回空白。
+    past.value.push(snapshot() ?? 'null');
+    if (past.value.length > HISTORY_LIMIT) past.value.shift();
+    restoreSnapshot(snap);
     dirty.value = true;
     // 同 undo：重做同样把画布换成了另一棵树，候选再不成立。
     clientRevision.value += 1;
@@ -824,6 +933,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     active?.abort();
     busy.value = false;
     agentRunning.value = false;
+    // 这一轮就此作废：告警跟着一起清，否则取消之后面板还挂着"部分分支未完成"。
+    agentWarnings.value = [];
     stageText.value = '';
     sourceGenerationError.value = '';
     if (restorePrevious && pendingRestore) {
@@ -1063,6 +1174,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 看起来像"这次又失败了"。
       agentEvents.value = [];
       agentError.value = '';
+      agentWarnings.value = [];
       status.value = '请在下方「输入主题或文本」里写下要生成的内容；上面的「导图标题」只改名字，不会重新生成。';
       return;
     }
@@ -1073,6 +1185,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     agentError.value = '';
     agentEvents.value = [];
+    // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。
+    agentWarnings.value = [];
     candidate.value = null;
     // 记下候选所依据的版本与所在的图：接受时用它判断期间有没有被改过、有没有换了图。
     // 意图也要记：接受时得知道这份内容算「新作品」还是「改现有这张图」。
@@ -1122,23 +1236,33 @@ export const useMindMapStore = defineStore('mindmap', () => {
             // 状态行显示的也是人话：用户读不到 `mindmap_generate` 这种函数名。
             stageText.value = agentToolLabel(event.name, 'running');
             break;
-          case 'tool_end':
+          case 'tool_end': {
             stageText.value = event.ok
               ? agentToolLabel(event.name, 'done')
               : `${event.name} 未成功`;
+            // 后端分片生成会以 ok=true 报"结果不完整"：partial 与 diagnostics 都在
+            // result_summary 里。不在这里接下来，面板与状态行都看不见它。
+            const warnings = agentWarningsFrom(event.result_summary);
+            if (warnings.length) {
+              recordWarnings(warnings);
+              // 候选可能已经先到了（snapshot 与工具帧的先后不固定）。这时状态行
+              // 还写着"候选已就绪"，得跟着改，不能让两句文案在同一个面板上打架。
+              if (candidate.value && event.ok) status.value = candidateStatus('候选已就绪');
+            }
             break;
+          }
           case 'snapshot':
             // 后端整树校验通过后先推一帧 snapshot：done 之前用户就该看得见候选长什么样。
             // 只放候选、不碰 content——没经用户确认的内容不许进画布。
             candidate.value = event.content;
-            status.value = '候选已就绪，确认后才会应用到画布。';
+            status.value = candidateStatus('候选已就绪');
             break;
           case 'done':
             settled = true;
             if (event.content) {
               // 只放进候选，不动 content：用户确认之前画布保持原样
               candidate.value = event.content;
-              status.value = '模型给出了候选导图，确认后才会应用到画布。';
+              status.value = candidateStatus('模型给出了候选导图');
             } else if (!candidate.value) {
               // 已经收到过 snapshot 的候选就留着：这一帧只是没重复带内容。
               status.value = '模型这次没有产出导图。';
@@ -1234,6 +1358,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     dirty.value = true;
     clientRevision.value += 1;
     editingId.value = null;
+    // 告警说的是"这份候选缺了什么"，候选已落地就没有再挂着的理由；
+    // 留着它，用户会以为画布上这棵树还有问题等着处理。
+    agentWarnings.value = [];
     ensureSelection();
     status.value = '已应用模型的修改，记得保存。';
     return 'applied';
@@ -1243,6 +1370,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const had = candidate.value !== null;
     candidate.value = null;
     agentError.value = '';
+    agentWarnings.value = [];
     status.value = had ? '已丢弃候选，画布未变。' : '没有待处理的候选。';
   }
 
@@ -1310,6 +1438,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     clientRevision,
     candidate,
     agentEvents,
+    agentWarnings,
     agentRunning,
     agentError,
     agentEnabled,
