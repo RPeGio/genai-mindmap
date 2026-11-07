@@ -8,7 +8,7 @@
  * 2. 字符区间按 Unicode 码点算（后端契约如此），不是 UTF-16 下标；
  *    直接拿 `String.slice` 切会把 emoji 和部分汉字切在半个上。
  */
-import type { Source, SourceRef, SourceUsage } from '../api/types';
+import type { MindNode, Source, SourceRef, SourceUsage } from '../api/types';
 import { SOURCE_LABELS } from '../sources/input';
 
 export interface ResolvedRef {
@@ -110,9 +110,10 @@ export function windowOf(
 }
 
 /** 来源显示名：文件名优先，没有就用 kind 的中文名加序号。 */
-export function refName(ref: SourceRef, usage: SourceUsage[]): string {
-  const found = usage.find(item => item.source_id === ref.source_id);
-  if (!found) return `来源 ${ref.source_id.slice(0, 8)}`;
+export function refName(ref: SourceRef | string, usage: SourceUsage[]): string {
+  const sourceId = typeof ref === 'string' ? ref : ref.source_id;
+  const found = usage.find(item => item.source_id === sourceId);
+  if (!found) return `来源 ${sourceId.slice(0, 8)}`;
   const label = SOURCE_LABELS[found.kind] ?? '来源';
   return found.filename ? `${label} · ${found.filename}` : label;
 }
@@ -147,4 +148,47 @@ export function resolveRefs(
   usage: SourceUsage[] = [],
 ): ResolvedRef[] {
   return (refs ?? []).map(ref => resolveRef(ref, sources, usage));
+}
+
+/** 一条"这个节点引用了这份来源"的记录。 */
+export interface RefHit {
+  /** 引用它的节点 id。 */
+  id: string;
+  /** 节点标题（未截断）。 */
+  label: string;
+  /** 从根到该节点的标题路径（含该节点），与详情面板的面包屑同口径。 */
+  path: string[];
+}
+
+export interface RefIndex {
+  /** source_id → 引用它的节点数。同一节点重复引用同一来源只算一次。 */
+  counts: Record<string, number>;
+  /** source_id → 引用它的节点，按先序排列（列表展开的顺序要稳定）。 */
+  hits: Record<string, RefHit[]>;
+}
+
+/**
+ * 反向索引：从"来源"看"哪些节点引用了它"。
+ *
+ * 正向链路（节点 → 引用）已经在详情面板里了；这里补反向，是因为用户读材料时
+ * 更关心"这段话被用到哪去了"。按先序遍历建，列表顺序与大纲顺序一致。
+ */
+export function buildRefIndex(root: MindNode | null): RefIndex {
+  const index: RefIndex = { counts: {}, hits: {} };
+  if (!root) return index;
+
+  const walk = (node: MindNode, path: string[]) => {
+    const trail = [...path, node.label];
+    const seen = new Set<string>();
+    for (const ref of node.source_refs ?? []) {
+      if (!ref.source_id || seen.has(ref.source_id)) continue;
+      seen.add(ref.source_id);
+      (index.hits[ref.source_id] ??= []).push({ id: node.id, label: node.label, path: trail });
+      index.counts[ref.source_id] = (index.counts[ref.source_id] ?? 0) + 1;
+    }
+    for (const child of node.children) walk(child, trail);
+  };
+
+  walk(root, []);
+  return index;
 }

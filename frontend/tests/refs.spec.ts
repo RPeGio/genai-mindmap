@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import type { Source, SourceRef, SourceUsage } from '../src/api/types';
-import { excerptOf, locateInText, refName, refWhere, resolveRef, resolveRefs, windowOf } from '../src/mindmap/refs';
+import type { MindNode, Source, SourceRef, SourceUsage } from '../src/api/types';
+import { buildRefIndex, excerptOf, locateInText, refName, refWhere, resolveRef, resolveRefs, windowOf } from '../src/mindmap/refs';
 
 const TEXT = '矩阵的秩等于行向量组的极大线性无关组的个数。初等变换不改变矩阵的秩。';
 
@@ -138,5 +138,52 @@ describe('原文片段的三段切分', () => {
     const resolved = resolveRef({ source_id: 's1', start: 0, end: 6, quote: '矩阵的秩等于' }, [source()], usage);
     expect(`${resolved.before}${resolved.hit}${resolved.after}`).toBe(resolved.excerpt);
     expect(resolved.hit).toBe('矩阵的秩等于');
+  });
+});
+describe('来源反向索引', () => {
+  const tree = (): MindNode => ({
+    id: 'root',
+    label: '线代',
+    children: [
+      {
+        id: 'a',
+        label: '矩阵的秩',
+        source_refs: [{ source_id: 's1', start: 0, end: 6, quote: '矩阵的秩等' }],
+        children: [
+          {
+            id: 'a1',
+            label: '极大无关组',
+            source_refs: [
+              { source_id: 's1', start: 6, end: 20 },
+              // 同一节点重复引用同一来源：只算一次
+              { source_id: 's1', start: 6, end: 20 },
+            ],
+            children: [],
+          },
+        ],
+      },
+      { id: 'b', label: '条件数', source_refs: [{ source_id: 's2', quote: '条件数' }], children: [] },
+      { id: 'c', label: '没引用', children: [] },
+    ],
+  });
+
+  it('按来源统计节点数，同节点重复引用只算一次', () => {
+    const index = buildRefIndex(tree());
+    expect(index.counts.s1).toBe(2);
+    expect(index.counts.s2).toBe(1);
+    expect(index.counts.s3).toBeUndefined();
+  });
+
+  it('记录引用它的节点与路径，按先序排列', () => {
+    const index = buildRefIndex(tree());
+    expect(index.hits.s1.map(hit => hit.id)).toEqual(['a', 'a1']);
+    expect(index.hits.s1[1].path).toEqual(['线代', '矩阵的秩', '极大无关组']);
+    expect(index.hits.s2[0].path).toEqual(['线代', '条件数']);
+  });
+
+  it('没有导图时返回空索引，调用方不必先判空', () => {
+    const index = buildRefIndex(null);
+    expect(index.counts).toEqual({});
+    expect(index.hits).toEqual({});
   });
 });
