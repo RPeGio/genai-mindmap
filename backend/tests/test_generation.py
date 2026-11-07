@@ -496,6 +496,14 @@ class BranchFloorTest(unittest.TestCase):
 class PromptQualityTest(unittest.TestCase):
     """prompt 里的数量约束与引用正反例：模型只照字面执行，不写就是没有。"""
 
+    # quote 示例段本身是「原文：…」引出的一句话。锚点落在这里而不是整段第一个
+    # ✅/❌：提示词里还有拆到底的形态对照（同样用 ❌/✅），按整段取首标记会被
+    # 那些行抢走，取出来的"引用"其实是结构示例。
+    QUOTE_ANCHOR = "原文：会议决定在十月十七日发布二点零版本。"
+
+    def _quote_examples(self) -> str:
+        return SOURCED_DETAIL_PROMPT.split(self.QUOTE_ANCHOR, 1)[1]
+
     def test_both_prompts_state_the_point_and_branch_floor(self):
         for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
             self.assertIn("至少 2 个要点", prompt)
@@ -526,15 +534,61 @@ class PromptQualityTest(unittest.TestCase):
         self.assertIn("✅", SOURCED_DETAIL_PROMPT)
         self.assertIn(original, SOURCED_DETAIL_PROMPT)
 
-        good_line = SOURCED_DETAIL_PROMPT.split("✅", 1)[1].split("\n", 1)[0]
+        examples = self._quote_examples()
+        good_line = examples.split("✅", 1)[1].split("\n", 1)[0]
         good_quote = good_line.split('quote="', 1)[1].split('"', 1)[0]
         # 正向示例必须是原文里的连续片段，逐字可查
         self.assertIn(good_quote, original)
 
-        bad_line = SOURCED_DETAIL_PROMPT.split("❌", 1)[1].split("\n", 1)[0]
+        bad_line = examples.split("❌", 1)[1].split("\n", 1)[0]
         bad_quote = bad_line.split('quote="', 1)[1].split('"', 1)[0]
         # 反向示例是概括出来的话，原文里逐字找不到
         self.assertNotIn(bad_quote, original)
+
+
+class DepthPromptTest(unittest.TestCase):
+    """展开深度：判据是「还能不能再拆」，不是固定层数，也不是「越深越好」。
+
+    改这段之前，「每个分支再给 2-4 个要点」把结构暗示成根 → 分支 → 要点，
+    38036 字的论文实测只长到 4 层（103 个节点），`MAX_TREE_DEPTH = 8` 一次都
+    没被碰到；反过来写「越深越好」又会让模型为了凑层数制造节点。这两面都要守。
+    """
+
+    def test_no_prompt_suggests_a_fixed_number_of_levels(self):
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT,
+                       THINKING_MODELS["default"]["prompt"]):
+            self.assertNotIn("2-4", prompt)
+
+    def test_both_prompts_carry_the_split_until_rule(self):
+        """两条出口共用同一套深度规则：有来源时只换判据，不换「要不要继续拆」。"""
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
+            self.assertIn("还能不能再拆", prompt)
+            self.assertIn("不要停在两级", prompt)
+
+    def test_depth_ceiling_is_not_a_target(self):
+        """上限继续取自契约常量，并且明确写成可读性上限——数字不是目标。"""
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
+            self.assertIn(f"层级上限 {MAX_TREE_DEPTH}", prompt)
+            self.assertIn("不是要拆到的目标", prompt)
+
+    def test_stop_condition_is_stated(self):
+        """没有停止条件，「继续拆」就会变成造层级。"""
+        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
+            self.assertIn("最小可执行单元", prompt)
+            self.assertIn("单一概念", prompt)
+
+    def test_sourced_prompt_ties_depth_to_the_material(self):
+        """有来源时「继续拆」不能变成自由展开：判据必须落回原文。"""
+        self.assertIn("判据只看材料", SOURCED_DETAIL_PROMPT)
+        self.assertIn("必须能在原文里找到依据", SOURCED_DETAIL_PROMPT)
+        # 「拆得深」不许把「依据不足宁可少给」冲掉
+        self.assertIn("宁可少给", SOURCED_DETAIL_PROMPT)
+
+    def test_default_thinking_model_does_not_cap_depth(self):
+        """思考模型拼在生成提示词后面，它若给了层数区间就会被模型当成硬指标。"""
+        prompt = THINKING_MODELS["default"]["prompt"]
+        self.assertIn("不要停在两级", prompt)
+        self.assertIn("拆出更具体的内容", prompt)
 
 
 class ThinkingModelTest(unittest.TestCase):
