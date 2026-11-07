@@ -30,6 +30,25 @@ const activeRef = ref<ResolvedRef | null>(null);
 
 const copied = ref('');
 
+/**
+ * 屏幕底部的短暂提示。
+ *
+ * 导出的结果原来只写进左侧来源面板的 `store.status` 小字里，位置在折叠区下方，
+ * 失败时看上去就是"点了没反应"（用户实测：控制台 422，界面无提示）。成功和失败
+ * 都要能一眼看到，所以单独开一条浮层，四秒后自动消失。
+ */
+const notice = ref<{ kind: 'ok' | 'error'; text: string } | null>(null);
+let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flash(kind: 'ok' | 'error', text: string): void {
+  if (noticeTimer) clearTimeout(noticeTimer);
+  notice.value = { kind, text };
+  noticeTimer = setTimeout(() => {
+    notice.value = null;
+    noticeTimer = null;
+  }, kind === 'error' ? 6000 : 3000);
+}
+
 // 开发期示例选择器：只在 dev 服务器下加载，生产构建里这段会被整体去掉。
 const samples = ref<{ id: string; label: string }[]>([]);
 let sampleMaps: SampleMap[] = [];
@@ -114,8 +133,11 @@ async function onExport(): Promise<void> {
     const text = await exportMindMap(format, content);
     saveTextFile(exportFilename(format, content.title), text);
     store.status = `已导出 ${exportLabel(format)}（${content.title}）`;
+    flash('ok', store.status);
   } catch (error) {
-    store.status = error instanceof ApiError ? error.message : '导出失败，请重试。';
+    const message = error instanceof ApiError ? error.message : '导出失败，请重试。';
+    store.status = message;
+    flash('error', `导出失败：${message}`);
   } finally {
     exporting.value = false;
   }
@@ -162,6 +184,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('beforeunload', onBeforeUnload);
+  if (noticeTimer) clearTimeout(noticeTimer);
 });
 
 /** 标题用 change 提交（失焦或回车时），不在每次按键上都记一步撤销。 */
@@ -419,6 +442,17 @@ async function copyBody() {
         </details>
       </aside>
     </main>
+
+    <!-- 导出等一次性操作的结果浮层；错误停 6 秒，成功 3 秒。 -->
+    <div
+      v-if="notice"
+      class="fixed bottom-6 left-1/2 z-50 max-w-[90vw] -translate-x-1/2 rounded-md px-4 py-2 text-sm shadow-lg"
+      :class="notice.kind === 'error' ? 'bg-rose-600 text-white' : 'bg-slate-900 text-white'"
+      :role="notice.kind === 'error' ? 'alert' : 'status'"
+      aria-live="polite"
+    >
+      {{ notice.text }}
+    </div>
 
     <!--
       原文抽屉：从右侧滑出，不挤掉详情面板。只有本次会话解析过的来源才有原文，

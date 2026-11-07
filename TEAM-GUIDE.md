@@ -226,6 +226,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 - **两个文本入口的上限不同**：`/api/ingestion/text` 与 `/api/generations` 都是单段 10000 字，`/api/pipeline/generate` 合并后限 20000 字（`backend/app/pipeline/service.py:29`）。前端来源面板按 20000 字提示，所以 15000 字走 pipeline 没问题、走 `/api/generations` 会被 422 挡下。
 - **引用的原文不落库**：`source_refs` 随导图一起保存（`source_id` + `quote` + 可选的页码与字符区间），但 `Source.text` 只活在本次会话的来源列表里（`frontend/src/stores/sources.ts`）。刷新后重新打开导图，节点角标、来源名与 `quote` 还在，抽屉里却没有前后文——界面会显示"原文没有随导图保存"。另外后端**只在生成/流水线时校验引用**，保存时不复检，所以手工改过节点文字之后，旧引用可能已经对不上原文。
 - **导出用根节点文字，不是标题**：`export/puml` 取的是 `root.label`。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
+- **导出会把正文折进标题**：三种导出都收 v1 的 `MindMapContent`，`Node` 是 `extra="forbid"`，所以 `frontend/src/api/client.ts::exportMindMap()` 先调 `toExportV1()`：用全角冒号把 `note`（正文）接在 `label`（短标题）后面，再把 `note` 字段裁掉。导出文件里节点文字是"短标题：正文"，不是画布上那句被截断的短标题；后端三种格式都会把换行压成空格，所以多行正文不会破坏缩进。等 v2 上线可以改回按字段导出。
 - **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得用 SSE（`/api/generations/stream`、`/api/agent/runs/stream`）。
 - **前端还没接的接口**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check` 与 `/suggest`。上传格式白名单目前写死在 `frontend/src/sources/input.ts` 的 `FILE_ACCEPT`，与后端 `formats` 接口有漂移风险；诊断接口已有返回值但界面不渲染（`frontend/src/api/types.ts` 里 `diagnostics` 标注为"目前只用于排障"）。
 - **编辑不记协作方**：保存以整棵树为单位（`version` 乐观锁），没有字段级合并；两个人同时编辑同一张图，后保存的会拿到 409，只能选择覆盖（重新加载）或另存为新导图。

@@ -113,6 +113,35 @@ function toContractV1(content: MindMapContent): MindMapContent {
   };
 }
 
+/**
+ * 导出用的序列化：v1 形状，并把 `note` 正文折进 `label`。
+ *
+ * 导出的文件是拿出去给别人看的成品，只有画布上的短标题（`label`）信息量太低，
+ * 详情面板里那段正文（`note`）才是内容本身。后端三种格式都会把换行压成空格
+ * （`backend/app/export/service.py::_one_line`），所以这里用全角冒号接成一句，
+ * 不会被换行破坏缩进或 XML 结构。
+ */
+function toExportV1(content: MindMapContent): MindMapContent {
+  const fold = (node: MindNode): MindNode => {
+    const note = node.note?.trim();
+    const short = node.label.trim();
+    // 正文常常自己就以标题开头（示例数据与模型产出都这样），再拼一次会变成
+    // “分类：分类：……”，这时直接留正文。
+    const label = !note ? node.label : !short || note.startsWith(short) ? note : `${short}：${note}`;
+    return {
+      id: node.id,
+      label,
+      children: node.children.map(fold),
+      ...(node.source_refs?.length ? { source_refs: node.source_refs } : {}),
+    };
+  };
+  return {
+    title: content.title,
+    root: fold(content.root),
+    ...(content.source_usage ? { source_usage: content.source_usage } : {}),
+  };
+}
+
 /** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
 export function createMindMap(content: MindMapContent): Promise<MapRecord> {
   return request<MapRecord>('/mindmaps', {
@@ -296,7 +325,9 @@ export async function exportMindMap(
     response = await fetch(`${BASE}/export/${format}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      // 导出接口收的也是 v1 的 MindMapContent，带着 v2 的 note 一样会 422；
+      // toExportV1() 先把正文折进 label，再裁掉 v1 不认识的字段。
+      body: JSON.stringify({ content: toExportV1(content) }),
     });
   } catch {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
