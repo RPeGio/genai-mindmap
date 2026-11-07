@@ -38,12 +38,15 @@ async function generate() {
   if (generating.value || sources.parsing || recording.value || problem.value) return;
   if (!props.confirmDiscard('重新生成')) return;
 
-  // agent 路径：输入框内容直接作为目标交给模型，由它自己决定查资料还是生成。
-  // 是否新建取决于当前有没有导图——有图就是在改图，没图才是新建。
+  // agent 路径：输入框里是"要做什么"，来源列表是"依据什么"——两者分开送。
+  // 曾经把材料正文拼进 goal 并截到 1000 字：材料大半被丢掉，而且只要输入框
+  // 有一个字，附件就完全不参与。是否新建取决于当前有没有导图。
   if (store.agentEnabled) {
-    const goal = prompt.value.trim()
-      || sources.readySources.map(item => item.text ?? '').join('\n\n').slice(0, 1000);
-    await store.runGeneration(goal, store.content ? 'edit' : 'create');
+    const text = prompt.value.trim();
+    const ready = sources.readySources;
+    // 只写了材料、没写目标时给一句占位，别把正文当目标塞进去。
+    const goal = text || (ready.length ? `请基于附带的 ${ready.length} 份材料生成导图` : '');
+    await store.runGeneration(goal, store.content ? 'edit' : 'create', ready);
     return;
   }
 
