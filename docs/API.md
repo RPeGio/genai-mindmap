@@ -34,7 +34,7 @@
 
 `quote` 必须能在本次请求提供的原文里逐字匹配，`source_id` 必须出现在 `source_usage` 里；不合规的引用在生成/保存时被剔除，原因通过 `diagnostics`（带 `node_id`）返回，节点本身保留。规则见 [节点来源引用](SOURCE-REFERENCES.md)。
 
-整棵树 ID 唯一，最多 300 节点、8 层、每个节点最多 50 个子节点，每节点最多 20 条引用。标题和节点文字长度不超过 200。
+整棵树 ID 唯一，最多 1000 节点、8 层、每个节点最多 50 个子节点，每节点最多 20 条引用。标题和节点文字长度不超过 200。
 
 **v2 候选**在 v1 之上新增 `schema_version`、`layout`、`theme`、`relations[]` 以及节点的 `note`/`collapsed`/`style`/`pos`，详见 [CONTRACT_V2](CONTRACT_V2.md)。**后端尚未实现 v2**（`extra="forbid"`，提前发送 v2 字段会 422），前端当前按 v1 对接。
 

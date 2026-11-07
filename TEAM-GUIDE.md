@@ -211,7 +211,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 ## 7 动手前必须知道的四件事
 
-**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children` / `source_refs`（后者可选，节点级引用），不是 `topic`、不是 `text`。上限 300 节点、8 层、每节点 50 个子节点、标题与节点文字各 200 字，超了直接 422。`note` 仍属 v2 预留，后端 v1 契约是 `extra="forbid"`，发过去就 422。
+**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children` / `source_refs`（后者可选，节点级引用），不是 `topic`、不是 `text`。上限 1000 节点、8 层、每节点 50 个子节点、标题与节点文字各 200 字，超了直接 422。`note` 仍属 v2 预留，后端 v1 契约是 `extra="forbid"`，发过去就 422。
 
 **二、保存是乐观锁。** `PUT /api/mindmaps/{id}` 必须带上读到的 `version`，服务端版本号变了就返回 409，前端要提示用户重新打开，不能强行覆盖。
 
@@ -230,7 +230,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 - **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得用 SSE（`/api/generations/stream`、`/api/agent/runs/stream`）。
 - **前端还没接的接口**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check` 与 `/suggest`。上传格式白名单目前写死在 `frontend/src/sources/input.ts` 的 `FILE_ACCEPT`，与后端 `formats` 接口有漂移风险；诊断接口已有返回值但界面不渲染（`frontend/src/api/types.ts` 里 `diagnostics` 标注为"目前只用于排障"）。
 - **编辑不记协作方**：保存以整棵树为单位（`version` 乐观锁），没有字段级合并；两个人同时编辑同一张图，后保存的会拿到 409，只能选择覆盖（重新加载）或另存为新导图。
-- **撤销栈只在内存**：刷新页面后撤销历史清空，最多 50 步；保存不写历史。
+- **撤销栈只在内存**：刷新页面后撤销历史清空，最多 50 步或 10MB（先到者为准，节点上限提到 1000 后单份快照可能几十 KB，只按步数会涨到几十 MB）；保存不写历史。
 - **旧格式要系统依赖**：`.doc` / `.ppt` 依赖 LibreOffice（约 1.5 GB），没装时 422 而不是降级；`.xls` 依赖 `xlrd`。部署机装不装，直接决定这几个格式能不能用。
 - **当前没有登录和权限**：所有接口裸奔，只能在本机跑，不要往公网放。
 

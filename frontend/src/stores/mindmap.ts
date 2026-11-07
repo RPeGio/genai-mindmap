@@ -4,6 +4,7 @@ import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, Source, SourceRef } from '../api/types';
+import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
@@ -24,6 +25,15 @@ export const TRUNCATE_CHARS = 24;
 
 /** 撤销栈上限。整树快照一步几 KB，50 步封顶，内存与手感都够用。 */
 export const HISTORY_LIMIT = 50;
+
+/**
+ * 撤销栈的总字节上限。
+ *
+ * 只有步数上限时，节点上限从 300 提到 1000 之后会失真：一份快照就能到几十 KB，
+ * 50 步最坏能压到几十 MB。按字节封顶比调小步数更贴近真实内存占用，也不用牺牲
+ * "深树也能退很多步"。
+ */
+export const HISTORY_BYTES_LIMIT = 10 * 1024 * 1024;
 
 /** 保存的结果分类：界面据此决定提示什么，而不是把所有失败都说成"保存失败"。 */
 export type SaveResult = 'saved' | 'conflict' | 'invalid' | 'empty' | 'busy' | 'failed';
@@ -282,6 +292,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 撤销/重做存整树 JSON 快照：比命令模式少一半代码，300 节点的树一步也不到 100KB。 */
   const past = ref<string[]>([]);
   const future = ref<string[]>([]);
+  /** 撤销栈已占的字节数。维护这个数，免得每次压栈都把整栈重新编码一遍。 */
+  const pastBytes = ref(0);
 
   const saving = ref(false);
 
@@ -694,6 +706,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 选中节点的引用。空节点也有自己的空数组，详情面板不必再判空。 */
   const selectedRefs = computed<SourceRef[]>(() => selectedNode.value?.node.source_refs ?? []);
 
+  /**
+   * 来源的反向索引。
+   *
+   * 只从 `content` 算：画布上可能正画着候选或预览节点，把它们算进引用统计会让
+   * 左侧说"被 5 个节点引用"、而其中 3 个根本不在导图里。
+   */
+  const refIndex = computed(() => buildRefIndex(content.value?.root ?? null));
+
+  /**
+   * "把某个节点挪到视野中心"的触发计数。
+   *
+   * 用计数器而不是监听 `selectedId`：在画布上手动点节点时也会改选中，若监听选中，
+   * 视图会把人刚拖到的位置又拽回中心。只有从引用列表主动跳转时才加一。
+   */
+  const focusTick = ref(0);
+
   /** 从根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
   const breadcrumb = computed<MindNode[]>(() => {
     const target = selectedId.value;
@@ -717,19 +745,41 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function snapshot(): string | null {
     return content.value ? JSON.stringify(content.value) : null;
   }
+  function snapshotBytes(snap: string): number {
+    return new TextEncoder().encode(snap).length;
+  }
+
+  /**
+   * 压一步撤销，并按字节与步数两个上限淘汰最旧的。
+   *
+   * 至少保留一步：一份快照自身就超过上限时（极端大的树）清空栈会让撤销直接失效，
+   * 那比占着这 10MB 更糟。
+   */
+  function recordPast(snap: string) {
+    past.value.push(snap);
+    pastBytes.value += snapshotBytes(snap);
+    while (past.value.length > 1 && (past.value.length > HISTORY_LIMIT || pastBytes.value > HISTORY_BYTES_LIMIT)) {
+      const dropped = past.value.shift()!;
+      pastBytes.value -= snapshotBytes(dropped);
+    }
+  }
 
   /** 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。 */
   function pushHistory() {
     const snap = snapshot();
     if (!snap) return;
-    past.value.push(snap);
-    if (past.value.length > HISTORY_LIMIT) past.value.shift();
+    recordPast(snap);
     future.value = [];
   }
+
+  /** 还能撤销几步、占了多少字节：界面与测试都靠它确认字节上限真的生效。 */
+  const undoDepth = computed(() => past.value.length);
+  const undoBytes = computed(() => pastBytes.value);
 
   function resetHistory() {
     past.value = [];
     future.value = [];
+    pastBytes.value = 0;
   }
 
   /**
@@ -739,8 +789,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * JSON 里的空画布），否则用户点了「应用到画布」就再也退不回接受之前的样子。
    */
   function pushHistoryOrEmpty() {
-    past.value.push(snapshot() ?? 'null');
-    if (past.value.length > HISTORY_LIMIT) past.value.shift();
+    recordPast(snapshot() ?? 'null');
     // 树从这里长出新的分支了，重做栈必须失效。
     future.value = [];
   }
@@ -943,6 +992,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
     const snap = past.value.pop();
     if (!snap) return;
+    pastBytes.value -= snapshotBytes(snap);
     // 当前是空画布时也要压一步 `'null'`，否则「空 → 候选 → 撤销 → 重做 → 撤销」
     // 的最后一步会丢掉：重做那一次不记历史，再撤销就没得可撤，回不到空白。
     future.value.push(snapshot() ?? 'null');
@@ -964,8 +1014,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const snap = future.value.pop();
     if (!snap) return;
     // 与 undo 对称：当前是空画布时把空画布压进撤销栈，这样重做之后仍能撤回空白。
-    past.value.push(snapshot() ?? 'null');
-    if (past.value.length > HISTORY_LIMIT) past.value.shift();
+    recordPast(snapshot() ?? 'null');
     restoreSnapshot(snap);
     dirty.value = true;
     // 同 undo：重做同样把画布换成了另一棵树，候选再不成立。
@@ -1219,6 +1268,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function select(id: string | null) {
     if (id !== null && !(content.value && findNode(content.value.root, id))) return;
     selectedId.value = id;
+  }
+
+  /**
+   * 从引用列表跳到节点：选中它，并让画布把它移到视野中心。
+   *
+   * 与 `select()` 分开的原因见 `focusTick`：跳转是"我要看这个"，点选是"我在看这个"。
+   */
+  function locate(id: string) {
+    select(id);
+    if (selectedId.value !== id) return;
+    focusTick.value += 1;
   }
 
   function setDirection(next: Direction) {
@@ -1754,9 +1814,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
     nodeCount,
     selectedNode,
     selectedRefs,
+    refIndex,
+    focusTick,
     breadcrumb,
     canUndo,
     canRedo,
+    undoDepth,
+    undoBytes,
     saving,
     conflict,
     maps,
@@ -1766,6 +1830,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     cancel,
     preview,
     select,
+    locate,
     setDirection,
     beginEdit,
     endEdit,
