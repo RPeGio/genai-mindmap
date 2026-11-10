@@ -30,7 +30,7 @@ ote）、朝向（layout + 	heme.direction）随保存与打开往返、elation
 | F19 | 多语言实时翻译 | B 主责，A 配合 | 待实现 | — | 翻译服务与协作消息关联；测试延迟及保留原文。 |
 | F20 | PUML 生成与显示 | A 主责，B 配合 | 部分实现 | 2026-11-05 | 三种导出都已通路（`7770987`）：PlantUML / Markdown / OPML，前端标题栏下拉菜单直接下载，文件名取导图标题。**不做浏览器内渲染**——plantuml-encoder 只做压缩编码、出图要 JVM，viz.js 只认 DOT，理由见 [增量附录](ARCHITECTURE_ADDENDUM.md)。 |
 | F21 | 用户反馈与模型微调 | B | 待实现 | — | 收集经授权的评价数据，先评估提示词/模型基线，再验证是否满足微调条件及效果。 |
-| F22 | 容器化与部署、Kubernetes 扩展 | A 主责，B 配合 | 待实现 | — | 目标：单台 2C2G ECS + `deploy/docker-compose.yml` 五容器（nginx/api/web/db/ys，asr 走 profile），先 `IP:8080` 上线；K8s 只在文档里写明为扩容选项，不实现。当前仓库里还没有 `Dockerfile` 与 compose 文件，`docs/DEPLOY.md` 只记了依赖与体积。 |
+| F22 | 容器化与部署、Kubernetes 扩展 | A 主责，B 配合 | 部分实现 | 2026-11-10 | 单台 2C2G ECS 已可上线：`deploy/install.sh` 一条命令装完 systemd + nginx + Python 3.12（uv 管理的独立解释器），同源部署因此不需要 CORS，后端只监听 `127.0.0.1:8000`，Basic Auth 挡在前面，每日 `sqlite .backup` 备份保留 14 天，步骤见 `docs/DEPLOY.md` 第 7 节。**未做**：Dockerfile / compose（原计划五容器含 PG）、Kubernetes。选 systemd 而非容器化的理由：2C2G 上构建 docling+torch 镜像容易 OOM，而演示窗口只有一个。 |
 | F23 | 功能、兼容性、性能与压力测试 | RPeGio + 陈嘉涛 | 部分实现 | 2026-11-06 | 自动化回归已建立：后端 309 个 pytest 用例、前端 239 个 vitest 用例（16 个文件），CI 两个 job 双绿；竞态与失败路径有专门用例（保存与切图、生成中编辑、迟到响应、断流）。**未做**：浏览器兼容性矩阵、性能基准与压力测试、失败场景的录制回放。 |
 | F24 | 导图结构合理性 >85% | RPeGio + 陈嘉涛 | 待评估 | — | 20 条中文样本双人盲评，报一致率与分歧（口径见 [执行计划](PLAN.md) 第 5 节）。 |
 | F25 | 多模态支持率 ≥90% | RPeGio + 陈嘉涛 | 待评估 | — | 和指导老师明确分母（样例成功率或其他口径），按文本、图片、语音分别采样。 |
