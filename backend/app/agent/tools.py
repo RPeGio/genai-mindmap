@@ -58,6 +58,8 @@ from app.generation.service import (
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
 from app.knowledge.service import search_sources
+from app.optimization.service import check
+from app.optimization.source_refs import annotate_nli
 
 # 与 backend/app/contracts/mindmap.py 的 Node.children max_length 同口径
 MAX_CHILDREN = 50
@@ -1024,6 +1026,17 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         content, diagnostics = validate_generated_content(raw, sources=sources or None)
     except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
         return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
+
+    # 结构与语义两层复核，原先只长在 `pipeline/service.run()` 的收尾里：
+    #   - `check()` 只看树本身（单子节点、深度上限、同级重名），没有来源也能跑，
+    #     所以对一句话主题的生成同样有效；
+    #   - `annotate_nli()` 要对已通过前两层的引用与原文做语义蕴含打分，没有来源
+    #     就无从比对。未启用时它立刻返回空列表，连 onnxruntime 都不 import，
+    #     照搬即可，不必在调用处再判一次开关。
+    # 诊断只是提示，不影响这棵树能不能用——契约校验在上一步就决定过了。
+    diagnostics.extend(check(content))
+    if sources:
+        diagnostics.extend(annotate_nli(content, sources))
 
     ctx.candidate = content
     ctx.revision += 1
