@@ -10,6 +10,7 @@ export const LIMITS = {
   depth: 8,
   children: 50,
   label: 200,
+  note: 2000,
   title: 200,
 } as const;
 
@@ -73,6 +74,23 @@ export function renameNode(root: MindNode, id: string, label: string): MindNode 
   return {
     ...root,
     children: root.children.map(child => renameNode(child, id, label)),
+  };
+}
+
+/**
+ * 改节点正文（契约 v2 的 `note`）。返回新的根，原树不动。
+ *
+ * 纯空白等价于"没有正文"：后端把纯空白视为 `None`，这里先归一，
+ * 免得界面上出现一个 `note: '   '`、保存后又被服务端悄悄改成 null。
+ */
+export function setNodeNote(root: MindNode, id: string, note: string | null): MindNode {
+  if (root.id === id) {
+    const trimmed = note?.trim();
+    return { ...root, note: trimmed ? trimmed : null };
+  }
+  return {
+    ...root,
+    children: root.children.map(child => setNodeNote(child, id, note)),
   };
 }
 
@@ -158,6 +176,9 @@ export function validateDraft(content: MindMapContent): string | null {
     if (!label) return '节点标题不能为空';
     if (charLength(label) > LIMITS.label) {
       return `节点「${shortLabel(label)}」超过 ${LIMITS.label} 个字`;
+    }
+    if (node.note && charLength(node.note.trim()) > LIMITS.note) {
+      return `节点「${shortLabel(label)}」的正文超过 ${LIMITS.note} 个字`;
     }
     if (node.children.length > LIMITS.children) {
       return `节点「${shortLabel(label)}」最多 ${LIMITS.children} 个子节点`;

@@ -299,4 +299,90 @@ describe('节点引用', () => {
     store.select('a');
     expect(store.selectedRefs.length).toBe(2);
   });
+
+  it('改正文记一步历史，并标记为未保存', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.commitNote('a', '甲的正文');
+    expect(store.content?.root.children[0].note).toBe('甲的正文');
+    expect(store.dirty).toBe(true);
+
+    store.undo();
+    expect(store.content?.root.children[0].note).toBeUndefined();
+    store.redo();
+    expect(store.content?.root.children[0].note).toBe('甲的正文');
+  });
+
+  it('正文清空后存成 null，而不是空字符串', () => {
+    // 空字符串会被后端当成"有正文"，导出时就多出一行空白。
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+    store.commitNote('a', '先写点东西');
+
+    store.commitNote('a', '   ');
+    expect(store.content?.root.children[0].note).toBeNull();
+  });
+
+  it('正文没变就不记历史：失焦也会触发提交', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+    store.commitNote('a', '甲的正文');
+    const depth = store.undoDepth;
+
+    store.commitNote('a', '甲的正文');
+    expect(store.undoDepth).toBe(depth);
+  });
+
+  it('正文超过 2000 字时拒绝并提示', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.commitNote('a', '字'.repeat(2001));
+    expect(store.content?.root.children[0].note).toBeUndefined();
+    expect(store.status).toBe('节点正文最多 2000 个字');
+  });
+});
+
+describe('朝向跟着内容走', () => {
+  it('换方向写进 layout，并且可以撤销', () => {
+    const store = useMindMapStore();
+    store.preview(sample(), 'right');
+
+    store.setDirection('left');
+    expect(store.content?.theme?.direction).toBe('left');
+    expect(store.direction).toBe('left');
+
+    store.setDirection('down');
+    expect(store.content?.layout).toBe('vertical');
+    expect(store.direction).toBe('down');
+
+    store.undo();
+    expect(store.direction).toBe('left');
+  });
+
+  it('打开已保存的导图时恢复朝向', () => {
+    const store = useMindMapStore();
+
+    store.loadMap({ ...sample(), layout: 'vertical' }, {
+      id: 'm1',
+      version: 2,
+      updated_at: '2026-11-10T00:00:00Z',
+    });
+    expect(store.direction).toBe('down');
+
+    store.loadMap({ ...sample(), layout: 'tree', theme: { direction: 'left' } }, {
+      id: 'm2',
+      version: 1,
+      updated_at: '2026-11-10T00:00:00Z',
+    });
+    expect(store.direction).toBe('left');
+  });
+
+  it('没有内容时换方向不做任何事', () => {
+    const store = useMindMapStore();
+    store.setDirection('down');
+    expect(store.content).toBeNull();
+    expect(store.direction).toBe('right');
+  });
 });

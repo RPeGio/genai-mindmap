@@ -4,6 +4,7 @@ import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, Source, SourceRef } from '../api/types';
+import { directionOf, withDirection } from '../mindmap/direction';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
@@ -17,6 +18,7 @@ import {
   LIMITS,
   removeNode,
   renameNode,
+  setNodeNote,
   validateDraft,
 } from '../mindmap/edits';
 
@@ -267,7 +269,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const waitedMs = ref(0);
   const busy = ref(false);
   const selectedId = ref<string | null>(null);
-  const direction = ref<Direction>('right');
+  /**
+   * 朝向是 content 的派生值（layout + 	heme.direction），不单独存一份：
+   * 否则保存后再打开，画布上的朝向与库里的记录会各说各话。
+   */
+  const direction = computed<Direction>(() => directionOf(content.value));
   /** 用户手动平移/缩放后不再自动 fitView，否则每次节点增长都会把视图拽回去。 */
   const viewAdjusted = ref(false);
 
@@ -876,6 +882,29 @@ export const useMindMapStore = defineStore('mindmap', () => {
     status.value = '已修改，记得保存。';
   }
 
+  /**
+   * 提交节点正文（契约 v2 的 `note`）。
+   *
+   * 和改标题一样：内容没变就只收拾编辑态，不记历史；空正文是合法输入——
+   * 它表示"这个节点只保留短标题"，所以清空必须能存下去（不能当成"非法"）。
+   */
+  function commitNote(id: string, note: string | null) {
+    if (!content.value) return;
+    const node = findNode(content.value.root, id);
+    if (!node) return;
+
+    const next = note?.trim() ?? '';
+    const before = node.note?.trim() ?? '';
+    if (next === before) return;
+    if (charLength(next) > LIMITS.note) {
+      status.value = `节点正文最多 ${LIMITS.note} 个字`;
+      return;
+    }
+
+    if (!applyContent({ ...content.value, root: setNodeNote(content.value.root, id, next) }, true)) return;
+    status.value = next ? '已修改正文，记得保存。' : '已清空正文，只保留标题，记得保存。';
+  }
+
   function renameTitle(title: string) {
     if (!content.value) return;
     const next = title.trim();
@@ -1094,7 +1123,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = '没有可保存的导图。';
       return 'empty';
     }
-    const invalid = validateDraft(current);
+    // 朝向存在 content 里，但生成与示例拿到的 content 可能还带着后端默认值：
+    // 保存前按当前视图归一，否则会出现"看着是向左、存下去是向右"。
+    const payload = withDirection(current, direction.value);
+    const invalid = validateDraft(payload);
     if (invalid) {
       status.value = invalid;
       return 'invalid';
@@ -1106,8 +1138,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const session = mapSession;
     try {
       const record = mapId.value
-        ? await updateMindMap(mapId.value, current, version.value)
-        : await createMindMap(current);
+        ? await updateMindMap(mapId.value, payload, version.value)
+        : await createMindMap(payload);
 
       // 请求在途时用户可能已经切到别的导图（或点了新建）。这时响应属于
       // 上一张图，不能拿它改当前页面的 mapId —— 改了之后画布显示的是 B、
@@ -1281,8 +1313,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
     focusTick.value += 1;
   }
 
+  /**
+   * 换朝向。朝向写在 content 里，所以这是一次可撤销的内容修改：
+   * 换了方向之后按 Ctrl+Z 能退回原布局，和改文字是同一套语义。
+   */
   function setDirection(next: Direction) {
-    direction.value = next;
+    if (!content.value) return;
+    if (direction.value === next) return;
+    if (!applyContent(withDirection(content.value, next), true)) return;
     // 换方向后整体重排，视图必须重新适配，否则可能停在空白处。
     viewAdjusted.value = false;
   }
@@ -1304,8 +1342,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 清理 saving，这里必须自己复位，否则新图永远卡在"保存中"，点保存
     // 只会返回 busy。loadMap / newMap / generate 都是同一套处理。
     saving.value = false;
-    direction.value = dir;
-    content.value = next;
+    content.value = withDirection(next, dir);
     mode.value = 'demo';
     selectedId.value = null;
     editingId.value = null;
@@ -1353,6 +1390,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
     if (busy.value || sourceGenerating.value) return;
     sourceGenerationError.value = '';
+    // 朝向是 content 的派生值，而生成会先把 content 清空；先记下来，
+    // 生成结果回来时按用户当时选的朝向装回去。
+    const directionAtStart = direction.value;
 
     // 先把上一份结果存起来：新请求失败时恢复它，而不是让用户白等一场还丢了旧图。
     const previous = content.value;
@@ -1412,7 +1452,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
               break;
             case 'skeleton':
               // 只有 demo 模式会发这个事件：它一次性给出整棵树，不走增量推送。
-              content.value = event.content;
+              // 后端给的 content 带默认朝向，按用户当前选的还回去。
+              content.value = withDirection(event.content, directionAtStart);
               break;
             case 'node':
               // 增量方案：节点一个个长出来，同一 id 的文字会越补越全。
@@ -1425,7 +1466,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
               break;
             case 'done':
               settled = true;
-              content.value = event.content;
+              content.value = withDirection(event.content, directionAtStart);
               mode.value = event.mode;
               // 生成结果还没存过，标脏：离开页面前会提醒，保存时走"创建"。
               dirty.value = true;
@@ -1835,6 +1876,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     beginEdit,
     endEdit,
     commitLabel,
+    commitNote,
     renameTitle,
     addChildTo,
     addSiblingTo,
