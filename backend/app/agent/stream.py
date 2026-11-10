@@ -3,7 +3,7 @@
 只做编码，不做传输——路由负责把生成器接到 `StreamingResponse` 上。分开的好处是
 帧格式可以单独测，不必起一个 HTTP 服务。
 
-格式沿用项目已有的 `generation/stream_partial.py`：`data: {JSON}\\n\\n`，以
+格式沿用项目统一的 SSE 帧形状：`data: {JSON}\\n\\n`，以
 `data: [DONE]` 收尾。**不**用 SSE 的 `event:` 字段另起一套命名——前端已经有
 一个 `data:` 解析器，多一种帧形状只会让两处解析逻辑分叉。
 """

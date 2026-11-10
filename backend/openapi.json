@@ -5,88 +5,6 @@
     "version": "0.2.0"
   },
   "paths": {
-    "/api/generations": {
-      "post": {
-        "tags": [
-          "AI 生成"
-        ],
-        "summary": "Generate Map",
-        "description": "一次性生成：等模型吐完再返回，适合脚本调用与短输入。",
-        "operationId": "generate_map_api_generations_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/GenerateRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenerateResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/generations/stream": {
-      "post": {
-        "tags": [
-          "AI 生成"
-        ],
-        "summary": "Generate Map Stream",
-        "description": "流式生成：一次调用，节点边生成边出现。帧格式见 stream_partial.py 的模块注释。\n\n请求体校验失败时仍返回普通 JSON 错误（流还没开始，走统一错误处理器）；\n一旦开始推送，后续错误只能以 `{\"type\":\"error\"}` 事件的形式出现在流里。\n\n用 async 定义是必须的：客户端断开时 Starlette 会 cancel 这个生成器，\n异步 httpx 的连接随之关闭，模型侧才真正停止计费。",
-        "operationId": "generate_map_stream_api_generations_stream_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/GenerateRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/mindmaps": {
       "get": {
         "tags": [
@@ -226,48 +144,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MapRecord"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/pipeline/generate": {
-      "post": {
-        "tags": [
-          "生成流水线"
-        ],
-        "summary": "Generate From Sources",
-        "description": "多来源生成。demo 模式下可完整跑通，返回占位导图与真实诊断。",
-        "operationId": "generate_from_sources_api_pipeline_generate_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PipelineRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PipelineResponse"
                 }
               }
             }
@@ -522,7 +398,7 @@
           "多模态输入"
         ],
         "summary": "Create File Source",
-        "description": "上传文档或音频，解析成文本来源。\n\n返回的 `source` 可直接传给 `POST /api/pipeline/generate` 生成导图。\n解析失败（含扫描件无文本层、音频无人声）返回 422 并说明原因，\n不返回空内容。",
+        "description": "上传文档或音频，解析成文本来源。\n\n返回的 `source` 可直接作为 agent 运行请求里的 `sources`\n（`POST /api/agent/runs/stream`）生成导图。\n解析失败（含扫描件无文本层、音频无人声）返回 422 并说明原因，\n不返回空内容。",
         "operationId": "create_file_source_api_ingestion_files_post",
         "requestBody": {
           "content": {
@@ -572,48 +448,6 @@
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/knowledge/search": {
-      "post": {
-        "tags": [
-          "知识增强"
-        ],
-        "summary": "Search Knowledge",
-        "description": "知识库检索（F12/F13）。\n\n当前实现返回空结果且 `implemented=false`，前端应据此禁用相关入口，\n不要把它当成\"已经接好了知识库\"。",
-        "operationId": "search_knowledge_api_knowledge_search_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SearchRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SearchResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
               }
             }
           }
@@ -685,6 +519,48 @@
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/knowledge/search": {
+      "post": {
+        "tags": [
+          "知识增强"
+        ],
+        "summary": "Search Knowledge",
+        "description": "知识库检索（F12/F13）。\n\n当前实现返回空结果且 `implemented=false`，前端应据此禁用相关入口，\n不要把它当成\"已经接好了知识库\"。",
+        "operationId": "search_knowledge_api_knowledge_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
               }
             }
           },
@@ -1010,49 +886,6 @@
           "error"
         ],
         "title": "DiagnosticLevel"
-      },
-      "GenerateRequest": {
-        "properties": {
-          "text": {
-            "type": "string",
-            "maxLength": 10000,
-            "minLength": 1,
-            "title": "Text"
-          }
-        },
-        "type": "object",
-        "required": [
-          "text"
-        ],
-        "title": "GenerateRequest"
-      },
-      "GenerateResponse": {
-        "properties": {
-          "mode": {
-            "type": "string",
-            "enum": [
-              "demo",
-              "model"
-            ],
-            "title": "Mode"
-          },
-          "content": {
-            "$ref": "#/components/schemas/MindMapContent-Output"
-          },
-          "diagnostics": {
-            "items": {
-              "$ref": "#/components/schemas/Diagnostic"
-            },
-            "type": "array",
-            "title": "Diagnostics"
-          }
-        },
-        "type": "object",
-        "required": [
-          "mode",
-          "content"
-        ],
-        "title": "GenerateResponse"
       },
       "HTTPValidationError": {
         "properties": {
@@ -1434,55 +1267,6 @@
         "additionalProperties": false,
         "type": "object",
         "title": "NodeStyle"
-      },
-      "PipelineRequest": {
-        "properties": {
-          "sources": {
-            "items": {
-              "$ref": "#/components/schemas/Source"
-            },
-            "type": "array",
-            "maxItems": 50,
-            "minItems": 1,
-            "title": "Sources"
-          }
-        },
-        "type": "object",
-        "required": [
-          "sources"
-        ],
-        "title": "PipelineRequest"
-      },
-      "PipelineResponse": {
-        "properties": {
-          "mode": {
-            "type": "string",
-            "title": "Mode"
-          },
-          "content": {
-            "$ref": "#/components/schemas/MindMapContent-Output"
-          },
-          "diagnostics": {
-            "items": {
-              "$ref": "#/components/schemas/Diagnostic"
-            },
-            "type": "array",
-            "title": "Diagnostics"
-          },
-          "stages": {
-            "items": {
-              "$ref": "#/components/schemas/StageTraceOut"
-            },
-            "type": "array",
-            "title": "Stages"
-          }
-        },
-        "type": "object",
-        "required": [
-          "mode",
-          "content"
-        ],
-        "title": "PipelineResponse"
       },
       "Position": {
         "properties": {
@@ -1950,29 +1734,6 @@
         ],
         "title": "SourceUsage",
         "description": "整张导图使用过的来源摘要；不代表具体节点已建立证据链接。"
-      },
-      "StageTraceOut": {
-        "properties": {
-          "stage": {
-            "type": "string",
-            "title": "Stage"
-          },
-          "ok": {
-            "type": "boolean",
-            "title": "Ok"
-          },
-          "detail": {
-            "type": "string",
-            "title": "Detail",
-            "default": ""
-          }
-        },
-        "type": "object",
-        "required": [
-          "stage",
-          "ok"
-        ],
-        "title": "StageTraceOut"
       },
       "SuggestResponse": {
         "properties": {

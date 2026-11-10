@@ -1,6 +1,6 @@
 """骨架冒烟测试：验证新增模块的流程能走通、桩接口按约定返回。
 
-不访问模型、不写真实数据库（用 demo 模式 + 临时库）。
+不访问模型、不写真实数据库（用临时库）。
 """
 import asyncio
 import json
@@ -11,7 +11,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.main import app
-from app.generation.service import GenerationError
 from app.ingestion.service import NotSupportedSource, parse_bytes
 from app.contracts.source import SourceKind
 
@@ -69,7 +68,6 @@ class SkeletonTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(dir=data, ignore_cleanup_errors=True)
         cls.env = patch.dict(os.environ, {
             "MINDMAP_DB_PATH": str(Path(cls.tmp.name) / "skeleton.db"),
-            "MINDMAP_LLM_MODE": "demo",
         })
         cls.env.start()
 
@@ -83,74 +81,29 @@ class SkeletonTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b'"status":"ok"', raw)
 
-    def test_text_source_then_pipeline(self):
-        """文本来源 → 四段流水线 → 导图 + 阶段轨迹。"""
+    def test_text_source_round_trips_through_a_saved_map(self):
+        """文本来源解析出的摘要能随导图一起存取。
+
+        原先是「来源 → 流水线生成 → 保存」的整条链路；生成那一段已经收进 agent，
+        这里只守两端：ingestion 把文本解析成带 id 的来源，mindmaps 存取时把
+        `source_usage` 原样带回来。
+        """
         status, raw = request("POST", "/api/ingestion/text", {"text": "人工智能的应用"})
         self.assertEqual(status, 200)
         source = json.loads(raw)["source"]
         self.assertEqual(source["status"], "parsed")
-        status, raw = request("POST", "/api/pipeline/generate", {"sources": [source]})
-        self.assertEqual(status, 200)
-        content = json.loads(raw)["content"]
-        self.assertEqual(content["source_usage"][0]["source_id"], source["id"])
+        usage = {"source_id": source["id"], "kind": source["kind"],
+                 "filename": source["filename"],
+                 "char_count": len(source["text"].strip())}
+        content = {"title": "人工智能的应用",
+                   "root": {"id": "r", "label": "人工智能的应用", "children": []},
+                   "source_usage": [usage]}
         status, saved_raw = request("POST", "/api/mindmaps", {"content": content})
         self.assertEqual(status, 201)
         saved = json.loads(saved_raw)
         status, reloaded = request("GET", "/api/mindmaps/" + saved["id"])
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(reloaded)["content"]["source_usage"], content["source_usage"])
-
-    def test_pipeline_returns_stages(self):
-        source = {"kind": "text", "text": "人工智能的应用", "status": "parsed"}
-        status, raw = request("POST", "/api/pipeline/generate", {"sources": [source]})
-        self.assertEqual(status, 200)
-        body = raw.decode()
-        for stage in ("understand", "outline", "validate", "verify"):
-            self.assertIn(stage, body)
-        self.assertIn('"mode":"demo"', body)
-
-    def test_pipeline_records_every_accepted_source(self):
-        sources = [
-            {"id": "one", "kind": "text", "text": "第一份", "status": "parsed"},
-            {"id": "two", "kind": "markdown", "text": "第二份材料", "status": "parsed"},
-        ]
-        status, raw = request("POST", "/api/pipeline/generate", {"sources": sources})
-        self.assertEqual(status, 200)
-        usage = json.loads(raw)["content"]["source_usage"]
-        self.assertEqual([(item["source_id"], item["char_count"]) for item in usage],
-                         [("one", 3), ("two", 5)])
-
-    def test_pipeline_rejects_empty_sources(self):
-        status, _ = request("POST", "/api/pipeline/generate",
-                            {"sources": [{"kind": "text", "status": "failed"}]})
-        self.assertEqual(status, 422)
-
-    def test_pipeline_rejects_unparsed_and_duplicate_sources(self):
-        """来源不可用与 ID 重复仍在开流前 422。
-
-        「材料超过 20000 字」那条断言已经随字数上限一起删掉：长度不再是
-        pipeline 的判断依据，装不装得进上下文由生成前的 token 估算决定
-        （口径与状态码都不同，见 `test_source_refs`）。
-        """
-        sources = [
-            {"id": "one", "kind": "text", "text": "第一份材料", "status": "parsed"},
-            {"id": "two", "kind": "text", "text": "important second source", "status": "failed"},
-        ]
-        status, raw = request("POST", "/api/pipeline/generate", {"sources": sources})
-        self.assertEqual(status, 422)
-        self.assertIn("第 2 个来源", json.loads(raw)["detail"])
-        sources[1]["status"] = "parsed"
-        sources[1]["id"] = "one"
-        status, raw = request("POST", "/api/pipeline/generate", {"sources": sources})
-        self.assertEqual(status, 422)
-        self.assertIn("来源 ID 不能重复", json.loads(raw)["detail"])
-
-    def test_pipeline_reports_provider_failure_as_upstream_error(self):
-        source = {"kind": "text", "text": "有效文本", "status": "parsed"}
-        with patch("app.pipeline.service.generate", side_effect=GenerationError("服务暂时不可用")):
-            status, raw = request("POST", "/api/pipeline/generate", {"sources": [source]})
-        self.assertEqual(status, 502)
-        self.assertEqual(json.loads(raw)["detail"], "服务暂时不可用")
+        self.assertEqual(json.loads(reloaded)["content"]["source_usage"], [usage])
 
     def test_optimization_detects_duplicate(self):
         status, raw = request("POST", "/api/optimization/check", {"content": MAP})

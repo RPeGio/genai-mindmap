@@ -2,7 +2,6 @@
 from copy import deepcopy
 import json
 from pathlib import Path
-from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -11,7 +10,11 @@ import pytest
 
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.source import Source, SourceRef, SourceUsage
-from app.generation.service import CONTEXT_TOKEN_LIMIT, generate
+from app.generation.service import (
+    GenerationError,
+    _demo_content,
+    validate_generated_content,
+)
 from app.main import app
 from app.mindmaps import repository
 from app.optimization.service import check
@@ -44,10 +47,10 @@ def sources():
 
 @pytest.fixture
 def tree(sources):
-    # 一级分支必须是 3 条：走 `/api/pipeline/generate` 的用例经过
-    # `validate_generated_content` 的默认路径，`MIN_BRANCHES = 3` 会把 2 分支
-    # 的树判成 502。新增的 c 与其它分支一样带一条能逐字对上原文的引用，
-    # 这样它既不会引入新诊断，也让"某条诊断只出现在某个节点"的断言保持原意。
+    # 一级分支必须是 3 条：这些树最后都交给 `validate_generated_content`，
+    # 它默认要求 `MIN_BRANCHES = 3`。新增的 c 与其它分支一样带一条能逐字
+    # 对上原文的引用，这样它既不会引入新诊断，也让"某条诊断只出现在某个
+    # 节点"的断言保持原意。
     return {
         "title": "材料摘要",
         "root": {"id": "r", "label": "材料摘要", "source_refs": [
@@ -196,104 +199,62 @@ def test_page_claims_are_not_confused_with_quote_matching(tree, sources, page, c
     assert any(d.code == code and d.node_id == "a" for d in diagnostics)
 
 
-def test_pipeline_prompts_with_source_boundaries_and_rebuilds_summary(client, tree, sources):
+def test_validation_rebuilds_source_usage_and_drops_invented_references(tree, sources):
+    """来源摘要以真实输入重建，模型伪造的引用在契约校验前就被剔除。
+
+    这是 `pipeline/service.run()` 收尾留给 `validate_generated_content` 的职责，
+    换成 agent 之后仍然由同一个函数承担，所以直接对它断言，不必绕过 SSE。
+    """
     tree["source_usage"] = {"fabricated": "even invalid metadata must not be trusted"}
     tree["root"]["children"][0]["source_refs"].extend([
         {"source_id": "invented", "quote": "伪造来源"},
         {"source_id": "s2", "quote": "识别图像"},
     ])
     original = deepcopy(tree)
-    with patch("app.generation.service.chat", return_value=tree) as chat:
-        response = client.post("/api/pipeline/generate", json={
-            "sources": [s.model_dump(mode="json") for s in sources],
-        })
-    assert response.status_code == 200, response.text
-    body = response.json()
-    content = MindMapContent.model_validate(body["content"])
+
+    content, diagnostics = validate_generated_content(tree, sources=sources)
+
     assert [s.source_id for s in content.source_usage] == ["s1", "s2"]
     assert content.source_usage[1].filename == "会议.md"
     assert content.source_usage[0].char_count == len(sources[0].text.strip())
     assert content.root.children[0].source_refs == [SourceRef(source_id="s1", quote="识别图像")]
-    assert {(d["code"], d["node_id"]) for d in body["diagnostics"]} == {
+    assert {(d.code, d.node_id) for d in diagnostics} == {
         ("UNKNOWN_SOURCE_REF", "a"), ("SOURCE_QUOTE_MISMATCH", "a"),
     }
-    assert [stage["stage"] for stage in body["stages"]] == ["understand", "outline", "validate", "verify"]
-    system, user = chat.call_args.args
-    assert "source_refs" in system and "quote" in system
-    assert json.loads(user) == {"sources": [{"source_id": s.id, "text": s.text} for s in sources]}
     assert tree == original
 
 
-def test_pipeline_clears_unfounded_citation_but_keeps_node(client, tree, sources):
+def test_validation_clears_unfounded_citation_but_keeps_node(tree, sources):
+    """引用核验不过时只摘掉那条引用，节点本身留着由人决定。"""
     tree["root"]["children"][0]["source_refs"][0]["quote"] = "凭空添加的内容"
-    with patch("app.generation.service.chat", return_value=tree):
-        response = client.post("/api/pipeline/generate", json={
-            "sources": [s.model_dump(mode="json") for s in sources],
-        })
-    body = response.json()
-    assert response.status_code == 200, response.text
-    assert body["content"]["root"]["children"][0]["id"] == "a"
-    assert body["content"]["root"]["children"][0]["source_refs"] == []
-    assert {(d["code"], d["node_id"]) for d in body["diagnostics"]} == {
+
+    content, diagnostics = validate_generated_content(tree, sources=sources)
+
+    assert content.root.children[0].id == "a"
+    assert content.root.children[0].source_refs == []
+    assert {(d.code, d.node_id) for d in diagnostics} == {
         ("SOURCE_QUOTE_MISMATCH", "a"), ("UNSOURCED_NODE", "a"),
     }
 
 
-def test_pipeline_invalid_reference_shape_is_an_upstream_error(client, tree, sources):
+def test_validation_rejects_malformed_reference_shape(tree, sources):
+    """引用字段本身不合法时整次生成失败：那是模型没按约定写，不是可以修的引用。"""
     tree["root"]["source_refs"][0]["start"] = -1
-    with patch("app.generation.service.chat", return_value=tree):
-        response = client.post("/api/pipeline/generate", json={
-            "sources": [s.model_dump(mode="json") for s in sources],
-        })
-    assert response.status_code == 502
-    assert response.json()["request_id"]
+
+    with pytest.raises(GenerationError):
+        validate_generated_content(tree, sources=sources)
 
 
-def test_demo_does_not_invent_references(monkeypatch, sources):
-    monkeypatch.setenv("MINDMAP_LLM_MODE", "demo")
-    with patch("app.generation.service.chat") as chat:
-        result = generate("材料摘要", sources=sources)
-    chat.assert_not_called()
-    assert result.content.root.source_refs == result.content.root.children[0].source_refs == []
-    assert [d.code for d in result.diagnostics] == ["UNSOURCED_NODE", "UNSOURCED_NODE"]
+def test_demo_does_not_invent_references(sources):
+    """占位树不带任何引用：demo 不伪装成模型产物，也不伪造出处。
 
-
-def test_pipeline_no_longer_caps_character_count(client, tree):
-    """字数上限已删：20001 字（含大段空白）照常进入生成。
-
-    原先这里断言 422——`MAX_INPUT_CHARS = 20000`，而空白也算字数。那个数
-    没有实测依据，与"模型到底收不收"无关，现在只由 token 估算决定。
+    两个节点各报一条 UNSOURCED_NODE——这是提示而非失败，占位树照常可用。
     """
-    with patch("app.generation.service.chat", return_value=tree):
-        response = client.post("/api/pipeline/generate", json={"sources": [
-            {"id": "s1", "kind": "text", "status": "parsed", "text": " " * 20000 + "字"},
-        ]})
-    assert response.status_code == 200, response.text
+    content, diagnostics = validate_generated_content(
+        _demo_content("材料摘要").model_dump(), sources=sources, enforce_min_branches=False)
 
-
-def test_pipeline_rejects_material_over_context_tokens(client):
-    """替代字数上限的是上下文 token 边界：超了报 502 并带回可读文案。
-
-    502 而不是 422：这是模型拒绝服务的那一类失败（上游能力不足），
-    与"请求体不合法"是两回事——用户要改的是材料长度，不是请求格式。
-
-    样本按 `CONTEXT_TOKEN_LIMIT` 现算：限额是可调参数，写死字数的样本会在
-    调阈值之后掉进"装得下"的一侧，这条用例就从"超限必拒"退化成"正常生成"。
-    """
-    oversized = "字" * int(CONTEXT_TOKEN_LIMIT * 1.6)   # 汉字约 1.5 字/token
-    with patch("app.generation.service._config",
-               return_value=("https://example.com/v1", "k", "m")), \
-         patch("app.generation.service.httpx.Client") as http_client:
-        response = client.post("/api/pipeline/generate", json={"sources": [
-            {"id": "s1", "kind": "text", "status": "parsed", "text": oversized},
-        ]})
-
-    assert response.status_code == 502, response.text
-    detail = response.json()["detail"]
-    assert "超过模型上下文上限" in detail
-    assert "请精简后重试，或分成多次生成" in detail
-    # 超限的请求根本不该发出去
-    http_client.assert_not_called()
+    assert content.root.source_refs == content.root.children[0].source_refs == []
+    assert [d.code for d in diagnostics] == ["UNSOURCED_NODE", "UNSOURCED_NODE"]
 
 
 @pytest.mark.parametrize("path", ["/api/optimization/check", "/api/optimization/suggest"])

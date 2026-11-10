@@ -1,4 +1,4 @@
-"""通过 ASGI 请求验证演示生成和持久化，不访问第三方模型。"""
+"""通过 ASGI 请求验证导图持久化与契约版本兼容，不访问第三方模型。"""
 import asyncio
 import json
 import os
@@ -17,8 +17,7 @@ class ApiTest(unittest.TestCase):
         data = BACKEND / "data"
         data.mkdir(exist_ok=True)
         cls.tmp = tempfile.TemporaryDirectory(dir=data, ignore_cleanup_errors=True)
-        cls.env = patch.dict(os.environ, {"MINDMAP_DB_PATH": str(Path(cls.tmp.name) / "test.db"),
-                                         "MINDMAP_LLM_MODE": "demo"})
+        cls.env = patch.dict(os.environ, {"MINDMAP_DB_PATH": str(Path(cls.tmp.name) / "test.db")})
         cls.env.start()
 
     @classmethod
@@ -55,14 +54,14 @@ class ApiTest(unittest.TestCase):
 
         return asyncio.run(run())
 
-    def test_generate_save_load_update_and_conflict(self):
-        status, generated = self.call("/generations", "POST", {"text": "机器学习"})
-        self.assertEqual((status, generated["mode"]), (200, "demo"))
-        content = generated["content"]
-        self.assertEqual(content["root"]["label"], "机器学习")
+    def test_save_load_update_and_conflict(self):
+        # 内容直接构造：生成那一段已收进 agent，这里只守持久化与版本号语义。
+        content = {"title": "机器学习", "root": {"id": "1", "label": "机器学习", "children": [
+            {"id": "2", "label": "请编辑此演示节点", "children": []}]}}
         status, saved = self.call("/mindmaps", "POST", {"content": content})
         self.assertEqual(status, 201)
         map_id = saved["id"]
+        content = saved["content"]
         status, loaded = self.call("/mindmaps/" + map_id)
         self.assertEqual((status, loaded["content"]), (200, content))
         content["root"]["label"] = "已编辑"
@@ -99,7 +98,6 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(created["content"]["layout"], "tree")
 
     def test_validation_and_not_found(self):
-        self.assertEqual(self.call("/generations", "POST", {"text": "   "})[0], 422)
         bad = {"title": "重复", "root": {"id": "x", "label": "根", "children": [
             {"id": "x", "label": "子", "children": []}]}}
         self.assertEqual(self.call("/mindmaps", "POST", {"content": bad})[0], 422)

@@ -1,6 +1,6 @@
 """错误响应格式测试：任何出口（404 / 422 / 业务异常）都必须是同一套结构。
 
-不访问模型、不写真实数据库（demo 模式 + 临时库）。
+不访问模型、不写真实数据库（用临时库）。
 """
 import asyncio
 import json
@@ -11,7 +11,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.main import app
-from app.generation.service import GenerationError
 
 BACKEND = Path(__file__).resolve().parents[1]
 
@@ -57,7 +56,6 @@ class ErrorFormatTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(dir=data, ignore_cleanup_errors=True)
         cls.env = patch.dict(os.environ, {
             "MINDMAP_DB_PATH": str(Path(cls.tmp.name) / "errors.db"),
-            "MINDMAP_LLM_MODE": "demo",
         })
         cls.env.start()
 
@@ -84,7 +82,7 @@ class ErrorFormatTest(unittest.TestCase):
         self.assertEqual(body["code"], "http_404")
 
     def test_invalid_body_returns_validation_error(self):
-        status, raw, headers = request("POST", "/api/generations", {"text": "   "})
+        status, raw, headers = request("POST", "/api/mindmaps", {"content": {}})
         self.assertEqual(status, 422)
         body = json.loads(raw)
         self.assert_unified(body, headers)
@@ -95,21 +93,10 @@ class ErrorFormatTest(unittest.TestCase):
         self.assertTrue(body["detail"])
         self.assertIn("loc", body["detail"][0])
 
-    def test_generation_failure_returns_unified_502(self):
-        with patch("app.generation.router.generate",
-                   side_effect=GenerationError("模型服务暂时不可用")):
-            status, raw, headers = request("POST", "/api/generations", {"text": "机器学习"})
-        self.assertEqual(status, 502)
-        body = json.loads(raw)
-        self.assert_unified(body, headers)
-        self.assertEqual(body["code"], "http_502")
-        self.assertEqual(body["message"], "模型服务暂时不可用")
-        self.assertEqual(body["detail"], "模型服务暂时不可用")
-
     def test_request_id_header_is_echoed(self):
         calls = [
             ("GET", "/api/does-not-exist", None),
-            ("POST", "/api/generations", {"text": ""}),
+            ("POST", "/api/mindmaps", {"content": {}}),
         ]
         for method, path, body in calls:
             with self.subTest(path=path):
