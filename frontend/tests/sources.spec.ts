@@ -341,7 +341,9 @@ describe('合并生成边界', () => {
     const next = { title: '新图', root: { id: 'new', label: '新图', children: [] } };
     second.resolve(json({ mode: 'model', content: next, stages: [], diagnostics: [] }));
     await retried;
-    expect(map.content).toEqual(next);
+    // 生成结果装进画布时会补上朝向（`layout` / `theme.direction`），
+    // 所以这里只比对内容本身，不要求整对象逐字段相等。
+    expect(map.content).toMatchObject({ title: '新图', root: next.root });
     expect(map.mapId).toBeNull();
     expect(map.version).toBe(0);
     expect(map.dirty).toBe(true);

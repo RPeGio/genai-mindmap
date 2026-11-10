@@ -80,11 +80,13 @@ describe('exportMindMap', () => {
     vi.unstubAllGlobals();
   });
 
-  it('把 note 折进 label 再发，字段本身不带 v2 的 note', async () => {
-    // 样例导图里的节点带 note（正文）：v1 的 Node 不认这个字段，直接发会 422；
-    // 但也不能一裁了之——导出的成品只剩短标题就看不懂了。
+  it('导出直接发原样内容，正文与标题都由后端取', async () => {
+    // 契约 v2 之后后端三种导出统一取 `note or label`，前端不再把正文折进标题：
+    // 两端各拼一次，同一份内容会出现两种文字。
     const withNote = {
       title: '季度规划',
+      layout: 'tree',
+      theme: { direction: 'left' },
       root: { id: 'root', label: '产品', note: '正文放在 note 里', children: [] },
     } as MindMapContent;
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => '' });
@@ -93,13 +95,18 @@ describe('exportMindMap', () => {
     await exportMindMap('markdown', withNote);
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    const sent = JSON.parse(String(init.body)) as { content: { root: Record<string, unknown> } };
-    expect(sent.content.root).not.toHaveProperty('note');
-    // note 自己就以标题开头时不再重复拼一遍（实际数据里很常见）
-    expect(sent.content.root.label).toBe('产品：正文放在 note 里');
+    const sent = JSON.parse(String(init.body)) as {
+      content: { layout: string; theme: { direction: string }; root: Record<string, unknown> };
+    };
+    expect(sent.content.root.label).toBe('产品');
+    expect(sent.content.root.note).toBe('正文放在 note 里');
+    // 布局与朝向也要一起发出去，导出结果才和画布一致。
+    expect(sent.content.layout).toBe('tree');
+    expect(sent.content.theme.direction).toBe('left');
+    vi.unstubAllGlobals();
   });
 
-  it('正文已经以标题开头时不再重复标题', async () => {
+  it('正文以标题开头时也不再改写，交给后端取正文', async () => {
     const content = {
       title: '机器学习',
       root: {
@@ -116,7 +123,8 @@ describe('exportMindMap', () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     const sent = JSON.parse(String(init.body)) as { content: { root: Record<string, unknown> } };
-    expect(sent.content.root.label).toBe('分类：输出离散标签。');
+    expect(sent.content.root.label).toBe('分类');
+    expect(sent.content.root.note).toBe('分类：输出离散标签。');
     vi.unstubAllGlobals();
   });
 });

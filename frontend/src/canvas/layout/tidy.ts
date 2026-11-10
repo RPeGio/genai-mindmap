@@ -9,8 +9,8 @@ import type { MindNode } from '../../api/types';
  * - `down`  根在上、层级向下（组织架构/逻辑结构式）
  * - `both`  双向：根居中，子节点对半分列两侧
  *
- * 注意：契约 v2 的 `Theme.direction` 只有 right/left/both，垂直向下在 v2 里
- * 对应 `layout: "logic"`；映射关系见 docs/CONTRACT_V2.md。
+ * 注意：契约 v2 里垂直向下的布局是 `layout: "vertical"`，横向朝哪边是
+ * `Theme.direction`；两者的换算是 `frontend/src/mindmap/direction.ts` 一处完成的。
  */
 export type Direction = 'right' | 'left' | 'down' | 'both';
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
@@ -78,6 +78,39 @@ const directions: { value: Direction; label: string }[] = [
 
 const selected = computed(() => store.selectedNode);
 const pathText = computed(() => store.breadcrumb.map(node => node.label.trim()).join(' / '));
+
+/**
+ * 正文编辑框的草稿。
+ *
+ * 和标题一样不逐键写回 content：每敲一个字都进撤销栈的话，撤销一次只退一个字符。
+ * 选中变化时重新取一次，避免把上一个节点的正文带到另一个节点上。
+ */
+const noteTargetId = ref<string | null>(null);
+const noteDraft = ref('');
+
+watch(
+  () => [selected.value?.node.id ?? null, selected.value?.node.note ?? ''] as const,
+  ([id, note]) => {
+    noteTargetId.value = id;
+    noteDraft.value = note;
+  },
+  { immediate: true },
+);
+
+const noteLength = computed(() => Array.from(noteDraft.value).length);
+
+function commitNoteDraft() {
+  const id = noteTargetId.value;
+  if (!id) return;
+  store.commitNote(id, noteDraft.value);
+  // 提交后以 store 里的值为准：空正文会被归一成 null，草稿也要跟着归一，
+  // 否则框里留着空格、界面上却显示"没有正文"。
+  noteDraft.value = store.selectedNode?.node.note ?? '';
+}
+
+function resetNoteDraft() {
+  noteDraft.value = store.selectedNode?.node.note ?? '';
+}
 
 /** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
 const saveHint = computed(() => {
@@ -357,9 +390,21 @@ async function copyBody() {
           <h2 class="text-sm font-semibold">
             {{ selected.node.label.trim() }}
           </h2>
-          <p class="flex-1 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
-            {{ displayBody(selected.node) }}
-          </p>
+          <label class="flex flex-1 flex-col gap-1">
+            <span class="text-xs text-slate-400">
+              正文 {{ noteLength }} / 2000
+              <span v-if="!(selected.node.note ?? '').trim()">· 现在是空的，画布与导出用标题</span>
+            </span>
+            <textarea
+              v-model="noteDraft"
+              aria-label="节点正文"
+              class="min-h-24 flex-1 resize-y rounded-md border border-slate-200 px-2 py-1.5 text-sm leading-relaxed text-slate-700 focus:border-slate-400 focus:outline-none"
+              maxlength="2000"
+              placeholder="写这个节点的解释或细节；留空则画布与导出都用标题"
+              @blur="commitNoteDraft"
+              @keydown.esc="resetNoteDraft"
+            />
+          </label>
 
           <section v-if="selectedRefs.length" class="flex flex-col gap-2 border-t border-slate-200 pt-3">
             <h3 class="text-xs font-medium text-slate-500">来源引用（{{ selectedRefs.length }}）</h3>

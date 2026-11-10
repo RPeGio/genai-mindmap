@@ -76,6 +76,7 @@ flowchart TD
 | Agent 面板 | `POST /api/agent/runs/stream` | **已接入**：`src/components/AgentPanel.vue` 显示工具进度，候选需点接受才落到画布 |
 | 诊断面板（待接入） | `POST /api/optimization/check` / `/suggest` | 接口已实现，界面还没渲染 `diagnostics`；建议需用户确认后再改 |
 | 引用展示 | 无请求（读 `node.source_refs`） | **已接入**：`src/mindmap/refs.ts` 负责定位与截断，节点右上角显示引用条数，选中后在详情面板列出来源与位置，点一条在右侧抽屉里看原文并高亮命中句；左侧来源行反向显示"被 N 个节点引用"，点节点名跳转（`buildRefIndex`）；原文只在本次会话可回查 |
+| 正文编辑 | 随保存一起发（`note`） | **已接入**：详情面板的 textarea 编辑 `node.note`（≤2000 字，Esc 放弃），失焦或 Ctrl+S 提交；画布与导出都取 `note or label`，朝向（`layout` / `theme.direction`）也随保存与打开往返 |
 
 `stages` 随同步响应一次性返回，只能展示完成后的阶段记录，不能显示生成中的实时进度；实时进度需要未来的任务状态接口或 SSE。
 

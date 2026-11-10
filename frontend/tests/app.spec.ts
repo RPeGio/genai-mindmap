@@ -49,6 +49,9 @@ function mountApp() {
   return mount(App, { global: { plugins: [createPinia()] } });
 }
 
+/** 左侧输入区也有一个 textarea，按标签定位详情面板里的正文框。 */
+const NOTE_TEXTAREA = 'textarea[aria-label="节点正文"]';
+
 /**
  * 按文字找按钮：开发期示例选择器会异步插入一排按钮，
  * 用 `findAll('button')[0]` 会随加载时机拿到不同的东西。
@@ -342,5 +345,63 @@ describe('导出提示', () => {
     const status = wrapper.find('[role="status"]');
     expect(status.exists()).toBe(true);
     expect(wrapper.text()).toContain('已导出 PlantUML');
+  });
+});
+
+describe('正文编辑', () => {
+  const mapWith = (note?: string) => ({
+    title: '正文',
+    root: {
+      id: 'r',
+      label: '根',
+      children: [{ id: 'a', label: '甲', note, children: [] }],
+    },
+  });
+
+  it('选中节点后正文在输入框里可以改，失焦即提交', async () => {
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(mapWith(), 'right');
+    store.select('a');
+    await wrapper.vm.$nextTick();
+
+    const textarea = wrapper.find(NOTE_TEXTAREA);
+    expect(textarea.exists()).toBe(true);
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('');
+
+    await textarea.setValue('矩阵的秩是主元个数');
+    await textarea.trigger('blur');
+    await wrapper.vm.$nextTick();
+
+    expect(store.content?.root.children[0].note).toBe('矩阵的秩是主元个数');
+    expect(store.dirty).toBe(true);
+  });
+
+  it('已有正文时打开就把正文填进去，并显示字数', async () => {
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(mapWith('已经写过的正文'), 'right');
+    store.select('a');
+    await wrapper.vm.$nextTick();
+
+    const textarea = wrapper.find(NOTE_TEXTAREA);
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('已经写过的正文');
+    expect(wrapper.text()).toContain('正文 7 / 2000');
+  });
+
+  it('按 Esc 放弃这次输入，回到原来的正文', async () => {
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(mapWith('原来的正文'), 'right');
+    store.select('a');
+    await wrapper.vm.$nextTick();
+
+    const textarea = wrapper.find(NOTE_TEXTAREA);
+    await textarea.setValue('改了一半');
+    await textarea.trigger('keydown', { key: 'Escape' });
+    await wrapper.vm.$nextTick();
+
+    expect((wrapper.find(NOTE_TEXTAREA).element as HTMLTextAreaElement).value).toBe('原来的正文');
+    expect(store.content?.root.children[0].note).toBe('原来的正文');
   });
 });

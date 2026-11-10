@@ -239,6 +239,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.7 | 2026-11-05 | 语音接口二次切换：ISI 一句话识别 → 百炼 `qwen-audio-3.1-asr-flash`。换来句级时间戳、300 秒单次上限、60 秒音频快 2.8 倍且便宜 3.9 倍；依赖 `websockets` 与 `aliyun-python-sdk-core` 一并移除，`MAX_SLICE_SECONDS` 60 → 300 |
 | v1.8 | 2026-11-06 | 生成链路 Agent 化：受限 tool-calling 循环（四个工具、`RunBudget` 预算）、op 契约与两端共读用例、SSE v2 事件、前端候选确认（`docs/AGENT_PLAN.md`）。`/api/agent/tasks` 仍是桩；F02/F03/F16 转「部分实现」 |
 | v1.9 | 2026-11-07 | 文档对账：功能清单加实现日期、能力与端点按代码现状重写（19 个端点、无 501 路由、`source_refs` 属 v1）、配置项补 6 个变量；`NEXT-PLAN.md` 加日期同步说明 |
-| v1.12 | 2026-11-10 | 契约 v2 在后端落地（P3 第一步）：`schema_version`、`note`、`layout`（新增 `vertical`）、`theme`、`relations`、`style`/`pos`/`collapsed` 进 `backend/app/contracts/mindmap.py`；旧记录读时补默认值（`migrate_content()`），不跑一次性脚本；导出改取 `note or label`；v1 请求体继续接受。前端仍在 `toContractV1()` 里裁 `note`，接线放下一个 PR |
+| v1.13 | 2026-11-10 | 契约 v2 前端接线（P3 第二步）：详情面板可直接编辑节点正文（`note`，≤2000 字），保存 / 打开 / 导出都按 v2 发，`toContractV1()` 与 `toExportV1()` 删除；朝向（`layout` + `theme.direction`）随内容持久化，重新打开能恢复原布局，向下对应 `layout: vertical`；`relations` / `style` / `pos` / `collapsed` 原样透传不丢。H1 结案（陈嘉涛已在 PR #13 认可） |
+| v1.12 | 2026-11-10 | 契约 v2 在后端落地（P3 第一步）：`schema_version`、`note`、`layout`（新增 `vertical`）、`theme`、`relations`、`style`/`pos`/`collapsed` 进 `backend/app/contracts/mindmap.py`；旧记录读时补默认值（`migrate_content()`），不跑一次性脚本；导出改取 `note or label`；v1 请求体继续接受 |
 | v1.11 | 2026-11-08 | 引用反向索引（P2）：左侧来源行标注被几个节点引用、内联节点列表可跳转、未引用来源标 amber；撤销栈改按 10MB 字节上限（节点上限提到 1000 后只按步数会失控）；新增 docs/TODO.md 记录文件占用，避免两人同改 stores/mindmap.ts |
 | v1.10 | 2026-11-07 | 节点来源引用进界面（F08，`fc8f82f`）：画布角标显示条数、详情面板列来源与位置、右侧抽屉看原文并高亮命中句；原文不落库，跨会话只剩 `quote`。「每个来源被几个节点引用」的反向索引放 P2 |

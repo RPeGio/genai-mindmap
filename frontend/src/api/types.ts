@@ -1,5 +1,8 @@
-/** 后端契约 v1 的 TypeScript 镜像。字段以 backend/app/contracts/mindmap.py 为准；
- *  后端升到契约 v2 后由 openapi-typescript 生成 schema.d.ts 替换本文件。 */
+/** 后端契约的 TypeScript 镜像。字段以 backend/app/contracts/mindmap.py 为准。
+ *
+ *  2026-11-10 起后端是契约 v2：本文件声明了 v2 的字段，但界面只读写
+ *  `note` / `layout` / `theme.direction`，其余（`relations` / `style` / `pos` /
+ *  `collapsed`）只做透传保存。等接 `openapi-typescript` 生成 `schema.d.ts` 后删本文件。 */
 export interface MindNode {
   id: string;
   /** 一句话标题。画布上按 24 字截断显示，全文在悬停卡片与详情面板里。 */
@@ -21,6 +24,15 @@ export interface MindNode {
    * 字符区间以 `Source.text` 为准，用 Unicode 码点计（不是 UTF-16 下标）。
    */
   source_refs?: SourceRef[];
+  /**
+   * 契约 v2 的视图字段：折叠状态、样式、手动坐标。
+   *
+   * 界面都还不渲染，但必须声明成可选字段并原样透传保存——否则用户点一次保存，
+   * 后端下发的这些字段就被序列化丢掉了（`note` 在 v1 阶段已经踩过同一个坑）。
+   */
+  collapsed?: boolean;
+  style?: NodeStyle | null;
+  pos?: NodePosition | null;
 }
 
 /** 节点引用。与 backend/app/contracts/source.py 的 `SourceRef` 对应。 */
@@ -91,6 +103,54 @@ export interface MindMapContent {
   root: MindNode;
   /** 整图来源摘要；旧导图可以省略，不代表节点级引用。 */
   source_usage?: SourceUsage[];
+  /** 契约 v2：内容格式版本。旧记录没有该字段，按 v2 默认值理解。 */
+  schema_version?: 2;
+  /**
+   * 契约 v2：树的排布方式。界面目前只认 `tree` 与 `vertical`；
+   * `logic` / `timeline` / `fishbone` / `manual` 原样透传保存，不渲染。
+   */
+  layout?: LayoutKind;
+  /** 契约 v2：主题。界面只读写 `direction`，其余字段原样透传。 */
+  theme?: MindMapTheme;
+  /** 契约 v2：节点之间的非层级关系。界面不渲染，原样透传保存。 */
+  relations?: MindRelation[];
+}
+
+/** 与 `backend/app/contracts/mindmap.py::LayoutKind` 一致。 */
+export type LayoutKind = 'tree' | 'vertical' | 'logic' | 'timeline' | 'fishbone' | 'manual';
+
+/** 与后端 `Theme` 一致。`direction` 只描述横向布局朝哪边。 */
+export interface MindMapTheme {
+  preset?: 'default' | 'slate' | 'forest' | 'sunset' | 'mono';
+  accent?: string | null;
+  font?: 'system' | 'serif' | 'mono';
+  direction?: 'right' | 'left' | 'both';
+}
+
+/** 与后端 `NodeStyle` 一致。界面不渲染，原样透传。 */
+export interface NodeStyle {
+  color?: string | null;
+  icon?: string | null;
+  bold?: boolean;
+  italic?: boolean;
+  shape?: 'rounded' | 'rect' | 'pill';
+}
+
+/** 与后端 `Position` 一致。只在 `layout === 'manual'` 时有效。 */
+export interface NodePosition {
+  x: number;
+  y: number;
+}
+
+/** 与后端 `Relation` 一致。界面不渲染，原样透传。 */
+export interface MindRelation {
+  id: string;
+  source: string;
+  target: string;
+  type: 'cause' | 'ref' | 'conflict' | 'depends';
+  label?: string | null;
+  evidence?: string | null;
+  provenance?: 'user' | 'ai' | 'import';
 }
 
 /** 同步生成接口的响应：mode 说明内容来自演示规则还是模型。 */
