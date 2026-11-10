@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-10）：后端 515 个测试（pytest）、前端 372 个 vitest 用例（22 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-10）：后端 517 个测试（pytest）、前端 372 个 vitest 用例（22 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -97,7 +97,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               515 个测试
+  tests/               517 个测试
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -125,8 +125,9 @@ docs/
   ARCHITECTURE.md      模块边界、技术选型及来源
   ARCHITECTURE_ADDENDUM.md  存储迁移、SSE 协议、流水线细节
   PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q36）
-  CONTRACT_V2.md       契约 v2（后端 2026-11-10 已落地；前端类型仍手写 v1 镜像）
+  CONTRACT_V2.md       契约 v2（两端 2026-11-10 已落地；`types.ts` 是 v2 镜像，`schema.d.ts` 由 `openapi.json` 生成，`contract-check.ts` 编译期断言两者一致）
   HANDOFF.md           需要对方知悉或确认的跨人决策（待确认 / 已确认）
+  TODO.md              文件占用与交接（协作文件，动共用文件前先看这里）
   W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
 START_HERE.md          原始的骨架说明
@@ -213,7 +214,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 ## 7 动手前必须知道的四件事
 
-**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children` / `source_refs`（后者可选，节点级引用），不是 `topic`、不是 `text`。上限 1000 节点、8 层、每节点 50 个子节点、标题与节点文字各 200 字，超了直接 422。`note` 仍属 v2 预留，后端 v1 契约是 `extra="forbid"`，发过去就 422。
+**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children` / `source_refs`（后者可选，节点级引用），不是 `topic`、不是 `text`。上限 1000 节点、8 层、每节点 50 个子节点、标题与节点文字各 200 字，超了直接 422。`note`（正文，≤2000 字）已随契约 v2 上线，保存与导出都直接发送，前端不再裁剪。
 
 **二、保存是乐观锁。** `PUT /api/mindmaps/{id}` 必须带上读到的 `version`，服务端版本号变了就返回 409，前端要提示用户重新打开，不能强行覆盖。
 
@@ -225,10 +226,10 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 ## 8 已知的坑
 
-- **两个文本入口的上限不同**：`/api/ingestion/text` 与 `/api/generations` 都是单段 10000 字，`/api/pipeline/generate` 合并后限 20000 字（`backend/app/pipeline/service.py:29`）。前端来源面板按 20000 字提示，所以 15000 字走 pipeline 没问题、走 `/api/generations` 会被 422 挡下。
+- **文字上限有两种口径**：`/api/ingestion/text` 与 `/api/generations` 仍是单段 10000 字（`backend/app/contracts/source.py:123`、`backend/app/contracts/mindmap.py:222`）；`/api/pipeline/generate` 不再按字数封顶（原因写在 `backend/app/pipeline/service.py:26` 的注释里），改由真实调用前的 token 预算判断（`generation/service.py::ensure_input_within_context`）。前端来源面板按 300000 字提示（`frontend/src/sources/input.ts:19`），所以 15000 字走 pipeline 没问题、走 `/api/generations` 仍会被 422 挡下。
 - **引用的原文不落库**：`source_refs` 随导图一起保存（`source_id` + `quote` + 可选的页码与字符区间），但 `Source.text` 只活在本次会话的来源列表里（`frontend/src/stores/sources.ts`）。刷新后重新打开导图，节点角标、来源名与 `quote` 还在，抽屉里却没有前后文——界面会显示"原文没有随导图保存"。另外后端**只在生成/流水线时校验引用**，保存时不复检，所以手工改过节点文字之后，旧引用可能已经对不上原文。
-- **导出用根节点文字，不是标题**：`export/puml` 取的是 `root.label`。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
-- **导出会把正文折进标题**：三种导出都收 v1 的 `MindMapContent`，`Node` 是 `extra="forbid"`，所以 `frontend/src/api/client.ts::exportMindMap()` 先调 `toExportV1()`：用全角冒号把 `note`（正文）接在 `label`（短标题）后面，再把 `note` 字段裁掉。导出文件里节点文字是"短标题：正文"，不是画布上那句被截断的短标题；后端三种格式都会把换行压成空格，所以多行正文不会破坏缩进。等 v2 上线可以改回按字段导出。
+- **导出用根节点文字，不是标题**：三种导出取的是根节点的 `_node_text`（`backend/app/export/service.py`，即 `note or label`）。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
+- **导出取节点正文，不再折进标题**：前端把整棵树原样发出去（`toExportV1()` 与 `toContractV1()` 都已删除），由后端 `backend/app/export/service.py::_node_text` 取 `node.note or node.label`：有正文就导正文，没有才回落短标题。所以导出文件里是完整的正文，不是画布上那句被截断的短标题；三种格式都会把换行压成空格（PUML 另把 `*` 换成 `·`），多行正文不会破坏缩进。
 - **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得用 SSE（`/api/generations/stream`、`/api/agent/runs/stream`）。
 - **前端还没接的接口**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check` 与 `/suggest`。上传格式白名单目前写死在 `frontend/src/sources/input.ts` 的 `FILE_ACCEPT`，与后端 `formats` 接口有漂移风险；诊断接口已有返回值但界面不渲染（`frontend/src/api/types.ts` 里 `diagnostics` 标注为"目前只用于排障"）。
 - **编辑不记协作方**：保存以整棵树为单位（`version` 乐观锁），没有字段级合并；两个人同时编辑同一张图，后保存的会拿到 409，只能选择覆盖（重新加载）或另存为新导图。
@@ -243,7 +244,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 如果只有一个人有余力，按这个顺序：
 
 1. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
-2. **契约 v2 定稿**（RPeGio 与陈嘉涛，见 `docs/HANDOFF.md` 的 H1/H2）：`note` 与 v2 同批上线；layout/theme/relations 再排期。
+2. **v2 的界面渲染**（RPeGio，F09/F10）：契约 v2 两端已落地，缺的是画布的多布局与主题样式渲染；`relations` / `style` / `pos` 目前只落库、没有界面读它们。
 3. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
 4. **部署骨架**（RPeGio，F22）：`Dockerfile` + `deploy/docker-compose.yml` + nginx，目标单台 2C2G、`IP:8080` 可访问；没有登录和权限之前只能内网演示。
 
