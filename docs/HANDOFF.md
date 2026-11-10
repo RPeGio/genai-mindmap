@@ -18,12 +18,6 @@
 
 | 编号 | 日期 | 提出人 | 决策 | 理由 | 影响面 | 未回复期间的默认做法 |
 |---|---|---|---|---|---|---|
-| H1 | 2026-11-03 | RPeGio | 节点正文复用契约 v2 已有的 `Node.note`（`max_length=2000`），`label` 继续当短标题，**不收紧** 200 字上限 | 画布节点只有 180×48 px，长文本必须截断；截断后要能看全文，就需要一个"标题 + 正文"的双字段结构。v2 已经定义了 `note`，再加一个新字段会让迁移多一条无意义的分支 | `docs/CONTRACT_V2.md` 的 `Node`；前端 `src/api/types.ts`、`src/stores/mindmap.ts` 的 `displayBody()` | **2026-11-10 起 v2 已在后端落地**，`note` 可以保存；前端仍在 `src/api/client.ts::toContractV1()` 里裁掉它，下一个 PR（前端接线）删除该函数后即可写入。在那之前，本地编辑的正文刷新后会丢 |
-
-> H1 需要陈嘉涛在 PR 审查阶段确认。五条要点：① 复用 v2 的 `note`，不新增字段；② `label` 不收紧上限，仍允许长文本，`note` 只是可选的更长正文；③ `note` 必须与 v2 同批上线，不与 v1 混用；④ 迁移时 `note` 置 `None`、`label` 原样，保证无损（实现上靠 Pydantic 默认值 `note=None`，不需要改写整棵树）；⑤ 前端取值收敛在 `displayBody()` 一处，回退逻辑不散落到组件里。
->
-> 落地依据（2026-11-10）：③④ 已由契约 v2 落地兑现（`backend/app/contracts/mindmap.py`，测试 `backend/tests/test_contract_v2.py`）；①⑤ 在 R2 起就是这样实现的。剩下 ② 与"前端开始发送 `note`"两项随下一个 PR 完成。
-
 | H2 | 2026-11-04 | RPeGio | 保存以**整棵树**为单位提交（`POST /api/mindmaps` 建图、`PUT /api/mindmaps/{id}` 带 `version`），不做字段级合并；编辑上限在前端也校验一遍（标题/节点 200 字、1000 节点、8 层、每节点 50 子节点），文案与后端一致 | 字段级合并需要 diff + 三方合并，代价远超当前收益；单机单人对同一张图并发编辑的概率低，409 时让用户选"重新加载 / 另存为新图 / 取消"已经够用。前端先校验是为了不把明显非法的树发出去、省一次 422 往返，**不替代**后端校验 | 无后端改动；前端 `src/mindmap/edits.ts` 的 `validateDraft()` 与 `backend/app/contracts/mindmap.py` 的限制必须同步（改动任一侧要同时改另一侧） | 已按此实现（R3，PR #7）。若陈嘉涛不认同，改动集中在前端 `save()` 一个函数与 409 弹层，回退成本低；后端校验始终是唯一权威，前端校验只为省一次 422 往返 |
 
 ## 已确认
@@ -32,3 +26,8 @@
 |---|---|---|---|---|
 | H0 | 2026-11-03 | 陈嘉涛提出评估，RPeGio 裁定 | 后端地基压缩：W1 只做统一错误体 + `urllib`→`httpx`，SQLAlchemy / Alembic / PG 迁移顺延到验收之后，v1 继续用 `sqlite3` | 已写入 `docs/PLAN.md` Q35；W1–W3 以"SQLite 单文件 + 备份脚本"兑现"含数据库"的考核要求 |
 | H0b | 2026-11-03 | 陈嘉涛提出评估，RPeGio 裁定 | 实时协作（F17 / Yjs）保留，但排期延后：W2 不设硬门，W3 视余量决定是否落地 | 已写入 `docs/PLAN.md` Q36；`NEXT-PLAN.md` 原"W2 不做协作"的提议不再成立 |
+| H1 | 2026-11-03 | RPeGio | 节点正文复用契约 v2 已有的 `Node.note`（`max_length=2000`），`label` 继续当短标题，**不收紧** 200 字上限 | 陈嘉涛在契约 v2 审查时认可（PR #13，2026-11-10 合入 `dev` 的 `9f015ab`）；后端随 PR #13 落地（`backend/app/contracts/mindmap.py`、`backend/tests/test_contract_v2.py`），前端随本轮 PR 接线：详情面板可编辑正文，保存/打开/导出都发 `note`，`toContractV1()` / `toExportV1()` 已删除 |
+
+> H1 五条要点（确认后仍保留，供后来者核对实现是否走样）：① 复用 v2 的 `note`，不新增字段；② `label` 不收紧上限，仍允许长文本，`note` 只是可选的更长正文；③ `note` 必须与 v2 同批上线，不与 v1 混用；④ 迁移时 `note` 置 `None`、`label` 原样，保证无损（实现上靠 Pydantic 默认值 `note=None`，不需要改写整棵树）；⑤ 前端取值收敛在 `displayBody()` 一处，回退逻辑不散落到组件里。
+>
+> 兑现情况（2026-11-10）：①②③④ 已由契约 v2 落地兑现；⑤ 仍是 R2 起的实现方式（`frontend/src/stores/mindmap.ts`）。

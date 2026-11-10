@@ -1,11 +1,11 @@
 # MindMapContent v2 契约
 
-> 状态：**已落地（后端 2026-11-10）**· 归属：A/B 共管 · 任何字段改动需双人 review + 迁移脚本
+> 状态：**两端已落地（后端 2026-11-10、前端 2026-11-10）**· 归属：A/B 共管 · 任何字段改动需双人 review + 迁移脚本
 > v1 定义见 `backend/app/contracts/mindmap.py`（`id` / `label` / `children` / `source_refs`）。
 >
-> **落地状态（2026-11-10）**：`backend/app/contracts/mindmap.py` 已实现本文件全部字段与校验；`frontend/src/api/types.ts` 仍是手写的 v1 镜像，前端的保存/读取尚未发送 `schema_version` / `layout` / `theme` / `note`（下一个 PR 接线）。因为新字段全有默认值，**旧前端发来的 v1 请求体照样可用**，不需要两边同时上线。
+> **落地状态（2026-11-10）**：`backend/app/contracts/mindmap.py` 已实现本文件全部字段与校验；`frontend/src/api/types.ts` 已补 v2 字段，保存、打开、导出都按 v2 发（`frontend/src/api/client.ts` 里原有的 `toContractV1()` / `toExportV1()` 两个裁剪函数已删除）。因为新字段全有默认值，**旧前端发来的 v1 请求体照样可用**，后端也可以先上、前端后上。
 >
-> 逐字段状态：**已接线**（前端已在用或本轮就会用）= `schema_version`、`layout`、`theme.direction`、`note`、`source_refs`；**仅落库**（schema 里有、还没有界面读它）= `relations`、`style`、`pos`、`collapsed`、`theme.preset / accent / font`。把它们现在写进契约的理由是"只加不删"：晚一次成本是一次 `schema_version` 升位 + 两端类型全改。
+> 逐字段状态：**已接线**（前端已在读或在写）= `schema_version`、`layout`、`theme.direction`、`note`（详情面板可编辑并随保存落库）、`source_refs`；**仅落库**（schema 里有、还没有界面读它；前端按"读到什么原样带回去"的方式透传，不会丢）= `relations`、`style`、`pos`、`collapsed`、`theme.preset / accent / font`。把它们现在写进契约的理由是"只加不删"：晚一次成本是一次 `schema_version` 升位 + 两端类型全改。
 >
 > R2 画布已按 `node.note ?? node.label` 渲染正文（取值收敛在 `frontend/src/stores/mindmap.ts` 的 `displayBody()`）；v2 落地前前端保存时会裁掉 `note`（`src/api/client.ts::toContractV1()`），`note` 与 v2 同批上线后该函数删除——见 [交接文档](HANDOFF.md) H1。
 
