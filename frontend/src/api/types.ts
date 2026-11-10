@@ -213,6 +213,21 @@ export interface Source {
   failed_pages: number[];
   /** 音频时长（秒）；兼容未返回此字段的旧响应。 */
   duration_seconds?: number | null;
+  /**
+   * 音频的句级时间戳（音频来源才有）。
+   *
+   * 加这个字段是因为 `backend/app/contracts/source.py::Source` 已经下发它，而镜像里
+   * 缺字段时，「把来源原样送回后端」会把时间戳整段丢掉——需要按句回指原文的功能
+   * 就再也用不上它。时间是从**原始录音**开头算的毫秒偏移，不是相对切片。
+   */
+  sentences?: AudioSentence[];
+}
+
+/** 音频里的一句话及其在原始录音中的位置。 */
+export interface AudioSentence {
+  text: string;
+  begin_ms: number;
+  end_ms: number;
 }
 
 export interface CreateTextSourceResponse {

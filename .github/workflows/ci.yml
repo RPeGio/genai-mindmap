@@ -37,6 +37,14 @@ jobs:
       - name: Test
         run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=0
 
+      # 前端的契约类型由这份快照生成。忘了重新导出时，本地那条 pytest
+      # （tests/test_openapi_snapshot.py）会红；这里再多一层：即便快照更新了，
+      # 也要确认提交上去的就是重新生成过的结果，而不是手改的。
+      - name: OpenAPI 快照
+        run: |
+          python scripts/export_openapi.py
+          git -C .. diff --exit-code backend/openapi.json
+
   frontend:
     name: frontend (vitest + build)
     runs-on: ubuntu-latest
@@ -54,6 +62,13 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      # 生成结果必须与提交的文件一致：后端加了字段却没跑 npm run gen:api 时，
+      # 这里会红，而不是等到某天字段被静默丢掉才发现。
+      - name: 契约类型
+        run: |
+          npm run gen:api
+          git -C .. diff --exit-code frontend/src/api/schema.d.ts
 
       - name: Test
         run: npm test
