@@ -7,6 +7,7 @@ import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, 
 import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
+import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -1419,6 +1420,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
     thinkingModel: string = 'default',
   ): Promise<void> {
     if (busy.value || agentRunning.value) return;
+    // 来源合法性在这里再判一次。组件里已有同样的闸门，但 `runGeneration` 是唯一
+    // 入口——绕过组件直调（测试，或将来加的快捷入口）时那一层就不在了。判一次
+    // 只省一次 422 往返，权威仍是后端契约校验。
+    if (sources && sources.length > 0) {
+      const problem = sourceInputError(sources);
+      if (problem) {
+        agentError.value = problem;
+        status.value = problem;
+        return;
+      }
+    }
     const prompt = goal.trim();
     if (!prompt) {
       // 这里最容易踩的坑：用户把主题写进了「导图标题」（那个框只改名字、
