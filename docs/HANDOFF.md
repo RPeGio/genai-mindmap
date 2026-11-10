@@ -16,9 +16,7 @@
 
 ## 待确认
 
-| 编号 | 日期 | 提出人 | 决策 | 理由 | 影响面 | 未回复期间的默认做法 |
-|---|---|---|---|---|---|---|
-| H2 | 2026-11-04 | RPeGio | 保存以**整棵树**为单位提交（`POST /api/mindmaps` 建图、`PUT /api/mindmaps/{id}` 带 `version`），不做字段级合并；编辑上限在前端也校验一遍（标题/节点 200 字、1000 节点、8 层、每节点 50 子节点），文案与后端一致 | 字段级合并需要 diff + 三方合并，代价远超当前收益；单机单人对同一张图并发编辑的概率低，409 时让用户选"重新加载 / 另存为新图 / 取消"已经够用。前端先校验是为了不把明显非法的树发出去、省一次 422 往返，**不替代**后端校验 | 无后端改动；前端 `src/mindmap/edits.ts` 的 `validateDraft()` 与 `backend/app/contracts/mindmap.py` 的限制必须同步（改动任一侧要同时改另一侧） | 已按此实现（R3，PR #7）。若陈嘉涛不认同，改动集中在前端 `save()` 一个函数与 409 弹层，回退成本低；后端校验始终是唯一权威，前端校验只为省一次 422 往返 |
+目前没有待确认项。
 
 ## 已确认
 
@@ -27,6 +25,7 @@
 | H0 | 2026-11-03 | 陈嘉涛提出评估，RPeGio 裁定 | 后端地基压缩：W1 只做统一错误体 + `urllib`→`httpx`，SQLAlchemy / Alembic / PG 迁移顺延到验收之后，v1 继续用 `sqlite3` | 已写入 `docs/PLAN.md` Q35；W1–W3 以"SQLite 单文件 + 备份脚本"兑现"含数据库"的考核要求 |
 | H0b | 2026-11-03 | 陈嘉涛提出评估，RPeGio 裁定 | 实时协作（F17 / Yjs）保留，但排期延后：W2 不设硬门，W3 视余量决定是否落地 | 已写入 `docs/PLAN.md` Q36；`NEXT-PLAN.md` 原"W2 不做协作"的提议不再成立 |
 | H1 | 2026-11-03 | RPeGio | 节点正文复用契约 v2 已有的 `Node.note`（`max_length=2000`），`label` 继续当短标题，**不收紧** 200 字上限 | 陈嘉涛在契约 v2 审查时认可（PR #13，2026-11-10 合入 `dev` 的 `9f015ab`）；后端随 PR #13 落地（`backend/app/contracts/mindmap.py`、`backend/tests/test_contract_v2.py`），前端随本轮 PR 接线：详情面板可编辑正文，保存/打开/导出都发 `note`，`toContractV1()` / `toExportV1()` 已删除 |
+| H2 | 2026-11-04 | RPeGio | 保存以**整棵树**为单位提交（`POST /api/mindmaps` 建图、`PUT /api/mindmaps/{id}` 带 `version`），不做字段级合并；编辑上限在前端也校验一遍（标题/节点 200 字、1000 节点、8 层、每节点 50 子节点），文案与后端一致 | 陈嘉涛在 R3 开发期即已认可（RPeGio 于 2026-11-10 复核转述）；实现见 PR #7（`dev` 的 `4594fd4`）与 PR #10（`28fbbe3`，上限随上游 `13cce17` 由 300 改 1000）；后端校验始终是唯一权威（`backend/app/contracts/mindmap.py`），前端 `src/mindmap/edits.ts` 的 `validateDraft()` 只为省一次 422 往返 |
 
 > H1 五条要点（确认后仍保留，供后来者核对实现是否走样）：① 复用 v2 的 `note`，不新增字段；② `label` 不收紧上限，仍允许长文本，`note` 只是可选的更长正文；③ `note` 必须与 v2 同批上线，不与 v1 混用；④ 迁移时 `note` 置 `None`、`label` 原样，保证无损（实现上靠 Pydantic 默认值 `note=None`，不需要改写整棵树）；⑤ 前端取值收敛在 `displayBody()` 一处，回退逻辑不散落到组件里。
 >

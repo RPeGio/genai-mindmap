@@ -104,7 +104,9 @@ frontend/
     main.ts            入口（挂 Pinia 与 Vue Flow 样式）
     styles.css         Tailwind 入口
     api/client.ts      fetch 封装 + ApiError（生成 3 个、导图 CRUD 4 个、上传 1 个、导出 1 个、agent 1 个）
-    api/types.ts       与后端契约 v1 对应的 TS 类型（`note` 为 v2 预留）
+    api/types.ts       契约 v2 的 TS 镜像（手写，读起来比生成类型省事）
+    api/schema.d.ts    openapi-typescript 从 backend/openapi.json 生成，勿手改
+    api/contract-check.ts 编译期断言：镜像与生成类型的键集合、形状必须一致
     canvas/MindMapCanvas.vue  Vue Flow 容器：平移 / 缩放 / 点选 / 键盘建树
     canvas/MindNode.vue       自定义节点：截断 + 悬停看全文 + 内联编辑
     canvas/layout/tidy.ts     自研紧凑树布局（向右 / 向左 / 向下 / 双向）
@@ -205,7 +207,7 @@ POST /api/knowledge/search         检索（桩，返回空）
 
 W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W2 起交叉 review。
 
-交界只有一个：`backend/app/contracts/`。改这里的任何字段，必须两个人同时知道，同步 `docs/CONTRACT_V2.md`、`docs/API.md` 和前端 `src/api/types.ts`（v2 落地后改为 `npm run gen:api` 生成）。
+交界只有一个：`backend/app/contracts/`。改这里的任何字段，必须两个人同时知道，并同步三样东西：`docs/CONTRACT_V2.md`（语义）、`backend/openapi.json` + `frontend/src/api/schema.d.ts`（重新导出与生成）、`frontend/src/api/types.ts`（手写镜像）。漏掉后两步时，`pytest`、`vue-tsc` 或 CI 会各报一处，不会静默通过。
 
 ---
 

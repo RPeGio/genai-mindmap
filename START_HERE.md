@@ -34,6 +34,15 @@ npm run dev
 
 后端测试：在 `backend` 目录执行 `pytest -q`（`pytest.ini` 已设 `pythonpath = .`，也可用 `python -m pytest`）；前端测试与构建检查：在 `frontend` 目录分别执行 `npm test` 和 `npm run build`。CI 配置见 `.github/workflows/ci.yml`，两个 job 分别对应这两组命令。
 
+改了 `backend/app/contracts/` 里的任何字段后，要按这个顺序更新前端类型（漏了哪一步，`pytest`、`vue-tsc` 或 CI 会各报一处）：
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe scripts\export_openapi.py   # 更新 backend/openapi.json
+cd ..\frontend
+npm run gen:api                                        # 重新生成 src/api/schema.d.ts
+```
+
 不使用虚拟环境激活也可以用 `.\.venv\Scripts\python -m pip ...` 和 `.\.venv\Scripts\python -m uvicorn ...`。如果 PowerShell 限制脚本执行，可使用后一种方式。
 
 ### 配置真实模型（可选）
