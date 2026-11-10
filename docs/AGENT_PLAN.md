@@ -39,7 +39,7 @@
 保留 `F/stores/mindmap.ts::content` 为未保存编辑的真相，SQLite `MapRecord` 为已保存快照；后端只持有本次请求的候选副本，结束/断开即释放，不持有跨请求的权威会话。下一轮始终上传当前快照，避免双主同步。
 `F/api/types.ts` 新增 `AgentRunRequest={runId:string,intent:"create"|"expand"|"edit",goal:string,input:TextInput|SourcesInput|NoInput,snapshot:MindMapContent|null,selectedIds:string[],scope:"selection"|"map",baseClientRevision:number,recentEdits:RecentEdit[],historyTruncated:boolean}`；`TextInput={kind:"text",text:string}`、`SourcesInput={kind:"sources",sources:Source[]}`、`NoInput={kind:"none"}`。
 `B/agent/router.py::async stream_run(body: AgentRunRequest, request: Request) -> StreamingResponse` 对应 `POST /api/agent/runs/stream`；`create` 必须有 text/sources、snapshot=null；`expand/edit` 必须有 snapshot，选中节点必须存在，expand 恰选 1 个节点。scope=selection 只允许改所选子树（含新增后代），scope=map 才能改全图/标题；`execute()` 与规范化器均检查范围。goal 1–1000 字、text ≤10000 字、sources ≤50 个，复用 `_understand()`；合并长度不再按字数卡（后端已删掉 `MAX_INPUT_CHARS = 20000`，改由真实调用前的 token 估算决定）；非法请求在开始 SSE 前返回 422。
-`RunContext={runId,baseClientRevision,candidate:MindMapContent|null,candidateRevision:0,scopeIds,sourcesById,messages,executedCalls,budget}`；`Candidate={runId,mapSession,baseClientRevision,revision,content,batches,diagnostics,state:"running"|"ready"|"stale"}`。前端 snapshot 通过 toContractV1() 序列化，剔除 note；服务端记录快照来源，不从 `mapId` 重读数据库来覆盖未保存编辑。
+`RunContext={runId,baseClientRevision,candidate:MindMapContent|null,candidateRevision:0,scopeIds,sourcesById,messages,executedCalls,budget}`；`Candidate={runId,mapSession,baseClientRevision,revision,content,batches,diagnostics,state:"running"|"ready"|"stale"}`。前端 snapshot 原样发送整棵树（原计划要过 `toContractV1()` 把 `note` 裁掉，该函数已随契约 v2 落地删除）；服务端记录快照来源，不从 `mapId` 重读数据库来覆盖未保存编辑。
 store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`candidate`、`activeRun`；沿用 `mapSession` 隔离切图。`commitLabel()`、`addChildTo()`、`addSiblingTo()`、`deleteNode()` 通过 `commitOps(ops: MindMapOp[], origin: "user"|"agent") -> boolean` 不可变更新。
 `recentEdits` 为最多 50 条 `{fromRevision,toRevision,kind:"ops",ops}` 或 `{fromRevision,toRevision,kind:"snapshot",reason:"undo"|"redo"|"title"}`；超出标 `historyTruncated`，当前快照始终完整。它只解释差异，不在后端重放；请求开始后新增的编辑留给下一轮，避免重复执行。
 `acceptCandidate(runId: string): "applied"|"stale"|"invalid"` 仅在 ready、同 mapSession、当前 revision=baseClientRevision、无节点/标题输入草稿时执行；有草稿先提交或取消，再重新检查 revision。`discardCandidate(runId: string): void` 仅删除候选；接受成功即清候选并记已接受 runId，重复点击不得二次提交。
@@ -61,7 +61,7 @@ store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`
 
 `OpBatch={batchId:string,baseRevision:number,revision:number,ops:MindMapOp[],title?:string,sourceUsage?:SourceUsage[]}`；title/sourceUsage 是整图元数据，同批原子应用，前者与根 label 分开，后者只能由真实来源及原快照摘要确定，不能相信模型声明。每批 0–100 个 op，但 op/title/sourceUsage 至少一项有效变更；空变化回 no_change、版本不增长；整次运行 ≤500 个 op。
 `B/agent/ops.py::apply_ops(content: MindMapContent, batch: OpBatch) -> MindMapContent` 与 `F/mindmap/ops.ts::applyOps(content: MindMapContent, batch: OpBatch): MindMapContent`：在副本上按序执行，检查所有目标，再校验最终整树；任何失败整批不提交，输入对象不得变化。
-`execute()` 与前端候选 reducer 负责核对 baseRevision；纯 apply_ops/applyOps 不持会话状态。每个成功 batch 的 revision=baseRevision+1；300 节点/8 层/50 子节点、label/title 长度、ID 唯一和来源关联由 `MindMapContent.validate_tree()` 兜底；人工编辑与局部 op 不执行整图生成的 MIN_BRANCHES 门槛。
+`execute()` 与前端候选 reducer 负责核对 baseRevision；纯 apply_ops/applyOps 不持会话状态。每个成功 batch 的 revision=baseRevision+1；1000 节点/8 层/50 子节点、label/title 长度、ID 唯一和来源关联由 `MindMapContent.validate_tree()` 兜底；人工编辑与局部 op 不执行整图生成的 MIN_BRANCHES 门槛。
 后端 `B/agent/ops.py::new_node_id(existing: set[str]) -> str` 用 `n_`+uuid4.hex 并查重；新图所有模型 id 一次映射后再发 snapshot。`F/mindmap/edits.ts::newId(existingIds?: ReadonlySet<string>): string` 改成完整 UUID 随机量，HTTP 下用 getRandomValues 回退，不截成 8 位；无随机源明确报错。
 旧 id（数字字符串、root、n_8位等）原样保留，只要求现契约的 1–100 字符及全树唯一，不能通过 label 推断身份。模型 add 草案只分配 `$tmp1` 这类临时 id，parentId 可指此前临时 id；`normalize_ops(drafts: list[DraftOp], ctx: RunContext) -> tuple[list[MindMapOp], dict[str,str]]` 映射为服务端新 id 并返回 idMap。
 新增/修改引用复用 `B/contracts/source.py::SourceRef`：source_id 必填，quote ≤300 字，page≥1，start/end 必须成对且为原文 Unicode 码点的 [start,end)。前端定位用 `Array.from(text)`，不能直接用 UTF-16 下标。
@@ -69,7 +69,7 @@ store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`
 扩展 `B/optimization/source_refs.py::verify_source_refs(content, sources, *, remove_invalid=False, node_ids: set[str] | None=None)`，默认行为不变；label 变化使旧语义评分失效，重新诊断。`annotate_nli(content, sources, *, node_ids: set[str] | None=None, max_checks: int=MAX_NLI_CHECKS) -> list[Diagnostic]` 保留旧默认行为；agent 仅传机械核验通过的受影响节点与剩余额度，整轮最多 100 条，仍只给提示、不自动删节点。所有引用修正必须先计入 batch，再发事件。
 `POST /api/mindmaps` 仍为 `{content}`→MapRecord，`PUT /api/mindmaps/{id}` 仍为 `{version,content}`→MapRecord；没有 PUT 集合接口，也不新增自动持久化 op 接口。`B/mindmaps/repository.py::update_map(map_id, version, content) -> str` 的乐观锁继续防止跨标签覆盖。
 `F/mindmap/edits.ts::validateDraft()` 补齐 id 长度、refs≤20、source_usage≤50/唯一及关联检查；`ops.py/ops.ts` 的 `OpError(code, path, message)` 给出同一失败位置。前端新增 `SourceRef={source_id:string,page?:number|null,start?:number|null,end?:number|null,quote?:string|null}`，整数/码点规则与后端一致。
-前置修复 `F/api/types.ts::MindNode.source_refs?: SourceRef[]` 和 `client.ts::toContractV1()`：保留 source_refs/source_usage，仅裁未知 note；历史、人工编辑及导出同样保留引用。`MapRecord.version` 只在保存成功后 +1，`candidateRevision` 和 batchId 永不作为数据库版本。
+前置修复 `F/api/types.ts::MindNode.source_refs?: SourceRef[]`：早期 `client.ts::toContractV1()` 会在保存时把引用整批裁掉，该函数已随契约 v2 删除，现在前端直接发送整树、引用不经过任何裁剪；历史、人工编辑及导出同样保留引用。`MapRecord.version` 只在保存成功后 +1，`candidateRevision` 和 batchId 永不作为数据库版本。
 
 ## 4. 四个工具及复用边界
 
@@ -154,7 +154,7 @@ v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知�
 | 阶段 | 改/增文件与接口 | 新增测试 | 可观测验收 | 回滚方式 |
 |---|---|---|---|---|
 | 0a–0c：质量基线 | 第 0 节 service.py/stream_partial.py、backend/eval 两文件；`ensure_finish_reason()`、`diagnose_density()` | 第 0 节列明的三条传输链、数量边界和引用对照 | 截断静默成功=0；0/1/2/3 分支两入口一致；报告每个样本成功/失败、覆盖、引用、P50/P95 和 token，不删除失败样本 | 各小补丁单独回退，策略见第 0 节；无数据迁移 |
-| 1：引用保真与共用 op | `F/api/types.ts`、`client.ts::toContractV1()`、`F/mindmap/edits.ts`、新增 ops.ts、扩展 `F/stores/mindmap.ts::commitOps()`；`B/contracts/ops.py`、`B/agent/ops.py`、`source_refs.py`，手工编辑经 commitOps | test_agent_ops.py、ops.spec.ts、共同 fixture；扩展 save/store-edit | ≥40 组正常/非法/边界 batch 两端结果一致；任一第 k 个 op 失败时原树零变化；50 步撤销/重做后树、引用、子项顺序相同；真实前端 POST→GET→PUT 引用数量不减 | 部署仅保留引用序列化修复、恢复旧编辑函数的前一构建；该修复保留为回滚基线，已保存内容无需转换 |
+| 1：引用保真与共用 op | `F/api/types.ts`、`client.ts`、`F/mindmap/edits.ts`、新增 ops.ts、扩展 `F/stores/mindmap.ts::commitOps()`；`B/contracts/ops.py`、`B/agent/ops.py`、`source_refs.py`，手工编辑经 commitOps | test_agent_ops.py、ops.spec.ts、共同 fixture；扩展 save/store-edit | ≥40 组正常/非法/边界 batch 两端结果一致；任一第 k 个 op 失败时原树零变化；50 步撤销/重做后树、引用、子项顺序相同；真实前端 POST→GET→PUT 引用数量不减 | 部署仅保留引用序列化修复、恢复旧编辑函数的前一构建；该修复保留为回滚基线，已保存内容无需转换 |
 | 2：后端可调用 agent | 新增 `B/agent/contracts.py/provider.py/tools.py/stream.py`，扩展 agent/service.py/router.py、generation/service.py、knowledge/service.py、source_refs.py；开放 run SSE，旧 UI 不变 | test_agent_provider.py/tools.py/stream.py，旧 errors/skeleton 回归 | 模型模拟“检索→生成→改支”须有匹配 callId 与反馈后的第二轮；未知工具/坏参数零执行；最多 8 次模型与 8 次工具，120 秒截止；20 次中断中 httpx 连接均在 1 秒内关闭；运行前后业务库内容相同 | `MINDMAP_AGENT_ENABLED=0`，新路由返回明确未执行；旧入口继续可用，无新增表需清理 |
 | 3：前端统一运行与候选接受 | `F/api/client.ts/types.ts`、`stores/mindmap.ts`、`App.vue`、`components/SourceInputs.vue`，新增 `components/AgentPanel.vue`；runGeneration/acceptCandidate/cancelRun | agent.spec.ts、sse.spec.ts，按第 6 节迁移 store/upload/sources/save/app | 各执行 20 次手改/未提交草稿/undo/切图/保存并发/取消重试，静默覆盖=0；一轮接受仅 1 步历史；重复 batch 不加节点；拆分 SSE 每字节仍得同树；候选未接受时保存/导出内容不变 | 重发 `VITE_MINDMAP_AGENT=0` 的前端构建，候选丢弃、当前已接受树仍可旧接口保存；后端功能可保持关闭 |
 | 4：实测后放量 | 扩展 `backend/eval/agent_quality.py::compare()`、cases.json，新增 `backend/eval/agent_acceptance_cases.json`；更新 `docs/API.md`、`ARCHITECTURE.md`、`ARCHITECTURE_ADDENDUM.md` 的过期说明与开关 | 30 条局部操作人工标注任务、每条 3 次；两种部署开关组合的端到端用例 | 90 次局部请求精确完成率 ≥90%、未指向节点/子树误改=0、有效引用保留率=100%；受控机器端到端 P95≤60 秒、相同任务 token 中位数≤整图重生的 2 倍；先 10% 试用，100 次后仍达标再扩大 | 未达任一质量/成本门槛即关前端 agent 开关；保留质量修复和 op，不回退已保存数据 |
@@ -198,9 +198,9 @@ v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知�
 |---|---|
 | 现网兼容端点能稳定完成 tool_calls 回填 | `B/agent/provider.py::complete_tools()` 做 20 次非推理工具调用探针，记录 finish、参数、tool_call_id、usage 和取消；仅在验证支持时发送相应推理模式参数。供应商 [Chat Completions 文档](https://api-docs.deepseek.com/api/create-chat-completion/) 不能替代当前部署实测；首版不依赖 strict/Beta。 |
 | 三分支与材料每支两个要点更好，且不会诱发补写 | `backend/eval/agent_quality.py::evaluate()` 对充分/不足材料分开复核覆盖、误拒和无依据事实；若不足材料误拒不可接受，另设计显式紧凑模式，不偷偷放松全局门槛。 |
-| 16384 token 足以覆盖当前产品的合理输出 | 同脚本加入 300 节点×200 字、密集引用、emoji 与 20000 字来源边界，核对 usage/length；不能沿用调研“每字约 0.6 token”当安全证明，必要时在生成策略中降低节点预算，保存契约仍支持 300 节点。 |
+| 16384 token 足以覆盖当前产品的合理输出 | 同脚本加入 1000 节点×200 字、密集引用、emoji 与 20000 字来源边界，核对 usage/length；不能沿用调研“每字约 0.6 token”当安全证明，必要时在生成策略中降低节点预算，保存契约仍支持 1000 节点。 |
 | 四工具比直接生成更值得付出延迟与 token | `compare()` 用同一输入比较第 0 阶段单次生成和 agent 的人工质量、局部修改成功率与成本；纯主题已达门槛则继续默认旧生成，扩展/编辑可单独启用。 |
 | 附件词片检索足以支持来源定位 | `search_sources()` 在 30 个有标注问题上测 Recall@5，目标 ≥90%；失败时允许小输入直接提供完整原文，超过上下文预算明确失败，再评估索引方案，不能把 search() 桩当能力。 |
-| 300 节点下整树快照、候选重放和布局开销可接受 | `F/mindmap/ops.ts::applyOps()` 与 store layout 在目标浏览器/2 核部署环境跑 50 次大树批次，记录 P95 与内存；目标本地接受处理 P95<100ms、无重复重排风暴，未达则做批量渲染优化。 |
+| 1000 节点下整树快照、候选重放和布局开销可接受 | `F/mindmap/ops.ts::applyOps()` 与 store layout 在目标浏览器/2 核部署环境跑 50 次大树批次，记录 P95 与内存；目标本地接受处理 P95<100ms、无重复重排风暴，未达则做批量渲染优化。 |
 | 连接断开能及时停止上游计费 | `test_agent_stream.py` 的连接关闭只证明本地取消；另记录供应商取消后实际 usage/账单，与 1 秒本地关闭指标分开，不宣称关连接就必然零后续费用。 |
 | 前端权威状态足够满足使用方式 | `stores/mindmap.ts` 的刷新/多标签验收确认未接受候选可丢、已接受未保存编辑按当前提示处理；若需求转为跨设备续跑，再设计持久任务、事件重放和来源存储，不能靠本计划的内存 RunContext 达成。 |
