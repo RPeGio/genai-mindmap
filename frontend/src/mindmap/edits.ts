@@ -2,7 +2,7 @@ import type { MindMapContent, MindNode } from '../api/types';
 
 /**
  * 与服务端 Pydantic 约束逐条对应（`backend/app/contracts/mindmap.py`）：
- * 节点 id ≤100、label 1–200、children ≤50、总数 ≤300、深度 ≤8、title 1–200。
+ * 节点 id ≤100、label 1–200、children ≤50、总数 ≤1000、深度 ≤8、title 1–200。
  * 前端先拦一次，省掉一次必然失败的请求；服务端仍是最终裁判（422）。
  */
 export const LIMITS = {

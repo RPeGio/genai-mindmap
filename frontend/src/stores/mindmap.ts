@@ -270,7 +270,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const busy = ref(false);
   const selectedId = ref<string | null>(null);
   /**
-   * 朝向是 content 的派生值（layout + 	heme.direction），不单独存一份：
+   * 朝向是 content 的派生值（layout + theme.direction），不单独存一份：
    * 否则保存后再打开，画布上的朝向与库里的记录会各说各话。
    */
   const direction = computed<Direction>(() => directionOf(content.value));
@@ -295,7 +295,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const savedAt = ref<string | null>(null);
   const dirty = ref(false);
 
-  /** 撤销/重做存整树 JSON 快照：比命令模式少一半代码，300 节点的树一步也不到 100KB。 */
+  /** 撤销/重做存整树 JSON 快照：比命令模式少一半代码。节点上限 1000、每个节点还带正文，一份快照能到几十到几百 KB，只按 50 步计会涨到十几 MB，所以除了步数还按字节截（10MB）。 */
   const past = ref<string[]>([]);
   const future = ref<string[]>([]);
   /** 撤销栈已占的字节数。维护这个数，免得每次压栈都把整栈重新编码一遍。 */

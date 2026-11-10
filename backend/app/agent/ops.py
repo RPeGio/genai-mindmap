@@ -46,7 +46,7 @@ def new_node_id(existing: set[str]) -> str:
 
     用完整 32 位 uuid4 hex。前端 `edits.ts` 里截成 8 位是够用的——前端只管
     显示与本次会话的局部编辑；服务端要落库、要参与之后所有 op 的引用解析，
-    8 位 hex 在 300 节点规模下碰撞概率虽低，但一旦撞上就是"引用了另一个节点"
+    8 位 hex 在 1000 节点规模下碰撞概率虽低，但一旦撞上就是"引用了另一个节点"
     这种完全静默的错误，排查成本远高于多出的 26 个字符。
     """
     while True:
@@ -179,7 +179,7 @@ def normalize_ops(drafts: list[dict], existing: set[str]) -> tuple[list[MindMapO
 
 
 def _validate_tree(content: MindMapContent) -> MindMapContent:
-    """整树兜底校验：300 节点 / 8 层 / 单节点 50 子 / id 唯一 / 引用合法。
+    """整树兜底校验：1000 节点 / 8 层 / 单节点 50 子 / id 唯一 / 引用合法。
 
     走 `model_dump()` 再 `model_validate()`，而不是直接 `model_validate(content)`：
     pydantic v2 默认 `revalidate_instances="never"`，传一个已构造好的实例会

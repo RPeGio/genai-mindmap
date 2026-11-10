@@ -209,7 +209,7 @@ class GenerateDeepArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
     # 上限 20 是按契约反推的，不是拍的：最少每支 2 个要点，一个分支占 3 个节点，
-    # 300 节点理论能放 100 支；真正限制它的是可读性——超过二十条一级分支，
+    # 1000 节点理论能放 333 支；真正限制它的是可读性——超过二十条一级分支，
     # 图会宽到没法看。原来的 8 没有任何依据，长材料（比如二十几节的讲义）
     # 天然会有更多一级节点，卡在 8 等于逼模型把不相关的东西塞进同一支。
     branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
