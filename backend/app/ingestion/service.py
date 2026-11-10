@@ -1,7 +1,7 @@
 """多模态输入解析（F05 / F06 / F07 / F08）。
 
 流程位置：
-    上传内容 ──parse()──> Source(text) ──> pipeline
+    上传内容 ──parse()──> Source(text) ──> agent 请求的 sources
 
 当前实现状态：
     text / markdown   已实现（解码 + 空白规整）

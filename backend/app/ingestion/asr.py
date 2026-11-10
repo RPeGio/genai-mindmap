@@ -1,7 +1,7 @@
 """语音转写（F07）：阿里云百炼 Qwen-Audio-ASR。
 
 流程位置：
-    录音 / 音频文件 ──transcribe_audio()──> Source(kind=audio) ──> pipeline
+    录音 / 音频文件 ──transcribe_audio()──> Source(kind=audio) ──> agent 请求的 sources
 
 **为什么用这个接口**：它在一次同步调用里同时返回文本、句级时间戳和词级
 时间戳。之前用过 ISI 的「一句话识别」，只有整段文本、没有句子边界，

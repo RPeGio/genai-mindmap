@@ -793,10 +793,10 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
 def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
     """把来源拼成 `SOURCED_DETAIL_PROMPT` 约定的 sources 数组。
 
-    必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而
-    `_understand()` 返回的是纯文本合并，里面一个 id 都没有——模型看不见 id
-    就永远写不出合法引用，引用功能等于从来没通。那个函数服务于 pipeline 的
-    限长与 demo 路径，语义不同，不能在这里复用。
+    必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而旧流水线
+    的 `_understand()`（已随 `app/pipeline/` 删除）返回的是纯文本合并，里面一个
+    id 都没有——模型看不见 id 就永远写不出合法引用，引用功能等于从来没通。那种
+    形态服务于限长与 demo 路径，语义不同，不能在这里复用。
 
     用 `ensure_ascii=False`：中文原样传输，模型看到的 token 更少，
     也免得它把 `\\u4e2d` 这种转义当成正文抄进 quote。

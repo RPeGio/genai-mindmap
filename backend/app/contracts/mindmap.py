@@ -13,7 +13,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.contracts.diagnostic import Diagnostic
 from app.contracts.source import SourceRef, SourceUsage
 
 # 整树节点上限。1000 是**承载能力**：前端渲染、保存、导出都还扛得住，所以它是
@@ -216,23 +215,6 @@ def migrate_content(data: dict) -> dict:
     if data.get("schema_version") == 2:
         return data
     return {**{k: v for k, v in V1_TO_V2_DEFAULTS.items() if k not in data}, **data}
-
-
-class GenerateRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=10000)
-
-    @model_validator(mode="after")
-    def not_blank(self) -> GenerateRequest:
-        self.text = self.text.strip()
-        if not self.text:
-            raise ValueError("请输入非空文本")
-        return self
-
-
-class GenerateResponse(BaseModel):
-    mode: Literal["demo", "model"]
-    content: MindMapContent
-    diagnostics: list[Diagnostic] = Field(default_factory=list)
 
 
 class SaveRequest(BaseModel):

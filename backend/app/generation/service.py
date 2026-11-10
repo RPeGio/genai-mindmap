@@ -608,8 +608,9 @@ def validate_generated_content(
 ) -> tuple[MindMapContent, list[Diagnostic]]:
     """以真实输入重建来源摘要，剔除模型伪造的关联，再执行契约与原文校验。
 
-    无 Source 的同步和 SSE 入口共用此出口：在契约校验之前清空所有节点的
-    来源声明，避免伪造摘要与引用互相背书，也不让错误的引用拖垮有效的树。
+    agent 的 `mindmap_generate`（`app/agent/tools.py::_generate()`）走这个出口：
+    无来源时在契约校验之前清空所有节点的来源声明，避免伪造摘要与引用互相背书，
+    也不让错误的引用拖垮有效的树。
 
     `enforce_min_branches` 是**质量**门槛而不是契约门槛：模型整图生成要求一级
     分支不少于 `MIN_BRANCHES` 条，demo 占位结构与用户已保存的旧图不走这道关。
