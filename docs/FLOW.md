@@ -12,8 +12,8 @@ flowchart TD
   A4[语音 / WAV 音频] --> S
 
   S --> SRC[Source<br/>统一来源模型]
-  SRC --> U[understand<br/>合并多来源]
-  U --> O[outline<br/>调用模型]
+  SRC --> U[合并来源<br/>逐项带 source_id]
+  U --> O[生成<br/>mindmap_generate 调模型]
   O --> V[validate<br/>MindMapContent 校验]
   V --> R[verify<br/>结构诊断]
   R --> MAP[导图 JSON]
@@ -26,6 +26,8 @@ flowchart TD
   SAVE --> SUG[optimization<br/>候选建议]
   SUG -.用户确认.-> EDIT
 ```
+
+图里的两个环节就是第 3 节表格的"合并理解"与"大纲生成"；`understand` / `outline` 是已删除的 `app/pipeline/` 里的阶段名，不再有对应实现。来源合并与长度校验分散在前端 `src/sources/input.ts::sourceInputError`（提交前挡未解析或空来源）与后端 `AgentRunRequest.sources_within_context`（开流前按 token 估算），图里不再单列。
 
 ## 2 入口
 
@@ -64,8 +66,8 @@ flowchart TD
 |---|---|---|
 | 输入框（`src/App.vue`） | `POST /api/agent/runs/stream` | **已接入**：输入 → 工具循环 → 候选就绪 → 用户点接受才进画布 |
 | 画布（R2） | 无请求 | **已接入**：`src/canvas/MindMapCanvas.vue` 消费 `content`，坐标由 `src/canvas/layout/tidy.ts` 计算；可平移缩放点选，双击内联改文字，Tab / Enter / Delete 建树，撤销栈最多 50 步 |
-| 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{id}` | **已接入**：首次保存 POST 建新图，之后 PUT 带 `version`；409 弹三选（重新加载服务端版本 / 另存为新导图 / 取消）；Ctrl+S 触发，`beforeunload` 拦未保存离开 |
-| 打开列表（R3） | `GET /api/mindmaps` / `GET /api/mindmaps/{id}` | **已接入**：顶部"打开"弹层列出已保存导图，点开替换画布并清空撤销栈 |
+| 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{map_id}` | **已接入**：首次保存 POST 建新图，之后 PUT 带 `version`；409 弹三选（重新加载服务端版本 / 另存为新导图 / 取消）；Ctrl+S 触发，`beforeunload` 拦未保存离开 |
+| 打开列表（R3） | `GET /api/mindmaps` / `GET /api/mindmaps/{map_id}` | **已接入**：顶部"打开"弹层列出已保存导图，点开替换画布并清空撤销栈 |
 | 上传面板 | `POST /api/ingestion/files` | **已接入**：`src/components/SourceInputs.vue` 上传文档 / 图片 / WAV，解析后进来源列表，再随生成请求一起发给 agent |
 | 多来源生成 | `POST /api/agent/runs/stream` | **已接入**：`src/stores/mindmap.ts` 的 `runGeneration(goal, intent, sources)`，来源原样随请求发出（不拼进 goal），产物是候选 |
 | 录音输入 | `POST /api/ingestion/files` | **已接入**：`src/components/RecordButton.vue` + `src/audio/recorder.ts` 采集 16kHz WAV 后走同一条上传链路 |

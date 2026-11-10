@@ -63,8 +63,8 @@
 | `GET /api/ingestion/formats` | 无 | `{"document":[…],"audio":[".wav"],"image":[".png",…],"maxUploadBytes":…,"maxAudioBytes":…,"maxImageBytes":…}` | — |
 | `GET /api/mindmaps` | 无 | 导图记录数组 | — |
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
-| `GET /api/mindmaps/{id}` | 无 | 导图记录 | 不存在 404 |
-| `PUT /api/mindmaps/{id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
+| `GET /api/mindmaps/{map_id}` | 无 | 导图记录 | 不存在 404 |
+| `PUT /api/mindmaps/{map_id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
 | `POST /api/agent/runs/stream` | `{"goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `done` / `error`；`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`，所以 demo / model 帧必带，缺字段只说明对面"没说"），产物是**候选** | 目标为空 422；来源合计超出模型上下文 422；预算用尽或模型失败以 `error` 事件下发 |
 
 **流式接口只有一套帧格式**，就是 `/api/agent/runs/stream` 的这套；旧的 `/api/generations/stream`（`stage` / `skeleton` / `node` / `done` / `error` + 末尾 `data: [DONE]`）已连路由一起删除。`backend/app/generation/stream_partial.py` 现在只剩增量解析器（`parse_partial` / `collect_new_nodes`），供 agent 的 `node_grow` 预览调用，不再有帧拼装。

@@ -18,7 +18,7 @@
 
 ## 1. 循环位置与框架取舍
 
-选择后端 Python 自写受限 tool-calling 循环，放在已有 `B/agent/`；`B/generation/` 继续负责单次生成和校验，`B/pipeline/` 负责来源准备，前端只展示、接受候选。当前 `agent.service.plan(goal)` 是桩，不能当作可用循环。
+选择后端 Python 自写受限 tool-calling 循环，放在已有 `B/agent/`；`B/generation/` 继续负责单次生成和校验，来源准备当时放在 `B/pipeline/`（该包已删除，现在由 `B/agent/tools.py` 的 `_pick_sources()` / `_source_prompt_input()` 承担），前端只展示、接受候选。当前 `agent.service.plan(goal)` 是桩，不能当作可用循环。
 | 方案 | 取舍与代价 |
 |---|---|
 | `httpx.AsyncClient` + Pydantic + 自写循环（采用） | 复用 `_config()`、错误类型及取消语义，不新增运行时依赖；必须自己维护工具消息配对、预算、去重、终止与协议测试，集中在下列 4 个模块。 |
@@ -38,7 +38,7 @@
 
 保留 `F/stores/mindmap.ts::content` 为未保存编辑的真相，SQLite `MapRecord` 为已保存快照；后端只持有本次请求的候选副本，结束/断开即释放，不持有跨请求的权威会话。下一轮始终上传当前快照，避免双主同步。
 `F/api/types.ts` 新增 `AgentRunRequest={runId:string,intent:"create"|"expand"|"edit",goal:string,input:TextInput|SourcesInput|NoInput,snapshot:MindMapContent|null,selectedIds:string[],scope:"selection"|"map",baseClientRevision:number,recentEdits:RecentEdit[],historyTruncated:boolean}`；`TextInput={kind:"text",text:string}`、`SourcesInput={kind:"sources",sources:Source[]}`、`NoInput={kind:"none"}`。
-`B/agent/router.py::async stream_run(body: AgentRunRequest, request: Request) -> StreamingResponse` 对应 `POST /api/agent/runs/stream`；`create` 必须有 text/sources、snapshot=null；`expand/edit` 必须有 snapshot，选中节点必须存在，expand 恰选 1 个节点。scope=selection 只允许改所选子树（含新增后代），scope=map 才能改全图/标题；`execute()` 与规范化器均检查范围。goal 1–1000 字、text ≤10000 字、sources ≤50 个，复用 `_understand()`；合并长度不再按字数卡（后端已删掉 `MAX_INPUT_CHARS = 20000`，改由真实调用前的 token 估算决定）；非法请求在开始 SSE 前返回 422。
+`B/agent/router.py::async stream_run(body: AgentRunRequest, request: Request) -> StreamingResponse` 对应 `POST /api/agent/runs/stream`；`create` 必须带 goal、snapshot=null（sources 可空）；`expand/edit` 必须有 snapshot，选中节点必须存在，expand 恰选 1 个节点。scope=selection 只允许改所选子树（含新增后代），scope=map 才能改全图/标题；`execute()` 与规范化器均检查范围。goal 1–1000 字、sources ≤50 个，来源校验走 `AgentRunRequest.sources_within_context`（开流前按 token 估算）；合并长度不再按字数卡（后端已删掉 `MAX_INPUT_CHARS = 20000`，改由真实调用前的 token 估算决定）；非法请求在开始 SSE 前返回 422。
 `RunContext={runId,baseClientRevision,candidate:MindMapContent|null,candidateRevision:0,scopeIds,sourcesById,messages,executedCalls,budget}`；`Candidate={runId,mapSession,baseClientRevision,revision,content,batches,diagnostics,state:"running"|"ready"|"stale"}`。前端 snapshot 原样发送整棵树（原计划要过 `toContractV1()` 把 `note` 裁掉，该函数已随契约 v2 落地删除）；服务端记录快照来源，不从 `mapId` 重读数据库来覆盖未保存编辑。
 store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`candidate`、`activeRun`；沿用 `mapSession` 隔离切图。`commitLabel()`、`addChildTo()`、`addSiblingTo()`、`deleteNode()` 通过 `commitOps(ops: MindMapOp[], origin: "user"|"agent") -> boolean` 不可变更新。
 `recentEdits` 为最多 50 条 `{fromRevision,toRevision,kind:"ops",ops}` 或 `{fromRevision,toRevision,kind:"snapshot",reason:"undo"|"redo"|"title"}`；超出标 `historyTruncated`，当前快照始终完整。它只解释差异，不在后端重放；请求开始后新增的编辑留给下一轮，避免重复执行。
@@ -76,9 +76,9 @@ store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`
 首版仍取四工具，区分整图、局部展开、读来源、确定性改树；校验器始终由服务端强制执行，不交给模型选择调用。`B/agent/tools.py` 四个同名函数统一签名 `async <tool>(args: <Args>, ctx: RunContext) -> ToolResult`；JSON 中空数组表示对应已定义类型的列表。
 | 工具 | 入参 JSON | 成功出参 JSON | 内部调用与权限 |
 |---|---|---|---|
-| mindmap_generate | `{"topic":"学习计划","source_ids":[]}` | `{"ok":true,"root_id":"n_...","candidateRevision":1,"node_count":25,"diagnostics":[]}` | 仅 create 且候选为空时可用；无来源用 DETAIL_PROMPT，有来源用 SOURCED_DETAIL_PROMPT；复用 `service.chat_async()`、`validate_generated_content()`、`pipeline._understand()`，新增 `B/generation/service.py::generate_async(text: str, *, sources: list[Source] \| None = None, budget: RunBudget) -> GenerateResponse` 组合它们。结果放 ctx 并发 snapshot；不调同步 generate，不落库。 |
+| mindmap_generate | `{"topic":"学习计划","source_ids":[]}` | `{"ok":true,"root_id":"n_...","candidateRevision":1,"node_count":25,"diagnostics":[]}` | 仅 create 且候选为空时可用；无来源用 DETAIL_PROMPT，有来源用 SOURCED_DETAIL_PROMPT；复用 `service.chat_async()`、`validate_generated_content()` 以及 `optimization` 的 `check()` / `annotate_nli()`，落在 `B/agent/tools.py::_generate()`（计划里的 `generate_async(...) -> GenerateResponse` 没有落地，那个响应类已随旧通道删除）。结果放 ctx 并发 snapshot；不落库。 |
 | node_expand | `{"node_id":"n1","instruction":"补充实施要点","count":3,"source_ids":["s1"]}` | `{"ok":true,"batchId":"...","candidateRevision":2,"ops":[],"idMap":{},"diagnostics":[]}` | count 2–4，节点必须存在且有剩余容量；`chat_async(EXPAND_PROMPT, 当前节点及路径/已有孩子/证据)` 只返回新增孩子草案，最多 4 个、不重写原 label；按第 3 节生成 add 并调用 apply_ops、引用校验与 `optimization.service.check()`。 |
-| rag_query | `{"question":"发布时间依据","source_ids":["s1"],"top_k":5}` | `{"ok":true,"hits":[{"source_id":"s1","start":0,"end":9,"quote":"会议决定下周发布。","score":1.0}],"method":"lexical"}` | top_k 1–5，仅查本轮附件；新增 `B/knowledge/service.py::search_sources(sources: list[Source], query: str, top_k: int = 5) -> list[EvidenceHit]`，用原始文本定长/段落分块及中文词片重合排序，每片 ≤300 码点；返回原始偏移，空命中如实返回。现有 search() 是桩，不能当 RAG 复用；仅复用 `_understand()` 的输入校验，无 embedding 调用。 |
+| rag_query | `{"question":"发布时间依据","source_ids":["s1"],"top_k":5}` | `{"ok":true,"hits":[{"source_id":"s1","start":0,"end":9,"quote":"会议决定下周发布。","score":1.0}],"method":"lexical"}` | top_k 1–5，仅查本轮附件；新增 `B/knowledge/service.py::search_sources(sources: list[Source], query: str, top_k: int = 5) -> list[EvidenceHit]`，用原始文本定长/段落分块及中文词片重合排序，每片 ≤300 码点；返回原始偏移，空命中如实返回。现有 search() 是桩，不能当 RAG 复用；来源取自 `_pick_sources()`，只查本轮附件，无 embedding 调用。 |
 | mindmap_edit | `{"ops":[{"op":"update","id":"n1","changes":{"label":"发布时间"}}],"title":null}` | `{"ok":true,"batchId":"...","candidateRevision":3,"ops":[],"idMap":{},"diagnostics":[]}` | 输入为 DraftOp[]（add id 使用临时名），title=null 表示不改；只调用 normalize_ops、apply_ops、validate_patch_refs、check，不再调用模型；根不能删，越界/未知目标整批退回错误。 |
 
 统一失败结构 `{"ok":false,"code":"invalid_tool_args","message":"...","errors":[{"path":"ops.0.id","reason":"节点不存在"}],"retryable":true}`；执行失败 candidateRevision 不变。已验证结构/引用诊断随工具结果回到模型，成功结果同时提供实际新 id，后续工具才能精确定位。
@@ -95,16 +95,16 @@ store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`
 | stage | `{stage,detail}` | 展示阶段；计时不阻塞执行。 |
 | tool_start | `{callId,name,argsSummary}` | 显示调用卡片；不暴露整份来源文本、密钥或内部推理。 |
 | ops | `{callId,batch:OpBatch}` | 仅在候选副本原子应用；batchId 去重；绝不能直接写 content。 |
-| tool_end | `{callId,name,ok,resultSummary,diagnostics,latencyMs}` | 更新对应卡片；可修复错误留在工具反馈中，候选 revision 不增长。 |
+| tool_end | `{callId,name,ok,resultSummary,latencyMs}`（诊断在 `resultSummary` 里，没有独立字段） | 更新对应卡片；可修复错误留在工具反馈中，候选 revision 不增长。 |
 | snapshot（新增） | `{content:MindMapContent}` | create 第一次完整生成且校验成功后初始化候选；编辑模式禁止用它替换现有树。 |
-| done | `{mode,content,diagnostics,latencyMs,usage,status:"ready"\|"no_change",batchIds:string[]}` | 校对候选 revision、batchIds 和完整 v1 快照，一致才进入待接受；不是自动保存/应用。 |
-| error | `{code,message,request_id,finish_reason?:string}` | 终止并使候选不可接受，保留当前图与来源。 |
+| done | `{content?,usage,mode}`（`B/agent/contracts.py::DoneEvent`，按 `exclude_none=True` 编码，正常帧必带 `mode`） | 用 `content` 校对候选 revision 后进入待接受，`usage` 并入本次运行用量；不是自动保存/应用。 |
+| error | `{code,message,limit?}`（`limit` 只在预算耗尽时给出是哪一个） | 终止并使候选不可接受，保留当前图与来源。 |
 
 成功序列为 stage→tool_start→snapshot 或 ops→tool_end→下一轮→done→`[DONE]`；失败为工具反馈后继续一次，或直接 error→`[DONE]`。连接正常时恰有一个终态；取消/断网不承诺终态帧，且不能补发假 done。
 新增 `client.ts::readSse<T>(response: Response, onEvent: (event:T)=>void, signal?: AbortSignal): Promise<void>` 与 `runAgentStream(body: AgentRunRequest, onEvent: (event:AgentEvent)=>void, signal?: AbortSignal): Promise<void>`；支持 UTF-8 分片、CRLF/多 data 行，JSON 解析与业务回调分开捕错。
 v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知变更帧立即中止；reader 在 finally 释放。`[DONE]` 或 EOF 本身不算成功，必须收到合法 done；不做自动重连或重发 POST，首版无事件重放和重启恢复能力。
 `F/stores/mindmap.ts::runGeneration(goal: string, intent: 'create'|'expand'|'edit', sources?: Source[], thinkingModel?: string): Promise<void>` 统一走 agent、共用 activeRun/controller/candidate/reducer；原先的 `generate(text)` 与 `generateSources(sources, options?)` 两条前端通道已删除，没有 `agentEnabled` 开关可回退。空文本不转成"带来源材料"，避免丢掉主题展开语义。
-`cancel()`、`cancelSourceGeneration()` 委托 `cancelRun()`；busy/sourceGenerating 保留为兼容视图状态，不再维护两套异步所有权。`F/components/SourceInputs.vue::generate()/cancel()` 接新调度，confirmReplace 仅保留于旧通道；`F/App.vue` 接候选预览、接受/丢弃及工具卡片；新路径启动不再询问丢弃旧图，采用新图时才确认替换。
+`cancel()` 是唯一的取消出口（换图也走它），同时复位 `busy` 与 `agentRunning`，不再维护两套异步所有权。`F/components/SourceInputs.vue::generate()/cancel()` 接新调度；`F/App.vue` 只挂 `<AgentPanel />`，候选预览、接受/丢弃与工具卡片都在 `F/components/AgentPanel.vue` 里（`acceptCandidate()` / `discardCandidate()`）。
 `F/components/AgentPanel.vue` 定义 `props:{candidate:Candidate|null,trace:ToolTrace[]}`、`emits:{accept:[runId:string],discard:[runId:string]}`；`F/api/types.ts` 同步声明 Diagnostic（level/code/node_id/message/evidence）及 `Source.sentences?: AudioSentence[]`，避免以 unknown 丢弃诊断与音频来源字段。
 阶段 3 当初用 `VITE_MINDMAP_AGENT` 在两条旧 HTTP 通道与 `/api/agent/runs/stream` 之间切换；**该开关与那两条旧通道都已删除**，前端只剩 agent 这一条，没有"回旧入口"的分支。后端 `MINDMAP_AGENT_ENABLED=0` 仍在：开流前返回 503/agent_disabled（`B/agent/router.py::stream_run`）。
 代理候选首版按已验证整图/完整 op 批展示，不使用 parse_partial() 的半截节点当执行依据；代价是首节点出现可能更晚，stage/tool_start 提供即时反馈。旧 `skeleton` / `node` 帧已随旧生成通道一起删除。
@@ -113,7 +113,7 @@ v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知�
 
 旧 `POST /api/generations`、`POST /api/generations/stream`、`POST /api/pipeline/generate` 已删除（连同 `generation/router.py`、`pipeline/` 整包）；`POST /api/agent/tasks`、`POST /api/knowledge/search` 保留且继续 implemented=false。生成与编辑现在只有 `/api/agent/runs/stream` 一条出口。
 数据库 schema 不变：`B/mindmaps/repository.py::connect()` 仍只有 mindmaps(id,version,content,updated_at)。op、运行日志、候选状态不落业务库；旧图默认空引用即可读取。刷新会丢未接受候选，已保存内容不丢；持久任务/协作须另立迁移，不暗中加 session 表。
-测试基线：静态枚举后端 196 用例/12 文件（含参数展开）；前端按任务基线 168/13。以下为预期改动，本次只写计划，未运行会产生缓存或临时数据库的测试。
+测试基线：下面第一组是**计划期**的静态枚举值（后端 196 用例/12 文件，含参数展开；前端 168/13），写在计划当时，只作对照，不代表现在的规模；**当前实测**为后端 `pytest` 488 passed + 19 subtests（20 个测试文件）、前端 `vitest` 358 用例 / 23 文件。以下为预期改动，本次只写计划，未运行会产生缓存或临时数据库的测试。
 
 | 后端现有文件（BT/） | 会破的断言与逐项处理 |
 |---|---|
