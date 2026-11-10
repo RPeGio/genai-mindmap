@@ -86,13 +86,13 @@ store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`
 新增 `service.chat_async(..., max_tokens=None, observer: Callable[[CompletionMeta],None] | None=None) -> dict`，保留旧参数默认值；observer 将 token/finish/耗时交给共用预算。tool_result 给模型只回上述摘要、规范化 op 和诊断，完整树通过下一轮上下文及 SSE 提供。
 `rag_query` 的 score 只表示检索排序；`verify_source_refs()` 的匹配只证明引文存在；二者都不证明结论正确。首版不接持久知识库、跨请求来源存储或外部联网检索。
 
-## 5. SSE 与两条前端通道
+## 5. SSE 与前端通道
 
-旧 `B/generation/router.py::generate_map_stream()`、`generate_stream_partial(text)` 保持 v1；客户端目前声明六类帧，但后端实际没有 heartbeat 发射点。新 `B/agent/stream.py::encode_event(event: AgentEvent) -> str` 仍输出 `data: {JSON}\n\n`，不照搬附录中的 `event:` 格式。
-每个 v2 JSON 帧都有 `{v:2,runId,seq,baseClientRevision,candidateRevision,type}`；seq 从 1 连续递增；`F/api/client.ts` 新增独立 `AgentEvent` 联合，不把 v2 偷塞进旧 StreamEvent。
+旧 `B/generation/router.py` 的两条同步/流式生成路由与 `generate_stream_partial(text)` 已删除，本节的 v2 帧是现在**唯一**的流式协议。`B/agent/stream.py::encode_event(event: AgentEvent) -> str` 输出 `data: {JSON}\n\n`，不照搬附录中的 `event:` 格式。
+每个 v2 JSON 帧的信封只有 `{seq, type}`（`backend/app/agent/contracts.py::_EventBase`）：`seq` 由服务端从 1 连续递增补齐，没有 `v` / `runId` / revision 字段，轮次与候选版本在各事件自己的 payload 里。`F/api/client.ts` 用独立的 `AgentEvent` 联合，不把 v2 偷塞进旧 StreamEvent。
 | 帧 | 除公共字段外的结构 | 前端动作 |
 |---|---|---|
-| stage / heartbeat | `{stage,detail,step}` / `{waitedMs}`；heartbeat 最多每 10 秒一次 | 展示阶段与等待时间；计时不阻塞执行，结束时取消计时任务。 |
+| stage | `{stage,detail}` | 展示阶段；计时不阻塞执行。 |
 | tool_start | `{callId,name,argsSummary}` | 显示调用卡片；不暴露整份来源文本、密钥或内部推理。 |
 | ops | `{callId,batch:OpBatch}` | 仅在候选副本原子应用；batchId 去重；绝不能直接写 content。 |
 | tool_end | `{callId,name,ok,resultSummary,diagnostics,latencyMs}` | 更新对应卡片；可修复错误留在工具反馈中，候选 revision 不增长。 |
@@ -103,15 +103,15 @@ store 新增 `clientRevision`（每次已提交编辑/撤销/重做递增）、`
 成功序列为 stage→tool_start→snapshot 或 ops→tool_end→下一轮→done→`[DONE]`；失败为工具反馈后继续一次，或直接 error→`[DONE]`。连接正常时恰有一个终态；取消/断网不承诺终态帧，且不能补发假 done。
 新增 `client.ts::readSse<T>(response: Response, onEvent: (event:T)=>void, signal?: AbortSignal): Promise<void>` 与 `runAgentStream(body: AgentRunRequest, onEvent: (event:AgentEvent)=>void, signal?: AbortSignal): Promise<void>`；支持 UTF-8 分片、CRLF/多 data 行，JSON 解析与业务回调分开捕错。
 v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知变更帧立即中止；reader 在 finally 释放。`[DONE]` 或 EOF 本身不算成功，必须收到合法 done；不做自动重连或重发 POST，首版无事件重放和重启恢复能力。
-`F/stores/mindmap.ts::runGeneration(input: TextInput|SourcesInput): Promise<void>` 共用 activeRun/controller/candidate/reducer；`generate(text)` 与 `generateSources(sources, options?)` 保留外部签名并委托，分别传 kind=text/sources；空文本不转成“带来源材料”，避免丢掉主题展开语义。
+`F/stores/mindmap.ts::runGeneration(goal: string, intent: 'create'|'expand'|'edit', sources?: Source[], thinkingModel?: string): Promise<void>` 统一走 agent、共用 activeRun/controller/candidate/reducer；原先的 `generate(text)` 与 `generateSources(sources, options?)` 两条前端通道已删除，没有 `agentEnabled` 开关可回退。空文本不转成"带来源材料"，避免丢掉主题展开语义。
 `cancel()`、`cancelSourceGeneration()` 委托 `cancelRun()`；busy/sourceGenerating 保留为兼容视图状态，不再维护两套异步所有权。`F/components/SourceInputs.vue::generate()/cancel()` 接新调度，confirmReplace 仅保留于旧通道；`F/App.vue` 接候选预览、接受/丢弃及工具卡片；新路径启动不再询问丢弃旧图，采用新图时才确认替换。
 `F/components/AgentPanel.vue` 定义 `props:{candidate:Candidate|null,trace:ToolTrace[]}`、`emits:{accept:[runId:string],discard:[runId:string]}`；`F/api/types.ts` 同步声明 Diagnostic（level/code/node_id/message/evidence）及 `Source.sentences?: AudioSentence[]`，避免以 unknown 丢弃诊断与音频来源字段。
-开关 `VITE_MINDMAP_AGENT=0` 时两条旧 HTTP 通道照常工作；=1 时共用 `/api/agent/runs/stream`。后端 `MINDMAP_AGENT_ENABLED=0` 在调用模型前返回 503/agent_disabled；前端只在明确未执行的 404 或该 code 上可回旧入口一次，SSE 开始或普通上游失败后绝不自动重跑。
-代理候选首版按已验证整图/完整 op 批展示，不使用 parse_partial() 的半截节点当执行依据；代价是首节点出现可能更晚，stage/tool_start 提供即时反馈。旧 skeleton/node 展示继续留在 v1。
+阶段 3 当初用 `VITE_MINDMAP_AGENT` 在两条旧 HTTP 通道与 `/api/agent/runs/stream` 之间切换；**该开关与那两条旧通道都已删除**，前端只剩 agent 这一条，没有"回旧入口"的分支。后端 `MINDMAP_AGENT_ENABLED=0` 仍在：开流前返回 503/agent_disabled（`B/agent/router.py::stream_run`）。
+代理候选首版按已验证整图/完整 op 批展示，不使用 parse_partial() 的半截节点当执行依据；代价是首节点出现可能更晚，stage/tool_start 提供即时反馈。旧 `skeleton` / `node` 帧已随旧生成通道一起删除。
 
 ## 6. 兼容、测试逐文件迁移与数据库
 
-旧 `POST /api/generations`、`POST /api/generations/stream`、`POST /api/pipeline/generate`、`POST /api/agent/tasks`、`POST /api/knowledge/search` 全保留；后两者继续 implemented=false，新能力只走新路由。`generation/router.py::generate_map()` 和 `pipeline/router.py::generate_from_sources()` 的同步返回形状不改。
+旧 `POST /api/generations`、`POST /api/generations/stream`、`POST /api/pipeline/generate` 已删除（连同 `generation/router.py`、`pipeline/` 整包）；`POST /api/agent/tasks`、`POST /api/knowledge/search` 保留且继续 implemented=false。生成与编辑现在只有 `/api/agent/runs/stream` 一条出口。
 数据库 schema 不变：`B/mindmaps/repository.py::connect()` 仍只有 mindmaps(id,version,content,updated_at)。op、运行日志、候选状态不落业务库；旧图默认空引用即可读取。刷新会丢未接受候选，已保存内容不丢；持久任务/协作须另立迁移，不暗中加 session 表。
 测试基线：静态枚举后端 196 用例/12 文件（含参数展开）；前端按任务基线 168/13。以下为预期改动，本次只写计划，未运行会产生缓存或临时数据库的测试。
 
@@ -146,7 +146,7 @@ v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知�
 | smoke-canvas.spec.ts | Vue Flow 容器挂载断言原样；候选面板不替换画布引擎。 |
 | tidy.spec.ts | 8 项方向/边界/重叠断言原样；新增 op 前后布局样本放 ops 测试，不重写布局算法。 |
 
-新增测试文件：`BT/test_agent_ops.py`、`test_agent_provider.py`、`test_agent_tools.py`、`test_agent_stream.py`、`FT/ops.spec.ts`、`agent.spec.ts`、`sse.spec.ts`；同一组 JSON 用例放 `tests/fixtures/mindmap_ops.json`，两端读取并比较完整归一化树及错误位置，不能各写一套只验证自身实现的快照。
+新增测试文件（实际落地的）：`BT/test_agent_ops.py`、`test_agent_tools.py`、`test_agent_stream.py`、`test_agent_loop.py`、`test_agent_node_grow.py`、`test_agent_demo.py`、`FT/ops.spec.ts`、`ops-contract.spec.ts`、`agent.spec.ts`、`agent-ops.spec.ts`、`agent-preview.spec.ts`；同一组 JSON 用例放 `tests/fixtures/mindmap_ops.json`，两端读取并比较完整归一化树及错误位置（`test_ops_contract_sync.py` + `ops-contract.spec.ts`），不能各写一套只验证自身实现的快照。
 
 ## 7. 可独立上线与回滚的切片
 
@@ -155,9 +155,9 @@ v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知�
 |---|---|---|---|---|
 | 0a–0c：质量基线 | 第 0 节 service.py/stream_partial.py、backend/eval 两文件；`ensure_finish_reason()`、`diagnose_density()` | 第 0 节列明的三条传输链、数量边界和引用对照 | 截断静默成功=0；0/1/2/3 分支两入口一致；报告每个样本成功/失败、覆盖、引用、P50/P95 和 token，不删除失败样本 | 各小补丁单独回退，策略见第 0 节；无数据迁移 |
 | 1：引用保真与共用 op | `F/api/types.ts`、`client.ts`、`F/mindmap/edits.ts`、新增 ops.ts、扩展 `F/stores/mindmap.ts::commitOps()`；`B/contracts/ops.py`、`B/agent/ops.py`、`source_refs.py`，手工编辑经 commitOps | test_agent_ops.py、ops.spec.ts、共同 fixture；扩展 save/store-edit | ≥40 组正常/非法/边界 batch 两端结果一致；任一第 k 个 op 失败时原树零变化；50 步撤销/重做后树、引用、子项顺序相同；真实前端 POST→GET→PUT 引用数量不减 | 部署仅保留引用序列化修复、恢复旧编辑函数的前一构建；该修复保留为回滚基线，已保存内容无需转换 |
-| 2：后端可调用 agent | 新增 `B/agent/contracts.py/provider.py/tools.py/stream.py`，扩展 agent/service.py/router.py、generation/service.py、knowledge/service.py、source_refs.py；开放 run SSE，旧 UI 不变 | test_agent_provider.py/tools.py/stream.py，旧 errors/skeleton 回归 | 模型模拟“检索→生成→改支”须有匹配 callId 与反馈后的第二轮；未知工具/坏参数零执行；最多 8 次模型与 8 次工具，120 秒截止；20 次中断中 httpx 连接均在 1 秒内关闭；运行前后业务库内容相同 | `MINDMAP_AGENT_ENABLED=0`，新路由返回明确未执行；旧入口继续可用，无新增表需清理 |
-| 3：前端统一运行与候选接受 | `F/api/client.ts/types.ts`、`stores/mindmap.ts`、`App.vue`、`components/SourceInputs.vue`，新增 `components/AgentPanel.vue`；runGeneration/acceptCandidate/cancelRun | agent.spec.ts、sse.spec.ts，按第 6 节迁移 store/upload/sources/save/app | 各执行 20 次手改/未提交草稿/undo/切图/保存并发/取消重试，静默覆盖=0；一轮接受仅 1 步历史；重复 batch 不加节点；拆分 SSE 每字节仍得同树；候选未接受时保存/导出内容不变 | 重发 `VITE_MINDMAP_AGENT=0` 的前端构建，候选丢弃、当前已接受树仍可旧接口保存；后端功能可保持关闭 |
-| 4：实测后放量 | 扩展 `backend/eval/agent_quality.py::compare()`、cases.json，新增 `backend/eval/agent_acceptance_cases.json`；更新 `docs/API.md`、`ARCHITECTURE.md`、`ARCHITECTURE_ADDENDUM.md` 的过期说明与开关 | 30 条局部操作人工标注任务、每条 3 次；两种部署开关组合的端到端用例 | 90 次局部请求精确完成率 ≥90%、未指向节点/子树误改=0、有效引用保留率=100%；受控机器端到端 P95≤60 秒、相同任务 token 中位数≤整图重生的 2 倍；先 10% 试用，100 次后仍达标再扩大 | 未达任一质量/成本门槛即关前端 agent 开关；保留质量修复和 op，不回退已保存数据 |
+| 2：后端可调用 agent | 新增 `B/agent/contracts.py/provider.py/tools.py/stream.py`，扩展 agent/service.py/router.py、generation/service.py、knowledge/service.py、source_refs.py；开放 run SSE，旧 UI 不变 | test_agent_tools.py/stream.py/loop.py，旧 errors/skeleton 回归 | 模型模拟“检索→生成→改支”须有匹配 callId 与反馈后的第二轮；未知工具/坏参数零执行；最多 8 次模型与 8 次工具，120 秒截止；20 次中断中 httpx 连接均在 1 秒内关闭；运行前后业务库内容相同 | `MINDMAP_AGENT_ENABLED=0`，新路由返回明确未执行；旧入口现已删除（见阶段 3 的回滚说明），无新增表需清理 |
+| 3：前端统一运行与候选接受 | `F/api/client.ts/types.ts`、`stores/mindmap.ts`、`App.vue`、`components/SourceInputs.vue`，新增 `components/AgentPanel.vue`；runGeneration/acceptCandidate/cancelRun | agent.spec.ts、agent-ops.spec.ts、agent-preview.spec.ts，按第 6 节迁移 store/upload/sources/save/app | 各执行 20 次手改/未提交草稿/undo/切图/保存并发/取消重试，静默覆盖=0；一轮接受仅 1 步历史；重复 batch 不加节点；拆分 SSE 每字节仍得同树；候选未接受时保存/导出内容不变 | 这条回滚已失效：`VITE_MINDMAP_AGENT` 开关与两条旧前端通道都已删除，候选只能靠界面上的"丢弃"作废；后端功能仍可用 `MINDMAP_AGENT_ENABLED=0` 关掉 |
+| 4：实测后放量 | 扩展 `backend/eval/agent_quality.py::compare()`、cases.json，新增 `backend/eval/agent_acceptance_cases.json`；更新 `docs/API.md`、`ARCHITECTURE.md`、`ARCHITECTURE_ADDENDUM.md` 的过期说明与开关 | 30 条局部操作人工标注任务、每条 3 次；两种部署开关组合的端到端用例 | 90 次局部请求精确完成率 ≥90%、未指向节点/子树误改=0、有效引用保留率=100%；受控机器端到端 P95≤60 秒、相同任务 token 中位数≤整图重生的 2 倍；先 10% 试用，100 次后仍达标再扩大 | 未达任一质量/成本门槛即 `MINDMAP_AGENT_ENABLED=0` 停用（前端已无开关可关）；保留质量修复和 op，不回退已保存数据 |
 
 阶段 2 真实供应商验收先用 20 次最小工具回填及取消探针；demo 必须全程 0 次网络调用、显式标 mode=demo。阶段 3 协议与竞态主要用可控时钟/延迟假流，不用真实模型随机性掩盖状态错误。
 实施后的常规检查入口为后端 `python -m pytest -q`、前端 `npm test` 与 `npm run build`；每阶段记录新增失败归属与上述业务计数。数据库回滚演练必须用副本，两标签同 version 保存应恰有一次成功、一次 409。

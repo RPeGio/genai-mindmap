@@ -1,19 +1,20 @@
 # agent 生成流的节点级事件
 
-普通生成（`/api/generate/stream`）已经能做到「模型还在输出，节点就一个个出现」，
-实现在 `generation/stream_partial.py`：请求带 `stream: true`，逐 `data:` 帧收
-`delta.content`，攒够一小段就用 `parse_partial` 补括号解析，再用
-`collect_new_nodes` 挑出没推过的节点。
+「模型还在输出，节点就一个个出现」这层能力原先长在普通生成流（`POST /api/generations/stream`，已删除）上，
+增量解析器还在 `generation/stream_partial.py`：流式接收侧逐 `data:` 帧收 `delta.content`，攒够一小段就交给
+`parse_partial` 补括号解析，再用 `collect_new_nodes` 挑出没推过的节点。现在它只服务于 agent 的
+`node_grow` 预览。
 
-agent 路径（`/api/agent/runs/stream`）没有这一层：工具内部的模型调用走
-`chat_async`，等整个响应收完、解析成树，才在最后由 `snapshot` 帧一次性给出候选。
-深层生成要发十几次调用，用户看到的是十几秒空屏然后整棵树同时出现。
+agent 路径（`POST /api/agent/runs/stream`）已经接上这一层：深层生成（`mindmap_generate_deep`）在工具内部
+边收模型分片边解析，把已经写完整的节点报成 `node_grow` 帧；整树仍然只在 `snapshot` / `done` 帧里给出候选。
+没有这一层时，深层生成要发十几次调用，用户看到的是十几秒空屏然后整棵树同时出现。
 
 本文定义 agent 侧的节点生长事件，粒度对齐普通生成：**节点写完就上屏**。
 
 ## 与普通生成的差别
 
-普通生成是一棵树一个 JSON，节点自带 `id`，父子关系能直接从 JSON 里读出来。
+普通生成是一棵树一个 JSON，节点自带 `id`，父子关系能直接从 JSON 里读出来。（该路径已删除，
+下面的对比保留是因为解析器与提示词仍按同样的形状工作。）
 
 深层生成的每次展开调用长这样，**没有 id**：
 
