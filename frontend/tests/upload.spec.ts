@@ -125,12 +125,16 @@ const GENERATE_URL = '/api/pipeline/generate';
 
 beforeEach(() => {
   setActivePinia(createPinia());
+  // 这里测的是旧的批量通道（`/api/pipeline/generate`）：agent 已是默认路径，
+  // 不关掉的话「合并生成导图」会打到 agent 路由，端点断言与帧语义全对不上。
+  vi.stubEnv('VITE_MINDMAP_AGENT', '0');
 });
 
 afterEach(() => {
   wrappers.splice(0).forEach(wrapper => wrapper.unmount());
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 

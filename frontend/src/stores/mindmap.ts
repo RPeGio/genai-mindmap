@@ -3,8 +3,9 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, Source, SourceRef } from '../api/types';
+import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, OpBatch, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
+import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
@@ -331,6 +332,28 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * `mapId` / `version` / 历史；`expand` / `edit` 改的就是当前这张图，身份必须留着。
    */
   let candidateIntent: 'create' | 'expand' | 'edit' = 'create';
+
+  /**
+   * 候选树当前走到第几版 op。
+   *
+   * 每批 op 的 `base_revision` 是后端在**它那棵树**上算的序号（0 起，一批加一），
+   * 这里记的是"我这份候选已经应用到这里"。两者对不上就说明中间漏了一批
+   * （丢帧、乱序），在错位的树上继续套用比不套用更糟。
+   *
+   * 只放在 store 内部，不进返回对象：界面不需要读它，它只是消费端的一致性账本。
+   */
+  let candidateRevision = 0;
+
+  /**
+   * 候选整棵作废时，把 op 版本账本一起归零。
+   *
+   * 零是后端每一轮的新起点（`RunContext.revision` 从 0 起算）。漏掉这一步，
+   * 下一轮的第一批 op 会因为 `base_revision=0` 对不上旧账本而被整批丢掉，
+   * 表现出来就是"改了半天候选一点没动"。
+   */
+  function resetCandidateOps() {
+    candidateRevision = 0;
+  }
 
   /** 给面板显示的工具进度与阶段。 */
   const agentEvents = ref<AgentEvent[]>([]);
@@ -1070,6 +1093,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 换了一张图，上一张图算出来的候选没有任何意义：留着它，一次误点就会把
     // 那张图的内容装进这张图。
     candidate.value = null;
+    resetCandidateOps();
     saving.value = false;
     titleDraft.value = null;
     content.value = next;
@@ -1090,6 +1114,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     mapSession += 1;
     // 同上：新建之后旧候选不再属于画布上的任何一张图。
     candidate.value = null;
+    resetCandidateOps();
     saving.value = false;
     titleDraft.value = null;
     content.value = null;
@@ -1118,6 +1143,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 失败时保留 dirty —— 一次网络抖动不能让用户以为已经存上了。
    */
   async function save(): Promise<SaveResult> {
+    // 生成中途保存必然出脏数据：`content` 可能是增量拼出来的半棵树、`dirty`
+    // 还是 false、`mapId` 还可能是 null，POST 出去就是一条半截记录，`done`
+    // 到达后再保存又多出第二条。挡在这里，而不是留给后端去猜哪条该丢。
+    if (busy.value || agentRunning.value) {
+      status.value = '正在生成导图，完成之后才能保存。';
+      return 'busy';
+    }
     const current = content.value;
     if (!current) {
       status.value = '没有可保存的导图。';
@@ -1337,6 +1369,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     mapSession += 1;
     // 换图即作废旧候选（preview 也被「多来源生成」复用，它同样会换掉整棵树）。
     candidate.value = null;
+    resetCandidateOps();
     titleDraft.value = null;
     // 上一张图在途的保存到这里就作废了：它的 finally 因为会话不匹配不会
     // 清理 saving，这里必须自己复位，否则新图永远卡在"保存中"，点保存
@@ -1594,12 +1627,50 @@ export const useMindMapStore = defineStore('mindmap', () => {
   // ---- agent 运行与候选接受 ----
 
   /**
-   * 是否走 agent 新路径。
+   * 是否走 agent 路径。
    *
-   * 默认关闭：现有两条生成通道（流式 / 批量）已经过端到端验证，新路径要能被
-   * 一条环境变量关掉退回旧行为，而不是靠回滚代码。
+   * 默认开启：agent 是目标形态，旧的流式 / 批量两条通道留着只是对照基线，
+   * 删它们之前先把默认路径切过来。`VITE_MINDMAP_AGENT=0` 仍能退回旧行为——
+   * 回滚靠一个环境变量，不靠回滚代码。
+   *
+   * 每次调用都重新读，不在建 store 时算成一个常量：测试里 `vi.stubEnv` 到
+   * beforeEach / 用例内部才生效，模块级常量读得太早，读到的是构建时的值；
+   * 运行时切换开关也不该要求重建 store。
    */
-  const agentEnabled = String(import.meta.env?.VITE_MINDMAP_AGENT ?? '') === '1';
+  function agentEnabled(): boolean {
+    return String(import.meta.env?.VITE_MINDMAP_AGENT ?? '1') !== '0';
+  }
+
+  /**
+   * 把一批 op 应用到候选上，返回是否应用成功。
+   *
+   * 只动 `candidate`，绝不写 `content`：采纳仍然要用户点「应用」。这是整条 agent
+   * 路径的核心约束，不因为帧是增量的就默认落地。
+   *
+   * 失败与乱序都**静默丢弃**：`done` 帧会带完整树覆盖候选，少应用一批不会丢数据；
+   * 而在这种时候弹一句"修改没能应用"，用户只会以为最终结果不可信。
+   */
+  function applyOpsToCandidate(batch: OpBatch): boolean {
+    // edit / expand 这两条路上后端不发 snapshot（候选从请求带过去的树起步），
+    // 所以候选要由画布那份树的副本兜底——`applyOps` 自己会克隆，不会改到 content。
+    // 不兜底的话第一批 op 就没有落点，"打开旧图 → 让 AI 改"依旧一点反应都没有。
+    const base = candidate.value ?? (candidateIntent === 'create' ? null : content.value);
+    if (!base) return false;
+    // 对不上就是中间漏了一批：在错位的树上继续套用只会套出错位的结构。
+    if (batch.base_revision !== candidateRevision) {
+      previewDebug(`[agent] 丢弃 ops 批次：base_revision=${batch.base_revision}，当前 ${candidateRevision}`);
+      return false;
+    }
+    try {
+      candidate.value = applyOps(base, batch).content;
+    } catch (error) {
+      previewDebug(`[agent] 丢弃 ops 批次：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+    // 只有真正落进候选才算这一版完成，失败那批不能推进账本。
+    candidateRevision = batch.base_revision + 1;
+    return true;
+  }
 
   async function runGeneration(
     goal: string,
@@ -1631,6 +1702,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。
     agentWarnings.value = [];
     candidate.value = null;
+    // 新一轮的 op 从第 0 版重新开始，上一轮的账本留着只会把首批 op 判成乱序。
+    resetCandidateOps();
     // 上一轮长到一半的预览同样不能留：它的节点属于上一次运行，混进这一轮的
     // 面板里，用户会以为新任务已经长出了这些分支。
     clearAgentPreview();
@@ -1702,6 +1775,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
             // 两者可能不一致——把预览当候选，等于把一棵没校验过的树交给用户应用。
             growPreviewNode(event.path, event.label, event.expandable);
             break;
+          case 'ops':
+            // `edit` 意图的改动**只**以 op 批次下发（没有整树快照）。不接这一帧，
+            // "打开旧图 → 让 AI 改 → 界面没反应"就是必然结果。
+            if (applyOpsToCandidate(event.batch)) {
+              status.value = `已应用 ${event.batch.ops.length} 条修改，确认后才会应用到画布。`;
+            }
+            break;
           case 'snapshot':
             // 后端整树校验通过后先推一帧 snapshot：done 之前用户就该看得见候选长什么样。
             // 完整候选一到，预览就没有存在意义了，整棵作废（含还等着挂的缓存）。
@@ -1769,6 +1849,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 那张图的内容写进当前记录。
     if (candidateSession !== mapSession) {
       candidate.value = null;
+      resetCandidateOps();
       status.value = '候选是在另一张导图上生成的，已失效，请重新运行。';
       return 'stale';
     }
@@ -1788,6 +1869,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (invalid) {
       status.value = `候选不合法，已丢弃：${invalid}`;
       candidate.value = null;
+      resetCandidateOps();
       return 'invalid';
     }
     // 到这里候选可以落地了。先按意图处理"这份内容是谁"：
@@ -1811,6 +1893,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
     content.value = candidate.value;
     candidate.value = null;
+    // 候选落地之后账本归零：这份内容已经进了 content，下一轮从第 0 版重来。
+    resetCandidateOps();
     mode.value = 'model';
     dirty.value = true;
     clientRevision.value += 1;
@@ -1826,6 +1910,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function discardCandidate(): void {
     const had = candidate.value !== null;
     candidate.value = null;
+    resetCandidateOps();
     agentError.value = '';
     agentWarnings.value = [];
     status.value = had ? '已丢弃候选，画布未变。' : '没有待处理的候选。';

@@ -642,6 +642,7 @@ describe('思维模型进入请求体', () => {
   it('agent 路径关闭时下拉不渲染', () => {
     // 关闭时走旧的一次性生成接口，它根本不接收 thinking_model：
     // 把选不生效的控件摆在这里，用户会以为自己换过拆解方式了。
+    vi.stubEnv('VITE_MINDMAP_AGENT', '0');
     const wrapper = mount(SourceInputs, {
       global: { plugins: [createPinia()] },
       props: { confirmDiscard: () => true },

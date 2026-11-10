@@ -28,11 +28,11 @@ const thinkingModel = ref('default');
 /**
  * 拆解方式只在"会真正生效"的路径上出现。
  *
- * 两条路选了没用：`agentEnabled === false` 时走旧的一次性生成接口，它不接收
+ * 两条路选了没用：`agentEnabled()` 为假时走旧的一次性生成接口，它不接收
  * `thinking_model`；已有导图时走 `edit` 意图，后端的编辑路径也不消费这个字段。
  * 摆一个选了不起作用的控件，比不摆更糟——用户会以为自己换过拆法了。
  */
-const thinkingModelVisible = computed(() => store.agentEnabled && !store.content);
+const thinkingModelVisible = computed(() => store.agentEnabled() && !store.content);
 
 const recording = ref(false);
 const generating = computed(() => store.busy || store.sourceGenerating);
@@ -81,7 +81,7 @@ async function generate() {
   // agent 路径：输入框里是"要做什么"，来源列表是"依据什么"——两者分开送。
   // 曾经把材料正文拼进 goal 并截到 1000 字：材料大半被丢掉，而且只要输入框
   // 有一个字，附件就完全不参与。是否新建取决于当前有没有导图。
-  if (store.agentEnabled) {
+  if (store.agentEnabled()) {
     const text = prompt.value.trim();
     const ready = sources.readySources;
     // 只写了材料、没写目标时给一句占位，别把正文当目标塞进去。

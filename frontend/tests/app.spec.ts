@@ -1,6 +1,6 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia } from 'pinia';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
 import { useMindMapStore } from '../src/stores/mindmap';
@@ -62,8 +62,20 @@ function buttonByText(wrapper: VueWrapper, text: string) {
   return found;
 }
 
+/**
+ * 这个文件测的是旧的同步 / SSE 通道（`/api/generations/stream`）。
+ *
+ * agent 路径现在是默认，不显式关掉，按钮就会打到 `/api/agent/runs/stream`，
+ * 断言的端点与帧语义全对不上。旧通道要一直绿到被删除那一天——它是那次删除的
+ * 对照基线，所以这里固定回旧路径，而不是改写用例去适配 agent。
+ */
+beforeEach(() => {
+  vi.stubEnv('VITE_MINDMAP_AGENT', '0');
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('App', () => {

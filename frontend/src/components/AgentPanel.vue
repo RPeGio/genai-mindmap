@@ -12,7 +12,7 @@ import { agentToolLabel, useMindMapStore, type PreviewNode } from '../stores/min
 const store = useMindMapStore();
 
 const visible = computed(() =>
-  store.agentEnabled
+  store.agentEnabled()
   && (store.agentRunning || store.candidate !== null || store.agentEvents.length > 0 || !!store.agentError),
 );
 
