@@ -14,7 +14,7 @@
 | 变更 | 原因 |
 |---|---|
 | 新增 `schema_version: 2` | 显式版本号，迁移与兼容判断不再靠字段探测 |
-| `Node` 新增 `note` / `collapsed` / `style` / `source_refs` / `pos` | 画布编辑、样式、知识引用、手动布局都需要落到数据里 |
+| `Node` 新增 `note` / `collapsed` / `style` / `pos` | 画布编辑、样式、手动布局都需要落到数据里（`source_refs` 是 v1 已有字段，不属本次新增） |
 | 新增 `layout` | 布局模式必须随导图保存，否则重开后视图错乱 |
 | 新增 `theme` | 主题是导图属性，不是本地偏好 |
 | 新增 `relations[]` | 跨节点因果/引用/冲突关系，v1 无法表达（只能用重复节点冒充，已明确禁止） |
@@ -141,6 +141,16 @@ def migrate_content(data: dict) -> dict:
 - 迁移期间服务只读（维护窗口 5 分钟即可，数据量小）。
 - 回滚：保留迁移前 dump，失败则恢复并回退服务镜像 tag。
 
+**回滚约束：v2 写回之后，不能回滚到 v1 契约。** 上面那条"读时补默认值"是单向的——v1 记录读进 v2 没问题，但一旦保存，`model_dump_json()` 就把 v2 全字段写进库（顶层的 `schema_version` / `layout` / `theme` / `relations`，以及每个节点的 `note` / `collapsed` / `style` / `pos`，值是 `null` / `false` 的也照写）。此时把服务退回 v1 契约，读这些记录会撞上 `extra="forbid"` 抛 `ValidationError`，`GET /api/mindmaps/{id}` 直接 500，不会降级成"缺字段"。
+
+实测（把 v2 记录交给 `13cce17` 的 v1 契约解析）：手写的最小 v2 记录（顶层四件 + 根节点 `note`）报 5 个 `extra_forbidden`；库里真正保存过的记录字段更全，报错数是 `4 + 4 × 节点数`（两个节点的样例报 12 个），随树规模增长。
+
+所以这个决定要在**发布前**做，不能等回滚时再想：
+
+- 保守做法：回滚步骤里固定加一步——先备份 `backend/data/mindmaps.db` 再换镜像。库里有 v2 记录时，回滚等于丢这批记录，只能靠备份整库还原。
+- 需要保留双向能力时，在写入侧留契约版本开关（能读 v2、只写 v1 的降级模式），代价是要为 `note` / `layout` / `theme` 定义裁剪规则，且裁剪不可逆（用户写过的正文直接消失）。
+- 判断点：这次发布只要**有可能回退**，就属于必须提前决定的范围——契约升位、前后端同批上线、验收期演示，都算；纯文档与注释改动不写库，不涉及。
+
 ## 5 前端类型生成（已落地 2026-11-10）
 
 整条链路是"后端 → 快照 → 类型 → 断言"，跑一次就能拿到与后端一致的类型：
@@ -157,7 +167,7 @@ npm run gen:api
 - 快照和生成物各有一道防线：`backend/tests/test_openapi_snapshot.py` 在本地跑 pytest 时核对快照是否过期，CI 的两个 job 再各跑一次"重新生成 + `git diff --exit-code`"。三层都过了，才说明提交的生成物确实来自当前代码。
 - **手写的 `frontend/src/api/types.ts` 保留**，但降级为"读起来省事的镜像"：业务代码继续 import 它，因为它比 `components["schemas"]["MindMapContent-Output"]` 好写；而它与生成结果的一致性由 `frontend/src/api/contract-check.ts` 在 `vue-tsc` 期间断言（键集合必须一样、抹平可空性后形状必须能互相赋值）。只留生成类型的话，`note` 这种"后端有、镜像没声明"的字段会重演被整批丢掉的历史事故；只留手写类型的话，后端加字段没人发现。两者加在一起才闭合。
 - 前端额外需要、后端没有的类型（如画布内部节点）放在 `src/canvas/types.ts`，**不得**与契约同名。
-- `MindMapOp` / `OpBatch` 不在 OpenAPI 里（走 agent 的 SSE 事件），两端靠 `backend/tests/fixtures/mindmap_ops.json` 共用一份用例对齐。
+- `MindMapOp` / `OpBatch` 不在 OpenAPI 里（走 agent 的 SSE 事件），两端靠仓库根的 `tests/fixtures/mindmap_ops.json` 共用一份用例对齐（`backend/tests/test_ops_contract_sync.py:22` 用 `parents[2]` 定位到它）。
 
 ## 6 完整示例
 
