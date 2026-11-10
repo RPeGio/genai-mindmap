@@ -141,16 +141,23 @@ def migrate_content(data: dict) -> dict:
 - 迁移期间服务只读（维护窗口 5 分钟即可，数据量小）。
 - 回滚：保留迁移前 dump，失败则恢复并回退服务镜像 tag。
 
-## 5 前端类型生成（不再手写 `types.ts`）
+## 5 前端类型生成（已落地 2026-11-10）
+
+整条链路是"后端 → 快照 → 类型 → 断言"，跑一次就能拿到与后端一致的类型：
 
 ```powershell
-# backend 启动后
-npx openapi-typescript http://127.0.0.1:8000/openapi.json -o src/api/schema.d.ts
+# 1. backend 目录：把 app.openapi() 导出成仓库里的快照
+.\.venv\Scripts\python.exe scripts\export_openapi.py
+
+# 2. frontend 目录：从快照生成类型
+npm run gen:api
 ```
 
-- 生成物 `src/api/schema.d.ts` **提交入库**，CI 里跑 `npm run gen:api && git diff --exit-code` 保证与后端同步。
-- 手写的 `frontend/src/api/types.ts`（v1 镜像）删除；业务层只从 `schema.d.ts` 取 `components["schemas"]["MindMapContent"]`。
+- `backend/openapi.json` 与 `frontend/src/api/schema.d.ts` **都提交入库**：一次接口变更的 diff 里能直接看到契约改了什么，不必起服务去抓。
+- 快照和生成物各有一道防线：`backend/tests/test_openapi_snapshot.py` 在本地跑 pytest 时核对快照是否过期，CI 的两个 job 再各跑一次"重新生成 + `git diff --exit-code`"。三层都过了，才说明提交的生成物确实来自当前代码。
+- **手写的 `frontend/src/api/types.ts` 保留**，但降级为"读起来省事的镜像"：业务代码继续 import 它，因为它比 `components["schemas"]["MindMapContent-Output"]` 好写；而它与生成结果的一致性由 `frontend/src/api/contract-check.ts` 在 `vue-tsc` 期间断言（键集合必须一样、抹平可空性后形状必须能互相赋值）。只留生成类型的话，`note` 这种"后端有、镜像没声明"的字段会重演被整批丢掉的历史事故；只留手写类型的话，后端加字段没人发现。两者加在一起才闭合。
 - 前端额外需要、后端没有的类型（如画布内部节点）放在 `src/canvas/types.ts`，**不得**与契约同名。
+- `MindMapOp` / `OpBatch` 不在 OpenAPI 里（走 agent 的 SSE 事件），两端靠 `backend/tests/fixtures/mindmap_ops.json` 共用一份用例对齐。
 
 ## 6 完整示例
 

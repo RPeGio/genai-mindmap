@@ -1,0 +1,2176 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "生成式 AI 思维导图",
+    "version": "0.2.0"
+  },
+  "paths": {
+    "/api/generations": {
+      "post": {
+        "tags": [
+          "AI 生成"
+        ],
+        "summary": "Generate Map",
+        "description": "一次性生成：等模型吐完再返回，适合脚本调用与短输入。",
+        "operationId": "generate_map_api_generations_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/generations/stream": {
+      "post": {
+        "tags": [
+          "AI 生成"
+        ],
+        "summary": "Generate Map Stream",
+        "description": "流式生成：一次调用，节点边生成边出现。帧格式见 stream_partial.py 的模块注释。\n\n请求体校验失败时仍返回普通 JSON 错误（流还没开始，走统一错误处理器）；\n一旦开始推送，后续错误只能以 `{\"type\":\"error\"}` 事件的形式出现在流里。\n\n用 async 定义是必须的：客户端断开时 Starlette 会 cancel 这个生成器，\n异步 httpx 的连接随之关闭，模型侧才真正停止计费。",
+        "operationId": "generate_map_stream_api_generations_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mindmaps": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "List Maps",
+        "operationId": "list_maps_api_mindmaps_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MapRecord"
+                  },
+                  "type": "array",
+                  "title": "Response List Maps Api Mindmaps Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Create Map",
+        "operationId": "create_map_api_mindmaps_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapRecord"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mindmaps/{map_id}": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Get Map",
+        "operationId": "get_map_api_mindmaps__map_id__get",
+        "parameters": [
+          {
+            "name": "map_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Map Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapRecord"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Update Map",
+        "operationId": "update_map_api_mindmaps__map_id__put",
+        "parameters": [
+          {
+            "name": "map_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Map Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapRecord"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pipeline/generate": {
+      "post": {
+        "tags": [
+          "生成流水线"
+        ],
+        "summary": "Generate From Sources",
+        "description": "多来源生成。demo 模式下可完整跑通，返回占位导图与真实诊断。",
+        "operationId": "generate_from_sources_api_pipeline_generate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PipelineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/optimization/check": {
+      "post": {
+        "tags": [
+          "逻辑优化"
+        ],
+        "summary": "Check Map",
+        "description": "只读诊断；可传 sources，按原文核验节点引用。",
+        "operationId": "check_map_api_optimization_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/optimization/suggest": {
+      "post": {
+        "tags": [
+          "逻辑优化"
+        ],
+        "summary": "Suggest For Map",
+        "description": "给出候选修改列表。用户确认后才能应用（当前无自动应用接口）。",
+        "operationId": "suggest_for_map_api_optimization_suggest_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/export/puml": {
+      "post": {
+        "tags": [
+          "导出"
+        ],
+        "summary": "Export Puml",
+        "description": "导出 PlantUML 文本。\n\n前端拿到后可直接下载，或贴到语雀 / Typora / Confluence 等支持 puml 的工具。",
+        "operationId": "export_puml_api_export_puml_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/export/markdown": {
+      "post": {
+        "tags": [
+          "导出"
+        ],
+        "summary": "Export Markdown",
+        "description": "导出 Markdown 大纲。",
+        "operationId": "export_markdown_api_export_markdown_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/export/opml": {
+      "post": {
+        "tags": [
+          "导出"
+        ],
+        "summary": "Export Opml",
+        "description": "导出 OPML，便于导入 XMind 等工具。",
+        "operationId": "export_opml_api_export_opml_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ingestion/text": {
+      "post": {
+        "tags": [
+          "多模态输入"
+        ],
+        "summary": "Create Text Source",
+        "description": "文本 / Markdown 直通。",
+        "operationId": "create_text_source_api_ingestion_text_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTextSourceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTextSourceResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ingestion/files": {
+      "post": {
+        "tags": [
+          "多模态输入"
+        ],
+        "summary": "Create File Source",
+        "description": "上传文档或音频，解析成文本来源。\n\n返回的 `source` 可直接传给 `POST /api/pipeline/generate` 生成导图。\n解析失败（含扫描件无文本层、音频无人声）返回 422 并说明原因，\n不返回空内容。",
+        "operationId": "create_file_source_api_ingestion_files_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_file_source_api_ingestion_files_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTextSourceResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ingestion/formats": {
+      "get": {
+        "tags": [
+          "多模态输入"
+        ],
+        "summary": "List Supported Formats",
+        "description": "列出当前支持的文件类型与上传上限，前端可据此限制文件选择框。",
+        "operationId": "list_supported_formats_api_ingestion_formats_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/knowledge/search": {
+      "post": {
+        "tags": [
+          "知识增强"
+        ],
+        "summary": "Search Knowledge",
+        "description": "知识库检索（F12/F13）。\n\n当前实现返回空结果且 `implemented=false`，前端应据此禁用相关入口，\n不要把它当成\"已经接好了知识库\"。",
+        "operationId": "search_knowledge_api_knowledge_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/tasks": {
+      "post": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Create Task",
+        "description": "目标驱动生成（F02）。当前只返回阶段骨架，不产生导图。",
+        "operationId": "create_task_api_agent_tasks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/stream": {
+      "post": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Stream Run",
+        "operationId": "stream_run_api_agent_runs_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "tags": [
+          "基础服务"
+        ],
+        "summary": "Health",
+        "operationId": "health_api_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AgentPlan": {
+        "properties": {
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "stages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Stages"
+          },
+          "implemented": {
+            "type": "boolean",
+            "title": "Implemented",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "goal"
+        ],
+        "title": "AgentPlan"
+      },
+      "AgentRunRequest": {
+        "properties": {
+          "goal": {
+            "type": "string",
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Goal"
+          },
+          "intent": {
+            "type": "string",
+            "enum": [
+              "create",
+              "expand",
+              "edit"
+            ],
+            "title": "Intent",
+            "default": "create"
+          },
+          "thinking_model": {
+            "type": "string",
+            "enum": [
+              "default",
+              "first-principles",
+              "feynman",
+              "systematic",
+              "critical"
+            ],
+            "title": "Thinking Model",
+            "default": "default"
+          },
+          "snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "selected_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Selected Ids"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Sources"
+          },
+          "budget": {
+            "$ref": "#/components/schemas/RunBudget"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "goal"
+        ],
+        "title": "AgentRunRequest",
+        "description": "一次 agent 运行。\n\n`snapshot` 是前端当前的树。服务端**不**从数据库重读——用户可能有一堆没保存\n的编辑，重读数据库等于把它们丢掉。"
+      },
+      "AgentTaskRequest": {
+        "properties": {
+          "goal": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Goal"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "goal"
+        ],
+        "title": "AgentTaskRequest"
+      },
+      "AudioSentence": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "begin_ms": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Begin Ms"
+          },
+          "end_ms": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "End Ms"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "begin_ms",
+          "end_ms"
+        ],
+        "title": "AudioSentence",
+        "description": "音频里的一句话，以及它在**原始录音**中的位置。\n\n时间是从整段录音开头算的毫秒偏移，不是相对于某个切片。切片识别时\n由服务层按段的起点平移过——否则第二段的所有时间会从 0 重新开始，\n节点会指回错误的位置。\n\n只保留句级粒度。词级时间戳接口也返回，但节点引用用不到那么细，\n存下来只会让契约和前端都变重。"
+      },
+      "Body_create_file_source_api_ingestion_files_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_create_file_source_api_ingestion_files_post"
+      },
+      "CheckRequest": {
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Input"
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Source"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sources"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "title": "CheckRequest"
+      },
+      "CheckResponse": {
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array",
+            "title": "Diagnostics"
+          }
+        },
+        "type": "object",
+        "required": [
+          "diagnostics"
+        ],
+        "title": "CheckResponse"
+      },
+      "CreateTextSourceRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 10000,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "markdown"
+            ],
+            "title": "Kind",
+            "default": "text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "CreateTextSourceRequest",
+        "description": "最小可用入口：直接贴文本。"
+      },
+      "CreateTextSourceResponse": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "title": "CreateTextSourceResponse"
+      },
+      "Diagnostic": {
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/DiagnosticLevel",
+            "default": "info"
+          },
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "Diagnostic"
+      },
+      "DiagnosticLevel": {
+        "type": "string",
+        "enum": [
+          "info",
+          "warn",
+          "error"
+        ],
+        "title": "DiagnosticLevel"
+      },
+      "GenerateRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 10000,
+            "minLength": 1,
+            "title": "Text"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "GenerateRequest"
+      },
+      "GenerateResponse": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "demo",
+              "model"
+            ],
+            "title": "Mode"
+          },
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Output"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array",
+            "title": "Diagnostics"
+          }
+        },
+        "type": "object",
+        "required": [
+          "mode",
+          "content"
+        ],
+        "title": "GenerateResponse"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "KnowledgeHit": {
+        "properties": {
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "snippet": {
+            "type": "string",
+            "title": "Snippet",
+            "default": ""
+          },
+          "score": {
+            "type": "number",
+            "title": "Score",
+            "default": 0.0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "KnowledgeHit"
+      },
+      "LayoutKind": {
+        "type": "string",
+        "enum": [
+          "tree",
+          "vertical",
+          "logic",
+          "timeline",
+          "fishbone",
+          "manual"
+        ],
+        "title": "LayoutKind"
+      },
+      "MapRecord": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Output"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "version",
+          "content",
+          "updated_at"
+        ],
+        "title": "MapRecord"
+      },
+      "MindMapContent-Input": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Input"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/LayoutKind",
+            "default": "tree"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "root"
+        ],
+        "title": "MindMapContent"
+      },
+      "MindMapContent-Output": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Output"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/LayoutKind",
+            "default": "tree"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "root"
+        ],
+        "title": "MindMapContent"
+      },
+      "Node-Input": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Label"
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/Node-Input"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Children"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "collapsed": {
+            "type": "boolean",
+            "title": "Collapsed",
+            "default": false
+          },
+          "style": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NodeStyle"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_refs": {
+            "items": {
+              "$ref": "#/components/schemas/SourceRef"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "title": "Source Refs"
+          },
+          "pos": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Position"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "Node"
+      },
+      "Node-Output": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Label"
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/Node-Output"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Children"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "collapsed": {
+            "type": "boolean",
+            "title": "Collapsed",
+            "default": false
+          },
+          "style": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NodeStyle"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_refs": {
+            "items": {
+              "$ref": "#/components/schemas/SourceRef"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "title": "Source Refs"
+          },
+          "pos": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Position"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "Node"
+      },
+      "NodeStyle": {
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^#[0-9a-fA-F]{6}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
+          "bold": {
+            "type": "boolean",
+            "title": "Bold",
+            "default": false
+          },
+          "italic": {
+            "type": "boolean",
+            "title": "Italic",
+            "default": false
+          },
+          "shape": {
+            "type": "string",
+            "enum": [
+              "rounded",
+              "rect",
+              "pill"
+            ],
+            "title": "Shape",
+            "default": "rounded"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "NodeStyle"
+      },
+      "PipelineRequest": {
+        "properties": {
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Sources"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sources"
+        ],
+        "title": "PipelineRequest"
+      },
+      "PipelineResponse": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "title": "Mode"
+          },
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Output"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array",
+            "title": "Diagnostics"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/StageTraceOut"
+            },
+            "type": "array",
+            "title": "Stages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "mode",
+          "content"
+        ],
+        "title": "PipelineResponse"
+      },
+      "Position": {
+        "properties": {
+          "x": {
+            "type": "number",
+            "maximum": 1000000.0,
+            "minimum": -1000000.0,
+            "title": "X"
+          },
+          "y": {
+            "type": "number",
+            "maximum": 1000000.0,
+            "minimum": -1000000.0,
+            "title": "Y"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "x",
+          "y"
+        ],
+        "title": "Position",
+        "description": "节点坐标。只有 `layout == \"manual\"` 时有意义——自动布局的坐标是算出来的，\n存进数据只会在下次换布局时被当成用户意图。"
+      },
+      "Relation": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "source": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Target"
+          },
+          "type": {
+            "$ref": "#/components/schemas/RelationType"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 300
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "provenance": {
+            "type": "string",
+            "enum": [
+              "user",
+              "ai",
+              "import"
+            ],
+            "title": "Provenance",
+            "default": "user"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "target",
+          "type"
+        ],
+        "title": "Relation",
+        "description": "跨节点的关系线。来源与目标是节点 id，必须都在树里。"
+      },
+      "RelationType": {
+        "type": "string",
+        "enum": [
+          "cause",
+          "ref",
+          "conflict",
+          "depends"
+        ],
+        "title": "RelationType"
+      },
+      "RunBudget": {
+        "properties": {
+          "max_model_calls": {
+            "type": "integer",
+            "maximum": 120.0,
+            "minimum": 1.0,
+            "title": "Max Model Calls",
+            "default": 80
+          },
+          "max_tool_calls": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Max Tool Calls",
+            "default": 8
+          },
+          "max_seconds": {
+            "type": "number",
+            "maximum": 3600.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Max Seconds",
+            "default": 600.0
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "maximum": 131072.0,
+            "minimum": 1024.0,
+            "title": "Max Output Tokens",
+            "default": 65536
+          },
+          "max_repairs": {
+            "type": "integer",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Max Repairs",
+            "default": 1
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "RunBudget",
+        "description": "一次 run 的资源上限。\n\n`max_model_calls` 数的是**真实调用次数**，不是外层轮数：循环里每一轮 provider\n调用、以及工具内部的每一次 `chat_async` 调用都算一次，共用 `RunContext` 上\n同一个账本。默认值按最贵的一条路（六支分片）算，算式见字段注释：\n「查 → 建 → 改 → 修」这种多轮对话只用其中几次，多出来的余量不会被无故花掉。\n\n`max_output_tokens` 同时约束两条出口：provider 那一轮，以及工具内部每一次\n`chat_async`——参数由 `tools._max_tokens()` 夹到 provider 认的上限再发出去。\n只约束前者时，工具内这条出口等于没有边界。\n\n`max_repairs` 约束的是**工具执行失败次数**（`ToolResult.ok == False` 的次数），\n与模型调用次数无关：一次成功的模型响应里发三个工具、其中两个失败，只消耗\n这里两次。全轮共享而不是按轮重置——按轮重置等于给模型无限次重试，\n每次重试都照样计费。"
+      },
+      "SaveRequest": {
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Input"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "title": "SaveRequest"
+      },
+      "SearchRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Query"
+          },
+          "top_k": {
+            "type": "integer",
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Top K",
+            "default": 5
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "SearchRequest"
+      },
+      "SearchResponse": {
+        "properties": {
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeHit"
+            },
+            "type": "array",
+            "title": "Hits"
+          },
+          "implemented": {
+            "type": "boolean",
+            "title": "Implemented",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "SearchResponse"
+      },
+      "Source": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SourceKind"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "span": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSpan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "parsed",
+              "failed"
+            ],
+            "title": "Status",
+            "default": "pending"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "parsed_pages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parsed Pages"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated",
+            "default": false
+          },
+          "failed_pages": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Failed Pages"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "sentences": {
+            "items": {
+              "$ref": "#/components/schemas/AudioSentence"
+            },
+            "type": "array",
+            "title": "Sentences"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "Source"
+      },
+      "SourceKind": {
+        "type": "string",
+        "enum": [
+          "text",
+          "markdown",
+          "document",
+          "image",
+          "audio"
+        ],
+        "title": "SourceKind"
+      },
+      "SourceRef": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source Id"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page"
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start"
+          },
+          "end": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End"
+          },
+          "quote": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 300
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quote"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_id"
+        ],
+        "title": "SourceRef",
+        "description": "节点引用。字符区间以原始 Source.text 为准，使用从零开始的 [start, end)。\n\n第一层只校验字段；来源关联和原文匹配分别由导图契约与服务层校验。"
+      },
+      "SourceSpan": {
+        "properties": {
+          "page": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page"
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start"
+          },
+          "end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SourceSpan",
+        "description": "来源定位，用于节点溯源。"
+      },
+      "SourceUsage": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SourceKind"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "char_count": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Char Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_id",
+          "kind",
+          "char_count"
+        ],
+        "title": "SourceUsage",
+        "description": "整张导图使用过的来源摘要；不代表具体节点已建立证据链接。"
+      },
+      "StageTraceOut": {
+        "properties": {
+          "stage": {
+            "type": "string",
+            "title": "Stage"
+          },
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "stage",
+          "ok"
+        ],
+        "title": "StageTraceOut"
+      },
+      "SuggestResponse": {
+        "properties": {
+          "suggestions": {
+            "items": {
+              "$ref": "#/components/schemas/Suggestion"
+            },
+            "type": "array",
+            "title": "Suggestions"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array",
+            "title": "Diagnostics"
+          }
+        },
+        "type": "object",
+        "title": "SuggestResponse"
+      },
+      "Suggestion": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SuggestionKind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind",
+          "message"
+        ],
+        "title": "Suggestion"
+      },
+      "SuggestionKind": {
+        "type": "string",
+        "enum": [
+          "dedupe",
+          "merge",
+          "link",
+          "fill",
+          "drop"
+        ],
+        "title": "SuggestionKind"
+      },
+      "Theme": {
+        "properties": {
+          "preset": {
+            "type": "string",
+            "enum": [
+              "default",
+              "slate",
+              "forest",
+              "sunset",
+              "mono"
+            ],
+            "title": "Preset",
+            "default": "default"
+          },
+          "accent": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^#[0-9a-fA-F]{6}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accent"
+          },
+          "font": {
+            "type": "string",
+            "enum": [
+              "system",
+              "serif",
+              "mono"
+            ],
+            "title": "Font",
+            "default": "system"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "right",
+              "left",
+              "both"
+            ],
+            "title": "Direction",
+            "default": "right"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "Theme"
+      },
+      "UpdateRequest": {
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Input"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content",
+          "version"
+        ],
+        "title": "UpdateRequest"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}
