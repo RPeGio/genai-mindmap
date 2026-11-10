@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
-from app.contracts.mindmap import MapRecord, MindMapContent
+from app.contracts.mindmap import MapRecord, MindMapContent, migrate_content
 
 
 def db_path() -> Path:
@@ -28,8 +28,12 @@ def connect() -> sqlite3.Connection:
 
 
 def _record(row: sqlite3.Row) -> MapRecord:
+    # 库里可能还躺着没有 schema_version 的 v1 记录；补默认值这一步放在读取处，
+    # 而不是写一个一次性迁移脚本——数据量小、只有一个写入方，读时补齐足够，
+    # 而且永远不会有"忘了跑脚本"的窗口。
     return MapRecord(id=row["id"], version=row["version"],
-                     content=json.loads(row["content"]), updated_at=row["updated_at"])
+                     content=migrate_content(json.loads(row["content"])),
+                     updated_at=row["updated_at"])
 
 
 def list_maps() -> list[MapRecord]:

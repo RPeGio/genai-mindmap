@@ -8,14 +8,18 @@
 
 **尚未封装**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check`、`POST /api/optimization/suggest`、`POST /api/knowledge/search`、`POST /api/agent/tasks`。其中前两个是小事，中间两个是"结构诊断还没进界面"，后两个仍是桩。
 
-## 导图格式 v1（当前）与 v2（候选）
+## 导图格式 v2（当前；v1 请求体仍然接受）
 
 ```json
 {
+  "schema_version": 2,
   "title": "人工智能",
+  "layout": "tree",
+  "theme": {"preset": "default", "font": "system", "direction": "right"},
   "root": {
     "id": "root",
     "label": "人工智能",
+    "note": "可选的正文，画布上只显示短标题",
     "children": [
       {"id": "node-1", "label": "机器学习", "children": []}
     ]
@@ -36,7 +40,9 @@
 
 整棵树 ID 唯一，最多 1000 节点、8 层、每个节点最多 50 个子节点，每节点最多 20 条引用。标题和节点文字长度不超过 200。
 
-**v2 候选**在 v1 之上新增 `schema_version`、`layout`、`theme`、`relations[]` 以及节点的 `note`/`collapsed`/`style`/`pos`，详见 [CONTRACT_V2](CONTRACT_V2.md)。**后端尚未实现 v2**（`extra="forbid"`，提前发送 v2 字段会 422），前端当前按 v1 对接。
+**v2 已落地**（2026-11-10，`backend/app/contracts/mindmap.py`）：在 v1 之上新增 `schema_version`、`layout`（`tree` / `vertical` / `logic` / `timeline` / `fishbone` / `manual`）、`theme`（预设、强调色、字体、`direction`）、`relations[]`，以及节点的 `note` / `collapsed` / `style` / `pos`。字段定义与校验规则见 [CONTRACT_V2](CONTRACT_V2.md)。
+
+兼容策略是"**读时补默认值**"：没有 `schema_version` 的 v1 请求体与库里的 v1 记录都直接可用（缺的字段填默认值），保存后写成 v2；不需要跑迁移脚本，也不需要停机。反过来不成立——把 v2 字段发给旧版后端仍会 422（`extra="forbid"`），所以升级顺序必须是后端先上、前端后上。
 
 `source_usage` 是可选的**整张导图来源摘要**：多来源流水线根据实际输入填写，保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。直接文本生成时该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
 

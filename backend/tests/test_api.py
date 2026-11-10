@@ -74,6 +74,30 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(conflict["message"], "导图已被修改，请重新打开后再保存")
         self.assertEqual(self.call("/mindmaps/" + map_id)[1]["content"]["root"]["label"], "已编辑")
 
+    def test_v2_payload_round_trips(self):
+        """v2 的正文、布局、主题要能原样存取——前端保存的就是这些字段。"""
+        payload = {"content": {
+            "schema_version": 2, "title": "契约 v2", "layout": "vertical",
+            "theme": {"preset": "forest", "direction": "left"},
+            "root": {"id": "root", "label": "根", "note": "这是正文",
+                     "children": [{"id": "a", "label": "子", "note": None, "children": []}]},
+        }}
+        status, created = self.call("/mindmaps", "POST", payload)
+        self.assertEqual(status, 201)
+        self.assertEqual(created["content"]["schema_version"], 2)
+        self.assertEqual(created["content"]["root"]["note"], "这是正文")
+        self.assertEqual(created["content"]["theme"]["preset"], "forest")
+        status, loaded = self.call("/mindmaps/" + created["id"])
+        self.assertEqual((status, loaded["content"]), (200, created["content"]))
+
+    def test_v1_payload_still_accepted(self):
+        """旧前端发来的请求没有 schema_version，读出来应当已是 v2 形状。"""
+        v1 = {"content": {"title": "旧客户端", "root": {"id": "root", "label": "根", "children": []}}}
+        status, created = self.call("/mindmaps", "POST", v1)
+        self.assertEqual(status, 201)
+        self.assertEqual(created["content"]["schema_version"], 2)
+        self.assertEqual(created["content"]["layout"], "tree")
+
     def test_validation_and_not_found(self):
         self.assertEqual(self.call("/generations", "POST", {"text": "   "})[0], 422)
         bad = {"title": "重复", "root": {"id": "x", "label": "根", "children": [

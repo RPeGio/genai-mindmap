@@ -118,5 +118,42 @@ class NewlineTest(unittest.TestCase):
         ET.fromstring(to_opml(content))                 # 换行不该破坏 XML
 
 
+class NoteTextTest(unittest.TestCase):
+    """v2 之后节点有两个文字字段：`label` 是短标题，`note` 是正文。
+
+    导出是给别人看的，只拿标题会得到一份没有解释的骨架，所以正文优先。
+    """
+
+    def build_with_note(self):
+        return MindMapContent.model_validate({
+            "title": "机器学习",
+            "root": {"id": "root", "label": "机器学习", "note": "研究如何让计算机从数据里学规律。",
+                     "children": [
+                         {"id": "a", "label": "监督学习", "note": "给的是带标签的数据。"},
+                         {"id": "b", "label": "无监督学习"},
+                     ]},
+        })
+
+    def test_note_wins_over_label_in_all_formats(self):
+        content = self.build_with_note()
+        self.assertIn("* 研究如何让计算机从数据里学规律。", to_puml(content))
+        self.assertIn("- 研究如何让计算机从数据里学规律。", to_markdown(content))
+        root = ET.fromstring(to_opml(content))
+        self.assertEqual(root.find("./body/outline").get("text"), "研究如何让计算机从数据里学规律。")
+        self.assertIn("给的是带标签的数据。", to_markdown(content))
+
+    def test_label_is_used_when_note_is_missing(self):
+        content = self.build_with_note()
+        self.assertIn("- 无监督学习", to_markdown(content))
+        self.assertNotIn("无监督学习 给的是", to_markdown(content))
+
+    def test_multiline_note_stays_on_one_line(self):
+        content = MindMapContent.model_validate({
+            "title": "t", "root": {"id": "r", "label": "标题", "note": "第一行\n第二行", "children": []},
+        })
+        self.assertIn("- 第一行 第二行", to_markdown(content))
+        ET.fromstring(to_opml(content))
+
+
 if __name__ == "__main__":
     unittest.main()

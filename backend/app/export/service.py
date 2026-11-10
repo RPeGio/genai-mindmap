@@ -23,6 +23,15 @@ def _depth_marks(depth: int) -> str:
     return "*" * max(1, depth)
 
 
+def _node_text(node: Node) -> str:
+    """节点导出文字：正文优先。
+
+    `label` 是画布上的短标题（≤200 字），`note` 才是生成的完整表述。只导出
+    `label` 的话，别人拿到的是一份只有骨架、没有解释的大纲。
+    """
+    return node.note if node.note else node.label
+
+
 def _one_line(text: str) -> str:
     """压成单行。导出格式里换行会破坏缩进与 XML 结构。"""
     return " ".join(text.split())
@@ -45,11 +54,11 @@ def _escape_markdown(text: str) -> str:
 def to_puml(content: MindMapContent) -> str:
     """把导图转成 PlantUML mindmap 语法。"""
     lines: list[str] = ["@startmindmap"]
-    lines.append(f"* {_sanitize(content.root.label)}")
+    lines.append(f"* {_sanitize(_node_text(content.root))}")
 
     def walk(node: Node, depth: int) -> None:
         for child in node.children:
-            lines.append(f"{_depth_marks(depth)} {_sanitize(child.label)}")
+            lines.append(f"{_depth_marks(depth)} {_sanitize(_node_text(child))}")
             walk(child, depth + 1)
 
     # 根节点已输出，子节点从第 2 层开始
@@ -65,11 +74,11 @@ def to_markdown(content: MindMapContent) -> str:
     （生成器允许不同），根节点的文字会在导出结果里消失。
     """
     lines: list[str] = [f"# {_escape_markdown(content.title)}", ""]
-    lines.append(f"- {_escape_markdown(content.root.label)}")
+    lines.append(f"- {_escape_markdown(_node_text(content.root))}")
 
     def walk(node: Node, depth: int) -> None:
         for child in node.children:
-            lines.append(f"{'  ' * depth}- {_escape_markdown(child.label)}")
+            lines.append(f"{'  ' * depth}- {_escape_markdown(_node_text(child))}")
             walk(child, depth + 1)
 
     walk(content.root, 1)
@@ -85,7 +94,7 @@ def to_opml(content: MindMapContent) -> str:
 
     def outline(node: Node, depth: int) -> list[str]:
         pad = "  " * depth
-        parts = [f"{pad}<outline text={quoteattr(_one_line(node.label))}>"]
+        parts = [f"{pad}<outline text={quoteattr(_one_line(_node_text(node)))}>"]
         for child in node.children:
             parts.extend(outline(child, depth + 1))
         parts.append(f"{pad}</outline>")

@@ -82,8 +82,8 @@ free -h
 > R1：Vue 3 + TS + Vite + Tailwind 骨架、`src/api/client.ts`（`generateMindMapStream` 流式封装与 SSE 解析）、`src/api/types.ts`。
 > R2：`@vue-flow/core` 画布（`src/canvas/MindMapCanvas.vue`、`src/canvas/MindNode.vue`）、自研紧凑树布局（`src/canvas/layout/tidy.ts`，支持向右 / 向左 / 向下 / 双向）、Pinia store（`src/stores/mindmap.ts`）、三栏界面（输入 / 画布 / 节点详情）、截断文字的悬停卡片与详情面板。
 > R3：`src/mindmap/edits.ts`（改名 / 加子节点 / 加兄弟 / 删子树 / 提交前校验）、双击内联编辑、Tab/Enter/Delete 建树、撤销重做（整树快照 50 步）、保存（首次 POST、之后 PUT 带 `version`，409 三选弹层）、打开列表与新建、Ctrl+S 与 `beforeunload` 保护。
-> 239 个 vitest 用例（16 个文件：纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 真实画布挂载 / agent）；`npm test` 与 `npm run build` 均通过。
-> **R3 未做**：拖拽调结构（W3）、自动保存、v2 的 layout/theme。导出与 Agent 面板由陈嘉涛在 2026-11-05、2026-11-06 补齐（不在 R3 范围内）。
+> 352 个 vitest 用例（21 个文件：纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / 真实画布挂载 / agent）；`npm test` 与 `npm run build` 均通过。
+> **R3 未做**：拖拽调结构（W3）、自动保存、v2 的 layout/theme 前端接线（2026-11-10 起 v2 已在后端落地，前端待接）。导出与 Agent 面板由陈嘉涛在 2026-11-05、2026-11-06 补齐（不在 R3 范围内）。
 > 依赖已装 `pinia`、`@vue-flow/core`、`@vue-flow/background`；未装 `@vue-flow/controls`、minimap、dagre。
 
 ```powershell

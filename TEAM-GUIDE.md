@@ -68,9 +68,9 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-06）：后端 309 个测试（pytest）、前端 239 个 vitest 用例（16 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-10）：后端 515 个测试（pytest）、前端 352 个 vitest 用例（21 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
-本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
+本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
 开发服务器左上角有一排「布局示例」按钮（单节点 / 向右 / 向左 / 向下 / 双向）：点一下就能不经过后端装载一份示例导图，用来肉眼检查布局与文本截断。数据在 `frontend/src/dev/samples.ts`，只在 `npm run dev` 下按需加载，生产构建里不进包。
 
@@ -97,7 +97,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               309 个测试
+  tests/               515 个测试
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -116,14 +116,14 @@ frontend/
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
     stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               239 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / agent）
+  tests/               352 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
   ARCHITECTURE.md      模块边界、技术选型及来源
   ARCHITECTURE_ADDENDUM.md  存储迁移、SSE 协议、流水线细节
   PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q36）
-  CONTRACT_V2.md       目标契约（尚未落地，后端仍是 v1）
+  CONTRACT_V2.md       契约 v2（后端 2026-11-10 已落地；前端类型仍手写 v1 镜像）
   HANDOFF.md           需要对方知悉或确认的跨人决策（待确认 / 已确认）
   W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
