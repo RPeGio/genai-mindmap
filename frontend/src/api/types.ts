@@ -153,12 +153,6 @@ export interface MindRelation {
   provenance?: 'user' | 'ai' | 'import';
 }
 
-/** 同步生成接口的响应：mode 说明内容来自演示规则还是模型。 */
-export interface GenerateResponse {
-  mode: 'demo' | 'model';
-  content: MindMapContent;
-}
-
 /** 已保存的导图记录。`version` 是乐观锁的版本号，保存时要原样带回去。 */
 export interface MapRecord {
   id: string;
@@ -234,14 +228,6 @@ export interface CreateTextSourceResponse {
   source: Source;
 }
 
-/** 生成流水线的响应。stages / diagnostics 目前只用于排障，界面不渲染。 */
-export interface PipelineResponse {
-  mode: 'demo' | 'model';
-  content: MindMapContent;
-  diagnostics: unknown[];
-  stages: unknown[];
-}
-
 // ---- agent 运行 ----
 
 /**
@@ -275,9 +261,8 @@ export interface AgentRunRequest {
 /**
  * agent 事件流。`seq` 从 1 连续递增，前端靠它判断丢帧与乱序。
  *
- * 与旧流式生成的 `StreamEvent` 分开：后者是「边生成边吐节点」，这里是
- * 「边跑边报工具进度」，两者的状态机完全不同，硬塞进一个联合类型会让
- * store 里的 switch 变成一团。
+ * 生成只剩这一条通道，所以这就是唯一的帧形状；状态机完整地待在 store 的
+ * `runGeneration` 里，一个 switch 能从头读到尾。
  */
 export type AgentEvent =
   | { type: 'stage'; seq: number; stage: string; detail?: string }
@@ -309,5 +294,17 @@ export type AgentEvent =
       expandable: boolean | null;
     }
   | { type: 'snapshot'; seq: number; content: MindMapContent }
-  | { type: 'done'; seq: number; content?: MindMapContent | null; usage?: Record<string, unknown> }
+  | {
+      type: 'done';
+      seq: number;
+      content?: MindMapContent | null;
+      usage?: Record<string, unknown>;
+      /**
+       * 这棵树是演示规则拼出来的还是模型产出的。
+       *
+       * 后端按 `exclude_none=True` 编码，正常帧一定带值；字段缺失只说明对方
+       * 是没填 mode 的旧版本——那是"没说"，不是"模型"。
+       */
+      mode?: 'demo' | 'model' | null;
+    }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };

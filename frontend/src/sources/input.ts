@@ -1,6 +1,6 @@
 import type { Source, SourceKind } from '../api/types';
 
-// 与 ingestion/router.py、pipeline/router.py 和 pipeline/service.py 保持一致。
+// 与 ingestion/router.py 以及 agent 侧的来源上限保持一致。
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 export const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 export const MAX_SOURCES = 50;

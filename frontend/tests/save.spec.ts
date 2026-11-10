@@ -28,14 +28,14 @@ interface Call {
 
 let calls: Call[] = [];
 
-/** 构造一个立刻给出 done 帧再 [DONE] 的 SSE 响应，用来跑通流式生成。 */
+/** 构造一个立刻给出 done 帧再 [DONE] 的 SSE 响应，用来跑通一次 agent 运行。 */
 function streamWithDone(content: MindMapContent): Response {
   const encoder = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       const frame = (payload: unknown) =>
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
-      frame({ type: 'done', mode: 'model', content, latencyMs: 100, degraded: false, reason: '' });
+      frame({ type: 'done', seq: 1, content, mode: 'model' });
       controller.enqueue(encoder.encode('data: [DONE]\n\n'));
       controller.close();
     },
@@ -459,7 +459,7 @@ describe('保存', () => {
   });
 
   it('保存期间重新生成：旧响应不会把身份套到生成出的新图上', async () => {
-    // 文本生成同样会换掉整张图，会话必须跟着切。否则 A 的保存响应回来时
+    // agent 接受候选同样会换掉整张图，会话必须跟着切。否则 A 的保存响应回来时
     // 会话号没变，mapId 会被写回 A，之后保存新图就 PUT 到 A 的记录上。
     const store = useMindMapStore();
     store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
@@ -468,7 +468,7 @@ describe('保存', () => {
     let releaseSave: (() => void) | null = null;
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);
-      if (url.includes('/generations/stream')) {
+      if (url.includes('/agent/runs/stream')) {
         return streamWithDone({
           title: '新生成的图',
           root: { id: 'nr', label: '新根', children: [] },
@@ -483,8 +483,9 @@ describe('保存', () => {
     const saving = store.save();
     await vi.waitFor(() => expect(releaseSave).not.toBeNull());
 
-    // 保存还没回来，用户重新生成了一张新图
-    await store.generate('新主题');
+    // 保存还没回来，用户重新生成并接受了候选
+    await store.runGeneration('新主题', 'create');
+    expect(store.acceptCandidate()).toBe('applied');
 
     releaseSave!();
     await saving;

@@ -2,12 +2,11 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, generateFromSources, generateMindMapStream, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
+import { ApiError, createMindMap, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, OpBatch, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
-import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -361,6 +360,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const agentError = ref('');
 
   /**
+   * 这一轮 agent 产出的树是演示还是模型给的，取自 `done` 帧的 `mode`。
+   *
+   * `null` 表示"没说"（旧后端省略了这个字段），接受时退回 `'model'`——那是
+   * 这条通道一直以来的行为，不能因为多了个字段就让老后端的结果显示成未知。
+   * 而一旦帧里明确写了 `demo`，界面就必须说明白：占位树不能顶着"模型生成"。
+   */
+  const agentMode = ref<'demo' | 'model' | null>(null);
+
+  /**
    * 本轮运行里"结果不完整"的证据：部分完成标记 + 每条诊断。
    *
    * 面板在候选上方按琥珀色列出，`status` 也会因此改成「部分分支未完成」。
@@ -585,14 +593,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const listBusy = ref(false);
 
   let controller: AbortController | null = null;
-
-  /**
-   * 当前这轮流式生成的"回滚到生成前"函数。
-   *
-   * 用户主动点取消时要用它把旧图还回来；而换图（loadMap / newMap / preview）
-   * 引起的失效则不能回滚——那时画布上已经是要展示的新内容了。
-   */
-  let pendingRestore: (() => void) | null = null;
 
   /**
    * 画布该画哪棵树。
@@ -1143,9 +1143,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 失败时保留 dirty —— 一次网络抖动不能让用户以为已经存上了。
    */
   async function save(): Promise<SaveResult> {
-    // 生成中途保存必然出脏数据：`content` 可能是增量拼出来的半棵树、`dirty`
-    // 还是 false、`mapId` 还可能是 null，POST 出去就是一条半截记录，`done`
-    // 到达后再保存又多出第二条。挡在这里，而不是留给后端去猜哪条该丢。
+    // 生成中途保存必然出脏数据：`dirty` 还是 false、`mapId` 还可能是 null，
+    // POST 出去就是一条半截记录，`done` 到达后再保存又多出第二条。挡在这里，
+    // 而不是留给后端去猜哪条该丢。
     if (busy.value || agentRunning.value) {
       status.value = '正在生成导图，完成之后才能保存。';
       return 'busy';
@@ -1291,37 +1291,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 把增量节点合并进当前树。
-   * 同一个 id 会反复到达（文字逐渐变长），所以已存在时更新文字、保留其子节点。
-   */
-  function upsert(node: MindNode, parentId: string, incoming: MindNode): MindNode {
-    if (node.id === parentId) {
-      const index = node.children.findIndex(child => child.id === incoming.id);
-      const children =
-        index >= 0
-          ? node.children.map((child, i) =>
-              i === index ? { ...incoming, children: child.children } : child,
-            )
-          : [...node.children, incoming];
-      return { ...node, children };
-    }
-    return { ...node, children: node.children.map(child => upsert(child, parentId, incoming)) };
-  }
-
-  function applyNode(parentId: string | null, incoming: MindNode) {
-    if (!content.value) {
-      content.value = { title: incoming.label, root: incoming };
-      return;
-    }
-    const root = content.value.root;
-    if (parentId === null) {
-      content.value = { ...content.value, root: { ...incoming, children: root.children } };
-    } else {
-      content.value = { ...content.value, root: upsert(root, parentId, incoming) };
-    }
-  }
-
-  /**
    * 选中一个节点。
    *
    * 只接受 `content` 里真实存在的节点。预览的派生 id 和候选的 id 都还没进画布：
@@ -1367,7 +1336,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 会因为会话号没变而把它的 id 写进 mapId——画布上是新图、身份却是旧图，
     // 下次保存就把新内容 PUT 到旧记录上。
     mapSession += 1;
-    // 换图即作废旧候选（preview 也被「多来源生成」复用，它同样会换掉整棵树）。
+    // 换图即作废旧候选（preview 同样会换掉整棵树）。
     candidate.value = null;
     resetCandidateOps();
     titleDraft.value = null;
@@ -1390,13 +1359,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 掐掉在途的流式生成。
+   * 掐掉在途的 agent 运行。
    *
-   * `restorePrevious` 为真表示这是用户主动取消，应该把生成前的导图还回来；
-   * 换图场景（loadMap / newMap / preview）传 false —— 那时画布上已经是要
-   * 展示的新内容，再回滚旧图反而是错的。
+   * 取消只是停止这一轮：画布上的 `content` 从来没被这一轮碰过（候选落地要用户
+   * 点「应用」），所以不需要回滚，清掉属于这一轮的中间态就够了。
+   * 换图场景（loadMap / newMap / preview）也走它，把旧流掐死。
    */
-  function cancel(restorePrevious = false) {
+  function cancel() {
     const active = controller;
     controller = null;
     active?.abort();
@@ -1407,239 +1376,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 取消/换图同理：长到一半的预览属于已经结束的那一次运行。
     clearAgentPreview();
     stageText.value = '';
-    sourceGenerationError.value = '';
-    if (restorePrevious && pendingRestore) {
-      pendingRestore();
-    }
-    pendingRestore = null;
     status.value = '已取消。';
   }
 
-  async function generate(text: string): Promise<void> {
-    const prompt = text.trim();
-    if (!prompt) {
-      status.value = '请输入主题或文本。';
-      return;
-    }
-    if (busy.value || sourceGenerating.value) return;
-    sourceGenerationError.value = '';
-    // 朝向是 content 的派生值，而生成会先把 content 清空；先记下来，
-    // 生成结果回来时按用户当时选的朝向装回去。
-    const directionAtStart = direction.value;
-
-    // 先把上一份结果存起来：新请求失败时恢复它，而不是让用户白等一场还丢了旧图。
-    const previous = content.value;
-    const previousMode = mode.value;
-    const previousSave = {
-      mapId: mapId.value,
-      version: version.value,
-      savedAt: savedAt.value,
-      dirty: dirty.value,
-    };
-
-    busy.value = true;
-    waitedMs.value = 0;
-    stageText.value = '正在连接';
-    content.value = null;
-    mode.value = null;
-    selectedId.value = null;
-    editingId.value = null;
-    viewAdjusted.value = false;
-    // 生成出来的是新导图，还没存过；上一份已保存的导图不能因此被覆盖。
-    // 会话也要跟着换：上一份图在途的保存响应回来时不能把它的 id 写进 mapId，
-    // 否则画布上是新图、身份是旧图，下次保存就把新内容 PUT 到旧记录上。
-    mapSession += 1;
-    titleDraft.value = null;
-    mapId.value = null;
-    version.value = 0;
-    savedAt.value = null;
-    saving.value = false;
-    dirty.value = false;
-    resetHistory();
-
-    const ctrl = new AbortController();
-    controller = ctrl;
-    // settled 表示这次请求已经有了明确结局（成功或明确失败）；
-    // 只有「既没 done 也没 error」才说明连接是被掐断的。
-    let settled = false;
-
-    const restore = () => {
-      content.value = previous;
-      mode.value = previousMode;
-      mapId.value = previousSave.mapId;
-      version.value = previousSave.version;
-      savedAt.value = previousSave.savedAt;
-      dirty.value = previousSave.dirty;
-    };
-    // 注册给 cancel()：用户点取消时由它负责回滚，因为那时 controller 已经被
-    // 清空，收尾分支认不出这次中断属于"主动取消"还是"换图"。
-    pendingRestore = restore;
-
-    try {
-      await generateMindMapStream(
-        prompt,
-        event => {
-          switch (event.type) {
-            case 'stage':
-              stageText.value = event.detail;
-              break;
-            case 'skeleton':
-              // 只有 demo 模式会发这个事件：它一次性给出整棵树，不走增量推送。
-              // 后端给的 content 带默认朝向，按用户当前选的还回去。
-              content.value = withDirection(event.content, directionAtStart);
-              break;
-            case 'node':
-              // 增量方案：节点一个个长出来，同一 id 的文字会越补越全。
-              applyNode(event.parentId, event.node as MindNode);
-              stageText.value = '节点生成中';
-              status.value = '正在生成，节点会陆续出现…';
-              break;
-            case 'heartbeat':
-              waitedMs.value = Math.round(event.waitedMs / 1000);
-              break;
-            case 'done':
-              settled = true;
-              content.value = withDirection(event.content, directionAtStart);
-              mode.value = event.mode;
-              // 生成结果还没存过，标脏：离开页面前会提醒，保存时走"创建"。
-              dirty.value = true;
-              status.value =
-                event.mode === 'demo'
-                  ? '这是固定结构的演示数据，不是 AI 生成。'
-                  : `模型已生成候选导图，用时 ${(event.latencyMs / 1000).toFixed(1)} 秒，可直接编辑，记得保存。`;
-              stageText.value = '';
-              break;
-            case 'error':
-              settled = true;
-              // 后端在流里报错时，之前那份导图同样要还回来，不能只留一个空画布。
-              restore();
-              status.value = event.message;
-              stageText.value = '';
-              break;
-          }
-        },
-        ctrl.signal,
-      );
-
-      // 已经被后来的请求接管：这个旧请求无论成功、失败还是被取消，
-      // 都不许再改画面和状态，否则新请求的预览会被旧导图替换。
-      // 只要当前 controller 不是自己（被新请求接管，或被 cancel() 
-      // 清成了 null），这个旧请求就无权再改画面。旧写法要求 controller 非空，
-      // 于是「生成中点新建」时 controller 被清成 null，restore() 照样执行，
-      // 新建出来的空白画布又被旧图盖了回去。
-      if (controller !== ctrl) return;
-      if (ctrl.signal.aborted) {
-        restore();
-        status.value = '已取消。';
-      } else if (!settled) {
-        // 流正常结束但没有 done 帧：中途断了，不能假装成功。
-        restore();
-        status.value = '连接中断，结果可能不完整，请重试。';
-      }
-    } catch (error) {
-      if (controller !== ctrl) return;
-      restore();
-      status.value = ctrl.signal.aborted
-        ? '已取消。'
-        : error instanceof ApiError
-          ? error.message
-          : '生成失败，请重试。';
-      stageText.value = '';
-    } finally {
-      // 取消后立刻重新生成时，旧请求的收尾不能把新请求的状态清掉。
-      if (controller === ctrl) {
-        busy.value = false;
-        controller = null;
-      }
-      // 本轮已经收尾，回滚注册作废，免得下一次 cancel() 拿到过期的闭包。
-      if (pendingRestore === restore) pendingRestore = null;
-    }
-  }
-
-  // ---- 多来源统一生成；收集与解析在 sources store 中完成 ----
-
-  const sourceGenerating = ref(false);
-  const sourceGenerationError = ref('');
-  let sourceController: AbortController | null = null;
-
-  function cancelSourceGeneration() {
-    sourceController?.abort();
-    sourceController = null;
-    sourceGenerating.value = false;
-    sourceGenerationError.value = '';
-    status.value = '已取消生成，来源和当前导图已保留。';
-  }
-
-  async function generateSources(
-    sources: Source[],
-    options?: { confirmReplace?: (reason: 'edited' | 'switched') => boolean },
-  ): Promise<void> {
-    if (sourceGenerating.value || busy.value) return;
-    sourceGenerationError.value = sourceInputError(sources);
-    if (sourceGenerationError.value) {
-      status.value = sourceGenerationError.value;
-      return;
-    }
-
-    const sessionAtStart = mapSession;
-    const contentAtStart = content.value;
-    const ctrl = new AbortController();
-    sourceController = ctrl;
-    sourceGenerating.value = true;
-    status.value = `正在合并 ${sources.length} 个来源生成导图…`;
-
-    try {
-      const result = await generateFromSources(sources, ctrl.signal);
-      if (sourceController !== ctrl) return;
-
-      // 生成期间仍可编辑旧图；包括还没有提交的节点或标题草稿。
-      const switched = sessionAtStart !== mapSession;
-      const edited = content.value !== contentAtStart
-        || editingId.value !== null
-        || titleDraft.value !== null;
-      if ((switched || edited) && !options?.confirmReplace?.(switched ? 'switched' : 'edited')) {
-        sourceGenerationError.value = switched
-          ? '生成结果已就绪，但期间已切换到别的导图，已保留当前内容。'
-          : '生成结果已就绪，但期间你修改过当前导图，已保留你的修改。';
-        status.value = sourceGenerationError.value;
-        return;
-      }
-
-      preview(result.content, direction.value);
-      mode.value = result.mode;
-      dirty.value = true;
-      status.value = result.mode === 'demo'
-        ? `已合并 ${sources.length} 个来源生成演示导图（固定结构，非 AI 生成），记得保存。`
-        : `已合并 ${sources.length} 个来源生成导图，可直接编辑，记得保存。`;
-    } catch (error) {
-      if (sourceController !== ctrl) return;
-      sourceGenerationError.value = error instanceof ApiError ? error.message : '生成失败，请重试。';
-      status.value = sourceGenerationError.value;
-    } finally {
-      // 取消之后马上重试时，迟到的旧响应不能清掉新一轮状态。
-      if (sourceController === ctrl) {
-        sourceController = null;
-        sourceGenerating.value = false;
-      }
-    }
-  }
-
   // ---- agent 运行与候选接受 ----
-
-  /**
-   * 是否走 agent 路径。
-   *
-   * 默认开启：agent 是目标形态，旧的流式 / 批量两条通道留着只是对照基线，
-   * 删它们之前先把默认路径切过来。`VITE_MINDMAP_AGENT=0` 仍能退回旧行为——
-   * 回滚靠一个环境变量，不靠回滚代码。
-   *
-   * 每次调用都重新读，不在建 store 时算成一个常量：测试里 `vi.stubEnv` 到
-   * beforeEach / 用例内部才生效，模块级常量读得太早，读到的是构建时的值；
-   * 运行时切换开关也不该要求重建 store。
-   */
-  function agentEnabled(): boolean {
-    return String(import.meta.env?.VITE_MINDMAP_AGENT ?? '1') !== '0';
-  }
 
   /**
    * 把一批 op 应用到候选上，返回是否应用成功。
@@ -1701,6 +1441,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentEvents.value = [];
     // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。
     agentWarnings.value = [];
+    // 同理，上一轮是演示还是模型，跟这一轮没关系；不清就会把上一轮的 demo
+    // 标记挂到这一轮的候选上。
+    agentMode.value = null;
     candidate.value = null;
     // 新一轮的 op 从第 0 版重新开始，上一轮的账本留着只会把首批 op 判成乱序。
     resetCandidateOps();
@@ -1792,12 +1535,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
             break;
           case 'done':
             settled = true;
+            // 这棵树的来历只有 done 帧说得准，落在这里等「接受」时再写进 mode。
+            // 后端 `exclude_none=True`，所以正常帧一定带值；缺字段只说明对面是
+            // 没填 mode 的旧版本，记作"没说"，不能替它认成模型产出。
+            agentMode.value = event.mode ?? null;
             // 终态已到，预览再留着只会让人以为还有节点在路上。
             clearAgentPreview();
             if (event.content) {
               // 只放进候选，不动 content：用户确认之前画布保持原样
               candidate.value = event.content;
-              status.value = candidateStatus('模型给出了候选导图');
+              status.value = candidateStatus(
+                agentMode.value === 'demo' ? '演示导图已就绪（不是 AI 生成的）' : '模型给出了候选导图',
+              );
             } else if (!candidate.value) {
               // 已经收到过 snapshot 的候选就留着：这一帧只是没重复带内容。
               status.value = '模型这次没有产出导图。';
@@ -1895,7 +1644,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     candidate.value = null;
     // 候选落地之后账本归零：这份内容已经进了 content，下一轮从第 0 版重来。
     resetCandidateOps();
-    mode.value = 'model';
+    // 来源标记跟着 done 帧走，不再一律写成「模型」：演示模式产出的是一棵占位树，
+    // 给它贴"模型生成"的标签就是让界面替它撒谎。没说（旧后端）才退回 model。
+    mode.value = agentMode.value ?? 'model';
     dirty.value = true;
     clientRevision.value += 1;
     editingId.value = null;
@@ -1903,7 +1654,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 留着它，用户会以为画布上这棵树还有问题等着处理。
     agentWarnings.value = [];
     ensureSelection();
-    status.value = '已应用模型的修改，记得保存。';
+    status.value = mode.value === 'demo'
+      ? '已应用演示导图（固定结构，不是 AI 生成），记得保存。'
+      : '已应用模型的修改，记得保存。';
     return 'applied';
   }
 
@@ -1952,7 +1705,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
     maps,
     listOpen,
     listBusy,
-    generate,
     cancel,
     preview,
     select,
@@ -1979,10 +1731,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
     openList,
     closeList,
     openMap,
-    sourceGenerating,
-    sourceGenerationError,
-    generateSources,
-    cancelSourceGeneration,
     // agent 路径
     clientRevision,
     candidate,
@@ -1992,7 +1740,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentWarnings,
     agentRunning,
     agentError,
-    agentEnabled,
+    agentMode,
     runGeneration,
     acceptCandidate,
     discardCandidate,

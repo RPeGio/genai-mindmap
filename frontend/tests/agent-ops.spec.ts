@@ -1,11 +1,10 @@
 /**
- * agent 增量帧与默认开关的回归测试。
+ * agent 增量帧的回归测试。
  *
- * 三件事在这一步才第一次有了消费者：
+ * 两件事在这一步才第一次有了消费者：
  *   - `ops` 帧：`edit` 意图的改动**只**走它，不接就是"打开旧图 → 让 AI 改 →
  *     界面没反应"；
- *   - `save()` 的生成期早退：生成中途保存会 POST 出一条半截记录；
- *   - `agentEnabled`：默认开启，且必须每次调用时重新读环境变量。
+ *   - `save()` 的生成期早退：生成中途保存会 POST 出一条半截记录。
  */
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -74,7 +73,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  vi.unstubAllEnvs();
 });
 
 describe('ops 帧进候选', () => {
@@ -145,19 +143,5 @@ describe('生成期保存', () => {
 
     gate.finish();
     await running;
-  });
-});
-
-describe('agent 开关', () => {
-  it('默认开启，VITE_MINDMAP_AGENT=0 关闭', () => {
-    const store = useMindMapStore();
-    expect(store.agentEnabled()).toBe(true);
-
-    // 建 store 之后才改环境变量也要生效：读的是调用时的值，不是创建时的快照
-    vi.stubEnv('VITE_MINDMAP_AGENT', '0');
-    expect(store.agentEnabled()).toBe(false);
-
-    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
-    expect(store.agentEnabled()).toBe(true);
   });
 });

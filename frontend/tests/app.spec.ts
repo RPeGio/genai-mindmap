@@ -1,8 +1,9 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia } from 'pinia';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
+import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 
@@ -27,23 +28,19 @@ function streamReply(frames: unknown[], status = 200): Response {
   return { ok: status < 400, status, body, json: async () => ({}) } as unknown as Response;
 }
 
-const done = {
-  type: 'done',
-  mode: 'model',
-  content: {
-    title: '机器学习',
-    root: {
-      id: 'r',
-      label: '机器学习',
-      children: [
-        { id: 'c', label: '监督学习', children: [{ id: 'g', label: '梯度下降', children: [] }] },
-      ],
-    },
+const CONTENT: MindMapContent = {
+  title: '机器学习',
+  root: {
+    id: 'r',
+    label: '机器学习',
+    children: [
+      { id: 'c', label: '监督学习', children: [{ id: 'g', label: '梯度下降', children: [] }] },
+    ],
   },
-  latencyMs: 8600,
-  degraded: false,
-  reason: '',
 };
+
+/** agent 的收尾帧：`mode` 说明这棵树是演示规则拼的还是模型产出的。 */
+const doneFrame = (mode: 'demo' | 'model') => ({ type: 'done', seq: 2, content: CONTENT, mode });
 
 function mountApp() {
   return mount(App, { global: { plugins: [createPinia()] } });
@@ -62,20 +59,8 @@ function buttonByText(wrapper: VueWrapper, text: string) {
   return found;
 }
 
-/**
- * 这个文件测的是旧的同步 / SSE 通道（`/api/generations/stream`）。
- *
- * agent 路径现在是默认，不显式关掉，按钮就会打到 `/api/agent/runs/stream`，
- * 断言的端点与帧语义全对不上。旧通道要一直绿到被删除那一天——它是那次删除的
- * 对照基线，所以这里固定回旧路径，而不是改写用例去适配 agent。
- */
-beforeEach(() => {
-  vi.stubEnv('VITE_MINDMAP_AGENT', '0');
-});
-
 afterEach(() => {
   vi.unstubAllGlobals();
-  vi.unstubAllEnvs();
 });
 
 describe('App', () => {
@@ -87,22 +72,45 @@ describe('App', () => {
     await buttonByText(wrapper, '生成导图').trigger('click');
 
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(wrapper.get('[role="status"]').text()).toContain('请输入主题或文本');
+    // 提示必须点明是哪个框：用户把主题写进「导图标题」再点生成，界面毫无动静。
+    expect(wrapper.get('[role="status"]').text()).toContain('「输入主题或文本」');
   });
 
-  it('生成完成后显示节点数、模式与耗时', async () => {
-    const fetchMock = vi.fn(async () => streamReply([done]));
+  it('点生成把请求打到 agent 路由，候选不自动落画布', async () => {
+    const fetchMock = vi.fn(async () => streamReply([
+      { type: 'stage', seq: 1, stage: '准备' },
+      doneFrame('model'),
+    ]));
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
     await wrapper.get('textarea').setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
 
+    // 生成只剩这一条通道
+    await vi.waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith('/api/agent/runs/stream', expect.anything()));
+    // 候选要用户点「应用」才算数：画布可以先预览它，但 content 必须还是空的
+    await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
+    expect(useMindMapStore().content).toBeNull();
+  });
+
+  it.each([
+    { mode: 'model' as const, badge: '模型生成' },
+    { mode: 'demo' as const, badge: '演示模式（非 AI 生成）' },
+  ])('接受候选后按 done 帧的 $mode 显示来源徽标', async ({ mode, badge }) => {
+    // 演示模式产出的是一棵占位树，界面不能替它贴上"模型生成"。
+    // 来源只有 done 帧说得准，所以整条链路（帧 → 候选 → 接受 → 徽标）一起验。
+    vi.stubGlobal('fetch', vi.fn(async () => streamReply([doneFrame(mode)])));
+    const wrapper = mountApp();
+
+    await wrapper.get('textarea').setValue('机器学习');
+    await buttonByText(wrapper, '生成导图').trigger('click');
+    await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
+    await buttonByText(wrapper, '应用到画布').trigger('click');
+
     await vi.waitFor(() => expect(wrapper.text()).toContain('3 个节点'));
-    // 用的是流式端点
-    expect(fetchMock).toHaveBeenCalledWith('/api/generations/stream', expect.anything());
-    expect(wrapper.text()).toContain('模型生成');
-    expect(wrapper.get('[role="status"]').text()).toContain('8.6 秒');
+    expect(wrapper.text()).toContain(badge);
   });
 
   it('没有选中节点时详情面板给出说明', () => {
@@ -132,7 +140,7 @@ describe('App', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
-        streamReply([{ type: 'error', code: 'generation_failed', message: '模型返回超时' }])),
+        streamReply([{ type: 'error', seq: 1, code: 'generation_failed', message: '模型返回超时' }])),
     );
     const wrapper = mountApp();
 
