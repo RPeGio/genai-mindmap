@@ -68,10 +68,10 @@
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
 | `GET /api/mindmaps/{id}` | 无 | 导图记录 | 不存在 404 |
 | `PUT /api/mindmaps/{id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
-| `POST /api/agent/runs/stream` | `{"goal":"…","intent":"create / expand / edit","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：`{v:2,runId,seq,type}`，`type` ∈ `stage` / `heartbeat` / `tool_start` / `ops` / `tool_end` / `snapshot` / `done` / `error`，产物是**候选** | 目标为空 422；预算用尽或模型失败以 `error` 事件下发 |
+| `POST /api/agent/runs/stream` | `{"goal":"…","intent":"create / expand / edit","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `done` / `error`，产物是**候选** | 目标为空 422；预算用尽或模型失败以 `error` 事件下发 |
 
-**流式接口有两套帧格式。** 生成链路（`/api/generations/stream`）每帧 `data: <json>`，`type` 区分 `stage` / `node` / `heartbeat` / `done` / `error` / `skeleton`；`node` 事件的节点只有 `id`/`label`（不含 children），前端按 id 插入或覆盖；收到 `done` 后前端应用完整 `content` 对齐；`data: [DONE]` 表示流正常结束，不是 JSON。事件定义与生成逻辑见 `backend/app/generation/stream_partial.py`。
-Agent 链路（`/api/agent/runs/stream`）用 v2 信封 `{v:2,runId,seq,baseClientRevision,candidateRevision,type}`，产物是 `ops` 操作批次而不是增量节点；前端把它挂在候选副本上，用户点接受才落到画布。协议见 `docs/AGENT_PLAN.md`。
+**流式接口有两套帧格式。** 生成链路（`/api/generations/stream`）每帧 `data: <json>`，`type` 区分 `stage` / `skeleton` / `node` / `done` / `error`；`node` 事件带 `parentId` 与 `node`，其中的节点恒为 `{"id","label","children":[]}`——`children` 一律发空数组，子树靠后续帧逐个挂上来，前端按 id 插入或覆盖；收到 `done` 后前端应用完整 `content` 对齐；`data: [DONE]` 表示流正常结束，不是 JSON。事件定义与生成逻辑见 `backend/app/generation/stream_partial.py`。
+Agent 链路（`/api/agent/runs/stream`）的信封也只有 `{seq, type, ...}`：`seq` 由服务端补齐，没有 `v` / `runId` / revision 字段（轮次与候选版本在各事件自己的 payload 里）。产物是 `ops` 操作批次而不是增量节点，另有 `node_grow` 只作深层生成的预览帧、收到 `snapshot` 即作废；前端把它挂在候选副本上，用户点接受才落到画布。协议见 `docs/AGENT_STREAM_PROTOCOL.md`，设计背景见 `docs/AGENT_PLAN.md`。
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。流水线目前同步返回，`stages` 是完成后的阶段记录，不是实时进度。
 
