@@ -5,7 +5,6 @@ import type {
   GenerateResponse,
   MapRecord,
   MindMapContent,
-  MindNode,
   PipelineResponse,
   Source,
 } from './types';
@@ -87,66 +86,11 @@ export function getMindMap(id: string): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`);
 }
 
-/**
- * 发出去之前裁成后端当前认识的形状。
- *
- * 后端 v1 的 `MindMapContent` 是 `extra="forbid"`：多一个 `note` 就直接 422，
- * 而 `note` 属于契约 v2（见 `docs/HANDOFF.md` H1，与 v2 同批上线）。
- * 所以这里显式按 v1 序列化：本地留着 `note` 供界面显示正文，但不把后端还不认识的字段发出去。
- */
-function toContractV1(content: MindMapContent): MindMapContent {
-  // 只裁 note —— 它是契约 v2 字段，v1 后端的 Node 是 extra="forbid"，
-  // 带着它发出去必然 422。
-  //
-  // source_refs 必须保留：它在 v1 契约里本来就有（contracts/mindmap.py 的 Node），
-  // 之前这里一并裁掉，表现是保存后引用全部消失、刷新后再也读不回来。
-  const strip = (node: MindNode): MindNode => ({
-    id: node.id,
-    label: node.label,
-    children: node.children.map(strip),
-    ...(node.source_refs?.length ? { source_refs: node.source_refs } : {}),
-  });
-  return {
-    title: content.title,
-    root: strip(content.root),
-    ...(content.source_usage ? { source_usage: content.source_usage } : {}),
-  };
-}
-
-/**
- * 导出用的序列化：v1 形状，并把 `note` 正文折进 `label`。
- *
- * 导出的文件是拿出去给别人看的成品，只有画布上的短标题（`label`）信息量太低，
- * 详情面板里那段正文（`note`）才是内容本身。后端三种格式都会把换行压成空格
- * （`backend/app/export/service.py::_one_line`），所以这里用全角冒号接成一句，
- * 不会被换行破坏缩进或 XML 结构。
- */
-function toExportV1(content: MindMapContent): MindMapContent {
-  const fold = (node: MindNode): MindNode => {
-    const note = node.note?.trim();
-    const short = node.label.trim();
-    // 正文常常自己就以标题开头（示例数据与模型产出都这样），再拼一次会变成
-    // “分类：分类：……”，这时直接留正文。
-    const label = !note ? node.label : !short || note.startsWith(short) ? note : `${short}：${note}`;
-    return {
-      id: node.id,
-      label,
-      children: node.children.map(fold),
-      ...(node.source_refs?.length ? { source_refs: node.source_refs } : {}),
-    };
-  };
-  return {
-    title: content.title,
-    root: fold(content.root),
-    ...(content.source_usage ? { source_usage: content.source_usage } : {}),
-  };
-}
-
 /** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
 export function createMindMap(content: MindMapContent): Promise<MapRecord> {
   return request<MapRecord>('/mindmaps', {
     method: 'POST',
-    body: JSON.stringify({ content: toContractV1(content) }),
+    body: JSON.stringify({ content }),
   });
 }
 
@@ -161,7 +105,7 @@ export function updateMindMap(
 ): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`, {
     method: 'PUT',
-    body: JSON.stringify({ content: toContractV1(content), version }),
+    body: JSON.stringify({ content, version }),
   });
 }
 
@@ -325,9 +269,9 @@ export async function exportMindMap(
     response = await fetch(`${BASE}/export/${format}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // 导出接口收的也是 v1 的 MindMapContent，带着 v2 的 note 一样会 422；
-      // toExportV1() 先把正文折进 label，再裁掉 v1 不认识的字段。
-      body: JSON.stringify({ content: toExportV1(content) }),
+      // 后端三种导出统一取 `note or label`，这里直接发原样内容：
+      // 前端不再自己做"把正文折进标题"的拼接，避免同一份内容在两端拼出两种结果。
+      body: JSON.stringify({ content }),
     });
   } catch {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
