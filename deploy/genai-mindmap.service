@@ -1,0 +1,48 @@
+[Unit]
+Description=genai-mindmap API (FastAPI + uvicorn)
+Documentation=https://github.com/RPeGio/genai-mindmap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=genai
+Group=genai
+WorkingDirectory=/opt/genai-mindmap/backend
+
+# 密钥等运行时配置放在这里，仓库里不存（install.sh 会创建，权限 0640 root:genai）
+EnvironmentFile=-/etc/genai-mindmap/env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# 下面这条不只是整洁：docling 第一次解析 docx/pptx 会下载版面模型到
+# $HOME/.cache/docling。服务用户的 HOME 若落在 /home 下，会被 ProtectHome
+# 挡在外面（下载失败 → 上传直接 422）。指到可写的数据目录里最稳。
+Environment=HOME=/var/lib/genai-mindmap
+
+# --proxy-headers + --forwarded-allow-ips：nginx 在 127.0.0.1 上反代，
+# 让 request_id 日志与限流能看到真实来源 IP。
+#
+# 只开 1 个 worker：SQLite 是单写者，开多 worker 只会让写冲突变成
+# "database is locked" 的偶发 500；2C2G 上多进程也吃内存。
+ExecStart=/opt/genai-mindmap/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 --workers 1 \
+    --proxy-headers --forwarded-allow-ips=127.0.0.1 \
+    --no-server-header --timeout-keep-alive 65
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+# 只允许写数据目录与临时目录；代码目录只读
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/genai-mindmap /var/log/genai-mindmap
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=genai-mindmap
+
+[Install]
+WantedBy=multi-user.target
