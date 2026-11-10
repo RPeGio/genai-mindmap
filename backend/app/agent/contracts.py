@@ -342,6 +342,10 @@ class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
     content: MindMapContent | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
+    # 这棵树是怎么来的，前端接受候选时要照它标记来源，不能一律写成"模型生成"。
+    # 缺省 None 而不是 "model"：没填的帧就是"没说"，把它默认成模型产出会让
+    # 占位树继续冒充满分答案——缺省值只该表示未知。
+    mode: Literal["demo", "model"] | None = None
 
 
 class ErrorEvent(_EventBase):

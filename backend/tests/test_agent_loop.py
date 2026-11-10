@@ -518,6 +518,8 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(events[-1].type, "done")
         self.assertIsNotNone(events[-1].content)
         self.assertEqual(events[-1].content.root.label, "主题")
+        # 走这条收尾的产物来自模型，不是占位树：前端要据此标来源。
+        self.assertEqual(events[-1].mode, "model")
 
     def test_repair_budget_limits_failed_tool_calls(self):
         """max_repairs 数的是工具失败次数，与模型调用次数无关。"""

@@ -262,7 +262,8 @@ def _budget_stop(
         ctx, tool_calls, call=call, code="budget_exhausted", message=_BUDGET_HINT[limit],
     )
     if ctx.candidate is not None:
-        return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total)
+        return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
+                         mode="model")
     return ErrorEvent(
         seq=next(seq), code="budget_exhausted",
         message=_BUDGET_HINT[limit], limit=limit,
@@ -435,7 +436,7 @@ async def run(
         demo_seq = itertools.count(1)
         yield StageEvent(seq=next(demo_seq), stage="demo", detail="演示模式，不调用模型")
         yield SnapshotEvent(seq=next(demo_seq), content=demo)
-        yield DoneEvent(seq=next(demo_seq), content=demo, usage={})
+        yield DoneEvent(seq=next(demo_seq), content=demo, usage={}, mode="demo")
         return
 
     active_provider = provider or default_provider()
@@ -507,7 +508,8 @@ async def run(
 
         if not completion.tool_calls:
             if completion.finish_reason == "stop":
-                yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total)
+                yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
+                                mode="model")
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
                 _log_failure(ctx, tool_calls, code="unexpected_finish", message=message)
