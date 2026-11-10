@@ -2,7 +2,11 @@
  *
  *  2026-11-10 起后端是契约 v2：本文件声明了 v2 的字段，但界面只读写
  *  `note` / `layout` / `theme.direction`，其余（`relations` / `style` / `pos` /
- *  `collapsed`）只做透传保存。等接 `openapi-typescript` 生成 `schema.d.ts` 后删本文件。 */
+ *  `collapsed`）只做透传保存。
+ *
+ *  `schema.d.ts` 已由 `openapi-typescript` 从 `backend/openapi.json` 生成，
+ *  但本文件**决定保留**：手写镜像读起来比生成的类型省事，两者靠
+ *  `contract-check.ts` 的编译期断言保持一致（见 `docs/CONTRACT_V2.md`）。 */
 export interface MindNode {
   id: string;
   /** 一句话标题。画布上按 24 字截断显示，全文在悬停卡片与详情面板里。 */

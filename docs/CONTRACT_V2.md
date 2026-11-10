@@ -7,7 +7,7 @@
 >
 > 逐字段状态：**已接线**（前端已在读或在写）= `schema_version`、`layout`、`theme.direction`、`note`（详情面板可编辑并随保存落库）、`source_refs`；**仅落库**（schema 里有、还没有界面读它；前端按"读到什么原样带回去"的方式透传，不会丢）= `relations`、`style`、`pos`、`collapsed`、`theme.preset / accent / font`。把它们现在写进契约的理由是"只加不删"：晚一次成本是一次 `schema_version` 升位 + 两端类型全改。
 >
-> R2 画布已按 `node.note ?? node.label` 渲染正文（取值收敛在 `frontend/src/stores/mindmap.ts` 的 `displayBody()`）；v2 落地前前端保存时会裁掉 `note`（`src/api/client.ts::toContractV1()`），`note` 与 v2 同批上线后该函数删除——见 [交接文档](HANDOFF.md) H1。
+> R2 画布已按 `node.note ?? node.label` 渲染正文（取值收敛在 `frontend/src/stores/mindmap.ts` 的 `displayBody()`）；v2 落地前前端保存时会裁掉 `note`（`src/api/client.ts::toContractV1()`），该函数已随 v2 一起删除，`toExportV1()` 也已删除——见 [交接文档](HANDOFF.md) H1。
 
 ## 1 v1 → v2 变更摘要
 

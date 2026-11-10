@@ -4,11 +4,11 @@
 
 ## 当前可运行范围
 
-- 前端 Vue 3 + TypeScript：文本 / 文档 / 图片 / 录音多来源输入 → 流式或流水线生成 → `@vue-flow/core` 画布（平移、缩放、点选节点看全文，支持向右 / 向左 / 向下 / 双向四种布局）→ 双击改文字 / Tab 加子节点 / Enter 加兄弟 / Delete 删子树 / 撤销重做 / Ctrl+S 保存（`version` 乐观锁，409 时三选弹层）→ 打开已保存导图 → PUML / Markdown / OPML 三种导出 → Agent 面板（候选需点接受才落到画布，旧 React 骨架已打 tag `v0.1.0-react-scaffold` 存档）。
-- 后端 FastAPI：生成接口（同步与 SSE 流式）、结构校验、SQLite 保存和读取、版本冲突检测、多来源流水线（文本 / 文档 / 图片 / 语音）、文档上传（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、`xlrd` 读 `.xls`、百炼 Qwen-Audio-ASR 转写 WAV）、节点级来源引用与三层校验、PUML / Markdown / OPML 导出、Agent 工具循环（`/api/agent/runs/stream`，产物是候选）、统一错误体、基础结构提示。
-- 默认 `demo` 生成固定结构，用于联调，**不会调用 AI**。可配置 Chat Completions 兼容模型服务，实际能力取决于服务商和模型。模型调用尚未在真实密钥环境验收。
+- 前端 Vue 3 + TypeScript：文本 / 文档 / 图片 / 录音多来源输入 → agent 工具循环生成 → `@vue-flow/core` 画布（平移、缩放、点选节点看全文，支持向右 / 向左 / 向下 / 双向四种布局）→ 双击改文字 / Tab 加子节点 / Enter 加兄弟 / Delete 删子树 / 撤销重做 / Ctrl+S 保存（`version` 乐观锁，409 时三选弹层）→ 打开已保存导图 → PUML / Markdown / OPML 三种导出 → Agent 面板（候选需点接受才落到画布，旧 React 骨架已打 tag `v0.1.0-react-scaffold` 存档）。生成与编辑现在只有 `POST /api/agent/runs/stream` 一条通道。
+- 后端 FastAPI：agent 工具循环（`/api/agent/runs/stream`：`mindmap_generate` / `mindmap_generate_deep` / `node_expand` / `rag_query` / `mindmap_edit`，产物是候选）、结构校验、SQLite 保存和读取、版本冲突检测、多来源输入（文本 / 文档 / 图片 / 语音，随生成请求一起交给 agent）、文档上传（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、`xlrd` 读 `.xls`、百炼 Qwen-Audio-ASR 转写 WAV）、节点级来源引用与三层校验、PUML / Markdown / OPML 导出、统一错误体、基础结构提示。旧的同步生成接口 `POST /api/generations`、流式 `POST /api/generations/stream` 与多来源流水线 `POST /api/pipeline/generate` 已删除。
+- 设 `MINDMAP_LLM_MODE=demo` 时生成固定结构，用于联调，**不会调用 AI**；agent 只认显式的 `demo`，没设这个变量不会自动降级成占位图（缺模型配置会直接报错）。设 `model` 并配好 `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY` / `MINDMAP_LLM_MODEL` 才会走 Chat Completions 兼容服务，实际能力取决于服务商和模型。模型调用尚未在真实密钥环境验收。
 - 尚未实现：知识库检索与持久知识库（`/api/knowledge/search` 是桩）、知识图谱、协作、翻译、模型评估、多布局与主题风格的**界面渲染**（v2 的 `layout` / `theme` 字段已能存能读，画布仍只有一套紧凑树布局，样式与主题没有实际渲染）、容器化部署。图片与语音处理已在 2026-11-05 落地，别再按"尚未实现"处理。
-- 多来源流水线记录整图来源摘要与节点级引用（`source_refs`，机械核验 + 可选 NLI），都能随导图保存；**界面已能展示引用**：节点右上角显示引用条数，选中后在右侧详情面板列出来源与位置，点一条在抽屉里看原文并高亮命中句。原文不持久化，所以跨会话重新打开只剩生成时记下的摘录。合并长度不再按固定字数封顶：后端在真实调用前按 token 预算判断（`backend/app/generation/service.py` 的 `CONTEXT_TOKEN_LIMIT`，200000 token，超了给可操作的错误而不是截断），前端来源面板的提示上限是 300000 字（`frontend/src/sources/input.ts:19`）。
+- agent 的忠实整理模式记录整图来源摘要与节点级引用（`source_refs`，机械核验 + 可选 NLI），都能随导图保存；**界面已能展示引用**：节点右上角显示来源条数，选中后在右侧详情面板列出来源与位置，点一条在抽屉里看原文并高亮命中句。原文不持久化，所以跨会话重新打开只剩生成时记下的摘录。来源正文合计不按固定字数封顶：后端在开流前按 token 预算判断（`backend/app/generation/service.py` 的 `CONTEXT_TOKEN_LIMIT`，200000 token，超了给可操作的错误而不是截断），前端来源面板的提示上限是 300000 字（`frontend/src/sources/input.ts:19`）。
 
 **当前只有本地单用户开发能力，没有登录、授权、访问隔离或生产安全加固，不要直接部署到公网或用于敏感数据。**
 

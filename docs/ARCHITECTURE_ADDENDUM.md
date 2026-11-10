@@ -75,7 +75,7 @@ update mindmaps
 > 而不是这里的 `mapId` / `nodeCount`，代码见 `backend/app/generation/stream_partial.py`。
 > 本章保留的价值是记录「任务化 + 断线重放」这条演进路线，尚未实现。
 
-对应 [API 契约](API.md) 里规划的 `GET /api/generation-tasks/{id}/events`。当前 `POST /api/generations` 同步返回完整导图，SSE 是**新增的第二条通道**，不替换同步接口——短输入和演示模式继续走同步。
+对应 [API 契约](API.md) 里规划的 `GET /api/generation-tasks/{id}/events`。现行只有一条流：`POST /api/agent/runs/stream`（SSE v2，帧格式见 [AGENT_PLAN](AGENT_PLAN.md) 第 5 节），没有同步生成接口，也没有任务化与断线重放——短输入与演示模式同样走这条（`MINDMAP_LLM_MODE=demo` 时 `run()` 只发三帧、不调模型）。
 
 ### 2.1 事件格式
 
@@ -104,11 +104,11 @@ data: {"code":"MODEL_TIMEOUT","message":"模型服务请求超时"}
 - 反向代理必须关缓冲：响应头 `X-Accel-Buffering: no`，Nginx 侧 `proxy_buffering off`
 - 事件只推"增量节点"，不推整棵树
 
-### 2.2 与同步接口的关系
+### 2.2 与现行流式接口的关系
 
 | 场景 | 用哪个 |
 |---|---|
-| 演示模式、短文本 | 同步 `POST /api/generations` |
+| 演示模式、短文本 | `POST /api/agent/runs/stream`（`MINDMAP_LLM_MODE=demo` 时只发 `stage` / `snapshot` / `done` 三帧，不调模型） |
 | 长文本、文档、多模态 | 异步任务 + SSE |
 | 断线恢复 | `GET /api/generation-tasks/{id}` 查状态，再决定是否重连 |
 
@@ -116,9 +116,14 @@ data: {"code":"MODEL_TIMEOUT","message":"模型服务请求超时"}
 
 ## 3 生成流水线
 
-现状：`backend/app/generation/service.py` 的 `generate()` 是一次模型调用，解析 JSON 后 `MindMapContent.model_validate`，失败直接抛 `GenerationError`。
+> **本章记的是流水线时代的形态。** `backend/app/pipeline/` 已整包删除（`POST /api/pipeline/generate` 一并删除）；
+> `understand → outline → validate → verify` 里只有 verify 那一步还活着：结构诊断 `check()` 与语义复核
+> `annotate_nli()` 已搬进 agent 的 `mindmap_generate` 收尾。下表「现在」列描述的是已删除的那套同步实现，
+> 保留它是为了对照目标形态，不是当前事实。
 
-当前多来源流水线已具备四个同步阶段，但并不支持单独重跑。未来目标形态：
+现状：生成走 agent 的工具循环——`mindmap_generate` 一次 `chat_async`，再交给 `generation/service.py::validate_generated_content` 解析并 `MindMapContent.model_validate`，失败直接抛 `GenerationError`。
+
+原先的多来源流水线有四个同步阶段，且不支持单独重跑。未来目标形态：
 
 ```
 understand → outline → validate → (verify) → respond
