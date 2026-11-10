@@ -34,7 +34,7 @@ flowchart LR
 | 导图编辑 | `frontend/src/App.vue`、`frontend/src/canvas/`、`frontend/src/stores/mindmap.ts`、`frontend/src/mindmap/` | 导图 JSON → 修改后的 JSON | R2 接入 `@vue-flow/core` 画布与自研 tidy-tree 布局（平移 / 缩放 / 点选看全文 / 四种方向）；R3 接入内联改名、Tab 建子节点、Enter 建兄弟、删子树、50 步撤销重做与乐观锁保存。 |
 | 导图管理 | `backend/app/mindmaps/` | 导图 JSON + 版本 → 保存记录 | 当前 SQLite 本地存储；后续 PostgreSQL、用户权限、历史版本。 |
 | 生成与模型适配 | `backend/app/generation/` | 文本 → 导图 JSON | 演示适配器和基础模型适配；后续接入生成任务、提示词管理和重试策略。 |
-| 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 当前后端仍是 v1 契约（`docs/API.md`）；v2 已冻结候选、待 D2 落地，届时前端类型由 `openapi-typescript` 生成，不再手写。 |
+| 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 后端已落地 v2（2026-11-10）：`schema_version` / `note` / `layout` / `theme` / `relations` / 节点样式与坐标；v1 请求体仍被接受（读时补默认值）。前端仍在手写 `types.ts`，类型生成（`openapi-typescript`）排在下一个 PR。 |
 | 多模态输入 | `backend/app/ingestion/`、`frontend/src/sources/`、`frontend/src/audio/` | 文本 / 文档 / 图片 / WAV 音频 → 来源 | 文本、Markdown、文档上传（PDF 逐页渲染交模型视觉识别；DOCX/PPTX/XLSX/HTML/MD 走 Docling；`.doc`/`.ppt` 经 LibreOffice 转换；`.xls` 走 `xlrd`）、图片理解（与 PDF 共用 `ingestion/vision_pdf.py` 的调用）与语音转写（百炼 Qwen-Audio-ASR，带句级时间戳，`ingestion/asr.py`）均可用。 |
 | 来源引用 | `backend/app/optimization/source_refs.py`、`backend/app/optimization/nli.py`（展示在 `frontend/src/mindmap/refs.ts`） | 节点 + 来源 → 校验后的 `source_refs` | 节点级引用随导图保存：机械核验（引文能在来源里找到）为主，可选中文 NLI（`MINDMAP_NLI_*`）复核。**界面已接入**（2026-11-07，`fc8f82f`）：角标显示条数，详情面板列来源与位置，抽屉里看原文并高亮命中句；原文不落库，跨会话只能看 `quote`。 |
 | 知识增强（待实现） | `backend/app/knowledge/` | 文档 → 分块/向量；问题 → 有来源片段 | 当前只有明确标识为未实现的检索桩；真实知识库与引用待开发。 |
@@ -48,11 +48,12 @@ flowchart LR
 ## 数据与调用约定
 
 1. 当前树以 `MindMapContent` 为唯一数据结构，节点 ID 唯一。后端限制最多 1000 节点、8 层、每节点最多 50 个孩子；前端与后端需按 [API 契约](API.md) 联调。
-2. 将来树以外的因果/引用连接应在版本化 schema 中新增独立 `relations`，包含来源节点、目标节点、关系类型及可追溯证据，不能通过重复节点冒充。布局、节点样式与语义结构分离，并规划迁移。
+2. 树以外的因果/引用连接用 v2 的独立 `relations` 表达（来源节点、目标节点、关系类型、可选证据与 `provenance`），不能通过重复节点冒充。布局（`layout`）、主题（`theme`）、节点样式与坐标（`style` / `pos`）是视图属性，与语义结构分开存放：语义结构不变时换布局不应改变数据含义。
 3. 当前多来源流水线将实际使用的来源 ID、类型、文件名及字符数写入 `MindMapContent.source_usage`，节点级的 `source_refs`（来源 ID、页码、字符区间、引文）随导图保存；这两者是摘要与定位信息，**不保存原文**，所以引用只能在本次请求内回查（界面在本次会话里回查原文，重新打开后只剩 `quote`）。原文持久化、跨请求回查与页码/时间戳在界面上的展示仍待补。
 4. AI 返回的是候选内容：服务端校验后返回；Agent 产物是 op 批次、挂在候选副本上，逻辑优化只给建议，都必须由用户确认，避免覆盖手工编辑。模型密钥只在服务端保存。
-5. 当前生成用同步请求或 SSE 流式，适合原型。导入、长文本、语音识别仍可能跑很久：持久任务（`pending → running → succeeded/failed`，支持超时、重试、状态查询）只在 `docs/ARCHITECTURE_ADDENDUM.md` 里设计过，代码里没有队列，也没有可断线重放的任务事件接口。
-6. 当前保存使用乐观锁。多人实时协作需要单独的 CRDT 同步与持久化，不应将当前版本号机制当作实时合并方案。
+5. 节点文字分两层：`label` 是画布上的短标题（≤200 字，换行在契约层折叠成空格），`note` 是可选正文（≤2000 字）。渲染与导出统一取 `note or label`，避免"画布上有解释、导出只剩骨架"。`collapsed` / `pos` 仅在手动布局下有意义，自动布局保存时不得携带坐标。
+6. 当前生成用同步请求或 SSE 流式，适合原型。导入、长文本、语音识别仍可能跑很久：持久任务（`pending → running → succeeded/failed`，支持超时、重试、状态查询）只在 `docs/ARCHITECTURE_ADDENDUM.md` 里设计过，代码里没有队列，也没有可断线重放的任务事件接口。
+7. 当前保存使用乐观锁。多人实时协作需要单独的 CRDT 同步与持久化，不应将当前版本号机制当作实时合并方案。
 
 ## 技术选择及来源
 

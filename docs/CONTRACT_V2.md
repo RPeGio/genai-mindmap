@@ -1,11 +1,13 @@
 # MindMapContent v2 契约
 
-> 状态：**冻结候选**（W1 定稿后冻结）· 归属：A/B 共管 · 任何字段改动需双人 review + 迁移脚本
-> v1 定义见 `backend/app/contracts/mindmap.py`（`id` / `label` / `children`）。
+> 状态：**已落地（后端 2026-11-10）**· 归属：A/B 共管 · 任何字段改动需双人 review + 迁移脚本
+> v1 定义见 `backend/app/contracts/mindmap.py`（`id` / `label` / `children` / `source_refs`）。
 >
-> **落地状态（2026-11-03）**：后端仍是 v1，`MindMapContent` 只有 `title` / `root` / `source_usage`；`frontend/src/api/types.ts` 是手写的 v1 镜像，**不是** v2 生成物。D2 把 v2 写进 Pydantic 后，前端类型改由 `openapi-typescript` 从 `/openapi.json` 生成，禁止再手写第二份。
+> **落地状态（2026-11-10）**：`backend/app/contracts/mindmap.py` 已实现本文件全部字段与校验；`frontend/src/api/types.ts` 仍是手写的 v1 镜像，前端的保存/读取尚未发送 `schema_version` / `layout` / `theme` / `note`（下一个 PR 接线）。因为新字段全有默认值，**旧前端发来的 v1 请求体照样可用**，不需要两边同时上线。
 >
-> R2 画布已按 `node.note ?? node.label` 渲染正文（取值收敛在 `frontend/src/stores/mindmap.ts` 的 `displayBody()`），但**不发送** `note` 字段：v1 是 `extra="forbid"`，提前发送会 422。`note` 与 v2 同批上线，待确认项见 [交接文档](HANDOFF.md) H1。
+> 逐字段状态：**已接线**（前端已在用或本轮就会用）= `schema_version`、`layout`、`theme.direction`、`note`、`source_refs`；**仅落库**（schema 里有、还没有界面读它）= `relations`、`style`、`pos`、`collapsed`、`theme.preset / accent / font`。把它们现在写进契约的理由是"只加不删"：晚一次成本是一次 `schema_version` 升位 + 两端类型全改。
+>
+> R2 画布已按 `node.note ?? node.label` 渲染正文（取值收敛在 `frontend/src/stores/mindmap.ts` 的 `displayBody()`）；v2 落地前前端保存时会裁掉 `note`（`src/api/client.ts::toContractV1()`），`note` 与 v2 同批上线后该函数删除——见 [交接文档](HANDOFF.md) H1。
 
 ## 1 v1 → v2 变更摘要
 
@@ -89,7 +91,8 @@ class Theme(BaseModel):
 
 class LayoutKind(str, Enum):
     tree = "tree"        # 经典思维导图（左右/单向）
-    logic = "logic"      # 逻辑结构图（缩进树）
+    vertical = "vertical"  # 根在上、子在下（画布上的"向下"）
+    logic = "logic"      # 逻辑结构图（向右缩进的清单，与 vertical 不同）
     timeline = "timeline"
     fishbone = "fishbone"  # L3，不进 v1.0.0 的 UI
     manual = "manual"      # 用户拖拽后进入，pos 生效
@@ -108,30 +111,35 @@ class MindMapContent(BaseModel):
 
 ## 3 校验规则（`model_validator(mode="after")`，任一不满足 → 422）
 
-1. 节点 `id` 全局唯一；总数 ≤ **300**；深度 ≤ **8**；每节点子节点 ≤ **50**（沿用 v1）。
-2. `label` 去首尾空白后非空；`label` 内的换行折叠为空格（前端同样处理）。
-3. `relations`：`source`/`target` 必须存在于树中；`source != target`；同一 `(source, target, type)` 不得重复；总数 ≤ 200。
+1. 节点 `id` 全局唯一；总数 ≤ **1000**（与 `backend/app/contracts/mindmap.py::MAX_TREE_NODES` 一致，随画布承载能力调整过）；深度 ≤ **8**；每节点子节点 ≤ **50**。
+2. `label` 去首尾空白后非空；`label` 内的换行折叠为空格（前端同样处理）。`title` 去首尾空白后非空。
+3. `relations`：`id` 唯一；`source`/`target` 必须存在于树中；`source != target`；同一 `(source, target, type)` 不得重复；总数 ≤ 200。
 4. `layout == "manual"` 时，**至少一个**节点有 `pos`；否则 `pos` 必须是 `None`（避免自动布局被历史坐标污染）。
 5. `source_refs.source_id` 必须出现在 `source_usage` 中；生成接口返回时若模型编造来源，**服务端直接清空** `source_refs`（沿用 v1 对 `source_usage` 的处理策略）。
 6. `note` / `quote` / `evidence` 允许为空，但不允许纯空白；纯空白视为 `None`。
 
 ## 4 迁移规则（v1 记录 → v2）
 
-写入时统一走 `migrate_v1_to_v2(content: dict) -> dict`：
+**实现方式：读时补默认值，不跑一次性脚本。** 见 `backend/app/contracts/mindmap.py::migrate_content()` 与 `backend/app/mindmaps/repository.py::_record()`。
 
 ```python
-DEFAULTS = {"schema_version": 2, "layout": "tree", "theme": {"preset": "default"},
-            "relations": []}
+V1_TO_V2_DEFAULTS = {"schema_version": 2, "layout": "tree", "theme": {}, "relations": []}
 
-def migrate(content: dict) -> dict:
-    if content.get("schema_version") == 2:
-        return content
-    return {**content, **DEFAULTS}  # Node 侧缺省字段由 pydantic 默认值补齐
+def migrate_content(data: dict) -> dict:
+    if data.get("schema_version") == 2:
+        return data
+    return {**{k: v for k, v in V1_TO_V2_DEFAULTS.items() if k not in data}, **data}
 ```
 
-- 迁移脚本 `backend/scripts/migrate_v1_v2.py`：读 `mindmaps` 全表 → 逐行迁移 → 写回并 `version + 1` → 输出统计（迁移数 / 跳过数 / 失败 id）。**先备份 `pg_dump` 再跑**。
+- 只补顶层缺的字段：`Node` 的新字段由 Pydantic 默认值补齐（`note=None` / `collapsed=False` / `style=None` / `pos=None`），不递归改写整棵树。
+- 幂等、且不覆盖已有值：已经是 v2 的返回原对象；带未来版本字段的记录也不裁剪。
+- 保存时 `model_dump_json()` 自然写出 v2，所以库里的数据是"用到才升级"，没有维护窗口。
+
+**什么时候才需要真正的迁移脚本**：接上 PostgreSQL / SQLAlchemy（`docs/PLAN.md` Q35 顺延到验收后）之后，或者要做**数据清洗**（例如把历史上过长的 `label` 拆成 `label` + `note`）时——那是改数据语义，不是补字段，必须备份 + 可回滚：
+
+- 迁移脚本 `backend/scripts/migrate_v1_v2.py`：读 `mindmaps` 全表 → 逐行迁移 → 写回并 `version + 1` → 输出统计（迁移数 / 跳过数 / 失败 id）。先备份再跑。
 - 迁移期间服务只读（维护窗口 5 分钟即可，数据量小）。
-- 回滚：保留迁移前 dump，失败则 `pg_restore` 并回退服务镜像 tag。
+- 回滚：保留迁移前 dump，失败则恢复并回退服务镜像 tag。
 
 ## 5 前端类型生成（不再手写 `types.ts`）
 
