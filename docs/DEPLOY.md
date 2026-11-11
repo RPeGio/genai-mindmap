@@ -177,3 +177,131 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 curl -s http://127.0.0.1:8000/api/health
 curl -s http://127.0.0.1:8000/api/ingestion/formats
 ```
+
+## 7. ECS 上线（Alibaba Cloud Linux 3，2C2G）
+
+目标形态：**nginx 发前端静态文件、`/api/` 反代到本机 uvicorn**，同源，因此不存在 CORS；后端只听 `127.0.0.1:8000`，公网只开 80/443。整个过程约 20–30 分钟，其中装 Python 依赖占大头。
+
+### 7.0 先做三件外部的事
+
+1. 域名加一条 A 记录指向 ECS 公网 IP（`ping 域名` 要返回该 IP）。
+2. 安全组放行 22、80、443；**不要**放行 8000——后端不该暴露。
+3. 想好用哪份模型密钥（`MINDMAP_LLM_*`）与语音密钥（`DASHSCOPE_API_KEY`，可不配）。
+
+### 7.1 把代码放上去
+
+```bash
+sudo dnf install -y git
+git clone https://github.com/RPeGio/genai-mindmap.git
+cd genai-mindmap
+```
+
+没有外网 git 访问时，本机 `git archive -o mindmap.tar.gz HEAD` 后 `scp` 上传，再 `tar -xf` 也行。
+
+### 7.2 一条命令装完
+
+```bash
+sudo bash deploy/install.sh --domain mindmap.example.com
+# 需要 .doc/.ppt（LibreOffice，+1.5GB）时加 --with-office
+# 想让脚本顺便签证书时加 --with-certbot
+```
+
+脚本做六件事，都可重复执行：
+
+| 步骤 | 内容 |
+|---|---|
+| 1 | `dnf` 装 nginx / htpasswd / sqlite / 编译基础件 |
+| 2 | 没有 swap 就加 2G（2G 内存解析 PDF、装 torch 都要余量） |
+| 3 | 建 `genai` 系统用户；代码到 `/opt/genai-mindmap`；数据到 `/var/lib/genai-mindmap`；`/etc/genai-mindmap/env` 权限 0640 |
+| 4 | 用 `uv` 装独立 CPython 3.12（避开系统 python3.6）并建 venv、装 `backend/requirements.txt` |
+| 5 | 装 systemd 单元并启动（只 1 个 worker，理由见下） |
+| 6 | 装 nginx 站点配置、生成 Basic Auth 账号 `demo`（随机密码只打印一次）、放行 SELinux 反代、装每日备份 cron |
+
+### 7.3 填密钥（运行时注入，不进仓库）
+
+```bash
+sudo vi /etc/genai-mindmap/env     # MINDMAP_LLM_BASE_URL / API_KEY / MODEL
+sudo systemctl restart genai-mindmap
+sudo journalctl -u genai-mindmap -n 30 --no-pager
+```
+
+`MINDMAP_LLM_MODE` 默认写的是 `model`；只想给人看界面、不烧额度时可以改 `demo`（PDF 视觉提取会退化成文本层）。
+
+### 7.4 发布前端
+
+2C2G 上装 node 再打包要拉几百 MB 依赖，不如本机构建：
+
+```powershell
+cd frontend
+npm run build
+scp -r dist/* root@<ECS_IP>:/opt/genai-mindmap/frontend/dist/
+```
+
+```bash
+ssh root@<ECS_IP> "chmod -R a+rX /opt/genai-mindmap/frontend/dist && nginx -s reload"
+```
+
+`dist` 里没有 `?sample=` 的示例代码——那是 `import.meta.env.DEV` 分支，构建时已被摇掉。
+
+### 7.5 签 HTTPS
+
+```bash
+sudo dnf install -y epel-release
+sudo dnf install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d mindmap.example.com --redirect
+```
+
+没有域名时只能 `http://IP`：能用，但浏览器的录音、剪贴板 API 在非安全上下文会被拦，演示语音与"复制全文"会失败。
+
+### 7.6 上线自检
+
+```bash
+curl -s http://127.0.0.1:8000/api/health                  # 后端活着
+curl -su demo:<密码> https://mindmap.example.com/api/health # 反代通
+sudo ss -lntup | grep -E ':(80|443|8000)'                 # 8000 只能听 127.0.0.1
+```
+
+浏览器里再过一遍：打开页面 → 生成一张导图（要能看到节点**逐步**冒出来，不是转圈转到底）→ 双击改文字 → 保存 → 刷新后能打开 → 上传一份 PDF → 导出 Markdown。
+
+### 7.7 日常运维
+
+```bash
+sudo systemctl status genai-mindmap
+sudo journalctl -u genai-mindmap -f            # 日志（含 request_id）
+sudo systemctl restart genai-mindmap           # 改了 /etc/genai-mindmap/env 之后
+sudo tail -n 50 /var/log/nginx/error.log
+sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/backups/genai-mindmap
+```
+
+恢复备份：`gunzip -c /var/backups/genai-mindmap/mindmaps-<时间>.db.gz > /var/lib/genai-mindmap/mindmaps.db`，然后 `chown genai:genai` 并重启服务。
+
+加演示账号：`sudo htpasswd /etc/nginx/.htpasswd-mindmap alice`。
+
+### 7.8 故障对照表
+
+| 现象 | 多半是 |
+|---|---|
+| 502 Bad Gateway | 后端没起来或崩了：`systemctl status genai-mindmap`、`journalctl -u genai-mindmap -n 50` |
+| 403 Forbidden（页面本身） | `dist` 权限（`chmod -R a+rX`）或 SELinux 不让 nginx 读 `/opt` |
+| 413 Request Entity Too Large | 上传超过 nginx 的 `client_max_body_size 24m` |
+| 504 但后端日志还在打印 | 生成超过 `proxy_read_timeout`；已设 900s，仍超时说明 `MINDMAP_LLM_*` 指向的模型太慢 |
+| 点了生成一直转圈、最后一次性出图 | SSE 被缓冲：确认 `location /api/` 里有 `proxy_buffering off` |
+| 偶发 `database is locked` | 起了多个 worker 或多个 uvicorn 实例；SQLite 只能一个写者 |
+| 上传 PDF 返回 422 说需要密钥 | `MINDMAP_LLM_MODE=demo`，或 `MINDMAP_LLM_*` 没填全 |
+| 页面上 Excel/Word 上传 422 | 没装 `--with-office` 时 `.doc/.ppt` 不可用（`.docx/.xlsx` 不需要 LibreOffice） |
+
+### 7.9 内存与并发（2C2G 的实话）
+
+- 空闲常驻约 150–250MB；`docling` 是懒加载，第一次上传 docx/pptx/xlsx/html/md 时会冲高到 600MB–1GB，之后常驻。
+- PDF 逐页视觉识别会并发 8 个请求，但内存主要花在 SSE 连接与图片缓冲上；**同时演示的人数控制在 2–3 人**。
+- 想要更多余量：升到 4G，或把 `MINDMAP_LLM_MODE` 保持 `model` 但避开大 PDF。
+
+## 8. 更新已部署的版本
+
+```bash
+cd ~/genai-mindmap && git pull            # 或重新 scp 一份代码
+sudo bash deploy/install.sh --domain mindmap.example.com   # 幂等，只更新代码与配置
+sudo systemctl restart genai-mindmap
+```
+
+前端有改动时再走一遍 7.4。改了契约（`backend/app/contracts/`）的那次更新，记得本机先 `pytest` 与 `npm test`——CI 绿了再发。
