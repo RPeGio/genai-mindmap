@@ -216,7 +216,7 @@ describe('来源收集', () => {
     slowDoc.resolve(json({ source: parsed('doc') }));
     await task;
     expect(store.items.map(item => item.label)).toEqual(order);
-    // 解析完成的先后不影响交给流水线的顺序
+    // 解析完成的先后不影响交给生成的顺序
     expect(store.readySources.map(source => source.id)).toEqual(['doc', 'slow', 'fast']);
   });
 
@@ -293,15 +293,11 @@ describe('来源收集', () => {
 });
 
 describe('合并生成边界', () => {
-  it('长度按 Unicode 码点并计入分隔换行，刚好到上限可提交，超出拦截', async () => {
+  it('长度按 Unicode 码点并计入分隔换行，刚好到上限可提交，超出拦截', () => {
     const valid = [textSource('😀'.repeat(MAX_INPUT_CHARS - 3)), textSource(' 字 ')];
     expect(mergedCharCount(valid)).toBe(MAX_INPUT_CHARS);
     expect(sourceInputError(valid)).toBe('');
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
-    await useMindMapStore().generateSources([...valid, textSource('多')]);
-    expect(useMindMapStore().sourceGenerationError).toContain(`${MAX_INPUT_CHARS + 3} 字`);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sourceInputError([...valid, textSource('多')])).toContain(`${MAX_INPUT_CHARS + 3} 字`);
   });
 
   it.each([
@@ -309,59 +305,9 @@ describe('合并生成边界', () => {
     { sources: [parsed(), parsed()], message: '来源 ID 重复' },
     { sources: [parsed('bad', { status: 'failed' })], message: '尚未解析成功' },
     { sources: Array.from({ length: 51 }, (_, i) => parsed(String(i))), message: '最多添加 50' },
-  ])('无效来源不能绕过界面校验：$message', async ({ sources, message }) => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
-    const map = useMindMapStore();
-    await map.generateSources(sources);
-    expect(map.sourceGenerationError).toContain(message);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it('取消后重试，迟到旧响应或旧错误不覆盖新结果', async () => {
-    const first = deferred<Response>();
-    const second = deferred<Response>();
-    const fetchMock = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
-    vi.stubGlobal('fetch', fetchMock);
-    const map = useMindMapStore();
-    const old = { title: '旧图', root: { id: 'old', label: '旧图', children: [] } };
-    map.loadMap(old, { id: 'old-id', version: 2, updated_at: '2026-11-05' });
-    const sources = [textSource('正文')];
-    const canceled = map.generateSources(sources);
-    const signal = fetchMock.mock.calls[0][1].signal as AbortSignal;
-    map.cancelSourceGeneration();
-    expect(signal.aborted).toBe(true);
-    expect(map.content).toEqual(old);
-    expect(map.mapId).toBe('old-id');
-    const retried = map.generateSources(sources);
-    first.reject(new Error('旧请求断开'));
-    await canceled;
-    expect(map.sourceGenerating).toBe(true);
-    expect(map.sourceGenerationError).toBe('');
-    const next = { title: '新图', root: { id: 'new', label: '新图', children: [] } };
-    second.resolve(json({ mode: 'model', content: next, stages: [], diagnostics: [] }));
-    await retried;
-    // 生成结果装进画布时会补上朝向（`layout` / `theme.direction`），
-    // 所以这里只比对内容本身，不要求整对象逐字段相等。
-    expect(map.content).toMatchObject({ title: '新图', root: next.root });
-    expect(map.mapId).toBeNull();
-    expect(map.version).toBe(0);
-    expect(map.dirty).toBe(true);
-    expect(map.sourceGenerating).toBe(false);
-  });
-
-  it('两条生成链路互斥，不能重复提交或由流式生成覆盖合并结果', async () => {
-    const pending = deferred<Response>();
-    const fetchMock = vi.fn().mockReturnValue(pending.promise);
-    vi.stubGlobal('fetch', fetchMock);
-    const map = useMindMapStore();
-    const running = map.generateSources([textSource('正文')]);
-    await map.generateSources([textSource('重复')]);
-    await map.generate('另一个流式任务');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    map.cancelSourceGeneration();
-    pending.resolve(json({ mode: 'demo', content: { title: '迟到', root: { id: 'late', label: '迟到', children: [] } } }));
-    await running;
-    expect(map.content).toBeNull();
+  ])('无效来源过不了界面校验：$message', ({ sources, message }) => {
+    // 校验是纯函数，界面拿它决定「合并生成导图」按不按得下去；
+    // 直接测它，就不必再借一条已经不存在的生成通道来断言"没发请求"。
+    expect(sourceInputError(sources)).toContain(message);
   });
 });

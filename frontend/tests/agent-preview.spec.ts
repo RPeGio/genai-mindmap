@@ -56,7 +56,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  vi.unstubAllEnvs();
 });
 
 describe('预览树按 path 生长', () => {
@@ -323,9 +322,8 @@ describe('预览与候选的隔离', () => {
 });
 
 describe('面板上的预览', () => {
-  /** 面板只在 agent 路径下渲染，所以先把开关打开再取 store。 */
+  /** 面板随运行的进度与候选出现，先把流跑起来再取 store。 */
   function openPanel() {
-    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
     return startStream();
   }
 

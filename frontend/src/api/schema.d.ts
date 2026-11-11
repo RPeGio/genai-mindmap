@@ -4,52 +4,6 @@
  */
 
 export interface paths {
-    "/api/generations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Generate Map
-         * @description 一次性生成：等模型吐完再返回，适合脚本调用与短输入。
-         */
-        post: operations["generate_map_api_generations_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/generations/stream": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Generate Map Stream
-         * @description 流式生成：一次调用，节点边生成边出现。帧格式见 stream_partial.py 的模块注释。
-         *
-         *     请求体校验失败时仍返回普通 JSON 错误（流还没开始，走统一错误处理器）；
-         *     一旦开始推送，后续错误只能以 `{"type":"error"}` 事件的形式出现在流里。
-         *
-         *     用 async 定义是必须的：客户端断开时 Starlette 会 cancel 这个生成器，
-         *     异步 httpx 的连接随之关闭，模型侧才真正停止计费。
-         */
-        post: operations["generate_map_stream_api_generations_stream_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/mindmaps": {
         parameters: {
             query?: never;
@@ -80,26 +34,6 @@ export interface paths {
         /** Update Map */
         put: operations["update_map_api_mindmaps__map_id__put"];
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/pipeline/generate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Generate From Sources
-         * @description 多来源生成。demo 模式下可完整跑通，返回占位导图与真实诊断。
-         */
-        post: operations["generate_from_sources_api_pipeline_generate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -241,7 +175,8 @@ export interface paths {
          * Create File Source
          * @description 上传文档或音频，解析成文本来源。
          *
-         *     返回的 `source` 可直接传给 `POST /api/pipeline/generate` 生成导图。
+         *     返回的 `source` 可直接作为 agent 运行请求里的 `sources`
+         *     （`POST /api/agent/runs/stream`）生成导图。
          *     解析失败（含扫描件无文本层、音频无人声）返回 422 并说明原因，
          *     不返回空内容。
          */
@@ -266,29 +201,6 @@ export interface paths {
         get: operations["list_supported_formats_api_ingestion_formats_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/knowledge/search": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Search Knowledge
-         * @description 知识库检索（F12/F13）。
-         *
-         *     当前实现返回空结果且 `implemented=false`，前端应据此禁用相关入口，
-         *     不要把它当成"已经接好了知识库"。
-         */
-        post: operations["search_knowledge_api_knowledge_search_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -326,6 +238,29 @@ export interface paths {
         put?: never;
         /** Stream Run */
         post: operations["stream_run_api_agent_runs_stream_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search Knowledge
+         * @description 知识库检索（F12/F13）。
+         *
+         *     当前实现返回空结果且 `implemented=false`，前端应据此禁用相关入口，
+         *     不要把它当成"已经接好了知识库"。
+         */
+        post: operations["search_knowledge_api_knowledge_search_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -470,22 +405,6 @@ export interface components {
          * @enum {string}
          */
         DiagnosticLevel: "info" | "warn" | "error";
-        /** GenerateRequest */
-        GenerateRequest: {
-            /** Text */
-            text: string;
-        };
-        /** GenerateResponse */
-        GenerateResponse: {
-            /**
-             * Mode
-             * @enum {string}
-             */
-            mode: "demo" | "model";
-            content: components["schemas"]["MindMapContent-Output"];
-            /** Diagnostics */
-            diagnostics?: components["schemas"]["Diagnostic"][];
-        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -621,21 +540,6 @@ export interface components {
              * @enum {string}
              */
             shape: "rounded" | "rect" | "pill";
-        };
-        /** PipelineRequest */
-        PipelineRequest: {
-            /** Sources */
-            sources: components["schemas"]["Source"][];
-        };
-        /** PipelineResponse */
-        PipelineResponse: {
-            /** Mode */
-            mode: string;
-            content: components["schemas"]["MindMapContent-Output"];
-            /** Diagnostics */
-            diagnostics?: components["schemas"]["Diagnostic"][];
-            /** Stages */
-            stages?: components["schemas"]["StageTraceOut"][];
         };
         /**
          * Position
@@ -825,18 +729,6 @@ export interface components {
             /** Char Count */
             char_count: number;
         };
-        /** StageTraceOut */
-        StageTraceOut: {
-            /** Stage */
-            stage: string;
-            /** Ok */
-            ok: boolean;
-            /**
-             * Detail
-             * @default
-             */
-            detail: string;
-        };
         /** SuggestResponse */
         SuggestResponse: {
             /** Suggestions */
@@ -914,72 +806,6 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
-    generate_map_api_generations_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["GenerateRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GenerateResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    generate_map_stream_api_generations_stream_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["GenerateRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     list_maps_api_mindmaps_get: {
         parameters: {
             query?: never;
@@ -1086,39 +912,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MapRecord"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    generate_from_sources_api_pipeline_generate_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PipelineRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PipelineResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1377,39 +1170,6 @@ export interface operations {
             };
         };
     };
-    search_knowledge_api_knowledge_search_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SearchRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SearchResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     create_task_api_agent_tasks_post: {
         parameters: {
             query?: never;
@@ -1463,6 +1223,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_knowledge_api_knowledge_search_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchResponse"];
                 };
             };
             /** @description Validation Error */

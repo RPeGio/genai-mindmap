@@ -1,42 +1,21 @@
-"""单次调用 + 增量 JSON 解析：让节点在模型还在输出时就逐个出现在画面上。
+"""增量 JSON 解析：模型还没写完，就把已经完整的节点挑出来。
 
-这是唯一的流式实现。曾经还有一个「两段式」（先骨架再展开）的方案，
-已经删除 —— 两套实现要维护两套测试、两套文档，而增量方案的完整耗时更短。
+服务于 agent 的节点生长预览（`agent/tools.py` 的 `_GenerateGrowStream`）：它一边
+收模型的分片正文，一边调用这里，把"已经写完整"的节点报成 `node_grow` 帧。
 
 增量解析的难点是 JSON 还没写完。这里的做法是「补齐括号」：扫描已收到的文本，
 跟踪字符串状态与括号栈，在末尾补上缺失的引号与闭括号，再交给 json.loads。
 截断在 `"label":` 这种位置时补出来的 JSON 仍然非法，函数返回 None 等下一批数据，
 所以不会把半截内容当成合法结构。
 
-全程 async：客户端断开时 Starlette 会 cancel 这个生成器，`httpx.AsyncClient`
-的连接随之关闭，模型侧才真正停止、不再计费。
+这个文件原先还带一条完整的 SSE 出口（`generate_stream_partial` 及其帧拼装），
+随 `POST /api/generations/stream` 一起删掉了。留下的是纯解析，与"用不用 SSE、
+走哪条路由"无关——预览机制换了三轮，它一次都没改过。
 """
 from __future__ import annotations
 
 import json
-import os
 import re
-import time
-from collections.abc import AsyncIterator
-
-from app.generation.service import (
-    DETAIL_PROMPT,
-    MAX_OUTPUT_TOKENS,
-    GenerationError,
-    _config,
-    _demo_content,
-    validate_generated_content,
-)
-
-_PARSE_INTERVAL_SECONDS = 0.15   # 两次尝试解析之间的最小间隔，避免每个 chunk 都全量解析
-_FINAL_GRACE_SECONDS = 60.0
-
-
-def _sse(payload: dict) -> str:
-    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
-
-
-_DONE_FRAME = "data: [DONE]\n\n"
 
 
 def _strip_fence(text: str) -> str:
@@ -159,122 +138,7 @@ def collect_new_nodes(obj: dict, seen: dict[str, str],
     return picked
 
 
-async def _stream_chat(system: str, user: str) -> AsyncIterator[str]:
-    """异步流式调用 Chat Completions，逐段产出 content。"""
-    import httpx
-
-    base, key, model = _config()
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.2,
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "stream": True,
-    }
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=_FINAL_GRACE_SECONDS,
-                                     follow_redirects=True) as client:
-            async with client.stream("POST", base + "/chat/completions",
-                                     content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                                     headers=headers) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0].get("delta", {}).get("content")
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
-                    if delta:
-                        yield delta
-    except httpx.HTTPStatusError as exc:
-        raise GenerationError(
-            f"模型服务返回 HTTP {exc.response.status_code}，请检查服务配置") from exc
-    except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
-        raise GenerationError("无法连接模型服务或请求超时") from exc
-
-
-async def _stream_events(text: str) -> AsyncIterator[str]:
-    mode = os.getenv("MINDMAP_LLM_MODE", "demo").strip().lower()
-
-    if mode == "demo":
-        yield _sse({"type": "stage", "stage": "demo", "progress": 0.5,
-                    "detail": "演示模式，不调用模型"})
-        # 演示内容是固定占位结构，只有一个子节点；质量门槛（一级分支不少于 3 条）
-        # 针对的是模型产出，所以这里显式关掉，别让 demo 被自己打回。
-        content, _ = validate_generated_content(
-            _demo_content(text).model_dump(), enforce_min_branches=False)
-        yield _sse({"type": "skeleton", "content": content.model_dump()})
-        yield _sse({"type": "done", "mode": "demo", "content": content.model_dump(),
-                    "latencyMs": 0, "degraded": False})
-        return
-
-    if mode != "model":
-        raise GenerationError("MINDMAP_LLM_MODE 只能是 demo 或 model")
-
-    started = time.monotonic()
-    yield _sse({"type": "stage", "stage": "outline", "progress": 0.1,
-                "detail": "正在生成（节点会边生成边出现）"})
-
-    buffer = ""
-    seen: dict[str, str] = {}
-    last_parse = 0.0
-    last_len = 0
-    pushed = 0
-
-    async for delta in _stream_chat(DETAIL_PROMPT, text):
-        buffer += delta
-        now = time.monotonic()
-        # 两个条件都满足才解析：既隔了足够时间，又攒了足够多新字符。
-        if now - last_parse < _PARSE_INTERVAL_SECONDS and len(buffer) - last_len < 40:
-            continue
-        last_parse = now
-        last_len = len(buffer)
-        partial = parse_partial(buffer)
-        if partial is None:
-            continue
-        for parent_id, node in collect_new_nodes(partial, seen, buffer):
-            pushed += 1
-            yield _sse({"type": "node", "parentId": parent_id, "node": node,
-                        "index": pushed})
-
-    # 收尾：必须拿到完整合法结构，否则说明这次生成不可用
-    try:
-        raw = json.loads(_strip_fence(buffer))
-    except json.JSONDecodeError as exc:
-        raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
-    content, _ = validate_generated_content(raw)
-
-    latency = int((time.monotonic() - started) * 1000)
-    yield _sse({"type": "done", "mode": "model", "content": content.model_dump(),
-                "latencyMs": latency, "degraded": False, "streamedNodes": pushed})
-
-
-async def generate_stream_partial(text: str) -> AsyncIterator[str]:
-    """流式生成的唯一出口：若干 `data: {json}`，末尾必然是 `data: [DONE]`。
-
-    被取消时不吞 CancelledError，让它继续上抛，连接才会真的断开。
-    """
-    try:
-        async for frame in _stream_events(text):
-            yield frame
-    except GenerationError as exc:
-        yield _sse({"type": "error", "code": "generation_failed", "message": str(exc)})
-    except BaseException:  # noqa: BLE001 - 含 CancelledError，必须原样上抛
-        raise
-    yield _DONE_FRAME
-
-
 __all__ = [
-    "generate_stream_partial",
     "parse_partial",
     "collect_new_nodes",
 ]

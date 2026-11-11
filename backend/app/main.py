@@ -4,12 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agent.router import router as agent_router
 from app.core.errors import register_error_handlers
 from app.export.router import router as export_router
-from app.generation.router import router as generation_router
 from app.ingestion.router import router as ingestion_router
 from app.knowledge.router import router as knowledge_router
 from app.mindmaps.router import router as mindmap_router
 from app.optimization.router import router as optimization_router
-from app.pipeline.router import router as pipeline_router
 
 app = FastAPI(title="生成式 AI 思维导图", version="0.2.0")
 # 所有错误出口统一成 {code, message, detail, request_id}，见 app/core/errors.py
@@ -22,16 +20,19 @@ app.add_middleware(
 )
 
 # 已实现的完整闭环
-app.include_router(generation_router, prefix="/api")   # 文本 → 导图（demo / model）
 app.include_router(mindmap_router, prefix="/api")      # 保存 / 读取 / 版本
-app.include_router(pipeline_router, prefix="/api")     # 多来源 → 导图（四段流水线）
 app.include_router(optimization_router, prefix="/api")  # 结构诊断与建议
 app.include_router(export_router, prefix="/api")       # 导出 puml
+app.include_router(ingestion_router, prefix="/api")    # 多模态输入
+app.include_router(agent_router, prefix="/api")        # AI 代理：文本/多来源 → 导图
 
 # 已规划、接口已固定、实现待补
-app.include_router(ingestion_router, prefix="/api")    # 多模态输入（仅文本可用）
 app.include_router(knowledge_router, prefix="/api")    # 知识检索（返回空）
-app.include_router(agent_router, prefix="/api")        # AI 代理（返回阶段骨架）
+
+# 生成只留 agent 这一条出口。旧的 `POST /api/generations`（同步、单段文本）与
+# `POST /api/pipeline/generate`（多来源、返回阶段轨迹）已删除：前端默认走 agent，
+# 它们独有的来源重建、引用核验与结构诊断都已搬进 `agent/tools.py` 的生成收尾，
+# 阶段轨迹由 agent 的 `stage` 事件覆盖。留两条平行出口只会让同一件事有两处真相。
 
 
 @app.get("/api/health", tags=["基础服务"])

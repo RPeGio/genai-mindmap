@@ -45,7 +45,8 @@ def create_text_source(body: CreateTextSourceRequest):
 async def create_file_source(file: UploadFile = File(...)):
     """上传文档或音频，解析成文本来源。
 
-    返回的 `source` 可直接传给 `POST /api/pipeline/generate` 生成导图。
+    返回的 `source` 可直接作为 agent 运行请求里的 `sources`
+    （`POST /api/agent/runs/stream`）生成导图。
     解析失败（含扫描件无文本层、音频无人声）返回 422 并说明原因，
     不返回空内容。
     """

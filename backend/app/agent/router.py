@@ -32,7 +32,8 @@ def create_task(body: AgentTaskRequest):
 def _agent_enabled() -> bool:
     """总开关。
 
-    默认开启：新能力上线后要能一条环境变量关掉回到旧路径，而不是回滚代码。
+    默认开启。旧生成通道已经删掉了，这条开关关掉就等于关掉 AI 能力：开流前
+    直接返回 503（`agent_disabled`），前端拿不到任何替代入口。
     """
     return os.getenv("MINDMAP_AGENT_ENABLED", "1").strip() != "0"
 

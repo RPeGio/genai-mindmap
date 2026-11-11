@@ -9,7 +9,7 @@ from app.contracts.source import Source, SourceRef
 
 logger = logging.getLogger(__name__)
 
-# 单次生成最多对多少条引用跑 NLI。一次推理 15–44 ms，不设上限时 300 节点
+# 单次生成最多对多少条引用跑 NLI。一次推理 15–44 ms，不设上限时 1000 节点
 # 每条引用都跑一遍能拖到几十秒，而用户只是点了「生成导图」。超出预算的
 # 引用静默跳过——它们是可选的附加评分，不是功能的必要条件。
 MAX_NLI_CHECKS = 100

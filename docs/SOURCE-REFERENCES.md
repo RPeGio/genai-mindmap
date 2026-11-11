@@ -79,13 +79,14 @@
 
 ## 生成、诊断与保存
 
-- `POST /api/pipeline/generate` 请求仍为 `{"sources": [...]}`。后端将来源 ID
-  和完整原文以 JSON 边界传给模型；根据实际输入重建 `source_usage`，不信任
-  模型提供的摘要。未知来源与未通过原文核验的引用会被剔除，原因通过
-  `diagnostics` 返回，并带上 `node_id`。节点本身保留，合法引用保留。
-- `POST /api/generations` 和 `/api/generations/stream` 只有单段文本，没有
-  可追溯的来源记录；在契约校验前清空模型返回的摘要及所有节点引用。
-  SSE 增量节点也不携带未经核验的引用。demo 不编造引用。
+- `POST /api/agent/runs/stream` 的请求带 `sources: [...]` 时，`mindmap_generate`
+  把来源 ID 和完整原文以 JSON 边界交给模型；生成收尾按实际输入重建
+  `source_usage`，不信任模型提供的摘要。未知来源与未通过原文核验的引用会被剔除，
+  原因通过 `diagnostics` 返回，并带上 `node_id`。节点本身保留，合法引用保留。
+- 不带来源的生成（`intent=create` 且没有 `sources`）没有可追溯的来源记录；
+  `validate_generated_content(sources=None)` 在契约校验前清空模型返回的摘要及所有
+  节点引用。`node_grow` 预览帧也不携带未经核验的引用——它只有 `label` 与
+  `expandable`。demo 不编造引用。
 - `POST /api/optimization/check` 和 `/api/optimization/suggest` 可额外传
   `sources` 执行第三层；省略时只做原有结构诊断，传 `[]` 会明确报告缺失原文。
   两个接口都不改写导图或数据库，重复来源 ID 返回 422。

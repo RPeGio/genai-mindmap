@@ -17,7 +17,6 @@ from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import (
     MAX_TREE_DEPTH,
     MAX_TREE_NODES,
-    GenerateResponse,
     MindMapContent,
     Node,
 )
@@ -413,51 +412,6 @@ def _config() -> tuple[str, str, str]:
     return base, key, model
 
 
-def chat(system: str, user: str, *, max_tokens: int | None = None) -> dict[str, Any]:
-    """调一次 Chat Completions，返回模型 content 里那段 JSON 解析后的对象。
-
-    只负责传输与 JSON 解析；结构是否符合契约由调用方用 MindMapContent 校验。
-    """
-    base, key, model = _config()
-    # 输入侧的物理边界，位置在 `_config()` 之后：配置缺失是部署问题，必须
-    # 先暴露，否则用户会按「精简材料」的提示白折腾一轮。
-    ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
-    request_body: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.2,
-        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
-    }
-    payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    try:
-        # 调用方路由函数是同步 def，这里只用同步客户端；按流读取，
-        # 一旦越过字节上限立即放弃响应，不必把超限内容读进内存。
-        with httpx.Client(timeout=_TIMEOUT_SECONDS, follow_redirects=True) as client:
-            with client.stream("POST", base + "/chat/completions",
-                               content=payload, headers=headers) as response:
-                response.raise_for_status()
-                buffer = bytearray()
-                for chunk in response.iter_bytes():
-                    buffer.extend(chunk)
-                    if len(buffer) > _MAX_RESPONSE_BYTES:
-                        raise GenerationError("模型响应过大")
-        body = json.loads(buffer)
-        # finish_reason 必须先看：被截断的 content 交给 parse_model_json 会被
-        # 补齐成"合法"的半棵树，那是最危险的一种成功。
-        return parse_model_json(_choice_content(body))
-    except httpx.HTTPStatusError as exc:
-        code = exc.response.status_code
-        raise GenerationError(f"模型服务返回 HTTP {code}，请检查服务配置") from exc
-    except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
-        raise GenerationError("无法连接模型服务或请求超时") from exc
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
-
-
 def _stream_frame(data: str) -> tuple[str, str | None] | None:
     """一帧 `data:` 里的 `(delta.content, finish_reason)`；形状不对返回 None。
 
@@ -555,7 +509,11 @@ async def _chat_streamed(
 async def _chat_once(
     base: str, request_body: dict[str, Any], headers: dict[str, str],
 ) -> dict[str, Any]:
-    """一次性请求：收满整个响应体再解析。"""
+    """一次性请求：收满整个响应体再解析。
+
+    `chat_async` 在没有预览消费者时的只有它也走这条；流式尝试被服务端拒掉
+    （不认 `stream`、流中途断掉）时同样退回这里。
+    """
     payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, follow_redirects=True) as client:
@@ -587,11 +545,11 @@ async def chat_async(
     max_tokens: int | None = None,
     on_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
-    """`chat()` 的异步版本，供流式接口使用。
+    """agent 的工具（生成 / 展开 / 编辑）唯一的模型出口。
 
-    流式接口必须能真正取消：客户端断开时 Starlette 会 cancel 生成器，
-    异步 httpx 会随之关闭连接、停止计费；同步 httpx 跑在线程里，
-    取消只能丢掉结果，请求本身仍会跑完并产生费用。
+    全程异步是硬要求：客户端断开时 Starlette 会 cancel 生成器，异步 httpx
+    会随之关闭连接、停止计费；同步 httpx 跑在线程里，取消只能丢掉结果，
+    请求本身仍会跑完并产生费用。
 
     `on_delta` 只服务「让上层边收边做预览」，返回的仍然是**同一份**解析结果：
     每收到一段 `delta.content` 调一次回调，最后还是走 `parse_model_json`。
@@ -599,13 +557,12 @@ async def chat_async(
     拼不起来、回调自己抛错）都退回一次性请求。宁可少几帧预览，也不能让这次
     生成失败。
 
-    这里没有复用 `generation/stream_partial._stream_chat`：那个函数按
-    `DETAIL_PROMPT` 那条出口的固定配置发请求，不接受 `max_tokens`，复用它会让
-    工具这条出口的输出上限与 `RunBudget` 分叉——预算里写着上限，请求里却是另一个数。
+    `max_tokens` 由调用方给：工具这条出口的上限来自 `RunBudget`，在这里再写
+    一个默认值，预算里写的数与请求里发的数就会各走各的。
     """
     base, key, model = _config()
-    # 与 `chat()` 同一道输入边界：工具内部的生成 / 展开也走这里，两条出口
-    # 各守一个数迟早会分叉。
+    # 输入侧的物理边界，与调用方是谁无关：装不装得进模型窗口由这里统一守，
+    # 否则每个出口各守一个数，迟早分叉。
     ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
     request_body: dict[str, Any] = {
         "model": model,
@@ -651,8 +608,9 @@ def validate_generated_content(
 ) -> tuple[MindMapContent, list[Diagnostic]]:
     """以真实输入重建来源摘要，剔除模型伪造的关联，再执行契约与原文校验。
 
-    无 Source 的同步和 SSE 入口共用此出口：在契约校验之前清空所有节点的
-    来源声明，避免伪造摘要与引用互相背书，也不让错误的引用拖垮有效的树。
+    agent 的 `mindmap_generate`（`app/agent/tools.py::_generate()`）走这个出口：
+    无来源时在契约校验之前清空所有节点的来源声明，避免伪造摘要与引用互相背书，
+    也不让错误的引用拖垮有效的树。
 
     `enforce_min_branches` 是**质量**门槛而不是契约门槛：模型整图生成要求一级
     分支不少于 `MIN_BRANCHES` 条，demo 占位结构与用户已保存的旧图不走这道关。
@@ -717,27 +675,3 @@ def diagnose_density(content: MindMapContent, *, minimum: int = 2) -> list[Diagn
                      f"少于建议的 {minimum} 个；材料稀疏时可以保留，不必强行补写"),
         ))
     return diagnostics
-
-
-def generate(text: str, *, sources: list[Source] | None = None) -> GenerateResponse:
-    mode = os.getenv("MINDMAP_LLM_MODE", "demo").strip().lower()
-    if mode == "demo":
-        result = _demo_content(text.strip()).model_dump()
-        # demo 是固定占位结构（根节点 + 一个可编辑的子节点），它不伪装成模型
-        # 产物，自然也不该被「模型要给够分支」这条质量门槛打回。
-        enforce_min_branches = False
-    elif mode == "model":
-        enforce_min_branches = True
-        if sources is None:
-            result = chat(DETAIL_PROMPT, text)
-        else:
-            # 保留原始空白，引用区间才能与 Source.text 对齐；JSON 保持来源边界。
-            prompt_input = json.dumps({"sources": [
-                {"source_id": source.id, "text": source.text} for source in sources
-            ]}, ensure_ascii=False)
-            result = chat(SOURCED_DETAIL_PROMPT, prompt_input)
-    else:
-        raise GenerationError("MINDMAP_LLM_MODE 只能是 demo 或 model")
-    content, diagnostics = validate_generated_content(
-        result, sources=sources, enforce_min_branches=enforce_min_branches)
-    return GenerateResponse(mode=mode, content=content, diagnostics=diagnostics)

@@ -1,7 +1,7 @@
 """结构诊断（F15）与候选建议（F16）。
 
-位置：pipeline 的 verify 阶段调用 check()；
-      optimization/router 的 suggest() 面向用户产出可确认的修改建议。
+位置：agent 的生成收尾（`agent/tools.py::_generate`）与 optimization 路由共用；
+      `suggest()` 面向用户产出可确认的修改建议。
 
 check() 检查单子节点、达到深度上限及同一父节点下的重复标签；
 提供 sources 时还会核验引用原文。这不等于事实核验或语义蕴含判断。

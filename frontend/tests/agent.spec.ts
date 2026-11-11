@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils';
+import { mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -6,6 +6,7 @@ import AgentPanel from '../src/components/AgentPanel.vue';
 import SourceInputs from '../src/components/SourceInputs.vue';
 import type { MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { useSourcesStore } from '../src/stores/sources';
 
 /** 把若干事件包成 SSE 帧，模拟后端 /api/agent/runs/stream。 */
 function agentReply(frames: unknown[]): Response {
@@ -39,6 +40,13 @@ function stubFetch(reply: () => Response) {
 }
 
 const doneFrame = (payload: MindMapContent) => ({ type: 'done', seq: 4, content: payload });
+
+/** 按文字找按钮：输入区里「取消」「移除」这类按钮会随状态出现，只按序号取不可靠。 */
+function buttonByText(wrapper: VueWrapper, text: string) {
+  const found = wrapper.findAll('button').find(item => item.text().includes(text));
+  if (!found) throw new Error(`找不到按钮：${text}`);
+  return found;
+}
 
 /** 一次性 JSON 响应：openMap / save 走 request()，只读 json，不读流。 */
 function jsonReply(payload: unknown): Response {
@@ -85,8 +93,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  // agent 路径要开着面板才渲染，用例会临时改环境变量，别让它漏到下一个文件。
-  vi.unstubAllEnvs();
 });
 
 describe('agent 运行', () => {
@@ -235,7 +241,6 @@ describe('部分完成与诊断', () => {
   });
 
   it('带 diagnostics 时面板列出诊断 message，超过三条折成计数', async () => {
-    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
     const messages = [
       '分支「神经网络」展开失败，已留空',
       '因模型调用额度不足，分支「优化理论」没有展开，已留空',
@@ -276,7 +281,6 @@ describe('部分完成与诊断', () => {
   });
 
   it('接受候选后告警清空，不再挂在面板上', async () => {
-    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
     stubFetch(() => agentReply([
       {
         type: 'tool_end',
@@ -611,10 +615,8 @@ describe('思维模型进入请求体', () => {
   });
 
   it('下拉的五个选项与后端标识一致，默认选中通用', async () => {
-    // 新行为：下拉只在「会真正生效」时渲染（agent 路径 + 画布为空 / create）。
-    // 旧的一次性生成接口与 edit 路径都不消费 thinking_model，所以这里先打开
-    // agent 开关，再断言选项；不打开的话下拉根本不出现（见下面两条用例）。
-    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
+    // 新行为：下拉只在「会真正生效」时渲染（画布为空时走 create，后端才消费
+    // thinking_model）。已有导图时走 edit，见下面那条用例。
     const wrapper = mount(SourceInputs, {
       global: { plugins: [createPinia()] },
       props: { confirmDiscard: () => true },
@@ -639,20 +641,8 @@ describe('思维模型进入请求体', () => {
     expect(select.attributes('disabled')).toBeDefined();
   });
 
-  it('agent 路径关闭时下拉不渲染', () => {
-    // 关闭时走旧的一次性生成接口，它根本不接收 thinking_model：
-    // 把选不生效的控件摆在这里，用户会以为自己换过拆解方式了。
-    const wrapper = mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
-    });
-
-    expect(wrapper.find('#thinking-model').exists()).toBe(false);
-  });
-
   it('已有导图（edit 场景）时下拉不渲染', async () => {
     // 有导图时点击生成走 edit 意图，后端的编辑路径同样不消费 thinking_model。
-    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
     const wrapper = mount(SourceInputs, {
       global: { plugins: [createPinia()] },
       props: { confirmDiscard: () => true },
@@ -666,13 +656,40 @@ describe('思维模型进入请求体', () => {
   });
 });
 
+describe('运行中的来源区', () => {
+  it('运行期间冻结来源列表，取消后恢复可编辑', async () => {
+    // 生成中途还能改来源，用户会以为改动对这一轮生效——实际上请求体早就发出去了。
+    // 冻结与"取消后恢复"是同一件事的两半。
+    const gate = controllableReply();
+    stubFetch(() => gate.response);
+    const wrapper = mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    sources.addText('正文');
+
+    const running = store.runGeneration('做一张图', 'create', sources.readySources);
+    await vi.waitFor(() => expect(store.busy).toBe(true));
+    expect(wrapper.get('input[type="file"]').attributes('disabled')).toBeDefined();
+    expect(buttonByText(wrapper, '清空来源').attributes('disabled')).toBeDefined();
+    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeDefined();
+
+    await buttonByText(wrapper, '取消').trigger('click');
+    expect(store.busy).toBe(false);
+    // 取消不该顺手把用户收集的材料清掉
+    expect(sources.items).toHaveLength(1);
+    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeUndefined();
+
+    gate.finish();
+    await running;
+  });
+});
+
 describe('面板文案与候选骨架', () => {
-  /**
-   * 面板只在 agent 路径下可见，所以先打开开关、把状态铺好再挂载，
-   * 这样首帧渲染就带着内容，不用等 nextTick 再断言。
-   */
+  /** 把状态铺好再挂载，首帧渲染就带着内容，不用等 nextTick 再断言。 */
   function panel(seed: (store: ReturnType<typeof useMindMapStore>) => void) {
-    vi.stubEnv('VITE_MINDMAP_AGENT', '1');
     const store = useMindMapStore();
     seed(store);
     return mount(AgentPanel);

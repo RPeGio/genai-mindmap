@@ -12,8 +12,7 @@ import { agentToolLabel, useMindMapStore, type PreviewNode } from '../stores/min
 const store = useMindMapStore();
 
 const visible = computed(() =>
-  store.agentEnabled
-  && (store.agentRunning || store.candidate !== null || store.agentEvents.length > 0 || !!store.agentError),
+  store.agentRunning || store.candidate !== null || store.agentEvents.length > 0 || !!store.agentError,
 );
 
 /** 毫秒 → 「4.3 秒」。把 4341ms 直接摆给用户看是工程口吻。 */

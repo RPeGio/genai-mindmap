@@ -2,10 +2,8 @@ import type {
   AgentEvent,
   AgentRunRequest,
   CreateTextSourceResponse,
-  GenerateResponse,
   MapRecord,
   MindMapContent,
-  PipelineResponse,
   Source,
 } from './types';
 
@@ -67,14 +65,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-/** 同步生成：文本 → 导图候选。不落库，用户确认后再保存。 */
-export function generateMindMap(text: string): Promise<GenerateResponse> {
-  return request<GenerateResponse>('/generations', {
-    method: 'POST',
-    body: JSON.stringify({ text }),
-  });
-}
-
 // ---- 保存与打开 ----
 
 /** 已保存的导图列表（不含筛选，按更新时间倒序由后端决定）。 */
@@ -109,16 +99,7 @@ export function updateMindMap(
   });
 }
 
-// ---- 流式生成 ----
-
-/** 后端 generation/stream.py 推送的事件。类型放在 JSON 的 type 字段里。 */
-export type StreamEvent =
-  | { type: 'stage'; stage: string; progress: number; detail: string }
-  | { type: 'skeleton'; content: MindMapContent }
-  | { type: 'node'; parentId: string | null; node: { id: string; label: string; children: [] }; index: number }
-  | { type: 'heartbeat'; waitedMs: number }
-  | { type: 'done'; mode: 'demo' | 'model'; content: MindMapContent; latencyMs: number; degraded: boolean; reason?: string }
-  | { type: 'error'; code: string; message: string };
+// ---- agent 流式运行 ----
 
 /**
  * 通用 SSE 读取：POST 一个 JSON，按帧回调。
@@ -126,9 +107,8 @@ export type StreamEvent =
  * 不用 EventSource 是因为它只能发 GET，而输入文本可能很长。这里用 fetch 的
  * ReadableStream 自己切帧：SSE 的帧以空行分隔，每帧取第一条 `data: ` 行。
  *
- * 抽成公共函数是因为流式生成和 agent 运行都要用；两份各写一遍的话，某天
- * 一边修了分片边界处理、另一边没修，就会出现"同样的网络条件下只有一个接口
- * 偶发丢帧"这种极难复现的问题。
+ * 单独抽出来是为了让帧解析只有一份：`[DONE]` 终止帧、分片边界、单帧解析失败
+ * 跳过，这些细节各写一遍就会各自漂移，出现"同样的网络条件下只有一条流偶发丢帧"。
  */
 async function postSse<T>(
   url: string,
@@ -193,14 +173,6 @@ async function postSse<T>(
   }
 }
 
-export function generateMindMapStream(
-  text: string,
-  onEvent: (event: StreamEvent) => void,
-  signal?: AbortSignal,
-): Promise<void> {
-  return postSse<StreamEvent>(`${BASE}/generations/stream`, { text }, onEvent, signal);
-}
-
 export function runAgentStream(
   body: AgentRunRequest,
   onEvent: (event: AgentEvent) => void,
@@ -209,7 +181,7 @@ export function runAgentStream(
   return postSse<AgentEvent>(`${BASE}/agent/runs/stream`, body, onEvent, signal);
 }
 
-// ---- 文档上传与多来源生成 ----
+// ---- 文档上传 ----
 
 /**
  * 上传文档，由后端解析成文本来源。
@@ -279,13 +251,4 @@ export async function exportMindMap(
 
   if (!response.ok) throw await toApiError(response);
   return response.text();
-}
-
-/** 把解析好的来源原样送回流水线生成导图。不做裁剪：后端 Source 是 extra="forbid"，少字段才安全。 */
-export function generateFromSources(sources: Source[], signal?: AbortSignal): Promise<PipelineResponse> {
-  return request<PipelineResponse>('/pipeline/generate', {
-    method: 'POST',
-    body: JSON.stringify({ sources }),
-    signal,
-  });
 }

@@ -330,9 +330,9 @@ class NodeGrowEvent(_EventBase):
     """
 
     type: Literal["node_grow"] = "node_grow"
-    # 必填但可以为 null：根帧就是 path=null。层数上限是 4 层
-    # （`tools.DEEP_MAX_DEPTH`），索引链最长 3 位；留到 16 是给将来放宽层数
-    # 留余量，同时挡住畸形上报把帧撑大。
+    # 必填但可以为 null：根帧就是 path=null。层数上限是契约的 8 层
+    # （`tools.DEEP_MAX_DEPTH` 就是 `MAX_TREE_DEPTH`），索引链最长 7 位；留到
+    # 16 是给将来放宽层数留余量，同时挡住畸形上报把帧撑大。
     path: list[int] | None = Field(max_length=16)
     label: str = Field(min_length=1, max_length=200)
     expandable: bool | None = None
@@ -342,6 +342,10 @@ class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
     content: MindMapContent | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
+    # 这棵树是怎么来的，前端接受候选时要照它标记来源，不能一律写成"模型生成"。
+    # 缺省 None 而不是 "model"：没填的帧就是"没说"，把它默认成模型产出会让
+    # 占位树继续冒充满分答案——缺省值只该表示未知。
+    mode: Literal["demo", "model"] | None = None
 
 
 class ErrorEvent(_EventBase):

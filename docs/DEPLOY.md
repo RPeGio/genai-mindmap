@@ -35,7 +35,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MINDMAP_LLM_MODE` | `demo` | `demo` 不联网走本地占位；`model` 才调模型。**PDF 视觉提取只在 `model` 下工作** |
+| `MINDMAP_LLM_MODE` | `demo`（仅 PDF 视觉这条） | `demo` 不联网走本地占位；`model` 才调模型。**PDF 视觉提取只在 `model` 下工作**。agent 生成只认显式的 `demo`：不设这个变量不会自动降级成占位图，缺模型配置会直接报错 |
 | `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
 | `MINDMAP_LLM_API_KEY` | — | 密钥，只从环境变量读 |
 | `MINDMAP_LLM_MODEL` | — | 模型名，当前用 `deepseek-chat` |

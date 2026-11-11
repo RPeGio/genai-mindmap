@@ -3,7 +3,7 @@
 位置：用户给一个目标（"设计一款智能家居产品"），先拆成阶段，再逐阶段生成分支。
 
 状态：**骨架**。plan() 返回固定的三段结构，不含模型调用；
-真正实现要做的是：目标 → 阶段划分 → 每阶段调用流水线 → 合并成一棵树。
+真正实现要做的是：目标 → 阶段划分 → 每阶段调用 run() → 合并成一棵树。
 
 设计约束：
   - 每一步都要记录来源与依据，不只是结果
@@ -16,6 +16,7 @@ import contextlib
 import itertools
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -42,7 +43,7 @@ from app.agent.contracts import (
 from app.agent.provider import default_provider
 from app.agent.tools import ToolRegistry, build_registry
 from app.contracts.mindmap import MindMapContent
-from app.generation.service import GenerationError
+from app.generation.service import GenerationError, _demo_content
 
 DEFAULT_STAGES = ["目标澄清", "要点拆解", "分支展开", "风险与验证"]
 logger = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ def plan(goal: str) -> AgentPlan:
     """把目标拆成阶段。
 
     TODO(F02)：用模型做阶段划分，并为每个阶段生成"需要哪些输入"，
-    再逐阶段调用 pipeline.run()，最后合并。
+    再逐阶段调用本文件的 run()，最后把各阶段的候选合并成一棵树。
     现在返回固定阶段，只用来固定接口形状与前端交互顺序。
     """
     return AgentPlan(goal=goal, stages=list(DEFAULT_STAGES), implemented=False)
@@ -261,7 +262,8 @@ def _budget_stop(
         ctx, tool_calls, call=call, code="budget_exhausted", message=_BUDGET_HINT[limit],
     )
     if ctx.candidate is not None:
-        return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total)
+        return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
+                         mode="model")
     return ErrorEvent(
         seq=next(seq), code="budget_exhausted",
         message=_BUDGET_HINT[limit], limit=limit,
@@ -417,6 +419,26 @@ async def run(
     工具内部的 `chat_async` 调用共用它，且都在**请求发出之前**占位。分两处判、
     两处记，就会出现"判的时候以为还有额度"的超支。
     """
+    # 演示模式：机器上没有模型密钥时（评审演示、新人上手）走 agent 也要能出一张图，
+    # 否则这里是 `chat_async` 的第一句 `GenerationError`，一张图都生成不出来。
+    #
+    # 判断放在这个函数的入口，而不是 `_generate` / `_generate_deep`：那两个是工具层
+    # 各自的入口，写两遍就是同一个判断两处真相，而且外层循环会先花掉一次真正的
+    # 模型调用才轮到工具。
+    #
+    # 只认显式的 `demo`（`.env.example` 就是这么发的）。缺省值**不**取 demo：旧路径
+    # 那套「没配置就走 demo」的默认照搬到 agent 上，等于把默认路径静默降级成占位图，
+    # 而 agent 正是要成为默认的那条路。
+    if os.getenv("MINDMAP_LLM_MODE", "").strip().lower() == "demo":
+        # 占位树复用旧路径的 `_demo_content`：同一份占位结构只该有一个定义，
+        # 两处各写一份，改文案时必然只改一处。
+        demo = _demo_content(request.goal)
+        demo_seq = itertools.count(1)
+        yield StageEvent(seq=next(demo_seq), stage="demo", detail="演示模式，不调用模型")
+        yield SnapshotEvent(seq=next(demo_seq), content=demo)
+        yield DoneEvent(seq=next(demo_seq), content=demo, usage={}, mode="demo")
+        return
+
     active_provider = provider or default_provider()
     # 意图决定模型看得到哪些工具：expand 下根本没有 mindmap_edit，
     # 它也就不会去试"删掉另一个分支"。
@@ -486,7 +508,8 @@ async def run(
 
         if not completion.tool_calls:
             if completion.finish_reason == "stop":
-                yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total)
+                yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
+                                mode="model")
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
                 _log_failure(ctx, tool_calls, code="unexpected_finish", message=message)

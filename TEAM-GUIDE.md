@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-10）：后端 515 个测试（pytest）、前端 372 个 vitest 用例（22 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-10）：后端 488 个测试（pytest，另有 19 个 subtest）、前端 358 个 vitest 用例（23 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -83,27 +83,26 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 8 组路由（19 个端点）
+    main.py            应用装配，注册 6 组路由（14 个路径 / 16 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       MindMapContent / Node / 请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
       diagnostic.py    Diagnostic / Suggestion
       ops.py           导图操作（add / update / remove / move）
     ingestion/         多模态输入 → Source（文本 / 文档 / 图片 / WAV）
-    pipeline/          四段流水线编排
-    generation/        模型调用（demo / model，同步 + SSE 流式）
+    generation/        模型调用与上下文预算（demo / model）+ `stream_partial.py` 增量解析器
     optimization/      结构诊断与建议（三条结构规则 + 引用核验）
     knowledge/         知识检索（桩）
-    agent/             AI 代理（工具循环 / op 执行器 / SSE v2）
+    agent/             AI 代理（工具循环 / op 执行器 / SSE v2，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               515 个测试
+  tests/               488 个测试（另有 19 个 subtest）
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
     main.ts            入口（挂 Pinia 与 Vue Flow 样式）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（生成 3 个、导图 CRUD 4 个、上传 1 个、导出 1 个、agent 1 个）
+    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、上传 1 个、导出 1 个、agent 流 1 个）
     api/types.ts       契约 v2 的 TS 镜像（手写，读起来比生成类型省事）
     api/schema.d.ts    openapi-typescript 从 backend/openapi.json 生成，勿手改
     api/contract-check.ts 编译期断言：镜像与生成类型的键集合、形状必须一致
@@ -118,15 +117,16 @@ frontend/
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
     stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               372 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent）
+  tests/               358 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
   ARCHITECTURE.md      模块边界、技术选型及来源
-  ARCHITECTURE_ADDENDUM.md  存储迁移、SSE 协议、流水线细节
+  ARCHITECTURE_ADDENDUM.md  存储迁移、SSE 演进路线、生成链路细节
   PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q36）
-  CONTRACT_V2.md       契约 v2（后端 2026-11-10 已落地；前端类型仍手写 v1 镜像）
+  CONTRACT_V2.md       契约 v2（两端 2026-11-10 已落地；`types.ts` 是 v2 镜像，`schema.d.ts` 由 `openapi.json` 生成，`contract-check.ts` 编译期断言两者一致）
   HANDOFF.md           需要对方知悉或确认的跨人决策（待确认 / 已确认）
+  TODO.md              文件占用与交接（协作文件，动共用文件前先看这里）
   W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
 START_HERE.md          原始的骨架说明
@@ -136,7 +136,7 @@ START_HERE.md          原始的骨架说明
 
 ## 4 现在到底有什么
 
-**能用的**：文本生成导图（demo 或真实模型，`/api/generations` 同步、`/stream` 流式）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 候选确认，`POST /api/agent/runs/stream`）。
+**能用的**：文本生成导图（demo 或真实模型，走 agent 的 `mindmap_generate`，复杂主题走 `mindmap_generate_deep`）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 候选确认，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）。
 
 **是桩的**：知识检索（返回空 + `implemented:false`）、`POST /api/agent/tasks`（返回固定四阶段，不产生导图；真正的 agent 走 `/agent/runs/stream`）。
 
@@ -159,21 +159,19 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（17 个路径 / 19 个端点）
+## 5 接口一览（14 个路径 / 16 个端点）
 
 ```
 基础
 GET  /api/health
 
-生成
-POST /api/generations              文本 → 导图（一次性）
-POST /api/generations/stream       文本 → 导图（SSE 流式，页面默认走这条）
+生成（唯一入口）
+POST /api/agent/runs/stream        目标 + 来源 + 当前树 → SSE v2 事件与候选
 
 输入（多来源）
 POST /api/ingestion/text           文本 → Source
 POST /api/ingestion/files          上传文档 / 图片 / WAV → Source（multipart，≤10MB，音频 ≤20MB）
 GET  /api/ingestion/formats        支持的扩展名与上传上限
-POST /api/pipeline/generate        Source[] → 导图 + 阶段 + 诊断
 
 优化
 POST /api/optimization/check       导图 → 诊断（可带 sources 做引用核验）
@@ -191,7 +189,6 @@ GET  /api/mindmaps/{id}            读取
 PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
 
 代理与检索
-POST /api/agent/runs/stream        目标 + 来源 → SSE v2 事件与候选（可用）
 POST /api/agent/tasks              目标 → 阶段骨架（桩，implemented:false）
 POST /api/knowledge/search         检索（桩，返回空）
 ```
@@ -213,11 +210,11 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 ## 7 动手前必须知道的四件事
 
-**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children` / `source_refs`（后者可选，节点级引用），不是 `topic`、不是 `text`。上限 1000 节点、8 层、每节点 50 个子节点、标题与节点文字各 200 字，超了直接 422。`note` 仍属 v2 预留，后端 v1 契约是 `extra="forbid"`，发过去就 422。
+**一、`MindMapContent` 是唯一数据结构。** 节点字段是 `id` / `label` / `children` / `source_refs`（后者可选，节点级引用），不是 `topic`、不是 `text`。上限 1000 节点、8 层、每节点 50 个子节点、标题与节点文字各 200 字，超了直接 422。`note`（正文，≤2000 字）已随契约 v2 上线，保存与导出都直接发送，前端不再裁剪。
 
 **二、保存是乐观锁。** `PUT /api/mindmaps/{id}` 必须带上读到的 `version`，服务端版本号变了就返回 409，前端要提示用户重新打开，不能强行覆盖。
 
-**三、生成接口不自动保存。** `POST /api/generations` 和 `/api/pipeline/generate` 只返回内容，用户点了保存才落库。
+**三、生成接口不自动保存。** `POST /api/agent/runs/stream` 只把结果放进候选副本，用户点接受后画布才变，落库仍要显式保存。
 
 **四、AI 产出是候选。** 结构诊断和建议都不会自动改用户的导图，必须用户确认。手工编辑不能被生成结果覆盖。
 
@@ -225,11 +222,11 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 ## 8 已知的坑
 
-- **两个文本入口的上限不同**：`/api/ingestion/text` 与 `/api/generations` 都是单段 10000 字，`/api/pipeline/generate` 合并后限 20000 字（`backend/app/pipeline/service.py:29`）。前端来源面板按 20000 字提示，所以 15000 字走 pipeline 没问题、走 `/api/generations` 会被 422 挡下。
-- **引用的原文不落库**：`source_refs` 随导图一起保存（`source_id` + `quote` + 可选的页码与字符区间），但 `Source.text` 只活在本次会话的来源列表里（`frontend/src/stores/sources.ts`）。刷新后重新打开导图，节点角标、来源名与 `quote` 还在，抽屉里却没有前后文——界面会显示"原文没有随导图保存"。另外后端**只在生成/流水线时校验引用**，保存时不复检，所以手工改过节点文字之后，旧引用可能已经对不上原文。
-- **导出用根节点文字，不是标题**：`export/puml` 取的是 `root.label`。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
-- **导出会把正文折进标题**：三种导出都收 v1 的 `MindMapContent`，`Node` 是 `extra="forbid"`，所以 `frontend/src/api/client.ts::exportMindMap()` 先调 `toExportV1()`：用全角冒号把 `note`（正文）接在 `label`（短标题）后面，再把 `note` 字段裁掉。导出文件里节点文字是"短标题：正文"，不是画布上那句被截断的短标题；后端三种格式都会把换行压成空格，所以多行正文不会破坏缩进。等 v2 上线可以改回按字段导出。
-- **`stages` 不是实时进度**：它是同步响应里的完成记录。要看实时进度得用 SSE（`/api/generations/stream`、`/api/agent/runs/stream`）。
+- **文字上限有两种口径**：`/api/ingestion/text` 仍是单段 10000 字（`backend/app/contracts/source.py:123`）；提交给 `/api/agent/runs/stream` 的来源正文合计不按字数封顶，改由开流前的 token 估算判断（`backend/app/agent/contracts.py::AgentRunRequest.sources_within_context` → `generation/service.py::ensure_input_within_context`），装不下就在开流前 422。前端来源面板按 300000 字提示（`frontend/src/sources/input.ts:19`），所以 15000 字随生成请求发出去没问题、直接贴进 `/api/ingestion/text` 仍会被 422 挡下。「来源」总条数上限 50（`AgentRunRequest.sources` 的 `max_length`）。
+- **引用的原文不落库**：`source_refs` 随导图一起保存（`source_id` + `quote` + 可选的页码与字符区间），但 `Source.text` 只活在本次会话的来源列表里（`frontend/src/stores/sources.ts`）。刷新后重新打开导图，节点角标、来源名与 `quote` 还在，抽屉里却没有前后文——界面会显示"原文没有随导图保存"。另外后端**只在生成时校验引用**，保存时不复检，所以手工改过节点文字之后，旧引用可能已经对不上原文。
+- **导出用根节点文字，不是标题**：三种导出取的是根节点的 `_node_text`（`backend/app/export/service.py`，即 `note or label`）。前端“导图标题”和根节点文字是两个独立的输入框，改得不一致时，导出的中心主题会跟标题对不上。
+- **导出取节点正文，不再折进标题**：前端把整棵树原样发出去（`toExportV1()` 与 `toContractV1()` 都已删除），由后端 `backend/app/export/service.py::_node_text` 取 `node.note or node.label`：有正文就导正文，没有才回落短标题。所以导出文件里是完整的正文，不是画布上那句被截断的短标题；三种格式都会把换行压成空格（PUML 另把 `*` 换成 `·`），多行正文不会破坏缩进。
+- **`stages` 不是实时进度**：只有 `/api/agent/tasks` 那个桩返回固定阶段列表。实时进度看 `/api/agent/runs/stream` 的 `stage` / `tool_start` / `tool_end` 帧。
 - **前端还没接的接口**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check` 与 `/suggest`。上传格式白名单目前写死在 `frontend/src/sources/input.ts` 的 `FILE_ACCEPT`，与后端 `formats` 接口有漂移风险；诊断接口已有返回值但界面不渲染（`frontend/src/api/types.ts` 里 `diagnostics` 标注为"目前只用于排障"）。
 - **编辑不记协作方**：保存以整棵树为单位（`version` 乐观锁），没有字段级合并；两个人同时编辑同一张图，后保存的会拿到 409，只能选择覆盖（重新加载）或另存为新导图。
 - **撤销栈只在内存**：刷新页面后撤销历史清空，最多 50 步或 10MB（先到者为准，节点上限提到 1000 后单份快照可能几十 KB，只按步数会涨到几十 MB）；保存不写历史。
@@ -243,7 +240,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 如果只有一个人有余力，按这个顺序：
 
 1. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
-2. **契约 v2 定稿**（RPeGio 与陈嘉涛，见 `docs/HANDOFF.md` 的 H1/H2）：`note` 与 v2 同批上线；layout/theme/relations 再排期。
+2. **v2 的界面渲染**（RPeGio，F09/F10）：契约 v2 两端已落地，缺的是画布的多布局与主题样式渲染；`relations` / `style` / `pos` 目前只落库、没有界面读它们。
 3. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
 4. **上线**（RPeGio，F22，2026-11-10 已出可执行方案）：`deploy/install.sh` 一条命令在 Alibaba Cloud Linux 3 上装完 systemd + nginx + Python 3.12，同源反代因此不需要 CORS，Basic Auth 挡在前面，步骤见 `docs/DEPLOY.md` 第 7 节。**没做**：`Dockerfile` 与 compose——2C2G 上构建 docling+torch 镜像容易 OOM，演示窗口只有一个，容器化等验收后再补。
 

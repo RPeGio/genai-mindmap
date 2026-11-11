@@ -58,6 +58,8 @@ from app.generation.service import (
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
 from app.knowledge.service import search_sources
+from app.optimization.service import check
+from app.optimization.source_refs import annotate_nli
 
 # 与 backend/app/contracts/mindmap.py 的 Node.children max_length 同口径
 MAX_CHILDREN = 50
@@ -209,7 +211,7 @@ class GenerateDeepArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
     # 上限 20 是按契约反推的，不是拍的：最少每支 2 个要点，一个分支占 3 个节点，
-    # 300 节点理论能放 100 支；真正限制它的是可读性——超过二十条一级分支，
+    # 1000 节点理论能放 333 支；真正限制它的是可读性——超过二十条一级分支，
     # 图会宽到没法看。原来的 8 没有任何依据，长材料（比如二十几节的讲义）
     # 天然会有更多一级节点，卡在 8 等于逼模型把不相关的东西塞进同一支。
     branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
@@ -791,10 +793,10 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
 def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
     """把来源拼成 `SOURCED_DETAIL_PROMPT` 约定的 sources 数组。
 
-    必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而
-    `_understand()` 返回的是纯文本合并，里面一个 id 都没有——模型看不见 id
-    就永远写不出合法引用，引用功能等于从来没通。那个函数服务于 pipeline 的
-    限长与 demo 路径，语义不同，不能在这里复用。
+    必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而旧流水线
+    的 `_understand()`（已随 `app/pipeline/` 删除）返回的是纯文本合并，里面一个
+    id 都没有——模型看不见 id 就永远写不出合法引用，引用功能等于从来没通。那种
+    形态服务于限长与 demo 路径，语义不同，不能在这里复用。
 
     用 `ensure_ascii=False`：中文原样传输，模型看到的 token 更少，
     也免得它把 `\\u4e2d` 这种转义当成正文抄进 quote。
@@ -1024,6 +1026,17 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         content, diagnostics = validate_generated_content(raw, sources=sources or None)
     except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
         return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
+
+    # 结构与语义两层复核，原先只长在 `pipeline/service.run()` 的收尾里：
+    #   - `check()` 只看树本身（单子节点、深度上限、同级重名），没有来源也能跑，
+    #     所以对一句话主题的生成同样有效；
+    #   - `annotate_nli()` 要对已通过前两层的引用与原文做语义蕴含打分，没有来源
+    #     就无从比对。未启用时它立刻返回空列表，连 onnxruntime 都不 import，
+    #     照搬即可，不必在调用处再判一次开关。
+    # 诊断只是提示，不影响这棵树能不能用——契约校验在上一步就决定过了。
+    diagnostics.extend(check(content))
+    if sources:
+        diagnostics.extend(annotate_nli(content, sources))
 
     ctx.candidate = content
     ctx.revision += 1

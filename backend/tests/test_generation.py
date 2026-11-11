@@ -9,20 +9,19 @@ from app.contracts.mindmap import MAX_TREE_DEPTH, MAX_TREE_NODES, MindMapContent
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
-    MAX_OUTPUT_TOKENS,
     MIN_BRANCHES,
     SOURCED_DETAIL_PROMPT,
     THINKING_MODELS,
     GenerationError,
-    chat,
+    _demo_content,
     chat_async,
     diagnose_density,
     ensure_input_within_context,
     estimate_input_tokens,
-    generate,
     parse_model_json,
     thinking_block,
     thinking_options,
+    validate_generated_content,
 )
 
 
@@ -54,145 +53,6 @@ def _response_body(tree: dict, finish_reason: str | None = None) -> bytes:
     if finish_reason is not None:
         choice["finish_reason"] = finish_reason
     return json.dumps({"choices": [choice]}).encode()
-
-
-class MockStreamResponse:
-    """模拟 httpx 流式响应：既是上下文管理器，也按块吐字节。"""
-    def __init__(self, data, status_code=200):
-        self.data = data
-        self.status_code = status_code
-        self.request = httpx.Request("POST", "https://example.com/v1/chat/completions")
-    def __enter__(self):
-        return self
-    def __exit__(self, *args):
-        return False
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=self.request,
-                                        response=httpx.Response(self.status_code, request=self.request))
-    def iter_bytes(self):
-        yield self.data
-
-
-class MockClient:
-    """模拟 httpx.Client：记录调用参数，返回预设响应或抛出预设异常。"""
-    def __init__(self, response):
-        self.response = response
-        self.calls = []
-    def __enter__(self):
-        return self
-    def __exit__(self, *args):
-        return False
-    def stream(self, method, url, **kwargs):
-        self.calls.append((method, url, kwargs))
-        if isinstance(self.response, Exception):
-            raise self.response
-        return self.response
-
-
-class GenerationTest(unittest.TestCase):
-    def setUp(self):
-        self.env = patch.dict(os.environ, {"MINDMAP_LLM_MODE": "model", "MINDMAP_LLM_BASE_URL": "https://example.com/v1", "MINDMAP_LLM_MODEL": "test", "MINDMAP_LLM_API_KEY": "not-a-real-key"})
-        self.env.start()
-        self.addCleanup(self.env.stop)
-
-    def use_client(self, response):
-        """把 service 里的 httpx.Client 换成假客户端，返回该 patch 对象。"""
-        patcher = patch("app.generation.service.httpx.Client", return_value=MockClient(response))
-        client_class = patcher.start()
-        self.addCleanup(patcher.stop)
-        return client_class
-
-    @staticmethod
-    def body_of(tree):
-        return json.dumps({"choices": [{"message": {"content": json.dumps(tree)}}]}).encode()
-
-    def test_model_response(self):
-        tree = _tree(3)
-        client_class = self.use_client(MockStreamResponse(self.body_of(tree)))
-        result = generate("测试")
-        self.assertEqual(result.mode, "model")
-        self.assertEqual(result.content.root.label, "测试")
-        self.assertEqual(len(result.content.root.children), 3)
-        self.assertEqual(client_class.call_args.kwargs["timeout"], 600.0)
-        method, url, kwargs = client_class.return_value.calls[0]
-        self.assertEqual(method, "POST")
-        self.assertEqual(url, "https://example.com/v1/chat/completions")
-        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer not-a-real-key")
-
-    def test_invalid_model_response_is_not_treated_as_success(self):
-        self.use_client(MockStreamResponse(b'{"choices":[{"message":{"content":"not json"}}]}'))
-        with self.assertRaises(GenerationError) as raised:
-            generate("测试")
-        self.assertIn("不是符合约定的导图 JSON", str(raised.exception))
-
-    def test_model_cannot_claim_unverified_source_metadata(self):
-        tree = {"title": "测试", "root": {"id": "1", "label": "测试",
-                "source_refs": [{"source_id": "fake", "quote": "编造"}],
-                "children": [{"id": f"b{index}", "label": f"分支{index}", "children": [],
-                              "source_refs": [{"source_id": f"another-fake-{index}",
-                                               "page": -1}]}
-                             for index in range(1, 4)]},
-                "source_usage": [{"source_id": "fake", "kind": "text", "filename": None, "char_count": 3}]}
-        self.use_client(MockStreamResponse(self.body_of(tree)))
-        content = generate("测试").content
-        self.assertEqual(content.source_usage, [])
-        self.assertEqual(content.root.source_refs, [])
-        self.assertEqual([child.source_refs for child in content.root.children],
-                         [[], [], []])
-
-    def test_root_only_tree_is_rejected(self):
-        """光杆根节点不算生成成功：同步接口与流式接口用的是同一个下限。
-
-        下限从 1 提到 3 之后，这条用例的抓手仍然是「一条分支都没有」——
-        它对应的错误文案独立于「分支条数不够」，所以要单独守住。
-        """
-        tree = {"title": "测试", "root": {"id": "1", "label": "测试", "children": []}}
-        self.use_client(MockStreamResponse(self.body_of(tree)))
-        with self.assertRaises(GenerationError) as raised:
-            generate("测试")
-        self.assertIn("没有任何分支", str(raised.exception))
-
-    def test_model_service_http_error_is_reported(self):
-        self.use_client(MockStreamResponse(b"", status_code=503))
-        with self.assertRaises(GenerationError) as raised:
-            generate("测试")
-        self.assertIn("HTTP 503", str(raised.exception))
-
-    def test_model_connection_error_is_reported(self):
-        self.use_client(httpx.ConnectTimeout("连接超时"))
-        with self.assertRaises(GenerationError) as raised:
-            generate("测试")
-        self.assertIn("无法连接模型服务或请求超时", str(raised.exception))
-
-    def test_oversized_model_response_is_rejected(self):
-        self.use_client(MockStreamResponse(b"x" * 2_000_001))
-        with self.assertRaises(GenerationError) as raised:
-            generate("测试")
-        self.assertIn("模型响应过大", str(raised.exception))
-
-    def test_request_carries_explicit_output_token_limit(self):
-        """必须显式给 max_tokens，且取到服务端实测接受的最大值。
-
-        服务端默认 8192；实测 12106 字材料 → 13243 token 输出，16384 只剩
-        3000 余量。DeepSeek 接受 max_tokens=65536（HTTP 200），按每节点约
-        25 token 算装得下 2600 个节点，高于契约允许的 1000 个——所以输出上限
-        不再是内容被截断的原因，真被截断时由 finish_reason=length 明确报错。
-        """
-        tree = _tree(3)
-        client_class = self.use_client(MockStreamResponse(self.body_of(tree)))
-        generate("测试")
-        _, _, kwargs = client_class.return_value.calls[0]
-        payload = json.loads(kwargs["content"])
-        self.assertEqual(payload["max_tokens"], MAX_OUTPUT_TOKENS)
-        self.assertGreaterEqual(MAX_OUTPUT_TOKENS, 65536)
-
-    def test_explicit_max_tokens_still_wins(self):
-        """调用方显式指定时以调用方为准，便于个别短请求省钱。"""
-        client_class = self.use_client(MockStreamResponse(self.body_of(_tree(3))))
-        chat("系统", "用户", max_tokens=512)
-        _, _, kwargs = client_class.return_value.calls[0]
-        self.assertEqual(json.loads(kwargs["content"])["max_tokens"], 512)
 
 
 class MockAsyncStreamResponse:
@@ -257,11 +117,6 @@ class FinishReasonTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return client_class
 
-    def use_sync_client(self, response):
-        patcher = patch("app.generation.service.httpx.Client", return_value=MockClient(response))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def test_chat_async_rejects_truncated_output(self):
         """finish_reason=length：抛错，绝不把补全括号后的半棵树当成功。"""
         self.use_async_client(MockAsyncStreamResponse(_response_body(self.TREE, "length")))
@@ -280,13 +135,6 @@ class FinishReasonTest(unittest.TestCase):
         self.use_async_client(MockAsyncStreamResponse(_response_body(self.TREE, "stop")))
         result = asyncio.run(chat_async("系统", "用户"))
         self.assertEqual(result["root"]["label"], "测试")
-
-    def test_chat_also_rejects_truncated_output(self):
-        """同步路径口径必须一致：同一个响应体不能一个入口拒、另一个入口收。"""
-        self.use_sync_client(MockStreamResponse(_response_body(self.TREE, "length")))
-        with self.assertRaises(GenerationError) as raised:
-            chat("系统", "用户")
-        self.assertIn("截断", str(raised.exception))
 
 
 class ContextBudgetTest(unittest.TestCase):
@@ -351,19 +199,11 @@ class ContextBudgetTest(unittest.TestCase):
         with self.assertRaises(GenerationError):
             ensure_input_within_context(text, limit=1050, extra_tokens=100)
 
-    def test_chat_refuses_oversized_input_before_the_request_goes_out(self):
-        """超限的请求不该先花一次网络往返、再拿回一个 400。"""
-        env = {"MINDMAP_LLM_MODE": "model", "MINDMAP_LLM_BASE_URL": "https://example.com/v1",
-               "MINDMAP_LLM_MODEL": "test", "MINDMAP_LLM_API_KEY": "not-a-real-key"}
-        with patch.dict(os.environ, env), \
-             patch("app.generation.service.httpx.Client") as client:
-            with self.assertRaises(GenerationError) as raised:
-                chat("系统", _oversized())
-        client.assert_not_called()
-        self.assertIn("超过模型上下文上限", str(raised.exception))
-
     def test_chat_async_refuses_oversized_input_before_the_request_goes_out(self):
-        """工具内部的生成 / 展开走 chat_async，这条出口必须守同一道边界。"""
+        """超限的请求不该先花一次网络往返、再拿回一个 400。
+
+        agent 的工具（生成 / 展开 / 编辑）全走这条出口，它是唯一的一道输入边界。
+        """
         env = {"MINDMAP_LLM_MODE": "model", "MINDMAP_LLM_BASE_URL": "https://example.com/v1",
                "MINDMAP_LLM_MODEL": "test", "MINDMAP_LLM_API_KEY": "not-a-real-key"}
         with patch.dict(os.environ, env), \
@@ -431,23 +271,11 @@ class BranchFloorTest(unittest.TestCase):
 
     下限是**质量**要求而不是合法性要求：`MindMapContent.validate_tree()` 不加这道
     门槛，旧图和用户手工删到一条分支的图照常能存能开；demo 也显式跳过。
+
+    门槛住在 `validate_generated_content()` 里，agent 的 `mindmap_generate` 收尾
+    走的就是它，所以这里直接对那个函数断言——经由一条已经删掉的同步出口去测，
+    测到的只会是那条出口有没有接上它，而不是门槛本身。
     """
-
-    def setUp(self):
-        self.env = patch.dict(os.environ, {
-            "MINDMAP_LLM_MODE": "model",
-            "MINDMAP_LLM_BASE_URL": "https://example.com/v1",
-            "MINDMAP_LLM_MODEL": "test",
-            "MINDMAP_LLM_API_KEY": "not-a-real-key",
-        })
-        self.env.start()
-        self.addCleanup(self.env.stop)
-
-    def use_tree(self, tree):
-        patcher = patch("app.generation.service.httpx.Client",
-                        return_value=MockClient(MockStreamResponse(GenerationTest.body_of(tree))))
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def test_single_branch_is_rejected(self):
         """一条分支就是一条链，不是层次结构。
@@ -455,9 +283,8 @@ class BranchFloorTest(unittest.TestCase):
         文案必须可操作：说清模型给了几条、要求几条，并给出「换一种说法」或
         「补充材料」这两条出路，而不是干巴巴一句「不合格」。
         """
-        self.use_tree(_tree(1))
         with self.assertRaises(GenerationError) as raised:
-            generate("测试")
+            validate_generated_content(_tree(1))
         message = str(raised.exception)
         self.assertIn("分支", message)
         self.assertIn("1 条", message)
@@ -465,24 +292,31 @@ class BranchFloorTest(unittest.TestCase):
         self.assertIn("补充更多材料", message)
 
     def test_two_branches_are_rejected(self):
-        self.use_tree(_tree(2))
         with self.assertRaises(GenerationError) as raised:
-            generate("测试")
+            validate_generated_content(_tree(2))
         self.assertIn("2 条", str(raised.exception))
 
+    def test_root_only_tree_is_rejected(self):
+        """光杆根节点与「分支不够」是两种文案：前者连层次都没有。"""
+        tree = {"title": "测试", "root": {"id": "1", "label": "测试", "children": []}}
+        with self.assertRaises(GenerationError) as raised:
+            validate_generated_content(tree)
+        self.assertIn("没有任何分支", str(raised.exception))
+
     def test_three_branches_pass(self):
-        self.use_tree(_tree(3))
-        result = generate("测试")
-        self.assertEqual(len(result.content.root.children), 3)
-        # 密度诊断不进 GenerateResponse：既有 diagnostics 断言不能改口径。
-        self.assertEqual(result.diagnostics, [])
+        content, diagnostics = validate_generated_content(_tree(3))
+        self.assertEqual(len(content.root.children), 3)
+        # 密度诊断不在这条出口里：它只是提示，由调用方（agent 的生成收尾）决定要不要带。
+        self.assertEqual(diagnostics, [])
 
     def test_demo_single_child_placeholder_still_passes(self):
-        """demo 是固定占位结构，本来就只有一个子节点，不该被模型质量门槛打回。"""
-        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "demo"}):
-            result = generate("测试")
-        self.assertEqual(result.mode, "demo")
-        self.assertEqual(len(result.content.root.children), 1)
+        """demo 是固定占位结构，本来就只有一个子节点，不该被模型质量门槛打回。
+
+        demo 出口（agent 的 run）从不经过这道校验，仍是显式关掉它更接近真实调用。
+        """
+        content, _ = validate_generated_content(
+            _demo_content("测试").model_dump(), enforce_min_branches=False)
+        self.assertEqual(len(content.root.children), 1)
 
     def test_contract_still_accepts_a_single_branch_tree(self):
         """契约校验不设分支下限：旧图与手工编辑后的图必须照常能存能开。"""

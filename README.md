@@ -120,7 +120,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 后端
 
-FastAPI + Pydantic v2，8 组路由、19 个端点统一挂在 `/api` 下。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `knowledge/search` 与 `agent/tasks` 两个桩），没有返回 501 的路由。模型调用集中在 `backend/app/generation/` 与 `backend/app/agent/`：默认 `demo` 模式不联网，设 `MINDMAP_LLM_MODE=model` 后才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`。生成结果不自动保存，保存是带版本号的乐观锁（冲突返回 409）。
+FastAPI + Pydantic v2，6 组路由（14 个路径 / 16 个端点）统一挂在 `/api` 下。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `knowledge/search` 与 `agent/tasks` 两个桩），没有返回 501 的路由。模型调用集中在 `backend/app/agent/` 的工具循环（`mindmap_generate` / `mindmap_generate_deep` / `node_expand` / `rag_query` / `mindmap_edit`，`POST /api/agent/runs/stream` 是生成与编辑的唯一入口）与 `backend/app/generation/` 的底层 `chat_async`：设 `MINDMAP_LLM_MODE=demo` 时不联网、直接发占位树（agent 不把"没配置"默认降级成 demo，缺省则缺模型配置会报错），设 `model` 才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`。生成结果不自动保存：先落候选、用户接受后进画布，再显式保存（带版本号的乐观锁，冲突返回 409）。
 
 ### 核心模块开发
 
