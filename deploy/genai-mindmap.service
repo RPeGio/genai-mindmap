@@ -10,8 +10,12 @@ User=genai
 Group=genai
 WorkingDirectory=/opt/genai-mindmap/backend
 
-# 密钥等运行时配置放在这里，仓库里不存（install.sh 会创建，权限 0640 root:genai）
-EnvironmentFile=-/etc/genai-mindmap/env
+# 密钥等运行时配置放在这里，仓库里不存（install.sh 会创建，权限 0640 root:genai）。
+# 这里刻意不写 `-` 前缀：带 `-` 时文件缺失只是静默跳过，于是 MINDMAP_DB_PATH 回落到
+# 代码目录下的 backend/data（被 ProtectSystem=strict 挂成只读），MINDMAP_LLM_* 也全是空，
+# 表现为"服务起来了、一保存就 500"或者生成直接报错。宁可启动失败并给出明确的
+# "Failed to load environment files"，也不要一个看起来正常的坏服务。
+EnvironmentFile=/etc/genai-mindmap/env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 # 下面这条不只是整洁：docling 第一次解析 docx/pptx 会下载版面模型到
@@ -30,15 +34,24 @@ ExecStart=/opt/genai-mindmap/.venv/bin/uvicorn app.main:app \
     --no-server-header --timeout-keep-alive 65
 Restart=always
 RestartSec=3
-TimeoutStopSec=20
+# 生成预算最长 600 秒（RunBudget.max_seconds），停服务的宽限必须比它大：
+# 设成 20 秒等于每次重启都腰斩正在跑的生成，前端只看到断流。
+# 代价是 `systemctl restart` 可能等上十来分钟；急停用
+# `systemctl kill -s SIGKILL genai-mindmap`（见 docs/DEPLOY.md 7.7）。
+TimeoutStopSec=660
 KillSignal=SIGINT
+
+# /var/log/genai-mindmap 由 systemd 自己建（LogsDirectory），别再手写
+# ReadWritePaths 指向一个不存在的目录——那样 systemd 会以 226/NAMESPACE 直接拒绝启动。
+LogsDirectory=genai-mindmap
+LogsDirectoryMode=0750
 
 # 只允许写数据目录与临时目录；代码目录只读
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/genai-mindmap /var/log/genai-mindmap
+ReadWritePaths=/var/lib/genai-mindmap
 
 StandardOutput=journal
 StandardError=journal

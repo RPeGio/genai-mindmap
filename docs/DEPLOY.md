@@ -197,14 +197,29 @@ sudo dnf install -y git
 git clone https://github.com/RPeGio/genai-mindmap.git   # 默认就是 main
 cd genai-mindmap
 ls deploy/          # 能看到 install.sh / nginx.conf 才算对
-git describe --tags # 应该看到 v0.4.0-deploy 或更新的 tag
 ```
 
-想先把还没进 `main` 的改动放上去试用，再显式 `-b dev`（或某个特性分支）；试完记得切回 `main`，别让机器长期停在集成分支上——否则"线上跑的是什么"会说不清。
+**国内 ECS 上 `git clone` 大概率连不上 GitHub**（`OpenSSL SSL_connect: SSL_ERROR_SYSCALL` 或 `Connection timed out`，22 与 443 都一样），这不是仓库权限问题，是出口被拦。三条出路，按省事程度排：
 
-拉错了不用重来：`git switch main && git pull`。
+1. **本机打 tar 包再 scp**（最稳，不依赖服务器出网）：
 
-没有外网 git 访问时，本机 `git archive -o mindmap.tar.gz HEAD` 后 `scp` 上传，再 `tar -xf` 也行。
+   ```bash
+   # 本机：从要部署的 tag 导出（自动排除 .git / node_modules）
+   git archive --format=tar.gz -o genai-mindmap.tar.gz v0.4.0-deploy
+   scp genai-mindmap.tar.gz root@<ECS_IP>:/root/
+
+   # 服务器
+   mkdir -p /root/genai-mindmap && tar -xzf /root/genai-mindmap.tar.gz -C /root/genai-mindmap
+   cd /root/genai-mindmap && ls deploy/    # 有 install.sh 就对了
+   ```
+
+   注意 `git archive` 只导出被 git 跟踪的文件，`deploy/` 在仓库里，所以肯定在包里；`frontend/dist` 不在仓库里，按 7.4 单独传。
+
+2. **在服务器上挂代理**再 clone：`export https_proxy=http://<你的代理>:<端口>`，前提是这台机器能连到代理。
+
+3. **走镜像前缀**（例如 `https://ghfast.top/https://github.com/RPeGio/genai-mindmap.git`）。镜像可用性随时会变，只当临时手段；`git remote set-url origin` 记得改回官方地址。
+
+想先把还没进 `main` 的改动放上去试用，再显式 `-b dev`（或某个特性分支）；试完记得切回 `main`，别让机器长期停在集成分支上——否则"线上跑的是什么"会说不清。生产机上不建议 `git switch` 来回切：`/opt` 里的代码是 `install.sh` 解包过去的，不是 git 工作区（回滚见第 8 节）。
 
 ### 7.2 一条命令装完
 
@@ -220,10 +235,12 @@ sudo bash deploy/install.sh --domain mindmap.example.com
 |---|---|
 | 1 | `dnf` 装 nginx / htpasswd / sqlite / 编译基础件 |
 | 2 | 没有 swap 就加 2G（2G 内存解析 PDF、装 torch 都要余量） |
-| 3 | 建 `genai` 系统用户；代码到 `/opt/genai-mindmap`；数据到 `/var/lib/genai-mindmap`；`/etc/genai-mindmap/env` 权限 0640 |
-| 4 | 用 `uv` 装独立 CPython 3.12（避开系统 python3.6）并建 venv、装 `backend/requirements.txt` |
+| 3 | 建 `genai` 系统用户；代码到 `/opt/genai-mindmap`；数据到 `/var/lib/genai-mindmap`；`/etc/genai-mindmap/env` 权限 0640；覆盖前把当前代码快照到 `/var/lib/genai-mindmap/releases/`（保留 5 份，回滚用） |
+| 4 | 用 `uv` 装独立 CPython 3.12（避开系统 python3.6）并建 venv、装 `backend/requirements.txt`（默认走阿里云 PyPI 镜像） |
 | 5 | 装 systemd 单元并启动（只 1 个 worker，理由见下） |
-| 6 | 装 nginx 站点配置、生成 Basic Auth 账号 `demo`（随机密码只打印一次）、放行 SELinux 反代、装每日备份 cron |
+| 6 | 装 nginx 站点配置（IPv6 关闭时只监听 v4）、生成 Basic Auth 账号 `demo`（随机密码只打印一次）、放行 SELinux 反代与静态目录上下文、装每日备份 cron |
+
+重复执行是安全的，但有两处**故意不覆盖**：`/etc/genai-mindmap/env`（密钥）与 `/etc/nginx/.htpasswd-mindmap`（账号密码）。
 
 ### 7.3 填密钥（运行时注入，不进仓库）
 
@@ -242,12 +259,16 @@ sudo journalctl -u genai-mindmap -n 30 --no-pager
 ```powershell
 cd frontend
 npm run build
+# 发布前把服务器上现有 dist 留一份，回滚前端时直接换回来
+ssh root@<ECS_IP> "cd /opt/genai-mindmap/frontend && rm -rf dist.prev && cp -a dist dist.prev"
 scp -r dist/* root@<ECS_IP>:/opt/genai-mindmap/frontend/dist/
 ```
 
 ```bash
-ssh root@<ECS_IP> "chmod -R a+rX /opt/genai-mindmap/frontend/dist && nginx -s reload"
+ssh root@<ECS_IP> "chmod -R a+rX /opt/genai-mindmap/frontend/dist && restorecon -R /opt/genai-mindmap/frontend/dist && nginx -s reload"
 ```
+
+`restorecon` 这一步别省：`scp` 上来的文件带着父目录的 SELinux 类型，nginx 读不到时只报 403。
 
 `dist` 里没有 `?sample=` 的示例代码——那是 `import.meta.env.DEV` 分支，构建时已被摇掉。
 
@@ -256,8 +277,12 @@ ssh root@<ECS_IP> "chmod -R a+rX /opt/genai-mindmap/frontend/dist && nginx -s re
 ```bash
 sudo dnf install -y epel-release
 sudo dnf install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d mindmap.example.com --redirect
+# 只用 certonly --webroot：签发与配置分开，重跑 install.sh 不会把 HTTPS 冲掉
+sudo certbot certonly --webroot -w /var/www/html -d mindmap.example.com
+sudo bash deploy/install.sh --domain mindmap.example.com   # 检测到证书后自动写 443 块并让 80 跳转
 ```
+
+`certbot renew` 由 `certbot-renew.timer` 负责续期；续期只换证书文件，nginx 配置不需要动。
 
 没有域名时只能 `http://IP`：能用，但浏览器的录音、剪贴板 API 在非安全上下文会被拦，演示语音与"复制全文"会失败。
 
@@ -285,18 +310,27 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 
 加演示账号：`sudo htpasswd /etc/nginx/.htpasswd-mindmap alice`。
 
+**重启会等正在跑的生成**：单元里 `TimeoutStopSec=660`（生成预算是 600 秒），所以有长请求在跑时 `systemctl restart` 可能等到十来分钟。演示前别在有人用的时候重启；确实要立刻停，用
+`sudo systemctl kill -s SIGKILL genai-mindmap && sudo systemctl start genai-mindmap`（代价是那条请求直接断，前端看到断流）。
+
 ### 7.8 故障对照表
 
 | 现象 | 多半是 |
 |---|---|
 | 502 Bad Gateway | 后端没起来或崩了：`systemctl status genai-mindmap`、`journalctl -u genai-mindmap -n 50` |
-| 403 Forbidden（页面本身） | `dist` 权限（`chmod -R a+rX`）或 SELinux 不让 nginx 读 `/opt` |
+| 服务起不来，`status` 里写 `226/NAMESPACE` | 单元里 `ReadWritePaths` 指向了不存在的目录（`/var/log/genai-mindmap`）。现在改成 systemd 的 `LogsDirectory` 自己建，旧单元升级时重跑一次 `install.sh` 即可 |
+| 服务起不来，journal 里 `Failed to load environment files` | 这是**故意的**：单元里的 `EnvironmentFile` 没有 `-` 前缀，`/etc/genai-mindmap/env` 不在就拒绝启动。填好该文件（至少 `MINDMAP_DB_PATH` 与 `MINDMAP_LLM_*`）再启动 |
+| 403 Forbidden（页面本身） | 两层：文件权限（`chmod -R a+rX .../dist`）与 SELinux 上下文（`/opt` 下默认是 `usr_t`，nginx 读不了；`install.sh` 会 `semanage fcontext -t httpd_sys_content_t` + `restorecon`，手工传 dist 之后要再跑一次） |
+| nginx 起不来，error.log 里 `bind() to [::]:80 failed` | 机器把 IPv6 关了，配置里却还有 `listen [::]:80`。`install.sh` 现在按 `/proc/sys/net/ipv6/conf/all/disable_ipv6` 决定写不写这行——注意 `nginx -t` 只查语法，**查不出 bind 失败**，必须是 `systemctl restart nginx` 之后看 `status` 才算数 |
+| 重跑过安装脚本后 HTTPS 没了 | 旧版脚本用 `certbot --nginx` 把 443 写进 `conf.d`，又被下一次 `install.sh` 用模板覆盖。现在用 `certbot certonly --webroot` 只签发，443 由 `deploy/nginx-tls.conf` 渲染，重跑不会丢 |
 | 413 Request Entity Too Large | 上传超过 nginx 的 `client_max_body_size 24m` |
 | 504 但后端日志还在打印 | 生成超过 `proxy_read_timeout`；已设 900s，仍超时说明 `MINDMAP_LLM_*` 指向的模型太慢 |
 | 点了生成一直转圈、最后一次性出图 | SSE 被缓冲：确认 `location /api/` 里有 `proxy_buffering off` |
 | 偶发 `database is locked` | 起了多个 worker 或多个 uvicorn 实例；SQLite 只能一个写者 |
 | 上传 PDF 返回 422 说需要密钥 | `MINDMAP_LLM_MODE=demo`，或 `MINDMAP_LLM_*` 没填全 |
 | 页面上 Excel/Word 上传 422 | 没装 `--with-office` 时 `.doc/.ppt` 不可用（`.docx/.xlsx` 不需要 LibreOffice） |
+| `git clone` 报 `SSL_ERROR_SYSCALL` / 443 超时 | 服务器出口连不上 GitHub，见 7.1 的三条出路（tar + scp 最省事） |
+| `uv python install` 或 `uv pip install` 卡住 | 前者从 GitHub 取解释器（用 `UV_PYTHON_INSTALL_MIRROR`），后者默认已走阿里云镜像（`UV_DEFAULT_INDEX` 可改） |
 
 ### 7.9 内存与并发（2C2G 的实话）
 
@@ -306,24 +340,32 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 
 ## 8. 更新已部署的版本
 
-生产机上永远跟 `main`（默认分支），不要跟 `dev`：
+生产机上永远跟 `main`（默认分支），不要跟 `dev`。注意 **`/opt/genai-mindmap` 不是 git 工作区**，它是 `install.sh` 解包过去的一份拷贝——所以在生产机上 `git switch` 只改源码目录，改不到真正在跑的那份代码。正确的做法是"在新源码上跑脚本，脚本负责同步到 `/opt`"：
 
 ```bash
 cd ~/genai-mindmap
 git fetch --tags && git switch main && git pull --ff-only
 git describe --tags            # 记下这次发的版本号，出问题时好回滚
-sudo bash deploy/install.sh --domain mindmap.example.com   # 幂等，只更新代码与配置
+sudo bash deploy/install.sh --domain mindmap.example.com   # 幂等；覆盖 /opt 之前先把旧代码快照到 releases/
 sudo systemctl restart genai-mindmap
 sudo systemctl status genai-mindmap --no-pager
 ```
 
 前端有改动时再走一遍 7.4。改了契约（`backend/app/contracts/`）的那次更新，记得本机先 `pytest` 与 `npm test`——CI 绿了再发。
 
-回滚到上一个 tag：
+某个 tag 要不要发布，也可以在服务器上直接看：`cat /opt/genai-mindmap/DEPLOYED_VERSION` 就是当前这台的版本。
+
+### 回滚
+
+代码回滚走快照（每次 `install.sh` 覆盖前存的那份，保留最近 5 份）：
 
 ```bash
-git switch --detach v0.3.0-contract-v2     # 换成要回退到的版本
+ls -1t /var/lib/genai-mindmap/releases/          # 最新一份在最上
+sudo tar -xzf /var/lib/genai-mindmap/releases/20261111-101500.tar.gz -C /opt/genai-mindmap
+sudo chown -R genai:genai /opt/genai-mindmap
 sudo systemctl restart genai-mindmap
 ```
+
+前端也要跟着回：7.4 发布时如果按建议把旧目录留成 `dist.prev`，`cd /opt/genai-mindmap/frontend && rm -rf dist && mv dist.prev dist`，再 `restorecon -R dist`。
 
 ⚠️ 契约回滚有数据风险：库里一旦有 v2 记录（`schema_version: 2`），退回 v1 的读入路径会被 `extra="forbid"` 拒掉。真要回滚，先备份 `mindmaps.db`，并确认该版本能读现有数据。
