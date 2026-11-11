@@ -138,24 +138,9 @@ fi
 chown root:"$APP_USER" "$ENV_DIR/env"
 chmod 640 "$ENV_DIR/env"
 
-say "4/6 Python 3.12 与依赖（uv 管理，避开系统 python3.6/3.8）"
-if ! command -v uv >/dev/null 2>&1; then
-  # uv 自带下载器，比 pip 快很多；装在 /usr/local/bin 供 genai 用户使用。
-  # 如果 astral.sh 也连不上，改用：curl -L <uv release tar.gz> 解包到 /usr/local/bin。
-  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
-fi
-# uv python install 从 GitHub 取 python-build-standalone；GitHub 直连不通时
-# 用镜像： UV_PYTHON_INSTALL_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
-sudo -u "$APP_USER" env HOME="$OPT_DIR" /usr/local/bin/uv python install 3.12
-if [[ ! -x "$OPT_DIR/.venv/bin/python" ]]; then
-  sudo -u "$APP_USER" env HOME="$OPT_DIR" /usr/local/bin/uv venv --python 3.12 "$OPT_DIR/.venv"
-fi
-# docling 会带进 torch（CPU 版），首次安装 5–10 分钟、占 2GB 左右磁盘。
-# 默认走阿里云 PyPI 镜像，国内 ECS 上比 pypi.org 稳一个数量级；要换回官方源就覆盖 UV_DEFAULT_INDEX。
-UV_INDEX_URL="${UV_DEFAULT_INDEX:-https://mirrors.aliyun.com/pypi/simple}"
-sudo -u "$APP_USER" env HOME="$OPT_DIR" UV_DEFAULT_INDEX="$UV_INDEX_URL" \
-  /usr/local/bin/uv pip install \
-  --python "$OPT_DIR/.venv/bin/python" -r "$OPT_DIR/backend/requirements.txt"
+say "4/6 Python 与依赖（优先系统 3.12/3.11，uv 与清华 conda 镜像作退路）"
+# 单独成脚本，方便装到一半失败时只重跑这一步：sudo bash deploy/setup-python.sh
+OPT_DIR="$OPT_DIR" APP_USER="$APP_USER" bash "$REPO_DIR/deploy/setup-python.sh"
 
 say "5/6 systemd"
 install -m 644 "$REPO_DIR/deploy/genai-mindmap.service" /etc/systemd/system/genai-mindmap.service
