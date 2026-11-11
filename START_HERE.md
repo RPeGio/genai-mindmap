@@ -7,7 +7,7 @@
 - 前端 Vue 3 + TypeScript：文本 / 文档 / 图片 / 录音多来源输入 → 流式或流水线生成 → `@vue-flow/core` 画布（平移、缩放、点选节点看全文，支持向右 / 向左 / 向下 / 双向四种布局）→ 双击改文字 / Tab 加子节点 / Enter 加兄弟 / Delete 删子树 / 撤销重做 / Ctrl+S 保存（`version` 乐观锁，409 时三选弹层）→ 打开已保存导图 → PUML / Markdown / OPML 三种导出 → Agent 面板（候选需点接受才落到画布，旧 React 骨架已打 tag `v0.1.0-react-scaffold` 存档）。
 - 后端 FastAPI：生成接口（同步与 SSE 流式）、结构校验、SQLite 保存和读取、版本冲突检测、多来源流水线（文本 / 文档 / 图片 / 语音）、文档上传（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、`xlrd` 读 `.xls`、百炼 Qwen-Audio-ASR 转写 WAV）、节点级来源引用与三层校验、PUML / Markdown / OPML 导出、Agent 工具循环（`/api/agent/runs/stream`，产物是候选）、统一错误体、基础结构提示。
 - 默认 `demo` 生成固定结构，用于联调，**不会调用 AI**。可配置 Chat Completions 兼容模型服务，实际能力取决于服务商和模型。模型调用尚未在真实密钥环境验收。
-- 尚未实现：知识库检索与持久知识库（`/api/knowledge/search` 是桩）、知识图谱、协作、翻译、模型评估、多布局与主题风格（v2 契约未落地）、容器化部署。图片与语音处理已在 2026-11-05 落地，别再按"尚未实现"处理。
+- 尚未实现：知识库检索与持久知识库（`/api/knowledge/search` 是桩）、知识图谱、协作、翻译、模型评估、多布局与主题风格（v2 契约未落地）、容器化（Docker/compose；线上的 systemd + nginx 方案见 `docs/DEPLOY.md` 第 7 节）。图片与语音处理已在 2026-11-05 落地，别再按"尚未实现"处理。
 - 多来源流水线记录整图来源摘要与节点级引用（`source_refs`，机械核验 + 可选 NLI），都能随导图保存；**界面已能展示引用**：节点右上角显示引用条数，选中后在右侧详情面板列出来源与位置，点一条在抽屉里看原文并高亮命中句。原文不持久化，所以跨会话重新打开只剩生成时记下的摘录。合并后文本超过 20000 字会报错，不会悄悄丢弃内容。
 
 **当前只有本地单用户开发能力，没有登录、授权、访问隔离或生产安全加固，不要直接部署到公网或用于敏感数据。**
@@ -76,4 +76,4 @@ PDF 视觉识别复用上面的 `MINDMAP_LLM_*`，并要求 `MINDMAP_LLM_MODE=mo
 1. RPeGio 与陈嘉涛先共同阅读 [系统架构](docs/ARCHITECTURE.md)、[API 契约](docs/API.md) 和 [CONTRACT_V2](docs/CONTRACT_V2.md)，固定导图 JSON 格式；契约改动必须经 RPeGio 与陈嘉涛双人 review 并附迁移脚本。
 2. 分工按 [执行计划第 11 节](docs/PLAN.md)：RPeGio 负责契约 / Vue 画布 / 布局主题导出 / 部署与 CI，陈嘉涛负责后端地基 / 生成链路 / 多模态解析 / RAG / 诊断。任务与依赖仍以 [功能清单与分工](docs/FEATURES_AND_OWNERS.md) 的 F 编号为准。
 3. RPeGio 与陈嘉涛先在本人电脑跑通生成（R1）→ 画布（R2）→ 编辑与保存（R3）整条链路，再按功能清单实现剩余能力。
-4. 分支：`main` ← `dev` ← `feat/*`·`fix/*`，**PR 目标一律 `dev`**，提交信息用中文 Conventional Commits，PR 模板三问必填；`dev` 每周日合 `main` 并打 tag。CI 必须绿才能合并。
+4. 分支：`main` ← `dev` ← `feat/*`·`fix/*`，**PR 目标一律 `dev`**，提交信息用中文 Conventional Commits，PR 模板三问必填；**`main` 是生产分支**（ECS 上跑的就是它），`dev` 是集成分支，里程碑时 `dev` → `main` 合入并在 `main` 上打 tag（`v0.4.0-deploy` 起）。CI 必须绿才能合并。

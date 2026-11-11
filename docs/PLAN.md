@@ -224,6 +224,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | Q34 | 双人 review **仅**在 fork → 上游 PR 时强制；本仓库 dev 分支的 PR 由提交人自己 review 后合并 | 仓库是 fork，日常产出先落在自己仓库；向上游提 PR 时再走 `CODEOWNERS`，由 RPeGio 与陈嘉涛互相 assign |
 | Q35 | **后端地基压缩**：采纳陈嘉涛在 `NEXT-PLAN.md` 的建议，W1 只做「统一错误体 + `urllib`→`httpx`」两项；SQLAlchemy / Alembic / PostgreSQL 迁移顺延到**验收之后**，v1 继续 `sqlite3` 直连 | RPeGio 2026-11-03 确认。理由：契约 v2 与 ORM 迁移无法在 W2 前同时装进两地排期；错误体与 httpx 已由陈嘉涛在 `027b0c9` 落地。影响：第 3 节架构图中的 PG16、第 5 节验收门第 7 条（compose 五容器含 `db`）同批顺延到验收后，W1–W3 以 SQLite 单文件 + 备份脚本兑现"含数据库"的部署要求 |
 | Q36 | **实时协作（F17）保留，但排期延后**：不设 W2 硬门，W3 有余量再做，无余量则降级为文档说明 | 陈嘉涛倾向实现协作，RPeGio 同意保留该功能（`NEXT-PLAN.md` 原提议"W2 不做协作"不再成立）；协作依赖画布稳定与 save/undo 语义，先做完 R2–R3 再评估余量，避免两条线并行时相互阻塞 |
+| Q37 | **`main` 转为生产分支**：`main` ← `dev` ← `feat/*`；里程碑时 `dev` → `main` 合入并在 `main` 上打 tag，部署与回滚都以 tag 为准，ECS 只跟 `main` | 核心功能（生成、画布、编辑保存、多来源、引用、导出）已打通，需要一个稳定的"线上是什么"的答案；此前 main 与 dev 长期同步推进，无法区分"能演示"与"正在改"。`dev` 保留为集成分支，未验证完的改动不落到生产 |
 
 ## 12 变更记录
 
@@ -239,6 +240,8 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.7 | 2026-11-05 | 语音接口二次切换：ISI 一句话识别 → 百炼 `qwen-audio-3.1-asr-flash`。换来句级时间戳、300 秒单次上限、60 秒音频快 2.8 倍且便宜 3.9 倍；依赖 `websockets` 与 `aliyun-python-sdk-core` 一并移除，`MAX_SLICE_SECONDS` 60 → 300 |
 | v1.8 | 2026-11-06 | 生成链路 Agent 化：受限 tool-calling 循环（四个工具、`RunBudget` 预算）、op 契约与两端共读用例、SSE v2 事件、前端候选确认（`docs/AGENT_PLAN.md`）。`/api/agent/tasks` 仍是桩；F02/F03/F16 转「部分实现」 |
 | v1.9 | 2026-11-07 | 文档对账：功能清单加实现日期、能力与端点按代码现状重写（19 个端点、无 501 路由、`source_refs` 属 v1）、配置项补 6 个变量；`NEXT-PLAN.md` 加日期同步说明 |
+| v1.16 | 2026-11-11 | `main` 转为生产分支（`Q37`）：里程碑 `dev` → `main` + 打 tag，ECS 只跟 `main`；`docs/DEPLOY.md` 第 7.1、8 节按此改写（生产 clone 默认分支、更新走 tag、回滚步骤与契约回滚的数据风险）；`START_HERE.md` 分支规则同步 |
+| v1.15 | 2026-11-10 | ECS 上线骨架（F22 部分实现）：`deploy/install.sh`（Alibaba Cloud Linux 3：dnf 依赖 → swap → `genai` 服务账号与目录 → uv 装 CPython 3.12 与依赖 → systemd → nginx 站点 + Basic Auth + 每日备份 cron）、`deploy/genai-mindmap.service`、`deploy/nginx.conf`（同源反代、SSE 关缓冲、上传 24m、读超时 900s）、`deploy/backup.sh`（`sqlite .backup` 而非 `cp`）、`docs/DEPLOY.md` 第 7、8 节。仍然不做 Docker/compose |
 | v1.14 | 2026-11-10 | 契约类型生成与漂移防线：新增 `backend/scripts/export_openapi.py` 导出 `backend/openapi.json` 快照，`npm run gen:api` 用 openapi-typescript 生成 `frontend/src/api/schema.d.ts`；手写镜像保留，但由 `frontend/src/api/contract-check.ts` 在 `vue-tsc` 期间断言与生成类型一致（键集合 + 抹平可空性后的形状）；`pytest` 增快照过期检查、CI 两个 job 各加"重新生成 + `git diff --exit-code`" |
 | v1.13 | 2026-11-10 | 契约 v2 前端接线（P3 第二步）：详情面板可直接编辑节点正文（`note`，≤2000 字），保存 / 打开 / 导出都按 v2 发，`toContractV1()` 与 `toExportV1()` 删除；朝向（`layout` + `theme.direction`）随内容持久化，重新打开能恢复原布局，向下对应 `layout: vertical`；`relations` / `style` / `pos` / `collapsed` 原样透传不丢。H1 结案（陈嘉涛已在 PR #13 认可） |
 | v1.12 | 2026-11-10 | 契约 v2 在后端落地（P3 第一步）：`schema_version`、`note`、`layout`（新增 `vertical`）、`theme`、`relations`、`style`/`pos`/`collapsed` 进 `backend/app/contracts/mindmap.py`；旧记录读时补默认值（`migrate_content()`），不跑一次性脚本；导出改取 `note or label`；v1 请求体继续接受 |
