@@ -190,11 +190,18 @@ curl -s http://127.0.0.1:8000/api/ingestion/formats
 
 ### 7.1 把代码放上去
 
+**注意默认分支**：仓库的默认分支是 `main`，而最新的开发进度在 `dev`——直接 `git clone` 拿到的是 `main`，可能没有 `deploy/` 这个目录。必须显式指定分支：
+
 ```bash
 sudo dnf install -y git
-git clone https://github.com/RPeGio/genai-mindmap.git
+git clone -b dev https://github.com/RPeGio/genai-mindmap.git
 cd genai-mindmap
+ls deploy/      # 看不到这个目录就说明拉错分支了
 ```
+
+已经拉错了也不用重来：`git switch dev && git pull`。
+
+要跑某个还没合进 `dev` 的改动时，把分支名换成那个特性分支即可（例如 `-b feat/deploy-ecs`），部署完再切回来。
 
 没有外网 git 访问时，本机 `git archive -o mindmap.tar.gz HEAD` 后 `scp` 上传，再 `tar -xf` 也行。
 
