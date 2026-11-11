@@ -190,18 +190,19 @@ curl -s http://127.0.0.1:8000/api/ingestion/formats
 
 ### 7.1 把代码放上去
 
-**注意默认分支**：仓库的默认分支是 `main`，而最新的开发进度在 `dev`——直接 `git clone` 拿到的是 `main`，可能没有 `deploy/` 这个目录。必须显式指定分支：
+**分支约定（2026-11-11 起）：`main` 是生产分支**，ECS 上跑的、对外演示的就是它；`dev` 是集成分支，日常开发合到 `dev`，里程碑时才 `dev` → `main` 并打 tag。所以生产部署直接 clone 默认分支即可：
 
 ```bash
 sudo dnf install -y git
-git clone -b dev https://github.com/RPeGio/genai-mindmap.git
+git clone https://github.com/RPeGio/genai-mindmap.git   # 默认就是 main
 cd genai-mindmap
-ls deploy/      # 看不到这个目录就说明拉错分支了
+ls deploy/          # 能看到 install.sh / nginx.conf 才算对
+git describe --tags # 应该看到 v0.4.0-deploy 或更新的 tag
 ```
 
-已经拉错了也不用重来：`git switch dev && git pull`。
+想先把还没进 `main` 的改动放上去试用，再显式 `-b dev`（或某个特性分支）；试完记得切回 `main`，别让机器长期停在集成分支上——否则"线上跑的是什么"会说不清。
 
-要跑某个还没合进 `dev` 的改动时，把分支名换成那个特性分支即可（例如 `-b feat/deploy-ecs`），部署完再切回来。
+拉错了不用重来：`git switch main && git pull`。
 
 没有外网 git 访问时，本机 `git archive -o mindmap.tar.gz HEAD` 后 `scp` 上传，再 `tar -xf` 也行。
 
@@ -305,10 +306,24 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 
 ## 8. 更新已部署的版本
 
+生产机上永远跟 `main`（默认分支），不要跟 `dev`：
+
 ```bash
-cd ~/genai-mindmap && git pull            # 或重新 scp 一份代码
+cd ~/genai-mindmap
+git fetch --tags && git switch main && git pull --ff-only
+git describe --tags            # 记下这次发的版本号，出问题时好回滚
 sudo bash deploy/install.sh --domain mindmap.example.com   # 幂等，只更新代码与配置
 sudo systemctl restart genai-mindmap
+sudo systemctl status genai-mindmap --no-pager
 ```
 
 前端有改动时再走一遍 7.4。改了契约（`backend/app/contracts/`）的那次更新，记得本机先 `pytest` 与 `npm test`——CI 绿了再发。
+
+回滚到上一个 tag：
+
+```bash
+git switch --detach v0.3.0-contract-v2     # 换成要回退到的版本
+sudo systemctl restart genai-mindmap
+```
+
+⚠️ 契约回滚有数据风险：库里一旦有 v2 记录（`schema_version: 2`），退回 v1 的读入路径会被 `extra="forbid"` 拒掉。真要回滚，先备份 `mindmaps.db`，并确认该版本能读现有数据。
