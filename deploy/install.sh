@@ -221,15 +221,24 @@ chmod 644 /etc/cron.d/genai-mindmap-backup
 
 if [[ $WITH_CERTBOT -eq 1 ]]; then
   say "附带：certbot 签 HTTPS 证书"
-  # AL3 的官方源里没有 certbot，走 EPEL
-  dnf install -y epel-release || true
+  # AL3 的官方源里没有 certbot，走 EPEL。
+  # 注意：AL3 自带 epel-aliyuncs-release（已经提供 epel 仓库），再装 epel-release
+  # 会报 conflict with epel-release provided by ... 那条长错误——不影响后面装 certbot，
+  # 但看起来很吓人，所以两者都没装时才去装。
+  if ! rpm -q epel-release >/dev/null 2>&1 && ! rpm -q epel-aliyuncs-release >/dev/null 2>&1; then
+    dnf install -y epel-release || true
+  fi
   dnf install -y certbot python3-certbot-nginx
   # 用 certonly --webroot：只签发，不动 nginx 配置。
   # 之前用 `certbot --nginx` 会把 443 写进 conf.d 里那个文件，而本脚本每次都按模板
   # 覆盖它，于是"重跑一次安装脚本，HTTPS 就没了"。现在证书与配置分开管理。
   certbot certonly --webroot -w /var/www/html -d "$DOMAIN" \
     --non-interactive --agree-tos --register-unsafely-without-email || {
-      echo "证书签发失败：多半是域名还没解析到本机，或 80 端口没放行。修好后重跑：" >&2
+      echo "证书签发失败。两种原因，按报错内容对号：" >&2
+      echo "  · Timeout during connect / Connection refused：80 端口没对公网放行——" >&2
+      echo "    Let's Encrypt 的校验节点来自各地，安全组里只放行某个 IP 是不够的，要把 80 放到 0.0.0.0/0（签发完可再收紧）" >&2
+      echo "  · NXDOMAIN / DNS problem：域名还没解析到本机" >&2
+      echo "修好后重跑：" >&2
       echo "  certbot certonly --webroot -w /var/www/html -d $DOMAIN" >&2
     }
   systemctl enable --now certbot-renew.timer 2>/dev/null || true
