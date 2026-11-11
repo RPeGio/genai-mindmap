@@ -178,17 +178,17 @@ curl -s http://127.0.0.1:8000/api/health
 curl -s http://127.0.0.1:8000/api/ingestion/formats
 ```
 
-## 7. ECS 上线（Alibaba Cloud Linux 3，2C2G）
+## 9. ECS 上线（Alibaba Cloud Linux 3，2C2G）
 
 目标形态：**nginx 发前端静态文件、`/api/` 反代到本机 uvicorn**，同源，因此不存在 CORS；后端只听 `127.0.0.1:8000`，公网只开 80/443。整个过程约 20–30 分钟，其中装 Python 依赖占大头。
 
-### 7.0 先做三件外部的事
+### 9.0 先做三件外部的事
 
 1. 域名加一条 A 记录指向 ECS 公网 IP（`ping 域名` 要返回该 IP）。
 2. 安全组放行 22、80、443；**不要**放行 8000——后端不该暴露。
 3. 想好用哪份模型密钥（`MINDMAP_LLM_*`）与语音密钥（`DASHSCOPE_API_KEY`，可不配）。
 
-### 7.1 把代码放上去
+### 9.1 把代码放上去
 
 **分支约定（2026-11-11 起）：`main` 是生产分支**，ECS 上跑的、对外演示的就是它；`dev` 是集成分支，日常开发合到 `dev`，里程碑时才 `dev` → `main` 并打 tag。所以生产部署直接 clone 默认分支即可：
 
@@ -213,15 +213,15 @@ ls deploy/          # 能看到 install.sh / nginx.conf 才算对
    cd /root/genai-mindmap && ls deploy/    # 有 install.sh 就对了
    ```
 
-   注意 `git archive` 只导出被 git 跟踪的文件，`deploy/` 在仓库里，所以肯定在包里；`frontend/dist` 不在仓库里，按 7.4 单独传。
+   注意 `git archive` 只导出被 git 跟踪的文件，`deploy/` 在仓库里，所以肯定在包里；`frontend/dist` 不在仓库里，按 9.4 单独传。
 
 2. **在服务器上挂代理**再 clone：`export https_proxy=http://<你的代理>:<端口>`，前提是这台机器能连到代理。
 
 3. **走镜像前缀**（例如 `https://ghfast.top/https://github.com/RPeGio/genai-mindmap.git`）。镜像可用性随时会变，只当临时手段；`git remote set-url origin` 记得改回官方地址。
 
-想先把还没进 `main` 的改动放上去试用，再显式 `-b dev`（或某个特性分支）；试完记得切回 `main`，别让机器长期停在集成分支上——否则"线上跑的是什么"会说不清。生产机上不建议 `git switch` 来回切：`/opt` 里的代码是 `install.sh` 解包过去的，不是 git 工作区（回滚见第 8 节）。
+想先把还没进 `main` 的改动放上去试用，再显式 `-b dev`（或某个特性分支）；试完记得切回 `main`，别让机器长期停在集成分支上——否则"线上跑的是什么"会说不清。生产机上不建议 `git switch` 来回切：`/opt` 里的代码是 `install.sh` 解包过去的，不是 git 工作区（回滚见第 10 节）。
 
-### 7.2 一条命令装完
+### 9.2 一条命令装完
 
 ```bash
 sudo bash deploy/install.sh --domain mindmap.example.com
@@ -242,7 +242,7 @@ sudo bash deploy/install.sh --domain mindmap.example.com
 
 重复执行是安全的，但有两处**故意不覆盖**：`/etc/genai-mindmap/env`（密钥）与 `/etc/nginx/.htpasswd-mindmap`（账号密码）。
 
-### 7.3 填密钥（运行时注入，不进仓库）
+### 9.3 填密钥（运行时注入，不进仓库）
 
 ```bash
 sudo vi /etc/genai-mindmap/env     # MINDMAP_LLM_BASE_URL / API_KEY / MODEL
@@ -252,7 +252,7 @@ sudo journalctl -u genai-mindmap -n 30 --no-pager
 
 `MINDMAP_LLM_MODE` 默认写的是 `model`；只想给人看界面、不烧额度时可以改 `demo`（PDF 视觉提取会退化成文本层）。
 
-### 7.4 发布前端
+### 9.4 发布前端
 
 2C2G 上装 node 再打包要拉几百 MB 依赖，不如本机构建：
 
@@ -272,7 +272,7 @@ ssh root@<ECS_IP> "chmod -R a+rX /opt/genai-mindmap/frontend/dist && restorecon 
 
 `dist` 里没有 `?sample=` 的示例代码——那是 `import.meta.env.DEV` 分支，构建时已被摇掉。
 
-### 7.5 签 HTTPS
+### 9.5 签 HTTPS
 
 ```bash
 sudo dnf install -y epel-release
@@ -286,7 +286,7 @@ sudo bash deploy/install.sh --domain mindmap.example.com   # 检测到证书后�
 
 没有域名时只能 `http://IP`：能用，但浏览器的录音、剪贴板 API 在非安全上下文会被拦，演示语音与"复制全文"会失败。
 
-### 7.6 上线自检
+### 9.6 上线自检
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health                  # 后端活着
@@ -296,7 +296,7 @@ sudo ss -lntup | grep -E ':(80|443|8000)'                 # 8000 只能听 127.0
 
 浏览器里再过一遍：打开页面 → 生成一张导图（要能看到节点**逐步**冒出来，不是转圈转到底）→ 双击改文字 → 保存 → 刷新后能打开 → 上传一份 PDF → 导出 Markdown。
 
-### 7.7 日常运维
+### 9.7 日常运维
 
 ```bash
 sudo systemctl status genai-mindmap
@@ -313,7 +313,7 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 **重启会等正在跑的生成**：单元里 `TimeoutStopSec=660`（生成预算是 600 秒），所以有长请求在跑时 `systemctl restart` 可能等到十来分钟。演示前别在有人用的时候重启；确实要立刻停，用
 `sudo systemctl kill -s SIGKILL genai-mindmap && sudo systemctl start genai-mindmap`（代价是那条请求直接断，前端看到断流）。
 
-### 7.8 故障对照表
+### 9.8 故障对照表
 
 | 现象 | 多半是 |
 |---|---|
@@ -329,16 +329,16 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 | 偶发 `database is locked` | 起了多个 worker 或多个 uvicorn 实例；SQLite 只能一个写者 |
 | 上传 PDF 返回 422 说需要密钥 | `MINDMAP_LLM_MODE=demo`，或 `MINDMAP_LLM_*` 没填全 |
 | 页面上 Excel/Word 上传 422 | 没装 `--with-office` 时 `.doc/.ppt` 不可用（`.docx/.xlsx` 不需要 LibreOffice） |
-| `git clone` 报 `SSL_ERROR_SYSCALL` / 443 超时 | 服务器出口连不上 GitHub，见 7.1 的三条出路（tar + scp 最省事） |
+| `git clone` 报 `SSL_ERROR_SYSCALL` / 443 超时 | 服务器出口连不上 GitHub，见 9.1 的三条出路（tar + scp 最省事） |
 | `uv python install` 或 `uv pip install` 卡住 | 前者从 GitHub 取解释器（用 `UV_PYTHON_INSTALL_MIRROR`），后者默认已走阿里云镜像（`UV_DEFAULT_INDEX` 可改） |
 
-### 7.9 内存与并发（2C2G 的实话）
+### 9.9 内存与并发（2C2G 的实话）
 
 - 空闲常驻约 150–250MB；`docling` 是懒加载，第一次上传 docx/pptx/xlsx/html/md 时会冲高到 600MB–1GB，之后常驻。
 - PDF 逐页视觉识别会并发 8 个请求，但内存主要花在 SSE 连接与图片缓冲上；**同时演示的人数控制在 2–3 人**。
 - 想要更多余量：升到 4G，或把 `MINDMAP_LLM_MODE` 保持 `model` 但避开大 PDF。
 
-## 8. 更新已部署的版本
+## 10. 更新已部署的版本
 
 生产机上永远跟 `main`（默认分支），不要跟 `dev`。注意 **`/opt/genai-mindmap` 不是 git 工作区**，它是 `install.sh` 解包过去的一份拷贝——所以在生产机上 `git switch` 只改源码目录，改不到真正在跑的那份代码。正确的做法是"在新源码上跑脚本，脚本负责同步到 `/opt`"：
 
@@ -351,7 +351,7 @@ sudo systemctl restart genai-mindmap
 sudo systemctl status genai-mindmap --no-pager
 ```
 
-前端有改动时再走一遍 7.4。改了契约（`backend/app/contracts/`）的那次更新，记得本机先 `pytest` 与 `npm test`——CI 绿了再发。
+前端有改动时再走一遍 9.4。改了契约（`backend/app/contracts/`）的那次更新，记得本机先 `pytest` 与 `npm test`——CI 绿了再发。
 
 某个 tag 要不要发布，也可以在服务器上直接看：`cat /opt/genai-mindmap/DEPLOYED_VERSION` 就是当前这台的版本。
 
@@ -366,6 +366,28 @@ sudo chown -R genai:genai /opt/genai-mindmap
 sudo systemctl restart genai-mindmap
 ```
 
-前端也要跟着回：7.4 发布时如果按建议把旧目录留成 `dist.prev`，`cd /opt/genai-mindmap/frontend && rm -rf dist && mv dist.prev dist`，再 `restorecon -R dist`。
+前端也要跟着回：9.4 发布时如果按建议把旧目录留成 `dist.prev`，`cd /opt/genai-mindmap/frontend && rm -rf dist && mv dist.prev dist`，再 `restorecon -R dist`。
 
 ⚠️ 契约回滚有数据风险：库里一旦有 v2 记录（`schema_version: 2`），退回 v1 的读入路径会被 `extra="forbid"` 拒掉。真要回滚，先备份 `mindmaps.db`，并确认该版本能读现有数据。
+
+## 11. 出网受限的 ECS：PyPI 与模型源
+
+有的实例能 `dnf install`（走的是阿里云内网 repo），却连不上 `mirrors.aliyun.com`、`astral.sh`、GitHub——公网出口被安全组或网络策略收紧了。表现是 pip 一直 `Read timed out`、`uv` 报 `curl: (35)`。
+
+先分三步确认出口到底通不通：
+
+```bash
+curl -sI --max-time 8 https://www.baidu.com | head -1                 # 公网一般站点
+curl -sI --max-time 8 http://mirrors.cloud.aliyuncs.com/pypi/simple/ | head -1  # ECS 内网镜像
+getent hosts mirrors.aliyun.com mirrors.cloud.aliyuncs.com
+ip route; cat /etc/resolv.conf
+```
+
+- **只有内网镜像通**：把 PyPI 指向 `http://mirrors.cloud.aliyuncs.com/pypi/simple`（内网、不计公网流量）。`deploy/setup-python.sh` 已经按"公网阿里云 → 内网 → 官方"的顺序自动尝试，不用手改。
+- **全都不通**：去控制台看安全组**出方向**是否还留着"允许全部"，以及实例是否真的绑了公网 IP（只做端口映射、没有默认路由的实例发不出去包）。
+- **DNS 解析不出来**：`/etc/resolv.conf` 改成 `nameserver 100.100.2.136` 与 `100.100.2.138`（阿里云内网 DNS），再试。
+
+公网彻底不通时，两件事要单独安排：
+
+1. **依赖包**：本机 `pip download -r backend/requirements.txt -d wheels/`（Windows 上要加 `--platform manylinux2014_x86_64 --only-binary=:all:`），传上去 `pip install --no-index --find-links wheels/ -r requirements.txt`。
+2. **docling 模型**：首次解析 docx/pptx/pdf 会去 HuggingFace 取版面模型。公网不通就用 `HF_ENDPOINT` 指到可达镜像，或在能上网的机器上把 `~/.cache/docling` 打包带过去，解到 `/var/lib/genai-mindmap/.cache/docling`（服务单元的 `HOME` 就指向那里）。⚠️ 这条没做过端到端验证，纯文本生成与思维导图主流程不受影响，受影响的是文档/PDF 上传。

@@ -13,7 +13,6 @@ set -euo pipefail
 OPT_DIR="${OPT_DIR:-/opt/genai-mindmap}"
 APP_USER="${APP_USER:-genai}"
 VENV="$OPT_DIR/.venv"
-PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple}"
 CONDA_MIRROR="${CONDA_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda}"
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -83,9 +82,31 @@ if [[ ! -x "$VENV/bin/python" ]]; then
     || die "$PYTHON 缺少 venv 模块，先 dnf install -y $PYTHON-devel python3-pip"
 fi
 
-log "安装后端依赖（PyPI 走 ${PIP_INDEX}）"
-sudo -u "$APP_USER" "$VENV/bin/python" -m pip install --upgrade pip -i "$PIP_INDEX" >/dev/null
-sudo -u "$APP_USER" "$VENV/bin/python" -m pip install -i "$PIP_INDEX" -r "$OPT_DIR/backend/requirements.txt"
+# 依次尝试的 PyPI 源：公网阿里云镜像 → ECS 内网镜像 → 官方源。
+# 内网那个（mirrors.cloud.aliyuncs.com）只在 ECS 里解析得到，走内网、不占公网带宽，
+# 公网出不去但 dnf 能装包时，就是它在起作用。
+PIP_INDEXES="${PIP_INDEXES:-https://mirrors.aliyun.com/pypi/simple http://mirrors.cloud.aliyuncs.com/pypi/simple https://pypi.org/simple}"
+
+pip_install() { # $@ = pip install 的其余参数
+  local idx host
+  for idx in $PIP_INDEXES; do
+    host="$(printf '%s' "$idx" | awk -F/ '{print $3}')"
+    log "尝试 PyPI 源：$idx"
+    if [[ "$idx" == http://* ]]; then
+      sudo -u "$APP_USER" "$VENV/bin/python" -m pip install \
+        --timeout 20 --retries 1 --trusted-host "$host" -i "$idx" "$@" && return 0
+    else
+      sudo -u "$APP_USER" "$VENV/bin/python" -m pip install \
+        --timeout 20 --retries 1 -i "$idx" "$@" && return 0
+    fi
+    log "这个源不通，换下一个"
+  done
+  return 1
+}
+
+log "安装后端依赖"
+pip_install --upgrade pip >/dev/null 2>&1 || log "pip 自升级失败，继续用自带版本"
+pip_install -r "$OPT_DIR/backend/requirements.txt" || die "所有 PyPI 源都连不上，见 docs/DEPLOY.md 第 11 节"
 
 "$VENV/bin/python" -V
 echo "Python 依赖就绪：$VENV"

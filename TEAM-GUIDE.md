@@ -242,7 +242,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 1. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
 2. **v2 的界面渲染**（RPeGio，F09/F10）：契约 v2 两端已落地，缺的是画布的多布局与主题样式渲染；`relations` / `style` / `pos` 目前只落库、没有界面读它们。
 3. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
-4. **上线**（RPeGio，F22，2026-11-10 已出可执行方案）：`deploy/install.sh` 一条命令在 Alibaba Cloud Linux 3 上装完 systemd + nginx + Python 3.12，同源反代因此不需要 CORS，Basic Auth 挡在前面，步骤见 `docs/DEPLOY.md` 第 7 节。**没做**：`Dockerfile` 与 compose——2C2G 上构建 docling+torch 镜像容易 OOM，演示窗口只有一个，容器化等验收后再补。
+4. **上线**（RPeGio，F22，2026-11-10 已出可执行方案）：`deploy/install.sh` 一条命令在 Alibaba Cloud Linux 3 上装完 systemd + nginx + Python 3.12，同源反代因此不需要 CORS，Basic Auth 挡在前面，步骤见 `docs/DEPLOY.md` 第 9 节。**没做**：`Dockerfile` 与 compose——2C2G 上构建 docling+torch 镜像容易 OOM，演示窗口只有一个，容器化等验收后再补。
 
 已完成：**把引用搬到界面上**（F08，2026-11-07，`fc8f82f`）——节点右上角显示引用条数，选中后在右侧详情面板列出来源名与位置（`第 19–37 字`，有页码时一并给出），点一条在抽屉里看原文并把命中句标黄；原文不落库，跨会话只剩生成时记下的 `quote`。
 

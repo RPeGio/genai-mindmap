@@ -10,7 +10,7 @@
 # 由本机 `npm run build` 后 scp 上来，脚本最后会打印目标路径。
 #
 # 脚本可重复执行：目录存在就跳过、配置覆盖、密码不重设。覆盖配置之前会把当前
-# 代码快照到 /var/lib/genai-mindmap/releases/，回滚时直接从那里解包（见 DEPLOY 第 8 节）。
+# 代码快照到 /var/lib/genai-mindmap/releases/，回滚时直接从那里解包（见 DEPLOY 第 10 节）。
 set -euo pipefail
 
 DOMAIN=""
