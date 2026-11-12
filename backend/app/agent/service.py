@@ -508,6 +508,16 @@ async def run(
 
         if not completion.tool_calls:
             if completion.finish_reason == "stop":
+                # 模型一句"好的"就收工、一个工具都没调：接口层会正常返回 done，
+                # 前端只能显示"模型这次没有产出导图"，看不出模型到底说了什么。
+                # 把它的原话记进日志（截断），下次这类空结果才有得查。
+                if ctx.candidate is None:
+                    said = str(completion.message.get("content") or "").strip()
+                    _log_failure(
+                        ctx, tool_calls, code="no_tool_call",
+                        message=f"模型没有调用任何工具就结束，原话：{said[:200] or '（空回复）'}",
+                        level=logging.WARNING,
+                    )
                 yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
                                 mode="model")
             else:

@@ -146,7 +146,10 @@ def test_tool_failure_logs_reason_and_usage_without_material_or_tree(caplog):
     end = next(event for event in events if event.type == "tool_end")
     assert end.result_summary["code"] == "invalid_map"
     assert end.result_summary["message"] == "引用与原文不匹配"
-    assert _failure_logs(caplog) == [{
+    # 这一轮最后是一句 stop 且没有候选，循环会额外记一条 no_tool_call 的诊断
+    # （见 service.py 里那段注释）；这里只关心工具失败那一条。
+    tool_failures = [e for e in _failure_logs(caplog) if e["code"] != "no_tool_call"]
+    assert tool_failures == [{
         "call_id": "failure-1", "tool": "echo", "code": "invalid_map",
         "message": "引用与原文不匹配", "model_calls_used": 2, "tool_calls_used": 1,
     }]
