@@ -48,4 +48,4 @@ htmlcov/
 
 # AI Agent contracts
 AGENTS.md
-genai-mindmap.tar.gz
+*.gz
