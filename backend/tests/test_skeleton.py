@@ -80,6 +80,20 @@ class SkeletonTest(unittest.TestCase):
         status, raw = request("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertIn(b'"status":"ok"', raw)
+        # 版本号必须在，页面标题旁显示的就是它；本机跑源码时是 dev。
+        self.assertIn(b'"version"', raw)
+
+    def test_app_version_follows_env(self):
+        """`MINDMAP_VERSION` 由 install.sh 写进环境变量；没配时回落 dev。
+
+        写死一个版本号会让本机看起来也像发布版，所以空值必须是 `dev`。
+        """
+        from app.main import _app_version
+
+        with patch.dict(os.environ, {"MINDMAP_VERSION": "v0.4.7"}):
+            self.assertEqual(_app_version(), "v0.4.7")
+        with patch.dict(os.environ, {"MINDMAP_VERSION": "   "}):
+            self.assertEqual(_app_version(), "dev")
 
     def test_text_source_round_trips_through_a_saved_map(self):
         """文本来源解析出的摘要能随导图一起存取。

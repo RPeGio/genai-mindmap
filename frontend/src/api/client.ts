@@ -65,6 +65,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+// ---- 基础服务 ----
+
+/**
+ * 后端自己报的版本。线上由 `deploy/install.sh` 写进 `MINDMAP_VERSION`，
+ * 本机跑源码时是 `dev`——页面标题旁显示它，用来确认域名上跑的是哪一次部署。
+ */
+export interface Health {
+  status: string;
+  version: string;
+}
+
+export function getHealth(): Promise<Health> {
+  return request<Health>('/health');
+}
+
 // ---- 保存与打开 ----
 
 /** 已保存的导图列表（不含筛选，按更新时间倒序由后端决定）。 */

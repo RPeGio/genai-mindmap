@@ -47,6 +47,15 @@ function stubFetch(handler: (call: Call) => Response | Promise<Response>) {
         body: init?.body,
         headers: init?.headers,
       };
+      // 页面挂载时会探一次 /api/health 取版本号。它和这里的业务断言无关，
+      // 单独答掉且不计入 calls——否则"只发了一个请求"这类断言会被它带偏。
+      if (call.url.endsWith('/health')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'ok', version: 'test' }),
+        } as unknown as Response;
+      }
       calls.push(call);
       return handler(call);
     }),

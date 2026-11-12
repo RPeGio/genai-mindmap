@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "生成式 AI 思维导图",
-    "version": "0.2.0"
+    "version": "dev"
   },
   "paths": {
     "/api/mindmaps": {

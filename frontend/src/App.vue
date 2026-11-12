@@ -6,7 +6,7 @@ import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
 import SourceInputs from './components/SourceInputs.vue';
 import { SOURCE_LABELS } from './sources/input';
-import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
+import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, type ExportFormat } from './api/client';
 import type { SampleMap } from './dev/samples';
 import { displayBody, useMindMapStore } from './stores/mindmap';
 import { useSourcesStore } from './stores/sources';
@@ -39,6 +39,17 @@ const copied = ref('');
  */
 const notice = ref<{ kind: 'ok' | 'error'; text: string } | null>(null);
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 后端自报的版本号（线上是 tag，本机是 dev）；拉不到就是空串。 */
+const appVersion = ref('');
+
+/** 标题旁那个小徽章：tag 自带 `v` 前缀，别显示成 `vv0.4.7`；dev 就写 dev。 */
+const versionLabel = computed(() => {
+  const raw = appVersion.value.trim();
+  if (!raw) return '';
+  if (raw === 'dev') return 'dev';
+  return /^v/i.test(raw) ? raw : `v${raw}`;
+});
 
 function flash(kind: 'ok' | 'error', text: string): void {
   if (noticeTimer) clearTimeout(noticeTimer);
@@ -212,7 +223,24 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onMounted(() => {
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('beforeunload', onBeforeUnload);
+  void loadVersion();
 });
+
+/**
+ * 后端版本号，显示在标题旁。
+ *
+ * 拉不到就留空：版本号是装潢，不该因为它让页面多一个错误提示——用户真正
+ * 关心的是"域名上跑的是不是刚部署的那份"，而后端不可用时页面本来也做不了事。
+ */
+async function loadVersion() {
+  try {
+    // 有些测试替身会回一个不带 version 的对象，这里统一收敛成字符串：
+    // 徽章是装潢，不能因为字段缺失把整个页面带崩。
+    appVersion.value = String((await getHealth())?.version ?? '');
+  } catch {
+    appVersion.value = '';
+  }
+}
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
@@ -254,6 +282,11 @@ async function copyBody() {
     <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-2">
       <div class="flex items-center gap-3">
         <h1 class="text-sm font-semibold">生成式 AI 思维导图</h1>
+        <span
+          v-if="versionLabel"
+          class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-500"
+          :title="`后端版本 ${appVersion}`"
+        >{{ versionLabel }}</span>
         <div v-if="samples.length" class="flex items-center gap-1 text-xs text-slate-500">
           <span class="mr-1">布局示例</span>
           <button

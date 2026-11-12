@@ -16,11 +16,16 @@ set -euo pipefail
 DOMAIN=""
 WITH_OFFICE=0
 WITH_CERTBOT=0
+# 部署的版本号。用 `git archive` 打的包没有 .git，`git describe` 拿不到 tag，
+# 这时必须显式给：--version v0.4.7。它会写进环境变量，/api/health 原样带出，
+# 页面标题旁显示同一个值——"域名上跑的是不是刚部署的那份"一眼可辨。
+VERSION=""
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain) DOMAIN="${2:-}"; shift 2 ;;
+    --version) VERSION="${2:-}"; shift 2 ;;
     --with-office) WITH_OFFICE=1; shift ;;
     --with-certbot) WITH_CERTBOT=1; shift ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
@@ -137,6 +142,19 @@ else
 fi
 chown root:"$APP_USER" "$ENV_DIR/env"
 chmod 640 "$ENV_DIR/env"
+
+# 版本号也要落进环境变量：/api/health 原样带出，页面上显示的就是这一次部署的
+# 版本。每次都覆盖——只在首次写的话，重新部署后页面还挂着旧版本号，比没有更误导。
+if [[ -z "$VERSION" ]]; then
+  VERSION="$(cat "$OPT_DIR/DEPLOYED_VERSION" 2>/dev/null || true)"
+fi
+VERSION="${VERSION:-unknown}"
+if grep -q '^MINDMAP_VERSION=' "$ENV_DIR/env"; then
+  sed -i "s|^MINDMAP_VERSION=.*|MINDMAP_VERSION=$VERSION|" "$ENV_DIR/env"
+else
+  printf 'MINDMAP_VERSION=%s\n' "$VERSION" >> "$ENV_DIR/env"
+fi
+echo "版本号：$VERSION（页面标题旁显示 v$VERSION）"
 
 say "4/6 Python 与依赖（优先系统 3.12/3.11，uv 与清华 conda 镜像作退路）"
 # 单独成脚本，方便装到一半失败时只重跑这一步：sudo bash deploy/setup-python.sh

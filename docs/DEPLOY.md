@@ -224,10 +224,16 @@ ls deploy/          # 能看到 install.sh / nginx.conf 才算对
 ### 9.2 一条命令装完
 
 ```bash
-sudo bash deploy/install.sh --domain mindmap.example.com
+sudo bash deploy/install.sh --domain mindmap.example.com --version v0.4.7
 # 需要 .doc/.ppt（LibreOffice，+1.5GB）时加 --with-office
 # 想让脚本顺便签证书时加 --with-certbot
 ```
+
+`--version` 只影响一处：它把 `MINDMAP_VERSION` 写进 `/etc/genai-mindmap/env`，后端
+`/api/health` 会原样返回，页面标题旁的小徽章显示的就是这个值。用 `git archive` 打的包里
+没有 `.git`，脚本自己 `git describe` 拿不到 tag，所以**打包/部署时要显式传它**；不传则
+回落到 `/opt/genai-mindmap/DEPLOYED_VERSION`，再回落到 `unknown`。看到徽章写着 `unknown`
+就说明这次没传版本号，而不是部署失败。
 
 脚本做六件事，都可重复执行：
 
@@ -345,11 +351,18 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 ```bash
 cd ~/genai-mindmap
 git fetch --tags && git switch main && git pull --ff-only
-git describe --tags            # 记下这次发的版本号，出问题时好回滚
-sudo bash deploy/install.sh --domain mindmap.example.com   # 幂等；覆盖 /opt 之前先把旧代码快照到 releases/
+VERSION=$(git describe --tags)      # 记下这次发的版本号，出问题时好回滚
+sudo bash deploy/install.sh --domain mindmap.example.com --version "$VERSION"   # 幂等；覆盖 /opt 之前先把旧代码快照到 releases/
 sudo systemctl restart genai-mindmap
 sudo systemctl status genai-mindmap --no-pager
 ```
+
+发完刷新页面，标题旁徽章应变成刚传的 `$VERSION`；没变就是前端没重新发布（9.4）或后端没重启。
+
+两条版本来源要说清：`/opt/genai-mindmap/DEPLOYED_VERSION` 是脚本从源码目录 `git describe --tags`
+自动写的（tar 包里没有 `.git` 时它是空的），`--version` 写的是 env 里的 `MINDMAP_VERSION`。
+不带 `--version` 重跑时会退回读 `DEPLOYED_VERSION`，再退回 `unknown`——所以在 tar 部署的机器上
+**每次都传 `--version`**，否则徽章会停在 `unknown`。
 
 前端有改动时再走一遍 9.4。改了契约（`backend/app/contracts/`）的那次更新，记得本机先 `pytest` 与 `npm test`——CI 绿了再发。
 

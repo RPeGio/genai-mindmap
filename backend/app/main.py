@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,7 +11,20 @@ from app.knowledge.router import router as knowledge_router
 from app.mindmaps.router import router as mindmap_router
 from app.optimization.router import router as optimization_router
 
-app = FastAPI(title="生成式 AI 思维导图", version="0.2.0")
+def _app_version() -> str:
+    """线上版本号。
+
+    由 `deploy/install.sh` 从被打包的 tag 写进 `MINDMAP_VERSION`（systemd 的
+    EnvironmentFile），/api/health 原样带出，页面标题旁显示同一个值——这样
+    "域名上跑的是不是刚部署的那份"不用登服务器就能判断。
+
+    本机跑源码时没有这个变量，回落 `dev`：写死一个版本号只会让人以为本地也
+    是发布版。
+    """
+    return os.getenv("MINDMAP_VERSION", "").strip() or "dev"
+
+
+app = FastAPI(title="生成式 AI 思维导图", version=_app_version())
 # 所有错误出口统一成 {code, message, detail, request_id}，见 app/core/errors.py
 register_error_handlers(app)
 app.add_middleware(

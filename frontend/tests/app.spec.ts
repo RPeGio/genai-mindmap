@@ -46,6 +46,16 @@ function mountApp() {
   return mount(App, { global: { plugins: [createPinia()] } });
 }
 
+/**
+ * 只数业务请求。
+ *
+ * 页面挂载时会探一次 `/api/health` 取版本号；断言"不该发请求"的用例关心的是
+ * 生成、保存这类业务请求，把它算进去只会得到一个假失败。
+ */
+function apiCalls(fetchMock: ReturnType<typeof vi.fn>) {
+  return fetchMock.mock.calls.filter(([url]) => !String(url).endsWith('/health'));
+}
+
 /** 左侧输入区也有一个 textarea，按标签定位详情面板里的正文框。 */
 const NOTE_TEXTAREA = 'textarea[aria-label="节点正文"]';
 
@@ -71,7 +81,7 @@ describe('App', () => {
 
     await buttonByText(wrapper, '生成导图').trigger('click');
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(apiCalls(fetchMock)).toHaveLength(0);
     // 提示必须点明是哪个框：用户把主题写进「导图标题」再点生成，界面毫无动静。
     expect(wrapper.get('[role="status"]').text()).toContain('「输入主题或文本」');
   });
@@ -158,7 +168,7 @@ describe('App', () => {
     await vi.waitFor(() => expect(buttonByText(wrapper, '单节点')).toBeTruthy());
     await buttonByText(wrapper, '单节点').trigger('click');
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(apiCalls(fetchMock)).toHaveLength(0);
     expect(wrapper.text()).toContain('1 个节点');
     expect(wrapper.text()).toContain('演示模式');
   });
@@ -423,5 +433,44 @@ describe('正文编辑', () => {
 
     expect((wrapper.find(NOTE_TEXTAREA).element as HTMLTextAreaElement).value).toBe('原来的正文');
     expect(store.content?.root.children[0].note).toBe('原来的正文');
+  });
+});
+
+describe('版本徽章', () => {
+  function stubHealth(body: unknown) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => body }) as unknown as Response),
+    );
+  }
+
+  it('标题旁显示后端版本号，tag 的 v 前缀不会重复', async () => {
+    stubHealth({ status: 'ok', version: 'v0.4.7' });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('v0.4.7');
+    expect(wrapper.text()).not.toContain('vv0.4.7');
+  });
+
+  it('本机 dev 版原样显示 dev', async () => {
+    stubHealth({ status: 'ok', version: 'dev' });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('dev');
+  });
+
+  it('后端连不上时不显示徽章，也不额外报错', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('offline');
+      }),
+    );
+    const wrapper = mountApp();
+    await flushPromises();
+
+    expect(wrapper.find('header').text()).not.toContain('dev');
   });
 });
