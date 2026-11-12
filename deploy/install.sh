@@ -154,7 +154,7 @@ if grep -q '^MINDMAP_VERSION=' "$ENV_DIR/env"; then
 else
   printf 'MINDMAP_VERSION=%s\n' "$VERSION" >> "$ENV_DIR/env"
 fi
-echo "版本号：$VERSION（页面标题旁显示 v$VERSION）"
+echo "版本号：$VERSION（页面标题旁原样显示这个值；带不带 v 前缀都行）"
 
 say "4/6 Python 与依赖（优先系统 3.12/3.11，uv 与清华 conda 镜像作退路）"
 # 单独成脚本，方便装到一半失败时只重跑这一步：sudo bash deploy/setup-python.sh
@@ -163,7 +163,27 @@ OPT_DIR="$OPT_DIR" APP_USER="$APP_USER" bash "$REPO_DIR/deploy/setup-python.sh"
 say "5/6 systemd"
 install -m 644 "$REPO_DIR/deploy/genai-mindmap.service" /etc/systemd/system/genai-mindmap.service
 systemctl daemon-reload
-systemctl enable --now genai-mindmap
+systemctl enable genai-mindmap
+# 必须 restart 而不是 enable --now：服务已在跑时 --now 什么也不做，进程里还是上一版代码，
+# 于是 /opt 换了、健康检查却仍报旧版本号（v0.4.7 部署时踩过）。
+systemctl restart genai-mindmap
+
+# 等它起来并核对版本号；起不来就把 journal 里的关键行打出来，别让人去猜。
+health=""
+for _ in $(seq 1 20); do
+  health="$(curl -fsS --max-time 2 http://127.0.0.1:8000/api/health 2>/dev/null || true)"
+  [[ -n "$health" ]] && break
+  sleep 1
+done
+if [[ -z "$health" ]]; then
+  printf '服务没有在 20 秒内响应 /api/health，最近日志：\n'
+  journalctl -u genai-mindmap -n 20 --no-pager || true
+  die "后端启动失败，先按上面日志修，再重跑本脚本"
+fi
+printf '健康检查：%s\n' "$health"
+if [[ "$health" != *"$VERSION"* ]]; then
+  printf '⚠️ 健康检查里的版本号与 --version %s 不一致（多半是 env 里的 MINDMAP_VERSION 没生效）\n' "$VERSION"
+fi
 
 say "6/6 nginx"
 mkdir -p /etc/nginx/conf.d /var/www/html

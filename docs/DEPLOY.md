@@ -357,7 +357,11 @@ sudo systemctl restart genai-mindmap
 sudo systemctl status genai-mindmap --no-pager
 ```
 
-发完刷新页面，标题旁徽章应变成刚传的 `$VERSION`；没变就是前端没重新发布（9.4）或后端没重启。
+发完刷新页面，标题旁徽章应变成刚传的 `$VERSION`；没变就是前端没重新发布（9.4）。
+
+`install.sh` 第 5 步会 `systemctl restart` 并轮询 `/api/health`：**旧版只做 `enable --now`，
+服务已在跑时它什么都不做**，于是 `/opt` 换成新代码、进程里还是旧代码，健康检查一直报旧版本
+（v0.4.7 第一次部署就是这么卡住的）。现在起不来会直接把 journal 最后 20 行打出来。
 
 两条版本来源要说清：`/opt/genai-mindmap/DEPLOYED_VERSION` 是脚本从源码目录 `git describe --tags`
 自动写的（tar 包里没有 `.git` 时它是空的），`--version` 写的是 env 里的 `MINDMAP_VERSION`。
