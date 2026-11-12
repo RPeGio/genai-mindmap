@@ -79,9 +79,12 @@ class ScriptedProvider:
     def __init__(self, script: list[Any]) -> None:
         self._script = list(script)
         self.calls = 0
+        # 记下每次看到的 messages，用来断言"提醒"确实发给了模型
+        self.seen: list[list[dict[str, Any]]] = []
 
     async def complete_tools(self, messages, tools, *, budget):
         self.calls += 1
+        self.seen.append([dict(message) for message in messages])
         if not self._script:
             raise AssertionError("脚本已用完，循环比预期多调了一次模型")
         item = self._script.pop(0)
@@ -281,15 +284,23 @@ def test_repair_budget_logs_both_the_tool_failure_and_the_stop_reason(caplog):
 
 class BasicFlowTest(unittest.TestCase):
     def test_stop_without_tools_ends_with_done(self):
-        """模型直接给文字收尾：只发 done，不发工具事件。"""
-        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry("create"))
+        """模型直接给文字收尾：只发 done，不发工具事件。
+
+        整轮零工具调用会先被提醒一次，所以脚本给两段文字：提醒之后仍然只写字，
+        循环就认了——这时的行为才是这条用例要固定的"只发 done"。
+        """
+        events = _collect(
+            _request(), ScriptedProvider([_completion(), _completion()]), build_registry("create")
+        )
         types = [event.type for event in events]
         self.assertEqual(types, ["stage", "done"])
         self.assertEqual(events[-1].content, None)  # create 且没有快照
 
     def test_seq_is_continuous_from_one(self):
         """seq 必须从 1 连续递增：前端靠它判断丢帧和乱序。"""
-        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry("create"))
+        events = _collect(
+            _request(), ScriptedProvider([_completion(), _completion()]), build_registry("create")
+        )
         self.assertEqual([event.seq for event in events], [1, 2])
 
     def test_tool_result_is_filled_back_by_call_id(self):
@@ -1004,6 +1015,52 @@ class SourcesContextTest(unittest.TestCase):
             )
         self.assertIn("超过模型上下文上限", str(raised.exception))
         self.assertIn("请精简后重试，或分成多次生成", str(raised.exception))
+
+# ---------------------------------------------------------------------------
+# 模型只用文字回答、没调工具：先提醒一次，再不行才认
+# ---------------------------------------------------------------------------
+
+
+def _candidate_handler(args, ctx):
+    ctx.candidate = MindMapContent.model_validate(TREE)
+    return ToolResult(ok=True, content="ok", data={"content": TREE})
+
+
+def test_nudges_once_when_model_answers_in_text(caplog):
+    """线上实测的形态：模型把导图说明成一段文字，一条工具调用都没有。
+
+    这时不该直接给用户一个空结果，而是明确要求它走工具再试一轮。
+    """
+    provider = ScriptedProvider([
+        _completion(content="Rust 的学习路线大致是：基础语法、所有权、并发……", finish="stop"),
+        _completion([ToolCall(call_id="gen-1", name="echo", arguments={"text": "生成"})],
+                    finish="tool_calls"),
+        _completion(),
+    ])
+    events = _collect(_request(), provider, _registry(_candidate_handler))
+    done = next(event for event in events if event.type == "done")
+    assert done.content is not None, "提醒之后模型改走了工具，结果不该是空的"
+    assert [_e.name for _e in events if _e.type == "tool_start"] == ["echo"]
+    assert provider.calls == 3
+    # 第二次请求里必须能看到那句提醒，否则模型没有理由改变做法
+    nudge = provider.seen[1][-1]
+    assert nudge["role"] == "user" and "必须调用" in nudge["content"]
+    assert any("no_tool_call" in json.loads(r.args[0])["code"] for r in caplog.records
+               if r.name == "app.agent.service")
+
+
+def test_gives_up_after_one_nudge(caplog):
+    """提醒过还是只写字，就认：返回空结果，别在演示里反复空转额度。"""
+    provider = ScriptedProvider([
+        _completion(content="好的", finish="stop"),
+        _completion(content="还是文字", finish="stop"),
+    ])
+    events = _collect(_request(), provider, _registry(_candidate_handler))
+    done = next(event for event in events if event.type == "done")
+    assert done.content is None
+    assert provider.calls == 2, "只该提醒一次，不该无限重试"
+    logged = [json.loads(r.args[0]) for r in caplog.records if r.name == "app.agent.service"]
+    assert [entry["code"] for entry in logged] == ["no_tool_call", "no_tool_call"]
 
 
 if __name__ == "__main__":

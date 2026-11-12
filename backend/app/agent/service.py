@@ -51,6 +51,10 @@ logger = logging.getLogger(__name__)
 # 校验异常可能带上模型输出，日志只需足够定位的摘要，不能随材料或树的大小增长。
 MAX_LOG_MESSAGE_CHARS = 500
 
+# 模型把工具当"可选"、直接用文字回答时，最多再提醒几次。
+# 只提醒一次：推理型模型被叫一次通常就改走工具了，叫不动的话继续空转只会烧额度。
+MAX_NUDGES = 1
+
 
 class AgentPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -138,6 +142,21 @@ def _refresh_outline(messages: list[dict[str, Any]], ctx: RunContext) -> None:
     光大纲就把上下文吃满了。
     """
     messages[0] = {"role": "system", "content": _system_text(ctx.request, ctx.candidate)}
+
+
+def _nudge_text(registry: ToolRegistry) -> str:
+    """模型只用文字回答、没调工具时的提醒。
+
+    推理型模型（实测 `deepseek-flash`）会把工具理解成"需要时再用"，于是把导图
+    直接说成一段文字，接口层只能返回空结果。提醒必须把要求说死：走工具、别用
+    文字描述内容、现在就调。
+    """
+    names = "、".join(registry.names()) or "可用工具"
+    return (
+        "你刚才没有调用任何工具，只写了文字，这次结果里没有任何导图。"
+        f"现在必须调用 {names} 把导图作为工具参数提交："
+        "不要用文字描述导图内容，也不要解释你要怎么做，直接发出工具调用。"
+    )
 
 
 def _dedupe_key(call: ToolCall) -> str:
@@ -456,6 +475,7 @@ async def run(
     started = time.monotonic()
     tool_calls = 0
     failures = 0
+    nudges = 0
     usage_total: dict[str, Any] = {}
     last_call: ToolCall | None = None
 
@@ -518,6 +538,14 @@ async def run(
                         message=f"模型没有调用任何工具就结束，原话：{said[:200] or '（空回复）'}",
                         level=logging.WARNING,
                     )
+                    if nudges < MAX_NUDGES and tool_calls == 0:
+                        # 整轮一个工具都没调过、也没有产出：这是模型把导图当"作文"
+                        # 写了。把要求说死再给它一次机会；已经调过工具才开始写字的
+                        # 情况不在此列（那是它可以收尾的形态，提醒只会打乱节奏）。
+                        # 只提醒一次，叫不动就认，不在演示里空烧额度。
+                        nudges += 1
+                        messages.append({"role": "user", "content": _nudge_text(registry)})
+                        continue
                 yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
                                 mode="model")
             else:
