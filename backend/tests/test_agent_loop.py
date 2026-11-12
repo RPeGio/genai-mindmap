@@ -303,6 +303,40 @@ class BasicFlowTest(unittest.TestCase):
         )
         self.assertEqual([event.seq for event in events], [1, 2])
 
+    def test_text_only_failure_carries_the_model_words(self):
+        """没产出导图时，done 帧要带上模型的原话与思考。
+
+        线上出现过"模型只写字、不调工具"：那时接口层只有一帧 done，`journalctl`
+        里也未必捞得到告警，页面上唯一能说清原因的就是这两个字段。
+        """
+        said = Completion(
+            message={
+                "role": "assistant",
+                "content": "导图大概是：机器学习分监督和无监督……",
+                "reasoning_content": "看到 mindmap_generate 了，但直接说更简单。",
+            },
+            finish_reason="stop",
+        )
+        events = _collect(_request(), ScriptedProvider([said, said]), build_registry("create"))
+
+        self.assertEqual(events[-1].type, "done")
+        self.assertIsNone(events[-1].content)
+        self.assertIn("机器学习分监督和无监督", events[-1].text)
+        self.assertIn("直接说更简单", events[-1].reasoning)
+
+    def test_successful_result_does_not_carry_model_text(self):
+        """有产出时不带原话：那是正常结果，不需要把整篇输出塞进事件流。"""
+        snapshot = MindMapContent(**TREE)
+        events = _collect(
+            AgentRunRequest(goal="扩一下", intent="create", snapshot=snapshot),
+            ScriptedProvider([_completion(), _completion()]),
+            build_registry("create"),
+        )
+        self.assertEqual(events[-1].type, "done")
+        self.assertIsNotNone(events[-1].content)
+        self.assertEqual(events[-1].text, "")
+        self.assertEqual(events[-1].reasoning, "")
+
     def test_tool_result_is_filled_back_by_call_id(self):
         """工具结果要按 tool_call_id 回填，且下一轮能看到它。"""
         seen_messages: list[list[dict]] = []

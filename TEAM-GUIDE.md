@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-10）：后端 488 个测试（pytest，另有 19 个 subtest）、前端 358 个 vitest 用例（23 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-13）：后端 493 个测试（pytest，另有 19 个 subtest）、前端 365 个 vitest 用例（24 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -96,7 +96,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               488 个测试（另有 19 个 subtest）
+  tests/               493 个测试（另有 19 个 subtest）
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -117,7 +117,7 @@ frontend/
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
     stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               358 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent）
+  tests/               365 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度

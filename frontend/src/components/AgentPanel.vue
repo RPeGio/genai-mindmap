@@ -137,6 +137,22 @@ const hiddenPreview = computed(() => previewTotal.value - previewRows.value.leng
 const canAccept = computed(() => store.candidate !== null && !store.agentRunning);
 
 /**
+ * 收尾那一帧带回来的模型原话（后端只在没产出导图时填）。
+ *
+ * 取最后一个 `done`：一轮里可能有多帧，只有最后一帧是"这次结束的样子"。
+ */
+const modelText = computed(() => {
+  const events = store.agentEvents;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event.type !== 'done') continue;
+    if (!event.text && !event.reasoning) return null;
+    return { text: event.text ?? '', reasoning: event.reasoning ?? '' };
+  }
+  return null;
+});
+
+/**
  * 结果不完整的证据：partial 标记单独摆在标题行，诊断逐条列 message。
  *
  * 后端在 `ok=true` 的同时给出这些信息，界面只认 ok 的话，「3 个分支失败」
@@ -199,6 +215,26 @@ function cancel() {
     <p v-if="store.agentError" role="alert" class="mt-2 leading-relaxed text-rose-700">
       {{ store.agentError }}
     </p>
+
+    <!-- 模型只回了文字、没产出导图：把它的原话摆出来。线上排障时日志未必捞得到，
+         这里是唯一能看到"它到底说了什么"的地方。 -->
+    <div
+      v-if="modelText"
+      role="status"
+      class="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 leading-relaxed text-amber-900"
+    >
+      <p class="font-medium">模型这次只回了文字，没有调用工具</p>
+      <p v-if="modelText.text" class="mt-1 whitespace-pre-wrap break-words text-[11px]">
+        {{ modelText.text }}
+      </p>
+      <p v-else class="mt-1 text-[11px]">（回复里没有正文）</p>
+      <details v-if="modelText.reasoning" class="mt-1">
+        <summary class="cursor-pointer text-[11px] text-slate-500">模型当时在想什么</summary>
+        <p class="mt-1 whitespace-pre-wrap break-words text-[11px] text-slate-500">
+          {{ modelText.reasoning }}
+        </p>
+      </details>
+    </div>
 
     <!-- 部分完成与诊断：放在候选上方，用户先看到"这棵树不完整"，再决定接不接受。 -->
     <div

@@ -55,6 +55,9 @@ MAX_LOG_MESSAGE_CHARS = 500
 # 只提醒一次：推理型模型被叫一次通常就改走工具了，叫不动的话继续空转只会烧额度。
 MAX_NUDGES = 1
 
+# 推给界面的模型原话上限：这是排障用的摘要，不是把整篇输出搬进事件流。
+MODEL_TEXT_LIMIT = 4000
+
 
 class AgentPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -157,6 +160,10 @@ def _nudge_text(registry: ToolRegistry) -> str:
         f"现在必须调用 {names} 把导图作为工具参数提交："
         "不要用文字描述导图内容，也不要解释你要怎么做，直接发出工具调用。"
     )
+
+
+def _clip(text: str, limit: int = MODEL_TEXT_LIMIT) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _dedupe_key(call: ToolCall) -> str:
@@ -531,8 +538,9 @@ async def run(
                 # 模型一句"好的"就收工、一个工具都没调：接口层会正常返回 done，
                 # 前端只能显示"模型这次没有产出导图"，看不出模型到底说了什么。
                 # 把它的原话记进日志（截断），下次这类空结果才有得查。
+                said = str(completion.message.get("content") or "").strip()
+                reasoning = str(completion.message.get("reasoning_content") or "").strip()
                 if ctx.candidate is None:
-                    said = str(completion.message.get("content") or "").strip()
                     _log_failure(
                         ctx, tool_calls, code="no_tool_call",
                         message=f"模型没有调用任何工具就结束，原话：{said[:200] or '（空回复）'}",
@@ -546,8 +554,13 @@ async def run(
                         nudges += 1
                         messages.append({"role": "user", "content": _nudge_text(registry)})
                         continue
-                yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
-                                mode="model")
+                yield DoneEvent(
+                    seq=next(seq), content=ctx.candidate, usage=usage_total, mode="model",
+                    # 没产出时把原话带上：页面上直接能看到模型说了什么，排障不用
+                    # 登服务器翻 journalctl。有产出就不填，那是正常结果。
+                    text="" if ctx.candidate is not None else _clip(said),
+                    reasoning="" if ctx.candidate is not None else _clip(reasoning),
+                )
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
                 _log_failure(ctx, tool_calls, code="unexpected_finish", message=message)

@@ -346,6 +346,14 @@ class DoneEvent(_EventBase):
     # 缺省 None 而不是 "model"：没填的帧就是"没说"，把它默认成模型产出会让
     # 占位树继续冒充满分答案——缺省值只该表示未知。
     mode: Literal["demo", "model"] | None = None
+    # 收尾这一轮模型说的话（都在 MODEL_TEXT_LIMIT 内截断），**只在没产出导图时填**。
+    #
+    # 线上出现过"模型只写字、一个工具都不调"：那时 content 是 None，前端只能显示
+    # "模型这次没有产出导图"，而 journalctl 里未必捞得到日志（级别、输出去向都
+    # 可能让它消失）。把原话挂在这一帧上，页面上就能直接看到它到底说了什么。
+    # 有产出时不填：那属于正常结果，不需要把整篇输出塞进事件流。
+    text: str = ""
+    reasoning: str = ""
 
 
 class ErrorEvent(_EventBase):

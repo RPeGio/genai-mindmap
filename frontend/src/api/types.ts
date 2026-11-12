@@ -310,5 +310,13 @@ export type AgentEvent =
        * 是没填 mode 的旧版本——那是"没说"，不是"模型"。
        */
       mode?: 'demo' | 'model' | null;
+      /**
+       * 收尾这一轮模型说的话，**只在没产出导图时**由后端填（已截断）。
+       *
+       * 线上出现过"模型只写字、不调工具"，那时只有这一帧能说明原因；页面上
+       * 直接显示，排障不用登服务器翻日志。
+       */
+      text?: string;
+      reasoning?: string;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
