@@ -404,3 +404,68 @@ ip route; cat /etc/resolv.conf
 
 1. **依赖包**：本机 `pip download -r backend/requirements.txt -d wheels/`（Windows 上要加 `--platform manylinux2014_x86_64 --only-binary=:all:`），传上去 `pip install --no-index --find-links wheels/ -r requirements.txt`。
 2. **docling 模型**：首次解析 docx/pptx/pdf 会去 HuggingFace 取版面模型。公网不通就用 `HF_ENDPOINT` 指到可达镜像，或在能上网的机器上把 `~/.cache/docling` 打包带过去，解到 `/var/lib/genai-mindmap/.cache/docling`（服务单元的 `HOME` 就指向那里）。⚠️ 这条没做过端到端验证，纯文本生成与思维导图主流程不受影响，受影响的是文档/PDF 上传。
+
+## 12. 自动化部署（GitHub Actions → ECS）
+
+手动传 tar 的问题不是麻烦，而是**动作没有记录**：谁传的、传的哪个 tag、有没有漏传前端
+dist，全靠人记。`.github/workflows/deploy.yml` 把这件事交给 CI：**打 tag 就发布**，发布
+完用 `/api/health` 的版本号自检，对不上直接让 job 红。
+
+### 12.1 一次性配置
+
+在 GitHub 仓库的 *Settings → Secrets and variables → Actions* 里加四个 secret：
+
+| secret | 值 | 说明 |
+|---|---|---|
+| `ECS_HOST` | `47.119.154.142` | 公网 IP，不要填内网地址 |
+| `ECS_USER` | `root` | 需要能 `sudo`；想更保守就建专用用户并只给它 `install.sh` 的 sudo 权限 |
+| `ECS_SSH_KEY` | 部署用私钥全文 | 生成方式见下，**不要**复用你登录用的那把 |
+| `ECS_DOMAIN` | `genai-mindmap.rpegio.top` | 自检要访问它，必须能从公网解析 |
+| `ECS_PORT` | `22`（可省） | 改过 SSH 端口才需要 |
+
+部署专用密钥（本机执行，公钥追加到服务器 `~/.ssh/authorized_keys`）：
+
+```bash
+ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/deploy_key -N ""
+ssh-copy-id -i ~/.ssh/deploy_key.pub root@47.119.154.142   # 或在 Workbench 里手工追加
+gh secret set ECS_SSH_KEY < ~/.ssh/deploy_key              # 私钥交给 GitHub，不进仓库
+```
+
+安全组要放行**入方向 22**，来源只能是 `0.0.0.0/0`——GitHub 托管 runner 的出口 IP 是
+一组不断变化的大网段（`https://api.github.com/meta` 的 `actions` 字段），阿里云安全组
+规则条数放不下。因此这台机器要按"公网可达的 SSH"来对待：
+
+1. `sshd` 关掉密码登录（`PasswordAuthentication no`、`PermitRootLogin prohibit-password`）；
+2. 装 `fail2ban`（`dnf install -y epel-release fail2ban`，默认 sshd 规则即可）；
+3. 部署私钥只存在 GitHub secret 里，泄了就删掉对应 `authorized_keys` 行再换一把。
+
+> 另一条路是"服务器主动拉"，但这台机器连不上 GitHub（第 11 节），runner 也跑不起来，
+> 所以只能由 Actions 推。这不是偏好，是出口被收紧后的唯一解。
+
+### 12.2 日常发布
+
+```bash
+git switch main && git pull --ff-only
+git tag -a v0.4.8-deploy -m "v0.4.8: 这次改了什么"
+git push origin v0.4.8-deploy     # ← 这一步触发部署
+gh run watch                      # 看着它跑完
+```
+
+job 里依次做：`npm ci && npm run build` 出 dist → `git archive` 出源码包 → scp 两个包到
+`/tmp` → 解包到 `~/genai-mindmap` → `install.sh --domain … --version <tag>`（会同步 `/opt`、
+重启服务、把旧代码快照进 `releases/`）→ 替换前端 `dist`（旧的留成 `dist.prev`）→
+`nginx -s reload` → 请求 `https://<域名>/api/health` 比对版本号。
+
+跑完刷新页面，标题旁徽章应显示这次的 tag；不显示或显示旧值，就看 job 日志里自检那一步
+（版本不一致会让 job 直接失败，不会"绿着但没生效"）。
+
+### 12.3 回滚
+
+用 `workflow_dispatch` 指定一个旧 tag 重跑即可（tag 必须存在）：
+
+```bash
+gh workflow run deploy.yml -f version=v0.4.7-deploy
+```
+
+它走的是同一条路径：解包旧代码 → `install.sh`（快照当前版本）→ 换回旧 dist。前端与后端
+会一起退到该 tag，不会出现"后端退了、前端还是新的"。要手工回滚见第 10 节。
