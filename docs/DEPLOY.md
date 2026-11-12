@@ -423,12 +423,42 @@ dist，全靠人记。`.github/workflows/deploy.yml` 把这件事交给 CI：**�
 | `ECS_DOMAIN` | `genai-mindmap.rpegio.top` | 自检要访问它，必须能从公网解析 |
 | `ECS_PORT` | `22`（可省） | 改过 SSH 端口才需要 |
 
-部署专用密钥（本机执行，公钥追加到服务器 `~/.ssh/authorized_keys`）：
+部署专用密钥。分三步，**注意每一步在哪台机器上执行**——本地是 Windows PowerShell，
+服务器上才是 bash（Workbench 里那些命令不用改）。
+
+第一步，本机生成密钥对（PowerShell 里 `-N ""` 会被吞掉，必须写成 `-N '""'`）：
+
+```powershell
+$key = "$env:USERPROFILE\.ssh\deploy_key"
+ssh-keygen -t ed25519 -C "github-actions-deploy" -f $key -N '""'
+Get-Content "$key.pub"          # 整行复制，下一步要用
+```
+
+第二步，在服务器（Workbench）里追加公钥：
 
 ```bash
-ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/deploy_key -N ""
-ssh-copy-id -i ~/.ssh/deploy_key.pub root@47.119.154.142   # 或在 Workbench 里手工追加
-gh secret set ECS_SSH_KEY < ~/.ssh/deploy_key              # 私钥交给 GitHub，不进仓库
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo 'ssh-ed25519 AAAAC3Nza... github-actions-deploy' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+第三步，回到本机，把四个 secret 写进仓库（PowerShell 不支持 `<` 输入重定向，
+所以用 `--body` 传内容）：
+
+```powershell
+gh secret set ECS_SSH_KEY  --body (Get-Content $key -Raw)
+gh secret set ECS_HOST     --body "47.119.154.142"
+gh secret set ECS_USER     --body "root"
+gh secret set ECS_DOMAIN   --body "genai-mindmap.rpegio.top"
+gh secret set ECS_PORT     --body "22"     # 改过 SSH 端口才需要
+gh secret list                              # 确认五个都在
+```
+
+验一把私钥能不能用（本机校园网连 SSH 可能仍被中间设备截断，这条只验证密钥本身，
+用 Workbench 的"文件管理"看不出密钥对不对）：
+
+```powershell
+ssh -i $key -o IdentitiesOnly=yes root@47.119.154.142 "echo ok"
 ```
 
 安全组要放行**入方向 22**，来源只能是 `0.0.0.0/0`——GitHub 托管 runner 的出口 IP 是
@@ -444,11 +474,14 @@ gh secret set ECS_SSH_KEY < ~/.ssh/deploy_key              # 私钥交给 GitHub
 
 ### 12.2 日常发布
 
-```bash
-git switch main && git pull --ff-only
+本地是 Windows PowerShell，一行一条，别用 `&&`（PowerShell 5.1 不支持）：
+
+```powershell
+git switch main
+git pull --ff-only
 git tag -a v0.4.8-deploy -m "v0.4.8: 这次改了什么"
 git push origin v0.4.8-deploy     # ← 这一步触发部署
-gh run watch                      # 看着它跑完
+gh run watch                      # 看着它跑完（Ctrl+C 只退出观察，不会取消 job）
 ```
 
 job 里依次做：`npm ci && npm run build` 出 dist → `git archive` 出源码包 → scp 两个包到
