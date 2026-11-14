@@ -50,9 +50,30 @@ echo "runner 版本：$version"
 
 mkdir -p "$RUNNER_DIR"
 chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME"
-tar_url="https://github.com/actions/runner/releases/download/v${version}/actions-runner-linux-x64-${version}.tar.gz"
-runuser -u "$RUNNER_USER" -- curl -fsSL "$tar_url" -o "$RUNNER_DIR/runner.tar.gz" \
-  || die "下载 runner 包失败：$tar_url"
+tar_name="actions-runner-linux-x64-${version}.tar.gz"
+direct="https://github.com/actions/runner/releases/download/v${version}/${tar_name}"
+
+# github.com 首页能连，并不代表 release 的下载地址能连：下载会 302 到
+# release-assets.githubusercontent.com（旧版是 objects.githubusercontent.com），
+# 那台域名在部分网络里是"连得上但立刻被断开"，curl 报 (52) Empty reply from server。
+# 所以这里依次尝试：直连 → 几个常用 GitHub 加速前缀。
+say "下载 runner ${version}"
+downloaded=0
+for prefix in "" "https://ghfast.top/" "https://gh-proxy.com/" "https://ghproxy.net/"; do
+  url="${prefix}${direct}"
+  echo "尝试：${url}"
+  if runuser -u "$RUNNER_USER" -- curl -fSL --http1.1 \
+      --connect-timeout 15 --max-time 600 --retry 2 --retry-delay 2 \
+      "$url" -o "$RUNNER_DIR/runner.tar.gz"; then
+    downloaded=1
+    break
+  fi
+  echo "  这个源不行，换下一个"
+done
+[[ "$downloaded" == "1" ]] || die "所有下载源都失败。先确认这台机器能不能连 release 域名：
+  curl -sSI --max-time 8 https://release-assets.githubusercontent.com | head -n 1
+  curl -sSI --max-time 8 https://objects.githubusercontent.com | head -n 1
+两条都报 (52)/(56)/超时的话，就是下载域名被挡；把能用的镜像加到上面的列表里再跑。"
 runuser -u "$RUNNER_USER" -- tar -xzf "$RUNNER_DIR/runner.tar.gz" -C "$RUNNER_DIR"
 rm -f "$RUNNER_DIR/runner.tar.gz"
 
