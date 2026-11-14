@@ -53,62 +53,43 @@ chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME"
 tar_name="actions-runner-linux-x64-${version}.tar.gz"
 direct="https://github.com/actions/runner/releases/download/v${version}/${tar_name}"
 
-if [[ -x "$RUNNER_DIR/config.sh" ]]; then
-  # 上一次已经解过包（哪怕注册失败），不用再下 200MB
-  say "runner 已经在 $RUNNER_DIR，跳过下载"
-else
-  # github.com 首页能连，并不代表 release 的下载地址能连：下载会 302 到
-  # release-assets.githubusercontent.com（旧版是 objects.githubusercontent.com），
-  # 那台域名在部分网络里是"连得上但立刻被断开"，curl 报 (52) Empty reply from server。
-  # 所以这里依次尝试：直连 → 几个常用 GitHub 加速前缀。
-  say "下载 runner ${version}"
-  downloaded=0
-  for prefix in "" "https://ghfast.top/" "https://gh-proxy.com/" "https://ghproxy.net/"; do
-    url="${prefix}${direct}"
-    echo "尝试：${url}"
-    if runuser -u "$RUNNER_USER" -- curl -fL --http1.1 \
-        --connect-timeout 15 --max-time 900 --retry 3 --retry-delay 3 \
-        "$url" -o "$RUNNER_DIR/runner.tar.gz"; then
-      # 镜像偶尔会"下到一半断开"，大小对不上就当失败
-      size="$(stat -c %s "$RUNNER_DIR/runner.tar.gz" 2>/dev/null || echo 0)"
-      if [[ "$size" -gt 100000000 ]]; then
-        downloaded=1
-        break
-      fi
-      echo "  只下到 $((size / 1024 / 1024))MB，不完整，换下一个源"
-    fi
-    echo "  这个源不行，换下一个"
-    rm -f "$RUNNER_DIR/runner.tar.gz"
-  done
-  [[ "$downloaded" == "1" ]] || die "所有下载源都失败。先确认这台机器能不能连 release 域名：
+# github.com 首页能连，并不代表 release 的下载地址能连：下载会 302 到
+# release-assets.githubusercontent.com（旧版是 objects.githubusercontent.com），
+# 那台域名在部分网络里是"连得上但立刻被断开"，curl 报 (52) Empty reply from server。
+# 所以这里依次尝试：直连 → 几个常用 GitHub 加速前缀。
+say "下载 runner ${version}"
+downloaded=0
+for prefix in "" "https://ghfast.top/" "https://gh-proxy.com/" "https://ghproxy.net/"; do
+  url="${prefix}${direct}"
+  echo "尝试：${url}"
+  if runuser -u "$RUNNER_USER" -- curl -fSL --http1.1 \
+      --connect-timeout 15 --max-time 600 --retry 2 --retry-delay 2 \
+      "$url" -o "$RUNNER_DIR/runner.tar.gz"; then
+    downloaded=1
+    break
+  fi
+  echo "  这个源不行，换下一个"
+done
+[[ "$downloaded" == "1" ]] || die "所有下载源都失败。先确认这台机器能不能连 release 域名：
   curl -sSI --max-time 8 https://release-assets.githubusercontent.com | head -n 1
   curl -sSI --max-time 8 https://objects.githubusercontent.com | head -n 1
 两条都报 (52)/(56)/超时的话，就是下载域名被挡；把能用的镜像加到上面的列表里再跑。"
-  runuser -u "$RUNNER_USER" -- tar -xzf "$RUNNER_DIR/runner.tar.gz" -C "$RUNNER_DIR"
-  rm -f "$RUNNER_DIR/runner.tar.gz"
-fi
+runuser -u "$RUNNER_USER" -- tar -xzf "$RUNNER_DIR/runner.tar.gz" -C "$RUNNER_DIR"
+rm -f "$RUNNER_DIR/runner.tar.gz"
 
 say "注册到仓库（标签 $LABELS）"
-# 重跑时 runner 目录里可能已有 .runner/.credentials，config.sh 会直接报
-# "Cannot configure the runner because it is already configured"，先清掉再注册。
-if [[ -f "$RUNNER_DIR/.runner" ]]; then
-  echo "检测到旧的注册信息，先移除"
-  ( cd "$RUNNER_DIR" && runuser -u "$RUNNER_USER" -- ./config.sh remove --token "$TOKEN" ) \
-    || rm -f "$RUNNER_DIR/.runner" "$RUNNER_DIR/.credentials" "$RUNNER_DIR/.credentials_rsaparams"
-fi
-
-# 必须在 runner 目录里跑：config.sh 会用相对路径找 ./bin
-( cd "$RUNNER_DIR" && runuser -u "$RUNNER_USER" -- ./config.sh \
-    --url "$REPO_URL" \
-    --token "$TOKEN" \
-    --name "$(hostname)-genai" \
-    --labels "$LABELS" \
-    --work "$RUNNER_HOME/_work" \
-    --unattended --replace )
+runuser -u "$RUNNER_USER" -- "$RUNNER_DIR/config.sh" \
+  --url "$REPO_URL" \
+  --token "$TOKEN" \
+  --name "$(hostname)-genai" \
+  --labels "$LABELS" \
+  --work "$RUNNER_HOME/_work" \
+  --unattended --replace
 
 say "装成系统服务"
-( cd "$RUNNER_DIR" && ./svc.sh install "$RUNNER_USER" >/dev/null )
-( cd "$RUNNER_DIR" && ./svc.sh start )
+"$RUNNER_DIR/svc.sh" install "$RUNNER_USER" >/dev/null
+"$RUNNER_DIR/svc.sh" start
+"$RUNNER_DIR/svc.sh" status || true
 
 say "开放唯一一条 sudo 权限"
 cat > /etc/sudoers.d/genai-cd <<EOF
