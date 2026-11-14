@@ -409,100 +409,117 @@ ip route; cat /etc/resolv.conf
 1. **依赖包**：本机 `pip download -r backend/requirements.txt -d wheels/`（Windows 上要加 `--platform manylinux2014_x86_64 --only-binary=:all:`），传上去 `pip install --no-index --find-links wheels/ -r requirements.txt`。
 2. **docling 模型**：首次解析 docx/pptx/pdf 会去 HuggingFace 取版面模型。公网不通就用 `HF_ENDPOINT` 指到可达镜像，或在能上网的机器上把 `~/.cache/docling` 打包带过去，解到 `/var/lib/genai-mindmap/.cache/docling`（服务单元的 `HOME` 就指向那里）。⚠️ 这条没做过端到端验证，纯文本生成与思维导图主流程不受影响，受影响的是文档/PDF 上传。
 
-## 12. 自动化部署（GitHub Actions → ECS）
+## 12. 自动化部署（GitHub Actions + 自托管 runner，零入方向端口）
 
 手动传 tar 的问题不是麻烦，而是**动作没有记录**：谁传的、传的哪个 tag、有没有漏传前端
 dist，全靠人记。`.github/workflows/deploy.yml` 把这件事交给 CI：**打 tag 就发布**，发布
 完用 `/api/health` 的版本号自检，对不上直接让 job 红。
 
-### 12.1 一次性配置
+### 12.1 为什么是自托管 runner，而不是 Actions 直连 SSH
 
-在 GitHub 仓库的 *Settings → Secrets and variables → Actions* 里加四个 secret：
+最初的版本是"GitHub 托管机 scp 到 ECS"，代价是**必须把 22 端口对 `0.0.0.0/0` 放开**——
+GitHub 托管 runner 的出口 IP 是一组不断变化的大网段（`https://api.github.com/meta` 的
+`actions` 字段），阿里云安全组装不下，只能全开。一台挂着 root 部署密钥的公网 SSH，是
+这套部署里最大的敞口，而它换来的只是"不用手动传文件"。
 
-| secret | 值 | 说明 |
+现在改成：ECS 上跑一个 **self-hosted runner**，由它主动连 GitHub 取任务（出站 443），
+所以 **入方向一个端口都不用开**：
+
+| | 旧方案（Actions → SSH） | 现在（self-hosted runner） |
 |---|---|---|
-| `ECS_HOST` | `47.119.154.142` | 公网 IP，不要填内网地址 |
-| `ECS_USER` | `root` | 需要能 `sudo`；想更保守就建专用用户并只给它 `install.sh` 的 sudo 权限 |
-| `ECS_SSH_KEY` | 部署用私钥全文 | 生成方式见下，**不要**复用你登录用的那把 |
-| `ECS_DOMAIN` | `genai-mindmap.rpegio.top` | 自检要访问它，必须能从公网解析 |
-| `ECS_PORT` | `22`（可省） | 改过 SSH 端口才需要 |
+| 入方向端口 | 22 对 `0.0.0.0/0` | 无 |
+| 凭据 | 私钥存在 GitHub secret | 注册 token（一次性，装完即弃） |
+| 构建在哪 | GitHub 托管机 | GitHub 托管机（runner 只装包，不构建） |
+| 谁能触发 | 有仓库写权限的人打 tag | 同左 |
+| runner 权限 | — | 普通用户 `ghrunner`，只能 sudo 一个 root 拥有的脚本 |
 
-部署专用密钥。分三步，**注意每一步在哪台机器上执行**——本地是 Windows PowerShell，
-服务器上才是 bash（Workbench 里那些命令不用改）。
+构建仍然放在 GitHub 托管机上（`ubuntu-latest` 跑 `npm ci && npm run build`），因为 2C2G
+的内存跑不起前端构建；runner 只做两件事：下载 artifact、调用安装脚本。少一个 node 环境，
+也少一份"服务器上装的 node 版本和本地不一样"的差异。
 
-第一步，本机生成密钥对（PowerShell 里 `-N ""` 会被吞掉，必须写成 `-N '""'`）：
+### 12.2 一次性配置
+
+**第一步：在服务器上装 runner。** 先在本地拿一个注册 token（有效期一小时，装完就没用了）：
 
 ```powershell
-$key = "$env:USERPROFILE\.ssh\deploy_key"
-ssh-keygen -t ed25519 -C "github-actions-deploy" -f $key -N '""'
-Get-Content "$key.pub"          # 整行复制，下一步要用
+gh api -X POST repos/RPeGio/genai-mindmap/actions/runners/registration-token --jq .token
 ```
 
-第二步，在服务器（Workbench）里追加公钥：
+然后在服务器的 Workbench 里，用**新版本的源码包**跑（`install-runner.sh` 需要
+`/usr/local/sbin/genai-cd-apply` 已存在，这个文件由 `install.sh` 安装）：
 
 ```bash
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo 'ssh-ed25519 AAAAC3Nza... github-actions-deploy' >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
+mkdir -p /root/genai-mindmap-src
+tar -xzf /root/genai-mindmap-vX.Y.Z.tar.gz -C /root/genai-mindmap-src
+cd /root/genai-mindmap-src
+sudo bash deploy/install.sh --domain genai-mindmap.rpegio.top --version vX.Y.Z-deploy
+sudo bash deploy/install-runner.sh --token <上一步拿到的 token>
 ```
 
-第三步，回到本机，把四个 secret 写进仓库（PowerShell 不支持 `<` 输入重定向，
-所以用 `--body` 传内容）：
+`install-runner.sh` 会：建 `ghrunner` 用户 → 从 `api.github.com` 取 runner 最新版本 →
+下载解包 → 以标签 `genai-ecs` 注册 → 装成 systemd 服务 → 写
+`/etc/sudoers.d/genai-cd`（**只有一行**：`ghrunner` 可免密执行 `/usr/local/sbin/genai-cd-apply`）。
 
-```powershell
-gh secret set ECS_SSH_KEY  --body (Get-Content $key -Raw)
-gh secret set ECS_HOST     --body "47.119.154.142"
-gh secret set ECS_USER     --body "root"
-gh secret set ECS_DOMAIN   --body "genai-mindmap.rpegio.top"
-gh secret set ECS_PORT     --body "22"     # 改过 SSH 端口才需要
-gh secret list                              # 确认五个都在
+脚本末尾会打印状态。确认 runner 在线：
+
+```bash
+cd ~ghrunner/actions-runner && sudo -u ghrunner ./svc.sh status
+gh api repos/RPeGio/genai-mindmap/actions/runners --jq '.runners[] | "\(.name) \(.status)"'
 ```
 
-验一把私钥能不能用（本机校园网连 SSH 可能仍被中间设备截断，这条只验证密钥本身，
-用 Workbench 的"文件管理"看不出密钥对不对）：
+**第二步：打一个 tag 试跑。** 见 12.3。
 
-```powershell
-ssh -i $key -o IdentitiesOnly=yes root@47.119.154.142 "echo ok"
-```
+**第三步：收紧入口。** job 跑绿之后，这台机器就再也不需要入方向 SSH 了：
 
-安全组要放行**入方向 22**，来源只能是 `0.0.0.0/0`——GitHub 托管 runner 的出口 IP 是
-一组不断变化的大网段（`https://api.github.com/meta` 的 `actions` 字段），阿里云安全组
-规则条数放不下。因此这台机器要按"公网可达的 SSH"来对待：
+1. 安全组删掉 22 的规则（只留 80/443）；Workbench 走的是阿里云自己的通道，不受影响。
+2. 删掉 `~/.ssh/authorized_keys` 里的部署公钥（如果按旧方案加过）。
+3. 以前写过 `ECS_HOST` / `ECS_USER` / `ECS_SSH_KEY` / `ECS_PORT` 四个 secret 的，一并删掉
+   （`gh secret delete ECS_SSH_KEY` 之类）；现在只用一个仓库变量 `ECS_DOMAIN`（可选，
+   缺省 `genai-mindmap.rpegio.top`）。
 
-1. `sshd` 关掉密码登录（`PasswordAuthentication no`、`PermitRootLogin prohibit-password`）；
-2. 装 `fail2ban`（`dnf install -y epel-release fail2ban`，默认 sshd 规则即可）；
-3. 部署私钥只存在 GitHub secret 里，泄了就删掉对应 `authorized_keys` 行再换一把。
-
-> 另一条路是"服务器主动拉"，但这台机器连不上 GitHub（第 11 节），runner 也跑不起来，
-> 所以只能由 Actions 推。这不是偏好，是出口被收紧后的唯一解。
-
-### 12.2 日常发布
+### 12.3 日常发布
 
 本地是 Windows PowerShell，一行一条，别用 `&&`（PowerShell 5.1 不支持）：
 
 ```powershell
 git switch main
 git pull --ff-only
-git tag -a v0.4.8-deploy -m "v0.4.8: 这次改了什么"
-git push origin v0.4.8-deploy     # ← 这一步触发部署
+git tag -a v0.4.9-deploy -m "v0.4.9: 这次改了什么"
+git push origin v0.4.9-deploy     # ← 这一步触发部署
 gh run watch                      # 看着它跑完（Ctrl+C 只退出观察，不会取消 job）
 ```
 
-job 里依次做：`npm ci && npm run build` 出 dist → `git archive` 出源码包 → scp 两个包到
-`/tmp` → 解包到 `~/genai-mindmap` → `install.sh --domain … --version <tag>`（会同步 `/opt`、
-重启服务、把旧代码快照进 `releases/`）→ 替换前端 `dist`（旧的留成 `dist.prev`）→
-`nginx -s reload` → 请求 `https://<域名>/api/health` 比对版本号。
+两个 job 依次做：
+
+1. `build`（GitHub 托管机）：`npm ci && npm run build` 出 dist → `git archive` 出源码包 →
+   两个包作为 artifact 上传，保留 7 天。
+2. `deploy`（ECS 上的 runner）：下载 artifact 到 `/tmp/genai-release` →
+   `sudo /usr/local/sbin/genai-cd-apply --domain … --version <tag>`（解包到
+   `~/genai-mindmap` → 跑 `install.sh` 同步 `/opt` 并重启 → 换前端 dist，旧的留成
+   `dist.prev` → `nginx -t && reload` → 本机 `/api/health` 自检）→ 最后再从
+   `https://<域名>/api/health` 比对一次版本号。
 
 跑完刷新页面，标题旁徽章应显示这次的 tag；不显示或显示旧值，就看 job 日志里自检那一步
 （版本不一致会让 job 直接失败，不会"绿着但没生效"）。
 
-### 12.3 回滚
+### 12.4 回滚
 
 用 `workflow_dispatch` 指定一个旧 tag 重跑即可（tag 必须存在）：
 
 ```bash
-gh workflow run deploy.yml -f version=v0.4.7-deploy
+gh workflow run deploy.yml -f version=v0.4.8-deploy
 ```
 
 它走的是同一条路径：解包旧代码 → `install.sh`（快照当前版本）→ 换回旧 dist。前端与后端
 会一起退到该 tag，不会出现"后端退了、前端还是新的"。要手工回滚见第 10 节。
+
+### 12.5 排障
+
+| 现象 | 原因与处置 |
+|---|---|
+| Actions 里 deploy job 一直 `Waiting for a runner` | runner 没在线：`cd ~ghrunner/actions-runner && sudo -u ghrunner ./svc.sh status`，再看 `journalctl -u 'actions.runner.*' -n 50` |
+| runner 注册失败 `Invalid registration token` | token 过期（一小时），重新取一次 |
+| job 里 `sudo -n` 报 `a password is required` | `/etc/sudoers.d/genai-cd` 没写上或路径不对；`sudo visudo -c` 检查，`sudo -u ghrunner sudo -n /usr/local/sbin/genai-cd-apply --help` 试一下 |
+| `genai-cd-apply: command not found` | 没跑过带 `cd-apply.sh` 的新版 `install.sh`，先手工跑一次 |
+| 自检报版本不一致 | 服务没重启成功：`systemctl status genai-mindmap`、`journalctl -u genai-mindmap -n 50`，常见原因是 `/etc/genai-mindmap/env` 里 `MINDMAP_VERSION` 没被覆盖（旧 `install.sh` 不认 `--version`） |
+| 前端换了但页面还是旧的 | `dist.prev` 说明替换发生了；检查 nginx 的 `root` 是否指向 `/opt/genai-mindmap/frontend/dist`，以及 `restorecon` 是否执行（SELinux 开着时上下文不对会 403） |

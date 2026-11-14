@@ -1,7 +1,6 @@
 name: Deploy
 
-# 只在打 tag 时发布：main 上的提交不算"要上线"，打 tag 才算。
-# 手动跑一次用于回滚或补发，输入要与 tag 完全一致（例如 v0.4.7）。。
+# 触发：打 tag 即发布；也可以手动指定一个旧 tag 回滚。
 on:
   push:
     tags:
@@ -9,21 +8,25 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "要部署的 tag（必须已存在，例如 v0.4.7）"
+        description: "要部署的 tag（必须已存在，例如 v0.4.8-deploy）"
         required: true
 
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  deploy:
+  # 在 GitHub 托管的机器上构建：不占 ECS 的 2G 内存，也不用给它装 node。
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # git describe 需要 tag
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -35,11 +38,10 @@ jobs:
         id: v
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            version="${{ inputs.version }}"
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
-            version="${GITHUB_REF_NAME}"
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: 构建前端
         working-directory: frontend
@@ -49,47 +51,57 @@ jobs:
           tar -czf ../frontend-dist.tar.gz -C dist .
 
       - name: 打包源码
-        run: |
-          git archive --format=tar.gz -o source.tar.gz "${{ steps.v.outputs.version }}"
+        run: git archive --format=tar.gz -o source.tar.gz "${{ steps.v.outputs.version }}"
 
-      - name: 准备 SSH
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.ECS_SSH_KEY }}" > ~/.ssh/id_deploy
-          chmod 600 ~/.ssh/id_deploy
-          # 先扫主机指纹，避免首次连接失败；指纹变化会直接报错而不是静默继续
-          ssh-keyscan -p "${{ secrets.ECS_PORT || 22 }}" "${{ secrets.ECS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
-          printf 'Host ecs\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile ~/.ssh/id_deploy\n  IdentitiesOnly yes\n' \
-            "${{ secrets.ECS_HOST }}" "${{ secrets.ECS_PORT || 22 }}" "${{ secrets.ECS_USER }}" > ~/.ssh/config
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.v.outputs.version }}
+          path: |
+            source.tar.gz
+            frontend-dist.tar.gz
+          retention-days: 7
 
-      - name: 上传安装包
+  # 在 ECS 上跑（self-hosted runner）：只出站，不需要任何入方向端口。
+  deploy:
+    needs: build
+    runs-on: [self-hosted, linux, x64, genai-ecs]
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: 解析版本号
+        id: v
         run: |
-          scp source.tar.gz frontend-dist.tar.gz ecs:/tmp/
-          ssh ecs "rm -rf ~/genai-mindmap && mkdir -p ~/genai-mindmap && tar -xzf /tmp/source.tar.gz -C ~/genai-mindmap"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: 安装并发布前端
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ steps.v.outputs.version }}
+          path: /tmp/genai-release
+
+      - name: 安装
+        env:
+          DOMAIN: ${{ vars.ECS_DOMAIN || 'genai-mindmap.rpegio.top' }}
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
-          ssh ecs "sudo bash ~/genai-mindmap/deploy/install.sh \
-            --domain '${{ secrets.ECS_DOMAIN }}' \
-            --version '${{ steps.v.outputs.version }}'"
-          # 前端单独传：dist 不在源码包里，install.sh 也不负责它
-          ssh ecs "set -e
-            sudo mkdir -p /opt/genai-mindmap/frontend/dist
-            sudo rm -rf /opt/genai-mindmap/frontend/dist.prev
-            sudo mv /opt/genai-mindmap/frontend/dist /opt/genai-mindmap/frontend/dist.prev
-            sudo mkdir -p /opt/genai-mindmap/frontend/dist
-            sudo tar -xzf /tmp/frontend-dist.tar.gz -C /opt/genai-mindmap/frontend/dist
-            sudo chown -R genai:genai /opt/genai-mindmap/frontend
-            sudo chmod -R a+rX /opt/genai-mindmap/frontend/dist
-            sudo restorecon -R /opt/genai-mindmap/frontend/dist || true
-            sudo systemctl reload nginx"
+          sudo -n /usr/local/sbin/genai-cd-apply \
+            --domain "$DOMAIN" \
+            --version "$VERSION" \
+            --source /tmp/genai-release/source.tar.gz \
+            --dist /tmp/genai-release/frontend-dist.tar.gz
 
       - name: 上线自检
+        env:
+          DOMAIN: ${{ vars.ECS_DOMAIN || 'genai-mindmap.rpegio.top' }}
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
-          # /api/health 在 nginx 里是免鉴权的，所以这里不需要 Basic Auth 账号
-          got="$(curl -fsS --retry 5 --retry-delay 3 "https://${{ secrets.ECS_DOMAIN }}/api/health" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
+          got="$(curl -fsS --retry 5 --retry-delay 3 "https://${DOMAIN}/api/health" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
           echo "线上版本：$got"
-          test "$got" = "${{ steps.v.outputs.version }}" || {
-            echo "::error::线上版本是 $got，与期望的 ${{ steps.v.outputs.version }} 不一致"
+          test "$got" = "$VERSION" || {
+            echo "::error::线上版本是 $got，与期望的 $VERSION 不一致"
             exit 1
           }

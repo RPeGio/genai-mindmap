@@ -257,6 +257,11 @@ echo '20 3 * * * root /usr/local/bin/genai-mindmap-backup >/var/log/genai-mindma
   > /etc/cron.d/genai-mindmap-backup
 chmod 644 /etc/cron.d/genai-mindmap-backup
 
+# CD 的唯一特权入口。runner 用户（ghrunner）只被允许 sudo 这一个文件，
+# 而它由 root 拥有、runner 改不了，所以 runner 侧被攻破最多只能"装一个包"。
+install -m 755 "$REPO_DIR/deploy/cd-apply.sh" /usr/local/sbin/genai-cd-apply
+chown root:root /usr/local/sbin/genai-cd-apply
+
 if [[ $WITH_CERTBOT -eq 1 ]]; then
   say "附带：certbot 签 HTTPS 证书"
   # AL3 的官方源里没有 certbot，走 EPEL。
