@@ -9,18 +9,116 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Awaitable, Callable, Literal, Protocol, Union
+from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, Protocol, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.contracts.mindmap import MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
-from app.generation.service import GenerationError, ensure_input_within_context
+from app.generation.service import (
+    SOURCE_MODE_RAG,
+    GenerationError,
+    ensure_input_within_context,
+    source_mode,
+)
+from app.optimization.source_refs import EvidenceSpan
+
+logger = logging.getLogger(__name__)
+
+# 一次运行最多保留多少条命中区间。模型可能反复调 `rag_query`（改一条长材料时
+# 实测能刷十几次），不设上限就是"内存随运行时长线性增长"。200 条覆盖 40 次
+# `top_k=5` 的检索；超了丢**最旧**的，因为引用校验只需要"这条引用落在哪次命中
+# 的哪一段"，而模型总是先检索、后生成——最旧的条目被丢时，对应的引用通常已经
+# 写完了。丢的时候记 debug：这是容量策略生效，不是错误。
+MAX_EVIDENCE_SPANS = 200
+
+# 一次运行最多缓存多少份**从知识库回查出来的**来源（含正文）。库命中的
+# `source_id` 是持久 id，不在本次 `request.sources` 里，收尾的引用校验要按它
+# 逐字比对原文，就必须把 `Source` 先取回内存。
+#
+# 50 不是拍的：它是**与 `MAX_SOURCES` 对齐**（单次请求的材料份数上限，见本文件
+# 下方的「材料」那一段）。库来源与请求内来源在校验里是同一种东西——`tools._verify_sources`
+# 把两者拼成一个列表交给 `verify_source_refs`——所以库这边比请求那边更紧没有道理。
+#
+# 20 太小的后果是可复现的：一次检索命中 25 份库来源时，FIFO 把最旧的 5 份挤出去，
+# 后 5 份的 `Source` 进不了缓存，那些来源上的引用全部被判 `SOURCE_TEXT_UNAVAILABLE`
+# 并在 `remove_invalid=True` 那一步静默剔除——检索成功、引用写对，用户看到的却是
+# "这一支没有证据"。库越大、问法越泛，这个窗口越容易撞上。
+#
+# 代价可控：一份典型材料 30 KB，50 份 1.5 MB，而一次运行只用一个进程。
+# 超了仍丢**最旧**的：模型先检索、后写引用，最旧那批的引用通常已经写完。
+MAX_LIBRARY_SOURCES = 50
 
 
 # ---------------------------------------------------------------- 预算
+
+
+# 模型调用额度的上界。理由是算术，不是口味：分片生成的每一次调用恰好展开一个
+# 父节点，每次至少落 `DEEP_MIN_BREADTH`（2）个节点，所以 1000 节点的承载上限
+# 对应约 500 次调用；取 400 是"覆盖绝大部分反复扩展的场景，同时仍拦得住跑飞的
+# 循环"的那一侧。要更高得重新算这条算式（见 `_initial_call_plan` 的注释）。
+MAX_MODEL_CALLS_LIMIT = 400
+
+# 初次生成的规模，与 `generation.budget` / `agent.tools` 共用同一组数。
+_INITIAL_BRANCHES = 6
+_INITIAL_FANOUT = 3
+# 每支最多一次补点（`tools.SUPPLEMENTARY_BRANCH_LIMIT`），逐支记得上界是分支数。
+_INITIAL_RETRIES = _INITIAL_BRANCHES
+# 外层对话轮次：一轮发起工具调用、一轮收尾（`_budget_stop` 那两帧之间）。
+_OUTER_ROUNDS = 2
+
+
+def _initial_call_plan() -> int:
+    """一次完整初次生成需要多少次模型调用——**算出来的，不是拍的**。
+
+    算式就是分片生成的结构本身：骨架产出第 1 层，之后**每次调用展开一个父节点**，
+    而最后一层是由上一层写出来的、不再需要展开。所以
+
+        骨架 1 + 展开 6 个分支 + 展开 18 个二级 = 25 次内容调用
+
+    注意这里**不是** 79：79 是 4 层满额树的**节点数**（1+6+18+54），不是调用数。
+    把最后一层也算成一次调用会得出 79，进而误判"80 的预算装不下 4 层树"——那正是
+    差点让初次生成白白降到 3 层的算术错误（实测 `branches=6, points_per_branch=3`
+    的完整初次生成用掉 25 次）。
+
+    再加"要点不足的那几支各补一次"（≤6，`SUPPLEMENTARY_BRANCH_LIMIT`）与收尾两轮
+    （2）= 33。
+
+    这条函数存在的意义不是算出一个精确数字，而是让"预算够不够"变成可验证的：
+    `tests/test_budget.py` 与 `tests/test_generation_limits.py` 用它去断言默认预算
+    装得下一次满额 4 层树、且那次生成 `partial=false`。写死一个数之后，将来谁把
+    初次深度调到 5 层，没有任何地方会红。
+    """
+    from app.generation.budget import INITIAL_MAX_DEPTH, calls_for_levels, level_sizes
+
+    sizes = level_sizes(_INITIAL_BRANCHES, _INITIAL_FANOUT, INITIAL_MAX_DEPTH + 1)
+    return calls_for_levels(sizes) + _INITIAL_RETRIES + _OUTER_ROUNDS
+
+
+# 一次 run 里按几倍"初次生成"配额度。
+#
+# 不是拍脑袋的倍数：一个真实会话里，用户会**重做一次**（第一张不合意就再来一张，
+# 而失败的那次同样烧调用），之后还会点几次「展开这个节点」（每次 1 次调用）。
+# 3 倍覆盖"初次 + 重做一次 + 十几个扩展"，同时仍是一道能在跑飞的循环上刹住的闸。
+_INITIAL_CALL_PLANS_PER_RUN = 3
+
+
+def _default_max_model_calls() -> int:
+    """默认额度 = 初次生成需要量 × 3，向上取整到 100。
+
+    33 × 3 = 99 → 100。这个数比旧的 80 高，但**高的理由不是"猜着不够"**：
+    4 层满额树要 33 次（含补点与外层轮次），一个会话里再来一张就是 66，加十几次
+    扩展正好一百上下。
+
+    旧值 80 为什么"被烧光"：它对应的是**没有层数上限**的年代——7 层、240 个节点
+    的树要一百多次调用，80 在第 6/7 层用尽，于是最下面两层整片留空。深度锁到
+    4 层之后 80 其实够用；这次的改动是让默认值与算式对齐，并把上界从 120 放到
+    400（要更大规模的用户配得上，而不是被一个为"六支分片"拍的数字挡住）。
+    """
+    return -(-_initial_call_plan() * _INITIAL_CALL_PLANS_PER_RUN // 10) * 10
 
 
 class RunBudget(BaseModel):
@@ -50,14 +148,21 @@ class RunBudget(BaseModel):
     # 耗时 35 秒——也就是说 40 已经成了比层数更硬的限制，正好卡在"刚有点意思"
     # 的地方停下。80 对应约 6~7 层、70 秒上下，仍在 `max_seconds` 之内。
     #
-    # 这仍然是成本护栏而不是内容边界：每次调用都要付钱，没有上限时一个跑飞的
-    # 循环能烧掉任意多额度。但它不该比模型的判断更早替用户做决定，所以取"够走完
-    # 常见规模"的值，而不是"够防住算错"的最小值。
+    # **默认值现在由"初次 4 层满额树"的真实调用数算出来**（`_initial_call_plan()`）：
     #
-    # 超过预算不再等于失败：工具内部会在额度不足时停止展开并记一条诊断，外层
-    # 则以已经建好的树收尾（见 `service._budget_stop`）。用户拿到的是「树 + 少
-    # 展开了几支」，不是「什么都没有 + 一条错误」。
-    max_model_calls: int = Field(default=80, ge=1, le=120)
+    #     骨架 1 + 展开 6 个分支 + 展开 18 个二级 = 25 次内容调用
+    #     + 每支最多一次补点（6） + 外层两轮对话（发起 / 收尾）= 33
+    #
+    # 默认取 3 倍（100）：一个真实会话里还会重做一张、再点十几次扩展。旧值 80 对应
+    # 的是"没有层数上限"的年代（7 层 / 240 节点要一百多次调用），80 在第 6/7 层
+    # 用尽、最下面两层整片留空——深度锁到 4 层之后，问题不再出在预算上。
+    #
+    # 上界放到 400：分片生成的每一次调用恰好展开一个父节点，而每次展开至少落
+    # 2 个节点（`DEEP_MIN_BREADTH`），所以 1000 节点的承载上限对应约 500 次调用；
+    # 400 覆盖绝大多数反复扩展的场景，同时仍是一道能拦住"跑飞的循环"的闸。
+    # 想再高就得重新算这条算式，而不是把数字调大。
+    max_model_calls: int = Field(
+        default=_default_max_model_calls(), ge=1, le=MAX_MODEL_CALLS_LIMIT)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
     # 时间上限从 120 提到 600：120 秒是照「一句话主题」的短路径拍的，实测
     # 12106 字材料出 526 个节点要 48.6 秒，慢速档 97 tok/s 时同样的材料光是
@@ -210,6 +315,80 @@ class RunContext:
     # 必须与加通道之前**逐字相同**（连流式请求都不发）。判空只在
     # `tools._emit_grow` 与 `tools._GrowStream` 的入口处做一次。
     emit: EmitFn | None = None
+    # 本次运行累积的命中区间（`tools._rag` 每检索一次并一批进来）。它是
+    # `verify_source_refs(..., evidence=...)` 的唯一输入，也是"父块模式"下唯一能
+    # 区分"引用落在命中的子块里"与"引用落在父块里与查询无关的一半"的东西。
+    #
+    # 为什么存在这里而不是 `ToolResult.data`：hits 只活在 `_rag` 的返回值里，而
+    # 校验发生在 `mindmap_generate` 收尾（`validate_generated_content`），中间隔着
+    # 整个循环。`ToolResult.data` 是**一次调用**的产物，循环从不汇总它；要汇总就得
+    # 在 `service.run()` 里按工具名特判 `data["hits"]` 的形状，等于让循环认识检索
+    # 工具的私有字段。`RunContext` 本来就是"跨轮存活的可变状态"，证据正好是这种
+    # 东西，且 `_rag` 与 `_generate` 拿的是同一个 ctx，不需要任何新管道。
+    evidence: list[EvidenceSpan] = field(default_factory=list)
+    # 本次运行里从知识库回查出来的来源（持久 id -> Source），`_rag` 命中后填入。
+    #
+    # 它存在的**唯一**理由是收尾的引用校验：`verify_source_refs` 用
+    # `by_id = {source.id: source}` 查原文，而库命中的 `source_id` 是持久 id、
+    # 不在 `request.sources` 里。不把它并进校验，一条逐字正确的库引用会被判成
+    # "来源不存在（SOURCE_TEXT_UNAVAILABLE）"、在 `remove_invalid=True` 时被静默
+    # 剔除——检索成功、引用写出、最后收尾时消失，这是整条链上最隐蔽的一种失败。
+    #
+    # 只装**真的被本次检索命中过**的库来源，不是整库：校验的语义是"你引的东西
+    # 这次确实查到过"，而不是"库里恰好有这份材料"。
+    library_sources: dict[str, Source] = field(default_factory=dict)
+
+    def record_library_sources(self, sources: Iterable[Source]) -> None:
+        """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。
+
+        跳过请求内来源不是优化而是正确性：同一份正文可能既是本次上传的、又在库里
+        （`source_id` 不同），两个身份都要留着——引用写的是哪个身份就按哪个校验，
+        缓存只负责"库那个身份查得到原文"。
+
+        逐出策略与 `record_evidence` 同向（FIFO 丢最旧）：模型先检索、后写引用，
+        最旧那批的引用通常已经写完，丢它的代价最小；而"拒绝新增"会让长循环里
+        后面所有库引用都失去校验依据。
+        """
+        for source in sources:
+            if source.id in self.sources_by_id or source.id in self.library_sources:
+                continue
+            self.library_sources[source.id] = source
+        overflow = len(self.library_sources) - MAX_LIBRARY_SOURCES
+        if overflow > 0:
+            for source_id in list(self.library_sources)[:overflow]:
+                del self.library_sources[source_id]
+            logger.debug("库来源缓存达到 %d 份上限，丢弃最旧的 %d 份",
+                         MAX_LIBRARY_SOURCES, overflow)
+
+    def record_evidence(self, spans: Iterable[EvidenceSpan]) -> None:
+        """把一批命中区间并进本次运行的证据集：去重、限量、丢最旧。
+
+        去重键是 `(source_id, start, end, leaf_start, leaf_end)`——比"父块三元组"
+        多两位，理由是可证伪的：同一个父块被两次不同问法命中时，两次命中的**子块**
+        往往不同（父块 450–700 字，子块 200 字上下，一个父块 2–4 个子块），而校验
+        问的正是"这条引用落在哪个子块里"。只按父块区间去重会把后一次的叶子区间
+        丢掉，那条本来合法的引用随后被判成"落在父块里与查询无关的部分"——用一次
+        去重换来一次系统性误伤，代价方向完全错了。重试同一次检索时两个叶子区间
+        也相同，所以"同一批 hits 累两次只有一份"照样成立。
+
+        逐出策略是 FIFO 而不是"拒绝新增"：新证据总是比旧证据有用（模型刚检索完
+        就会写引用），而拒绝新增会让长循环里后面所有引用都失去校验依据。
+        """
+        seen = {
+            (span.source_id, span.start, span.end, span.leaf_start, span.leaf_end)
+            for span in self.evidence
+        }
+        for span in spans:
+            key = (span.source_id, span.start, span.end, span.leaf_start, span.leaf_end)
+            if key in seen:
+                continue
+            seen.add(key)
+            self.evidence.append(span)
+        overflow = len(self.evidence) - MAX_EVIDENCE_SPANS
+        if overflow > 0:
+            del self.evidence[:overflow]
+            logger.debug("证据区间达到 %d 条上限，丢弃最旧的 %d 条",
+                         MAX_EVIDENCE_SPANS, overflow)
 
     def reserve_model_call(self) -> bool:
         """占掉一次模型调用额度，拿不到返回 False。
@@ -225,6 +404,12 @@ class RunContext:
 
 
 # ---------------------------------------------------------------- 请求
+
+
+# 单次请求能带的来源份数上限。**这也是清单的条数上限**：`tools.MATERIAL_MANIFEST_MAX_ITEMS`
+# 引用的就是这个常量，两处一个数。分两次写（这里 50、渲染器 50）迟早分叉，而分叉
+# 的表现是"请求收下了、清单里却少两份"，模型连这两份材料存在都不知道。
+MAX_SOURCES = 50
 
 
 class AgentRunRequest(BaseModel):
@@ -245,22 +430,71 @@ class AgentRunRequest(BaseModel):
     ] = "default"
     snapshot: MindMapContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
-    sources: list[Source] = Field(default_factory=list, max_length=50)
+    sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)
     budget: RunBudget = Field(default_factory=RunBudget)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sources_not_too_many(cls, data: Any) -> Any:
+        """份数上限：两种形态的"为什么不行"完全不同，文案必须分开。
+
+        - `rag`：正文不进 prompt，所以"材料字太多"根本不是问题；卡住的是**清单**。
+          清单列不下的材料，模型连"有这一份"都不知道——那比拒绝更糟，因为树看起来
+          是完整的，只是少了两块。
+        - `full`：每份正文都要进 prompt，份数上限与上下文是同一件事的两个方向。
+
+        字段上的 `max_length` 仍然留着（OpenAPI 要有 `maxItems`，前端据此先拦一步），
+        这里在它之前给出能照着做的文案：pydantic 的 "List should have at most 50
+        items" 读不出多了几份、也读不出为什么，用户唯一能做的动作是"删到 50 份"。
+
+        放在 `mode="before"`：`mode="after"` 的校验器跑不到这一步（字段校验先失败）。
+        """
+        if not isinstance(data, dict):
+            return data
+        sources = data.get("sources") or []
+        # 只认列表：传进来一个 60 字符的字符串时，"份数"是它自身的长度，按份数报错
+        # 会给出一个用户看不懂的数字。类型错留给字段校验去报。
+        if not isinstance(sources, (list, tuple)):
+            return data
+        count = len(sources)
+        if count <= MAX_SOURCES:
+            return data
+        if source_mode() == SOURCE_MODE_RAG:
+            raise ValueError(
+                f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
+                f"rag 形态下正文不占上下文，卡住的是材料清单：清单只列得下 "
+                f"{MAX_SOURCES} 条，多出来的材料模型连存在都不知道。请分批生成。")
+        raise ValueError(
+            f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
+            "请分批生成。")
 
     @model_validator(mode="after")
     def sources_within_context(self) -> "AgentRunRequest":
-        """来源正文合计要装得进模型上下文。
+        """`full` 形态下：来源正文合计要装得进模型上下文。
 
         原先这里卡的是「合计 20000 字」。那个数按一句话主题拍的，没有实测依据，
         而且与 pipeline 的同一口径互相抄写——两处一起错、一起被当成边界。真正
         的边界只有一条：模型的上下文窗口装不装得下。所以改判 token，超了仍然
         在开流之前拒绝，文案给出两条出路（精简 / 分批）。
 
+        **`rag` 形态下这条预检直接跳过**：正文根本不进 prompt，没有可测量的对象。
+        留着它的后果不是"保守"，是错——一份 25 万字的材料在 `rag` 形态下只贡献
+        一行清单（几十 token），却会在开流前被 422 拒掉，而它本来是能处理的。
+        清单自己的 token 上限由 `tools._material_manifest` 负责，超了截的是**清单项**，
+        不是拒绝整个请求：删掉两行索引，比劝用户去精简一份他并不需要精简的材料好。
+
+        份数上限是另一个量，见 `sources_not_too_many`（两种形态都要拦）。
+
+        另两处同名的 token 预检（`provider.complete_tools` 与
+        `generation.chat_async`）量的是**实际要发出去的消息**，不是材料体积：
+        `rag` 形态下那些消息里没有正文，自然不会被它们拦。
+
         这里必须抛 `ValueError`：它发生在 FastAPI 解析请求体的时候，只有
         ValidationError 才会被收成 422 并把文案带回前端；`GenerationError`
         冒出去会变成 500，用户看到的是"服务器内部错误"。
         """
+        if not self.sources or source_mode() == SOURCE_MODE_RAG:
+            return self
         text = "\n".join(source.text or "" for source in self.sources)
         if not text:
             return self

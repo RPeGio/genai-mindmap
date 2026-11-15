@@ -41,9 +41,14 @@ from app.agent.contracts import (
     ToolEndEvent,
 )
 from app.agent.provider import default_provider
-from app.agent.tools import ToolRegistry, build_registry
+from app.agent.tools import ToolRegistry, build_registry, library_available
 from app.contracts.mindmap import MindMapContent
-from app.generation.service import GenerationError, _demo_content
+from app.generation.service import (
+    SOURCE_MODE_RAG,
+    GenerationError,
+    _demo_content,
+    source_mode,
+)
 
 DEFAULT_STAGES = ["目标澄清", "要点拆解", "分支展开", "风险与验证"]
 logger = logging.getLogger(__name__)
@@ -97,6 +102,18 @@ _INTENT_RULES = {
     "edit": "这次是精确修改已有导图。必须按节点 id 改，禁止整张重新生成。",
 }
 
+# `rag` 形态下的 create 指令，与上面那条**语义相反**，而且必须是相反的：
+# 正文不在上下文里，`don't retrieve` 等于让模型凭标题编。上面那条实测结论
+# （"别让它先查"）成立于 `full` 形态——那时正文就在 prompt 里，先查纯属浪费；
+# 形态一换，前提没了，结论就得跟着翻。
+#
+# 只覆盖 `create`：`expand` / `edit` 的指令里没有"不要检索"这句话，也就没有
+# 矛盾要消除，多写一句反而会诱导它们在本不需要材料时也去查。
+_RAG_INTENT_RULES = {
+    "create": "这次是新建导图。材料正文不在上下文里，先调用 rag_query 检索，"
+              "再按检索到的片段生成；检索不到的部分如实留空，不要编造。",
+}
+
 
 def outline_text(content: MindMapContent | None, limit: int = 200) -> str:
     """把树压成带 id 的大纲，让模型能引用具体节点。
@@ -120,10 +137,33 @@ def outline_text(content: MindMapContent | None, limit: int = 200) -> str:
     return "\n".join(lines)
 
 
+def _intent_rule(request: AgentRunRequest) -> str:
+    """这次意图该配哪条指令。`rag` 形态只覆盖**有东西可查**的 `create`（理由见上）。
+
+    没有来源、库里也没有材料时不改：`rag` 与 `full` 在"这次根本没带材料"时行为
+    完全一样，这时换成检索优先的指令，只会让模型去查一个空列表。
+
+    条件从 `request.sources` 扩成 `request.sources or 库非空`：知识库接上以后，
+    "这次请求有没有材料"不再等于"有没有东西可查"。库里存着过往材料时，`full`
+    形态那句"直接生成，不要先去检索资料"就成了错的前提——那份材料根本不在
+    上下文里。判据必须跟着**可检索的东西**走，而不是跟着请求来的那几份走。
+
+    代价是每轮刷新 system 时会读一次库（`library_source_count`，一次本地
+    sqlite 计数查询，不读正文）。这里不做缓存：库可能在运行期间被别的请求写入，
+    而"这一轮才发现库里有材料"并不会让前面的轮次变错——模型下一轮就会看到新
+    指令，比一条运行开始时算死的布尔值更接近事实。
+    """
+    if source_mode() == SOURCE_MODE_RAG and (request.sources or library_available()):
+        override = _RAG_INTENT_RULES.get(request.intent)
+        if override is not None:
+            return override
+    return _INTENT_RULES.get(request.intent, "")
+
+
 def _system_text(request: AgentRunRequest, content: MindMapContent | None) -> str:
     return "\n".join([
         _SYSTEM_BASE,
-        _INTENT_RULES.get(request.intent, ""),
+        _intent_rule(request),
         "当前导图：",
         outline_text(content),
     ]).strip()

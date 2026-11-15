@@ -225,22 +225,26 @@ if [[ ! -f /etc/nginx/.htpasswd-mindmap ]]; then
   PASS="$(openssl rand -base64 12)"
   htpasswd -cb /etc/nginx/.htpasswd-mindmap demo "$PASS"
   chmod 640 /etc/nginx/.htpasswd-mindmap
-  chown root:nginx /etc/nginx/.htpasswd-mindmap 2>/dev/null || true
+  # 不吞错：AL3 上 nginx 的运行用户就叫 nginx，chown 失败说明这台机器的用户组
+  # 与假设不符——留成 root:root 640 的话 nginx 读不到，表现是全站 500 而不是启动报错。
+  chown root:nginx /etc/nginx/.htpasswd-mindmap
   echo "已创建 Basic Auth 账号：demo / $PASS   （只显示这一次）"
 else
   echo "已有 /etc/nginx/.htpasswd-mindmap，保留不动；要加账号用 htpasswd -b <文件> <用户名> <密码>"
 fi
 
-# SELinux 默认不允许 nginx 反代到本地端口；AL3 默认 enforcing
-setsebool -P httpd_can_network_connect 1 2>/dev/null || true
-
-# 前端 dist 放在 /opt 下，SELinux 里那是 usr_t，nginx 读不到就是 403 ——
-# 而且只报 403，日志里写 permission denied，看起来像文件权限没给够。
-if command -v semanage >/dev/null 2>&1 && selinuxenabled 2>/dev/null; then
-  semanage fcontext -a -t httpd_sys_content_t "$WEB_ROOT(/.*)?" 2>/dev/null \
-    || semanage fcontext -m -t httpd_sys_content_t "$WEB_ROOT(/.*)?" 2>/dev/null \
-    || true
-  restorecon -R "$WEB_ROOT" 2>/dev/null || true
+# SELinux（AL3 默认 enforcing）要放行两件事，缺一条就有一半功能不可用：
+#   1) 反代到 127.0.0.1:8000 —— setsebool，否则接口一律 502
+#   2) nginx 读 /opt 下的前端静态文件 —— /opt 默认标签是 usr_t，httpd_t 读不到，
+#      表现是首页 403 而 nginx 配置、权限看起来全对。chmod a+rX 只是 DAC，管不了它。
+# 这里不用 `|| true` 兜：失败就要看得见，静默放过等于埋伏一个线上 403。
+if [[ "$(getenforce 2>/dev/null || echo Disabled)" != "Disabled" ]]; then
+  setsebool -P httpd_can_network_connect 1
+  semanage fcontext -a -t httpd_sys_content_t "${WEB_ROOT}(/.*)?" 2>/dev/null \
+    || semanage fcontext -m -t httpd_sys_content_t "${WEB_ROOT}(/.*)?" 2>/dev/null
+  restorecon -Rv "$WEB_ROOT"
+else
+  echo "SELinux 未启用，跳过上下文设置"
 fi
 
 nginx -t

@@ -35,6 +35,7 @@ from app.agent.service import run
 from app.agent.stream import encode_event
 from app.agent.stream_items import closed_items
 from app.agent.tools import (
+    GENERATE_EVIDENCE_RULES,
     PLAN_PROMPT,
     ToolRegistry,
     build_registry,
@@ -42,15 +43,32 @@ from app.agent.tools import (
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source
 from app.generation.service import (
+    DETAIL_NO_SOURCE_RULES,
     DETAIL_PROMPT,
-    SOURCED_DETAIL_PROMPT,
-    SOURCED_THINKING_GUARD,
+    RAG_SOURCE_PROMPT,
+    RAG_THINKING_GUARD,
     GenerationError,
     chat_async,
     thinking_block,
 )
 
 TOPIC = "考研数学复习计划"
+
+
+def _walk_nodes(root):
+    """前序遍历整棵树：断言“每个节点的某个字段”时用它，不用写递归。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(node.children)
+
+
+def _without(node_dump, key):
+    """逐层删掉一个键：`model_dump(exclude=…)` 只管顶层，嵌套层里的还在。"""
+    trimmed = {name: value for name, value in node_dump.items() if name != key}
+    trimmed["children"] = [_without(child, key) for child in node_dump.get("children", [])]
+    return trimmed
 
 
 class _EchoArgs(BaseModel):
@@ -307,13 +325,27 @@ class DeepGrowReportTest(unittest.TestCase):
     def test_expandable_flag_reaches_the_frame(self):
         frames = self._run_deep(
             lambda user: {"children": [{"label": "能再拆", "expandable": True},
-                                       {"label": "拆到底了", "expandable": False},
-                                       {"label": "没写"}]}
+                                       {"label": "拆到底了", "expandable": False}]}
         )
         flags = {frame["label"]: frame["expandable"] for frame in frames}
         self.assertIs(flags["能再拆"], True)
         self.assertIs(flags["拆到底了"], False)
-        self.assertIsNone(flags["没写"])
+
+    def test_nodes_cut_by_the_slot_quota_are_never_reported(self):
+        """被 `_trim_slots` 裁掉的候选**不许**上报——它们从来没进过树。
+
+        `points_per_branch=2` 时这一路只接纳前 2 个节点，模型多给的第 3 个会在
+        合并前被裁掉。旧行为是照单全收地报，界面上表现为"长出来又消失"：用户看着
+        一个节点出现，几秒后整棵树里没有它，而任何日志都不会提这件事。
+        """
+        frames = self._run_deep(
+            lambda user: {"children": [{"label": "留下的一"}, {"label": "留下的二"},
+                                       {"label": "被裁的三"}]}
+        )
+        labels = {frame["label"] for frame in frames}
+        self.assertIn("留下的一", labels)
+        self.assertIn("留下的二", labels)
+        self.assertNotIn("被裁的三", labels)
 
     def test_no_channel_means_no_streaming_request(self):
         """通道为 None：一次流式都不发，工具行为与加这个功能之前一样。"""
@@ -572,7 +604,10 @@ class GenerateGrowTest(unittest.TestCase):
     def _execute(self, ctx):
         registry = build_registry("create", has_sources=bool(ctx.request.sources))
         if ctx.request.sources:
-            self.assertNotIn("mindmap_generate_deep", registry)
+            # 本文件跑在默认形态（`rag`）下。`mindmap_generate_deep` 现在**在**注册表
+            # 里（分片 + 按支检索那一轮放开了 discard），本文件固定走的是整树生成
+            # 那条路，所以这里守住的是"整树生成仍然可用"，不再是"deep 被撤掉"。
+            self.assertIn("mindmap_generate", registry)
         call = ToolCall(call_id="generate-1", name="mindmap_generate",
                         arguments={"topic": "整理论文"})
         return _run(registry.execute(call, ctx))
@@ -584,9 +619,15 @@ class GenerateGrowTest(unittest.TestCase):
         tree["root"]["source_refs"] = [{"source_id": "s1", "quote": "论文原文。"}]
 
         async def chat(system, user, *, max_tokens, on_delta):
-            self.assertTrue(system.startswith(SOURCED_DETAIL_PROMPT))
-            self.assertEqual(json.loads(user.split("\n", 1)[1]),
-                             [{"source_id": "s1", "text": "论文原文。"}])
+            # 默认形态是 `rag`：输入里没有整份正文，正文只能经检索命中进来
+            # （生成前那一次主题检索，见 `tests/test_generate_evidence.py`）。
+            # 这条断言同时守两件事——预览通道不依赖正文，以及拼装只有一处
+            # （工具里是同一处拼装，但流式与非流式是两个入口）。
+            self.assertTrue(system.startswith(RAG_SOURCE_PROMPT))
+            self.assertIn("本次附带 1 份材料", user)
+            manifest, _, evidence = user.partition("本次已对该主题做过一次检索")
+            self.assertNotIn("论文原文。", manifest)
+            self.assertIn("论文原文。", evidence)
             self.assertEqual(max_tokens, 1234)
             text = json.dumps(tree, ensure_ascii=False)
             for start in range(0, len(text), 7):
@@ -603,6 +644,7 @@ class GenerateGrowTest(unittest.TestCase):
             result = self._execute(ctx)
         self.assertTrue(result.ok, result.content)
         self.assertEqual(result.data["node_count"], 7)
+        # 引用校验用的仍是完整原文：提示词里没有正文，不代表核验也拿不到正文。
         self.assertEqual(ctx.candidate.root.source_refs[0].quote, "论文原文。")
         self.assertEqual(ctx.candidate.source_usage[0].source_id, "s1")
         self.assertEqual((ctx.revision, ctx.extra_model_calls, ctx.model_calls_used), (1, 1, 1))
@@ -613,7 +655,8 @@ class GenerateGrowTest(unittest.TestCase):
         tree = self._tree()
 
         async def chat(system, user, *, max_tokens, on_delta):
-            self.assertEqual(system, DETAIL_PROMPT + thinking_block("default"))
+            self.assertEqual(system, DETAIL_PROMPT + thinking_block("default")
+                             + DETAIL_NO_SOURCE_RULES)
             self.assertEqual(user, "整理论文")
             await on_delta(json.dumps(tree, ensure_ascii=False))
             return tree
@@ -715,17 +758,41 @@ class GenerateGrowTest(unittest.TestCase):
                 self.assertTrue(result.ok, result.content)
                 self.assertEqual(len(calls), 1)
                 system, user, max_tokens = calls[0]
-                expected_system = DETAIL_PROMPT + thinking_block("default")
+                expected_system = (DETAIL_PROMPT + thinking_block("default")
+                                   + DETAIL_NO_SOURCE_RULES)
                 if with_sources:
-                    expected_system = (SOURCED_DETAIL_PROMPT + thinking_block("default")
-                                       + SOURCED_THINKING_GUARD)
-                    self.assertEqual(json.loads(user.split("\n", 1)[1]),
-                                     [{"source_id": "s1", "text": "论文原文。"}])
+                    # 默认形态是 `rag`：提示词与输入都换成"清单 + 命中"的那一套。
+                    # 之前这里钉的是 `full`（sources 数组 + 整份正文），形态一换，
+                    # 期望值就得跟着换——放宽成"以某个前缀开头"是没用的，那正好
+                    # 会放过"两种形态拼错了"这一整类问题。
+                    #
+                    # 末尾多出的一句来自 `mindmap_generate` 生成前那次检索：主题
+                    # "整理论文"与正文"论文原文。"共享词项，必有命中，所以提示词
+                    # 要告诉模型"这次不用再检索"（`GENERATE_EVIDENCE_RULES`）。
+                    expected_system = (RAG_SOURCE_PROMPT + thinking_block("default")
+                                       + RAG_THINKING_GUARD + GENERATE_EVIDENCE_RULES)
+                    self.assertIn("本次附带 1 份材料", user)
+                    manifest, _, evidence = user.partition("本次已对该主题做过一次检索")
+                    # 正文只能经检索命中进来，清单里一个字节都没有
+                    self.assertNotIn("论文原文。", manifest)
+                    self.assertIn("论文原文。", evidence)
+                    self.assertNotIn("sources 数组", user)
                 else:
                     self.assertEqual(user, "整理论文")
                 self.assertEqual(system, expected_system)
                 self.assertEqual(max_tokens, 1234)
-                self.assertEqual(ctx.candidate.root, MindMapContent.model_validate(self._tree()).root)
+                # `expandable` 是工具**落树时**打的标（见 `tools._stamp_expandable`），
+                # 模型给的那棵树里没有它。所以逐字段比对时把它摘掉，再单独断言它：
+                # 这棵 3 层的树离契约的 8 层还远，每个节点都该是 `yes`（"还能展开"）。
+                # 直接把它从比对里删干净而不补一条断言，等于把三态这件事从"这次改动
+                # 没影响别的东西"的证据里悄悄拿掉。
+                expected_root = MindMapContent.model_validate(self._tree()).root
+                self.assertEqual(
+                    _without(ctx.candidate.root.model_dump(), "expandable"),
+                    _without(expected_root.model_dump(), "expandable"),
+                )
+                self.assertEqual({node.expandable for node in _walk_nodes(ctx.candidate.root)},
+                                 {"yes"})
 
     def test_stream_failures_keep_sourced_generation_successful(self):
         text = json.dumps(self._tree(), ensure_ascii=False)
@@ -859,13 +926,37 @@ class ChatAsyncStreamingTest(unittest.TestCase):
         self.assertEqual(result, {"children": [{"label": "甲"}]})
         self.assertEqual(calls["n"], 1)  # 第一段之后就不再回调
 
-    def test_truncated_stream_is_rejected_without_a_second_request(self):
-        """finish_reason=length 是硬边界：与一次性路径同样判失败，不重发请求。"""
+    def test_truncated_stream_is_salvaged_without_a_second_request(self):
+        """finish_reason=length：回收已闭合的节点，并且**仍不重发请求**。
+
+        旧行为是一律抛错（"硬边界"）。现在唯一的区别是那句"能回收就不失败"：
+        被切的正文里已经有一个完整节点（`{"label":"甲"}` 闭合了），把它交出去
+        比让整次生成报废更有用。而"不重发请求"这条没有变——重发的还是同一份
+        被切的输出，多花一次钱、结果一样。
+        """
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
             return httpx.Response(200, content=_sse(['{"children":[{"label":"甲"}'],
+                                                     finish_reason="length"))
+
+        async def on_delta(text: str) -> None:
+            return None
+
+        result = self._call(handler, on_delta)
+        self.assertEqual(list(result["children"]), [{"label": "甲"}])
+        self.assertTrue(getattr(result, "partial", False))
+        self.assertEqual(getattr(result, "recovered", 0), 1)
+        self.assertEqual(len(requests), 1)
+
+    def test_unrecoverable_truncated_stream_is_rejected(self):
+        """切在 label 中间：一个完整节点都回收不出来，才判失败（同样不重发）。"""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, content=_sse(['{"children":[{"label":"写了一半'],
                                                      finish_reason="length"))
 
         async def on_delta(text: str) -> None:

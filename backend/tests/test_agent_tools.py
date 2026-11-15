@@ -10,6 +10,12 @@
 分片生成（`mindmap_generate_deep`）的用例额外盯住三件事：分支调用是并发的、
 并发被限在 3 个以内、要点不足时只补那一支而不是整张重来。这三条一旦退化，
 单次调用会被打回「一次出一整棵树」，而那正是这条路径要解决的问题。
+
+**本文件按模块固定成 `MINDMAP_SOURCE_MODE=full`**（见下面的 `_full_source_mode`）。
+这里的一批用例钉的是"正文整份进 prompt"这条形态的契约：结构化 sources 数组、
+超预算二分裁剪、来源 id 原样透传——它们在 `rag` 形态下没有意义（那里正文根本
+不进 prompt）。`rag` 形态的行为在 `tests/test_source_mode.py`，默认值也是在那里
+钉的，所以这里的固定不会把"默认到底是不是 rag"藏起来。
 """
 from __future__ import annotations
 
@@ -60,6 +66,22 @@ TREE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _full_source_mode(clean_env, monkeypatch):
+    """整个模块跑在 `full` 形态下（理由见模块 docstring）。
+
+    必须显式依赖 `clean_env`：那个 fixture 会把 `MINDMAP_SOURCE_MODE` 删掉
+    （宿主机上留着 `full` 不该影响别的文件），同作用域的两条 autouse 之间没有
+    可靠顺序，只有依赖关系能定住"先清、后设"。
+
+    用 fixture 而不是逐条 `patch.dict`：这个文件里 unittest 用例与裸 pytest 函数
+    混着写，逐条加装饰器必然漏——而漏掉的那条在 `rag` 形态下会静默变成"另一个
+    测试"，不是报错。
+    """
+    monkeypatch.setenv("MINDMAP_SOURCE_MODE", "full")
+    yield
+
+
 def _content() -> MindMapContent:
     return MindMapContent.model_validate(TREE)
 
@@ -94,7 +116,11 @@ def _run(coro):
 
 
 def _prompt_payload(user: str) -> list[dict]:
-    """取出 `_source_prompt_input` 里那段 JSON 数组。"""
+    """取出 `_source_prompt_input` 里那段 JSON 数组（**只有 `full` 形态有**）。
+
+    `rag` 形态的输入是纯文本清单，拿它来解析只会得到一条 JSONDecodeError。
+    那一边的断言在 `tests/test_source_mode.py`。
+    """
     return json.loads(user.split("\n", 1)[1])
 
 
@@ -1008,8 +1034,13 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertGreaterEqual(state["peak"], 2)
 
     def test_depth_limit_is_configurable(self):
-        """`max_depth` 真的会改变结果：3 与 4 各跑一次，最深一层差一层。"""
-        for max_depth, calls in ((3, 10), (4, 16)):
+        """`max_depth` 真的会改变结果：2 与 3 各跑一次，最深一层差一层。
+
+        原来这里的两个取值是 3 与 4。**初次生成现在上限 4 层（含根）**，也就是
+        `max_depth <= 3`（这个参数按 root 之下算），所以 4 这一档已经不可能生效
+        ——它现在由下面那条 `test_initial_depth_is_capped_at_four_levels` 负责。
+        """
+        for max_depth, calls in ((2, 4), (3, 10)):
             ctx = _ctx(max_model_calls=20)
             seen: list[str] = []
 
@@ -1032,6 +1063,39 @@ class GenerateDeepToolTest(unittest.TestCase):
             self.assertEqual([item["depth"] for item in result.data["levels"]],
                              list(range(max_depth + 1)))
             self.assertEqual(len(seen), calls)
+
+    def test_initial_depth_is_capped_at_four_levels(self):
+        """初次生成恒定 4 层（含根）：传 4 会被夹到 3，传 8 同样。
+
+        这一条钉的是"别差一层"：`GenerateDeepArgs.max_depth` 按 **root 之下** 算，
+        `INITIAL_MAX_DEPTH = 3` 对应 4 层树。写成 4 就变成 5 层，节点数上界从
+        79 跳到 241，第一次生成必然撑爆调用预算并交出半棵树。
+        """
+        from app.agent.tools import INITIAL_MAX_DEPTH
+
+        self.assertEqual(INITIAL_MAX_DEPTH, 3)
+        for requested in (4, 8):
+            ctx = _ctx(max_model_calls=20)
+            seen: list[str] = []
+
+            async def fake(system, user, *, max_tokens=None, _seen=seen):
+                _seen.append(user)
+                if system.startswith(PLAN_PROMPT):
+                    return _plan("甲", "乙", "丙")
+                if "本条一级分支：" in user:
+                    return _children(f"{_branch_title(user)}一", f"{_branch_title(user)}二")
+                return _children(_subnode_label(user) + "·细节")
+
+            with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+                result = _run(build_registry("create").execute(_call(
+                    "mindmap_generate_deep", topic="机器学习", branches=3,
+                    points_per_branch=2, max_depth=requested), ctx))
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(result.data["depth_limit"], INITIAL_MAX_DEPTH)
+            # 4 层含根 = levels 里出现 0/1/2/3，没有第 4 层
+            self.assertEqual([item["depth"] for item in result.data["levels"]],
+                             [0, 1, 2, 3])
 
     def test_two_level_output_is_unchanged_at_depth_two(self):
         """`max_depth=2` 时产出与改多级之前一致：两层，且不吃模型多给的下层。"""
@@ -1325,6 +1389,17 @@ class ExpandToolTest(unittest.TestCase):
 
 
 class RagToolTest(unittest.TestCase):
+    def setUp(self):
+        # 检索现在带向量路：这个类只验证工具的接线，不该因为宿主机恰好配了
+        # DASHSCOPE_API_KEY 就去调真实 embedding 接口——那会让单测变慢、计费，
+        # 结果还带网络的不确定性。融合与降级由 test_hybrid_search.py 覆盖。
+        # 查询计划同理：开关写死关，`_rag` 的分支才只取决于 mock，而不是宿主机的
+        # MINDMAP_QUERY_EXPANSION。多路的行为由 test_search_multi.py 覆盖。
+        env = patch.dict("os.environ", {"MINDMAP_HYBRID_SEARCH": "0",
+                                        "MINDMAP_QUERY_EXPANSION": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_returns_hits_from_attached_sources(self):
         source = Source(kind=SourceKind.text, status="parsed",
                         text="会议决定在十月十七日发布二点零版本，请提前准备上线材料。")
@@ -1353,6 +1428,27 @@ class RagToolTest(unittest.TestCase):
             _call("rag_query", question="量子色动力学的渐近自由"), ctx))
         self.assertTrue(result.ok)
         self.assertEqual(result.data["hits"], [])
+
+    def test_method_reflects_hit_method(self):
+        """混合检索生效时请求级 method 不能还写死 lexical：那会让模型以为这批
+        片段只做过关键词匹配。真值在每条 hit 上，这里只做汇总。"""
+        from app.knowledge.service import EvidenceHit
+
+        def hit(method):
+            return EvidenceHit(source_id="s1", start=0, end=3, quote="abc",
+                               score=0.02, score_bm25=1.0, score_vector=0.8,
+                               method=method)
+
+        source = Source(kind=SourceKind.text, status="parsed", text="abc")
+        for expected, hits in (("hybrid", [hit("hybrid")]), ("lexical", [hit("lexical")])):
+            ctx = _ctx(intent="expand", sources=[source])
+            # 单路检索走 `search_parent`（关着时它内部就是 `search_sources`），
+            # 所以打桩要打这一层：打 `search_sources` 打不到 `_rag` 直接调的那个名字。
+            with patch("app.agent.tools.search_parent", return_value=hits):
+                result = _run(build_registry("expand", has_sources=True).execute(
+                    _call("rag_query", question="abc"), ctx))
+            self.assertEqual(result.data["method"], expected)
+            self.assertEqual(result.data["hits"][0]["method"], expected)
 
 
 class EditToolTest(unittest.TestCase):

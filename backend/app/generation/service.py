@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -15,13 +17,16 @@ from pydantic import ValidationError
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import (
+    GENERATED_LABEL_MAX_CHARS,
     MAX_TREE_DEPTH,
     MAX_TREE_NODES,
     MindMapContent,
     Node,
+    clip_label,
 )
 from app.contracts.source import Source, SourceUsage
-from app.optimization.source_refs import verify_source_refs
+from app.generation.budget import INITIAL_MAX_DEPTH, INITIAL_MAX_NODES
+from app.optimization.source_refs import EvidenceSpan, verify_source_refs
 
 # 单次模型调用的超时（秒）与响应体上限（字节）：超时避免请求无限挂起，
 # 上限避免异常响应把内存读满。
@@ -38,7 +43,111 @@ _MAX_RESPONSE_BYTES = 2_000_000
 # 按每节点约 25 token 算，65536 装得下 2600 个节点，高于契约允许的 1000 个，
 # 所以输出上限不再是内容被截断的原因——真被截断时 `finish_reason=length`
 # 会明确报错，不会静默交付半棵树。
+#
+# **这个数是默认值，不是唯一值**。DeepSeek 系列接受 65536，qwen 系列的上限是
+# 32768，混元/本地部署的兼容端点各不相同。写死一个数意味着换一个模型就整条路
+# 报 400，而报错文案是"模型服务返回 HTTP 400，请检查服务配置"——用户无从知道
+# 该改哪个环境变量。所以：
+#
+#   1. `MINDMAP_LLM_MAX_TOKENS` 覆盖它（`max_tokens_cap()` 读）；
+#   2. 仍然超限时，从服务端的 400 正文里解析
+#      `Range of max_tokens should be [1, N]`，学到 N 并**自动降级重试一次**
+#      （`_chat_once`）。学到值只在进程内存里，不写任何配置文件：它是服务端的
+#      事实，不是用户的配置，落盘之后没人知道该在什么时候删掉它。
 MAX_OUTPUT_TOKENS = 65536
+
+# 覆盖上面那个默认值的环境变量。
+MAX_TOKENS_ENV = "MINDMAP_LLM_MAX_TOKENS"
+
+# 服务端在 400 里自报的上限（进程内学习值）。`None` = 还没学到任何东西。
+# 一旦学到就一直是它与配置值取小：同一进程里的每一个出口（生成、展开、agent
+# 轮次）都该发同一个数，否则"三处各写一个上限"这个老问题会以另一种形式回来。
+_LEARNED_MAX_TOKENS: int | None = None
+
+# 服务端 400 的正文形状。实测 DeepSeek 写的是
+# `Range of max_tokens should be [1, 65536]`；OpenAI 兼容端点还见过
+# `max_tokens is too large: 65536. This model supports at most 32768`。
+# 两种都认，任何一种解析不出来就不降级（宁可抛原来那个错误，也不要瞎猜一个数）。
+_MAX_TOKENS_RANGE = re.compile(r"[Rr]ange of max_tokens should be \[\s*(\d+)\s*,\s*(\d+)\s*\]")
+_MAX_TOKENS_AT_MOST = re.compile(r"supports at most (\d+)")
+
+
+def parse_max_tokens_limit(text: str) -> int | None:
+    """从服务端的错误正文里解析出它真正接受的 `max_tokens` 上界。
+
+    解析不出来返回 `None`——调用方据此**不降级**。猜一个数比报错更糟：猜大了
+    再撞一次 400（用户多等一轮），猜小了静默削掉输出能力（截断率上升，而原因
+    在日志里看不出来）。
+    """
+    body = text or ""
+    match = _MAX_TOKENS_RANGE.search(body)
+    if match:
+        upper = int(match.group(2))
+        return upper if upper > 0 else None
+    match = _MAX_TOKENS_AT_MOST.search(body)
+    if match:
+        upper = int(match.group(1))
+        return upper if upper > 0 else None
+    return None
+
+
+def configured_max_tokens() -> int:
+    """`MINDMAP_LLM_MAX_TOKENS` 的值；没配或不是正整数时回落到默认值。
+
+    非法值不抛错：这是一个可选调优项，写错时的正确处置是"按默认值继续"，而不是
+    让整次生成失败在一条环境变量上（与 `source_mode()` 对非法取值的处理同一条
+    道理）。只 warning 一次，避免每次拼请求都刷一行日志。
+    """
+    raw = os.getenv(MAX_TOKENS_ENV, "").strip()
+    if not raw:
+        return MAX_OUTPUT_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value > 0:
+        return value
+    if raw not in _WARNED_MAX_TOKENS:
+        _WARNED_MAX_TOKENS.add(raw)
+        logger.warning("%s=%r 不是正整数，按默认值 %d 处理",
+                       MAX_TOKENS_ENV, raw, MAX_OUTPUT_TOKENS)
+    return MAX_OUTPUT_TOKENS
+
+
+# 非法环境变量的告警去重集合（口径同 `_WARNED_SOURCE_MODES`）。
+_WARNED_MAX_TOKENS: set[str] = set()
+
+
+def max_tokens_cap() -> int:
+    """当前进程允许发出的 `max_tokens` 上限：配置值与服务端学习值取小。
+
+    三个出口都要用这一个函数：`chat_async`（工具内的生成/展开）、
+    `provider.complete_tools`（agent 轮次），以及任何将来新增的模型调用。
+    各写一处 `min(...)` 的结果，是三条路上限慢慢分叉，而分叉的表现只是
+    "某条路径偶尔 400"。
+    """
+    cap = configured_max_tokens()
+    if _LEARNED_MAX_TOKENS is not None:
+        cap = min(cap, _LEARNED_MAX_TOKENS)
+    return cap
+
+
+def learn_max_tokens(value: int) -> None:
+    """记下服务端自报的上限（只在内存里，见 `_LEARNED_MAX_TOKENS` 的注释）。"""
+    global _LEARNED_MAX_TOKENS
+    if value <= 0:
+        return
+    if _LEARNED_MAX_TOKENS is None or value < _LEARNED_MAX_TOKENS:
+        if _LEARNED_MAX_TOKENS != value:
+            logger.warning("模型服务自报 max_tokens 上限为 %d，本次进程后续请求将降到该值",
+                           value)
+        _LEARNED_MAX_TOKENS = value
+
+
+def reset_learned_max_tokens() -> None:
+    """清掉学习到的上限。只给测试用——生产里它是服务端的事实，不该被手动抹掉。"""
+    global _LEARNED_MAX_TOKENS
+    _LEARNED_MAX_TOKENS = None
 
 # 模型上下文（输入侧）上限，单位 token。**这是保守值，不是实测边界**：
 # 探测 api.deepseek.com 需要密钥，而本机没有可用密钥（占位密钥只拿到 401），
@@ -48,21 +157,117 @@ MAX_OUTPUT_TOKENS = 65536
 # 一万多输入 token，正常材料离这条线很远。
 CONTEXT_TOKEN_LIMIT = 200000
 
+logger = logging.getLogger(__name__)
+
+# 「材料怎么进 prompt」的开关：`full` 把每份来源的正文整份拼进去，`rag` 只给清单。
+#
+# 默认 `rag`。这不是性能优化，是**形态切换**：`full` 下模型自己就能扫全文，
+# `rag_query` 只是"帮我定位该引用哪一段"的辅助；`rag` 下模型只看得见检索回来的
+# 片段，检索从辅助变成了唯一入口。两种形态的提示词、引用来源、失败方式都不同，
+# 所以是一个显式的两态开关，而**不是**"材料小就走 full"的自适应——行为随材料
+# 大小跳变是最难排查的一类 bug：同一份请求换个字号，结论就变了。
+#
+# `rag` 形态下"正文不出进程"这句话**不成立**，准确说法见
+# `agent/tools._material_inputs` 的 docstring：进 prompt 的只有清单 + 检索片段 +
+# 查询扩展那每份 200 字（`MINDMAP_QUERY_EXPANSION`，默认关）+ **材料自带的章节
+# 标题**（`agent/tools._skeleton_outline` 给骨架的那份目录）；离开进程的还有
+# 混合检索的 embedding 请求（两种形态都一样）。
+#
+# 别把最后那一项读成"正文也进去了"：目录是原文的子集，只是一级标题行（一条最多
+# 40 字），覆盖率不到 60% 的材料一条都不进。准确口径是"正文**段**不进，标题行
+# 作为结构线索会进"——分片生成下覆盖度由骨架决定，看不到结构的骨架只能凭主题猜
+# 分块，材料里它没想到的章节就永远没人问（`docs/RAG-DECISIONS.md` 第 5 节）。
+SOURCE_MODE_ENV = "MINDMAP_SOURCE_MODE"
+SOURCE_MODE_FULL = "full"
+SOURCE_MODE_RAG = "rag"
+DEFAULT_SOURCE_MODE = SOURCE_MODE_RAG
+
+# 非法取值只告警一次。`source_mode()` 每拼一次提示词就调一次（一次请求里十几次），
+# 每次都 warning 会把日志刷满、把真正要看的东西埋掉——与 Neo4j `id()` 弃用通知
+# 的处理同一个道理（`docs/RAG-DECISIONS.md` 9.3）。
+_WARNED_SOURCE_MODES: set[str] = set()
+
+
+def source_mode() -> str:
+    """这次走哪种形态。只认 `full` / `rag`，其余（含未设置）一律按默认值处理。
+
+    不做记忆化：环境变量在一个进程里是常量，但测试要能逐条切换（`patch.dict`），
+    缓存会把"这条用例显式设成 full"变成"取决于上一条用例跑过什么"。
+
+    非法值按 `rag` 而不是 `full` 兜底：`full` 会把整份正文塞进 prompt，是一个
+    **有成本、有泄露面**的行为；配置写错时落到更省的那一侧，代价只是多调几次
+    检索，反过来则是白花 token 且没人预期到。
+    """
+    raw = os.getenv(SOURCE_MODE_ENV, "").strip().lower()
+    if raw in (SOURCE_MODE_FULL, SOURCE_MODE_RAG):
+        return raw
+    if raw and raw not in _WARNED_SOURCE_MODES:
+        _WARNED_SOURCE_MODES.add(raw)
+        logger.warning(
+            "%s=%r 不是合法取值（只认 %r / %r），按默认值 %r 处理",
+            SOURCE_MODE_ENV, raw, SOURCE_MODE_FULL, SOURCE_MODE_RAG, DEFAULT_SOURCE_MODE,
+        )
+    return DEFAULT_SOURCE_MODE
+
+
+# 「内容可以自由展开、引用必须标出处」——**三份生成提示词共用的唯一一句契约**。
+#
+# 上一版的契约是"检索不到就不要写，空着是正确结果"。代价实测过：同一份 12392 字
+# 材料，全文可见时覆盖率 100%，检索形态只有 28.8%，而且模型会写出"材料中没有相关
+# 内容：未检索到任何原文依据"这种节点——产品要的是一张完整的导图，不是"材料里有
+# 什么就画什么"。
+#
+# 新契约把两件事拆开：**内容**允许模型凭自己的知识补全，**出处**不许冒充材料。
+# 两半必须同时说，只说一半都会坏事：
+#   - 只说"自由展开"：模型会给自主补充的内容挂上编造的引用，"标明出处"退化成
+#     "随便挂一个看起来相关的引用"；
+#   - 只说"必须依据材料"：模型退回"没检索到就不写"，正是这次要消灭的那种空心树。
+#
+# 措辞只此一份。三份提示词（无来源 / `full` / `rag`）各自再补自己那种形态的细节
+# （引用怎么抄、检索不到怎么处理），但这一句必须逐字相同——它约束的是同一个行为，
+# 三种说法会让"到底能不能补全"随形态漂移，而那种漂移在界面上看不出来。
+CONTENT_FREEDOM_CONTRACT = (
+    "内容可自由展开：材料没覆盖的方面，按你的知识补全，不要留空节点。"
+    "但凡引用、转述、概括材料的，必须标出处；自主补充的内容不要冒充材料。"
+)
+
 # 一次性生成完整导图的提示词（非流式接口、流式接口的第二段都用它）。
 #
 # 输入有两种形态，必须分开说：早先只写了「整理」和「不要捏造」，模型对
 # 一句话的主题（如「机器学习」）就严格照做——那四个字里确实没有可整理的
 # 分支，于是只回一个光杆根节点，被 MIN_BRANCHES 拦下。而这个产品本来的
 # 用法就是「说一个主题，给一张图」，所以要把「围绕主题展开框架」和
-# 「忠实整理材料」区分开：前者允许补全结构，后者不许凭空加内容，两者
-# 都不许编造具体事实。
+# 「带材料的整理」区分开。
+#
+# 两种形态在**深度与覆盖**上的规则现在是同一条（能拆就拆、材料没覆盖的按知识
+# 补全），差别只剩「出处怎么标」：有材料的那一份由 `SOURCED_DETAIL_PROMPT` /
+# `RAG_SOURCE_PROMPT` 补上引用纪律。上一版把差别写成"后者不许凭空加内容"，
+# 实测把整棵树压成了材料的目录（覆盖率 28.8%），这一段因此改写。
 DETAIL_PROMPT = (
     "把用户输入变成一张思维导图。只返回一个 JSON 对象，不要代码围栏。"
     "格式为 {\"title\":\"标题\",\"root\":{\"id\":\"唯一id\","
-    "\"label\":\"节点文字\",\"children\":[]}}。每个节点均含 id、label、children，"
+    "\"label\":\"节点文字\",\"detail\":\"节点说明\",\"children\":[]}}。"
+    "每个节点均含 id、label、detail、children，"
+    # 节点是**两层**的：label 短、detail 长。这一条不改任何结构规则，它改的是
+    # "一个字放在哪个字段"。上一版只有一个 label，模型把整句解释塞进去，实测
+    # 240 个节点的树里 label 普遍 20–30 字，画布上挤成一团——而画布只截断显示，
+    # 内容其实一个都没少，少的是"短标题 + 长正文"这个形态。
+    #
+    # 两个上限都写死成可读的字数而不是 token 数：模型对"16 字"的理解比对
+    # "11 token"稳定得多。detail 的 2–3 句同样是可执行的要求，"写详细一点"
+    # 这类形容词它只能自己发挥。
+    f"label 是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
+    "detail 是给这个节点看的说明，2–3 句，可以带数字与条件；"
+    "画布上只显示 label，detail 是点开之后看到的正文。\n"
     # 这里的两个数字取自契约常量：写死过一次，结果契约从 300 放到 1000 之后
     # 提示词还在叫模型"不超过 300"，模型自我设限，契约放宽等于没生效。
     f"ID 全局唯一，层级不超过 {MAX_TREE_DEPTH}，节点不超过 {MAX_TREE_NODES}。"
+    # 上面那句是**契约**上限（承载能力），这一句是**这一次**的规模。两句都要在：
+    # 只说 1000 时模型会照着写一百多个节点，一次重响应既容易撞输出上限，画布上
+    # 也读不完；只说 80 时它会把 80 当硬边界，复杂主题上主动砍内容。
+    f"第一次生成本身请控制在 {INITIAL_MAX_NODES} 个节点、"
+    f"{INITIAL_MAX_DEPTH + 1} 层（含中心主题）以内：宁可少两层，也要让每一层都写完整。"
+    "更细的内容留给用户点开某个节点后再展开。"
     # 展开规则必须单独成段，判据只能是「还能不能再拆」。
     #
     # 早先这条规则被塞在分支数量里（「每个分支再给 2-4 个要点」），模型把它读成
@@ -86,12 +291,14 @@ DETAIL_PROMPT = (
     # 已经写完了」，深度规则就被它自己的思考步骤盖掉。
     "思考方式里的步骤只决定按什么角度拆，不决定拆到哪一层。\n"
     "输入分两种，按情况处理：\n"
-    "1) 完整材料（会议纪要、文章、笔记）：忠实整理它的结构，不要添加材料里"
-    "没有的内容。每个可分解的分支至少 2 个要点，具体几个由内容决定；"
-    "依据不足时宁可少给，不要为了凑数补写。\n"
+    "1) 带材料的整理（会议纪要、文章、笔记）：材料已经写到的方面按它的结构走；"
+    "材料没覆盖的方面按你的知识补全，不要留「材料中没有相关内容」这种空节点。"
+    "每个可分解的分支至少 2 个要点，具体几个由内容决定；"
+    "不要为了凑数把同一件事拆成两条。\n"
     "2) 简短的主题或目标（如「机器学习」「帮我规划毕业论文」）：围绕它展开成 "
     "3-6 个一级分支，每个分支再按上面那条「还能不能再拆」继续往下拆。"
-    "这是框架展开，不算捏造；但不要编造具体的数据、人名、文献或引用。\n"
+    "这是框架展开；做法、步骤、判断标准按你的知识写，"
+    "但不要编造看起来可核查的出处（书名、论文编号、链接）。\n"
     "两种情况下所有一级分支加起来不少于 3 条，根节点都必须有子节点，"
     "只有根节点的结果不合格。"
     # 正反例沿用手写示例的写法（下面 quote 那段也是 ❌/✅）：只说「更具体」时
@@ -104,33 +311,49 @@ DETAIL_PROMPT = (
     "❌ 要点写得很长、下面却不再拆：那是把同一层写胖，不是把结构写深\n"
     "✅ 每一层都比上一层更具体，父子不能是同一件事的两种说法\n"
     "不要停在两级就收；也不要为了凑层数制造节点——拆不动的那一支到此为止是正常的。"
+    + CONTENT_FREEDOM_CONTRACT
+)
+
+# 没有材料可标出处的那两条路（纯主题生成、`rag` 形态检索为空后的退化）追加的一句。
+#
+# 为什么单独一句而不是塞进 `DETAIL_PROMPT`：那份提示词是 `SOURCED_DETAIL_PROMPT`
+# 与 `RAG_SOURCE_PROMPT` 的前缀，写死"这次没有材料"会与后面那句"这次输入的是带了
+# 来源的材料"直接打架。每条路只描述自己那种形态，是这三份提示词一直以来的分工。
+DETAIL_NO_SOURCE_RULES = (
+    "\n这次没有可标出处的材料：不要写 source_refs，也不要在节点里写"
+    "「材料中没有相关内容」——按主题把你的知识写全，引用一律留空。\n"
 )
 
 SOURCED_DETAIL_PROMPT = DETAIL_PROMPT + (
-    "注意：这次输入的是带了来源的材料，按上面第 1 种形态处理，"
-    "不要因为主题简短就自行展开——所有内容都必须能在 sources 里找到依据。"
-    # 深度规则在有来源时要换成「材料能支撑到多细」。不换的话会两错：
-    # 一是把上面那句「继续拆」当成自由展开的许可，拆出来的层级靠常识补；
-    # 二是反过来把「忠实整理」理解成只抄一层，材料里再多细节也不往下走。
-    # 判据必须落在原文上，这样「拆得深」和「依据不足宁可少给」才是同一条规则。
-    "「还能不能再拆」这条同样适用，判据只看材料：原文里还有更具体的表述支撑，"
-    "就继续拆一层；材料到这里就没有更细的说法了，就停。"
+    "注意：这次输入的是带了来源的材料，按上面第 1 种形态处理。"
+    # 深度规则在有来源时要换成「材料能撑到多细，撑不住就按自己的知识接着拆」。
+    # 上一版写的是"判据只看材料，材料没说的就停"，实测把整棵树压成材料的目录：
+    # 材料没覆盖的角度全都不出现，用户拿到的是一份复印件而不是一张导图。
+    # 新判据保留"材料有更细的说法就照它拆"，但材料没说的部分改为可以凭知识补——
+    # 代价是多出来的那一层没有出处，所以同一句里把引用纪律钉上。
+    "「还能不能再拆」这条同样适用：原文里还有更具体的表述支撑，就继续拆一层；"
+    "材料到这里就没有更细的说法了，也可以按你的知识继续拆——只是那一层不挂引用。"
     # 「更具体的表述」也要给形状。只说「更具体」时模型只去找正文句子，
     # 而原文自带的分层（标题、编号、列表、表格行、公式步骤）同样是依据，
     # 而且比「哪句更像细节」更稳定——它是原文写下的，不是模型判断出来的。
     "原文自己的分层就是最直接的依据：标题、编号、列表项、表格的行、公式的每一步，"
     "都是材料给出的分点——遇到它们就照原样落成一层，不要把一整节压进一个节点。"
-    "拆得深不等于写得满——每一层新增的节点都必须能在原文里找到依据，"
-    "材料里没有的内容一律不补，这一支宁可浅一点。"
     "用户输入为 sources 数组，每项含 source_id 和 text，text 是待整理的原文。"
-    "每个有原文依据的节点增加 source_refs 数组，格式为"
+    "每个引用到材料的节点增加 source_refs 数组，格式为"
     '[{"source_id":"输入中已有的来源ID","quote":"逐字摘录的原文片段"}]。'
+    # 引用是**节点**的字段，与 label、detail 平级。写进 detail 的引用过不了
+    # `verify_source_refs`（它只看 `node.source_refs`），而且会变成一段无法点击的
+    # 纯文本——用户看到的"有出处"和系统认为的"有出处"不是同一件事。
+    "source_refs 与 label、detail 平级，不要写进 detail 的文字里。"
     "quote 不超过 300 字，必须出自对应来源的 text：可以只截取原文里的一段，"
     "但不能改写、概括、拼接或跨来源引用。\n"
     "原文：会议决定在十月十七日发布二点零版本。\n"
     '❌ quote="计划近期上线" —— 这是概括，原文里逐字找不到这句\n'
     '✅ quote="十月十七日发布二点零版本" —— 原文里的连续片段\n'
-    "没有直接依据时 source_refs 留空，不要编造引用。"
+    # 两句话分工：材料里有的话要挂引用；材料里没有的（自己补的）不挂。
+    # 只写后者会退化成"能引就引、引不到就编"，只写前者会退化成"没有依据的节点删掉"。
+    "有原文依据的地方就写 source_refs；自己补的内容不要挂引用，也不要写成"
+    "「材料指出」——那是在冒充材料。出处确实没有时 source_refs 留空，不要编造。"
     "不要输出 source_usage；不要猜测 page、start、end。"
 )
 
@@ -196,13 +419,73 @@ THINKING_MODELS: dict[str, dict[str, str]] = {
     },
 }
 
-# 有来源时的限定句。`SOURCED_DETAIL_PROMPT` 的语义是「忠实整理材料」，思维模型
-# 只能决定「按什么角度组织」，不能变成「自由展开」——不写这句，费曼那套「必须
-# 举反例」会直接诱导模型编材料里没有的内容。
+# 有来源时的限定句。它约束的是**出处**，不是内容范围：思维模型（尤其费曼那套
+# 「必须举反例」）会自然长出材料里没有的角度，上一版的写法把那些角度一律禁掉，
+# 结果整棵树退化成材料的目录。现在放开内容、只要求"自己补的不冒充材料"——
+# 这两件事必须分开说，合在一句里的话，模型只会执行更保守的那一半。
 SOURCED_THINKING_GUARD = (
-    "\n上面这套思考方式只用来决定「按什么角度整理」，不是展开许可："
-    "所有节点仍然必须落在 sources 覆盖到的范围内，材料里没有的角度宁可不要，"
-    "不要为了凑齐这套步骤而补写材料之外的内容。\n"
+    "\n上面这套思考方式只决定「按什么角度整理」，不是对内容范围的限制："
+    "每一步都可以写，材料没覆盖的部分按你的知识补全，不要因为材料没提到就跳过；"
+    "但凡引用、转述、概括材料的，必须标出处，自主补充的内容不要挂 source_refs。\n"
+)
+
+# `rag` 形态的提示词。**不能复用 `SOURCED_DETAIL_PROMPT`**：那一份写着「用户输入
+# 为 sources 数组，每项含 source_id 和 text，text 是待整理的原文」，而 rag 形态里
+# 一个字的正文都没有——照抄会让模型去找一个不存在的 text 字段，再把"没看见"读成
+# "材料里没有"，最后交出一棵空心树。两份提示词共用 `DETAIL_PROMPT` 的树规则，
+# 之后的每一句都只描述自己那种形态。
+RAG_SOURCE_PROMPT = DETAIL_PROMPT + (
+    "注意：这次输入的是带了来源的材料，按上面第 1 种形态处理。"
+    # 形态必须先讲清楚。模型不知道"还有东西没给我"时会把清单当成全文，直接从标题
+    # 推内容；这类错最难查，因为树看起来有依据，其实全是常识补的。
+    #
+    # 这里**不再要求模型自己调 `rag_query`**：`_generate` 在拼 system 之前已经做过
+    # 一次主题预检索（`tools._retrieve_topic`），命中就拼在 user 消息末尾。再让它
+    # 自行检索是重复的——它拿不到新东西，却多花一次 embedding + 一轮对话轮次，
+    # 而且"没检索到"的自我判断会把整棵树又拉回空心形态。
+    "\n你看不到材料全文：输入里只有一份材料清单（标题、字数、类型），正文一个字"
+    "都没有进来；与主题相关的原文片段由系统检索后附在输入末尾（evidence 数组），"
+    "那是你这次能引用的全部原文。\n"
+    "❌ 清单里有一份《预算管理办法》，就直接写「预算需经财务审批」并挂上引用"
+    "——这是从标题猜的\n"
+    "✅ 引用只从 evidence 里抄；evidence 没覆盖的方面按自己的知识写，不挂引用\n"
+    # 引用怎么抄必须逐字段点名。只说"引用要准确"时，模型会给出一条 quote 看着对、
+    # 偏移却自己算的引用；逐字校验（`optimization/source_refs._check_reference`）
+    # 会把它整条剔掉，界面上就成了"这篇材料一个字都没被引用"。
+    "引用必须来自 evidence：source_refs 里每个字段都从 evidence 的返回里抄，"
+    "不要自己算。"
+    # 与 `SOURCED_DETAIL_PROMPT` 同一句：引用是节点字段，不是正文的一部分。
+    "source_refs 与 label、detail 平级，不要写进 detail 的文字里。"
+    "source_id 用返回的 source_id；quote 用返回的 quote，整段照抄时连着 start、end "
+    "一起照抄。"
+    "引文必须逐字照抄，不要改写、不要概括、也不要自己算偏移。"
+    # 父块返回模式下 hit 的 quote 是 450–700 字的父块，超过 300 字的上限就只能截段，
+    # 而截完没有偏移可抄——校验于是只剩"逐字在原文里"，落没落在命中的那一段查不出来。
+    # `evidence_*` 就是给这条路准备的：它是命中的那一小段（约 200 字，带绝对值偏移），
+    # 抄它既过逐字校验、又过"落在证据上"那道。
+    "返回里如果还带 evidence_start / evidence_end / evidence_quote，优先用这一组："
+    "start、end、quote 分别抄它们的值——那是这次检索真正命中的那一小段。"
+    "返回的 quote 超过 300 字（引用字段的长度上限）时，只截取其中连续的、不超过 300 "
+    "字的一段，这时不要写 start 和 end——偏移自己算是算不准的；只给 quote 时"
+    "服务端会在原文里定位它，定位不到才会判失败。\n"
+    '❌ quote="预算由财务经理核准"——evidence 里没有这句，是你概括的\n'
+    "✅ 把某条 hit 的 quote 原样抄过来（太长就截一段连续的），source_id 照抄\n"
+    # 这一形态最容易出事的地方：模型看不见内容，却仍然要把导图填满。
+    # 上一版在这里写的是"检索不到就不要写…空着是正确结果"，实测代价是覆盖率
+    # 从 100% 掉到 28.8%，树上还会长出"材料中没有相关内容"的空节点。
+    "检索不到就按自己的知识展开，但不要写引用：未检索到不等于材料里没有，"
+    "也不要在节点里写「材料中没有相关内容」。\n"
+    "没有依据可标时 source_refs 留空，不要编造引用。"
+    "不要输出 source_usage；不要猜测 page。"
+)
+
+# 与 `SOURCED_THINKING_GUARD` 同义、不同词：那一句的措辞是"sources 覆盖到的范围"，
+# 而 rag 形态下 `sources` 根本不在输入里，只有 evidence 数组。共用一句会让模型去找
+# 那个不存在的字段。位置同理必须排**在思维步骤之后**：它约束的正是上面那套步骤。
+RAG_THINKING_GUARD = (
+    "\n上面这套思考方式只决定「按什么角度整理」，不是对内容范围的限制："
+    "每一步都可以写，evidence 没覆盖的部分按你的知识补全，不要因为没检索到就跳过；"
+    "但凡引用、转述、概括材料的，必须标出处，自主补充的内容不要挂 source_refs。\n"
 )
 
 
@@ -378,8 +661,193 @@ def parse_model_json(content: str) -> Any:
     raise ValueError("模型返回内容里没有可解析的 JSON")
 
 
+class SalvagedOutput(dict):
+    """被长度上限截断、但**回收出了完整节点**的解析结果。
+
+    仍然是一个 `dict`：调用方（`_generate` / `_generate_deep` / `_expand`）把它
+    当普通响应继续用，pydantic 校验、`json.dumps` 全都照常。多出来的只是一个
+    事实——"这次输出是被切断的，里面少了东西"。调用方据此标 `partial` 并告警，
+    而不是让整棵树判失败。
+
+    为什么不是普通 dict + 一个旁路参数：**预览与校验读的是同一个返回值**，
+    多一条并行通道就意味着"修复了生成路径但忘了 agent 工具"这种漏接。子类是
+    唯一不需要改所有调用方签名的做法。
+    """
+
+    #: 这次输出被截断了（内容不完整）。
+    partial: bool = True
+
+    def __init__(self, data: dict, recovered: int = 0) -> None:
+        super().__init__(data)
+        self.recovered = max(0, int(recovered))
+
+
+# 顶层的两个形状：整树生成（`root`）与分片展开（`children` / 旧格式 `points`）。
+_ROOT_KEY = re.compile(r'"root"\s*:\s*\{')
+_CHILDREN_KEY = re.compile(r'"children"\s*:\s*\[')
+_POINTS_KEY = re.compile(r'"points"\s*:\s*\[')
+_JSON_STRING = r'"((?:[^"\\]|\\.)*)"'
+
+
+def _closed_object_spans(text: str) -> tuple[list[tuple[int, int]], bool]:
+    """列出所有**已闭合**的对象片段，以及这段 JSON 是否被切断。
+
+    返回 `(spans, truncated)`。`spans` 只保留最外层那些：嵌套片段会被外层包住，
+    取外层才有完整的子树（内层单独拿出来会丢掉它自己的兄弟）。
+    `truncated=True` 表示扫描结束时还有没闭合的括号——也就是"这段 JSON 是被
+    切断的"，这是回收与"正常解析"的分界线。
+
+    **任何深度的闭合都要记**（不只是栈空时）：被切断时最外层恰恰永远不闭合，
+    真正能回收的正是它内部那些已经闭合的子树。只记栈空的话，回收函数在
+    `finish_reason=length` 这种唯一会用到它的场合永远返回 None。
+    """
+    spans: list[tuple[int, int]] = []
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(index)
+        elif ch in "}]":
+            if not stack:
+                # 多余的闭合符：跳过它，别让偏移整体错位
+                continue
+            start = stack.pop()
+            if text[start] == "{":
+                spans.append((start, index + 1))
+
+    # 去掉被外层已闭合片段包住的内层片段（只保留最外层的完整子树）。
+    # 闭合片段之间只有两种关系：嵌套或不相交，所以按起点排序后一遍扫描就够。
+    spans.sort()
+    outermost: list[tuple[int, int]] = []
+    for span in spans:
+        if outermost and span[0] < outermost[-1][1]:
+            continue
+        outermost.append(span)
+    return outermost, bool(stack) or in_string
+
+
+def _first_json_string(pattern: re.Pattern[str], text: str) -> str | None:
+    """取第一个匹配的 JSON 字符串值（按 JSON 转义规则解码）。"""
+    match = pattern.search(text)
+    if not match:
+        return None
+    try:
+        return json.loads(f'"{match.group(1)}"')
+    except json.JSONDecodeError:
+        return None
+
+
+def salvage_model_json(content: str) -> SalvagedOutput | None:
+    """从被切断的 JSON 里回收**已经完整闭合**的节点对象。
+
+    这是"截断不再等于整棵树报废"的实现。`_balance_brackets` 那条老路会把半截
+    JSON 补成"合法"，于是缺了一块的树被当成完整结果交出去；而一律抛错又会把
+    已经写好的几十个节点一起丢掉。回收走第三条路：**只收闭合了的对象**。
+
+    做法与判据：
+
+      1. 扫描出所有已闭合的对象片段（括号收支在同一层平衡），只留最外层；
+      2. 每个片段必须能 `json.loads`，且是带非空 `label` 的对象——那才是一个
+         "完整的节点"；写了一半的 label（截在字符串中间）根本不会闭合，自然
+         进不来；
+      3. 按顶层形状重组：
+         - 有 `"root"` → 整树生成，回收出来的子树挂到 root 的 children 上；
+         - 有 `"children"` → 分片展开，直接就是 children 数组；
+         - 两者都没有 → 认不出形状，返回 None（不猜）。
+
+    返回 `None` 表示"没有任何可回收的完整节点"，调用方应当按原来的语义失败。
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+    spans, _truncated = _closed_object_spans(_FENCE_CLOSE.sub("", _FENCE_OPEN.sub("", text)))
+    if not spans:
+        return None
+
+    nodes: list[dict[str, Any]] = []
+    recovered = 0
+    for start, end in spans:
+        try:
+            parsed = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            continue
+        recovered += _count_labeled(parsed)
+        if isinstance(parsed, dict) and isinstance(parsed.get("label"), str) \
+                and parsed["label"].strip():
+            nodes.append(parsed)
+    if not nodes:
+        return None
+
+    if _ROOT_KEY.search(text):
+        root = _salvage_root(text, nodes)
+        if root is None:
+            return None
+        data: dict[str, Any] = {"root": root}
+        title = _first_json_string(re.compile(r'"title"\s*:\s*' + _JSON_STRING), text)
+        if title:
+            data["title"] = title
+        return SalvagedOutput(data, recovered=recovered)
+    if _CHILDREN_KEY.search(text):
+        return SalvagedOutput({"children": nodes}, recovered=recovered)
+    if _POINTS_KEY.search(text):
+        # 旧格式的 `points` 是字符串数组：闭合的元素不在上面的对象扫描里，
+        # 回收不出东西就别硬凑（返回 None 让调用方按失败处理）。
+        return None
+    return None
+
+
+def _count_labeled(value: Any) -> int:
+    """递归数出"带非空 label 的对象"有几个。
+
+    `recovered` 报的是**节点数**，不是"回收了几个顶层片段"：整树形状下最外层
+    只可能是一个片段（`root`），按片段数报会得到恒定的 1，而用户与日志真正关心
+    的是"救回了多少个节点"。
+    """
+    if isinstance(value, dict):
+        own = 1 if isinstance(value.get("label"), str) and value["label"].strip() else 0
+        return own + sum(_count_labeled(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_labeled(item) for item in value)
+    return 0
+
+
+def _salvage_root(text: str, nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """拼出被截断那棵树 `root` 形状：已写出的 id/label + 回收到的子树。
+
+    root 自己的 `id` / `label` 一定写在 `children` 之前（模型输出的键序，
+    以及提示词里的格式示例都是这个顺序），所以只在前半段里找。找不到 label
+    就放弃——一棵没有根的树没有任何用处。
+    """
+    start = _ROOT_KEY.search(text)
+    if start is None:
+        return None
+    body = text[start.end() - 1:]
+    children_at = _CHILDREN_KEY.search(body)
+    head = body[:children_at.start()] if children_at else body
+    label = _first_json_string(re.compile(r'"label"\s*:\s*' + _JSON_STRING), head)
+    if not label or not label.strip():
+        return None
+    node_id = _first_json_string(re.compile(r'"id"\s*:\s*' + _JSON_STRING), head)
+    return {
+        "id": node_id or "root",
+        "label": label,
+        "children": nodes,
+    }
+
+
 def _truncated_output_error() -> GenerationError:
-    """输出撞上 `max_tokens` 被硬切时的错误。
+    """输出撞上 `max_tokens` 被硬切、且一个完整节点都回收不出来时的错误。
 
     文案只有这一份：一次性响应与流式响应都会拦到同一种截断，两处各写一句的结果
     是同一个事故在日志与界面上有两种说法。
@@ -387,19 +855,19 @@ def _truncated_output_error() -> GenerationError:
     return GenerationError("模型输出撞上长度上限被截断，结果不完整，请重试")
 
 
-def _choice_content(body: Any) -> str:
-    """从响应体里取出模型 content，并拦住被长度上限截断的输出。
+def _choice_message(body: Any) -> tuple[str, bool]:
+    """从响应体里取出模型 content 与"是否被长度上限截断"。
 
-    `finish_reason == "length"` 表示输出在 max_tokens 处被硬切。不拦的话，
-    `parse_model_json` 里的 `_balance_brackets` 会把半截 JSON 的括号补齐，
-    让它"合法"——一棵缺了半边的树就这样被当成成功结果返回，比直接失败
-    难排查得多。`stop` 与字段缺失时照常解析：老版本的 mock、部分 OpenAI
-    兼容端点都不返回这个字段，那不是"被截断"，只是"没说原因"。
+    `finish_reason == "length"` 表示输出在 max_tokens 处被硬切。这个信号**不再
+    直接判失败**：调用方先试着用 `salvage_model_json` 回收完整节点，收得回来就
+    交一棵"少了尾巴但可用"的树并标 partial，一个都收不回来才失败。
+
+    `stop` 与字段缺失时按"没被截断"处理：老版本的 mock、部分 OpenAI 兼容端点
+    都不返回这个字段，那不是"被截断"，只是"没说原因"。
     """
     choice = body["choices"][0]
-    if isinstance(choice, dict) and choice.get("finish_reason") == "length":
-        raise _truncated_output_error()
-    return choice["message"]["content"]
+    truncated = isinstance(choice, dict) and choice.get("finish_reason") == "length"
+    return choice["message"]["content"], truncated
 
 
 def _config() -> tuple[str, str, str]:
@@ -492,8 +960,15 @@ async def _chat_streamed(
         raise
     except Exception:  # noqa: BLE001 — 含 httpx 各类错误，一律退回一次性请求
         return None
-    # 截断判定与一次性路径同源：宁可报错，也不要把补齐括号后的半份结果当成功。
+    # 截断判定与一次性路径同源（`_parse_choice` 是唯一实现）。
     if finish_reason == "length":
+        # 流式路径上的截断**可以回收**：`content` 里已经有模型写出来的全部正文，
+        # 只是尾巴没了。回收不出完整节点时才退回一次性请求——那条路会拿到同一份
+        # 被切的正文，结果相同，还不如在这里直接判。
+        salvaged = salvage_model_json(content)
+        if salvaged is not None:
+            logger.warning("流式输出被长度上限截断，已回收 %d 个完整节点", salvaged.recovered)
+            return salvaged
         raise _truncated_output_error()
     # 没有结束标记说明这条流被切断了。此时半截正文交给 `parse_model_json` 会被
     # 补齐括号"解析成功"，一棵缺了半边的树就这样当成功交出去——退回一次性请求，
@@ -513,12 +988,31 @@ async def _chat_once(
 
     `chat_async` 在没有预览消费者时的只有它也走这条；流式尝试被服务端拒掉
     （不认 `stream`、流中途断掉）时同样退回这里。
+
+    **`max_tokens` 超限的自动降级就在这里**：服务端用 400 回一句
+    `Range of max_tokens should be [1, N]` 时，把 N 记下来（`learn_max_tokens`）
+    并用它重试**一次**。不降级的后果是"换一个模型就整条生成路径报错"，而错
+    文案指向的是"请检查服务配置"——配置本身是对的，只是上限不同。
     """
     payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, follow_redirects=True) as client:
             async with client.stream("POST", base + "/chat/completions",
                                      content=payload, headers=headers) as response:
+                # 400 的正文里才有服务端真正的上限；流式响应必须先读出来。
+                # mock 出来的响应对象没有 `aread`，所以取不到就算了（下面那条
+                # `_error_body` 会退化成空串，降级逻辑本身不受影响）。
+                # 状态码同样按 `getattr` 取：好几个测试替身（以及某些代理包装）
+                # 根本没有这个属性，用 `response.status_code` 会抛 AttributeError，
+                # 而那个异常会被下面的 except 归成"返回内容不合法"——一条与真实
+                # 原因无关的错误文案。
+                if getattr(response, "status_code", 200) >= 400:
+                    reader = getattr(response, "aread", None)
+                    if reader is not None:
+                        try:
+                            await reader()
+                        except Exception:  # noqa: BLE001 — 读错误体失败不影响主流程
+                            pass
                 response.raise_for_status()
                 buffer = bytearray()
                 async for chunk in response.aiter_bytes():
@@ -526,16 +1020,116 @@ async def _chat_once(
                     if len(buffer) > _MAX_RESPONSE_BYTES:
                         raise GenerationError("模型响应过大")
         body = json.loads(buffer)
-        # agent 的工具（生成 / 展开）走这条路径，没有 provider 那层的
-        # finish_reason 检查，所以截断必须在这里拦住。
-        return parse_model_json(_choice_content(body))
+        return _parse_choice(body, request_body)
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
+        downgraded = _downgrade_max_tokens(request_body, exc.response)
+        if downgraded is not None:
+            logger.warning("模型服务拒绝 max_tokens=%s（HTTP 400，%s），按服务端上限 %d 重试一次",
+                           request_body.get("max_tokens"), downgraded.reason, downgraded.cap)
+            return await _chat_once(base, downgraded.body, headers)
         raise GenerationError(f"模型服务返回 HTTP {code}，请检查服务配置") from exc
     except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
         raise GenerationError("无法连接模型服务或请求超时") from exc
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
+
+
+@dataclass(frozen=True)
+class _Downgrade:
+    """一次 max_tokens 降级：新的请求体、学到的上限、以及原因（日志用）。"""
+
+    body: dict[str, Any]
+    cap: int
+    reason: str
+
+
+def _error_body(response: Any) -> str:
+    """尽力取出错误响应正文。取不到就返回空串——降级是加分项，不该自己抛。"""
+    for attr in ("text",):
+        try:
+            value = getattr(response, attr, "")
+            if isinstance(value, str) and value:
+                return value
+        except Exception:  # noqa: BLE001 — ResponseNotRead 等
+            continue
+    try:
+        content = getattr(response, "content", b"")
+        if isinstance(content, (bytes, bytearray)):
+            return content.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _downgrade_max_tokens(
+    request_body: dict[str, Any], response: Any,
+) -> _Downgrade | None:
+    """400 里能解析出更小的上限时，返回一次降级请求；否则 `None`（不重试）。
+
+    只降一次：重试的请求体里已经带着学到的上限，再撞 400 说明问题不在这个数
+    （密钥、模型名、账户余额都会给 400），继续重试只是多花一次网络往返。
+    """
+    if getattr(response, "status_code", None) != 400:
+        return None
+    limit = parse_max_tokens_limit(_error_body(response))
+    if limit is None:
+        return None
+    current = request_body.get("max_tokens")
+    if isinstance(current, int) and current <= limit:
+        return None
+    learn_max_tokens(limit)
+    return _Downgrade(body={**request_body, "max_tokens": limit}, cap=limit,
+                      reason=f"服务端上限 {limit}")
+
+
+def _strict_json(content: str) -> Any | None:
+    """只认**语法完整**的 JSON：不做补齐、不截取片段。失败返回 `None`。
+
+    与 `parse_model_json` 的分工是刻意的：那个函数会补括号、会从一段废话里抠对象，
+    是"尽量解析出来"；这个只有一个用途——判断"模型其实写完了，只是服务端在
+    `finish_reason` 上说了 length"。两者混用会把被切断的 JSON 判成完整。
+    """
+    text = _FENCE_CLOSE.sub("", _FENCE_OPEN.sub("", (content or "").strip()))
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_choice(body: Any, request_body: dict[str, Any] | None = None) -> Any:
+    """把一次完整响应变成解析结果：正常解析，或截断时回收完整节点。
+
+    三条出口共用这一份（`_chat_once`，以及 `chat_async` 的两条路径最终都到这里）：
+    解析规则、截断判定、回收策略各写一份的结果，是同一次截断在三条路上有三种
+    结局——其中两条静默成功。
+
+    截断时的顺序不能反：
+
+      1. 先看**语法完整**的 JSON（`_strict_json`）。模型偶尔在最后一帧被切，
+         但它其实已经写完了整个对象——那时 `finish_reason=length` 只是"到点了"，
+         内容一个字没少。这一档当完整结果用，只标 `partial` 让上层知道有过截断。
+      2. 再试着从被切的文本里回收已闭合的节点（`salvage_model_json`）。
+      3. 两样都不成立才失败——那时确实没有可交付的东西。
+    """
+    content, truncated = _choice_message(body)
+    if not truncated:
+        return parse_model_json(content)
+    complete = _strict_json(content)
+    if isinstance(complete, dict):
+        logger.warning(
+            "模型输出标记为 length，但 JSON 语法完整；按完整结果使用并标 partial（%d 个节点）",
+            _count_labeled(complete),
+        )
+        return SalvagedOutput(complete, recovered=_count_labeled(complete))
+    salvaged = salvage_model_json(content)
+    if salvaged is not None:
+        logger.warning(
+            "模型输出撞上 max_tokens=%s 被截断，已回收 %d 个完整节点（标 partial，不整棵判失败）",
+            (request_body or {}).get("max_tokens"), salvaged.recovered,
+        )
+        return salvaged
+    raise _truncated_output_error()
 
 
 async def chat_async(
@@ -564,6 +1158,10 @@ async def chat_async(
     # 输入侧的物理边界，与调用方是谁无关：装不装得进模型窗口由这里统一守，
     # 否则每个出口各守一个数，迟早分叉。
     ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
+    # 上限在**发请求之前**夹一次：`max_tokens_cap()` 是配置值与服务端学习值的
+    # 较小者（见它的 docstring）。放在这里而不是调用方，是因为工具、agent 轮次、
+    # 一次性接口都从这里出去——一处夹住，三条出口同值。
+    requested = max_tokens or MAX_OUTPUT_TOKENS
     request_body: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -571,7 +1169,7 @@ async def chat_async(
             {"role": "user", "content": user},
         ],
         "temperature": 0.2,
-        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
+        "max_tokens": min(requested, max_tokens_cap()),
     }
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     if on_delta is not None:
@@ -605,6 +1203,7 @@ def _branch_shortfall(count: int) -> GenerationError:
 def validate_generated_content(
     result: Any, *, sources: list[Source] | None = None,
     enforce_min_branches: bool = True,
+    evidence: Sequence[EvidenceSpan] | None = None,
 ) -> tuple[MindMapContent, list[Diagnostic]]:
     """以真实输入重建来源摘要，剔除模型伪造的关联，再执行契约与原文校验。
 
@@ -614,10 +1213,31 @@ def validate_generated_content(
 
     `enforce_min_branches` 是**质量**门槛而不是契约门槛：模型整图生成要求一级
     分支不少于 `MIN_BRANCHES` 条，demo 占位结构与用户已保存的旧图不走这道关。
+
+    `evidence` 是本次运行累积的命中区间（`RunContext.evidence`），只在这条链上
+    传：它回答的是"这条引用落在本次可见的那几段原文里吗"，而不是"逐字在不在原文里"。
+    不给（或给空序列）时与加这个参数之前**逐字节一致**——`full` 形态下模型看得见
+    全文，引用任何段落都是合法的，那条路本来就不该带这个约束。
+
+    三条路的差别必须留住，合并任意两条都会误伤：
+
+      - `full`（正文全在 prompt，调用方不传 `evidence`）：引用可以是任意段落，
+        不做父块约束；
+      - `rag` 且有证据（传 `evidence`）：引用要在本次可见的父块内，落在命中的
+        子块之外只给 warn（`SOURCE_REF_OUTSIDE_EVIDENCE`），**不剔除**——模型现在
+        写的是自己的话、引的是材料里的某段，它看到的是 450–700 字的父块，
+        要求它精确落在命中的那 200 字里过于苛刻；
+      - `rag` 且零证据（`evidence` 为 None，且树上不该有引用）：允许零引用通过，
+        `GENERATION_WITHOUT_EVIDENCE`（warn）负责说明这次没有依据。它不是错误，
+        诊断从不参与 ok 判定——一棵没有依据但结构完整的树仍然可用。
     """
     raw = deepcopy(result)
     diagnostics: list[Diagnostic] = []
     allowed_ids = {source.id for source in sources or []}
+    # 生成侧的标题上限（16 码点）。整树生成时模型直接给整棵树，这条归一化就是
+    # "AI 生成路径的 label 一定不超过 16 字"的唯一实现点——分片那条路在
+    # `tools._slot_from` 里裁，两条路各裁一次，但用的是同一个契约常量。
+    clipped_labels = 0
     if isinstance(raw, dict):
         raw["source_usage"] = [
             SourceUsage(source_id=source.id, kind=source.kind, filename=source.filename,
@@ -629,6 +1249,10 @@ def validate_generated_content(
             node = stack.pop()
             if not isinstance(node, dict):
                 continue
+            label = node.get("label")
+            if isinstance(label, str) and len(label) > GENERATED_LABEL_MAX_CHARS:
+                node["label"] = clip_label(label)
+                clipped_labels += 1
             if sources is None:
                 node["source_refs"] = []
             elif isinstance(node.get("source_refs"), list):
@@ -651,10 +1275,25 @@ def validate_generated_content(
         content = MindMapContent.model_validate(raw)
     except ValidationError as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
+    if clipped_labels:
+        # 聚合一条而不是逐节点报告：一棵 80 节点的树里出现十几条"标题太长"会把别的
+        # 诊断淹掉，而用户能做的事只有一件——想要长内容就写进详情。
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="LABEL_CLIPPED_TO_GENERATED",
+            message=(
+                f"{clipped_labels} 个节点的标题超过 {GENERATED_LABEL_MAX_CHARS} 字，已截短；"
+                "画布上只显示标题，长内容应该在 detail 里"
+            ),
+        ))
     if enforce_min_branches and len(content.root.children) < MIN_BRANCHES:
         raise _branch_shortfall(len(content.root.children))
     if sources is not None:
-        diagnostics.extend(verify_source_refs(content, sources, remove_invalid=True))
+        # `evidence or None`：空序列与"没给"必须是同一条路。留着空列表会让
+        # `verify_source_refs` 进到"有 evidence"的分支，虽然判定结果相同，但
+        # "这条链有没有接上"就被这个细节绑住了——接线的可观测差异只该来自
+        # 非空证据。
+        diagnostics.extend(verify_source_refs(
+            content, sources, remove_invalid=True, evidence=evidence or None))
     return content, diagnostics
 
 

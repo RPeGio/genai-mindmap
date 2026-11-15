@@ -488,6 +488,14 @@ export interface components {
             children?: components["schemas"]["Node-Input"][];
             /** Note */
             note?: string | null;
+            /** Detail */
+            detail?: string | null;
+            /**
+             * Expandable
+             * @default unknown
+             * @enum {string}
+             */
+            expandable: "yes" | "no" | "unknown";
             /**
              * Collapsed
              * @default false
@@ -508,6 +516,14 @@ export interface components {
             children?: components["schemas"]["Node-Output"][];
             /** Note */
             note?: string | null;
+            /** Detail */
+            detail?: string | null;
+            /**
+             * Expandable
+             * @default unknown
+             * @enum {string}
+             */
+            expandable: "yes" | "no" | "unknown";
             /**
              * Collapsed
              * @default false
@@ -601,7 +617,7 @@ export interface components {
         RunBudget: {
             /**
              * Max Model Calls
-             * @default 80
+             * @default 100
              */
             max_model_calls: number;
             /**
@@ -680,12 +696,45 @@ export interface components {
             duration_seconds?: number | null;
             /** Sentences */
             sentences?: components["schemas"]["AudioSentence"][];
+            metadata?: components["schemas"]["SourceMetadata"];
+            /** Content Hash */
+            content_hash?: string | null;
         };
         /**
          * SourceKind
          * @enum {string}
          */
         SourceKind: "text" | "markdown" | "document" | "image" | "audio";
+        /**
+         * SourceMetadata
+         * @description 来源的描述性元数据：检索前过滤的依据，不参与正文解析。
+         *
+         *     两类的来源完全不同，不要混：
+         *       - `author` / `created_at` / `modified_at` **自动提取**。ingestion 层从文件
+         *         自己写的元数据里读（DOCX 的 `docProps/core.xml`、PDF 的文档信息字典），
+         *         确定性、零成本、不喂模型。
+         *       - `category` / `tags` **只由调用方给**。文件里没有可靠出处，本轮也不做
+         *         模型自动推断——推断错的分类会让检索静默漏掉正确来源，比没有分类糟。
+         *
+         *     时间一律是 **ISO8601 UTC 秒级字符串**（`2024-01-15T02:30:00Z`），与
+         *     `MapRecord.updated_at` 同口径。不用 `datetime` 对象：跨端传的是 JSON 字符串，
+         *     在这里放 datetime 只会让序列化格式随 pydantic 版本漂移；而过滤靠时间的
+         *     字典序比较，格式一变，比较就错。
+         *
+         *     字段全部有默认值，所以旧请求、旧存档不带元数据也照常构造。
+         */
+        SourceMetadata: {
+            /** Author */
+            author?: string | null;
+            /** Created At */
+            created_at?: string | null;
+            /** Modified At */
+            modified_at?: string | null;
+            /** Category */
+            category?: string | null;
+            /** Tags */
+            tags?: string[];
+        };
         /**
          * SourceRef
          * @description 节点引用。字符区间以原始 Source.text 为准，使用从零开始的 [start, end)。

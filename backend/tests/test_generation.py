@@ -117,9 +117,22 @@ class FinishReasonTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return client_class
 
-    def test_chat_async_rejects_truncated_output(self):
-        """finish_reason=length：抛错，绝不把补全括号后的半棵树当成功。"""
+    def test_chat_async_marks_a_complete_but_truncated_response(self):
+        """`finish_reason=length` 但 JSON 语法完整：内容一个字没少，照常交付 + 标 partial。
+
+        旧行为是一律抛错——那时它守的是"别把补全括号后的半棵树当成功"。现在补齐
+        那条路已经不走了（`_strict_json` 只认语法完整的 JSON），所以这一档可以
+        安全地当完整结果用；`partial` 让上层知道服务端认为输出到点了。
+        """
         self.use_async_client(MockAsyncStreamResponse(_response_body(self.TREE, "length")))
+        result = asyncio.run(chat_async("系统", "用户"))
+        self.assertEqual(result["title"], "测试")
+        self.assertTrue(getattr(result, "partial", False))
+
+    def test_chat_async_rejects_an_unrecoverable_truncation(self):
+        """切在字符串中间、一个完整节点都回收不出来：抛错，绝不交付半棵树。"""
+        broken = '{"title":"测试","root":{"id":"1","label":"测试写成了一半'
+        self.use_async_client(MockAsyncStreamResponse(_response_body(broken, "length")))
         with self.assertRaises(GenerationError) as raised:
             asyncio.run(chat_async("系统", "用户"))
         self.assertIn("截断", str(raised.exception))
@@ -343,13 +356,20 @@ class PromptQualityTest(unittest.TestCase):
             self.assertIn("至少 2 个要点", prompt)
             self.assertIn("不少于 3 条", prompt)
 
-    def test_material_branch_forbids_padding_to_hit_the_count(self):
-        """材料分支原先只说「忠实整理」，要点数量一个字都没提。
+    def test_material_branch_allows_expanding_beyond_the_material(self):
+        """带材料时**内容可以展开**，但出处必须标：这是这一轮改掉的旧要求。
 
-        补数量时最怕把模型推成「凑数」——依据不足要宁可少给。
+        上一版写的是"忠实整理、材料里没有的不要添加、依据不足宁可少给"，
+        实测把整棵树压成了材料的目录（同一份 12392 字材料，全文可见 100%、
+        检索形态 28.8%）。新契约只保留引用纪律的那一半。
         """
-        self.assertIn("不要为了凑数补写", DETAIL_PROMPT)
-        self.assertIn("依据不足时宁可", DETAIL_PROMPT)
+        self.assertIn("材料没覆盖的方面按你的知识补全", DETAIL_PROMPT)
+        self.assertIn("不要留「材料中没有相关内容」这种空节点", DETAIL_PROMPT)
+        self.assertIn("凡引用、转述、概括材料的，必须标出处", DETAIL_PROMPT)
+        self.assertIn("自主补充的内容不要冒充材料", DETAIL_PROMPT)
+        # 旧要求必须真的没了，否则两句在提示词里打架，模型只会执行更保守的那句
+        self.assertNotIn("依据不足时宁可", DETAIL_PROMPT)
+        self.assertNotIn("不要添加材料里", DETAIL_PROMPT)
 
     def test_prompt_node_ceiling_follows_the_contract(self):
         """提示词里的节点/层级上限必须与契约同值。
@@ -411,12 +431,19 @@ class DepthPromptTest(unittest.TestCase):
             self.assertIn("最小可执行单元", prompt)
             self.assertIn("单一概念", prompt)
 
-    def test_sourced_prompt_ties_depth_to_the_material(self):
-        """有来源时「继续拆」不能变成自由展开：判据必须落回原文。"""
-        self.assertIn("判据只看材料", SOURCED_DETAIL_PROMPT)
-        self.assertIn("必须能在原文里找到依据", SOURCED_DETAIL_PROMPT)
-        # 「拆得深」不许把「依据不足宁可少给」冲掉
-        self.assertIn("宁可少给", SOURCED_DETAIL_PROMPT)
+    def test_sourced_prompt_ties_depth_to_the_material_and_marks_the_rest_unsourced(self):
+        """有来源时「继续拆」可以越过材料，但越过的那一层不挂引用。
+
+        上一版的判据是"判据只看材料，材料没说到就停"，代价是整棵树变成材料的目录。
+        新判据保留"材料有更细的说法就照它拆"，材料没说的部分改为可以凭知识补——
+        同一句里必须把引用纪律钉上，否则"拆得深"会退化成"编得多"。
+        """
+        self.assertIn("原文里还有更具体的表述支撑", SOURCED_DETAIL_PROMPT)
+        self.assertIn("也可以按你的知识继续拆——只是那一层不挂引用", SOURCED_DETAIL_PROMPT)
+        self.assertIn("自己补的内容不要挂引用", SOURCED_DETAIL_PROMPT)
+        # 旧措辞必须消失：两句同时在场时模型只会执行更保守的那一句
+        self.assertNotIn("判据只看材料", SOURCED_DETAIL_PROMPT)
+        self.assertNotIn("宁可少给", SOURCED_DETAIL_PROMPT)
 
     def test_default_thinking_model_does_not_cap_depth(self):
         """思考模型拼在生成提示词后面，它若给了层数区间就会被模型当成硬指标。"""

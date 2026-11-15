@@ -197,6 +197,7 @@ sudo dnf install -y git
 git clone https://github.com/RPeGio/genai-mindmap.git   # 默认就是 main
 cd genai-mindmap
 ls deploy/          # 能看到 install.sh / nginx.conf 才算对
+git describe --tags # 本方案第一次上线后才会打第一个部署 tag；现在还看不到别当成失败
 ```
 
 **国内 ECS 上 `git clone` 大概率连不上 GitHub**（`OpenSSL SSL_connect: SSL_ERROR_SYSCALL` 或 `Connection timed out`，22 与 443 都一样），这不是仓库权限问题，是出口被拦。三条出路，按省事程度排：
@@ -381,6 +382,7 @@ ls -1t /var/lib/genai-mindmap/releases/          # 最新一份在最上
 sudo tar -xzf /var/lib/genai-mindmap/releases/20261111-101500.tar.gz -C /opt/genai-mindmap
 sudo chown -R genai:genai /opt/genai-mindmap
 sudo systemctl restart genai-mindmap
+sudo systemctl status genai-mindmap --no-pager
 ```
 
 前端也要跟着回：9.4 发布时如果按建议把旧目录留成 `dist.prev`，`cd /opt/genai-mindmap/frontend && rm -rf dist && mv dist.prev dist`，再 `restorecon -R dist`。

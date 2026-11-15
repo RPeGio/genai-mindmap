@@ -50,10 +50,13 @@
 """
 from __future__ import annotations
 
+import hashlib
+import html
 import re
 import threading
 
 from app.contracts.source import Source, SourceKind, SourceSpan
+from app.ingestion import metadata as source_metadata
 from app.ingestion.asr import AsrError, transcribe_audio
 
 # 单份文档最多交给 Docling 解析的页数。
@@ -117,7 +120,7 @@ def _suffix_of(filename: str | None) -> str:
     return filename[dot:].lower() if dot >= 0 else ""
 
 
-def _parse_pdf(raw: bytes) -> tuple[str, int, int]:
+def _parse_pdf(raw: bytes) -> tuple[list[str], int]:
     """PyMuPDF 抽文本，返回 (正文, 总页数, 实际解析页数)。
 
     只读文本层，不碰版面：实测 15 页英文双栏论文 0.19 秒 / 55MB，
@@ -159,6 +162,11 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
     """
     from app.ingestion import vision_pdf
 
+    # 元数据先取：它与正文解析完全独立，视觉那条路失败要回退文本层时也不用重取。
+    # 传的是 raw 而不是 filename 判断格式——.doc/.ppt 转成 PDF 后也走这个函数，
+    # 那时后缀还是旧格式，但内容已经是 PDF 信息字典了。
+    metadata = source_metadata.from_pdf(raw)
+
     # 兜底用，同时也是"这份文档到底有没有文字"的判断依据
     try:
         text_pages, page_count = _parse_pdf(raw)
@@ -185,6 +193,7 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
                       parsed_pages=len(text_pages),
                       truncated=len(text_pages) < page_count,
                       failed_pages=empty,
+                      metadata=metadata,
                       status="parsed")
 
     try:
@@ -226,6 +235,7 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
                   parsed_pages=limit,
                   truncated=limit < total,
                   failed_pages=unrecovered,
+                  metadata=metadata,
                   status="parsed")
 
 
@@ -261,7 +271,11 @@ def _normalize_markdown(markdown: str) -> str:
             return ""
         return f"[图: {alt}]"
 
-    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", alt_of, markdown)
+    # Docling 与视觉识别都会把 `&lt;` `&amp;` 这类实体原样留在 Markdown 里。
+    # 不反转义的话，检索 `<` 永远匹配不到它，而块长还按 4 个字符算——实测一份
+    # 中文 docx 里有 158 处。`\xa0` 是非断行空格，检索与切块都当它是普通空白。
+    text = html.unescape(markdown).replace("\xa0", " ")
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", alt_of, text)
     text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)       # 行尾空白
     text = re.sub(r"\n{3,}", "\n\n", text)                        # 连续空行
     return text.strip()
@@ -300,6 +314,7 @@ def _parse_office_source(filename: str | None, raw: bytes) -> Source:
     page_count = len(result.pages) if getattr(result, "pages", None) else None
     return Source(kind=SourceKind.document, filename=filename, text=text,
                   span=SourceSpan(page=page_count) if page_count else None,
+                  metadata=source_metadata.extract(filename, raw),
                   status="parsed")
 
 
@@ -333,8 +348,12 @@ def _parse_xls_source(filename: str | None, raw: bytes) -> Source:
         raise NotSupportedSource("这份 .xls 里没有可读的单元格内容")
 
     # 表格没有"页"的概念，span 留空；行数放 parsed_pages 也不合适，一并留空。
+    # 元数据同样走 extract：.xls 是 OLE 复合文档，不在 OOXML 集合里，这里会
+    # 老老实实返回空元数据——留着这一行是为了"所有文档分支都过同一个入口"，
+    # 将来补 xlrd 的属性集读取时不用再回来找哪里漏了。
     return Source(kind=SourceKind.document, filename=filename, text=text,
                   span=None, parsed_pages=None, truncated=False,
+                  metadata=source_metadata.extract(filename, raw),
                   status="parsed")
 
 
@@ -360,8 +379,31 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
     return _parse_office_source(filename, raw)
 
 
+def write_content_hash(source: Source) -> Source:
+    """把正文指纹写进 `Source.content_hash`，返回同一个对象。
+
+    **时机是这里的全部意义**：调用点必须在正文**定稿之后**——`_normalize_markdown`
+    已经跑完、任何按上下文截断都还没发生。早一步算得到的是与正文对不上的指纹，
+    而指纹是知识库的唯一键：对不上就会把两份不同的正文判成同一份（静默丢数据），
+    或者把同一份正文判成两份（重复入库）。
+
+    空正文不写指纹（留 `None`）：没有正文就没有可去重的内容，写一个
+    `sha256("")` 反而会让所有空材料在库里挤成一条。判空用 `strip()`，与
+    `library.ingest` 的拒绝条件同一口径——一处用 `if text`、另一处用
+    `if not text.strip()` 的话，纯空白正文会带着指纹进库，然后被库拒收。
+
+    算法与 `knowledge.library.content_hash` 完全同口径（sha256 十六进制全长）。
+    这里独立算一次而不是 import 那一层：`ingestion` 是解析层，不该反向依赖检索层
+    ——那会让"解析器能不能单独跑"取决于知识库有没有被 import。
+    """
+    text = source.text or ""
+    source.content_hash = (
+        hashlib.sha256(text.encode("utf-8")).hexdigest() if text.strip() else None)
+    return source
+
+
 def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
-    """按类型分发。
+    """按类型分发，并给返回的 `Source` 盖上正文指纹。
 
     分发顺序：
       1. markdown/text → 直接解码
@@ -370,6 +412,23 @@ def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
 
     一次只处理一个文件：多文件之间的并发属于上传队列（前端）的职责，
     这一层不该再套一层线程池——那会和 vision / asr 内部的并发叠成 N×N。
+
+    指纹在**唯一出口**处盖（`_parse_unstamped` 的返回值），不是在每个分支里各盖
+    一次：四个分支各写一遍，将来加第五个分支时漏盖不会有任何报错，只会在入库时
+    静默退化成"按正文重算"——那种退化看不见，直到有人依赖上传路径的指纹去做
+    去重比较。
+    """
+    return write_content_hash(_parse_unstamped(kind, filename, raw))
+
+
+def _parse_unstamped(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
+    """`parse_bytes` 的本体：只解析，不盖指纹。
+
+    `parse_text` / `parse_document_bytes` 这些**内部分支**保持不带指纹，是因为
+    它们各自还会被单独调用（`/ingestion/text` 走 `parse_text`，脚本走
+    `parse_document_bytes`），而"上传这条路的指纹在 `parse_bytes` 里盖"是一个
+    可以静态检查的边界。知识库那一侧不依赖调用方给指纹：`library.ingest` 对正文
+    重算一次才是权威（正文在下游仍可能被改）。
     """
     if kind in (SourceKind.text, SourceKind.markdown):
         try:
