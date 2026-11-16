@@ -252,6 +252,27 @@ function formatTime(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false });
 }
 
+/**
+ * 「上次的运行结果」这条提示的文案。
+ *
+ * 只给时间与目标，不给整棵树：这是一句通知，用户要不要捡回来是他的决定。两种状态
+ * 分开说——"完成了但没应用"和"被中断了但已经产出了一部分"对他的意义完全不同，
+ * 用同一句话糊过去，他会以为后者是一次完整的结果。
+ */
+const resumableText = computed(() => {
+  const run = store.resumableRun;
+  if (!run) return '';
+  const date = new Date(run.updated_at);
+  const clock = Number.isNaN(date.getTime())
+    ? ''
+    : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const when = clock ? `（${clock}）` : '';
+  const what = run.status === 'cancelled'
+    ? `上次${when}那次生成被中断了，已经生成的部分还留着`
+    : `上次${when}有一次生成完成了，但还没有应用到画布`;
+  return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
+});
+
 /** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
 function onKeydown(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
@@ -445,6 +466,34 @@ async function copyBody() {
       </section>
 
       <aside class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l border-slate-200 bg-white p-4">
+        <!--
+          上次运行留下的结果。**只是一条提示，不是弹窗**：用户可能正在做别的事，
+          打断他比让他知道这件事更烦。点「查看」把那份候选载入现有的确认流程
+          （应用/丢弃、过时检查、整树校验一步都不少），点「丢弃」就再也不问。
+        -->
+        <section
+          v-if="store.resumableRun"
+          aria-label="上次的运行结果"
+          class="rounded-md border border-sky-200 bg-sky-50 p-2 text-xs"
+        >
+          <p class="break-words leading-relaxed text-slate-700">{{ resumableText }}</p>
+          <div class="mt-1.5 flex gap-2">
+            <button
+              type="button"
+              class="rounded-md border border-sky-300 bg-white px-2 py-1 text-sky-800 hover:bg-sky-100"
+              @click="store.resumeRun()"
+            >
+              查看
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 bg-white px-2 py-1 text-slate-600 hover:bg-slate-50"
+              @click="store.dismissResumable()"
+            >
+              丢弃
+            </button>
+          </div>
+        </section>
         <AgentPanel />
         <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>

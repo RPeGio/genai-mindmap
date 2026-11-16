@@ -24,6 +24,28 @@ def connect() -> sqlite3.Connection:
         id TEXT PRIMARY KEY, version INTEGER NOT NULL,
         content TEXT NOT NULL, updated_at TEXT NOT NULL
     )""")
+    # `runs` 是 agent 运行的身份行（见 `app/agent/runs.py`）。它必须与 `mindmaps`
+    # 同一时刻建好：那张表的写入方是 SSE 生成器的 `finally`，而那条路上**不允许**
+    # 再有一次"发现表不存在 → 建表"的分支——被取消时多一个可能抛错的分支，就等于
+    # 把唯一要落库的草稿丢掉。
+    #
+    # 三列时间戳各管一件事，别合并：`updated_at` 是这一行最后一次状态变化（提示里
+    # 那个"12:03"用它），`applied_at` 是候选真的进了画布，`dismissed_at` 是用户
+    # 主动说"这份不要了"。合并成"处理过了"一个布尔值，就再也分不清"应用过"与
+    # "嫌弃过"，而"上次生成的导图去哪了"正是靠这个区别回答的。
+    conn.execute("""CREATE TABLE IF NOT EXISTS runs (
+        run_id       TEXT PRIMARY KEY,
+        status       TEXT NOT NULL,
+        request      TEXT,
+        candidate    TEXT,
+        failure      TEXT,
+        mode         TEXT,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL,
+        applied_at   TEXT,
+        dismissed_at TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
     # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
     # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"
     # 的窗口（与 `_record` 读时补齐 schema_version 是同一条理由）。

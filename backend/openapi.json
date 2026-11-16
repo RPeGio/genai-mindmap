@@ -535,6 +535,206 @@
         }
       }
     },
+    "/api/agent/runs": {
+      "get": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "List Runs",
+        "description": "运行台账。默认回答的是\"上次跑完、我还没处理的是哪一次\"。\n\n`status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出草稿的那次\n同样要能被捡起来**——否则\"关掉页面那 40 秒\"照样白花，只是从内存白花变成写进\n数据库白花。\n\n这条查询就是这张表草稿列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。",
+        "operationId": "list_runs_api_agent_runs_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "done",
+                    "cancelled",
+                    "failed",
+                    "running"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。",
+              "title": "Status"
+            },
+            "description": "只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。"
+          },
+          {
+            "name": "unapplied",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。",
+              "default": true,
+              "title": "Unapplied"
+            },
+            "description": "只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunSummary"
+                  },
+                  "title": "Response List Runs Api Agent Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Get Run",
+        "operationId": "get_run_api_agent_runs__run_id__get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}/applied": {
+      "post": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Mark Run Applied",
+        "description": "候选进了画布。前端在「应用」成功后调用一次，幂等。\n\n\"done 但已应用\"与\"done 但没应用\"只能靠这个时间戳分开：候选可能被 PUT 到一张\n已有导图上（推不出新记录），也可能应用之后又被撤销。用 `mindmaps` 表反推，\n得到的全是猜。",
+        "operationId": "mark_run_applied_api_agent_runs__run_id__applied_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}/dismissed": {
+      "post": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Mark Run Dismissed",
+        "description": "用户主动丢弃了这份候选。与\"应用过\"分开记：下次进页面不该再问同一次。",
+        "operationId": "mark_run_dismissed_api_agent_runs__run_id__dismissed_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/knowledge/search": {
       "post": {
         "tags": [
@@ -642,6 +842,20 @@
             ],
             "title": "Intent",
             "default": "create"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
           },
           "thinking_model": {
             "type": "string",
@@ -1457,6 +1671,162 @@
         "type": "object",
         "title": "RunBudget",
         "description": "一次 run 的资源上限。\n\n`max_model_calls` 数的是**真实调用次数**，不是外层轮数：循环里每一轮 provider\n调用、以及工具内部的每一次 `chat_async` 调用都算一次，共用 `RunContext` 上\n同一个账本。默认值按最贵的一条路（六支分片）算，算式见字段注释：\n「查 → 建 → 改 → 修」这种多轮对话只用其中几次，多出来的余量不会被无故花掉。\n\n`max_output_tokens` 同时约束两条出口：provider 那一轮，以及工具内部每一次\n`chat_async`——参数由 `tools._max_tokens()` 夹到 provider 认的上限再发出去。\n只约束前者时，工具内这条出口等于没有边界。\n\n`max_repairs` 约束的是**工具执行失败次数**（`ToolResult.ok == False` 的次数），\n与模型调用次数无关：一次成功的模型响应里发三个工具、其中两个失败，只消耗\n这里两次。全轮共享而不是按轮重置——按轮重置等于给模型无限次重试，\n每次重试都照样计费。"
+      },
+      "RunDetail": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          },
+          "dismissed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dismissed At"
+          },
+          "candidate": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate"
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "intent",
+          "goal",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunDetail",
+        "description": "单条：带候选正文与失败原因。"
+      },
+      "RunSummary": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          },
+          "dismissed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dismissed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "intent",
+          "goal",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunSummary",
+        "description": "列表里的一行：**不带候选正文**。\n\n候选是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句\n\"上次有一次生成完成了\"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。"
       },
       "SaveRequest": {
         "properties": {

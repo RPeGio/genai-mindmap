@@ -4,6 +4,8 @@ import type {
   CreateTextSourceResponse,
   MapRecord,
   MindMapContent,
+  RunDetail,
+  RunSummary,
   Source,
 } from './types';
 
@@ -179,6 +181,41 @@ export function runAgentStream(
   signal?: AbortSignal,
 ): Promise<void> {
   return postSse<AgentEvent>(`${BASE}/agent/runs/stream`, body, onEvent, signal);
+}
+
+// ---- 运行台账（run 的身份与草稿）----
+
+/**
+ * 上次跑完、但用户还没处理过的运行。
+ *
+ * 默认取后端给的"有草稿且未应用/未丢弃"那一批，其中**包含"被取消但已经产出草稿"
+ * 的运行**：那正是"关掉页面那 40 秒别白花"要捡回来的东西。只查 `done` 的话，
+ * 草稿会被写进库、然后再也没人读过——表就成了一行字。
+ */
+export function listRuns(status?: RunSummary['status']): Promise<RunSummary[]> {
+  const query = new URLSearchParams({ unapplied: 'true' });
+  if (status) query.set('status', status);
+  return request<RunSummary[]>(`/agent/runs?${query.toString()}`);
+}
+
+/** 单条详情，带候选正文。只有点「查看」时才值得走这一趟。 */
+export function getRun(runId: string): Promise<RunDetail> {
+  return request<RunDetail>(`/agent/runs/${encodeURIComponent(runId)}`);
+}
+
+/**
+ * 候选进了画布 / 被用户丢弃。两者分开记：`applied_at` 是"采纳过"，`dismissed_at`
+ * 是"嫌弃过"，下次进页面该不该再问是由它们区分的。
+ *
+ * 幂等，且只在"本来为空"时打第一个时间戳，所以前端可以放心重试。
+ */
+export function markRunResolved(
+  runId: string,
+  resolution: 'applied' | 'dismissed',
+): Promise<void> {
+  return request<void>(`/agent/runs/${encodeURIComponent(runId)}/${resolution}`, {
+    method: 'POST',
+  });
 }
 
 // ---- 文档上传 ----

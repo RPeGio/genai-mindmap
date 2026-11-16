@@ -325,6 +325,17 @@ export interface AgentRunRequest {
   goal: string;
   intent: 'create' | 'expand' | 'edit';
   /**
+   * 这次运行的**身份**（镜像后端 `AgentRunRequest.run_id`）。
+   *
+   * 由前端自己生成、每次点击生成一个新的：服务端发的话，客户端要先请求一次才拿得到
+   * id，而那一次请求本身就成了"第一次运行"——刷新重发时照样没有 id 可用。
+   *
+   * 幂等只在"带同一个 run_id"时生效。所以它的价值不是防"重复点击"（那是按钮禁用
+   * 与 `busy` 闸门的事），而是让服务端能认出"这是同一次运行又投递了一遍"：
+   * 正在跑 → 409 而不是再花一份钱；已经跑完 → 直接把候选重放回来。
+   */
+  run_id?: string | null;
+  /**
    * 拆解方式：同一句主题换一套步骤，长出来的树结构就不同。
    *
    * 取值与后端 `generation.service.THINKING_MODELS` 的键一一对应；后端是
@@ -341,6 +352,35 @@ export interface AgentRunRequest {
    * 而模型需要的是带 source_id 的结构化数据——否则它写不出合法的引用。
    */
   sources?: Source[];
+}
+
+/**
+ * 运行台账里的一行（镜像后端 `agent.router.RunSummary`）。
+ *
+ * **不带候选正文**：那是一整棵树，20 条一起下发只为显示一句"上次生成完成了"。
+ * 真要那份内容时点「查看」，走 `GET /api/agent/runs/{run_id}`。
+ *
+ * 这一行是"运行身份"落到界面上的唯一痕迹：此前 run 只活在一个 HTTP 连接的
+ * 寿命里，页面一关，已经跑出来的候选就跟着连接一起没了。
+ */
+export interface RunSummary {
+  run_id: string;
+  status: 'running' | 'done' | 'cancelled' | 'failed';
+  /** 原样回填：`create` 的候选落地时不能继承当前图的身份，`edit`/`expand` 要。 */
+  intent: 'create' | 'expand' | 'edit';
+  goal: string;
+  created_at: string;
+  updated_at: string;
+  applied_at?: string | null;
+  dismissed_at?: string | null;
+}
+
+/** 单条运行的详情（镜像后端 `RunDetail`）：多出候选正文、失败原因与来历。 */
+export interface RunDetail extends RunSummary {
+  candidate?: MindMapContent | null;
+  failure?: { code?: string; message?: string } | null;
+  /** `demo` 是占位树、`model` 是模型产出。重放时按它标来源，不能一律写成模型。 */
+  mode?: 'demo' | 'model' | null;
 }
 
 /**

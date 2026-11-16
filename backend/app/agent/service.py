@@ -19,7 +19,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -447,8 +447,51 @@ async def run(
     *,
     provider: ToolProvider | None = None,
     tools: ToolRegistry | None = None,
+    on_close: Callable[[MindMapContent | None], None] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """跑一次多轮工具循环，边跑边发事件。
+
+    这一层只做一件事：**在生成器被关掉时把 `ctx.candidate` 交出去**。循环本体在
+    `_loop` 里，一行都没改。
+
+    为什么必须在这里交、而不是让调用方从事件流里拼：
+
+      - 被取消时最后那棵树**不在任何一帧里**。`edit` / `expand` 的改动只以 op
+        批次下发，客户端手里只有一堆增量，拼不回整树；而 `ctx.candidate` 是
+        `apply_ops` 的整树兜底，它一定是完整、校验过的。
+      - `finally` 覆盖三条出路：正常收尾、抛异常、被 `aclose()` / `task.cancel()`
+        关掉。取消路径最容易漏——那正是"关掉页面那 40 秒白花"的那一条。
+
+    回调是**同步**的，不给调用方留 `await` 的机会：任务被取消时，`finally` 里第一个
+    `await` 会立刻再抛一次 `CancelledError`，唯一要做的那件事（落草稿）反而被跳过。
+    落库是本地 SQLite 写，微秒级，同步调用不会把事件循环卡住——与
+    `_intent_rule` 每轮读一次库同一个理由。
+
+    `on_close` 不传时行为与加它之前**逐字相同**（连一次库调用都没有），单测与
+    直接调 `run()` 的代码不受影响。
+    """
+    ctx = RunContext(
+        request=request,
+        candidate=request.snapshot,
+        sources_by_id={source.id: source for source in request.sources},
+    )
+    try:
+        async with contextlib.aclosing(_loop(request, ctx, provider=provider, tools=tools)) as events:
+            async for event in events:
+                yield event
+    finally:
+        if on_close is not None:
+            on_close(ctx.candidate)
+
+
+async def _loop(
+    request: AgentRunRequest,
+    ctx: RunContext,
+    *,
+    provider: ToolProvider | None = None,
+    tools: ToolRegistry | None = None,
+) -> AsyncIterator[AgentEvent]:
+    """多轮工具循环本体。
 
     终止只有四种：模型以 stop 收尾（done）、预算耗尽（error）、上游失败（error）、
     工具累计失败超过 `max_repairs`（error）。
@@ -473,6 +516,10 @@ async def run(
         # 占位树复用旧路径的 `_demo_content`：同一份占位结构只该有一个定义，
         # 两处各写一份，改文案时必然只改一处。
         demo = _demo_content(request.goal)
+        # 也记到 ctx 上：草稿要按"这次运行产出的那棵树"落库，占位树同样是产出。
+        # 不写这里的话，演示模式的 run 会以"没产出"收尾，回放时前端只看到
+        # 一句"模型这次没有产出导图"。
+        ctx.candidate = demo
         demo_seq = itertools.count(1)
         yield StageEvent(seq=next(demo_seq), stage="demo", detail="演示模式，不调用模型")
         yield SnapshotEvent(seq=next(demo_seq), content=demo)
@@ -486,11 +533,6 @@ async def run(
         request.intent, has_sources=bool(request.sources),
     )
     budget = request.budget
-    ctx = RunContext(
-        request=request,
-        candidate=request.snapshot,
-        sources_by_id={source.id: source for source in request.sources},
-    )
     messages = _initial_messages(request)
     seq = itertools.count(1)
     started = time.monotonic()

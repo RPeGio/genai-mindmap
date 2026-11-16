@@ -2,8 +2,8 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, OpBatch, Source, SourceRef } from '../api/types';
+import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunResolved, runAgentStream, updateMindMap } from '../api/client';
+import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
@@ -406,6 +406,119 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 而一旦帧里明确写了 `demo`，界面就必须说明白：占位树不能顶着"模型生成"。
    */
   const agentMode = ref<'demo' | 'model' | null>(null);
+
+  /**
+   * 上次跑完（或被中断）、但用户还没处理过的那次运行。
+   *
+   * 这是"run 身份"落到界面上的唯一痕迹。此前 run 只活在一个 HTTP 连接的寿命里：
+   * 关掉页面，已经生成出来的候选跟着连接一起没了，用户回来什么都看不到。现在
+   * 服务端把它落进 `runs` 表，进页面时问一句"有没有我还没接住的结果"。
+   *
+   * 只是**一条提示**，不是弹窗：用户可能正在做别的事，打断他比让他知道这件事更烦。
+   */
+  const resumableRun = ref<RunSummary | null>(null);
+
+  /**
+   * 这一次会话里已经明确表示"不要再问"了。
+   *
+   * 丢弃是**本次会话**的决定：服务端那边同样会记 `dismissed_at`，但如果那次请求
+   * 没发出去（后端挂了），不该让同一句话立刻又冒出来——用户刚说完"不要"，界面
+   * 就当没听见，比不让捡回结果更伤。
+   */
+  let resumableSettled = false;
+
+  /**
+   * 当前候选属于哪一次运行。应用/丢弃时用它上报，服务端据此分清"采纳过"与
+   * "嫌弃过"——两者都表示"别再提醒我"，但含义完全不同。
+   */
+  let activeRunId: string | null = null;
+
+  /** 每次点击生成一个新的 run 身份。服务端只在这个 id 相同时才做幂等。 */
+  function newRunId(): string {
+    // 不用 crypto.randomUUID：它在非安全上下文（http://192.168.x.x 打开的开发页）
+    // 里是 undefined，而那正是最需要它的时候。时间戳 + 随机后缀的碰撞概率对
+    // "一次会话里的几十次运行"绰绰有余。
+    return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  /**
+   * 问一次服务端：有没有"跑完了但我还没接住"的结果。
+   *
+   * 失败一声不响：进页面时后端没起来、或者 `runs` 表还是空的，都不该弹一句
+   * "查询失败"——用户此刻什么也没要求。
+   */
+  async function probeResumableRun(): Promise<void> {
+    if (resumableSettled) return;
+    try {
+      const pending = await listRuns();
+      resumableRun.value = pending.length > 0 ? pending[0] : null;
+    } catch {
+      resumableRun.value = null;
+    }
+  }
+
+  /**
+   * 把上次那个候选载入**现有的**候选确认流程。
+   *
+   * 落点与一次真跑结束时完全一样（`candidate` + 版本账本 + 意图），所以「应用」
+   * 「丢弃」、过时检查、整树校验一步都不少——不是另开一条"恢复"的旁路。
+   */
+  async function resumeRun(): Promise<void> {
+    const target = resumableRun.value;
+    if (!target) return;
+    try {
+      const detail = await getRun(target.run_id);
+      if (!detail.candidate) {
+        resumableRun.value = null;
+        status.value = '那次运行没有留下可用的内容。';
+        return;
+      }
+      agentEvents.value = [];
+      agentWarnings.value = [];
+      agentError.value = '';
+      clearAgentPreview();
+      resetCandidateOps();
+      candidate.value = detail.candidate;
+      candidateBaseRevision = clientRevision.value;
+      candidateSession = mapSession;
+      candidateIntent = detail.intent;
+      runIntent.value = detail.intent;
+      // 来历照原样带过来：占位树恢复成"模型生成"就是界面替它撒谎。
+      agentMode.value = detail.mode ?? null;
+      activeRunId = detail.run_id;
+      // 候选已经在面板上等着确认了，再留一条提示只会问两遍。
+      resumableRun.value = null;
+      status.value = '已载入上次生成的候选；确认后才会应用到画布。';
+    } catch (error) {
+      resumableRun.value = null;
+      status.value = error instanceof ApiError ? error.message : '读取上次的结果失败，请重试。';
+    }
+  }
+
+  /** 丢弃上次那份候选。服务端也记一笔，否则下次进页面还会问同一句。 */
+  async function dismissResumable(): Promise<void> {
+    const target = resumableRun.value;
+    resumableRun.value = null;
+    resumableSettled = true;
+    if (!target) return;
+    status.value = '已丢弃上次的候选，画布没有变。';
+    try {
+      await markRunResolved(target.run_id, 'dismissed');
+    } catch {
+      // 上报失败不影响"已经不问"这件事：这只是记账，用户要的是别再被问。
+    }
+  }
+
+  /**
+   * 上报候选的归宿（应用 / 丢弃）。失败不提示：写台账失败不该让用户以为
+   * 他没保存成功——那是两件事。
+   */
+  function reportRunResolution(kind: 'applied' | 'dismissed'): void {
+    const id = activeRunId;
+    activeRunId = null;
+    if (!id) return;
+    void markRunResolved(id, kind).catch(() => {});
+  }
 
   /**
    * 本轮运行里"结果不完整"的证据：部分完成标记 + 每条诊断。
@@ -1596,9 +1709,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     let settled = false;
 
     try {
+      // 每次点击一个新的身份：幂等只在"带同一个 run_id"时生效，而"点了两次生成"
+      // 本来就是两次运行（按钮禁用与 busy 闸门管那个）。真正需要同一个 id 的场景
+      // 是刷新重发、换标签页、客户端重试——那时服务端能认出这是同一次运行。
+      const runId = newRunId();
+      activeRunId = runId;
       const body: AgentRunRequest = {
         goal: prompt,
         intent,
+        run_id: runId,
         // 始终显式带上：即使宿主页面没给值也发 default，而不是省略字段。
         // 省略会把「前端没传」和「后端默认」两个概念混在一起，排查请求体时看不出
         // 用户到底选了哪套拆解方式；值本身与后端默认一致，传了不影响结果。
@@ -1832,6 +1951,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     status.value = mode.value === 'demo'
       ? '已应用演示导图（固定结构，不是 AI 生成），记得保存。'
       : '已应用模型的修改，记得保存。';
+    // 告诉服务端这次候选被采纳了：没有这一步，"done 但已应用"与"done 但没应用"
+    // 分不开，下次进页面还会问同一句。放在最后：上报失败不能影响已经落地的内容。
+    reportRunResolution('applied');
     return 'applied';
   }
 
@@ -1842,6 +1964,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentError.value = '';
     agentWarnings.value = [];
     status.value = had ? '已丢弃候选，画布未变。' : '没有待处理的候选。';
+    // 丢弃同样要落一笔：否则那张表分不清"用户还没看到"和"用户已经嫌弃过"。
+    // 只在**真有候选**时上报——没有候选却被记成"用户嫌弃过"，会把"关掉页面那
+    // 40 秒"刚捡回来的草稿永久地判死。
+    if (had) reportRunResolution('dismissed');
   }
 
   return {
@@ -1924,5 +2050,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     expandSelected,
     acceptCandidate,
     discardCandidate,
+    // 上次运行留下的结果（run 身份）
+    resumableRun,
+    probeResumableRun,
+    resumeRun,
+    dismissResumable,
   };
 });

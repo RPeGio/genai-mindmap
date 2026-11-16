@@ -65,9 +65,23 @@
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
 | `GET /api/mindmaps/{map_id}` | 无 | 导图记录 | 不存在 404 |
 | `PUT /api/mindmaps/{map_id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
-| `POST /api/agent/runs/stream` | `{"goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `done` / `error`；`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`，所以 demo / model 帧必带，缺字段只说明对面"没说"），产物是**候选** | 目标为空 422；来源合计超出模型上下文 422；预算用尽或模型失败以 `error` 事件下发 |
+| `POST /api/agent/runs/stream` | `{"run_id":"…","goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `done` / `error`；`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`，所以 demo / model 帧必带，缺字段只说明对面"没说"），产物是**候选** | 目标为空 422；来源合计超出模型上下文 422；同一个 `run_id` 正在跑 409（`run_in_progress`）；预算用尽或模型失败以 `error` 事件下发 |
+| `GET /api/agent/runs` | 查询参数 `status`（`done` / `cancelled` / `failed` / `running`，可省略）、`unapplied`（默认 `true`）、`limit`（1–100，默认 20） | 运行台账数组（`run_id` / `status` / `intent` / `goal` / 时间戳），**不含候选正文**。`status` 省略时取 `done` + `cancelled` 中"有草稿且既没应用也没丢弃"的 | — |
+| `GET /api/agent/runs/{run_id}` | 无 | 同上再加 `candidate`（整棵树）、`failure`、`mode` | 不存在 404 |
+| `POST /api/agent/runs/{run_id}/applied`<br>`POST /api/agent/runs/{run_id}/dismissed` | 无 | 204；幂等（只打第一个时间戳） | 不存在 404 |
 
 **流式接口只有一套帧格式**，就是 `/api/agent/runs/stream` 的这套；旧的 `/api/generations/stream`（`stage` / `skeleton` / `node` / `done` / `error` + 末尾 `data: [DONE]`）已连路由一起删除。`backend/app/generation/stream_partial.py` 现在只剩增量解析器（`parse_partial` / `collect_new_nodes`），供 agent 的 `node_grow` 预览调用，不再有帧拼装。
+
+**`run_id` 让一次运行有身份（新增）。** 以前请求里没有 run id，服务端没有能力识别"同一次运行又投递了一遍"，于是换标签页、刷新重发、客户端重试都会新开一次真跑——两倍的钱、两份候选，两个标签页各点一次「应用」就是两张图（`create_map` 每次 `uuid4()`）。现在：
+
+- 带同一个 `run_id` 且该行 `status=running` → 409 `run_in_progress`（同一个 run 并发跑两次会互相打架）。
+- 带同一个 `run_id` 且该行 `done` → 直接把已有候选按原样的帧重放（`snapshot` → `done`，`mode` 照原值），**不再调模型**。
+- 带同一个 `run_id` 且该行 `cancelled` / `failed` → 允许重跑，复用同一个 id（那是用户主动重试，不是重复投递）。重跑期间不清空上一轮的草稿。
+- 不带 `run_id`（老客户端）→ 服务端补一个，**响应体逐字节不变**，只是额外落一行台账。
+
+`done` 之后这行冻结：一条迟到的取消不许把已经交付的候选改写成 `cancelled`。SSE 因此从"run 本身"降级成"这一行的一次观察窗口"，帧格式一个字节都没改。
+
+**运行结束（含被取消）时草稿落库。** 这是"关掉页面那 40 秒白花"的解：abort 会让 uvicorn 关掉生成器、`aclosing` 触发 `task.cancel()`，工具里的模型请求被取消且已经花掉的调用不回滚——原先 `ctx.candidate` 只活内存，用户回来什么都看不到。现在 `_frames` 的 `finally` 里写一次（正常 → `done`，异常 → `failed` + `failure`，什么都没发出去就断了 → `cancelled`，**只要候选非空就写**）。前端进页面时问一次 `GET /api/agent/runs`，有残留就在侧栏提示一句（不是弹窗），点「查看」把它载入现有的候选确认流程，点「丢弃」记一笔 `dismissed_at`。
 信封只有 `{seq, type, ...}`：`seq` 由服务端补齐，没有 `v` / `runId` / revision 字段（轮次与候选版本在各事件自己的 payload 里）。产物是 `ops` 操作批次或整树 `snapshot` 而不是"增量节点上屏"；`node_grow` 只作深层生成的预览帧、收到 `snapshot` 即作废，前端把它挂在候选副本上，用户点接受才落到画布。`MINDMAP_LLM_MODE=demo` 也作用于 agent：`run()` 入口直接发 `stage` / `snapshot` / `done` 三帧（`done.mode=demo`），不调用模型，因此演示模式下没有 `tool_start` / `ops` / `node_grow` 帧。协议见 `docs/AGENT_STREAM_PROTOCOL.md`，设计背景见 `docs/AGENT_PLAN.md`。
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。`/api/agent/tasks` 仍返回固定阶段列表，那是桩，不反映真实进度。
@@ -91,7 +105,7 @@
 | 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。当前只有 agent 这一条 SSE 流，没有持久任务。 |
 | 优化 | 已有 `/api/optimization/suggest`，持久化和应用接口待确定 | 未来补齐矛盾、缺失、重组、跨节点关系候选及依据，不直接覆盖。 |
 | 知识库 | `POST /api/knowledge-bases`、`POST .../{id}/sources`、`POST .../{id}/search` | 导入来源、切分、向量化、检索与引用。 |
-| AI 代理 | `POST /api/agent/runs/stream` 已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环与候选确认已可用；任务化长跑、过程记录落库与多角色仍待设计。 |
+| AI 代理 | `POST /api/agent/runs/stream`、`GET /api/agent/runs` 系列已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环、候选确认与"运行结束后落草稿"已可用（`runs` 表，SQLite）；任务化长跑、`runs` 的跨进程/跨机存储（现为本地 SQLite，多 worker 共享同一文件）与多角色仍待设计。 |
 | 协作 | 房间授权接口 + Yjs WebSocket | 房间鉴权、实时同步、在线状态、恢复；最终协议由协作负责人完成设计。 |
 | 更多导出 | `/api/export/puml`、`/markdown`、`/opml` 均已实现；图像导出待开发 | PNG/SVG 渲染要额外依赖，优先用浏览器端截图或交给 PlantUML 服务。 |
 

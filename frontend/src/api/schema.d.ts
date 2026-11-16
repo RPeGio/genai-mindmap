@@ -244,6 +244,93 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agent/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Runs
+         * @description 运行台账。默认回答的是"上次跑完、我还没处理的是哪一次"。
+         *
+         *     `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出草稿的那次
+         *     同样要能被捡起来**——否则"关掉页面那 40 秒"照样白花，只是从内存白花变成写进
+         *     数据库白花。
+         *
+         *     这条查询就是这张表草稿列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
+         */
+        get: operations["list_runs_api_agent_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Run */
+        get: operations["get_run_api_agent_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}/applied": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark Run Applied
+         * @description 候选进了画布。前端在「应用」成功后调用一次，幂等。
+         *
+         *     "done 但已应用"与"done 但没应用"只能靠这个时间戳分开：候选可能被 PUT 到一张
+         *     已有导图上（推不出新记录），也可能应用之后又被撤销。用 `mindmaps` 表反推，
+         *     得到的全是猜。
+         */
+        post: operations["mark_run_applied_api_agent_runs__run_id__applied_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}/dismissed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark Run Dismissed
+         * @description 用户主动丢弃了这份候选。与"应用过"分开记：下次进页面不该再问同一次。
+         */
+        post: operations["mark_run_dismissed_api_agent_runs__run_id__dismissed_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/knowledge/search": {
         parameters: {
             query?: never;
@@ -316,6 +403,8 @@ export interface components {
              * @enum {string}
              */
             intent: "create" | "expand" | "edit";
+            /** Run Id */
+            run_id?: string | null;
             /**
              * Thinking Model
              * @default default
@@ -640,6 +729,61 @@ export interface components {
              * @default 1
              */
             max_repairs: number;
+        };
+        /**
+         * RunDetail
+         * @description 单条：带候选正文与失败原因。
+         */
+        RunDetail: {
+            /** Run Id */
+            run_id: string;
+            /** Status */
+            status: string;
+            /** Intent */
+            intent: string;
+            /** Goal */
+            goal: string;
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Applied At */
+            applied_at?: string | null;
+            /** Dismissed At */
+            dismissed_at?: string | null;
+            /** Candidate */
+            candidate?: unknown | null;
+            /** Failure */
+            failure?: {
+                [key: string]: unknown;
+            } | null;
+            /** Mode */
+            mode?: string | null;
+        };
+        /**
+         * RunSummary
+         * @description 列表里的一行：**不带候选正文**。
+         *
+         *     候选是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句
+         *     "上次有一次生成完成了"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。
+         */
+        RunSummary: {
+            /** Run Id */
+            run_id: string;
+            /** Status */
+            status: string;
+            /** Intent */
+            intent: string;
+            /** Goal */
+            goal: string;
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Applied At */
+            applied_at?: string | null;
+            /** Dismissed At */
+            dismissed_at?: string | null;
         };
         /** SaveRequest */
         SaveRequest: {
@@ -1279,6 +1423,130 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_runs_api_agent_runs_get: {
+        parameters: {
+            query?: {
+                /** @description 只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。 */
+                status?: ("done" | "cancelled" | "failed" | "running") | null;
+                /** @description 只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。 */
+                unapplied?: boolean;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunSummary"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_run_api_agent_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mark_run_applied_api_agent_runs__run_id__applied_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mark_run_dismissed_api_agent_runs__run_id__dismissed_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

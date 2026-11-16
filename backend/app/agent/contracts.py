@@ -422,6 +422,18 @@ class AgentRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     goal: str = Field(min_length=1, max_length=1000)
     intent: Literal["create", "expand", "edit"] = "create"
+    # 这次运行的**身份**。带同一个 id 重复投递时，服务端据它决定"真跑 / 409 /
+    # 直接回放已有候选"，见 `app/agent/runs.py`。
+    #
+    # 由调用方给、可选，而不是服务端自己发一个再返回：服务端发的话，客户端要
+    # 先请求一次才能拿到 id，那一次请求本身就成了"第一次运行"——刷新重发时它
+    # 照样没有 id 可用，等于什么都没解决。老客户端不带也能跑（服务端补一个 uuid4），
+    # 只是拿不到幂等。
+    #
+    # 字符集收窄到 `[A-Za-z0-9_.-]`：这个值会进 `GET /api/agent/runs/{run_id}` 的
+    # 路径。放开 `/` 与 `..` 会先在路由层制造一串"看起来像另一个接口"的路径。
+    run_id: str | None = Field(default=None, min_length=1, max_length=64,
+                               pattern=r"^[A-Za-z0-9_.-]+$")
     # 同一句主题换一种拆解方法，结构就不同（表在 `generation.service.THINKING_MODELS`）。
     # 用 Literal 而不是自由字符串：拼错的值会被 `model_config` 挡在开流之前，
     # 否则它会静默退化成 default，用户在下拉里选的东西等于没生效。
