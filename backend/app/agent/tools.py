@@ -2280,6 +2280,31 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     ctx.candidate = content
     ctx.revision += 1
     count = _count_nodes(content.root)
+
+    # 证据拼进了 prompt、树上却一条引用都没留下：这是 `rag` 形态下唯一没有信号的
+    # 情况——"把证据给了模型"和"模型用了证据"在产出上长得不一样，而失败的样子
+    # 却与"本来就没有证据"完全相同。
+    #
+    # 分母用 `topic_evidence.payload`，不是 `ctx.evidence`：后者还装着本次运行前几轮
+    # `rag_query` 的命中，而它们**没有**出现在这一次的 prompt 里，拿它当分母会把
+    # "给了几条"说多。`unsourced` 正是本条件的补集（它的定义是 `text` 为空），
+    # 所以两条诊断不会同时出现在一棵树上。
+    #
+    # 引用被逐字校验剔光与模型压根没写，在这里不再细分：`validate_generated_content`
+    # 已经把每一条剔除原因（`SOURCE_QUOTE_MISMATCH` 等）单独报过，这条只说"剩下 0 条"。
+    unused_evidence = len(topic_evidence.payload) if topic_evidence is not None else 0
+    evidence_unused = bool(unused_evidence) and not _count_refs(content.root)
+    if evidence_unused:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="EVIDENCE_UNUSED",
+            message=(
+                f"本次把 {unused_evidence} 条检索到的原文拼进了提示词，"
+                f"但生成的 {count} 个节点最终 0 条 source_refs"
+                "（模型没写引用，或写了但没通过逐字校验）；"
+                "证据给了却没被用上，不等于材料里没有相关内容"
+            ),
+        ))
+
     summary = f"已生成导图「{content.title}」，共 {count} 个节点。"
     if unsourced:
         # 一句话必须写进 `content`：这是模型唯一会读回去的地方，也是遥测/日志里
@@ -2294,6 +2319,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         summary += (
             f"{external_note}，这张图只基于主题「{args.topic}」生成，"
             "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
+        )
+    if evidence_unused:
+        # 用户读到的只有这句话。此处最容易误判成"材料里没有相关内容"（那正是
+        # `unsourced` 的含义），所以必须把"给了 N 条、落下来 0 条"摆出来，
+        # 并把两种可能一起说：模型没写，或者写了没过逐字校验。
+        summary += (
+            f"本次检索到 {unused_evidence} 条原文并已拼进提示词，"
+            "但这张图的节点没有留下任何引用（模型没写，或写了没通过逐字校验）；"
+            "这不代表「材料里没有相关内容」，换一个更贴近原文的说法重试可能就好了。"
         )
     data: dict[str, Any] = {
         "root_id": content.root.id,
@@ -3534,6 +3568,34 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             content_parts.append(
                 f"引用：保留 {refs_kept} 条通过逐字校验，剔除 {refs_dropped} 条。"
             )
+        # 证据给了、整棵树却一条引用都没留下：这与上面那句"一条都没命中"是两件事，
+        # 而在交付的树上它们长得一样——都没有任何 `source_refs`。这是 `rag` 形态下
+        # 唯一没有信号的失败面：检索成功、prompt 里有原文，模型就是没用。
+        #
+        # `before`（校验前模型声明的条数）与 `refs_kept`（最终留下几条）一起才
+        # 说得清"是没写还是被剔光"：只说"0 条"会把两种原因压成一句空话。
+        # 证据条数按 `(source_id, start, end)` 去重——`whole` 兜底时每支拿到的是
+        # 同一批命中，逐支相加会把 5 条说成 20 条。
+        if with_evidence and not refs_kept:
+            evidence_total = len({
+                (entry.get("source_id"), entry.get("start"), entry.get("end"))
+                for branch in branch_evidence if branch is not None
+                for entry in branch.payload
+            })
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="EVIDENCE_UNUSED",
+                message=(
+                    f"{with_evidence} 条分支拿到了材料依据（去重后 {evidence_total} 条证据"
+                    "拼进了提示词），但整棵树最终 0 条引用"
+                    + (f"（模型写了 {before} 条，全部没通过逐字校验）" if refs_dropped
+                       else "（模型一条引用都没有写）")
+                    + "；证据给了却没被用上，不等于材料里没有相关内容"
+                ),
+            ))
+            content_parts.append(
+                "按支检索给到的证据这次没有被用上：这不代表「材料里没有相关内容」，"
+                "换一个更贴近原文的分支说法重试可能就好了。"
+            )
     content_parts.append(
         f"按 {max_depth} 层预算展开，实际 {audit.deepest + 1} 层（含中心主题），各层节点数："
         f"{' / '.join(str(audit.depths.get(depth, 0)) for depth in range(audit.deepest + 1))}。"
@@ -4395,10 +4457,26 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
                     "本次是无证据展开：新节点没有写 source_refs。")
     elif sources and not retrieval.get("hits"):
         summary += "这次没有在材料里找到与这一支相关的原文，新节点没有写 source_refs。"
-    elif sources and refs_kept == 0:
+    elif evidence is not None and refs_kept == 0:
         # 有命中但一条都没留下：模型没写引用，或写了但过不了逐字校验。这两种在
         # 界面上是同一件事（节点没有出处），区别留在 `data.refs` 里。
         summary += "模型这次没有写出可核验的引用，新节点没有 source_refs。"
+
+    # 证据拼进了 prompt（`evidence` 非 None = 这一支真的检索到原文并附在 user 末尾）、
+    # 新节点却一条引用都没有：这与"没检索到"是两件事，而交付出去的结果一样。
+    # 判据用 `evidence` 而不是 `sources`：请求带了材料、这次一条都没命中时，`sources`
+    # 非空但 `evidence` 为 None——那种情况由上一个 elif 的"没找到原文"解释。
+    if evidence is not None and refs_kept == 0:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="EVIDENCE_UNUSED",
+            message=(
+                f"这次为「{node.label}」检索到 {len(evidence.payload)} 条原文并拼进了"
+                f"提示词，但新增的 {len(new_nodes)} 个子节点最终 0 条 source_refs"
+                + ("（模型写出的引用全部没通过核验）" if refs_dropped
+                   else "（模型一条引用都没有写）")
+                + "；证据给了却没被用上，不等于材料里没有相关内容"
+            ),
+        ))
 
     return ToolResult(
         ok=True,

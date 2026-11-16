@@ -42,6 +42,7 @@ from app.agent.tools import (
     GENERATE_EVIDENCE_HEADER,
     GENERATE_EVIDENCE_RULES,
     GENERATE_RETRIEVAL_TOP_K,
+    _count_refs,
     _source_prompt_input,
     build_registry,
 )
@@ -482,3 +483,102 @@ def test_end_to_end_rag_mode_produces_a_sourced_map(monkeypatch):
     assert gen_end.result_summary["retrieval"]["hits"] >= 1
     codes = {item["code"] for item in gen_end.result_summary["diagnostics"]}
     assert not codes & {"SOURCE_QUOTE_MISMATCH", "SOURCE_REF_OUTSIDE_EVIDENCE"}, codes
+
+
+# ---------------------------------------------------------------- 六、证据没用上
+
+
+def _codes(result) -> list[str]:
+    return [item["code"] for item in result.data["diagnostics"]]
+
+
+def test_evidence_unused_warns_when_generation_writes_no_refs(monkeypatch):
+    """有证据、零引用 → `EVIDENCE_UNUSED`（warn），且说清"给了几条、最后剩几条"。
+
+    这条诊断补的是 `rag` 形态下唯一没有信号的一种情况：检索成功、原文已经拼进
+    prompt，模型却一条引用都没写。产出上它和"材料里根本没有相关内容"
+    （`GENERATION_WITHOUT_EVIDENCE`）长得一模一样，而后者要换问法、前者要换模型
+    行为——用户没有任何线索分辨。
+    """
+    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
+    source = _material()
+    with _env(SOURCE_MODE_RAG):
+        result, (_system, user), ctx = _run_generate([source], TOPIC, _tree())
+
+    assert result.ok, result.content
+    # 前提：这次确实把证据拼进了 prompt（否则下面测的就是另一条路）
+    payload = _evidence_payload(user)
+    assert payload, "这条用例的前提是提示词里有证据"
+    assert result.data["retrieval"]["hits"] == len(payload)
+
+    item = next(entry for entry in result.data["diagnostics"]
+                if entry["code"] == "EVIDENCE_UNUSED")
+    assert item["level"] == "warn"
+    # 两个数都要在：给了多少条证据、最后剩几条引用
+    assert f"{len(payload)} 条检索到的原文" in item["message"]
+    assert "0 条 source_refs" in item["message"]
+    # 树上真的一条引用都没有：诊断说的是事实，不是猜测
+    assert _count_refs(ctx.candidate.root) == 0
+    # content 里也要有一句人话，并明确否掉"材料里没有"这个误读
+    assert "没有留下任何引用" in result.content
+    assert "材料里没有相关内容" in result.content
+
+
+def test_evidence_unused_also_covers_refs_dropped_by_verification(monkeypatch):
+    """写了但全被逐字校验剔光，同样算"证据没用上"。
+
+    两种原因在产出上是同一件事（0 条引用），但用户能据此分流：`SOURCE_QUOTE_MISMATCH`
+    在说"模型引错了"，`EVIDENCE_UNUSED` 在说"这批证据白给了"。少任何一条，用户都
+    只看到"树上一个引用都没有"。
+    """
+    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
+    source = _material()
+    # 只有 quote、没有坐标，且这段文字在原文里不存在 → 定位失败，剔除
+    bogus = {"source_id": source.id, "quote": "这句话原文里根本没有出现过"}
+    with _env(SOURCE_MODE_RAG):
+        result, _prompt, ctx = _run_generate([source], TOPIC, _tree([bogus]))
+
+    assert result.ok, result.content
+    assert _count_refs(ctx.candidate.root) == 0
+    codes = _codes(result)
+    assert "EVIDENCE_UNUSED" in codes
+    assert "SOURCE_QUOTE_MISMATCH" in codes, "剔除原因本身还要能看见"
+
+
+def test_evidence_unused_is_silent_when_refs_survive(monkeypatch):
+    """有证据、有引用 → 不报。这是这条诊断的"不报"界限（另一半是"没有证据"）。"""
+    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
+    source = _material()
+    hits = search_parent([source], TOPIC, GENERATE_RETRIEVAL_TOP_K)
+    assert hits and hits[0].leaf_start is not None
+    ref = {"source_id": source.id, "start": hits[0].leaf_start,
+           "end": hits[0].leaf_end,
+           "quote": (source.text or "")[hits[0].leaf_start:hits[0].leaf_end]}
+
+    with _env(SOURCE_MODE_RAG):
+        result, _prompt, ctx = _run_generate([source], TOPIC, _tree([ref]))
+
+    assert result.ok, result.content
+    assert _count_refs(ctx.candidate.root) == 1, "前提：这条引用留在树上"
+    assert "EVIDENCE_UNUSED" not in _codes(result)
+
+
+def test_evidence_unused_is_silent_without_evidence(monkeypatch):
+    """无证据、零引用 → 不报：那是 `GENERATION_WITHOUT_EVIDENCE` 的表述范围。
+
+    两条诊断的分母不同（"给了几条证据" vs "一条都没检索到"），同时出现会让用户
+    既不知道要不要改问法，也不知道这次到底检索到了什么。
+    """
+    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
+    with _env(SOURCE_MODE_RAG):
+        result, _prompt, ctx = _run_generate(
+            [_material(UNRELATED_TEXT)], UNRELATED_TOPIC, _tree())
+
+    assert result.ok, result.content
+    assert result.data["retrieval"]["hits"] == 0
+    assert _count_refs(ctx.candidate.root) == 0
+    codes = _codes(result)
+    assert "GENERATION_WITHOUT_EVIDENCE" in codes
+    assert "EVIDENCE_UNUSED" not in codes
+    # content 里也不能出现这条诊断的那句话：无证据时用户读到的是"只基于主题"
+    assert "没有留下任何引用" not in result.content

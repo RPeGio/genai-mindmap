@@ -61,6 +61,14 @@
 `rag` 形态一次证据都没检索到时允许零引用，由 `GENERATION_WITHOUT_EVIDENCE`（warn）
 说明这次没有依据——诊断从不参与成功判定。
 
+反过来，"证据已拼进 prompt、最终却一条引用都没有"是另一件事：模型没写，或写了但
+过不了第三层被剔光。`EVIDENCE_UNUSED`（warn）报出"给了几条证据、最后剩几条引用"，
+并在 `content` 里点明这不等于"材料里没有相关内容"。分母口径按路径各算各的：
+`mindmap_generate` 用主题预检索的命中数，`mindmap_generate_deep` 用按支证据去重后的
+条数（`whole` 兜底时各支拿到同一批，逐支相加会虚报），`node_expand` 用本次为这个
+节点检索的命中数。没有证据时它不报——那种情况归 `GENERATION_WITHOUT_EVIDENCE`
+与 `BRANCH_NO_EVIDENCE`。
+
 子块约束保留下来是为了**可观测**：谁引了父块里与查询无关的部分，诊断里看得见；
 要求模型精确落在命中的那 200 字里过于苛刻，实测会成批剔掉合法引用。
 
