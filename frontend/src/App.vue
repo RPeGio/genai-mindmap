@@ -8,6 +8,7 @@ import SourceInputs from './components/SourceInputs.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, type ExportFormat } from './api/client';
 import type { SampleMap } from './dev/samples';
+import type { DemoPreset } from './demo/presets';
 import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
 import { useSourcesStore } from './stores/sources';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
@@ -209,6 +210,38 @@ function confirmDiscard(action: string): boolean {
   return window.confirm(`当前有未保存的修改，${action}会丢掉这些修改，继续？`);
 }
 
+/**
+ * 演示用的预置导图：**只在用户点按钮时加载**，模型失败时不会自动顶上。
+ *
+ * 内容单独成块（动态 import），主包不因为演示数据变大。约定与理由写在
+ * `frontend/src/demo/presets.ts` 的文件头。
+ */
+const demoOpen = ref(false);
+const demoPresets = ref<DemoPreset[]>([]);
+const demoBusy = ref(false);
+
+async function openDemoPresets(): Promise<void> {
+  demoOpen.value = true;
+  if (demoPresets.value.length || demoBusy.value) return;
+  demoBusy.value = true;
+  try {
+    const mod = await import('./demo/presets');
+    demoPresets.value = mod.DEMO_PRESETS;
+  } catch {
+    store.status = '预置导图没能加载，刷新页面再试一次。';
+    demoOpen.value = false;
+  } finally {
+    demoBusy.value = false;
+  }
+}
+
+function loadDemoPreset(preset: DemoPreset): void {
+  if (!confirmDiscard(`载入「${preset.label}」`)) return;
+  store.loadPreset(preset);
+  demoOpen.value = false;
+  flash('ok', `已载入预置导图：${preset.label}`);
+}
+
 const exporting = ref(false);
 // 必须由 Vue 管住选中值：把占位项写成 disabled 时，浏览器会把第一个可用项
 // （PlantUML）当成初始选中，用户第一次点它就等于"值没变"，change 不触发，
@@ -373,6 +406,13 @@ async function copyBody() {
           @click="saveNow"
         >
           保存
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+          @click="openDemoPresets"
+        >
+          演示示例
         </button>
         <button
           type="button"
@@ -668,6 +708,47 @@ async function copyBody() {
         </p>
       </div>
     </aside>
+
+    <div
+      v-if="demoOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="demo-title"
+    >
+      <div class="flex max-h-[70vh] w-full max-w-lg flex-col rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+        <div class="flex items-center justify-between">
+          <h2 id="demo-title" class="text-sm font-semibold">预置演示导图</h2>
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="demoOpen = false">
+            关闭
+          </button>
+        </div>
+        <p class="mt-2 text-xs leading-relaxed text-slate-500">
+          这些图随页面一起打包，不经过模型，用来在演示时快速摆出一张完整的图。
+          它们不会自动顶替模型失败的提示——要哪张，自己点。
+        </p>
+        <p v-if="demoBusy" class="mt-3 text-xs text-slate-400">正在加载…</p>
+        <ul v-else class="mt-3 flex-1 divide-y divide-slate-100 overflow-y-auto">
+          <li
+            v-for="preset in demoPresets"
+            :key="preset.id"
+            class="flex items-start justify-between gap-3 py-2"
+          >
+            <div class="min-w-0">
+              <p class="text-sm text-slate-800">{{ preset.label }}</p>
+              <p class="text-xs leading-relaxed text-slate-400">{{ preset.description }}</p>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 rounded-md border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              @click="loadDemoPreset(preset)"
+            >
+              载入
+            </button>
+          </li>
+        </ul>
+      </div>
+    </div>
 
     <div
       v-if="store.listOpen"

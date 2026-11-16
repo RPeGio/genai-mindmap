@@ -1469,6 +1469,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
+   * 载入一张预置的演示导图（内容见 `frontend/src/demo/presets.ts`）。
+   *
+   * 复用 `preview` 的"换图即换会话"处理：不做的话，上一张图在途的保存响应回来时
+   * 会把旧 id 写进 `mapId`，画布是新图、身份却是旧图。`mapId` 保持为空，所以第一次
+   * 保存会新建记录，不会覆盖别人的图。
+   *
+   * 只改一句状态文案：预置图是内容完整的演示材料，不是"用来看布局的示例"。
+   */
+  function loadPreset(preset: {
+    label: string;
+    content: MindMapContent;
+    direction: Direction;
+  }) {
+    preview(preset.content, preset.direction);
+    status.value = `已载入预置演示导图「${preset.label}」：可以直接改，也可以保存成一张新导图。`;
+  }
+
+  /**
    * 掐掉在途的 agent 运行。
    *
    * 取消只是停止这一轮：画布上的 `content` 从来没被这一轮碰过（候选落地要用户
@@ -1882,6 +1900,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     listBusy,
     cancel,
     preview,
+    loadPreset,
     select,
     locate,
     setDirection,

@@ -442,6 +442,77 @@ describe('正文编辑', () => {
   });
 });
 
+describe('演示预置导图', () => {
+  /** 只要不带 health 的请求就算业务请求，这里一条都不该有。 */
+  function stubOffline() {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) }) as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('点「演示示例」列出三张预置图，载入时不请求后端', async () => {
+    const fetchMock = stubOffline();
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '演示示例').trigger('click');
+    // 预置内容是动态 import 进来的，要多等一拍才知道弹层里有什么。
+    await vi.waitFor(() => expect(wrapper.text()).toContain('Rust 学习路线'));
+    expect(wrapper.text()).toContain('RAG 方案选型');
+    expect(wrapper.text()).toContain('一次产品评审');
+
+    const loadButtons = wrapper.findAll('button').filter(item => item.text() === '载入');
+    expect(loadButtons).toHaveLength(3);
+    await loadButtons[0].trigger('click');
+    await flushPromises();
+
+    const store = useMindMapStore();
+    expect(store.content?.title).toBe('Rust 学习路线');
+    expect(store.nodeCount).toBeGreaterThan(20);
+    expect(store.status).toContain('已载入预置演示导图');
+    // 预置图不落盘、也不能凭空造出记录身份：第一次保存必须是新建。
+    expect(store.mapId).toBeNull();
+    expect(apiCalls(fetchMock)).toHaveLength(0);
+  });
+
+  it('不同预置图用不同朝向，双向那张排成左右两列', async () => {
+    stubOffline();
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '演示示例').trigger('click');
+    await vi.waitFor(() => expect(wrapper.findAll('button').filter(item => item.text() === '载入')).toHaveLength(3));
+    const loadButtons = wrapper.findAll('button').filter(item => item.text() === '载入');
+    await loadButtons[2].trigger('click');
+    await flushPromises();
+
+    const store = useMindMapStore();
+    expect(store.content?.title).toBe('一次产品评审的结论');
+    expect(store.direction).toBe('both');
+  });
+
+  it('模型失败时不会自动载入预置图', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).endsWith('/api/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
+      }
+      return streamReply([{ type: 'stage', seq: 1, stage: '准备', detail: 'create 意图' }, { type: 'done', seq: 2, content: null, mode: 'model' }]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await wrapper.find('textarea').setValue('随便来点');
+    await buttonByText(wrapper, '生成导图').trigger('click');
+    await flushPromises();
+
+    const store = useMindMapStore();
+    expect(store.content).toBeNull();
+    expect(wrapper.text()).toContain('演示示例');
+    expect(store.status).not.toContain('已载入预置演示导图');
+  });
+});
+
 describe('版本徽章', () => {
   function stubHealth(body: unknown) {
     vi.stubGlobal(
