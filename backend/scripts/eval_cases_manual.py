@@ -44,7 +44,7 @@ content_hash` 同口径）。材料一改，`load_manual_dataset` **明确报错
 
 指纹是**整份文件**的 `sha256`，所以往 `docs/PLAN.md` 末尾追加一行变更记录也会让它变红——
 追加不改变已标注章节的正文与偏移，此时把新指纹写回、再跑一遍 `test_retrieval_eval_*` 确认
-章节前缀与锚点仍各自命中一次即可，不需要重新标注。这个误触已经发生过两次（v1.21 与 v1.23），
+章节前缀与锚点仍各自命中一次即可，不需要重新标注。这个误触已经发生过三次（v1.21、v1.23 与 v1.24），
 看见 `MANUAL_SOURCE_HASHES` 报错先分辨是"标注过期"还是"只是追加了记录"。
 """
 from __future__ import annotations
@@ -104,7 +104,7 @@ class ManualCase:
 MANUAL_SOURCE_HASHES: dict[str, str] = {
     "docs/AGENT_PLAN.md": "1a06838dd1b45a98664c17d20db063cbb0427f9f4466b4ec28ac44f551f34393",
     "docs/RAG-DECISIONS.md": "0a61ef1684479991fae70e9bba07d1ece3e0f0f0997feab9d5bbbda2b59bcfb8",
-    "docs/PLAN.md": "d458797c61b209bb7d2a969ad4185595c90aef1176438627867fe55f5c009c73",
+    "docs/PLAN.md": "65867dc2f0222347088540b65c748d8fe3548186d3ecded53e5e744f7e87f71b",
     "docs/ARCHITECTURE.md": "d95bd8455e094bb1def66018a3d6b8fb88a0939527bff3d1a49f35df135c426b",
 }
 """这四份材料的 `sha256(正文)`；对不上就是材料变了，整套标注要复核。"""
