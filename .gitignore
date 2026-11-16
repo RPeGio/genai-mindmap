@@ -47,4 +47,8 @@ coverage.xml
 htmlcov/
 
 # AI Agent contracts
+# 规范要共享才有效：AGENTS.md 落到仓库里，两个人看到的才是同一份。
+# 各人的本地覆盖走 AGENTS.local.md（仍在忽略范围）。
 AGENTS.md
+!AGENTS.md
+AGENTS.local.md
