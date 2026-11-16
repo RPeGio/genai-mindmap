@@ -8,6 +8,7 @@ import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
+import { useSourcesStore } from './sources';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -292,6 +293,9 @@ function flatten(root: MindNode): FlatNode[] {
 }
 
 export const useMindMapStore = defineStore('mindmap', () => {
+  // 只为了在收到 `sources` 帧时把来源 id 换成持久 id（见 runGeneration）。
+  // 依赖方向是单向的：sources 不认识 mindmap，反过来才会。
+  const sourcesStore = useSourcesStore();
   const content = ref<MindMapContent | null>(null);
   const mode = ref<'demo' | 'model' | 'saved' | null>(null);
   const status = ref('输入主题或文本后生成，节点会边生成边出现。');
@@ -1641,6 +1645,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
         switch (event.type) {
           case 'stage':
             stageText.value = event.detail || event.stage;
+            break;
+          case 'sources':
+            // 后端刚把材料写进知识库，临时 id 已被换成持久 id。不换的话这张图里
+            // 的 `source_refs.source_id` 重新打开后指不到原文——引用计数、点开看
+            // 原文、会话内反向索引全部失效，而且是静默失效。
+            sourcesStore.remap(event.mapping);
             break;
           case 'tool_start':
             // 状态行显示的也是人话：用户读不到 `mindmap_generate` 这种函数名。

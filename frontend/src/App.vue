@@ -6,7 +6,8 @@ import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
 import SourceInputs from './components/SourceInputs.vue';
 import { SOURCE_LABELS } from './sources/input';
-import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, type ExportFormat } from './api/client';
+import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
+import type { LibraryEntry, LibrarySource } from './api/types';
 import type { SampleMap } from './dev/samples';
 import type { DemoPreset } from './demo/presets';
 import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
@@ -242,6 +243,77 @@ function loadDemoPreset(preset: DemoPreset): void {
   flash('ok', `已载入预置导图：${preset.label}`);
 }
 
+// ---- 知识库（只读） ----
+/**
+ * 库里有什么材料、每份被几张已保存导图引用、点开看正文预览。
+ *
+ * 只读：不提供删除、不提供"从这里选材料去生成"。后者的开关是
+ * `MINDMAP_LIBRARY_SEARCH`，与本面板无关——线上那个开关关着，这个入口照样能用。
+ * 材料是在**生成时**入库的，所以刚上传还没生成过的文件不会出现在这里。
+ */
+const libraryOpen = ref(false);
+const libraryEntries = ref<LibraryEntry[]>([]);
+const libraryTotal = ref(0);
+const libraryBusy = ref(false);
+const libraryError = ref('');
+/** 当前正在看正文的那一份；为 null 表示停在列表。 */
+const libraryPreview = ref<LibrarySource | null>(null);
+const libraryPreviewBusy = ref(false);
+
+async function openLibrary(): Promise<void> {
+  libraryOpen.value = true;
+  libraryPreview.value = null;
+  await loadLibrary();
+}
+
+async function loadLibrary(): Promise<void> {
+  libraryBusy.value = true;
+  libraryError.value = '';
+  try {
+    const payload = await listLibrary();
+    libraryEntries.value = payload.items;
+    libraryTotal.value = payload.total;
+  } catch (error) {
+    libraryEntries.value = [];
+    libraryTotal.value = 0;
+    libraryError.value = `知识库没能读取：${(error as Error).message}`;
+  } finally {
+    libraryBusy.value = false;
+  }
+}
+
+async function openLibrarySource(entry: LibraryEntry): Promise<void> {
+  libraryPreviewBusy.value = true;
+  libraryError.value = '';
+  try {
+    libraryPreview.value = await readLibrarySource(entry.source_id);
+  } catch (error) {
+    libraryError.value = `正文没能读取：${(error as Error).message}`;
+  } finally {
+    libraryPreviewBusy.value = false;
+  }
+}
+
+function closeLibrary(): void {
+  libraryOpen.value = false;
+  libraryPreview.value = null;
+}
+
+/** 材料被几张已保存导图引用过；0 表示存了但从没进过任何一张图。 */
+function citationLabel(count: number): string {
+  return count > 0 ? `被 ${count} 张导图引用` : '还没有导图引用它';
+}
+
+function librarySize(entry: LibraryEntry): string {
+  return `${entry.chars} 字 · ${entry.chunks} 段`;
+}
+
+function formatStamp(value: string): string {
+  const when = new Date(value);
+  if (Number.isNaN(when.getTime())) return value;
+  return when.toLocaleString('zh-CN', { hour12: false });
+}
+
 const exporting = ref(false);
 // 必须由 Vue 管住选中值：把占位项写成 disabled 时，浏览器会把第一个可用项
 // （PlantUML）当成初始选中，用户第一次点它就等于"值没变"，change 不触发，
@@ -413,6 +485,13 @@ async function copyBody() {
           @click="openDemoPresets"
         >
           演示示例
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+          @click="openLibrary"
+        >
+          知识库
         </button>
         <button
           type="button"
@@ -706,6 +785,82 @@ async function copyBody() {
           原文没有随导图保存，这里只能看到生成时记下的摘录。
           {{ activeRef.start != null ? '打开这张图时重新解析同一份来源，才能回到原文。' : '' }}
         </p>
+      </div>
+    </aside>
+
+    <aside
+      v-if="libraryOpen"
+      class="fixed inset-y-0 right-0 z-40 flex w-[480px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="library-title"
+    >
+      <div class="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+        <h2 id="library-title" class="text-sm font-semibold">知识库</h2>
+        <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="closeLibrary()">
+          关闭
+        </button>
+      </div>
+
+      <div class="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        <template v-if="libraryPreview">
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="libraryPreview = null">
+            ← 回到列表
+          </button>
+          <h3 class="mt-2 break-words text-sm font-medium text-slate-800">
+            {{ libraryPreview.filename || '未命名材料' }}
+          </h3>
+          <p class="mt-1 text-xs text-slate-400">
+            {{ SOURCE_LABELS[libraryPreview.kind] }} · 共 {{ libraryPreview.total_chars }} 字
+          </p>
+          <pre class="mt-3 whitespace-pre-wrap break-words font-sans text-xs leading-relaxed text-slate-700">{{ libraryPreview.text }}</pre>
+          <p
+            v-if="libraryPreview.truncated"
+            class="mt-3 rounded-md bg-amber-50 p-3 text-xs leading-relaxed text-amber-700"
+          >
+            这里只显示前 4000 字，全文共 {{ libraryPreview.total_chars }} 字。
+          </p>
+        </template>
+
+        <template v-else>
+          <p class="text-xs leading-relaxed text-slate-500">
+            生成时用到的材料会被收进这里，供以后复用。库里现在有
+            <strong class="text-slate-700">{{ libraryTotal }}</strong> 份。
+          </p>
+          <p v-if="libraryBusy" class="mt-3 text-xs text-slate-400">正在读取…</p>
+          <p v-else-if="libraryError" class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
+            {{ libraryError }}
+          </p>
+          <p v-else-if="libraryEntries.length === 0" class="mt-3 text-xs leading-relaxed text-slate-400">
+            还是空的。带着材料生成一次导图，用到的材料就会出现在这里。
+          </p>
+          <ul v-else class="mt-3 divide-y divide-slate-100">
+            <li v-for="entry in libraryEntries" :key="entry.source_id" class="py-2">
+              <button
+                type="button"
+                class="flex w-full items-start justify-between gap-3 text-left hover:bg-slate-50"
+                @click="openLibrarySource(entry)"
+              >
+                <span class="min-w-0">
+                  <span class="block break-words text-sm text-slate-800">{{ entry.filename || '未命名材料' }}</span>
+                  <span class="mt-0.5 block text-xs text-slate-400">
+                    {{ SOURCE_LABELS[entry.kind] }} · {{ librarySize(entry) }} · {{ formatStamp(entry.last_used_at) }}
+                  </span>
+                </span>
+                <span
+                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px]"
+                  :class="entry.cited_by > 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'"
+                >
+                  {{ citationLabel(entry.cited_by) }}
+                </span>
+              </button>
+            </li>
+          </ul>
+          <p v-if="libraryPreviewBusy" class="mt-3 text-xs text-slate-400">正在读取正文…</p>
+          <p class="mt-4 text-xs leading-relaxed text-slate-400">
+            这里只是看：材料正文随库保存，删改请走运维脚本。上传后还没生成过的文件不会出现在这里。
+          </p>
+        </template>
       </div>
     </aside>
 

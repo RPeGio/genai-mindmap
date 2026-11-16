@@ -184,6 +184,24 @@ export const useSourcesStore = defineStore('sources', () => {
     await drain();
   }
 
+  /**
+   * 按服务端给的对照表把来源 id 换成持久 id。
+   *
+   * 生成开始时后端会把材料写进知识库，同时用 `sources` 帧告诉前端"旧 id → 新 id"。
+   * 两处都得换：`item.source.id` 是导图引用与引用计数用的，`item.id` 是会话内
+   * 反向索引（"被几个节点引用"）与 `files` 映射的键——只换前者会让后者对不上。
+   */
+  function remap(ids: Record<string, string>): void {
+    const entries = Object.entries(ids);
+    if (!entries.length) return;
+    for (const item of items.value) {
+      const next = ids[item.id] ?? (item.source ? ids[item.source.id] : undefined);
+      if (!next || next === item.id) continue;
+      if (item.source) item.source = { ...item.source, id: next };
+      item.id = next;
+    }
+  }
+
   function remove(id: string): void {
     active.get(id)?.abort();
     files.delete(id);
@@ -199,5 +217,5 @@ export const useSourcesStore = defineStore('sources', () => {
   }
 
   onScopeDispose(clear);
-  return { items, error, parsing, readySources, problem, addText, addFiles, retry, remove, clear };
+  return { items, error, parsing, readySources, problem, addText, addFiles, retry, remove, clear, remap };
 });

@@ -32,6 +32,9 @@
  */
 import type { components } from './schema';
 import type {
+  LibraryEntry,
+  LibraryList,
+  LibrarySource,
   MapRecord,
   MindMapContent,
   MindMapTheme,
@@ -73,6 +76,9 @@ export const checks = {
   sourceSpanKeys: true satisfies SameKeys<SourceSpan, Schemas['SourceSpan']>,
   sourceUsageKeys: true satisfies SameKeys<SourceUsage, Schemas['SourceUsage']>,
   recordKeys: true satisfies SameKeys<MapRecord, Schemas['MapRecord']>,
+  libraryEntryKeys: true satisfies SameKeys<LibraryEntry, Schemas['LibraryEntry']>,
+  libraryListKeys: true satisfies SameKeys<LibraryList, Schemas['LibraryList']>,
+  librarySourceKeys: true satisfies SameKeys<LibrarySource, Schemas['LibrarySource']>,
 
   // ---- 字段形状 ----
   contentShape: true satisfies SameShape<MindMapContent, Schemas['MindMapContent-Output']>,
@@ -86,4 +92,7 @@ export const checks = {
   sourceSpanShape: true satisfies SameShape<SourceSpan, Schemas['SourceSpan']>,
   sourceUsageShape: true satisfies SameShape<SourceUsage, Schemas['SourceUsage']>,
   recordShape: true satisfies SameShape<MapRecord, Schemas['MapRecord']>,
+  libraryEntryShape: true satisfies SameShape<LibraryEntry, Schemas['LibraryEntry']>,
+  libraryListShape: true satisfies SameShape<LibraryList, Schemas['LibraryList']>,
+  librarySourceShape: true satisfies SameShape<LibrarySource, Schemas['LibrarySource']>,
 };

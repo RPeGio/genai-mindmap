@@ -2,6 +2,8 @@ import type {
   AgentEvent,
   AgentRunRequest,
   CreateTextSourceResponse,
+  LibraryList,
+  LibrarySource,
   MapRecord,
   MindMapContent,
   Source,
@@ -224,6 +226,21 @@ export async function uploadDocument(file: File, signal?: AbortSignal): Promise<
     throw new ApiError(response.status, 'empty_source', '后端没有返回解析结果，请重试。');
   }
   return body.source;
+}
+
+// ---- 知识库 ----
+
+/**
+ * 库里的材料列表。**不受 `MINDMAP_LIBRARY_SEARCH` 影响**：那个开关管的是
+ * "生成时要不要从库里捞材料"，这里只是把库里有什么显示出来。
+ */
+export function listLibrary(limit = 50): Promise<LibraryList> {
+  return request<LibraryList>(`/knowledge/library?limit=${limit}`);
+}
+
+/** 单份材料的正文预览（后端最多回 4000 字，`truncated` 标明是否截断）。 */
+export function readLibrarySource(id: string): Promise<LibrarySource> {
+  return request<LibrarySource>(`/knowledge/library/${encodeURIComponent(id)}`);
 }
 
 // ---- 导出 ----

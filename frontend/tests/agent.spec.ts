@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AgentPanel from '../src/components/AgentPanel.vue';
 import SourceInputs from '../src/components/SourceInputs.vue';
 import type { MindMapContent, Source } from '../src/api/types';
+import { textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 
@@ -886,5 +887,42 @@ describe('面板文案与候选骨架', () => {
     const rows = wrapper.findAll('ol > li');
     expect(rows[0].find('p').text()).toContain('模型服务返回 HTTP 429');
     expect(rows[1].find('p').exists()).toBe(false);
+  });
+});
+
+describe('材料入库后的 id 重映射', () => {
+  const readyItem = (id: string) => ({
+    id,
+    label: '资料.pdf',
+    kind: 'document' as const,
+    state: 'ready' as const,
+    source: { ...textSource('正文'), id, kind: 'document' as const, filename: '资料.pdf' },
+    error: '',
+    seconds: 0,
+  });
+
+  it('收到 sources 帧就把来源条目的 id 换成持久 id', async () => {
+    const sourcesStore = useSourcesStore();
+    sourcesStore.items = [readyItem('tmp-1')];
+    stubFetch(() => agentReply([
+      { type: 'sources', seq: 1, mapping: { 'tmp-1': '持久-1' } },
+      doneFrame(content()),
+    ]));
+
+    await useMindMapStore().runGeneration('整理材料', 'create', sourcesStore.readySources);
+
+    expect(sourcesStore.items[0].id).toBe('持久-1');
+    expect(sourcesStore.items[0].source?.id).toBe('持久-1');
+    expect(sourcesStore.readySources[0].id).toBe('持久-1');
+  });
+
+  it('没有这一帧时来源原样不动', async () => {
+    const sourcesStore = useSourcesStore();
+    sourcesStore.items = [readyItem('tmp-2')];
+    stubFetch(() => agentReply([doneFrame(content())]));
+
+    await useMindMapStore().runGeneration('整理材料', 'create', sourcesStore.readySources);
+
+    expect(sourcesStore.items[0].id).toBe('tmp-2');
   });
 });
