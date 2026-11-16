@@ -72,6 +72,16 @@ BEHAVIOUR = (
     # 置 0 会把那条前提整个跳过：所有用例都不会经过"查了一次空库"的那条路，
     # 于是"库空时逐字节不变"永远没被人跑过。需要关掉的用例自己 `setenv(..., "0")`。
     "MINDMAP_LIBRARY_SEARCH",
+    # 外部知识检索（`tools.external_knowledge_enabled`）。**清空而不是置 0**：
+    # 它默认关，而"默认关 = 既有用例一行都不变"正是这条接线要验证的前提之一
+    # （`tests/test_external_knowledge.py` 拿 `aeed033` 的旧模块钉着）。
+    # 置 0 会让"关着时逐字节相同"这条闸永远没被真的跑过——清空之后需要打开它的
+    # 用例自己 `setenv(..., "1")`。
+    "MINDMAP_EXTERNAL_KNOWLEDGE",
+    # 外部检索的代理地址（`knowledge/external.py`）。清空 = 用默认的 Clash Verge
+    # 地址；不清的话，宿主机上为别的用途配的代理会让外部源的请求目标随机器漂。
+    # 单测一律替换 `external._client`，这条只是防止"以为在测 A、其实连了 B"。
+    "MINDMAP_EXTERNAL_PROXY",
     # 重排模型名（`knowledge/rerank.py`）。清空 = 用默认值。不清的话宿主机上换个
     # 模型名会让 `tests/test_rerank.py` 里断言请求体的几条换一个字符串。
     "MINDMAP_RERANK_MODEL",

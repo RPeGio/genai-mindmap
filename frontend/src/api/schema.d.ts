@@ -704,7 +704,7 @@ export interface components {
          * SourceKind
          * @enum {string}
          */
-        SourceKind: "text" | "markdown" | "document" | "image" | "audio";
+        SourceKind: "text" | "markdown" | "document" | "image" | "audio" | "web" | "paper";
         /**
          * SourceMetadata
          * @description 来源的描述性元数据：检索前过滤的依据，不参与正文解析。
@@ -734,6 +734,10 @@ export interface components {
             category?: string | null;
             /** Tags */
             tags?: string[];
+            /** Url */
+            url?: string | null;
+            /** Raw Chars */
+            raw_chars?: number | null;
         };
         /**
          * SourceRef
@@ -777,6 +781,8 @@ export interface components {
             filename?: string | null;
             /** Char Count */
             char_count: number;
+            /** Url */
+            url?: string | null;
         };
         /** SuggestResponse */
         SuggestResponse: {

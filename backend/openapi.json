@@ -1645,7 +1645,9 @@
           "markdown",
           "document",
           "image",
-          "audio"
+          "audio",
+          "web",
+          "paper"
         ],
         "title": "SourceKind"
       },
@@ -1701,6 +1703,29 @@
             },
             "type": "array",
             "title": "Tags"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "raw_chars": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Chars"
           }
         },
         "additionalProperties": false,
@@ -1840,6 +1865,17 @@
             "type": "integer",
             "minimum": 1.0,
             "title": "Char Count"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
           }
         },
         "additionalProperties": false,

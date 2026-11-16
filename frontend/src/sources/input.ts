@@ -21,6 +21,9 @@ export const FILE_ACCEPT = '.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md
 
 export const SOURCE_LABELS: Record<SourceKind, string> = {
   text: '文本', markdown: 'Markdown', document: '文档', image: '图片', audio: '语音',
+  // 外部检索抓回来的两类。文案要明确说"外"，否则用户会以为这是自己上传的材料
+  // ——两者的可信度与责任归属都不一样。
+  web: '网页', paper: '论文',
 };
 
 let sourceSequence = 0;

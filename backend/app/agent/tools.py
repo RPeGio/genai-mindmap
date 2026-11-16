@@ -52,12 +52,13 @@ from app.contracts.mindmap import (
     clip_label,
 )
 from app.contracts.ops import OpBatch, OpError
-from app.contracts.source import Source, SourceUsage
+from app.contracts.source import Source, SourceKind, SourceMetadata, SourceUsage
 from app.generation import budget
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     DETAIL_NO_SOURCE_RULES,
     DETAIL_PROMPT,
+    EXTERNAL_TRUST_RULES,
     MIN_BRANCHES,
     RAG_SOURCE_PROMPT,
     RAG_THINKING_GUARD,
@@ -74,6 +75,7 @@ from app.generation.service import (
     validate_generated_content,
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
+from app.knowledge import external as external_knowledge
 from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
 from app.knowledge.service import (
@@ -284,6 +286,48 @@ def library_available() -> bool:
     三处各漏一次，而漏一次的表现是"模型看到了工具但查不到东西"或者反过来。
     """
     return library_search_enabled() and library_source_count() > 0
+
+
+# ---------------------------------------------------------------- 外部知识检索开关
+#
+# 用户只输一个主题时（`request.sources` 为空），这条链路原先零检索、零引用：
+# `DETAIL_PROMPT + DETAIL_NO_SOURCE_RULES` 明确告诉模型"没有可标出处的材料"。
+# 打开这个开关之后，主题先被拿去外部源（中文维基 / arXiv）搜一次，命中转成
+# `Source` 入库，然后**原样走有来源那条路**——预检索、拼证据、引用校验一行不改。
+#
+# 默认**关**，两个理由都不是"技术上做不到"：
+#
+#   1. 外部请求有不确定性（源挂掉、代理没开、公司网络封外网）。默认开会让"生成
+#      一张图"这个最基础的动作依赖一次外网往返——而这是用户唯一不能自己排查的
+#      那类失败。
+#   2. 内容可信度不同。上传材料是用户给的，可以假设权威；维基与 arXiv 参差。
+#      `source_refs` 的逐字校验只保证"这句话出自那个来源"，不保证"那个来源本身
+#      可信"——这个差别必须是一个显式的开关，不是默认行为。
+#
+# 关着时与 `aeed033` 逐字节相同（`tests/test_external_knowledge.py` 钉着）：不
+# 发请求、不改提示词、`content` 与 `data` 一个键都不多。
+EXTERNAL_KNOWLEDGE_ENV = "MINDMAP_EXTERNAL_KNOWLEDGE"
+EXTERNAL_KNOWLEDGE_TRUTHY = frozenset({"1", "on", "true", "yes"})
+
+# 一次检索最多拿几条外部命中。3 条与 `external.DEFAULT_LIMIT` 是同一个数（引用
+# 而不是重写一个 3）：那边是抓取层的默认，这边是"这次生成愿意为它花多少条清单
+# 位"，改一处忘另一处会让"库里存了 5 条、模型只看到 3 条"变得没人说得清。
+EXTERNAL_HIT_LIMIT = external_knowledge.DEFAULT_LIMIT
+
+
+def external_knowledge_enabled() -> bool:
+    """外部知识检索是否打开。**默认关**，显式写 `1/on/true/yes` 才算开。
+
+    判定方式与 `library_search_enabled` 一致，只把缺省值从 `"1"` 换成 `"0"`——
+    理由见上面那段注释，不是笔误。
+    """
+    return os.getenv(EXTERNAL_KNOWLEDGE_ENV, "0").strip().lower() in EXTERNAL_KNOWLEDGE_TRUTHY
+
+
+# `source_name` → `SourceKind`。表而不是三元表达式：加第三个源（RFC、百度百科）
+# 时只能改这里一处，而"忘了改"的表现是新源全部落进 `web`——不报错，只是界面上
+# 的类型标签错了一个字，谁也不会注意到。
+_EXTERNAL_KINDS = {"wikipedia": SourceKind.web, "arxiv": SourceKind.paper}
 
 
 class ToolRegistry:
@@ -1828,6 +1872,113 @@ GENERATE_EVIDENCE_RULES = (
 
 
 @dataclass(frozen=True)
+class _ExternalFetch:
+    """一次外部检索的产物。
+
+    `sources` 为空串（空列表）表示"没有能用的外部资料"，`failure` 区分两种原因：
+    非空是**检索本身出错**（代理没开、源 500、超时），None 是**源里确实没有**
+    （中文主题在 arXiv 上 0 条是常态）。两者给用户的文案必须分开——把"这次没查成"
+    说成"网上没有"是谎报，反过来则是让人白等一次重试。
+    """
+
+    sources: list[Source]
+    hits: int
+    elapsed: float
+    failure: str | None = None
+
+
+def _external_source(hit: external_knowledge.ExternalHit) -> Source:
+    """一条外部命中 → `Source`。**外部内容进入契约的唯一入口。**
+
+    五个字段各有理由，改任何一个都会在链路上留下一个静默失败：
+
+      - `filename = f"{source_name}: {title}"`：材料清单里要能一眼看出这是维基的
+        哪一条/arXiv 的哪一篇。只写标题分不出源，只写源没有信息量。
+      - `kind` 按源表映射成 `web` / `paper`：界面要能把"我的材料"与"外面抓的"
+        分开——两者可信度不同（见 `EXTERNAL_TRUST_RULES`）。
+      - `metadata.url`：原文地址，前端渲染成可点击链接。这是"引用能点回原文"的
+        唯一输入。
+      - `metadata.raw_chars`：截断前的长度。没有它，"这条本来就有 8000 字"与
+        "被砍掉了九成"长得一模一样。
+      - `status="parsed"`：正文已经在手上。`_verify_sources` 与
+        `source_refs._reference_problem` 都按这个值判"这份来源能不能当校验依据"，
+        少一个条件就是一类静默剔除。
+
+    `content_hash` **不填**：`library.ingest` 会按正文重算，这里填一个错的值只会
+    多一条 warning（见它的 docstring）。
+
+    `fetched_at` 与 `language` **不进** `Source`：`SourceMetadata` 里没有对应字段，
+    硬塞进 `tags` / `category` 会让过滤语义漂移（那两个字段的约定是"用户给的分类"）。
+    它们是抓取过程的描述——与 `library.load` 不还原页数、截断标记是同一条取舍。
+    """
+    text = external_knowledge.truncate_text(hit.text)
+    return Source(
+        kind=_EXTERNAL_KINDS.get(hit.source_name, SourceKind.web),
+        # 外部标题可能很长（arXiv 的标题有 200 字以上的），文件名跟着长会把
+        # `list_sources` 与日志都撑坏；200 字足够认出是哪一条。
+        filename=f"{hit.source_name}: {hit.title}"[:200],
+        text=text,
+        status="parsed",
+        metadata=SourceMetadata(
+            url=hit.url, raw_chars=max(hit.raw_chars, len(text)),
+            tags=[hit.source_name],
+        ),
+    )
+
+
+async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
+    """主题 → 外部检索 → 入库 → 本次可用的来源。
+
+    三件事必须同时成立，缺任何一件这条链接上去都是负资产：
+
+      1. **入库拿持久 id**。`Source.id` 默认是请求内的临时 uuid，而引用要能跨请求
+         点回原文——只有 `library.ingest` 给的持久 id 做得到（`library.load()` 是
+         界面上"点开一条引用"唯一的回查入口）。
+      2. **并进 `ctx.record_library_sources`**。收尾的 `_verify_sources(ctx)` 只看
+         `request.sources + ctx.library_sources`；不进这里的外部来源，其引用会在
+         `verify_source_refs(remove_invalid=True)` 那一步被判"来源不存在"并静默
+         剔除——检索成功、引用写出、最后消失，这是整条链上最隐蔽的一种失败。
+      3. **失败即空**。外部源全挂时返回空列表，调用方退回"只凭主题"的那条路，
+         并在 `content` 里说明。生成不能因为一次外网超时失败。
+
+    耗时与条数各记一行日志：这是用户点"生成"之后**多出来的**一次等待，混在总耗时
+    里就永远看不出"慢在哪"（与 `_retrieve_topic` 的同一条规矩）。
+    """
+    started = time.perf_counter()
+    query = (topic or "").strip()
+    try:
+        # 同步函数里最多两次 HTTP 往返（含 10 秒超时），直接在协程里调会把事件
+        # 循环按住——同进程里别人的流式响应会跟着卡（同 `_retrieve_topic`）。
+        hits = await asyncio.to_thread(
+            external_knowledge.search_external, query, limit=EXTERNAL_HIT_LIMIT)
+    except Exception as exc:  # noqa: BLE001 — 外部检索失败只降级，理由见 docstring
+        elapsed = time.perf_counter() - started
+        reason = _reason_text(exc)
+        logger.warning("外部检索失败（耗时 %.2fs）：%s", elapsed, reason)
+        return _ExternalFetch([], 0, elapsed, reason)
+
+    built: list[Source] = []
+    for hit in hits:
+        source = _external_source(hit)
+        try:
+            source_id = knowledge_library.ingest(source)
+        except Exception as exc:  # noqa: BLE001 — 单条入库失败不废整次检索
+            logger.warning("外部来源入库失败（%s / %s）：%s：%s",
+                           hit.source_name, hit.title[:40],
+                           type(exc).__name__, str(exc)[:160])
+            continue
+        built.append(source.model_copy(update={"id": source_id}))
+    if built:
+        ctx.record_library_sources(built)
+
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "外部检索：主题=%r 入库 %d 条（抓取 %d 条），耗时 %.2fs",
+        query[:50], len(built), len(hits), elapsed)
+    return _ExternalFetch(built, len(hits), elapsed)
+
+
+@dataclass(frozen=True)
 class _TopicEvidence:
     """`rag` 形态下生成前那一次主题检索的产物。
 
@@ -1929,6 +2080,21 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图。")
     ctx.extra_model_calls += 1
+    # 主题生成（请求没带任何材料）时先去外部知识源搜一次。默认关：关着时这整块
+    # 跳过，一次请求都不发、提示词与 `content` / `data` 与 `aeed033` 逐字节相同。
+    #
+    # 排在 `reserve_model_call` **之后**：额度已经占掉了，这时再去做一件"可能白等
+    # 20 秒"的事，至少要保证后面的模型调用还有额度——反过来就是白等一场之后才
+    # 被告知额度已用完。
+    #
+    # 拿到结果之后**不做任何特殊处理**：它们只是 `sources`，下面的 `if sources:`
+    # 分支、`_retrieve_topic`、`_citable_hits`、`verify_source_refs` 全都照旧跑。
+    # 这就是"外部结果一律转成 Source 并入库"的全部好处——引用校验、父块坐标、
+    # `library.load` 回查自动成立，没有第二条链要维护。
+    external: _ExternalFetch | None = None
+    if not sources and external_knowledge_enabled():
+        external = await _external_sources(args.topic, ctx)
+        sources = external.sources
     # `rag` 形态下这一次主题检索的产物；`full` 形态与无来源那条路恒为 None。
     topic_evidence: _TopicEvidence | None = None
     try:
@@ -1941,6 +2107,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         stream_kwargs = {}
         if ctx.emit is not None:
             stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
+        # 这批来源里混进了外部检索的正文时，多带一句"这是不可信数据"。
+        # 只在这种时候拼：给一条无关的警告会让模型对用户上传的材料也过敏。
+        external_rules = (
+            EXTERNAL_TRUST_RULES
+            if any(source.kind in (SourceKind.web, SourceKind.paper) for source in sources)
+            else ""
+        )
         if sources:
             # 两种形态的提示词不能混用（理由见 `RAG_SOURCE_PROMPT` 的注释）：
             # `rag` 下输入里没有正文，`full` 下的提示词却在教模型怎么读 sources 数组。
@@ -1958,7 +2131,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 ctx.record_evidence(topic_evidence.spans)
                 if topic_evidence.text:
                     system = (RAG_SOURCE_PROMPT + thinking + RAG_THINKING_GUARD
-                              + GENERATE_EVIDENCE_RULES)
+                              + GENERATE_EVIDENCE_RULES + external_rules)
                     raw = await chat_async(
                         system,
                         _source_prompt_input(
@@ -1986,7 +2159,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                     )
             else:
                 # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
-                system = SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
+                system = (SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
+                          + external_rules)
                 raw = await chat_async(
                     system, _source_prompt_input(sources, system=system),
                     max_tokens=_max_tokens(ctx), **stream_kwargs,
@@ -2001,6 +2175,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
 
     # 退化成"只凭主题"的那一版：请求带了材料，但这次一条依据都没拿到。
     unsourced = bool(sources) and topic_evidence is not None and not topic_evidence.text
+    # 走了外部检索、但空手而归（开关打开 + 请求不带材料）。它走的也是"纯主题"
+    # 那条路，但与"用户本来就想要一张纯主题的图"不是一回事：必须说出来。
+    external_empty = external is not None and not external.sources
 
     try:
         # `evidence` 只在这条链、且只在 `rag` 形态下交出去。
@@ -2086,6 +2263,20 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             ),
         ))
 
+    # 外部检索走过、但一条都没拿到。两种原因分开说（与 `unsourced` 同一条规矩）：
+    # "代理没开/源挂了"换个时间重试可能就有了，"网上确实没有"重试也没用。
+    external_note = None
+    if external_empty:
+        external_note = (f"外部检索出错（{external.failure}）" if external.failure
+                         else "没有搜到外部资料")
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EXTERNAL",
+            message=(
+                f"{external_note}：这张图只基于主题「{args.topic}」生成，"
+                "没有外部资料依据，节点上也不会有指向原文的引用"
+            ),
+        ))
+
     ctx.candidate = content
     ctx.revision += 1
     count = _count_nodes(content.root)
@@ -2096,6 +2287,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         summary += (
             f"{reason}，这张图只基于主题生成，不含任何材料依据；"
             "要一张有依据的图，请换一个更贴近材料内容的说法后重试。"
+        )
+    if external_note:
+        # 外部检索是**用户看得见的一次等待**（可能到 20 秒），它空手而归时必须
+        # 在用户读到的那句话里说清，否则"等了半分钟还是没有引用"无从解释。
+        summary += (
+            f"{external_note}，这张图只基于主题「{args.topic}」生成，"
+            "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
         )
     data: dict[str, Any] = {
         "root_id": content.root.id,
@@ -2111,6 +2309,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "top_k": GENERATE_RETRIEVAL_TOP_K,
             "seconds": round(topic_evidence.elapsed, 3),
             "failed": topic_evidence.failure,
+        }
+    if external is not None:
+        # 只在外部队列真的走过时才有这个键：开关关着时 `data` 的键集与 `aeed033`
+        # 逐字节相同（回归用例比的是键集，不只是值）。
+        data["external"] = {
+            "hits": external.hits,
+            "sources": len(external.sources),
+            "seconds": round(external.elapsed, 3),
+            "failed": external.failure,
         }
     return ToolResult(ok=True, content=summary, data=data)
 

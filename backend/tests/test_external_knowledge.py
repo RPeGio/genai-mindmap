@@ -1,0 +1,675 @@
+"""主题生成的外部知识检索：抓取 → 清洗 → 转 `Source` → 走既有 RAG 链。
+
+八组断言对着这次改动的八条要求（第 8 组在前端 `tests/external-ref-link.spec.ts`）：
+
+  1. 解析：固定 JSON / XML 样本 → `ExternalHit` 字段正确（不联网）。
+  2. 清洗：HTML/XML 标签剥掉、维基小节转 Markdown、超长正文截断且原始长度可查。
+  3. 失败：超时 / 500 / 非法 JSON / 脏 XML → 返回空，**不抛**。
+  4. 开关关：与 `aeed033` 的旧模块**逐字节**相同（加载旧 `tools.py` 对比
+     `(ok, content, data)`，并且一次外部请求都不发）。
+  5. 开关开 + 有结果：user 消息里有外部正文，`source_refs` 指向新入库的来源，
+     引用**校验后还在**（断言"还在"，"没抛异常"证明不了任何事）。
+  6. 开关开 + 全失败：退回纯主题生成，`content` 里说明。
+  7. 预算：请求次数不超上限、截止时间到了不再发请求。
+  8. `Source` 转换：文件名 / kind / metadata.url / raw_chars，以及 `javascript:`
+     这类 scheme 在契约层折成 None。
+
+全部离线：`tests/conftest.py` 的 `no_real_http` 会把真到传输层的请求变成断言失败；
+本文件用 `httpx.MockTransport` 造响应（它在传输层之前就返回，不触发那道闸），
+既验证了 URL / 参数 / 次数，又一条真请求都不发。
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib.util
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from app.agent import tools as agent_tools
+from app.agent.contracts import AgentRunRequest, RunBudget, RunContext
+from app.contracts.source import Source, SourceKind, SourceMetadata, safe_http_url
+from app.knowledge import external
+from app.knowledge import library
+
+# 写死基线，不跟随 HEAD：这一轮之后 `tools.py` 又被改过，拿 HEAD 对比等于自己跟
+# 自己比（与 `tests/test_library_wiring.py` 同一条规矩）。rev 与内容各钉一道——
+# 只有 rev 时改常量就能换掉基线，只有 hash 时看不出这份基线是哪一版。
+BASELINE_REV = "aeed033"
+BASELINE_SHA256 = "546fde932e7d331c70dec0bc221b7041a9d46409216bcc17b023d0f04d9a239e"
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# 真实响应的形状（2026-11 实测所得，正文截短）：`formatversion=2` 的 `pages` 是
+# 列表，条目里带 `fullurl` 与 `extract`。
+WIKI_JSON: dict[str, Any] = {
+    "batchcomplete": True,
+    "query": {
+        "pages": [{
+            "pageid": 749663,
+            "ns": 0,
+            "title": "碳中和",
+            "extract": (
+                "碳中和（英語：carbon neutrality）是指在一定时间内抵消自身产生的"
+                "二氧化碳排放量，达到相对“零排放”。\n\n\n"
+                "== 原理 ==\n要達成碳中和一般有两种做法：碳補償與低碳技術。\n\n"
+                "=== 碳交易 ===\n透過碳交易把減排成本轉移給其他地區。\n"
+            ),
+            "fullurl": "https://zh.wikipedia.org/wiki/%E7%A2%B3%E4%B8%AD%E5%92%8C",
+        }],
+    },
+}
+
+# 中文标题在维基上不命中时的搜索响应形状（`list=search`，`formatversion=2`）。
+WIKI_SEARCH_JSON: dict[str, Any] = {
+    "batchcomplete": True,
+    "query": {"search": [{"title": "碳中和"}, {"title": "碳交易"}]},
+}
+
+WIKI_MISS_JSON: dict[str, Any] = {
+    "batchcomplete": True,
+    "query": {"pages": [{"ns": 0, "title": "碳中和技术路径", "missing": True}]},
+}
+
+# arXiv 的 Atom 形状：`<id>` 是 abs 页（原文地址），摘要里带 XML 转义。
+ARXIV_XML = """<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2310.01234v1</id>
+    <title>Carbon Neutrality: Policy &amp; Technology Pathways</title>
+    <summary>We study &lt;b&gt;carbon&lt;/b&gt; neutrality targets.
+A second line of the abstract.</summary>
+  </entry>
+</feed>"""
+
+ARXIV_EMPTY_XML = """<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>ArXiv Query</title>
+</feed>"""
+
+
+# ---------------------------------------------------------------- 夹具
+
+
+def _client_factory(handler):
+    """把 `external._client` 换成一个走 `MockTransport` 的工厂。
+
+    `MockTransport` 在传输层**之前**返回响应，所以既不联网、也不触发
+    `conftest.no_real_http`——这比"把 `httpx.Client` 整个换掉"更接近生产路径：
+    URL 拼接、参数编码、状态码判断、JSON 解析全都真的跑了一遍。
+    """
+    def factory() -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), timeout=10.0)
+    return factory
+
+
+def _router(routes: dict[str, Any], calls: list[httpx.Request] | None = None):
+    """按 host 分派的 handler。`routes` 的值可以是 dict（JSON）、str（原始文本）、
+    `Exception`（那就抛出去）或 callable(request) → 响应。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(request)
+        target = "arxiv" if "arxiv.org" in request.url.host else "wikipedia"
+        spec = routes.get(target)
+        if isinstance(spec, Exception):
+            raise spec
+        if callable(spec):
+            return spec(request)
+        if isinstance(spec, str):
+            return httpx.Response(200, text=spec)
+        return httpx.Response(200, json=spec)
+    return handler
+
+
+def _request(sources: list[Source] | None = None) -> AgentRunRequest:
+    return AgentRunRequest(
+        goal="碳中和", intent="create", thinking_model="default",
+        sources=sources or [],
+        budget=RunBudget(max_model_calls=10, max_tool_calls=8, max_seconds=60.0,
+                         max_output_tokens=4096, max_repairs=1),
+    )
+
+
+def _ctx(sources: list[Source] | None = None) -> RunContext:
+    payload = sources or []
+    return RunContext(
+        request=_request(payload),
+        sources_by_id={source.id: source for source in payload},
+    )
+
+
+def _tree(refs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """三条一级分支（`MIN_BRANCHES=3` 的下限），第一条带引用。"""
+    return {
+        "title": "碳中和",
+        "root": {"id": "root", "label": "碳中和", "children": [
+            {"id": "a", "label": "政策", "children": [], "source_refs": refs or []},
+            {"id": "b", "label": "技术路径", "children": []},
+            {"id": "c", "label": "企业案例", "children": []},
+        ]},
+    }
+
+
+def _generate(ctx: RunContext, topic: str = "碳中和", *,
+              fake: Any = None) -> tuple[Any, list[tuple[str, str]]]:
+    """跑一次 `mindmap_generate`，同时把每次 `chat_async` 的 (system, user) 留下来。
+
+    `fake` 可以是固定的树，也可以是一个 "看 (system, user) 再决定返回什么" 的函数
+    —— 第五组要按 user 消息里的 evidence 造引用，只有后者做得到。
+    """
+    calls: list[tuple[str, str]] = []
+
+    async def chat(system: str, user: str, **kwargs: Any) -> Any:
+        calls.append((system, user))
+        return fake(system, user) if callable(fake) else fake
+
+    with patch.object(agent_tools, "chat_async", chat):
+        result = asyncio.run(agent_tools.build_registry("create").execute(
+            agent_tools.ToolCall(call_id="c-gen", name="mindmap_generate",
+                                 arguments={"topic": topic}), ctx))
+    return result, calls
+
+
+def _load_baseline_tools(tmp_path: Path):
+    """把 `BASELINE_REV` 的 `agent/tools.py` 载成独立模块，并核对 sha256。"""
+    try:
+        raw = subprocess.run(
+            ["git", "show", f"{BASELINE_REV}:backend/app/agent/tools.py"],
+            cwd=REPO_ROOT, capture_output=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:  # pragma: no cover
+        pytest.skip(f"读不到 {BASELINE_REV} 的 tools.py：{exc}")
+
+    assert hashlib.sha256(raw).hexdigest() == BASELINE_SHA256
+
+    path = tmp_path / f"tools_{BASELINE_REV}.py"
+    path.write_bytes(raw)
+    spec = importlib.util.spec_from_file_location(f"tools_baseline_{BASELINE_REV}", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------- 1 解析
+
+
+def test_wikipedia_json_becomes_external_hit(monkeypatch):
+    """固定 JSON → `ExternalHit` 的每个字段都对，且小节变成了 Markdown 标题。
+
+    断言的是**字段值**，不是"没抛异常"：外呼链路上最容易错的就是"parsed = True
+    但 title 是 None"这种半成功，它会在清单里显示成一条没有名字的材料。
+    """
+    calls: list[httpx.Request] = []
+    monkeypatch.setattr(
+        external, "_client", _client_factory(_router({"wikipedia": WIKI_JSON}, calls)))
+
+    hits = external.search_external("碳中和")
+
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit.source_name == "wikipedia"
+    assert hit.title == "碳中和"
+    assert hit.language == "zh"
+    assert hit.url == "https://zh.wikipedia.org/wiki/%E7%A2%B3%E4%B8%AD%E5%92%8C"
+    assert hit.fetched_at.endswith("Z") and len(hit.fetched_at) == 20
+    # 维基的小节标记转成了 Markdown —— 切块器与材料目录只认 `#{1,6} `。
+    assert "## 原理" in hit.text and "== 原理 ==" not in hit.text
+    assert "### 碳交易" in hit.text
+    assert hit.text.startswith("碳中和（英語：carbon neutrality）")
+    assert hit.raw_chars == len(hit.text)     # 未超限，原始长度就是正文长度
+    # 一次精确标题请求就够：`titles=` 命中时不该再去搜一遍。
+    wiki_calls = [c for c in calls if "wikipedia.org" in c.url.host]
+    assert [request.url.params.get("titles") for request in wiki_calls] == ["碳中和"]
+
+
+def test_arxiv_atom_becomes_external_hit(monkeypatch):
+    """固定 Atom → `ExternalHit`；XML 转义反转义、内嵌标签剥掉、http 换 https。"""
+    monkeypatch.setattr(
+        external, "_client", _client_factory(_router({"arxiv": ARXIV_XML})))
+
+    hits = external.search_external("carbon neutrality")
+
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit.source_name == "arxiv"
+    assert hit.language == "en"
+    assert hit.title == "Carbon Neutrality: Policy & Technology Pathways"
+    assert hit.url == "https://arxiv.org/abs/2310.01234v1"
+    assert "carbon neutrality targets" in hit.text
+    assert "<b>" not in hit.text and "&lt;" not in hit.text
+    # 多行摘要压成一段（换行保留但行内空白归一）
+    assert "A second line of the abstract." in hit.text
+
+
+def test_wikipedia_falls_back_to_search_when_title_misses(monkeypatch):
+    """`titles=` 不命中时走条目检索，再逐条抓正文。
+
+    没有这一步，"碳中和技术路径"这种输入在维基上一条都拿不到——而它恰恰是
+    用户最常输入的形态（精确标题只对"碳中和"这种单名词生效）。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("list") == "search":
+            return httpx.Response(200, json=WIKI_SEARCH_JSON)
+        titles = request.url.params.get("titles")
+        if titles == "碳中和":
+            return httpx.Response(200, json=WIKI_JSON)
+        # 第二条：正文为空 → 不该产出命中（`_wiki_pages` 会滤掉）
+        return httpx.Response(200, json={
+            "query": {"pages": [{"ns": 0, "title": titles, "extract": "  "}]}})
+
+    monkeypatch.setattr(
+        external, "_client", _client_factory(_router({"wikipedia": handler})))
+
+    hits = external.search_external("碳中和技术路径")
+
+    assert [hit.title for hit in hits] == ["碳中和"]
+
+
+# ---------------------------------------------------------------- 2 清洗与截断
+
+
+def test_clean_text_strips_tags_and_entities():
+    """标签与实体：`<script>` 整段删掉，`&lt;` 反转义后当作标签再删。"""
+    dirty = (
+        "<div>前<script>alert(1)</script>后</div>\n\n\n\n"
+        "&lt;img src=x onerror=alert(1)&gt;正文 &amp; 更多"
+    )
+    cleaned = external.clean_text(dirty)
+
+    assert "alert(1)" not in cleaned        # script 内容整段不见
+    assert "<div>" not in cleaned and "</div>" not in cleaned
+    assert "前" in cleaned and "后" in cleaned
+    assert "&amp;" not in cleaned and "&" in cleaned
+    # 空行压到最多两行（切块按空行分段，多余空行只是噪声）
+    assert "\n\n\n" not in cleaned
+
+
+def test_truncate_records_original_length(monkeypatch):
+    """超长正文截到 8000 字，`raw_chars` 仍是原始长度。
+
+    这两个数字分开才有意义：只留截断后的长度时，"这条本来就这么长"与"被砍掉了
+    九成"在界面上长得一模一样。
+    """
+    long_extract = "碳中和" * 4000          # 12000 字
+    payload = {
+        "query": {"pages": [{"ns": 0, "title": "碳中和", "extract": long_extract,
+                             "fullurl": "https://zh.wikipedia.org/wiki/x"}]}}
+    monkeypatch.setattr(
+        external, "_client", _client_factory(_router({"wikipedia": payload})))
+
+    hits = external.search_external("碳中和")
+
+    assert len(hits[0].text) == external.TEXT_MAX_CHARS
+    assert hits[0].text.endswith("…")
+    assert hits[0].raw_chars == len(long_extract)
+
+
+def test_markdown_heading_conversion_keeps_depth():
+    """`==` / `===` 的层级原样保留（2 → 2 级、3 → 3 级）。"""
+    text = "== 一级 ==\n正文\n=== 二级 ===\n正文"
+    assert external._wiki_markdown(text) == "## 一级\n正文\n### 二级\n正文"
+
+
+# ---------------------------------------------------------------- 3 失败即空
+
+
+@pytest.mark.parametrize("failure", [
+    httpx.ReadTimeout("timed out"),
+    httpx.ConnectError("proxy refused"),
+    httpx.HTTPError("boom"),
+])
+def test_network_failure_returns_empty(monkeypatch, failure):
+    """超时 / 连不上 / 传输错误 → 空列表，不抛。外部源挂了不能影响生成。"""
+    monkeypatch.setattr(
+        external, "_client", _client_factory(_router({"wikipedia": failure,
+                                                      "arxiv": failure})))
+    assert external.search_external("碳中和") == []
+
+
+def test_http_500_returns_empty(monkeypatch):
+    monkeypatch.setattr(
+        external, "_client",
+        _client_factory(lambda request: httpx.Response(500, text="upstream down")))
+
+    assert external.search_external("碳中和") == []
+
+
+def test_invalid_json_returns_empty(monkeypatch):
+    """非法 JSON 走 `ValueError` 那条路（`Response.json()` 抛的就是它）。"""
+    monkeypatch.setattr(
+        external, "_client", _client_factory(_router({"wikipedia": "{not json",
+                                                      "arxiv": ARXIV_EMPTY_XML})))
+
+    assert external.search_external("碳中和") == []
+
+
+def test_broken_xml_returns_empty(monkeypatch):
+    monkeypatch.setattr(
+        external, "_client",
+        _client_factory(_router({"wikipedia": WIKI_JSON,
+                                 "arxiv": "<feed><entry>unclosed"})))
+
+    hits = external.search_external("碳中和")
+
+    # arXiv 挂了不影响维基那条：一个源出问题不该把另一个源的成果一起扔掉
+    assert [hit.source_name for hit in hits] == ["wikipedia"]
+
+
+def test_empty_query_makes_no_request(monkeypatch):
+    calls: list[httpx.Request] = []
+    monkeypatch.setattr(
+        external, "_client", _client_factory(_router({}, calls)))
+
+    assert external.search_external("   ") == []
+    assert external.search_external("碳中和", limit=0) == []
+    assert calls == []
+
+
+def test_oversized_response_is_rejected(monkeypatch):
+    """超过 `MAX_RESPONSE_BYTES` 的响应体不解析（外部源不是可信的一端）。"""
+    huge = "x" * (external.MAX_RESPONSE_BYTES + 1)
+    monkeypatch.setattr(
+        external, "_client",
+        _client_factory(lambda request: httpx.Response(200, text=huge)))
+
+    assert external.search_external("碳中和") == []
+
+
+# ---------------------------------------------------------------- 4 开关关＝旧模块
+
+
+def test_switch_off_matches_baseline(tmp_path, monkeypatch):
+    """`MINDMAP_EXTERNAL_KNOWLEDGE` 关着时，`_generate` 与 `aeed033` 逐字节相同。
+
+    比的是 `(ok, content, data)`——`data` 的键集也要比，因为"逐字节"包含它：
+    多一个 `external` 键就是一次契约变化，而它在界面上表现为"同一个请求、两种
+    遥测形状"，排查时最难对上。
+    """
+    baseline = _load_baseline_tools(tmp_path)
+    monkeypatch.delenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, raising=False)
+
+    forbidden: list[str] = []
+    monkeypatch.setattr(
+        agent_tools.external_knowledge, "search_external",
+        lambda *args, **kwargs: forbidden.append("called") or [])
+
+    tree = _tree()
+    current, current_calls = _generate(_ctx(), fake=tree)
+
+    async def old_chat(system: str, user: str, **kwargs: Any) -> Any:
+        return tree
+
+    with patch.object(baseline, "chat_async", old_chat):
+        old = asyncio.run(baseline._generate(
+            baseline.GenerateArgs(topic="碳中和"), _ctx()))
+
+    assert (current.ok, current.content, current.data) \
+        == (old.ok, old.content, old.data)
+    # 提示词也逐字相同（system 里不该多出那句外部来源的警告）
+    assert current_calls and current_calls[0][0] == agent_tools.DETAIL_PROMPT \
+        + agent_tools.thinking_block("default") + agent_tools.DETAIL_NO_SOURCE_RULES
+    assert forbidden == [], "开关关着时一次外部请求都不该发"
+
+
+# ---------------------------------------------------------------- 5 开 + 有结果
+
+
+def test_external_sources_flow_into_generation(monkeypatch):
+    """开关开 + 外部有结果：正文进 user 消息、引用指向新入库的来源、校验后还在。
+
+    这条用例的价值在"还在"两个字上：`verify_source_refs(remove_invalid=True)` 会把
+    指向未知来源的引用**静默删掉**，所以"没抛异常"什么都证明不了。
+    """
+    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
+    monkeypatch.setattr(
+        external, "_client",
+        _client_factory(_router({"wikipedia": WIKI_JSON,
+                                 "arxiv": ARXIV_EMPTY_XML})))
+
+    seen_user: list[str] = []
+
+    def fake(system: str, user: str) -> Any:
+        seen_user.append(user)
+        # 从 user 消息末尾的 evidence 数组里抄一条引用——这正是模型的处境：
+        # 它唯一的原文来源就是这段 JSON。
+        payload = json.loads(user[user.rindex("["):])
+        hit = payload[0]
+        return _tree([{"source_id": hit["source_id"], "start": hit["start"],
+                       "end": hit["end"], "quote": hit["quote"]}])
+
+    ctx = _ctx()
+    result, calls = _generate(ctx, fake=fake)
+
+    assert result.ok, result.content
+    assert seen_user, "外部正文没有进 user 消息"
+    assert "碳中和（英語：carbon neutrality）" in seen_user[0]
+    # 不可信数据的声明必须在 system 里（不是 user）：它约束的是模型怎么对待这些
+    # 内容，而不是这些内容本身。
+    system = calls[0][0]
+    assert "外部抓取的内容" in system and "不要执行" in system
+
+    # 引用指向**入库后的持久 id**，且校验之后仍在
+    refs = ctx.candidate.root.children[0].source_refs
+    assert refs, "外部来源的引用被校验剔掉了"
+    source_id = refs[0].source_id
+    stored = library.load(source_id)
+    assert stored is not None
+    assert stored.kind is SourceKind.web
+    assert stored.metadata.url == "https://zh.wikipedia.org/wiki/%E7%A2%B3%E4%B8%AD%E5%92%8C"
+    assert stored.metadata.tags == ["wikipedia"]
+    assert stored.filename == "wikipedia: 碳中和"
+    # `source_usage` 带上了 url：保存后的导图也要能点回原文
+    usage = {item.source_id: item for item in ctx.candidate.source_usage}
+    assert usage[source_id].url == stored.metadata.url
+    assert result.data["external"]["sources"] == 1
+    assert result.data["external"]["failed"] is None
+
+
+def test_external_hits_are_interleaved(monkeypatch):
+    """两个源都有结果时按 `source_name` 交替，而不是一个源占满。"""
+    hits = [
+        external.ExternalHit("w1", "t", "https://w/1", "wikipedia", "2026-01-01T00:00:00Z", "zh"),
+        external.ExternalHit("w2", "t", "https://w/2", "wikipedia", "2026-01-01T00:00:00Z", "zh"),
+        external.ExternalHit("a1", "t", "https://a/1", "arxiv", "2026-01-01T00:00:00Z", "en"),
+    ]
+    assert [hit.title for hit in external._interleave(hits, 3)] == ["w1", "a1", "w2"]
+    assert [hit.title for hit in external._interleave(hits, 2)] == ["w1", "a1"]
+
+
+def test_library_reuse_does_not_duplicate(monkeypatch):
+    """同一份外部正文再次命中 → 复用同一条库记录（`content_hash` 去重）。"""
+    hit = external.ExternalHit(
+        title="碳中和", text="碳中和正文", url="https://zh.wikipedia.org/wiki/x",
+        source_name="wikipedia", fetched_at="2026-01-01T00:00:00Z",
+        language="zh", raw_chars=5)
+    source = agent_tools._external_source(hit)
+
+    first = library.ingest(source)
+    second = library.ingest(source)
+
+    assert first == second
+    assert len(library.list_sources(limit=10)) == 1
+
+
+def test_request_sources_skip_external_entirely(monkeypatch):
+    """请求自带材料时**一条外部请求都不发**：主题检索只在"只有一个主题"时发生。
+
+    这条不是优化而是语义：用户上传了材料，"这次该依据什么"已经有了答案，
+    再去网上抓一份混进来，会让引用指向他自己没给过的来源。
+    """
+    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
+    forbidden: list[Any] = []
+    monkeypatch.setattr(
+        agent_tools.external_knowledge, "search_external",
+        lambda *args, **kwargs: forbidden.append("called") or [])
+
+    material = Source(kind=SourceKind.text, status="parsed",
+                      text="# 制度\n\n## 预算审批\n\n预算审批由部门负责人签核，超过额度上报总经理。")
+    ctx = _ctx([material])
+    result, _ = _generate(ctx, fake=_tree())
+
+    assert result.ok, result.content
+    assert forbidden == []
+    assert "external" not in result.data
+
+
+# ---------------------------------------------------------------- 6 开 + 全失败
+
+
+def test_external_empty_falls_back_to_topic_only(monkeypatch):
+    """源返回空 → 纯主题生成，`content` 里必须说明。"""
+    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
+    monkeypatch.setattr(
+        external, "_client",
+        _client_factory(_router({"wikipedia": WIKI_MISS_JSON,
+                                 "arxiv": ARXIV_EMPTY_XML})))
+
+    ctx = _ctx()
+    result, calls = _generate(ctx, topic="量子色动力学的渐近自由", fake=_tree())
+
+    assert result.ok, result.content
+    assert "没有搜到外部资料" in result.content
+    assert "只基于主题" in result.content
+    # 纯主题那条提示词：不带外部来源的警告（这次没有外部内容）
+    assert "外部抓取的内容" not in calls[0][0]
+    assert {item["code"] for item in result.data["diagnostics"]} >= {
+        "GENERATION_WITHOUT_EXTERNAL"}
+    assert result.data["external"] == {
+        "hits": 0, "sources": 0,
+        "seconds": result.data["external"]["seconds"], "failed": None}
+    assert library.list_sources(limit=10) == []
+
+
+def test_external_error_falls_back_with_reason(monkeypatch):
+    """外部检索抛错 → 同样退回纯主题，但文案要说是**出错**而不是"没有"。"""
+    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
+
+    def boom(query: str, **kwargs: Any) -> list[Any]:
+        raise httpx.ConnectError("proxy refused")
+
+    monkeypatch.setattr(agent_tools.external_knowledge, "search_external", boom)
+
+    ctx = _ctx()
+    result, _ = _generate(ctx, fake=_tree())
+
+    assert result.ok, result.content
+    assert "外部检索出错" in result.content and "ConnectError" in result.content
+    assert result.data["external"]["failed"].startswith("ConnectError")
+
+
+# ---------------------------------------------------------------- 7 预算
+
+
+def test_budget_caps_requests_and_time():
+    """预算：请求次数到顶就 `None`，截止时间到了也 `None`。"""
+    budget = external._Budget(limit=2, seconds=60.0)
+    assert budget.take() is not None
+    assert budget.take() is not None
+    assert budget.take() is None
+    assert budget.used == 2
+
+    expired = external._Budget(limit=9, seconds=0.0)
+    assert expired.take() is None
+
+
+def test_search_external_never_exceeds_request_limit(monkeypatch):
+    """真实路径的请求次数不超上限：维基精确 miss + 搜索 + 逐条，arXiv 一次。"""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if "arxiv.org" in request.url.host:
+            return httpx.Response(200, text=ARXIV_EMPTY_XML)
+        if request.url.params.get("list") == "search":
+            # 搜索返回一堆候选，逼着它逐条抓——这是请求次数最容易失控的地步
+            return httpx.Response(200, json={
+                "query": {"search": [{"title": f"候选{i}"} for i in range(8)]}})
+        return httpx.Response(200, json=WIKI_MISS_JSON)
+
+    monkeypatch.setattr(external, "_client", _client_factory(handler))
+
+    external.search_external("碳中和", limit=3)
+
+    assert len(calls) <= external.REQUEST_LIMIT, [str(c.url) for c in calls]
+    # 上界也是硬的：1 精确 + 1 搜索 + 3 逐条 + 1 arXiv
+    assert len(calls) <= 6
+
+
+def test_deadline_stops_slow_source(monkeypatch):
+    """慢源不拖垮整次检索：一个源卡住时，另一个源的结果照常返回。"""
+    monkeypatch.setattr(external, "DEADLINE_SECONDS", 1.0)
+    monkeypatch.setattr(external, "REQUEST_TIMEOUT", 0.2)
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        if "arxiv.org" in request.url.host:
+            time.sleep(0.5)
+            raise httpx.ReadTimeout("timed out")
+        return httpx.Response(200, json=WIKI_JSON)
+
+    monkeypatch.setattr(external, "_client", _client_factory(_router({"wikipedia": slow})))
+
+    hits = external.search_external("碳中和")
+
+    assert [hit.source_name for hit in hits] == ["wikipedia"]
+
+
+# ---------------------------------------------------------------- 8 Source 转换
+
+
+def test_external_source_contract_fields():
+    """转换后的 `Source` 每个字段都对——这是"外部内容进入契约"的唯一入口。"""
+    hit = external.ExternalHit(
+        title="Carbon Neutrality", text="正文", url="https://arxiv.org/abs/2310.01234v1",
+        source_name="arxiv", fetched_at="2026-01-01T00:00:00Z", language="en",
+        raw_chars=9999)
+    source = agent_tools._external_source(hit)
+
+    assert source.kind is SourceKind.paper
+    assert source.filename == "arxiv: Carbon Neutrality"
+    assert source.text == "正文"
+    assert source.status == "parsed"      # 少这一条就是一类静默剔除
+    assert source.metadata.url == "https://arxiv.org/abs/2310.01234v1"
+    assert source.metadata.raw_chars == 9999
+    assert source.metadata.tags == ["arxiv"]
+    assert source.content_hash is None    # 由 `library.ingest` 按正文重算
+
+
+def test_unknown_source_name_defaults_to_web():
+    hit = external.ExternalHit(
+        title="某条目", text="正文", url="https://example.com/x",
+        source_name="baike", fetched_at="2026-01-01T00:00:00Z", language="zh",
+        raw_chars=2)
+    assert agent_tools._external_source(hit).kind is SourceKind.web
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("https://arxiv.org/abs/2310.01234v1", "https://arxiv.org/abs/2310.01234v1"),
+    ("http://example.com/a", "http://example.com/a"),
+    ("  https://example.com/b  ", "https://example.com/b"),
+    ("javascript:alert(1)", None),
+    ("data:text/html,<script>alert(1)</script>", None),
+    ("file:///etc/passwd", None),
+    ("example.com", None),
+    ("", None),
+    (None, None),
+])
+def test_safe_http_url_whitelist(value, expected):
+    """只有 http/https 能进 `metadata.url`：前端会把它塞进 `<a href>`。"""
+    assert safe_http_url(value) == expected
+
+
+def test_metadata_rejects_javascript_url():
+    """契约层的兜底：`javascript:` 进不来（前端那一侧就不用再判一次）。"""
+    metadata = SourceMetadata(url="javascript:alert(1)")
+    assert metadata.url is None
+    with pytest.raises(Exception):
+        SourceMetadata(raw_chars=-1)

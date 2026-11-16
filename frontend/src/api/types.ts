@@ -201,14 +201,28 @@ export interface MapRecord {
 
 // ---- 来源（文档解析）----
 
-/** 来源模态，镜像后端 SourceKind。 */
-export type SourceKind = 'text' | 'markdown' | 'document' | 'image' | 'audio';
+/**
+ * 来源模态，镜像后端 SourceKind。
+ *
+ * `web` / `paper` 是**外部检索**抓回来的（维基百科条目、arXiv 论文），不是用户
+ * 上传的材料。分开不是为了好看：两者的可信度不同，界面上要能区分"我的材料"与
+ * "外面抓的资料"（引用只证明这句话出自那个来源，不证明来源本身权威）。
+ */
+export type SourceKind = 'text' | 'markdown' | 'document' | 'image' | 'audio' | 'web' | 'paper';
 
 export interface SourceUsage {
   source_id: string;
   kind: SourceKind;
   filename: string | null;
   char_count: number;
+  /**
+   * 原文地址（外部检索的来源才有）。
+   *
+   * 放在摘要里而不是只放在 `Source.metadata`：保存的导图**不带** `Source`，
+   * 重新打开时手里只有这份摘要——只把它留在 `Source` 上，等于"这一轮能看到链接，
+   * 下次打开就没了"。
+   */
+  url?: string | null;
 }
 
 /** 来源定位，供节点溯源。 */
@@ -279,6 +293,13 @@ export interface SourceMetadata {
   modified_at?: string | null;
   category?: string | null;
   tags?: string[];
+  /**
+   * 原文地址（外部检索专用）。后端只放行 http/https——`javascript:` 之类的 scheme
+   * 在这里是可执行的，所以校验在契约侧就做了，前端可以放心塞进 `<a href>`。
+   */
+  url?: string | null;
+  /** 抓取时的原始字符数（外部检索专用）：正文按 8000 字入库截断，这个数是截断前的。 */
+  raw_chars?: number | null;
 }
 
 /** 音频里的一句话及其在原始录音中的位置。 */

@@ -30,6 +30,14 @@ export interface ResolvedRef {
   where: string;
   /** 来源显示名，如"文档 · 线代第一章.pdf"。 */
   name: string;
+  /**
+   * 原文地址：非空时界面把它渲染成可点开的链接。
+   *
+   * 外部检索回来的来源（维基条目、arXiv 论文）才有这个值。没有它的引用仍然只能
+   * 看摘录——"这句话出自哪篇论文"必须能自己核对，否则"自动填充或验证节点内容"
+   * 只闭环了一半。
+   */
+  url: string | null;
 }
 
 /** UTF-16 下标 → 码点下标。 */
@@ -109,13 +117,54 @@ export function windowOf(
   };
 }
 
-/** 来源显示名：文件名优先，没有就用 kind 的中文名加序号。 */
-export function refName(ref: SourceRef | string, usage: SourceUsage[]): string {
+/**
+ * 来源显示名：文件名优先，没有就用 kind 的中文名加序号。
+ *
+ * 三级退让，顺序有理由：
+ *   1. `source_usage`——导图自己声明的来源清单，保存后重开也还在；
+ *   2. 本次会话里那份 `Source`——外部检索刚抓回来的来源可能还没进 `source_usage`
+ *      （比如生成失败但引用已经在树上），这时文件名比 `来源 s1a2b3c` 有用得多；
+ *   3. 只有 id 时退回 `来源 <前 8 位>`：不给一个看起来像名字的假名字。
+ */
+export function refName(
+  ref: SourceRef | string,
+  usage: SourceUsage[],
+  source: Source | null = null,
+): string {
   const sourceId = typeof ref === 'string' ? ref : ref.source_id;
   const found = usage.find(item => item.source_id === sourceId);
-  if (!found) return `来源 ${sourceId.slice(0, 8)}`;
-  const label = SOURCE_LABELS[found.kind] ?? '来源';
-  return found.filename ? `${label} · ${found.filename}` : label;
+  if (found) {
+    const label = SOURCE_LABELS[found.kind] ?? '来源';
+    return found.filename ? `${label} · ${found.filename}` : label;
+  }
+  if (source) {
+    const label = SOURCE_LABELS[source.kind] ?? '来源';
+    return source.filename ? `${label} · ${source.filename}` : label;
+  }
+  return `来源 ${sourceId.slice(0, 8)}`;
+}
+
+/**
+ * 引用能不能点回原文。
+ *
+ * 两个来源依次退让：本次会话里那份来源的 `metadata.url`（最完整），然后是摘要
+ * （`source_usage`）里的 `url`——保存过的旧图不带 `Source`，只把它留在 `metadata`
+ * 上等于"这次能点、下次打开就没了"。
+ *
+ * 再判一次 http/https：后端契约已经过滤过一遍，但手写或导入的导图不经过那一道，
+ * 而这个值会被直接塞进 `<a href>`。
+ */
+export function refUrl(
+  ref: SourceRef,
+  source: Source | null,
+  usage: SourceUsage[],
+): string | null {
+  const fromSource = source?.metadata?.url ?? null;
+  const candidate = fromSource
+    ?? usage.find(item => item.source_id === ref.source_id)?.url
+    ?? null;
+  if (!candidate) return null;
+  return /^https?:\/\//i.test(candidate) ? candidate : null;
 }
 
 /** 把一条引用解析成"能直接画"的形状。 */
@@ -137,7 +186,8 @@ export function resolveRef(ref: SourceRef, sources: Source[], usage: SourceUsage
     start: located?.start ?? null,
     end: located?.end ?? null,
     where: refWhere(ref),
-    name: refName(ref, usage),
+    name: refName(ref, usage, source),
+    url: refUrl(ref, source, usage),
   };
 }
 

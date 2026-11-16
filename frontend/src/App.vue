@@ -502,18 +502,42 @@ async function copyBody() {
             <h3 class="text-xs font-medium text-slate-500">来源引用（{{ selectedRefs.length }}）</h3>
             <ul class="flex flex-col gap-1.5">
               <li v-for="(item, index) in selectedRefs" :key="`${item.ref.source_id}-${index}`">
-                <button
-                  type="button"
-                  class="w-full rounded-md border border-slate-200 px-2 py-1.5 text-left hover:border-slate-300 hover:bg-slate-50"
-                  @click="activeRef = item"
-                >
-                  <span class="block truncate text-xs text-slate-600">
-                    {{ item.name }}<span v-if="item.where"> · {{ item.where }}</span>
-                  </span>
-                  <span class="mt-0.5 line-clamp-2 block text-xs leading-relaxed text-slate-500">
-                    {{ item.quote || '（这条引用没有摘录）' }}
-                  </span>
-                </button>
+                <div class="rounded-md border border-slate-200 px-2 py-1.5 hover:border-slate-300 hover:bg-slate-50">
+                  <!--
+                    有原文地址的来源（外部检索的维基条目 / arXiv 论文）名字就是链接：
+                    用户读完这句可以直接去核对出处，而不是只能在抽屉里看一段没有上下文的
+                    摘录。没有地址时保持原来的样子（点开抽屉），不给一个点不动的假链接。
+                  -->
+                  <a
+                    v-if="item.url"
+                    :href="item.url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="block truncate text-xs text-sky-700 underline decoration-sky-300 underline-offset-2 hover:text-sky-900"
+                    :title="`在新窗口打开原文：${item.url}`"
+                  >
+                    {{ item.name }}<span v-if="item.where" class="text-slate-500"> · {{ item.where }}</span>
+                  </a>
+                  <button
+                    v-else
+                    type="button"
+                    class="w-full text-left"
+                    @click="activeRef = item"
+                  >
+                    <span class="block truncate text-xs text-slate-600">
+                      {{ item.name }}<span v-if="item.where"> · {{ item.where }}</span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    class="mt-0.5 block w-full text-left"
+                    @click="activeRef = item"
+                  >
+                    <span class="line-clamp-2 block text-xs leading-relaxed text-slate-500">
+                      {{ item.quote || '（这条引用没有摘录）' }}
+                    </span>
+                  </button>
+                </div>
               </li>
             </ul>
           </section>
