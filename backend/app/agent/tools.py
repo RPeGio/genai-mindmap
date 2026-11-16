@@ -324,10 +324,20 @@ def external_knowledge_enabled() -> bool:
     return os.getenv(EXTERNAL_KNOWLEDGE_ENV, "0").strip().lower() in EXTERNAL_KNOWLEDGE_TRUTHY
 
 
-# `source_name` → `SourceKind`。表而不是三元表达式：加第三个源（RFC、百度百科）
-# 时只能改这里一处，而"忘了改"的表现是新源全部落进 `web`——不报错，只是界面上
-# 的类型标签错了一个字，谁也不会注意到。
-_EXTERNAL_KINDS = {"wikipedia": SourceKind.web, "arxiv": SourceKind.paper}
+# `source_name` → `SourceKind`。表而不是三元表达式：加一个新源时只能改这里一处，
+# 而"忘了改"的表现是新源全部落进 `web`——不报错，只是界面上的类型标签错了一个字，
+# 谁也不会注意到。
+#
+# 分类不是按"哪个站"而是按**内容是什么**：百科给的是对某个词的通俗解释（`web`，
+# 与用户上传的网页材料同类），论文给的是研究（`paper`）。`generation.service` 的
+# `EXTERNAL_TRUST_RULES` 会按这两类给模型不同的提示语，所以这不是纯装饰。
+_EXTERNAL_KINDS = {
+    "wikipedia": SourceKind.web,
+    "baike": SourceKind.web,
+    "arxiv": SourceKind.paper,
+    "openalex": SourceKind.paper,
+    "crossref": SourceKind.paper,
+}
 
 
 class ToolRegistry:
@@ -1893,7 +1903,8 @@ def _external_source(hit: external_knowledge.ExternalHit) -> Source:
     五个字段各有理由，改任何一个都会在链路上留下一个静默失败：
 
       - `filename = f"{source_name}: {title}"`：材料清单里要能一眼看出这是维基的
-        哪一条/arXiv 的哪一篇。只写标题分不出源，只写源没有信息量。
+        哪一条、arXiv 的哪一篇、快懂百科的哪个词条。只写标题分不出源，只写源没有
+        信息量——而"这条从哪来"正是用户判断可信度的唯一依据。
       - `kind` 按源表映射成 `web` / `paper`：界面要能把"我的材料"与"外面抓的"
         分开——两者可信度不同（见 `EXTERNAL_TRUST_RULES`）。
       - `metadata.url`：原文地址，前端渲染成可点击链接。这是"引用能点回原文"的
@@ -1947,8 +1958,9 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
     started = time.perf_counter()
     query = (topic or "").strip()
     try:
-        # 同步函数里最多两次 HTTP 往返（含 10 秒超时），直接在协程里调会把事件
-        # 循环按住——同进程里别人的流式响应会跟着卡（同 `_retrieve_topic`）。
+        # 同步函数，最多 `external_knowledge.REQUEST_LIMIT` 次 HTTP 往返、墙钟上限
+        # `DEADLINE_SECONDS`。直接在协程里调会把事件循环按住这么久——同进程里别人的
+        # 流式响应会跟着卡（同 `_retrieve_topic`）。
         hits = await asyncio.to_thread(
             external_knowledge.search_external, query, limit=EXTERNAL_HIT_LIMIT)
     except Exception as exc:  # noqa: BLE001 — 外部检索失败只降级，理由见 docstring
