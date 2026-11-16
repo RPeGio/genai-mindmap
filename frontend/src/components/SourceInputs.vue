@@ -52,6 +52,22 @@ const problem = computed(() => {
  */
 const showRefState = computed(() => !!store.content);
 
+/**
+ * 状态行第二行：正常时是阶段文案，长静默时换成"模型正在思考"。
+ *
+ * 后端只在静默达到 10 秒才发心跳，所以 `waitedMs > 0` 基本等价于"已经静默 10 秒"。
+ * 阈值再写一遍是为了前端自己也站得住：万一别处的实现改成更密的保活帧，
+ * 这里不会 1 秒就把阶段文案顶掉。
+ */
+const SILENT_HINT_SECONDS = 10;
+const stageLine = computed(() => {
+  if (store.waitedMs >= SILENT_HINT_SECONDS) {
+    return `模型正在思考，已等 ${store.waitedMs} 秒`;
+  }
+  if (!store.stageText) return '';
+  return store.stageText;
+});
+
 function refCount(sourceId: string): number {
   return store.refIndex.counts[sourceId] ?? 0;
 }
@@ -251,8 +267,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       <button v-if="generating" type="button" class="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700" @click="cancel">取消</button>
     </div>
     <p role="status" class="text-xs leading-relaxed text-slate-500">{{ store.status }}</p>
-    <p v-if="store.stageText" class="text-xs text-slate-400">
-      {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
+    <p v-if="stageLine" class="text-xs text-slate-400">
+      {{ stageLine }}<span v-if="store.waitedMs > 0 && store.waitedMs < SILENT_HINT_SECONDS">（已等待 {{ store.waitedMs }} 秒）</span>
     </p>
   </div>
 </template>

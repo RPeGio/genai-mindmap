@@ -1635,6 +1635,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 否则旧回调会把新请求刚设好的 stageText / status / candidate 覆盖掉。
         if (controller !== ctrl) return;
         agentEvents.value = [...agentEvents.value, event];
+        // 真进度帧到了，静默就结束了：等待计时必须跟着归零，否则「已等 25 秒」
+        // 会一直挂在状态行上，看起来像卡住了——而那会儿节点已经在长。
+        if (event.type !== 'heartbeat') waitedMs.value = 0;
         switch (event.type) {
           case 'stage':
             stageText.value = event.detail || event.stage;
@@ -1677,6 +1680,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
             // 只放候选、不碰 content——没经用户确认的内容不许进画布。
             candidate.value = event.content;
             status.value = candidateStatus('候选已就绪');
+            break;
+          case 'heartbeat':
+            // 模型思考期间最长静默到过 25 秒，这帧就是告诉用户"还在跑"。
+            // 只更新等待计时，不改 stageText：心跳不带业务进度，覆盖掉真实阶段文案
+            // 会让用户以为进度回退了。文案拼接在渲染层做（见 SourceInputs.vue）。
+            waitedMs.value = Math.round(event.waited_ms / 1000);
             break;
           case 'done':
             settled = true;

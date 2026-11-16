@@ -358,6 +358,13 @@ export type AgentEvent =
       expandable: boolean | null;
     }
   | { type: 'snapshot'; seq: number; content: MindMapContent }
+  /**
+   * 长静默期间的保活帧。
+   *
+   * 线上实测单轮静默到过 25 秒，那段时间事件流里一个字节都没有，中间链路的空闲
+   * 超时会掐断连接。它不带业务进度：真实进度看 `stage` / `tool_start` / `node_grow`。
+   */
+  | { type: 'heartbeat'; seq: number; waited_ms: number }
   | {
       type: 'done';
       seq: number;

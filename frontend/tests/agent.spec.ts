@@ -213,6 +213,47 @@ describe('agent 运行', () => {
     stream.finish();
     await running;
   });
+
+  it('心跳帧累积等待时长，真进度帧一到就归零', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'heartbeat', seq: 1, waited_ms: 10200 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(10));
+
+    // 心跳连着来是"还在等"，数字要跟着涨
+    stream.push({ type: 'heartbeat', seq: 2, waited_ms: 20400 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(20));
+
+    // 真进度到了，静默结束：计时必须归零，否则「已等 20 秒」会一直挂着
+    stream.push({ type: 'node_grow', seq: 3, path: [], label: '根' });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(0));
+
+    stream.push(doneFrame(content()));
+    stream.finish();
+    await running;
+  });
+
+  it('心跳不改阶段文案：它不带业务进度', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'tool_start', seq: 1, call_id: 'c1', name: 'mindmap_generate' });
+    await vi.waitFor(() => expect(store.stageText).toBe('正在定框架'));
+
+    stream.push({ type: 'heartbeat', seq: 2, waited_ms: 11000 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(11));
+    // 让心跳把阶段文案顶掉，会让用户以为进度回退了
+    expect(store.stageText).toBe('正在定框架');
+
+    stream.push(doneFrame(content()));
+    stream.finish();
+    await running;
+  });
 });
 
 describe('部分完成与诊断', () => {
@@ -684,6 +725,52 @@ describe('运行中的来源区', () => {
 
     gate.finish();
     await running;
+  });
+});
+
+describe('静默提示', () => {
+  function panel() {
+    return mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+  }
+
+  it('静默到 10 秒时把阶段文案换成「模型正在思考」，两句话不并存', async () => {
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.stageText = '正在定框架';
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('正在定框架');
+    expect(wrapper.text()).not.toContain('模型正在思考');
+
+    store.waitedMs = 12;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('模型正在思考，已等 12 秒');
+    // 阶段文案被顶掉，不是两句叠在一起
+    expect(wrapper.text()).not.toContain('正在定框架');
+  });
+
+  it('10 秒以内仍显示阶段文案，等待秒数附在后面', async () => {
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.stageText = '正在定框架';
+    store.waitedMs = 3;
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).toContain('正在定框架');
+    expect(wrapper.text()).toContain('（已等待 3 秒）');
+    expect(wrapper.text()).not.toContain('模型正在思考');
+  });
+
+  it('没有阶段文案时也不因为等待计时凭空多出一行', async () => {
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.stageText = '';
+    store.waitedMs = 0;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).not.toContain('正在思考');
+    expect(wrapper.text()).not.toContain('已等待');
   });
 });
 
