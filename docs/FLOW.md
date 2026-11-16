@@ -13,9 +13,9 @@ flowchart TD
 
   S --> SRC[Source<br/>统一来源模型]
   SRC --> U[合并来源<br/>逐项带 source_id]
-  U --> O[生成<br/>mindmap_generate 调模型]
+  U --> O[生成<br/>mindmap_generate_deep 调模型]
   O --> V[validate<br/>MindMapContent 校验]
-  V --> R[verify<br/>结构诊断]
+  V --> R[verify<br/>引用逐字校验 + 契约]
   R --> MAP[导图 JSON]
 
   MAP --> SAVE[(保存 / 版本)]
@@ -27,7 +27,7 @@ flowchart TD
   SUG -.用户确认.-> EDIT
 ```
 
-图里的两个环节就是第 3 节表格的"合并理解"与"大纲生成"；`understand` / `outline` 是已删除的 `app/pipeline/` 里的阶段名，不再有对应实现。来源合并与长度校验分散在前端 `src/sources/input.ts::sourceInputError`（提交前挡未解析或空来源）与后端 `AgentRunRequest.sources_within_context`（开流前按 token 估算），图里不再单列。
+图里的两个环节就是第 3 节表格的"合并理解"与"大纲生成"；`understand` / `outline` 是已删除的 `app/pipeline/` 里的阶段名，不再有对应实现。来源合并由前端 `src/sources/input.ts::sourceInputError` 在提交前挡下未解析或空来源；后端**不再**做"正文合计装得进上下文"的预检——正文不进 prompt（`docs/ONE-PATH.md`），图里不再单列这一步。
 
 ## 2 入口
 
@@ -43,10 +43,10 @@ flowchart TD
 | 环节 | 模块 | 输入 | 输出 | 状态 |
 |---|---|---|---|---|
 | 来源解析 | `app/ingestion` | 文本 / Markdown 字符串 / 上传的文档、图片或 WAV / 浏览器录音 | `Source` | 文本、文档（Docling + pymupdf）、图片（多模态视觉）、语音（百炼 Qwen-Audio-ASR，带句级时间戳）均已实现 |
-| 合并理解 | `app/agent/tools.py`（`mindmap_generate` 的忠实整理模式） | `Source[]` | 结构化来源输入（逐项带 `source_id`，供模型写引用） | 已实现；未解析或空内容的来源由前端在提交前挡下（`src/sources/input.ts::sourceInputError`），工具侧只取有正文的来源。长度在开流前按 token 估算卡（`AgentRunRequest.sources_within_context` → `ensure_input_within_context`），超了 422 而不是截断 |
-| 大纲生成 | `app/agent/tools.py`（`mindmap_generate` / `mindmap_generate_deep`） | 目标文本（或结构化来源） | `MindMapContent` | 已实现（`MINDMAP_LLM_MODE=demo` 时不调模型，直接发占位树；有来源时只能走 `mindmap_generate` 的忠实整理） |
+| 合并理解 | `app/agent/tools.py`（`_generate_deep` 的材料入口：短材料退化 + 外部检索） | `Source[]` | 可检索来源 + 骨架的章节标题行 | 已实现；未解析或空内容的来源由前端在提交前挡下（`src/sources/input.ts::sourceInputError`），工具侧只取有正文的来源。正文**不按字数/体积卡**：它不进 prompt，所以没有"装不装得下"这道预检（`MINDMAP_SOURCE_MODE=full` 那条路已删除，见 `docs/ONE-PATH.md`） |
+| 大纲生成 | `app/agent/tools.py`（`mindmap_generate_deep`：骨架 → 按支检索 → 并发展开） | 目标文本（或材料清单 + 章节标题） | `MindMapContent` | 已实现（`MINDMAP_LLM_MODE=demo` 时不调模型，直接发占位树；整树一次成型的 `mindmap_generate` 已删除） |
 | 契约校验 | `app/contracts/mindmap.py` | 任何模型输出 | 合法树 / 异常 | 已实现（1000 节点 / 8 层 / 50 子节点） |
-| 结构诊断 | `app/optimization.check` | 导图 | `Diagnostic[]` | 单子节点、深度上限、同级重复标签三种结构提示；`mindmap_generate` 收尾时会跑一遍（原先只在流水线收尾跑） |
+| 结构诊断 | `app/optimization.check` | 导图 | `Diagnostic[]` | 单子节点、深度上限、同级重复标签三种结构提示；生成侧只在 `/api/optimization/*` 体检时跑（它原先也挂在已删除的整树生成收尾里） |
 | 候选建议 | `app/optimization.suggest` | 导图 | `Suggestion[]` | 同级重复标签 → dedupe 候选，可信度未评估 |
 | 知识检索 | `app/knowledge.search` | 查询串 | `KnowledgeHit[]` | 桩（返回空 + implemented=false） |
 | 导出 | `app/export` | 导图 | puml / markdown / opml 文本 | 三种格式均已实现（2026-11-05） |

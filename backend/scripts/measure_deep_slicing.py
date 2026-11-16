@@ -1,18 +1,20 @@
-"""分片 + 按支检索的三组对照实测（本机可复现，无 LLM 密钥）。
+"""分片 + 按支检索的覆盖度实测（本机可复现，无 LLM 密钥）。
 
-三组：
+**只剩一组**：`mindmap_generate_deep` + 每支各检索一次（分片 + 按支检索）。
 
-  A  `SOURCE_MODE=full` + `mindmap_generate`   整树，全文在 prompt 里
-  B  `SOURCE_MODE=rag`  + `mindmap_generate`   整树，一次检索
-  C  `SOURCE_MODE=rag`  + `mindmap_generate_deep`  分片，每支各检索一次
+早先这里有三组对照，A（`SOURCE_MODE=full` + `mindmap_generate`，整树、全文在
+prompt 里）与 B（`rag` + `mindmap_generate`，整树、一次检索）已经随那个形态一起
+删除（`docs/ONE-PATH.md`），所以脚本只剩它们曾经对照的那一组。A/B 的数字留在
+`docs/RAG-DECISIONS.md` 第 5 节与 `tools._search_branch` 的注释里——那是它们
+唯一还有用的地方（证明"为什么只剩这一条路"）。
 
 **测的是检索覆盖度，不是生成质量**。本机没有 `MINDMAP_LLM_*` 凭证，所以"模型"
 是脚本化的（`ScriptedModel`）：它只按固定规则使用**它在 prompt 里真正看到的文字**
 ——看得到哪几段就写哪几个节点，命中里给什么引文就抄什么引文。于是覆盖度这个
-数字反映的是"材料有没有被送进模型"，正是这次改动能影响的部分；生成质量完全
+数字反映的是"材料有没有被送进模型"，正是这条设计能影响的部分；生成质量完全
 不在这个脚本的射程内。
 
-判定口径（三组同一套，才可比）：
+判定口径：
 
   - **覆盖率** = 最终树的 `source_refs` 命中的材料段落数 / 段落总数。命中的定义
     是"引用区间的**起点**落在这一段里"（父块/叶子块有重叠，用任何重叠都算会让
@@ -31,7 +33,7 @@
 
 `--skeleton` 有两个取值，对应两种"模型怎么定一级分支"：
 
-  - `headings`（默认）：用材料自带的小节标题。真实模型在 `rag` 形态下看不到正文，
+  - `headings`（默认）：用材料自带的小节标题。真实模型看不到正文，
     这一条对它有利——报告里必须说明。
   - `generic`：用一组与材料用词无关的通用标题（"背景/现状/方法/数据"…），
     模拟"骨架猜偏了"的情况。两者之差就是"分支标题当 query 够不够用"的下限证据。
@@ -56,12 +58,13 @@ REPO = BACKEND.parent
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-# 环境必须在 import 应用之前定下来：`source_mode()` 等函数每次都读 env，但
-# `repository.db_path()` 这类在 import 期就可能缓存，早设比晚设安全。
+# 环境必须在 import 应用之前定下来：`repository.db_path()` 这类在 import 期就可能
+# 缓存，早设比晚设安全。
 _TMP = tempfile.mkdtemp(prefix="measure-slicing-")
 os.environ["MINDMAP_DB_PATH"] = str(Path(_TMP) / "measure.db")
 os.environ.pop("MINDMAP_HYBRID_SEARCH", None)
 os.environ.setdefault("MINDMAP_PARENT_RETRIEVAL", "1")
+os.environ.setdefault("MINDMAP_EXTERNAL_KNOWLEDGE", "0")
 
 from app.agent.contracts import (  # noqa: E402
     AgentRunRequest,
@@ -164,118 +167,40 @@ def _clean(label: str, limit: int = 18) -> str:
     return text[:limit] or "（空）"
 
 
-def _sources_from_prompt(user: str) -> list[str]:
-    """`full` 形态的 prompt 里那一段 sources 数组 → 每份的正文。
-
-    解不出来就退回"整条消息当一份正文"：这条路径只在数据形状意外时需要，
-    它的保守后果是覆盖率偏高（子串匹配更容易命中），不会把失败伪装成成功。
-    """
-    marker = "sources 数组（JSON）：\n"
-    if marker not in user:
-        return [user]
-    try:
-        items = json.loads(user.split(marker, 1)[1])
-    except (ValueError, IndexError):
-        return [user]
-    if not isinstance(items, list):
-        return [user]
-    return [str(item.get("text") or "") for item in items if isinstance(item, dict)]
-
-
-# ---------------------------------------------------------------- 脚本化的"模型"
-
-
 @dataclass
 class ScriptedModel:
     """只看得到 prompt 里真正出现的文字，并按固定规则把它变成节点。
 
     这不是在模拟"聪明的模型"，而是在模拟**一个忠实但只会抄的模型**：看得到就写，
-    看不到就写不出来。生成质量因此被固定住，三组之间的差别只可能来自"材料有没有
+    看不到就写不出来。生成质量因此被固定住，覆盖率的差别只可能来自"材料有没有
     送到它眼前"。
 
-    - 整树生成（A/B）：A 从 prompt 里的 sources JSON 认出可见段落；B 从上一轮
-      `rag_query` 的命中里认出可见段落（真实模型也是这么用上下文的）。
-      每段一个节点，节点上抄一段逐字引文。
-    - 分片生成（C）：骨架按 `titles` 返回；每支按**这一支自己的 evidence 数组**
-      写节点，一条命中一个节点，引文抄 `evidence_*`。
+    分片生成：骨架按 `titles` 返回；每支按**这一支自己的 evidence 数组**写节点，
+    一条命中一个节点，引文抄 `evidence_*`。
     """
 
     spans: list[tuple[int, int]]
     text: str
     titles: tuple[str, ...]
     source_id: str
-    hits: list = field(default_factory=list)
     refs_written: int = 0
     calls: int = 0
 
-    # -------- 三种请求的分派
+    # -------- 两种请求的分派
     async def __call__(self, system: str, user: str, *, max_tokens=None, on_delta=None):
         self.calls += 1
         if system.startswith(PLAN_PROMPT):
             return {"branches": list(self.titles)}
         if "本条一级分支：" in user:
             return self._expand(user)
-        if "从一级分支到这里的路径：" in user:
-            return {"children": []}      # 第 3 层不会走到：子项都声明 expandable=false
-        return self._whole_tree(user)
+        return {"children": []}      # 第 3 层不会走到：子项都声明 expandable=false
 
-    # -------- 整树
-    def _whole_tree(self, user: str) -> dict:
-        refs = [self._ref_from_text(index) for index in self._visible_paragraphs(user)]
-        refs = [ref for ref in refs if ref]
-        # 平铺成 4 条一级分支：`mindmap_generate` 要求一级分支不少于 3 条。
-        buckets = 4
-        children = []
-        for bucket in range(buckets):
-            chunk = refs[bucket::buckets]
-            children.append({
-                "id": f"b{bucket}",
-                "label": f"要点组 {bucket + 1}",
-                "children": [
-                    {"id": f"b{bucket}-{position}", "label": _clean(ref["quote"]),
-                     "children": [], "source_refs": [ref]}
-                    for position, ref in enumerate(chunk)
-                ],
-            })
-        self.refs_written += len(refs)
-        return {"title": "材料整理", "root": {"id": "root", "label": "材料整理",
-                                             "children": children}}
-
-    def _visible_paragraphs(self, user: str) -> list[int]:
-        """这一轮生成看得见哪几段。
-
-        `full` 形态：来源正文整份在 prompt 里的 sources 数组里——把那个数组解出来
-        逐段比对（不是在整条消息上做子串匹配：JSON 里换行是 `\\n`，逐字比会漏掉
-        所有带换行的段落，那是度量口径的漏，不是覆盖的漏）。
-        `rag` 形态：只有上一轮检索的命中，按命中区间的起点归属段落。
-        """
-        if os.getenv("MINDMAP_SOURCE_MODE", "rag") == "full":
-            visible: list[int] = []
-            texts = _sources_from_prompt(user)
-            for index, (start, _) in enumerate(self.spans):
-                probe = self.text[start:start + 40]
-                if probe and any(probe in body for body in texts):
-                    visible.append(index)
-            return visible
-        seen: list[int] = []
-        for hit in self.hits:
-            index = _paragraph_at(self.spans, hit.start)
-            if index is not None:
-                seen.append(index)
-        return seen
-
-    def _ref_from_text(self, index: int) -> dict | None:
-        start, end = self.spans[index]
-        quote = self.text[start:end][:200]
-        return {"source_id": self.source_id, "quote": quote} if quote else None
-
-    # -------- 分片
     def _expand(self, user: str) -> dict:
         if "evidence 数组）：\n" not in user:
             return {"children": []}      # 无证据：按提示词要求如实留空
         entries = json.loads(user.split("evidence 数组）：\n", 1)[1])
         children = []
-        for position, entry in enumerate(entries[:POINTS_PER_BRANCH]):
+        for entry in entries[:POINTS_PER_BRANCH]:
             ref = self._ref_from_hit(entry)
             if ref is None:
                 continue
@@ -350,7 +275,6 @@ def _completion(calls: list[ToolCall]) -> Completion:
 class GroupResult:
     name: str
     tool: str
-    mode: str
     ok: bool
     coverage: float
     coverage_any: float
@@ -371,11 +295,10 @@ class GroupResult:
 
 
 def run_group(
-    name: str, tool: str, mode: str, *, text: str, spans: list[tuple[int, int]],
-    titles: tuple[str, ...], topic: str, topic_query: str, source_id: str,
-    fake_embedding: bool, embed_latency: float, query_mode: str = "topic-title",
+    name: str, *, text: str, spans: list[tuple[int, int]],
+    titles: tuple[str, ...], topic: str, source_id: str,
+    fake_embedding: bool, embed_latency: float, query_mode: str = "title",
 ) -> tuple[GroupResult, Probes]:
-    os.environ["MINDMAP_SOURCE_MODE"] = mode
     source = Source(id=source_id, kind=SourceKind.document, status="parsed",
                     filename="RAG-DECISIONS.md", text=text)
     request = AgentRunRequest(
@@ -386,18 +309,10 @@ def run_group(
     probes = make_probes()
     model = ScriptedModel(spans=spans, text=text, titles=titles, source_id=source_id)
 
-    calls: list[ToolCall] = []
-    if tool == "mindmap_generate":
-        if mode == "rag":
-            calls.append(ToolCall(call_id="c-rag", name="rag_query",
-                                  arguments={"question": topic_query}))
-        calls.append(ToolCall(call_id="c-gen", name="mindmap_generate",
-                              arguments={"topic": topic}))
-    else:
-        calls.append(ToolCall(call_id="c-deep", name="mindmap_generate_deep",
-                              arguments={"topic": topic, "branches": MAX_BRANCHES,
-                                         "points_per_branch": POINTS_PER_BRANCH,
-                                         "max_depth": 2}))
+    calls = [ToolCall(call_id="c-deep", name="mindmap_generate_deep",
+                      arguments={"topic": topic, "branches": MAX_BRANCHES,
+                                 "points_per_branch": POINTS_PER_BRANCH,
+                                 "max_depth": 2})]
     script = [_completion([call]) for call in calls] + [_completion([])]
 
     from app.knowledge.service import search_parent as real_search_parent
@@ -409,8 +324,6 @@ def run_group(
                                   library=library)
         probes.searches.append((query, top_k))
         probes.search_hits.append((query, hits))
-        # B 组：整树生成要"记得"上一轮检索看到了什么
-        model.hits = list(hits)
         return hits
 
     def fake_embed(texts):
@@ -528,7 +441,7 @@ def run_group(
         notes.append("未配置向量：纯 BM25")
 
     return GroupResult(
-        name=name, tool=tool, mode=mode, ok=ok,
+        name=name, tool="mindmap_generate_deep", ok=ok,
         coverage=len(starts_hit) / len(spans) if spans else 0.0,
         coverage_any=len(any_hit) / len(spans) if spans else 0.0,
         refs_written=model.refs_written, refs_kept=len(refs), refs_verbatim=verbatim,
@@ -569,12 +482,12 @@ def report(results: list[GroupResult], *, spans: int, chars: int, titles) -> Non
               f"{len(titles)} 支：{'、'.join(titles)}")
     print(header)
     print()
-    columns = ("组", "工具", "形态", "覆盖率", "上界", "引用 写出/留存/逐字",
+    columns = ("组", "工具", "覆盖率", "上界", "引用 写出/留存/逐字",
                "工具调用", "模型调用", "检索", "embed 次数(批)/文本", "节点", "耗时")
     rows = []
     for item in results:
         rows.append((
-            item.name, item.tool, item.mode,
+            item.name, item.tool,
             f"{item.coverage:.1%}", f"{item.coverage_any:.1%}",
             f"{item.refs_written}/{item.refs_kept}/{item.refs_verbatim}",
             item.tool_calls, item.model_calls, item.searches,
@@ -643,11 +556,8 @@ def main() -> int:
                              "topic-title 是上一版（实测更差），topic 是同一句发 N 次的对照组")
     parser.add_argument("--branches", type=int, default=MAX_BRANCHES,
                         help="一级分支条数（成本闸的上界是 20，用它可以量最坏情况）")
-    parser.add_argument("--only", default="ABC",
-                        help="只跑某几组（A/B/C 的任意组合）。量 C 的冷缓存成本时用 C，"
-                             "否则同进程里 B 已经把那批块向量写进缓存，C 的数字会偏小")
     parser.add_argument("--show-output", action="store_true",
-                        help="打印每组工具回给模型的那段 content（真实输出）")
+                        help="打印工具回给模型的那段 content（真实输出）")
     parser.add_argument("--fake-embedding", action="store_true",
                         help="注入确定性假向量（量批量与次数用）")
     parser.add_argument("--embed-latency", type=float, default=0.0,
@@ -666,33 +576,18 @@ def main() -> int:
         titles = tuple(padded)
     titles = titles[:args.branches]
     topic = "RAG 与召回：一轮评估记录与取舍"
-    # B 组那一次检索的问句：用主题本身。这是最自然、也最有利于 B 的选择——
-    # 换成"这份材料讲了什么"这类泛问句，B 的覆盖只会更低（见 docs/RAG-DECISIONS.md 2.3）。
-    topic_query = topic
 
-    common = dict(text=text, spans=spans, titles=titles, topic=topic,
-                  topic_query=topic_query, source_id="m1",
-                  fake_embedding=args.fake_embedding,
-                  embed_latency=args.embed_latency, query_mode=args.query_mode)
-    groups = {
-        "A": ("mindmap_generate", "full"),
-        "B": ("mindmap_generate", "rag"),
-        "C": ("mindmap_generate_deep", "rag"),
-    }
-    pairs = [
-        run_group(name, *groups[name], **common)
-        for name in ("A", "B", "C") if name in args.only.upper()
-    ]
-    results = [item for item, _ in pairs]
-    report(results, spans=len(spans), chars=len(text), titles=titles)
+    result, probes = run_group(
+        "C", text=text, spans=spans, titles=titles, topic=topic, source_id="m1",
+        fake_embedding=args.fake_embedding, embed_latency=args.embed_latency,
+        query_mode=args.query_mode,
+    )
+    report([result], spans=len(spans), chars=len(text), titles=titles)
     if args.show_output:
         print()
-        for item in results:
-            print(f"[{item.name}] {item.output}")
-            print()
-    deep = [probes for item, probes in pairs if item.tool == "mindmap_generate_deep"]
-    if deep:
-        branch_overlap(deep[-1], spans, limit=POINTS_PER_BRANCH)
+        print(f"[{result.name}] {result.output}")
+        print()
+    branch_overlap(probes, spans, limit=POINTS_PER_BRANCH)
     print(f"\nquery 拼法：{args.query_mode}；骨架来源：{args.skeleton}；"
           f"分支数：{len(titles)}")
     return 0

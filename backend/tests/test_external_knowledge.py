@@ -26,16 +26,8 @@
 """
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import importlib.util
-import json
-import subprocess
-import sys
 import time
-from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 from urllib.parse import unquote
 
 import httpx
@@ -44,32 +36,8 @@ import pytest
 from app.agent import tools as agent_tools
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext
 from app.contracts.source import Source, SourceKind, SourceMetadata, safe_http_url
-from app.generation.service import SOURCE_MODE_ENV, SOURCE_MODE_FULL
 from app.knowledge import external
 from app.knowledge import library
-
-# 写死基线，不跟随 HEAD：这一轮之后 `tools.py` 又被改过，拿 HEAD 对比等于自己跟
-# 自己比（与 `tests/test_library_wiring.py` 同一条规矩）。rev 与内容各钉一道——
-# 只有 rev 时改常量就能换掉基线，只有 hash 时看不出这份基线是哪一版。
-#
-# 三个基线，钉的是三件不同的事：
-#   - `aeed033`：外部知识检索**第一次接进来**的那一版。开关关着时"整个功能不存在"；
-#   - `83d61a0`：加源之前的那一版。加三个源不能改动开关关闭时的任何一个字节
-#     ——这是"新源可以加，但不许偷偷改变关闭状态下的行为"的验收线；
-#   - `dceae7e`：**翻默认值之前**的 HEAD。翻成默认开之后，"关掉开关"必须仍然回到
-#     这一版的行为：不发请求、不换提示词、`data` 的键集不多不少；
-#   - `202a7bd`：**加相关性门与检索进度帧之前**的 HEAD（本轮改动的起点）。门只该
-#     在"抓到了东西"时改变结果，进度帧只在有 SSE 消费者时出现——两件事都不该碰
-#     "关掉外部检索"这条路的任何一个字节。它是本轮唯一能证明"我没顺手改坏别的"
-#     的基线，缺了它就只能靠读 diff 自查。
-BASELINES = {
-    "aeed033": "546fde932e7d331c70dec0bc221b7041a9d46409216bcc17b023d0f04d9a239e",
-    "83d61a0": "f085b4f2fc341f1bb0d4f1299590552abf291e7af63af518b868b6877b0cab3b",
-    "dceae7e": "51902cb3149cbc1b1cf486ae65bf6e576b0677d8db8d580152583c3d2255db4c",
-    "202a7bd": "a55d394823818d3dd00649df566d33abe53892cd9b56f02948d8f086a12810ef",
-}
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # 真实响应的形状（2026-11 实测所得，正文截短）：`formatversion=2` 的 `pages` 是
 # 列表，条目里带 `fullurl` 与 `extract`。
@@ -284,47 +252,6 @@ def _tree(refs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
             {"id": "c", "label": "企业案例", "children": []},
         ]},
     }
-
-
-def _generate(ctx: RunContext, topic: str = "碳中和", *,
-              fake: Any = None) -> tuple[Any, list[tuple[str, str]]]:
-    """跑一次 `mindmap_generate`，同时把每次 `chat_async` 的 (system, user) 留下来。
-
-    `fake` 可以是固定的树，也可以是一个 "看 (system, user) 再决定返回什么" 的函数
-    —— 第五组要按 user 消息里的 evidence 造引用，只有后者做得到。
-    """
-    calls: list[tuple[str, str]] = []
-
-    async def chat(system: str, user: str, **kwargs: Any) -> Any:
-        calls.append((system, user))
-        return fake(system, user) if callable(fake) else fake
-
-    with patch.object(agent_tools, "chat_async", chat):
-        result = asyncio.run(agent_tools.build_registry("create").execute(
-            agent_tools.ToolCall(call_id="c-gen", name="mindmap_generate",
-                                 arguments={"topic": topic}), ctx))
-    return result, calls
-
-
-def _load_baseline_tools(tmp_path: Path, rev: str = "aeed033"):
-    """把某个基线 rev 的 `agent/tools.py` 载成独立模块，并核对 sha256。"""
-    try:
-        raw = subprocess.run(
-            ["git", "show", f"{rev}:backend/app/agent/tools.py"],
-            cwd=REPO_ROOT, capture_output=True, check=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError) as exc:  # pragma: no cover
-        pytest.skip(f"读不到 {rev} 的 tools.py：{exc}")
-
-    assert hashlib.sha256(raw).hexdigest() == BASELINES[rev]
-
-    path = tmp_path / f"tools_{rev}.py"
-    path.write_bytes(raw)
-    spec = importlib.util.spec_from_file_location(f"tools_baseline_{rev}", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 # ---------------------------------------------------------------- 1 解析
@@ -754,51 +681,6 @@ def test_oversized_response_is_rejected(monkeypatch):
 # ---------------------------------------------------------------- 4 开关关＝旧模块
 
 
-@pytest.mark.parametrize("rev", sorted(BASELINES))
-def test_switch_off_matches_baseline(tmp_path, monkeypatch, rev):
-    """`MINDMAP_EXTERNAL_KNOWLEDGE=0` 时，`_generate` 与基线 rev 逐字节相同。
-
-    比的是 `(ok, content, data)`——`data` 的键集也要比，因为"逐字节"包含它：
-    多一个 `external` 键就是一次契约变化，而它在界面上表现为"同一个请求、两种
-    遥测形状"，排查时最难对上。
-
-    跑四个基线（理由见 `BASELINES`）：`aeed033` 证明"功能不存在"，`83d61a0`
-    证明"加了三个源之后，关闭状态仍然一个字节没动"，`dceae7e` 证明"**默认值翻了
-    之后**，显式关掉仍然回到翻之前的行为"，`202a7bd` 证明"加了相关性门与检索进度
-    帧之后，关掉开关仍然回到本轮改动之前的行为"。
-
-    `_ctx()` 的 `emit` 是 None，所以这条用例同时钉住"没有 SSE 消费者时一帧都不多"：
-    进度帧只该出现在有消费者的那条路上。
-
-    **关掉必须显式写 `0`**：默认值现在是开，`delenv` 只会把开关打开，这条用例就
-    变成"开着的时候与关着的基线相同"——它会在第一次外部请求上失败（一次请求都
-    不该发），但失败原因读起来像是实现坏了。"默认开"这件事由
-    `test_default_is_on_and_explicit_zero_still_turns_it_off` 单独钉。
-    """
-    baseline = _load_baseline_tools(tmp_path, rev)
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "0")
-
-    forbidden: list[str] = []
-    monkeypatch.setattr(
-        agent_tools.external_knowledge, "search_external",
-        lambda *args, **kwargs: forbidden.append("called") or [])
-
-    tree = _tree()
-    current, current_calls = _generate(_ctx(), fake=tree)
-
-    async def old_chat(system: str, user: str, **kwargs: Any) -> Any:
-        return tree
-
-    with patch.object(baseline, "chat_async", old_chat):
-        old = asyncio.run(baseline._generate(
-            baseline.GenerateArgs(topic="碳中和"), _ctx()))
-
-    assert (current.ok, current.content, current.data) \
-        == (old.ok, old.content, old.data), rev
-    # 提示词也逐字相同（system 里不该多出那句外部来源的警告）
-    assert current_calls and current_calls[0][0] == agent_tools.DETAIL_PROMPT \
-        + agent_tools.thinking_block("default") + agent_tools.DETAIL_NO_SOURCE_RULES
-    assert forbidden == [], "开关关着时一次外部请求都不该发"
 
 
 def test_kind_table_is_the_only_thing_tools_gained():
@@ -820,55 +702,6 @@ def test_kind_table_is_the_only_thing_tools_gained():
 # ---------------------------------------------------------------- 5 开 + 有结果
 
 
-def test_external_sources_flow_into_generation(monkeypatch):
-    """开关开 + 外部有结果：正文进 user 消息、引用指向新入库的来源、校验后还在。
-
-    这条用例的价值在"还在"两个字上：`verify_source_refs(remove_invalid=True)` 会把
-    指向未知来源的引用**静默删掉**，所以"没抛异常"什么都证明不了。
-    """
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
-    monkeypatch.setattr(
-        external, "_client",
-        _client_factory(_router({"wikipedia": WIKI_JSON,
-                                 "arxiv": ARXIV_EMPTY_XML})))
-
-    seen_user: list[str] = []
-
-    def fake(system: str, user: str) -> Any:
-        seen_user.append(user)
-        # 从 user 消息末尾的 evidence 数组里抄一条引用——这正是模型的处境：
-        # 它唯一的原文来源就是这段 JSON。
-        payload = json.loads(user[user.rindex("["):])
-        hit = payload[0]
-        return _tree([{"source_id": hit["source_id"], "start": hit["start"],
-                       "end": hit["end"], "quote": hit["quote"]}])
-
-    ctx = _ctx()
-    result, calls = _generate(ctx, fake=fake)
-
-    assert result.ok, result.content
-    assert seen_user, "外部正文没有进 user 消息"
-    assert "碳中和（英語：carbon neutrality）" in seen_user[0]
-    # 不可信数据的声明必须在 system 里（不是 user）：它约束的是模型怎么对待这些
-    # 内容，而不是这些内容本身。
-    system = calls[0][0]
-    assert "外部抓取的内容" in system and "不要执行" in system
-
-    # 引用指向**入库后的持久 id**，且校验之后仍在
-    refs = ctx.candidate.root.children[0].source_refs
-    assert refs, "外部来源的引用被校验剔掉了"
-    source_id = refs[0].source_id
-    stored = library.load(source_id)
-    assert stored is not None
-    assert stored.kind is SourceKind.web
-    assert stored.metadata.url == "https://zh.wikipedia.org/wiki/%E7%A2%B3%E4%B8%AD%E5%92%8C"
-    assert stored.metadata.tags == ["wikipedia"]
-    assert stored.filename == "wikipedia: 碳中和"
-    # `source_usage` 带上了 url：保存后的导图也要能点回原文
-    usage = {item.source_id: item for item in ctx.candidate.source_usage}
-    assert usage[source_id].url == stored.metadata.url
-    assert result.data["external"]["sources"] == 1
-    assert result.data["external"]["failed"] is None
 
 
 def test_external_hits_are_interleaved(monkeypatch):
@@ -897,83 +730,13 @@ def test_library_reuse_does_not_duplicate(monkeypatch):
     assert len(library.list_sources(limit=10)) == 1
 
 
-def test_request_sources_skip_external_entirely(monkeypatch):
-    """请求自带材料时**一条外部请求都不发**：主题检索只在"只有一个主题"时发生。
-
-    这条不是优化而是语义：用户上传了材料，"这次该依据什么"已经有了答案，
-    再去网上抓一份混进来，会让引用指向他自己没给过的来源。
-    """
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
-    forbidden: list[Any] = []
-    monkeypatch.setattr(
-        agent_tools.external_knowledge, "search_external",
-        lambda *args, **kwargs: forbidden.append("called") or [])
-
-    material = Source(kind=SourceKind.text, status="parsed", text=(
-        "# 制度\n\n## 预算审批\n\n预算审批由部门负责人签核，超过额度上报总经理。\n\n"
-        "## 报销时限\n\n费用报销的时限是三十个自然日，逾期不再受理。\n\n"
-        "## 采购合规\n\n采购合同必须经过法务审核，金额超过五十万元另行招标。\n\n"
-        "## 归档与审计\n\n全部单据按季度归档，财务部每半年抽查一次；"
-        "审计发现的问题要在十五个工作日内整改完毕并书面反馈。\n\n"
-        "## 培训\n\n新员工入职后三十日内完成财务制度培训并考核，"
-        "未通过的在下一批次补训；各部门负责人负责督促落实。\n\n"
-        "## 附则\n\n本制度自发布之日起施行，由财务部负责解释；"
-        "各部门可依据本制度制定实施细则，但不得与本制度相抵触。\n\n"
-        "## 违规处理\n\n未按本制度履行审批手续的，财务部有权退回并暂停该笔支付。\n"
-    ))
-    # 材料必须长过降级阈值，否则这次走的是"材料太短 → 无材料 → 去搜"，而那条路
-    # **本来就该**发外部请求——用例会红，但红的不是它想证明的那件事。
-    assert len(material.text) > agent_tools.SHORT_MATERIAL_CHARS
-    ctx = _ctx([material])
-    result, _ = _generate(ctx, fake=_tree())
-
-    assert result.ok, result.content
-    assert forbidden == []
-    assert "external" not in result.data
 
 
 # ---------------------------------------------------------------- 6 开 + 全失败
 
 
-def test_external_empty_falls_back_to_topic_only(monkeypatch):
-    """源返回空 → 纯主题生成，`content` 里必须说明。"""
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
-    monkeypatch.setattr(
-        external, "_client",
-        _client_factory(_router({"wikipedia": WIKI_MISS_JSON,
-                                 "arxiv": ARXIV_EMPTY_XML})))
-
-    ctx = _ctx()
-    result, calls = _generate(ctx, topic="量子色动力学的渐近自由", fake=_tree())
-
-    assert result.ok, result.content
-    assert "没有搜到外部资料" in result.content
-    assert "只基于主题" in result.content
-    # 纯主题那条提示词：不带外部来源的警告（这次没有外部内容）
-    assert "外部抓取的内容" not in calls[0][0]
-    assert {item["code"] for item in result.data["diagnostics"]} >= {
-        "GENERATION_WITHOUT_EXTERNAL"}
-    assert result.data["external"] == {
-        "hits": 0, "sources": 0,
-        "seconds": result.data["external"]["seconds"], "failed": None}
-    assert library.list_sources(limit=10) == []
 
 
-def test_external_error_falls_back_with_reason(monkeypatch):
-    """外部检索抛错 → 同样退回纯主题，但文案要说是**出错**而不是"没有"。"""
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
-
-    def boom(query: str, **kwargs: Any) -> list[Any]:
-        raise httpx.ConnectError("proxy refused")
-
-    monkeypatch.setattr(agent_tools.external_knowledge, "search_external", boom)
-
-    ctx = _ctx()
-    result, _ = _generate(ctx, fake=_tree())
-
-    assert result.ok, result.content
-    assert "外部检索出错" in result.content and "ConnectError" in result.content
-    assert result.data["external"]["failed"].startswith("ConnectError")
 
 
 # ---------------------------------------------------------------- 7 预算
@@ -1154,229 +917,16 @@ def test_default_is_on_and_explicit_zero_still_turns_it_off(monkeypatch):
         assert agent_tools.external_knowledge_enabled() is True, on
 
 
-def test_short_material_falls_back_to_topic_with_a_reason(monkeypatch):
-    """8 字材料不走材料路径，但**文字当提示进 prompt**，并在 `content` 里说清原因。
-
-    这条钉的是上一轮的真问题：材料只有 8 个字，却生成 72 个节点、其中 7 个带引用
-    （密度 9.7%），界面上看不出另外 65 个是模型自己补的。判据不是"少几个引用"，
-    而是**这次压根不该走材料路径**——它切不出可区分的检索单元（见
-    `tools.SHORT_MATERIAL_CHARS`）。
-
-    两个方向都要断言：提示词退回 `DETAIL_PROMPT`（不走检索），而短材料的文字仍然
-    在 user 消息里（用户的输入不能被丢掉，它只是从"语料"变成"说明"）。
-    """
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "0")
-    forbidden: list[Any] = []
-    monkeypatch.setattr(
-        agent_tools.external_knowledge, "search_external",
-        lambda *args, **kwargs: forbidden.append("called") or [])
-
-    ctx = _ctx([_short_material()])
-    result, calls = _generate(ctx, topic=SHORT_TEXT, fake=_tree())
-
-    assert result.ok, result.content
-    system, user = calls[0]
-    assert system == agent_tools.DETAIL_PROMPT + agent_tools.thinking_block("default") \
-        + agent_tools.DETAIL_NO_SOURCE_RULES
-    assert "本次附带" not in user            # 材料清单一份都不给
-    assert SHORT_TEXT in user                # 但它的文字还在（当主题提示）
-    assert "不足以作为可检索的材料" in user
-    # 用户看得到的那句话
-    assert f"材料只有 {len(SHORT_TEXT)} 字" in result.content
-    assert "这次按主题生成" in result.content
-    assert "外部检索未开启" in result.content
-    # 机器读的那一半
-    codes = {item["code"] for item in result.data["diagnostics"]}
-    assert "MATERIAL_TOO_SHORT" in codes
-    assert "retrieval" not in result.data, "没走材料路径，就不该有这次预检索"
-    assert result.data["material"] == {
-        "chars": len(SHORT_TEXT), "sources": 1,
-        "threshold": agent_tools.SHORT_MATERIAL_CHARS, "degraded": True}
-    assert forbidden == []
 
 
-def test_short_material_is_topped_up_by_external_sources(monkeypatch):
-    """短材料 + 外部搜到：走 RAG，引用指向外部来源，`content` 说清"补全"。
-
-    端到端（`MockTransport` 在传输层之前返回，所以 URL / 参数 / 解析都真跑过）：
-    短材料 → 外部检索 → 入库 → 预检索 → 引用 → 收尾校验。引用**校验之后还在**是
-    这条用例的重点：`verify_source_refs(remove_invalid=True)` 会把指向未知来源的
-    引用静默删掉，"没抛异常"证明不了任何事。
-    """
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
-    monkeypatch.setattr(
-        external, "_client",
-        _client_factory(_router({"wikipedia": WIKI_JSON, "arxiv": ARXIV_EMPTY_XML})))
-
-    seen: dict[str, str] = {}
-
-    def fake(system: str, user: str) -> Any:
-        seen["system"], seen["user"] = system, user
-        payload = json.loads(user[user.rindex("["):])
-        hit = payload[0]
-        return _tree([{"source_id": hit["source_id"], "start": hit["start"],
-                       "end": hit["end"], "quote": hit["quote"]}])
-
-    ctx = _ctx([_short_material("碳中和 政策")])
-    result, _ = _generate(ctx, topic="碳中和", fake=fake)
-
-    assert result.ok, result.content
-    assert seen["system"].startswith(agent_tools.RAG_SOURCE_PROMPT)
-    # 短材料的文字仍然当提示进 prompt，且位置在 evidence 之前（evidence 必须在末尾）
-    assert "碳中和 政策" in seen["user"]
-    assert seen["user"].index("碳中和 政策") < seen["user"].index("本次已对该主题做过一次检索")
-    # 引用落在**外部来源**上，且校验后仍在
-    refs = ctx.candidate.root.children[0].source_refs
-    assert refs, "外部来源的引用被校验剔掉了"
-    assert library.load(refs[0].source_id) is not None
-    # `content` 里同时说清"材料太短"与"外部补全"
-    assert "材料只有 6 字" in result.content
-    assert "并用外部检索到的 1 条资料" in result.content
-    assert "wikipedia" in result.content
-    codes = {item["code"] for item in result.data["diagnostics"]}
-    assert "MATERIAL_TOO_SHORT" in codes
-    assert "GENERATION_FROM_EXTERNAL" in codes
 
 
-def test_default_on_reaches_external_without_setting_the_env(monkeypatch):
-    """不设环境变量（= 默认开）时，一次纯主题生成就能拿到外部引用。
-
-    这一条是"默认开"的**端到端**证据：上面那条只验证了开关的返回值，这条验证它
-    真的接到了 `_generate` 上。少了它，`os.getenv(..., "0")` 打错成别的键也照样全绿。
-    """
-    monkeypatch.delenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, raising=False)
-    monkeypatch.setattr(
-        external, "_client",
-        _client_factory(_router({"wikipedia": WIKI_JSON, "arxiv": ARXIV_EMPTY_XML})))
-
-    def fake(system: str, user: str) -> Any:
-        payload = json.loads(user[user.rindex("["):])
-        hit = payload[0]
-        return _tree([{"source_id": hit["source_id"], "start": hit["start"],
-                       "end": hit["end"], "quote": hit["quote"]}])
-
-    ctx = _ctx()
-    result, calls = _generate(ctx, topic="碳中和", fake=fake)
-
-    assert result.ok, result.content
-    assert calls[0][0].startswith(agent_tools.RAG_SOURCE_PROMPT)
-    assert result.data["external"]["sources"] == 1
-    assert ctx.candidate.root.children[0].source_refs
-    # 有引用时也要说清"依据从外部来"——B 那句话术
-    assert "依据来自外部检索" in result.content
-    codes = {item["code"] for item in result.data["diagnostics"]}
-    assert "GENERATION_FROM_EXTERNAL" in codes
-    # 而且排在**第一条**：前端的诊断面板只列前三条，逐节点 `UNSOURCED_NODE`（一棵树
-    # 里几十条）会把这句话挤到看不见（见 `_generate` 里 `lead` 那段注释）。
-    assert result.data["diagnostics"][0]["code"] == "GENERATION_FROM_EXTERNAL"
 
 
-def test_external_empty_says_it_found_nothing(monkeypatch):
-    """搜不到 → 纯主题，`content` 说"没有搜到外部资料"（不开环境变量也一样）。"""
-    monkeypatch.delenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, raising=False)
-    assert agent_tools.external_knowledge_enabled(), "前提：默认开"
-    monkeypatch.setattr(
-        external, "_client",
-        _client_factory(_router({"wikipedia": WIKI_MISS_JSON, "arxiv": ARXIV_EMPTY_XML})))
-
-    ctx = _ctx()
-    result, calls = _generate(ctx, topic="量子色动力学的渐近自由", fake=_tree())
-
-    assert result.ok, result.content
-    assert calls[0][0] == (agent_tools.DETAIL_PROMPT + agent_tools.thinking_block("default")
-                           + agent_tools.DETAIL_NO_SOURCE_RULES)
-    assert "没有搜到外部资料" in result.content
-    assert "只基于主题" in result.content
-    codes = {item["code"] for item in result.data["diagnostics"]}
-    assert "GENERATION_WITHOUT_EXTERNAL" in codes
-    assert "MATERIAL_TOO_SHORT" not in codes
 
 
-def test_the_three_degradations_speak_differently(monkeypatch):
-    """三种退化各有各的话术：材料太短 / 外部搜到 / 外部搜不到。
-
-    钉的是"用户能看懂这次为什么没有引用（或为什么有）"：
-      A 材料太短 → `MATERIAL_TOO_SHORT`（+ 有没有外部补全）；
-      B 外部搜到 → `GENERATION_FROM_EXTERNAL`；
-      C 外部搜不到 → `GENERATION_WITHOUT_EXTERNAL`。
-    三条 signature 必须**互不出现在对方的 content 里**——只断言"三句话不相等"太松：
-    两句都能带同一个前缀，用户还是分不清。
-    """
-    signatures = {
-        "short": "不足以支撑检索",
-        "external": "依据来自外部检索",
-        "missing": "没有搜到外部资料",
-    }
-    contents: dict[str, str] = {}
-    codes: dict[str, set[str]] = {}
-
-    def record(name: str, result: Any) -> None:
-        contents[name] = result.content
-        codes[name] = {item["code"] for item in result.data["diagnostics"]}
-
-    # A：短材料 + 关掉外部检索（最干净的 A，不带任何外部尾巴）
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "0")
-    record("short", _generate(_ctx([_short_material()]), topic=SHORT_TEXT,
-                              fake=_tree())[0])
-
-    # B：无材料 + 外部搜到
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
-    monkeypatch.setattr(
-        external, "_client",
-        _client_factory(_router({"wikipedia": WIKI_JSON, "arxiv": ARXIV_EMPTY_XML})))
-
-    def fake(system: str, user: str) -> Any:
-        payload = json.loads(user[user.rindex("["):])
-        hit = payload[0]
-        return _tree([{"source_id": hit["source_id"], "start": hit["start"],
-                       "end": hit["end"], "quote": hit["quote"]}])
-
-    record("external", _generate(_ctx(), topic="碳中和", fake=fake)[0])
-
-    # C：无材料 + 外部搜不到
-    monkeypatch.setattr(
-        external, "_client",
-        _client_factory(_router({"wikipedia": WIKI_MISS_JSON, "arxiv": ARXIV_EMPTY_XML})))
-    record("missing", _generate(_ctx(), topic="碳中和的产业政策演变路径",
-                                fake=_tree())[0])
-
-    assert len(set(contents.values())) == 3, contents
-    for name, signature in signatures.items():
-        assert signature in contents[name], (name, contents[name])
-        for other, other_signature in signatures.items():
-            if other != name:
-                assert other_signature not in contents[name], (name, other_signature)
-
-    # 诊断码也必须分得开（遥测/日志按 code 聚合，不读中文句子）
-    assert "MATERIAL_TOO_SHORT" in codes["short"]
-    assert "GENERATION_FROM_EXTERNAL" in codes["external"]
-    assert "GENERATION_WITHOUT_EXTERNAL" in codes["missing"]
-    assert "GENERATION_WITHOUT_EXTERNAL" not in codes["external"]
-    assert "GENERATION_FROM_EXTERNAL" not in codes["missing"]
 
 
-def test_full_mode_keeps_using_a_short_material(monkeypatch):
-    """阈值是**切块参数**的推论，只在 `rag` 形态成立：`full` 下短材料照用。
-
-    `full` 把正文整份放进 prompt，模型看得到每一个字——那里既没有"落不到段落"
-    的问题，也不该因为短就被丢掉（丢的是几个真能挂上引用的节点）。这条用例把
-    "按形态收窄"这个决定钉住：谁哪天把规则放开成全局，这里立刻红。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, SOURCE_MODE_FULL)
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
-    forbidden: list[Any] = []
-    monkeypatch.setattr(
-        agent_tools.external_knowledge, "search_external",
-        lambda *args, **kwargs: forbidden.append("called") or [])
-
-    ctx = _ctx([_short_material()])
-    result, calls = _generate(ctx, topic=SHORT_TEXT, fake=_tree())
-
-    assert result.ok, result.content
-    assert calls[0][0].startswith(agent_tools.SOURCED_DETAIL_PROMPT)
-    assert SHORT_TEXT in calls[0][1]          # 正文照旧整份进 prompt
-    assert "material" not in result.data
-    assert forbidden == []
 
 
 def test_external_query_merges_the_hint_without_repeating_it():
@@ -1393,36 +943,4 @@ def test_external_query_merges_the_hint_without_repeating_it():
     assert agent_tools._external_query("", [_short_material("了解一下")]) == "了解一下"
 
 
-def test_short_material_diverges_from_the_baseline_on_purpose(tmp_path, monkeypatch):
-    """与 `dceae7e` 的**唯一一处有意分叉**，单独钉在这里。
-
-    `test_switch_off_matches_baseline` 用"请求不带材料"跑，它守的是"翻默认值没有
-    改变关闭状态的既有行为"。短材料是例外，而且必须是例外：那条规则是**正确性**
-    修复（8 字材料撑起 72 个节点、界面看不出哪些是编的），不是网络功能，所以它
-    不受"外部检索开关"管辖——关掉开关的用户同样不该被喂一张假依据的图。
-
-    这条用例把分叉的形状钉死：`content` 多了那句说明，`data` 里 `retrieval` 换成
-    `material`，别的地方不许再动。
-    """
-    baseline = _load_baseline_tools(tmp_path, "dceae7e")
-    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "0")
-
-    ctx = _ctx([_short_material()])
-    current, _ = _generate(ctx, topic=SHORT_TEXT, fake=_tree())
-
-    async def old_chat(system: str, user: str, **kwargs: Any) -> Any:
-        return _tree()
-
-    with patch.object(baseline, "chat_async", old_chat):
-        old = asyncio.run(baseline._generate(
-            baseline.GenerateArgs(topic=SHORT_TEXT), _ctx([_short_material()])))
-
-    assert (current.ok, old.ok) == (True, True)
-    assert current.content != old.content
-    assert "不足以支撑检索" in current.content
-    assert "不足以支撑检索" not in old.content
-    # 键集：少一个 `retrieval`（没走预检索）、多一个 `material`（这次被降级了）
-    assert set(old.data) - set(current.data) == {"retrieval"}
-    assert set(current.data) - set(old.data) == {"material"}
-    assert current.data["node_count"] == old.data["node_count"]
 

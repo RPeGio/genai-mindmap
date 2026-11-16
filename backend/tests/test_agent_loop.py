@@ -500,24 +500,24 @@ class BudgetTest(unittest.TestCase):
         「模型调用次数已用完」同时出现，不知道该不该用那份候选。
         """
         async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
-            return {"title": "主题", "root": {"id": "root", "label": "主题", "children": [
-                {"id": "a", "label": "分支一", "children": []},
-                {"id": "b", "label": "分支二", "children": []},
-                {"id": "c", "label": "分支三", "children": []},
-            ]}}
+            if system.startswith(PLAN_PROMPT):
+                return {"branches": ["分支一", "分支二", "分支三"]}
+            return {"children": [{"label": "要点一", "expandable": False}]}
 
-        call = ToolCall(call_id="gen-1", name="mindmap_generate",
-                        arguments={"topic": "机器学习"})
+        call = ToolCall(call_id="gen-1", name="mindmap_generate_deep",
+                        arguments={"topic": "机器学习", "branches": 3,
+                                   "points_per_branch": 2})
         provider = ScriptedProvider([_completion([call], finish="tool_calls")])
         with patch("app.agent.tools.chat_async", new=fake_chat):
-            # 2 次刚好够「外层发工具 + 工具内一次生成」，收尾那轮就没有了
+            # 2 次刚好够「外层发工具 + 工具内那一次骨架」，展开就没有额度了
             events = _collect(
                 _request(budget=RunBudget(max_model_calls=2, max_tool_calls=50)),
                 provider, build_registry("create"))
 
         self.assertEqual(events[-1].type, "done")
         self.assertIsNotNone(events[-1].content)
-        self.assertEqual(events[-1].content.root.label, "主题")
+        # 根节点的 label 就是主题（分片路的根在骨架之前就定好）
+        self.assertEqual(events[-1].content.root.label, "机器学习")
         # 走这条收尾的产物来自模型，不是占位树：前端要据此标来源。
         self.assertEqual(events[-1].mode, "model")
 
@@ -578,15 +578,18 @@ class BudgetTest(unittest.TestCase):
         """预算 1：外层调用 + 工具内部调用合计只能 1 次。
 
         这是实测缺陷的回归：判停只看外层轮数时，预算 1 的 run 仍然发出了
-        4 次真实请求——外层 1 次，`mindmap_generate` 内部又调了 3 次。
+        4 次真实请求（外层 1 次，生成工具内部又调了 3 次）。
         """
         chats: list[str] = []
 
         async def fake_chat(system, user, *, max_tokens=None):
             chats.append(user)
-            return TREE
+            if system.startswith(PLAN_PROMPT):
+                return {"branches": ["分支一", "分支二", "分支三"]}
+            return {"children": [{"label": "要点一", "expandable": False}]}
 
-        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
+        call = ToolCall(call_id="c1", name="mindmap_generate_deep",
+                        arguments={"topic": "机器学习", "branches": 3})
         provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
         with patch("app.agent.tools.chat_async", new=fake_chat):
             events = _collect(
@@ -601,7 +604,7 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(events[-1].limit, "max_model_calls")
 
     def test_budget_two_lets_the_tool_spend_the_second_call(self):
-        """对照：预算 2 时工具能拿到第二次额度并真的生成。
+        """对照：预算 2 时工具能拿到第二次额度并真的出骨架。
 
         没有这一条，预算 1 的"工具内部零次调用"可能只是因为工具永远不调模型。
         """
@@ -609,9 +612,12 @@ class BudgetTest(unittest.TestCase):
 
         async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
             chats.append(user)
-            return TREE
+            if system.startswith(PLAN_PROMPT):
+                return {"branches": ["分支一", "分支二", "分支三"]}
+            return {"children": [{"label": "要点一", "expandable": False}]}
 
-        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
+        call = ToolCall(call_id="c1", name="mindmap_generate_deep",
+                        arguments={"topic": "机器学习", "branches": 3})
         provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
         with patch("app.agent.tools.chat_async", new=fake_chat):
             events = _collect(
@@ -619,10 +625,15 @@ class BudgetTest(unittest.TestCase):
                 provider, build_registry("create"),
             )
 
+        # 第二次额度给了骨架那一次调用：展开一次都没发（额度已经用完）
         self.assertEqual(len(chats), 1)
         self.assertEqual(provider.calls + len(chats), 2)
         snapshot = next(event for event in events if event.type == "snapshot")
-        self.assertEqual(_node_ids(snapshot.content.root), {"root", "a", "b", "b1", "c"})
+        self.assertEqual([branch.label for branch in snapshot.content.root.children],
+                         ["分支一", "分支二", "分支三"])
+        self.assertTrue(all(not branch.children for branch in snapshot.content.root.children))
+        # 候选已经建好，收尾那轮问不了 → done（不是 error）：与上一条同一语义。
+        self.assertEqual(events[-1].type, "done")
 
 
 class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
@@ -763,51 +774,41 @@ class SnapshotEmissionTest(unittest.TestCase):
 
     def test_generate_success_emits_snapshot_with_valid_tree(self):
         async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
-            return TREE
+            if system.startswith(PLAN_PROMPT):
+                return {"branches": ["甲", "乙", "丙"]}
+            return {"children": [{"label": "要点一", "expandable": False},
+                                 {"label": "要点二", "expandable": False}]}
 
-        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "机器学习"})
+        call = ToolCall(call_id="c1", name="mindmap_generate_deep",
+                        arguments={"topic": "机器学习", "branches": 3,
+                                   "points_per_branch": 2, "max_depth": 2})
         provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
         with patch("app.agent.tools.chat_async", new=fake_chat):
             events = _collect(_request(), provider, build_registry("create"))
 
         types = [event.type for event in events]
-        # 顺序即契约：tool_end 之后、done 之前；generate 不产生 op 批次，
-        # 所以这里看不到 ops 帧
-        self.assertEqual(types, ["stage", "tool_start", "tool_end", "snapshot", "done"])
-        self.assertEqual([event.seq for event in events], [1, 2, 3, 4, 5])
+        # 顺序即契约：tool_end 之后、done 之前；分片生成不产生 op 批次，
+        # 所以这里看不到 ops 帧。中间那一段 `node_grow` 是生长预览（骨架落定先报
+        # 根与一级分支，展开时每写出一个子项再报一条），帧数取决于模型给了几个
+        # 节点，所以只钉形状不钉条数。
+        self.assertEqual(types[:2], ["stage", "tool_start"])
+        self.assertEqual(types[-3:], ["tool_end", "snapshot", "done"])
+        self.assertEqual(set(types[2:-3]), {"node_grow"})
+        self.assertEqual([event.seq for event in events], list(range(1, len(events) + 1)))
+
+        labels = [event.label for event in events if event.type == "node_grow"]
+        self.assertEqual(labels[0], "机器学习")          # 根最先报，path=None
+        self.assertLessEqual({"甲", "乙", "丙"}, set(labels))
 
         snapshot = next(event for event in events if event.type == "snapshot")
-        # 整树校验：能重新走一遍契约（id 唯一、层数、children 上限）才算完整，
-        # 补括号拼出来的半棵树过不了这一关
+        # 整树校验：能重新走一遍契约（id 唯一、层数、children 上限）才算完整
         replay = MindMapContent.model_validate(snapshot.content.model_dump())
-        self.assertEqual(_node_ids(replay.root), {"root", "a", "b", "b1", "c"})
+        self.assertEqual([branch.label for branch in replay.root.children],
+                         ["甲", "乙", "丙"])
+        self.assertTrue(all(len(branch.children) == 2 for branch in replay.root.children))
         # snapshot 与 done 必须是同一棵树：两个来源不一致会让前端闪一下
         self.assertEqual(events[-1].content.model_dump(), snapshot.content.model_dump())
 
-    def test_sourced_generate_emits_growth_before_tool_end_and_snapshot(self):
-        async def fake_chat(system, user, *, max_tokens=None, on_delta=None):
-            self.assertIsNotNone(on_delta)
-            text = json.dumps(TREE, ensure_ascii=False)
-            for start in range(0, len(text), 7):
-                await on_delta(text[start:start + 7])
-            return TREE
-
-        source = Source(id="s1", kind="document", status="parsed", text="论文原文。")
-        request = AgentRunRequest(goal="整理论文", intent="create", sources=[source])
-        call = ToolCall(call_id="c1", name="mindmap_generate", arguments={"topic": "论文"})
-        provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
-        with patch("app.agent.tools.chat_async", new=fake_chat):
-            events = _collect(request, provider)
-
-        self.assertEqual([event.type for event in events],
-                         ["stage", "tool_start"] + ["node_grow"] * 5
-                         + ["tool_end", "snapshot", "done"])
-        self.assertEqual([event.seq for event in events], list(range(1, 11)))
-        growth = [event for event in events if event.type == "node_grow"]
-        self.assertEqual([(event.path, event.label) for event in growth],
-                         [(None, "根"), ([], "甲"), ([], "乙"), ([1], "乙一"), ([], "丙")])
-        self.assertTrue(events[-3].ok)
-        self.assertEqual(events[-2].content, events[-1].content)
 
     def test_snapshot_is_not_emitted_when_candidate_already_exists(self):
         """expand / edit 一开始就有候选树：不重复发 snapshot。"""
@@ -970,19 +971,18 @@ class BudgetDefaultsTest(unittest.TestCase):
 
 
 class SourcesContextTest(unittest.TestCase):
-    """来源正文的边界是模型上下文，不再是「合计 20000 字」。
+    """来源正文**没有**体积上限：正文不进 prompt，只进材料清单。
 
-    20000 那个数没有实测依据，而且与 pipeline 的同名常量互相抄写——两处
-    一起错。现在改判 token：装得下就放行，装不下就在开流前说清楚。
+    这条边界原来是"`full` 形态下来源正文合计要装得进模型上下文"（超了在开流前
+    422）。`full` 删除之后那个校验一并删掉了（`docs/ONE-PATH.md`）：正文段从不
+    进 prompt，量它等于量一个不存在的对象。一份 25 万字的材料现在只贡献清单里
+    一行（几十 token），所以下面这条"超大材料放行"就是当下的正确行为。
 
-    **这条边界只在 `full` 形态下存在**：`rag` 形态正文不进 prompt，没有可测的
-    对象，同一份材料必须放行（按形态分叉的用例在 `tests/test_source_mode.py`）。
-    所以下面这条拒绝用例要显式把形态设成 `full`——默认值是 `rag`，不设的话它测
-    的就不再是它名字里那句"超上下文被拒"。
+    份数上限（`MAX_SOURCES=50`）仍然在，见 `sources_not_too_many`。
     """
 
     def test_long_material_within_the_context_is_accepted(self):
-        # 30000 汉字 ≈ 20000 token：字数上限删掉之后必须放行（两种形态都放行）
+        # 30000 汉字 ≈ 20000 token：字数上限删掉之后必须放行
         text = "字" * 30000
         request = AgentRunRequest(
             goal="整理材料",
@@ -992,21 +992,36 @@ class SourcesContextTest(unittest.TestCase):
         # 这份样本必须真的装得下，否则"放行"断言会因为限额变小而失去意义
         self.assertLess(estimate_input_tokens(text), CONTEXT_TOKEN_LIMIT)
 
-    def test_material_over_the_context_is_rejected_while_parsing_the_request(self):
-        """`full` 形态下必须抛 ValueError：只有它会被 FastAPI 收成 422 并把文案带回前端。
+    def test_material_over_the_context_is_accepted_now_that_the_body_never_enters(self):
+        """超过上下文窗口的材料**放行**：正文整份进 prompt 的那条路已经不存在了。
 
-        样本按 `CONTEXT_TOKEN_LIMIT` 现算：限额是可调参数，写死字数的样本在
-        调阈值之后就不再超限，用例会从"超限被拒"悄悄退化成"普通材料被接收"。
+        这条原来断言的是"必须抛 ValueError，被 FastAPI 收成 422"。删掉那个预检
+        之后留着它只会挡住一份本来能处理的材料——它的正文不进 prompt，模型看到的
+        是检索命中与章节标题行。样本按 `CONTEXT_TOKEN_LIMIT` 现算：限额是可调参数，
+        写死字数的样本在调阈值之后就不再超限。
         """
-        with patch.dict("os.environ", {"MINDMAP_SOURCE_MODE": "full"}):
-            with self.assertRaises(ValidationError) as raised:
-                AgentRunRequest(
-                    goal="整理材料",
-                    sources=[Source(kind="text", status="parsed",
-                                    text="字" * int(CONTEXT_TOKEN_LIMIT * 1.6))],
-                )
-        self.assertIn("超过模型上下文上限", str(raised.exception))
-        self.assertIn("请精简后重试，或分成多次生成", str(raised.exception))
+        text = "字" * int(CONTEXT_TOKEN_LIMIT * 1.6)
+        self.assertGreater(estimate_input_tokens(text), CONTEXT_TOKEN_LIMIT)
+
+        request = AgentRunRequest(
+            goal="整理材料",
+            sources=[Source(kind="text", status="parsed", text=text)],
+        )
+
+        self.assertEqual(len(request.sources), 1)
+        self.assertEqual(request.sources[0].text, text)
+
+    def test_too_many_sources_still_get_rejected(self):
+        """份数上限仍然拦，且文案说清"卡住的是清单"而不是"正文太大"。"""
+        with self.assertRaises(ValidationError) as raised:
+            AgentRunRequest(
+                goal="整理材料",
+                sources=[Source(kind="text", status="parsed", text="短文")
+                         for _ in range(60)],
+            )
+        message = str(raised.exception)
+        self.assertIn("超过单次请求上限", message)
+        self.assertIn("清单", message)
 
 
 if __name__ == "__main__":

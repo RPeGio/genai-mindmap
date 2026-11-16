@@ -14,8 +14,9 @@
 写成用例只会测到父块切在哪。拆成两份材料之后这条性质是构造保证的，断言才有
 意义。（这条限制本身值得记下来：同一份材料里兄弟块的内容会随父块一起串门。）
 
-形态前提：分片检索只在 `rag` 下发生（`full` 下正文已在 prompt 里，检索是白花），
-所以本文件默认跑在 `rag`，另有两支用例钉住 `full` 下"不做检索、注册表仍撤掉 deep"。
+形态已不再是一个开关：`MINDMAP_SOURCE_MODE` 与它的 `full` 分支整体删除，判据只剩
+"这次有没有可检索的正文"。所以本文件直接跑在那条唯一的路上；没有正文分支的用例
+（不检索、`retrieval.mode == "off"`）在文末单独一条。
 
 `tests/conftest.py` 默认把 `MINDMAP_PARENT_RETRIEVAL` 关掉（那是为了让检索类用例
 稳定走单级 BM25）。需要两级命中的用例自己打开它——这也正好覆盖了两种开关状态：
@@ -48,7 +49,6 @@ from app.agent.tools import (
     build_registry,
 )
 from app.contracts.source import Source, SourceKind
-from app.generation.service import SOURCE_MODE_ENV
 from app.knowledge.service import EvidenceHit
 
 # 两份互不重叠的材料：一份讲预算审批，一份讲绩效考核。分支标题照这两块起，
@@ -160,9 +160,8 @@ def _codes(result) -> list[str]:
 
 
 @pytest.fixture(autouse=True)
-def _rag_mode(clean_env, monkeypatch):
-    """本文件默认 `rag` 形态：分片检索只在这条路上发生。"""
-    monkeypatch.setenv(SOURCE_MODE_ENV, "rag")
+def _clean_globals(clean_env):
+    """依赖 `clean_env` 清掉宿主机上的凭证与开关（本文件不需要别的形态前提）。"""
     yield
 
 
@@ -678,6 +677,37 @@ def test_branch_hits_accumulate_into_run_context_evidence(monkeypatch):
     assert len(ctx.evidence) == 1
 
 
+# ---------------------------------------------------------------- 8. 没有材料时不检索
+
+
+def test_no_material_means_no_retrieval():
+    """没有可检索正文 → 一次分支检索都不发、`retrieval.mode == "off"`。
+
+    这一段原来是"`full` 形态不检索"的钉子（正文整份在 prompt 里，按支检索是白花）。
+    形态删掉之后判据变成"这次有没有可检索的正文字段"，结论一样：没有正文就没有
+    检索，也没有引用纪律要拼。
+    """
+    searches: list[str] = []
+
+    def spy_search(sources, query, top_k=5, *, filters=None):
+        searches.append(query)
+        return []
+
+    request = AgentRunRequest(
+        goal="整理管理办法", intent="create", sources=[],
+        budget=RunBudget(max_model_calls=20, max_tool_calls=8, max_output_tokens=32768),
+    )
+    empty = RunContext(request=request, candidate=None, sources_by_id={})
+
+    with patch("app.agent.tools.search_parent", new=spy_search):
+        result = _run_deep(empty, _plain_chat, registry_with_sources=False)
+
+    assert result.ok, result.content
+    assert searches == []
+    assert result.data["retrieval"]["mode"] == "off"
+    assert "按支检索" not in result.content
+
+
 def test_evidence_spans_from_every_branch_are_kept(monkeypatch):
     """每支的命中都要进证据集：只把第一支记进去，后面两支的引用会被判越界。"""
     monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
@@ -697,53 +727,3 @@ def test_evidence_spans_from_every_branch_are_kept(monkeypatch):
     assert result.data["retrieval"]["branches_with_hits"] == len(BRANCHES)
 
 
-# ---------------------------------------------------------------- 8/9. 形态与注册表
-
-
-def test_full_mode_never_retrieves_per_branch(monkeypatch):
-    """`full` 形态：一次分支检索都不发，提示词里也没有引用纪律。
-
-    正文整份在 prompt 里，分片检索是白花——而且 `full` 下模型引用没被这次检索
-    命中的段落是合法的，给它加"只许引命中的那一段"反而是错的。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "full")
-    searches: list[str] = []
-
-    def spy_search(sources, query, top_k=5, *, filters=None):
-        searches.append(query)
-        return []
-
-    result = _run_deep(_ctx(), _plain_chat, registry_with_sources=False)
-
-    assert result.ok, result.content
-    assert searches == []
-    assert result.data["retrieval"]["mode"] == "off"
-    assert "按支检索" not in result.content
-
-
-def test_full_mode_still_discards_deep(monkeypatch):
-    """`full` + 有来源：注册表里仍然没有 `mindmap_generate_deep`（行为不变）。
-
-    这是回归钉子：放开 discard 只该在 `rag` 下发生。`full` 下它按主题自由展开
-    的树与材料脱钩却会 ok=True 返回，那条路不能重新长出来。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "full")
-    names = build_registry("create", has_sources=True).names()
-    assert "mindmap_generate_deep" not in names
-    assert "mindmap_generate" in names
-    assert "rag_query" not in names
-
-    # 没有来源时两个生成工具都在场（与形态无关）
-    assert "mindmap_generate_deep" in build_registry("create").names()
-
-
-def test_rag_mode_registry_offers_deep_alongside_generate(monkeypatch):
-    """`rag` + 有来源：两个生成工具都在场，**没有** `rag_query`。
-
-    两条生成路都会在工具内部先检索（整树预检索、分片按支检索），再给检索工具
-    只会让模型连查八次把 `max_tool_calls` 用光、一次生成都没调。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "rag")
-    names = build_registry("create", has_sources=True).names()
-    assert names == ["mindmap_generate", "mindmap_generate_deep"]
-    assert "rag_query" not in names

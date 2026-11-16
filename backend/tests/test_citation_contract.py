@@ -9,17 +9,17 @@
 两半必须同时成立——只说前者，模型会给自主补充的内容挂上编造的引用；只说后者，
 模型退回"没检索到就不写"，正是这次要消灭的空心树。
 
-本文件按改动说明的九条验收点组织（编号与那份清单一一对应）：
+本文件按改动说明的验收点组织（编号与那份清单一一对应，被删形态的编号留空）：
 
-    1. 三份提示词都含同一句契约，`RAG_SOURCE_PROMPT` 里不再有"空着是正确结果"
-    2. 整树生成不再要求模型自己调 `rag_query`
+    1. 树规则提示词含同一句契约；分片的"无证据"规则里不再有"空着是正确结果"
     3. 引用落在父块内但不在命中子块 → 保留 + 一条 warn
     4. 服务端按引文补正偏移（只给 quote 不给偏移）
     5. 同一父块内多处出现 → 标"待核"，保留
     6. 无偏移且无引文、有区间而引文为空 → 都拒
-    7. 零证据：允许零引用，`content` 说明"没有检索到依据"
-    8. `full` 形态不受父块约束
     9. 补查限额：一支最多 1 次、一次运行最多 3 次
+
+原来的 2 / 7 / 8 三条（整树不自行检索、零证据、`full` 不受父块约束）随
+`MINDMAP_SOURCE_MODE=full` 与整树生成一起删除，见 `docs/ONE-PATH.md`。
 
 单层的判定表在 `tests/test_source_refs.py` 里逐格钉着；这里测的是接进生成链之后
 用户实际看到的结果（保留了什么、诊断里有什么）。
@@ -28,12 +28,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
+    BRANCH_NO_EVIDENCE_RULES,
     PLAN_PROMPT,
     SUPPLEMENTARY_MIN_NODES,
     SUPPLEMENTARY_RUN_LIMIT,
@@ -42,10 +43,6 @@ from app.agent.tools import (
 from app.contracts.source import Source, SourceKind
 from app.generation.service import (
     DETAIL_PROMPT,
-    RAG_SOURCE_PROMPT,
-    SOURCE_MODE_ENV,
-    SOURCE_MODE_FULL,
-    SOURCED_DETAIL_PROMPT,
     validate_generated_content,
 )
 from app.knowledge.service import EvidenceHit
@@ -116,19 +113,7 @@ def _codes_of(result) -> list[str]:
     return [item["code"] for item in result.data["diagnostics"]]
 
 
-def _run_generate(sources: list[Source], topic: str, tree: dict):
-    """跑一次 `mindmap_generate`，返回 (结果, 模型收到的 (system, user), ctx)。"""
-    ctx = _ctx(sources)
-    mocked = AsyncMock(return_value=tree)
-    with patch("app.agent.tools.chat_async", new=mocked):
-        result = asyncio.run(build_registry("create", has_sources=bool(sources)).execute(
-            ToolCall(call_id="c-gen", name="mindmap_generate",
-                     arguments={"topic": topic}), ctx))
-    system, user = mocked.await_args.args
-    return result, (system, user), ctx
-
-
-# ---------------------------------------------------------------- 1. 提示词回归
+# ---------------------------------------------------------------- 1. 提示词契约
 
 
 CONTRACT_CLAUSES = (
@@ -138,57 +123,28 @@ CONTRACT_CLAUSES = (
 )
 
 
-@pytest.mark.parametrize("name,prompt", [
-    ("DETAIL_PROMPT", DETAIL_PROMPT),
-    ("SOURCED_DETAIL_PROMPT", SOURCED_DETAIL_PROMPT),
-    ("RAG_SOURCE_PROMPT", RAG_SOURCE_PROMPT),
-])
-def test_every_prompt_states_the_same_contract(name, prompt):
-    """三份提示词必须逐字含同一句契约。
+def test_the_tree_prompt_states_the_contract_verbatim():
+    """纯主题那条路的树规则必须逐字含「内容自由 / 引用标出处」那一句。
 
-    `SOURCED_DETAIL_PROMPT` 与 `RAG_SOURCE_PROMPT` 是 `DETAIL_PROMPT` 的前缀 + 后缀，
-    所以这一条同时证明"这一句只写了一份"——三处各写一遍，改一处就会漂。
+    `DETAIL_PROMPT` 现在只在**没有可检索材料**时被拼进骨架（`_generate_deep`），
+    它承载的三条契约仍然是"补全但不冒充材料"这条产品的底线。整树一次成型的出口
+    删掉之后，这段文字是唯一以"完整树规则"形式存在的副本，所以它得留在用例里。
     """
     for clause in CONTRACT_CLAUSES:
-        assert clause in prompt, (name, clause)
+        assert clause in DETAIL_PROMPT, clause
 
 
-def test_rag_prompt_drops_the_empty_is_correct_rule():
-    """旧契约那一句必须真的消失，只留新的一句。
+def test_no_branch_prompt_keeps_the_old_empty_is_correct_rule():
+    """旧契约那一句必须真的消失，只留"照常写满、引用留空"。
 
     两句同时在场时模型只会执行更保守的那句（"检索不到就不要写"），新契约等于
-    没生效——这正是覆盖率一直上不去的原因之一。
+    没生效——这正是覆盖率一直上不去的原因之一。这条原来钉在 `RAG_SOURCE_PROMPT`
+    上；那份提示词随整树生成删除，判据搬到分片的两份"无证据"规则上。
     """
-    assert "空着是正确结果" not in RAG_SOURCE_PROMPT
-    assert "检索不到就不要写" not in RAG_SOURCE_PROMPT
-    assert "检索不到就按自己的知识展开" in RAG_SOURCE_PROMPT
-    assert "未检索到不等于材料里没有" in RAG_SOURCE_PROMPT
-
-
-# ---------------------------------------------------------------- 2. 整树不再自行检索
-
-
-def test_tree_generation_does_not_ask_the_model_to_retrieve_itself():
-    """整树生成的 system 与清单里都不能再出现"先调 rag_query"。
-
-    这一条路在拼 system 之前已经做过主题预检索（`_retrieve_topic`），命中拼在
-    user 末尾。再要求模型自行检索是重复的：它拿不到新东西，却多花一次 embedding
-    + 一轮对话，而"我还没查过"的自我判断会把整棵树又拉回空心形态。
-    """
-    source = _source()
-    result, (system, user), _ctx_after = _run_generate([source], "预算审批与报销时限", _tree())
-
-    assert result.ok, result.content
-    assert "rag_query" not in system
-    assert "先检索" not in system
-    # user 里那句"要写与材料有关的内容，先调用 rag_query 检索"同样不能再出现：
-    # 模型读的是整条消息，而这次命中已经附在末尾了。
-    # （`GENERATE_EVIDENCE_HEADER` 里还留着"与 rag_query 的返回同形"，那是形状
-    #   说明、不是动作指令，所以按指令措辞断言而不是按工具名。）
-    for phrase in ("先调用 rag_query 检索", "写任何与材料有关的内容之前"):
-        assert phrase not in user, phrase
-    # 前提：这次真的命中了，否则测的是"检索为空"那条退化路
-    assert "本次已对该主题做过一次检索" in user
+    assert "空着是正确结果" not in BRANCH_NO_EVIDENCE_RULES
+    assert "检索不到就不要写" not in BRANCH_NO_EVIDENCE_RULES
+    assert "照常把这一支展开写满" in BRANCH_NO_EVIDENCE_RULES
+    assert "未检索到不等于材料里没有" in BRANCH_NO_EVIDENCE_RULES
 
 
 # ---------------------------------------------------------------- 3. 父块内、子块外
@@ -297,59 +253,6 @@ def test_citation_without_a_quote_is_rejected(ref):
 
     assert content.root.children[0].source_refs == []
     assert "UNVERIFIED_SOURCE_REF" in _codes(diagnostics)
-
-
-# ---------------------------------------------------------------- 7. 零证据
-
-
-def test_zero_evidence_allows_zero_citations_and_says_so():
-    """`rag` 形态一条证据都没检索到：允许零引用，但必须在 `content` 里说明。
-
-    `GENERATION_WITHOUT_EVIDENCE` 是 warn 级诊断——它不参与 ok 判定。一棵"结构完整
-    但没有任何依据"的图仍然可用，用户要能一眼看出它为什么没有引用。
-    """
-    # 正文要长过 `SHORT_MATERIAL_CHARS`：短了会先被"材料太短"的退化规则吃掉，
-    # 走的是 `MATERIAL_TOO_SHORT` 那条路，`GENERATION_WITHOUT_EVIDENCE` 根本不会出现。
-    source = _source("甲乙丙丁戊己庚辛壬癸。" * 30)
-    with patch("app.agent.tools.search_parent", new=lambda *a, **k: []):
-        result, (system, _user), ctx = _run_generate(
-            [source], "量子色动力学的渐近自由", _tree())
-
-    assert result.ok, result.content
-    # 提示词退回"没有材料可标出处"那一份
-    assert system.startswith(DETAIL_PROMPT)
-    assert all(not child.source_refs for child in ctx.candidate.root.children)
-    levels = {item["code"]: item["level"] for item in result.data["diagnostics"]}
-    assert levels["GENERATION_WITHOUT_EVIDENCE"] == "warn"
-    assert "不含任何材料依据" in result.content
-    assert "只基于主题" in result.content
-
-
-# ---------------------------------------------------------------- 8. full 不受父块约束
-
-
-def test_full_mode_ignores_the_parent_block_constraint(monkeypatch):
-    """`full` 形态：正文整份在 prompt 里，引用任何段落都合法。
-
-    引用刻意选在**父块内、命中区间外**——如果父块约束被错误地施加到这条路上，
-    它必然会被标成 `SOURCE_REF_OUTSIDE_EVIDENCE`，所以这条断言有区分度。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, SOURCE_MODE_FULL)
-    source = _source()
-    ctx = _ctx([source])
-    ctx.record_evidence([_evidence(source)])
-
-    mocked = AsyncMock(return_value=_tree([_ref(OUTSIDE)]))
-    with patch("app.agent.tools.chat_async", new=mocked):
-        result = asyncio.run(build_registry("create", has_sources=True).execute(
-            ToolCall(call_id="c-gen", name="mindmap_generate",
-                     arguments={"topic": "整理制度"}), ctx))
-
-    assert result.ok, result.content
-    system, _user = mocked.await_args.args
-    assert system.startswith(SOURCED_DETAIL_PROMPT)
-    assert "SOURCE_REF_OUTSIDE_EVIDENCE" not in _codes_of(result)
-    assert [ref.quote for ref in ctx.candidate.root.children[0].source_refs] == [OUTSIDE]
 
 
 # ---------------------------------------------------------------- 9. 补查限额

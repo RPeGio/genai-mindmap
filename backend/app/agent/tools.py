@@ -1,17 +1,19 @@
-"""工具注册表与五个业务工具。
+"""工具注册表与四个业务工具。
 
 注册表只负责分派与参数校验，业务逻辑在各个 `_xxx` 函数里。
 
-五个工具的划分照「用户意图 + 作用域」而不是 CRUD 动词：
-- `mindmap_generate` 只在没有导图时可用，一次调用产出一整棵候选树
-- `mindmap_generate_deep` 同样只在没有导图时可用，但拆成「骨架 → 并发展开 →
-  验收 → 局部重试」四段，复杂主题用它（理由见该函数的 docstring）。它不读任何
-  来源正文，所以请求带材料时注册表根本不注册它——那条路会产出一棵与材料无关
-  的树，而且成功返回
+四个工具的划分照「用户意图 + 作用域」而不是 CRUD 动词：
+- `mindmap_generate_deep` 只在没有导图时可用，拆成「骨架 → 并发展开 → 验收 →
+  局部重试」四段（理由见该函数的 docstring）。它是**唯一**的生成路：有材料时
+  分片 + 按支检索实测 30.5%，而整树一次成型只能靠一次 top_k=5 的预检索，
+  实测 5.1%（`docs/ONE-PATH.md`、`docs/RAG-DECISIONS.md` 第 5 节）
 - `node_expand` 只能在已选中的节点下加子节点，不能删、不能移
 - `rag_query` 只读，查本次请求带来的来源**与知识库**（`library=True`，默认开；
   库命中的 `source_id` 是持久 id，收尾校验前要用 `library.load()` 取回原文）
 - `mindmap_edit` 才允许改/删/移，且必须按节点 id
+
+`create` 只剩这一条生成路：整树一次成型的 `mindmap_generate` 已随
+`MINDMAP_SOURCE_MODE=full` 形态一起删除（决策与代价见 `docs/ONE-PATH.md`）。
 
 这样切是为了把「改错地方」的风险压到协议层：`node_expand` 的入参里没有
 `parent_id` 的自由度（只能是你当前选中的那个），模型想乱挂也挂不了。
@@ -33,7 +35,7 @@ from typing import Any, Callable, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.agent.contracts import MAX_SOURCES, RunContext, ToolCall, ToolResult, ToolSpec
+from app.agent.contracts import RunContext, ToolCall, ToolResult, ToolSpec
 from app.agent.ops import (
     TEMP_ID_PREFIX,
     apply_ops,
@@ -55,26 +57,17 @@ from app.contracts.ops import OpBatch, OpError
 from app.contracts.source import Source, SourceKind, SourceMetadata, SourceUsage
 from app.generation import budget
 from app.generation.service import (
+    CONTENT_FREEDOM_CONTRACT,
     CONTEXT_TOKEN_LIMIT,
     DETAIL_NO_SOURCE_RULES,
-    DETAIL_PROMPT,
     EXTERNAL_TRUST_RULES,
     MIN_BRANCHES,
-    RAG_SOURCE_PROMPT,
-    RAG_THINKING_GUARD,
-    SOURCE_MODE_RAG,
-    SOURCED_DETAIL_PROMPT,
-    SOURCED_THINKING_GUARD,
     GenerationError,
     chat_async,
-    ensure_input_within_context,
     estimate_input_tokens,
     max_tokens_cap,
-    source_mode,
     thinking_block,
-    validate_generated_content,
 )
-from app.generation.stream_partial import collect_new_nodes, parse_partial
 from app.knowledge import external as external_knowledge
 from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
@@ -88,8 +81,7 @@ from app.knowledge.service import (
     search_multi,
     search_parent,
 )
-from app.optimization.service import check
-from app.optimization.source_refs import EvidenceSpan, annotate_nli, verify_source_refs
+from app.optimization.source_refs import EvidenceSpan, verify_source_refs
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +158,8 @@ DEEP_BRANCH_TOP_K = 3
 BRANCH_QUERY_LIMIT = 3
 
 # 分片检索**全部**失败时退回"整树一次检索"的条数。与 `rag_query` 的默认
-# `top_k=5` 同口径：那正是 `mindmap_generate` 那条路拿到的量，退回时用户看到的
-# 证据量与改造前一致，不是"缩水版的降级"。
+# `top_k=5` 同口径：与 `rag_query` 的默认值相同，退回时用户看到的证据量与改造前
+# （整树一次检索那条老路）一致，不是"缩水版的降级"。
 DEEP_FALLBACK_TOP_K = 5
 
 # ---- 限额补查（`_generate_deep` 的 `expand_branch`）---------------------------
@@ -226,11 +218,6 @@ INITIAL_MAX_NODES = budget.INITIAL_MAX_NODES
 # 79 变成 1+6+18+54+162 = 241，第一次生成必然撑爆调用预算。
 INITIAL_MAX_DEPTH = budget.INITIAL_MAX_DEPTH
 
-# 截断必须让模型知情，否则它会把半份材料当成全文来整理和引用。
-# 校验用的 sources 始终保留完整原文，只有提示词里的副本可以裁剪。
-SOURCE_TRUNCATED_HINT = "（原文过长，已截断）"
-
-
 # ---------------------------------------------------------------- 知识库开关
 #
 # 知识库（`knowledge/library.py`）让"材料"从**一次请求的临时对象**变成**跨请求
@@ -246,8 +233,8 @@ SOURCE_TRUNCATED_HINT = "（原文过长，已截断）"
 LIBRARY_SEARCH_ENV = "MINDMAP_LIBRARY_SEARCH"
 LIBRARY_SEARCH_TRUTHY = frozenset({"1", "on", "true", "yes"})
 # 数库里有几份材料时的上限。`list_sources` 的计数是 `len()`，给它一个比
-# `prune(keep_count=200)` 的默认值更宽的数没有意义——超过 200 份时清单里写
-# "200 份以上"（见 `_material_manifest`），而 200 正是淘汰策略的稳态规模。
+# `prune(keep_count=200)` 的默认值更宽的数没有意义——超过 200 份时调用方只该
+# 说"200 份以上"，而 200 正是淘汰策略的稳态规模。
 LIBRARY_COUNT_LIMIT = 200
 
 
@@ -291,12 +278,13 @@ def library_available() -> bool:
 
 # ---------------------------------------------------------------- 外部知识检索开关
 #
-# 用户只输一个主题时（`request.sources` 为空），这条链路原先零检索、零引用：
-# `DETAIL_PROMPT + DETAIL_NO_SOURCE_RULES` 明确告诉模型"没有可标出处的材料"。
+# 用户只输一个主题时（`request.sources` 为空，或材料太短被降级），这条链路原先
+# 零检索、零引用：`DETAIL_NO_SOURCE_RULES` 明确告诉模型"没有可标出处的材料"。
 # 打开这个开关之后，主题先被拿去外部源（中文维基 / 快懂百科 / arXiv / OpenAlex /
-# Crossref）搜一次，命中转成 `Source` 入库，然后**原样走有来源那条路**——预检索、
+# Crossref）搜一次，命中转成 `Source` 入库，然后**原样走有来源那条路**——按支检索、
 # 拼证据、引用校验一行不改。所以"主题生成"与"材料梳理"在路径上是同一条：
-# `_generate` 里那个 `if sources:` 才是主路，`else` 只是"连外部都没搜到"的兜底。
+# `_generate_deep` 里那个 `sources` 非空的分支才是主路，空的那一支只是"连外部都
+# 没搜到"时的兜底（纯主题）。
 #
 # 默认**开**（`dceae7e` 之后翻的）。翻之前先量过一轮，理由不再是"技术上做得到"：
 #
@@ -352,7 +340,7 @@ EXTERNAL_HIT_LIMIT = external_knowledge.DEFAULT_LIMIT
 EXTERNAL_SEARCH_STAGE = "external_search"
 
 # 材料总字数低于这个值时不走材料路径，改成"把短材料当主题提示 + 走外部检索/纯主题"
-# （`_generate` 的退化规则，话术见 `MATERIAL_TOO_SHORT`）。
+# （`_generate_deep` 的退化规则，话术见 `MATERIAL_TOO_SHORT`）。
 #
 # 取 `LEAF_MAX_CHARS`（300），而那个数的定义本身就是**引用字段的上限**
 # （`SourceRef.quote` 的 `max_length=300`，`knowledge/service.py` 里把它钉成同一个
@@ -364,7 +352,7 @@ EXTERNAL_SEARCH_STAGE = "external_search"
 #
 #   - `CHUNK_MIN_CHARS=150`：整篇低于 150 时 `_chunk_spans` 连切都不切，一段就是
 #     一块；低于 300 时连子块都只有一块（`_leaf_spans` 在 `end-start <= 300` 时
-#     直接返回整段），于是 `GENERATE_RETRIEVAL_TOP_K=5` 退化成 1 条、
+#     直接返回整段），于是按支检索 `top_k=DEEP_BRANCH_TOP_K=3` 退化成 1 条、
 #     `search_parent` 的"哪一段支撑哪一句"退化成"整篇都在这一条里"；
 #   - 真实案例：8 字材料（`rust 学习路线`）走 `rag` 路径，一次检索只回 1 条 9 字
 #     命中，模型据此生成 72 个节点、其中 7 个带引用（密度 9.7%）——另外 65 个是
@@ -441,7 +429,7 @@ class ToolRegistry:
     async def execute(self, call: ToolCall, ctx: RunContext) -> ToolResult:
         spec = self._specs.get(call.name)
         if spec is None:
-            # 返回而不是抛：模型偶尔会编一个很像的工具名（把 mindmap_generate
+            # 返回而不是抛：模型偶尔会编一个很像的工具名（把 mindmap_generate_deep
             # 写成 generate_mindmap）。写成一条可读错误回给模型，下一轮它通常
             # 能自己改对；抛异常则整个 run 报废。
             return ToolResult(
@@ -482,11 +470,6 @@ class ToolRegistry:
 
 
 # ---------------------------------------------------------------- 参数模型
-
-
-class GenerateArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
 
 
 class GenerateDeepArgs(BaseModel):
@@ -727,7 +710,7 @@ def _nodes_per_call(ctx: RunContext, *, system: str = "") -> int:
 
 def _require_candidate(ctx: RunContext) -> MindMapContent | ToolResult:
     if ctx.candidate is None:
-        return _fail("no_candidate", "当前还没有导图，请先调用 mindmap_generate 生成。")
+        return _fail("no_candidate", "当前还没有导图，请先调用 mindmap_generate_deep 生成。")
     return ctx.candidate
 
 
@@ -1310,48 +1293,6 @@ class _GrowStream:
             await self._report(own, position, child)
 
 
-@dataclass
-class _GenerateGrowStream:
-    """整树响应自带 id，需要把父 id 转成预览协议里的父节点索引链。"""
-
-    ctx: RunContext
-    buffer: str = ""
-    seen: dict[str, str] = field(default_factory=dict)
-    reported: set[tuple[tuple[int, ...] | None, str]] = field(default_factory=set)
-    path_of: dict[str, tuple[int, ...]] = field(default_factory=dict)
-    child_counts: dict[str, int] = field(default_factory=dict)
-    pending: dict[str, list[dict]] = field(default_factory=dict)
-
-    async def feed(self, delta: str) -> None:
-        self.buffer += delta
-        obj = parse_partial(self.buffer)
-        if obj is None:
-            return
-        for parent_id, node in collect_new_nodes(obj, self.seen, self.buffer):
-            await self._report(parent_id, node)
-
-    async def _report(self, parent_id: str | None, node: dict) -> None:
-        if parent_id is not None and parent_id not in self.path_of:
-            # 增量提取顺序异常时可能先拿到孩子；提取器已记住孩子的 id，
-            # 这里若直接跳过，后续 delta 就再也不会返回这些孩子。
-            self.pending.setdefault(parent_id, []).append(node)
-            return
-
-        path: tuple[int, ...] | None = None
-        own: tuple[int, ...] = ()
-        if parent_id is not None:
-            path = self.path_of[parent_id]
-            index = self.child_counts.get(parent_id, 0)
-            self.child_counts[parent_id] = index + 1
-            own = (*path, index)
-
-        # 整树提取器只保留 id/label，不能把它补出的空 children 当作不可展开。
-        await _emit_grow(self.ctx, self.reported, path, node["label"].strip()[:200], None)
-        self.path_of[node["id"]] = own
-        for child in self.pending.pop(node["id"], []):
-            await self._report(node["id"], child)
-
-
 def _audit_branches(
     content: MindMapContent, minimum: int,
 ) -> tuple[list[tuple[int, str, str, int]], list[str]]:
@@ -1496,223 +1437,6 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
     return _TreeAudit(depths=depths, total=total, deepest=deepest, blank=blank, missing=missing)
 
 
-def _source_prompt_input(
-    sources: list[Source], *, system: str = "", retrieval_hint: bool = True,
-) -> str:
-    """把来源拼成模型这次的输入。**形态由 `MINDMAP_SOURCE_MODE` 决定**。
-
-    - `rag`（默认）：只拼一份**材料清单**（标题、字数、类型），正文一个字都不进
-      **这一处**——内容要么靠检索命中，要么靠模型自己的知识。（整次请求里还有检索
-      命中、骨架那一次的章节标题，见 `_material_inputs` 的四种说法。）
-    - `full`：把每份来源的正文整份拼进去（受上下文预算裁剪），行为与
-      `901b484` 逐字节一致，回归用例钉着这一点（`tests/test_source_mode.py`）。
-
-    两种形态的正文可见性完全不同，这是刻意的：`full` 下模型能自己扫全文，
-    检索只是辅助；`rag` 下检索是唯一入口。所以这里没有"材料小就走 full"的
-    折中——行为随材料大小跳变最难排查，短材料一样走检索。
-
-    `retrieval_hint` 只对 `rag` 生效：整树生成（`_generate`）在拼之前已经做过一次
-    主题预检索、命中就附在 user 末尾，这时再指示模型"先调用 `rag_query`"是重复的
-    （见 `RAG_SOURCE_PROMPT` 的注释）。别的入口（`rag_query` / 展开 / 改树）那里
-    模型确实要自己检索，保留提示。
-    """
-    if source_mode() == SOURCE_MODE_RAG:
-        # 清单是模型**唯一**能知道"手上有什么"的地方，而知识库里的材料不在
-        # `sources` 里——不在这里说一句，模型连"库里有东西可查"都无从知道。
-        return _material_manifest(
-            sources, library_total=library_source_count(), retrieval_hint=retrieval_hint)
-    return _full_source_prompt_input(sources, system=system)
-
-
-# 材料清单的上限。清单是**元信息**，超限时截断的只能是清单项，正文在任何情况下
-# 都不进 prompt——"截断正文后拼进去"不是"不放"，是"放一部分"，最难排查。
-#
-# 条数上限与契约的 `MAX_SOURCES` 是同一个数（请求最多带 50 份），直接引用而不是
-# 再写一个 50：两处各写一次，改一处忘一处的结果是"请求收下了、清单里少两份"，
-# 模型连那两份材料存在都不知道。渲染器这里仍然要判一次——`_material_manifest`
-# 也能被直接调用（测试、将来的建库路径），不能假定调用方已经过了契约那关。
-MATERIAL_MANIFEST_MAX_ITEMS = MAX_SOURCES
-# 清单本身的 token 上限。实测 50 条常规行（uuid + 中文标题 + 字数）约 1000 token，
-# 所以常规批量下先撞到的是条数上限；这条 1500 是给"标题很长"那一类兜底的——
-# 80 字标题 × 50 条能到 3000，那时截的是清单项。清单存在的意义只是"知道自己手上
-# 有什么"，涨到两千 token 就本末倒置了。
-MATERIAL_MANIFEST_TOKEN_LIMIT = 1500
-# 单条标题的长度上限。文件名可以是任意长的一串，不夹的话一份材料就能把清单吃满。
-MATERIAL_TITLE_MAX_CHARS = 80
-
-
-def _material_title(source: Source) -> str:
-    """清单里显示的名字：优先文件名（去掉扩展名），没有就用 id 兜底。
-
-    "未命名材料"不写成统一占位，是因为同一批里可能有多份没名字的：都叫
-    "未命名材料"时模型分不清第 1 条和第 3 条是两份不同的东西。
-    """
-    name = (source.filename or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
-    if name:
-        stem, dot, suffix = name.rpartition(".")
-        # `a.b.c` 这种多点名字只吃掉最后一段；没有点、或"扩展名"长得不像扩展名
-        # （超过 5 个字符）时保留原名，免得把《2024 年度报告》里的点当分隔符。
-        if dot and 0 < len(suffix) <= 5:
-            name = stem or name
-    if not name:
-        return source.id
-    return name if len(name) <= MATERIAL_TITLE_MAX_CHARS else name[:MATERIAL_TITLE_MAX_CHARS] + "…"
-
-
-def _material_type_label(source: Source) -> str:
-    """类型标签：有扩展名就给扩展名（pdf/docx/mp3），否则退回 `kind`。
-
-    扩展名比 `kind` 细——`document` 分不出 pdf 与 docx，而模型判断"这份材料能问
-    什么"时，扫描件和表格类文档的可问法并不一样。
-    """
-    name = (source.filename or "").strip()
-    if "." in name:
-        suffix = name.rsplit(".", 1)[-1].strip().lower()
-        if 0 < len(suffix) <= 5 and suffix.isalnum():
-            return suffix
-    return source.kind.value
-
-
-def _material_scale(source: Source) -> str:
-    """规模：文档给字数，语音额外给时长。
-
-    字数取的是**完整** `text` 的长度，不是将要进 prompt 的那部分——rag 形态下没有
-    "进 prompt 的那部分"，这个数字的作用是让模型知道"这份材料值不值得查"。
-    """
-    parts = [f"共 {len(source.text or ''):,} 字"]
-    if source.duration_seconds:
-        total = int(source.duration_seconds)
-        parts.append(f"时长 {total // 60}:{total % 60:02d}")
-    if source.sentences:
-        parts.append(f"{len(source.sentences)} 句带时间戳")
-    return "，".join(parts)
-
-
-def _material_manifest(
-    sources: list[Source], *, library_total: int = 0, retrieval_hint: bool = True,
-) -> str:
-    """`rag` 形态的输入：只有清单，没有正文。
-
-    形状与 `full` 形态的 sources 数组刻意不同（不是 JSON）：两种形态一眼能分出来，
-    排查"这次到底走了哪条路"时不用去读提示词全文。模型也不需要从这个结构里
-    解析任何东西——它只需要知道有哪几份材料、能不能查到。
-
-    `library_total` 是知识库里**另外**还有几份材料（`library_source_count()` 的
-    结果，0 表示关着或空库）。非 0 时在清单末尾加一行，且**只给数字不列文件名**：
-
-      - 不列是刻意的。库的稳态规模是 200 份（`library.prune` 的 `keep_count`），
-        列出来就是又一份"材料清单"，而清单的 1500 token 上限正是为了防止这件事。
-        再说模型对它们的操作只有 `rag_query` 一个，名字没有可操作性。
-      - 不说是"哪一类"也是刻意的：库里的材料与这次请求无关，任何概括都会变成
-        一条错误的先验（"原来库里都是财务制度"）。
-
-    `retrieval_hint=False` 时改写末行：整树生成这条路已经由服务端做过一次主题
-    预检索、命中就附在 user 末尾（`_retrieve_topic`），这时再让模型"先调用
-    `rag_query`"就是让它重复查同一件事——它拿不到新东西，却多花一次 embedding。
-    首行也一并去掉工具名：那一行只需要回答"正文在不在提示词里"。
-
-    默认 0 而不是自己去查库：这个函数是纯渲染器，被测试与将来别的入口直接调用，
-    让它内部读一次持久化状态，等于让"渲染"依赖"库的当前内容"，两次调用之间库变了
-    就会得到两份不同的提示词，而那种差异只会在真机上偶发。
-    """
-    head = ("本次附带 {count} 份材料（你看不到全文，正文不在提示词里）："
-            if not retrieval_hint else
-            "本次附带 {count} 份材料（你看不到全文，需要用 rag_query 检索）：")
-    lines = [head.format(count=len(sources))]
-    used = estimate_input_tokens(lines[0])
-    listed = 0
-    for index, source in enumerate(sources, start=1):
-        line = (f"{index}. 《{_material_title(source)}》"
-                f"（id={source.id}，{_material_scale(source)}，{_material_type_label(source)}）")
-        cost = estimate_input_tokens(line)
-        # 两个上限都要判：条数防"份数爆掉"，token 防"单条超长把预算吃满"。
-        # 截断的永远是清单项——正文从一开始就没打算进来。
-        if listed >= MATERIAL_MANIFEST_MAX_ITEMS or used + cost > MATERIAL_MANIFEST_TOKEN_LIMIT:
-            break
-        lines.append(line)
-        used += cost
-        listed += 1
-    if listed < len(sources):
-        # 必须说出来。少列几份却不说，模型会以为手上的材料就这些，
-        # 于是"清单里没有"被它读成"材料里没有"。
-        lines.append(f"（另有 {len(sources) - listed} 份材料未在清单里列出，"
-                     "同样可以用 rag_query 检索到。）")
-    if library_total > 0:
-        # `LIBRARY_COUNT_LIMIT` 是计数上限，撞到它说明库比这个数更多；写成
-        # "200 份以上"而不是"200 份"——四舍五入成一个确定数字会让模型以为
-        # 它数得清，而它接下来要判断的是"要不要去查"，不是"到底几份"。
-        shown = (f"{library_total} 份以上" if library_total >= LIBRARY_COUNT_LIMIT
-                 else f"{library_total} 份")
-        lines.append(f"知识库中另有 {shown}过往材料，同样可以用 rag_query 检索到。")
-    lines.append(
-        "要写与材料有关的内容，先调用 rag_query 检索；引用逐字取自检索结果。"
-        if retrieval_hint else
-        "与材料有关的原文片段由系统检索后附在本条消息末尾（evidence 数组）："
-        "引用逐字取自它，不必自己再查。"
-    )
-    return "\n".join(lines)
-
-
-def _full_source_prompt_input(sources: list[Source], *, system: str = "") -> str:
-    """`full` 形态：把来源拼成 `SOURCED_DETAIL_PROMPT` 约定的 sources 数组。
-
-    必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而旧流水线
-    的 `_understand()`（已随 `app/pipeline/` 删除）返回的是纯文本合并，里面一个
-    id 都没有——模型看不见 id 就永远写不出合法引用，引用功能等于从来没通。那种
-    形态服务于限长与 demo 路径，语义不同，不能在这里复用。
-
-    用 `ensure_ascii=False`：中文原样传输，模型看到的 token 更少，
-    也免得它把 `\\u4e2d` 这种转义当成正文抄进 quote。
-    """
-    items = [
-        {
-            "source_id": source.id,
-            "text": source.text or "",
-        }
-        for source in sources
-    ]
-
-    def render() -> str:
-        return "sources 数组（JSON）：\n" + json.dumps(items, ensure_ascii=False)
-
-    system_tokens = estimate_input_tokens(system)
-
-    def fits() -> bool:
-        return estimate_input_tokens(render()) + system_tokens <= CONTEXT_TOKEN_LIMIT
-
-    if fits():
-        return render()
-
-    # 预算属于整次请求：系统提示词、所有来源的 JSON 转义与截断提示都要算。
-    # 先给后续来源留出标识与提示，再按原顺序用剩余额度，避免每份各占一整窗。
-    for item in items:
-        item["text"] = SOURCE_TRUNCATED_HINT if item["text"] else ""
-    ensure_input_within_context(
-        render(), limit=CONTEXT_TOKEN_LIMIT, extra_tokens=system_tokens,
-    )
-    for source, item in zip(sources, items):
-        def fits_source(text: str) -> bool:
-            item["text"] = text
-            return fits()
-
-        item["text"] = _clip_source_text(source.text or "", fits=fits_source)
-    return render()
-
-
-def _clip_source_text(text: str, *, fits: Callable[[str], bool]) -> str:
-    """用实际提示词的 token 估算找最长前缀，避免中英文共用一个字符闸。"""
-    if fits(text):
-        return text
-    low, high = 0, len(text) - 1
-    while low < high:
-        middle = (low + high + 1) // 2
-        if fits(text[:middle] + SOURCE_TRUNCATED_HINT):
-            low = middle
-        else:
-            high = middle - 1
-    return text[:low] + SOURCE_TRUNCATED_HINT
-
-
 def _selection_scope_error(
     content: MindMapContent, args: EditArgs, ctx: RunContext,
 ) -> ToolResult | None:
@@ -1808,9 +1532,9 @@ def _skeleton_outline(sources: list[Source]) -> str:
     """拼给骨架的目录块；不该拼时返回空串。
 
     目录是**原文的子集**，和 `_material_inputs` 给 planner 的那前 200 字同一类：
-    `rag` 形态下"正文不进 prompt"这句话的准确版本是"正文不进，标题行作为结构线索
-    会进"（措辞见 `_material_inputs` 的 docstring 与 `generation.service` 里
-    `SOURCE_MODE_ENV` 的注释）。这里进 prompt 的只有标题行，一条最多 40 字。
+    "正文不进 prompt"这句话的准确版本是"正文不进，标题行作为结构线索会进"
+    （措辞见 `_material_inputs` 的 docstring 与 `generation.service` 里那段
+    "材料怎么进 prompt"的注释）。这里进 prompt 的只有标题行，一条最多 40 字。
 
     三件事一起做：取目录、判覆盖率、渲染。判覆盖率必须用**裁剪后**的那份目录
     （`outline_coverage(sources, entries)` 而不是不带参数的调用），否则"覆盖率
@@ -1909,9 +1633,9 @@ SUBNODE_EXPAND_PROMPT = (
 # ——改基础格式等于给"这一支没有证据"那条路也塞一个 `source_refs` 字段，而那条路
 # 上一个字都不该抄。
 #
-# 逐字照抄那一句与 `RAG_SOURCE_PROMPT` 同源（那里是整树生成用的），但不能复用：
-# 那份提示词讲的是"你看不到全文，检索结果附在末尾"，而这里模型手里已经有一支的
-# 命中，措辞必须指向 evidence 数组本身。
+# 逐字照抄那两句与 `rag_query` 返回的形状同源（同一套 `_citable_hits` 渲染），
+# 但不能复用一份提示词：`rag_query` 回给模型的是一串裸 JSON、它知道来自哪个工具；
+# 这里模型手里已经有一支的命中，措辞必须指向本次 user 消息末尾的 evidence 数组。
 #
 # 内容与出处分两句说（与 `generation.service.CONTENT_FREEDOM_CONTRACT` 同一契约）：
 # 上一版只写了"引用只能从本支的 evidence 里抄…找不到依据就给空数组"，模型把前半句
@@ -1953,36 +1677,6 @@ BRANCH_NO_EVIDENCE_RULES = (
     "source_refs 一律给空数组：没有依据可标时挂一个引用就是编造。"
     '如果你判断这一支里有关键论断需要材料依据，在响应里带一个与 children 同级的'
     '字段 "needs_evidence": true，系统会为这一支再检索一次。\n'
-)
-
-
-# `rag` 形态下生成前那次主题检索取几条。对齐 `RagArgs.top_k` 的默认值（5）而不是
-# `DEEP_BRANCH_TOP_K=3`：这里是**整棵树**一次覆盖主题的全部方面，而分片那 3 条是
-# **一支**的量。父块折叠（`_fold_to_parents`）还会再减一轮，实际落到模型手上的
-# 条数常少于 5；往下调省的是两三千字符，代价是漏掉整节内容，划不来。
-GENERATE_RETRIEVAL_TOP_K = 5
-
-# 命中渲染进 user 消息时的表头。`_rag` 回给模型的是一串裸 JSON 数组（那就是工具
-# 返回值的全部内容，模型知道它来自哪个工具），而这里同一段 JSON 出现在 prompt 里、
-# 没有工具名作上下文：不说清"这是什么、与 rag_query 的返回同形"，模型会把一段
-# 来历不明的数组当成参考资料，或者干脆当没看见。
-GENERATE_EVIDENCE_HEADER = (
-    "\n本次已对该主题做过一次检索，结果如下"
-    "（evidence 数组，与 rag_query 的返回同形）：\n"
-)
-
-# 有命中时拼在 system 末尾的那一句。
-#
-# `RAG_SOURCE_PROMPT` 已经写明"与主题相关的原文片段由系统检索后附在输入末尾"，
-# 这一句仍要单独留着：它把"这次已经查过了"说成一句明确的话。少了它，模型一边看着
-# evidence 一边觉得"我还没检索过"，会再查一遍同一件事——成本是一次 embedding +
-# 一轮对话，回报是零（同一份清单、同一个问法，回来的还是那几条）。
-#
-# 位置与 `BRANCH_EVIDENCE_RULES` 同理，拼在基础提示词与思维限定之后：它只描述
-# 这次的输入形状，不改树规则。
-GENERATE_EVIDENCE_RULES = (
-    "\n本次的 user 消息末尾已经附上「对主题做过的一次检索结果」（evidence 数组）："
-    "这一次不必再检索同一件事，直接用它的片段写内容与引用。\n"
 )
 
 
@@ -2084,6 +1778,15 @@ def _external_source_names(sources: Sequence[Source]) -> str:
     return "、".join(names) or "外部"
 
 
+def _has_external_source(sources: Sequence[Source]) -> bool:
+    """这批来源里有没有外部检索抓回来的（`kind` 是 `web` / `paper`）。
+
+    只用于决定要不要拼 `EXTERNAL_TRUST_RULES`：给一批纯用户上传的材料加一句
+    "这是不可信数据"会让模型对用户的材料也过敏，加免责声明、写得更保守。
+    """
+    return any(source.kind in (SourceKind.web, SourceKind.paper) for source in sources)
+
+
 def _external_stage_text(fetch: _ExternalFetch) -> str:
     """外部检索结束那一帧给人看的话。四种结果四句话。
 
@@ -2119,14 +1822,14 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
          并在 `content` 里说明。生成不能因为一次外网超时失败。
 
     耗时与条数各记一行日志：这是用户点"生成"之后**多出来的**一次等待，混在总耗时
-    里就永远看不出"慢在哪"（与 `_retrieve_topic` 的同一条规矩）。
+    里就永远看不出"慢在哪"（与 `_search_branch` 的同一条规矩）。
     """
     started = time.perf_counter()
     query = (topic or "").strip()
     try:
         # 同步函数，最多 `external_knowledge.REQUEST_LIMIT` 次 HTTP 往返、墙钟上限
         # `DEADLINE_SECONDS`。直接在协程里调会把事件循环按住这么久——同进程里别人的
-        # 流式响应会跟着卡（同 `_retrieve_topic`）。
+        # 流式响应会跟着卡（同 `_search_branch`）。
         hits = await asyncio.to_thread(
             external_knowledge.search_external, query, limit=EXTERNAL_HIT_LIMIT)
     except Exception as exc:  # noqa: BLE001 — 外部检索失败只降级，理由见 docstring
@@ -2156,532 +1859,7 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
     return _ExternalFetch(built, len(hits), elapsed)
 
 
-@dataclass(frozen=True)
-class _TopicEvidence:
-    """`rag` 形态下生成前那一次主题检索的产物。
-
-    `text` 为空串 = "没有能交给模型的证据"，这时 `failure` 区分两种原因：非空是
-    **检索本身出错**（换个配置或重试可能就有了），非空之外的 None 是**材料里确实
-    没命中**（问法能改，材料不会变）。两者给用户的文案必须分开——把"这次没查成"
-    说成"材料里没有"是谎报，反过来则是让人白等一次重试。
-    """
-
-    hits: list[EvidenceHit]
-    payload: list[dict[str, Any]]
-    spans: tuple[EvidenceSpan, ...]
-    text: str
-    elapsed: float
-    failure: str | None = None
-
-
-async def _retrieve_topic(sources: list[Source], topic: str) -> _TopicEvidence:
-    """`rag` 形态生成前的**一次**主题级检索：先把材料里与主题有关的原文拿到手。
-
-    为什么必须有这一步：`_source_prompt_input` 在 `rag` 形态下只拼材料清单（标题、
-    字数、类型），而 `mindmap_generate` 自己**没有检索入口**——模型的 `rag_query`
-    命中留在对话里，进不了这次生成的 user 消息。于是模型手里一个字都没有：旧契约
-    下它会照 `RAG_SOURCE_PROMPT` 说"检索不到就不要写"交出一条"材料中没有相关内容：
-    未检索到任何原文依据"，被 `MIN_BRANCHES=3` 判成 `invalid_map`；新契约下它倒是
-    敢写了，但一个字的原文都没见过，"标明出处"就无从谈起——所以这一次预检索不是
-    可选项，它是引用能成立的前提。
-
-    实测：同一主题、同一份材料，`full` 形态给 5 条分支，加了这一步之前 `rag` 形态
-    只给 1 条"没检索到"——差别不在模型，在输入。新契约上线后提示词侧还额外删掉了
-    "让模型自己调 `rag_query`"那条要求（重复检索拿不到新东西，见 `RAG_SOURCE_PROMPT`
-    的注释），命中只有这一个入口。
-
-    检索栈与 `_rag` 是同一套（`search_parent`：子块匹配、父块返回、`MINDMAP_RERANK`
-    打开时带重排），所以命中形状不需要第二套定义；渲染也复用 `_citable_hits`，
-    模型看到的 `evidence_*` 与 `rag_query` 返回的逐字段相同——两套形状会让它按一种
-    抄、被另一种校验。
-
-    只对真有正文的 `sources` 做：调用方（`_generate`）已经滤掉空来源，这里不重复
-    过滤——两处各滤一次，口径迟早分叉。
-
-    永不抛：检索失败只降级（退回"无来源"生成），不该废掉整次生成。失败与空命中
-    靠 `failure` 分开（见 `_TopicEvidence`）。
-
-    耗时单独记一行日志：这是用户点"生成"之后**多出来的**一次等待（embedding 一次
-    往返 + 重排 0.6–0.9 秒），混在总耗时里就永远看不出"慢在哪"。
-    """
-    query = (topic or "").strip()
-    started = time.perf_counter()
-    try:
-        # 与 `_search_branch` 同理：`search_parent` 是同步函数，里面有一次 embedding
-        # 网络往返。直接在协程里调用会把整个事件循环按住，同一个进程里别人的流式
-        # 响应跟着卡住。
-        hits = await asyncio.to_thread(
-            search_parent, sources, query, GENERATE_RETRIEVAL_TOP_K)
-    except Exception as exc:  # noqa: BLE001 — 检索失败只降级，理由见 docstring
-        elapsed = time.perf_counter() - started
-        reason = _reason_text(exc)
-        logger.warning("mindmap_generate 主题预检索失败（top_k=%d，耗时 %.2fs）：%s",
-                       GENERATE_RETRIEVAL_TOP_K, elapsed, reason)
-        return _TopicEvidence((), (), (), "", elapsed, reason)
-
-    elapsed = time.perf_counter() - started
-    payload = _citable_hits(hits, sources)
-    logger.info(
-        "mindmap_generate 主题预检索：%d 条命中（top_k=%d），耗时 %.2fs%s",
-        len(payload), GENERATE_RETRIEVAL_TOP_K, elapsed,
-        "" if payload else "；没有命中，这次按无来源形态生成",
-    )
-    return _TopicEvidence(
-        hits=hits,
-        payload=payload,
-        spans=tuple(
-            EvidenceSpan(hit.source_id, hit.start, hit.end, hit.leaf_start, hit.leaf_end)
-            for hit in hits
-        ),
-        text=(GENERATE_EVIDENCE_HEADER + json.dumps(payload, ensure_ascii=False)
-              if payload else ""),
-        elapsed=elapsed,
-    )
-
-
 # ---------------------------------------------------------------- 工具实现
-
-
-async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
-    if ctx.request.intent != "create":
-        return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
-    if ctx.candidate is not None and ctx.candidate.root.children:
-        return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
-
-    # 只喂真的有正文的来源：`status` 是给界面看的，模型能用的是 text。
-    # 不过滤的话，一个还没解析成功的空来源会让 validate_generated_content
-    # 重建 source_usage 时撞上 char_count >= 1，把整次生成判成失败——
-    # 用户只是多勾了一个空文件，却得到"模型返回的导图不合法"。
-    picked = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
-    # 材料太短 → 当成"没有材料"（理由与阈值见 `SHORT_MATERIAL_CHARS`）。
-    #
-    # 这里**不改 `ctx.request.sources`**：材料是用户给的，界面上还要显示它、它还在
-    # 收尾校验的可查来源里（`_verify_sources`）。被改掉的只是"这次喂给模型什么"——
-    # 一份 8 字的材料塞进 `rag` 路径之后，检索只会回 1 条 9 字命中，模型据此生成
-    # 72 个节点、7 个带引用，而界面看不出另外 65 个是它自己补的。
-    #
-    # 它仍然有用：作为外部检索的**主题提示**（`_external_query`）。所以这条退化
-    # 不是"丢掉用户的输入"，是"换个用法"。
-    #
-    # **只在 `rag` 形态生效**，这是阈值本身的推论而不是遗漏：`SHORT_MATERIAL_CHARS`
-    # 的全部依据是切块参数（一段切不出两个可区分的检索单元），而切块只发生在 `rag`。
-    # `full` 形态把正文整份放进 prompt，模型看得到每一个字，300 字以下的材料在那里
-    # 既没有"落不到段落"的问题、也不该因为短而被丢掉——那会白白损失几个真能挂上
-    # 引用的节点。
-    material_chars = sum(len((source.text or "").strip()) for source in picked)
-    short_material = (
-        picked
-        if 0 < material_chars < SHORT_MATERIAL_CHARS and source_mode() == SOURCE_MODE_RAG
-        else []
-    )
-    sources = [] if short_material else picked
-    # 额度在调用**之前**占：请求一旦发出就是一次真实计费，哪怕它随后抛错。
-    # 只在成功后记账会让预算在工具执行期间被超支使用（预算 1 实测跑出 4 次）。
-    if not ctx.reserve_model_call():
-        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图。")
-    ctx.extra_model_calls += 1
-    # 没有材料时先去外部知识源搜一次。默认开（实测与失败场景见 `EXTERNAL_KNOWLEDGE_ENV`
-    # 上面那段注释）；关着时这整块跳过，一次请求都不发、提示词与 `content` / `data`
-    # 与 `dceae7e` 逐字节相同。
-    #
-    # "没有材料"包含两种输入：本来就没传，以及传了但太短（`short_material`）。两者
-    # 走到这里是同一个理由——都拿不出可检索的正文；差别只在于后者的文字被并进了
-    # 查询词，而且它必须**被说出来**（`MATERIAL_TOO_SHORT`），否则用户会以为那 8 个字
-    # 被当成材料用了。
-    #
-    # 排在 `reserve_model_call` **之后**：额度已经占掉了，这时再去做一件"可能白等
-    # 20 秒"的事，至少要保证后面的模型调用还有额度——反过来就是白等一场之后才
-    # 被告知额度已用完。
-    #
-    # 拿到结果之后**不做任何特殊处理**：它们只是 `sources`，下面的 `if sources:`
-    # 分支、`_retrieve_topic`、`_citable_hits`、`verify_source_refs` 全都照旧跑。
-    # 这就是"外部结果一律转成 Source 并入库"的全部好处——引用校验、父块坐标、
-    # `library.load` 回查自动成立，没有第二条链要维护。
-    external: _ExternalFetch | None = None
-    if not sources and external_knowledge_enabled():
-        # 检索期间界面上什么都不动，看起来像卡死（实测中位 4.3 秒、最坏 20 秒）。
-        # 一帧"开始"、一帧"结束"，两帧都在 `_run_tool` 里被立刻转发出去——工具跑
-        # 在任务里，主循环一边等一边转帧，所以这行 await 不会把帧憋住。
-        await _emit_stage(ctx, EXTERNAL_SEARCH_STAGE, "正在检索外部资料…")
-        external = await _external_sources(_external_query(args.topic, short_material), ctx)
-        # 结束帧**一定带 count**（包括 0）：前端靠"有没有这个字段"区分开始与结束，
-        # `0` 与"还没结束"必须分得开。
-        await _emit_stage(
-            ctx, EXTERNAL_SEARCH_STAGE, _external_stage_text(external),
-            count=len(external.sources),
-        )
-        sources = external.sources
-    # 太短的材料**不当语料、但当说明**：文字仍然进 prompt（用户写的东西一个字都
-    # 不丢），只是它不再产生 evidence、不再产生引用。上面那次外部检索也用它当了
-    # 查询词（`_external_query`），两处用的是同一份文字、不同的用途。
-    #
-    # 为什么不直接拼进 `args.topic`：主题是这张图的中心节点，把那 8 个字并进去会
-    # 改变 `content.title` 与检索问法；提示是附加说明，位置分开、语义才不混。
-    hint_block = ""
-    if short_material:
-        hint_block = (
-            "\n\n用户还附了这段文字（{chars} 字，太短，不足以作为可检索的材料，"
-            "只当作主题的补充说明，不要从它里面挑句子当引用）：\n{hint}"
-        ).format(chars=material_chars,
-                 hint=" ".join((source.text or "").strip() for source in short_material))
-    # `rag` 形态下这一次主题检索的产物；`full` 形态与无来源那条路恒为 None。
-    topic_evidence: _TopicEvidence | None = None
-    try:
-        # 思维模型只改「怎么拆」，不改「拆什么」：拼在基础提示词之后、来源输入
-        # 之前（来源在 user 消息里）。有来源时要多带一句限定，否则「必须举反例」
-        # 这类要求会被当成展开许可，模型开始补写材料里没有的内容。
-        thinking = thinking_block(ctx.request.thinking_model)
-        # 无消费者时连 on_delta=None 都不传，保留原来的一次性调用约定。
-        # 回调失败的隔离与流式退回仍交给 chat_async，预览不参与候选树校验。
-        stream_kwargs = {}
-        if ctx.emit is not None:
-            stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
-        # 这批来源里混进了外部检索的正文时，多带一句"这是不可信数据"。
-        # 只在这种时候拼：给一条无关的警告会让模型对用户上传的材料也过敏。
-        external_rules = (
-            EXTERNAL_TRUST_RULES
-            if any(source.kind in (SourceKind.web, SourceKind.paper) for source in sources)
-            else ""
-        )
-        if sources:
-            # 两种形态的提示词不能混用（理由见 `RAG_SOURCE_PROMPT` 的注释）：
-            # `rag` 下输入里没有正文，`full` 下的提示词却在教模型怎么读 sources 数组。
-            # 判定放在**拼 system 的地方**而不是 `_source_prompt_input` 内部：
-            # 那一层只负责"给点什么"，提示词与输入必须是同一次判定的产物，
-            # 否则一次请求里两次读环境变量，理论上能拼出 A 的提示词配 B 的输入。
-            if source_mode() == SOURCE_MODE_RAG:
-                # `rag` 下清单里一个字的正文都没有，而这个工具**自己不做检索**：
-                # 不在这里补一次，模型手里就一个字都没有——按旧契约它会交出一条
-                # "材料中没有相关内容"的分支（详见 `_retrieve_topic`）。
-                topic_evidence = await _retrieve_topic(sources, args.topic)
-                # 命中并进本次运行的证据集：收尾的 `verify_source_refs` 要按它判
-                # "这条引用落在可见的父块里吗"。与 `_rag` 累积的是同一份东西，
-                # 两条路各记一份的话，"校验依据"会与"模型看到的证据"分叉。
-                ctx.record_evidence(topic_evidence.spans)
-                if topic_evidence.text:
-                    system = (RAG_SOURCE_PROMPT + thinking + RAG_THINKING_GUARD
-                              + GENERATE_EVIDENCE_RULES + external_rules)
-                    raw = await chat_async(
-                        system,
-                        _source_prompt_input(
-                            sources, system=system, retrieval_hint=False
-                        ) + hint_block + topic_evidence.text,
-                        max_tokens=_max_tokens(ctx), **stream_kwargs,
-                    )
-                else:
-                    # 检索为空/出错 → **退回无来源形态**（用户至少拿到一张能用的图）。
-                    #
-                    # 另一条路是"仍然按 rag 提示词生成"：那样模型会说"没检索到"，
-                    # 一条分支、`invalid_map`——就是这次的 bug。所以走这条：
-                    # `DETAIL_PROMPT` 是"按主题展开框架"的提示词，它不承诺材料依据，
-                    # 也不教模型写引用。输入只给主题，不给清单：清单里那句"你看不到
-                    # 全文"会让模型以为还有别的东西没拿到，反而不敢写。
-                    #
-                    # 校验仍然带着来源与证据（不在这里把 `sources` 判成 None）：
-                    # 模型在**本次运行的前几轮**可能已经 `rag_query` 到过真实片段，
-                    # 它据此写出的引用是合法的，不该因为这一次主题检索没命中就全删。
-                    # 逐字校验照跑，留下的只可能是真依据——"没有引用"是可见的
-                    # （聚合诊断 + `ToolResult.content`），"假装有依据"不可能。
-                    system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
-                    raw = await chat_async(
-                        system, args.topic + hint_block, max_tokens=_max_tokens(ctx),
-                        **stream_kwargs,
-                    )
-            else:
-                # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
-                system = (SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
-                          + external_rules)
-                raw = await chat_async(
-                    system, _source_prompt_input(sources, system=system),
-                    max_tokens=_max_tokens(ctx), **stream_kwargs,
-                )
-        else:
-            raw = await chat_async(
-                DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES,
-                args.topic + hint_block, max_tokens=_max_tokens(ctx), **stream_kwargs,
-            )
-    except GenerationError as exc:
-        return _fail("generation_failed", f"生成失败：{exc}")
-
-    # 退化成"只凭主题"的那一版：请求带了材料，但这次一条依据都没拿到。
-    unsourced = bool(sources) and topic_evidence is not None and not topic_evidence.text
-    # 走了外部检索、但空手而归（开关打开 + 没有可用材料）。它走的也是"纯主题"
-    # 那条路，但与"用户本来就想要一张纯主题的图"不是一回事：必须说出来。
-    external_empty = external is not None and not external.sources
-    # 这次模型手上的依据是从外部抓来的（开关开 + 搜到了 + 走了 RAG）。
-    external_used = external is not None and bool(external.sources)
-    # 这次**真的把原文喂给了模型**（`rag` 且预检索有命中）。三句话术的分叉点：
-    # 材料太短时它决定"外部补全"还是"纯知识"，外部成功时它是"有引用"的前提。
-    evidence_fed = topic_evidence is not None and bool(topic_evidence.text)
-
-    try:
-        # `evidence` 只在这条链、且只在 `rag` 形态下交出去。
-        #
-        # 为什么按形态门控：`full` 下材料正文整份在 prompt 里，模型引用一段"这次
-        # 检索没命中"的原文是合法且常见的——`full` 形态本来就不该有"你只能引命中
-        # 的那一段"这条约束。不门控的话，`full` + 父块开会把落在父块中非命中段里的
-        # 合法引用判成越界并剔除（`remove_invalid=True`），而用户看不出原因。
-        #
-        # 形态与"检索回什么粒度"无关（`_rag` 里不读 `source_mode()`），两件事各管
-        # 各的：粒度是检索的事，约束是 prompt 形态的事。
-        evidence = (ctx.evidence or None) if source_mode() == SOURCE_MODE_RAG else None
-        # 为空（没检索过、或检索全空）时是 None：`verify_source_refs` 走的是加这个
-        # 参数之前的原路，两条路的差异只有"给了非空证据"这一种
-        # （`tests/test_evidence_wiring.py` 里"空证据等价无证据"钉着逐字节不变）。
-        #
-        # `sources` 用 `_verify_sources(ctx)` 而不是提示词里那批：库命中的引用指向
-        # 持久 id，只拿 `request.sources` 去校验会把它判成"来源不存在"并静默剔除
-        # （理由见 `_verify_sources`）。开关关着、或这次没查过库时，两者逐元素相同。
-        verify_sources = _verify_sources(ctx)
-        content, diagnostics = validate_generated_content(
-            raw, sources=verify_sources or None, evidence=evidence)
-    except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
-        return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
-
-    if unsourced:
-        # 退化路径上"每个节点都没有引用"是**一件事**，只是按节点数重复了几十遍；
-        # 逐条留着会把别的诊断淹掉（分片那条路同样的处理，见 `_generate_deep`）。
-        # 聚成一条放在最后，明说这张图没有材料依据——用户要能一眼看出"为什么没有引用"。
-        diagnostics = [item for item in diagnostics if item.code != "UNSOURCED_NODE"]
-
-    # 初次规模：整树生成没有"层"的概念，只能守节点总数。
-    #
-    # 为什么是**裁剪**而不是判失败：这一次调用已经花掉了，模型给的树里前 80 个
-    # 节点是一棵合法的、父在子前的树——裁掉尾部之后用户仍得到一张能用的图；判失败
-    # 就什么都没有，而且下一轮大概率还是给这么多。代价是尾部那几个分支会整支消失，
-    # 所以它必须作为诊断说出来（`TREE_CLIPPED_TO_INITIAL`），不能静默。
-    # 模型输出被长度上限截断时（`SalvagedOutput`），回收出来的节点已经在树里了，
-    # 但"这次少了一块"必须让用户看见——否则 `ok=true` 与完整成功长得一模一样。
-    _note_truncation(diagnostics, raw)
-
-    before_clip = _count_nodes(content.root)
-    clipped = 0
-    cut_ids: set[str] = set()
-    if before_clip > INITIAL_MAX_NODES:
-        original_root = content.root
-        content, clipped = _clip_tree(content, INITIAL_MAX_NODES)
-        cut_ids = _shortened_ids(original_root, content.root)
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
-            message=(
-                f"模型返回了 {before_clip} 个节点，超过初次生成的 {INITIAL_MAX_NODES} 个上限，"
-                f"已保留前 {INITIAL_MAX_NODES} 个（尾部 {clipped} 个未保留）；"
-                "想要更大的树，请生成后用 node_expand 逐支展开"
-            ),
-        ))
-
-    # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"。
-    # 这个区别在这里最实：裁剪只会发生在初次生成，而用户下一步就是"点开某个节点
-    # 继续展开"——把被裁的那几个标成 `no`，界面上恰好是唯一能再长的地方灰着。
-    _stamp_expandable(content, {node_id: "unknown" for node_id in cut_ids},
-                      max_depth=mindmap_contract.MAX_TREE_DEPTH)
-
-    # 结构与语义两层复核，原先只长在 `pipeline/service.run()` 的收尾里：
-    #   - `check()` 只看树本身（单子节点、深度上限、同级重名），没有来源也能跑，
-    #     所以对一句话主题的生成同样有效；
-    #   - `annotate_nli()` 要对已通过前两层的引用与原文做语义蕴含打分，没有来源
-    #     就无从比对。未启用时它立刻返回空列表，连 onnxruntime 都不 import，
-    #     照搬即可，不必在调用处再判一次开关。
-    # 诊断只是提示，不影响这棵树能不能用——契约校验在上一步就决定过了。
-    diagnostics.extend(check(content))
-    if verify_sources:
-        diagnostics.extend(annotate_nli(content, verify_sources))
-
-    if unsourced:
-        reason = (f"检索出错（{topic_evidence.failure}）" if topic_evidence.failure
-                  else "材料里没有查到与这个主题相关的原文片段")
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EVIDENCE",
-            message=(
-                f"{reason}：这张图只基于主题「{args.topic}」生成，"
-                "没有任何材料依据，节点上也不会有引用"
-            ),
-        ))
-
-    # 外部检索走过、但一条都没拿到。两种原因分开说（与 `unsourced` 同一条规矩）：
-    # "代理没开/源挂了"换个时间重试可能就有了，"网上确实没有"重试也没用。
-    external_note = None
-    if external_empty:
-        external_note = (f"外部检索出错（{external.failure}）" if external.failure
-                         else "没有搜到外部资料")
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EXTERNAL",
-            message=(
-                f"{external_note}：这张图只基于主题「{args.topic}」生成，"
-                "没有外部资料依据，节点上也不会有指向原文的引用"
-            ),
-        ))
-
-    # 三种退化各自一条诊断 + 一句给用户的话。**三句话术互不相同**，因为用户要能
-    # 从 `content` 里读懂"这次为什么没有引用（或为什么有）"：
-    #
-    #   A. `MATERIAL_TOO_SHORT`  —— 材料太短，被换成了主题提示（有没有外部补全分开说）；
-    #   B. `GENERATION_FROM_EXTERNAL` —— 引用来自外部检索，可信度该怎么看；
-    #   C. `GENERATION_WITHOUT_EXTERNAL` —— 连外部都没搜到，只有模型自己的知识。
-    #
-    # A 与 C 可以同时出现（材料太短 + 外部也空手），那时 C 的**诊断**仍然保留
-    # （它有独立的 code，遥测与日志按 code 聚合），但 `content` 只留 A 的句子——
-    # 两句都在会读成"材料太短"和"没有外部资料"两件不相干的事，其实是一件事的两个面。
-    #
-    # A/B 收进 `lead` 再整体前置（而不是 append）：前端的诊断面板只列前三条
-    # （`AgentPanel.DIAGNOSTIC_LIMIT=3`），而 `validate_generated_content` 会先塞进
-    # 几十条逐节点告警（`UNSOURCED_NODE`——一棵 70 节点的树里大部分节点本来就不带
-    # 引用）。append 的话用户看到的是三条"某节点没有标出出处"，而"这次依据来自外部
-    # 检索"被挤到看不见——那句话恰好是他判断整棵树该信几成的唯一依据。
-    lead: list[Diagnostic] = []
-    short_note = None
-    if short_material:
-        short_note = (
-            f"材料只有 {material_chars} 字，不足以支撑检索"
-            f"（低于 {SHORT_MATERIAL_CHARS} 字时整份材料塞得进一条引用，"
-            "引用落不到具体段落），这次按主题生成"
-        )
-        if evidence_fed:
-            # 有外部正文进了 prompt：说清"依据从哪来"，别让用户以为那 8 个字撑起了一棵树。
-            short_note += (f"，并用外部检索到的 {len(sources)} 条资料"
-                           f"（{_external_source_names(sources)}）补全依据。")
-        elif external_used:
-            # 搜到了资料，但这批资料里没检索出可用片段（语义上等价于"没搜到"）。
-            short_note += "，只用模型自己的知识（外部资料没能检索出可用片段）。"
-        elif external is not None:
-            short_note += "，只用模型自己的知识（没有搜到外部资料）。"
-        else:
-            short_note += "，只用模型自己的知识（外部检索未开启）。"
-        lead.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="MATERIAL_TOO_SHORT",
-            message=(
-                f"材料总字数只有 {material_chars} 字（阈值 {SHORT_MATERIAL_CHARS} 字）："
-                f"这个长度切不出可区分的检索单元，按材料生成只会得到"
-                f"「引用落不到具体段落」的假依据，所以这次没有走材料路径，"
-                f"{len(short_material)} 份材料只当作主题提示"
-                + ("，依据由外部检索补上" if evidence_fed else "，依据来自模型自己的知识")
-            ),
-        ))
-
-    # B：外部资料真的成了依据。这不是告警（树是好的），但用户必须知道这批引用
-    # 该按什么标准看——逐字校验只保证"引文出自这个来源"，不保证"来源与主题相关"
-    # （实测 `Rust 所有权` 会拿到"农业"：rust 是锈病）。
-    #
-    # 诊断与句子分开判：材料太短时**句子**由 A 的尾巴说（"并用外部检索到的 N 条
-    # 资料补全"），但诊断仍然要留——遥测按 code 聚合，"这次用了外部资料"是一条
-    # 独立的、与"材料太短"正交的事实。
-    external_used_note = None
-    if external_used:
-        lead.append(Diagnostic(
-            level=DiagnosticLevel.info, code="GENERATION_FROM_EXTERNAL",
-            message=(
-                f"本次引用来自外部检索的 {len(external.sources)} 条资料"
-                f"（{_external_source_names(external.sources)}）；"
-                "逐字校验保证引文出自这些来源，不保证来源本身与主题高度相关"
-            ),
-        ))
-        if not short_material:
-            external_used_note = (
-                f"本次有 {len(external.sources)} 条依据来自外部检索"
-                f"（{_external_source_names(external.sources)}）："
-                "引用逐字可校验、能点回原文，但外部内容不像你上传的材料那样权威，"
-                "当作参考资料看即可。"
-            )
-
-    # 前置那两条"为什么"：顺序是先因后果（材料太短在前，外部补全在后）。
-    diagnostics = lead + diagnostics
-
-    ctx.candidate = content
-    ctx.revision += 1
-    count = _count_nodes(content.root)
-
-    # 证据拼进了 prompt、树上却一条引用都没留下：这是 `rag` 形态下唯一没有信号的
-    # 情况——"把证据给了模型"和"模型用了证据"在产出上长得不一样，而失败的样子
-    # 却与"本来就没有证据"完全相同。
-    #
-    # 分母用 `topic_evidence.payload`，不是 `ctx.evidence`：后者还装着本次运行前几轮
-    # `rag_query` 的命中，而它们**没有**出现在这一次的 prompt 里，拿它当分母会把
-    # "给了几条"说多。`unsourced` 正是本条件的补集（它的定义是 `text` 为空），
-    # 所以两条诊断不会同时出现在一棵树上。
-    #
-    # 引用被逐字校验剔光与模型压根没写，在这里不再细分：`validate_generated_content`
-    # 已经把每一条剔除原因（`SOURCE_QUOTE_MISMATCH` 等）单独报过，这条只说"剩下 0 条"。
-    unused_evidence = len(topic_evidence.payload) if topic_evidence is not None else 0
-    evidence_unused = bool(unused_evidence) and not _count_refs(content.root)
-    if evidence_unused:
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="EVIDENCE_UNUSED",
-            message=(
-                f"本次把 {unused_evidence} 条检索到的原文拼进了提示词，"
-                f"但生成的 {count} 个节点最终 0 条 source_refs"
-                "（模型没写引用，或写了但没通过逐字校验）；"
-                "证据给了却没被用上，不等于材料里没有相关内容"
-            ),
-        ))
-
-    summary = f"已生成导图「{content.title}」，共 {count} 个节点。"
-    if short_note:
-        # A：材料太短。这一句自己就说明了"按主题生成 + 依据从哪来"，所以它出现时
-        # 不再叠 C 那句（否则读成两件不相干的事）与 `unsourced` 那句（材料路径压根
-        # 没走，没有"检索没命中"这回事）。
-        summary += short_note
-    elif unsourced:
-        # 一句话必须写进 `content`：这是模型唯一会读回去的地方，也是遥测/日志里
-        # 唯一的"这次没依据"信号。写进 data 不够——用户看的是这句话。
-        summary += (
-            f"{reason}，这张图只基于主题生成，不含任何材料依据；"
-            "要一张有依据的图，请换一个更贴近材料内容的说法后重试。"
-        )
-    if external_note and not short_note:
-        # C：外部检索是**用户看得见的一次等待**（可能到 20 秒），它空手而归时必须在
-        # 用户读到的那句话里说清，否则"等了半分钟还是没有引用"无从解释。
-        summary += (
-            f"{external_note}，这张图只基于主题「{args.topic}」生成，"
-            "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
-        )
-    if external_used_note:
-        # B：搜到并用了。与 C 是两个方向的同一件事——用户要能分清"没有引用是因为
-        # 没搜到"和"有引用是因为搜到了"。
-        summary += external_used_note
-    if evidence_unused:
-        # 用户读到的只有这句话。此处最容易误判成"材料里没有相关内容"（那正是
-        # `unsourced` 的含义），所以必须把"给了 N 条、落下来 0 条"摆出来，
-        # 并把两种可能一起说：模型没写，或者写了没过逐字校验。
-        summary += (
-            f"本次检索到 {unused_evidence} 条原文并已拼进提示词，"
-            "但这张图的节点没有留下任何引用（模型没写，或写了没通过逐字校验）；"
-            "这不代表「材料里没有相关内容」，换一个更贴近原文的说法重试可能就好了。"
-        )
-    data: dict[str, Any] = {
-        "root_id": content.root.id,
-        "node_count": count,
-        "revision": ctx.revision,
-        "diagnostics": [item.model_dump() for item in diagnostics],
-    }
-    if topic_evidence is not None:
-        # 只加在 `rag` + 有材料这条路上：这是本次改动唯一多出来的等待，总耗时里
-        # 看不出来"慢在哪"，得把这一次检索单独报出来（与那条 info 日志同源）。
-        data["retrieval"] = {
-            "hits": len(topic_evidence.payload),
-            "top_k": GENERATE_RETRIEVAL_TOP_K,
-            "seconds": round(topic_evidence.elapsed, 3),
-            "failed": topic_evidence.failure,
-        }
-    if external is not None:
-        # 只在外部队列真的走过时才有这个键：开关关着时 `data` 的键集与 `dceae7e`
-        # 逐字节相同（回归用例比的是键集，不只是值）。
-        data["external"] = {
-            "hits": external.hits,
-            "sources": len(external.sources),
-            "seconds": round(external.elapsed, 3),
-            "failed": external.failure,
-        }
-    if short_material:
-        # 材料明明传了、这次却没用：机器读的那一半（用户读的那一半在 `content`
-        # 与 `MATERIAL_TOO_SHORT` 里）。数字放这里而不是只写进一句话，是为了让
-        # "阈值调过之后还触发吗"能在日志里直接看出来。
-        data["material"] = {
-            "chars": material_chars,
-            "sources": len(short_material),
-            "threshold": SHORT_MATERIAL_CHARS,
-            "degraded": True,
-        }
-    return ToolResult(ok=True, content=summary, data=data)
 
 
 async def _search_branch(
@@ -2814,7 +1992,7 @@ async def _retrieve_whole(
     只出现在文件名里），而分支标题正是模型认为这张图该覆盖的几块。
 
     条数取 5 而不是把各支的 3 加起来：兜底的语义是"退回改造之前的行为"
-    （`mindmap_generate` 在 `rag` 形态下拿到的就是 top_k=5），不是"缩水版降级"。
+    （整树一次检索那条老路拿到的就是 top_k=5），不是"缩水版降级"。
     """
     query = " ".join([topic.strip(), *titles]).strip()
     try:
@@ -2975,16 +2153,16 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     那一棵，两者不一致是正常的（预览可能多、可能少）。通道为 None 时这条路径
     **一行都不走**，工具行为与加预览之前完全相同。
 
-    **`rag` 形态下骨架之后、并发展开之前，每条一级分支各检索一次**（分片 + 按支
+    **有材料时，骨架之后、并发展开之前，每条一级分支各检索一次**（分片 + 按支
     检索，`docs/RAG-DECISIONS.md` 第 5 节）：query 是**分支标题本身**（不含主题，
     理由与三组消融数字见 `_search_branch`），走 `search_parent`（父块返回，默认开），
     `top_k=DEEP_BRANCH_TOP_K`。这个工具读来源有两处，形态都不是全文：骨架那一次
     读的是**标题行**（`_skeleton_outline`，原文的子集），展开读的是**检索结果**。
 
-    为什么必须按支检索：`rag` 形态下模型看不到正文，整树一次生成 = **整棵树只有
-    一次检索机会**。`top_k=5` 对八千字材料约覆盖 25%、对三万字约 8%，于是"没想到
-    要问的章节"会静默缺失——用户拿到一份看起来正常但缺了几块的导图。分片之后
-    覆盖度由**骨架**决定，不由模型的查询创意决定。
+    为什么必须按支检索：模型看不到正文，整树一次生成 = **整棵树只有一次检索
+    机会**。`top_k=5` 对八千字材料约覆盖 25%、对三万字约 8%，于是"没想到要问的
+    章节"会静默缺失——用户拿到一份看起来正常但缺了几块的导图。分片之后覆盖度由
+    **骨架**决定，不由模型的查询创意决定。
 
     三条硬约束（违反任意一条，这个能力就变成负资产）：
       1. **不占 `max_tool_calls`**：检索发生在工具内部，是服务端自己的并发检索，
@@ -2993,21 +2171,84 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
          文本哈希缓存，实测口径见 `DEEP_BRANCH_TOP_K` 的注释。
       3. **降级彻底**：没配 embedding 时纯 BM25 照常；某支抛错只让那一支无证据
          展开；**所有支都拿不到证据**时退回"整树一次检索"（`DEEP_FALLBACK_TOP_K`
-         条，与 `mindmap_generate` 同量），绝不因为检索失败交出一棵空树。
+         条），绝不因为检索失败交出一棵空树。
 
-    `full` 形态**不做**这些检索（下面的 `slicing` 只在 `rag` 下为真）：正文整份
-    已经在 prompt 里，分片检索是白花；注册表那边也不会在有来源时给出这个工具
-    （`build_registry` 按形态决定），这里判一次是给"绕过注册表直接调"兜底。
+    注册面：**这是 `create` 唯一的生成路**（整树一次成型在"正文不进 prompt"下
+    实测覆盖 5.1%，这里按支检索 30.5%）。所以 `slicing` 只回答一件事——这次有没有
+    可检索的正文；没有再没有任何形态分支需要判。
+
+    **材料入口三段**（原属已删除的 `_generate`）：只喂有正文的来源、材料太短退化、
+    没有材料时先做一次外部检索。三条都必须在这里，因为这是唯一的生成入口。
     """
     if ctx.request.intent != "create":
         return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
     if ctx.candidate is not None and ctx.candidate.root.children:
         return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
 
-    # 分片检索的两个前提：真的有可检索的正文，且当前是 `rag` 形态。
-    # 空正文的来源不参与（`status` 是给界面看的，能检索的只有 `text`）。
-    sources = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
-    slicing = bool(sources) and source_mode() == SOURCE_MODE_RAG
+    # ---- 材料准备：只喂有正文的来源、短材料退化、没有材料时先做外部检索 --------
+    #
+    # 这三段原来是整树生成那条路的入口（`_generate`，已随 `full` 形态删除），
+    # 现在只剩这一条生成路，它们也就是"生成前怎么处理用户给的材料"的唯一实现。
+    #
+    # 空正文的来源不参与（`status` 是给界面看的，能检索的只有 `text`）；不滤的话，
+    # 一个还没解析成功的空来源会让检索与 `source_usage` 各自撞上一次空正文。
+    picked = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
+    # 材料太短 → 当成"没有材料"（理由与阈值见 `SHORT_MATERIAL_CHARS`）。
+    #
+    # 这里**不改 `ctx.request.sources`**：材料是用户给的，界面上还要显示它、它还在
+    # 收尾校验的可查来源里（`_verify_sources`）。被改掉的只是"这次喂给模型什么"——
+    # 一份 8 字的材料塞进检索之后只会回 1 条 9 字命中，模型据此生成几十个节点、
+    # 其中几个带引用，而界面看不出其余都是它自己补的。
+    #
+    # 它仍然有用：作为外部检索的**主题提示**（`_external_query`）。所以这条退化
+    # 不是"丢掉用户的输入"，是"换个用法"。
+    material_chars = sum(len((source.text or "").strip()) for source in picked)
+    short_material = picked if 0 < material_chars < SHORT_MATERIAL_CHARS else []
+    sources = [] if short_material else picked
+    # 太短的材料**不当语料、但当说明**：文字仍然进 prompt（用户写的东西一个字都
+    # 不丢），只是它不再产生 evidence、不再产生引用。上面那次外部检索也用它当了
+    # 查询词（`_external_query`），两处用的是同一份文字、不同的用途。
+    #
+    # 为什么不直接拼进 `args.topic`：主题是这张图的中心节点，把那 8 个字并进去会
+    # 改变 `content.title` 与骨架的检索问法；提示是附加说明，位置分开、语义才不混。
+    hint_block = ""
+    if short_material:
+        hint_block = (
+            "\n\n用户还附了这段文字（{chars} 字，太短，不足以作为可检索的材料，"
+            "只当作主题的补充说明，不要从它里面挑句子当引用）：\n{hint}"
+        ).format(chars=material_chars,
+                 hint=" ".join((source.text or "").strip() for source in short_material))
+    # 没有材料时先去外部知识源搜一次。默认开（实测与失败场景见
+    # `EXTERNAL_KNOWLEDGE_ENV` 上面那段注释）。"没有材料"包含两种输入：本来就没传，
+    # 以及传了但太短（`short_material`）——两者都拿不出可检索的正文；差别只在于
+    # 后者的文字被并进了查询词，而且它必须**被说出来**（`MATERIAL_TOO_SHORT`），
+    # 否则用户会以为那 8 个字被当成材料用了。
+    #
+    # 外部结果**不做任何特殊处理**：它们只是 `sources`，下面按支检索、`_citable_hits`、
+    # `verify_source_refs` 全都照旧跑。这就是"外部结果一律转成 Source 并入库"的
+    # 全部好处——引用校验、父块坐标、`library.load` 回查自动成立，没有第二条链。
+    #
+    # 先探一次额度再外呼：外部检索不花模型调用，但"额度在别的工具里已经烧光"时
+    # 白等一次 6 秒的外网往返没有意义（`reserve_model_call` 只是这份额度的记账，
+    # 这里只读不占）。
+    if ctx.model_calls_used >= ctx.request.budget.max_model_calls:
+        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
+    external: _ExternalFetch | None = None
+    if not sources and external_knowledge_enabled():
+        # 检索期间界面上什么都不动，看起来像卡死（实测中位 4.3 秒、最坏 20 秒）。
+        # 一帧"开始"、一帧"结束"，两帧都在 `_run_tool` 里被立刻转发出去——工具跑
+        # 在任务里，主循环一边等一边转帧，所以这行 await 不会把帧憋住。
+        await _emit_stage(ctx, EXTERNAL_SEARCH_STAGE, "正在检索外部资料…")
+        external = await _external_sources(_external_query(args.topic, short_material), ctx)
+        # 结束帧**一定带 count**（包括 0）：前端靠"有没有这个字段"区分开始与结束，
+        # `0` 与"还没结束"必须分得开。
+        await _emit_stage(
+            ctx, EXTERNAL_SEARCH_STAGE, _external_stage_text(external),
+            count=len(external.sources),
+        )
+        sources = external.sources
+    # 分片检索的前提：真的有可检索的正文。空正文的来源不参与。
+    slicing = bool(sources)
 
     need = min(args.points_per_branch, MAX_CHILDREN)
     # 深度上限在参数层已经夹过一次（ge/le），这里再夹一次是防"绕过参数模型直接
@@ -3074,23 +2315,26 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     # 第一步：出骨架。额度在调用**之前**占——请求一旦发出就是一次真实计费。
     #
-    # `rag` 形态下这一次调用会带上**材料自带的章节**（`_skeleton_outline`）：正文
-    # 仍然不进 prompt，进的是每份材料自己的标题行（原文的子集，见
-    # `_material_inputs` 的 docstring）。为什么放在骨架这一次而不是展开：分片之后
-    # **覆盖度由骨架决定**——模型凭空想 8 支时，材料里它没想到的章节就再也不会有
+    # 有材料时这一次调用会带上**材料自带的章节**（`_skeleton_outline`）：正文仍然
+    # 不进 prompt，进的是每份材料自己的标题行（原文的子集，见 `_material_inputs`
+    # 的 docstring）。为什么放在骨架这一次而不是展开：分片之后**覆盖度由骨架决定**
+    # ——模型凭空想 8 支时，材料里它没想到的章节就再也不会有
     # 人问；给它一份目录，它至少知道"这份材料有这几块"。实测数字见
-    # `scripts/measure_outline_skeleton.py`。
-    #
-    # `full` 形态**不拼**：正文整份已经在 prompt 里，模型自己就能读到标题，
-    # 目录是同一份内容的第二份拷贝——白花 token，还会诱导它把目录当全文提纲、
-    # 忽略正文里的细节。所以这个开关跟着 `slicing` 走，不单独判一次形态。
+    # `scripts/measure_outline_skeleton.py`。没有材料时这一项自然是空串。
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
     ctx.extra_model_calls += 1
     outline = _skeleton_outline(sources) if slicing else ""
+    # 骨架这一路只在**没有可检索材料**时补那两句（`CONTENT_FREEDOM_CONTRACT` +
+    # `DETAIL_NO_SOURCE_RULES`）：它们是纯文本契约、不含输出格式，不会与
+    # `PLAN_PROMPT` 的"只返回 branches"打架。有材料时一个字都不加——那时引用的
+    # 规矩由每支的 `BRANCH_EVIDENCE_RULES` / `BRANCH_NO_EVIDENCE_RULES` 说。
+    plan_system = PLAN_PROMPT if slicing else (
+        PLAN_PROMPT + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
     try:
         raw_plan = await ask_model(
-            PLAN_PROMPT, _plan_ask(args.topic, args.branches, outline=outline))
+            plan_system,
+            _plan_ask(args.topic, args.branches, outline=outline) + hint_block)
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 
@@ -3147,8 +2391,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     retrieval_mode = "off"
     retrieval_failed: list[int] = []
     retrieval_empty: list[int] = []
-    # 分支标题 → 同义问法。`full` 形态不做按支检索，所以这里恒为空——它同时是
-    # `retrieval.expanded_branches` 的来源，两处共用一个变量才不会有半开状态。
+    # 分支标题 → 同义问法。没有可检索的材料时不做按支检索，所以这里恒为空——
+    # 它同时是 `retrieval.expanded_branches` 的来源，两处共用一个变量才不会有半开状态。
     expansions: dict[str, list[str]] = {}
     if slicing:
         branch_titles = [title for title, _ in skeleton]
@@ -3220,17 +2464,26 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             ))
 
     def prompt_for(base: str, evidence: _BranchEvidence | None) -> str:
-        """这一支该用哪份提示词：有证据 / 无证据（分片形态）/ 不看证据（`full`）。
+        """这一支该用哪份提示词：有证据 / 无证据（有材料、这一支没查到）/ 纯主题。
 
-        三者不能合并：`full` 形态下 `evidence is None` 是"这个工具不读来源"，
-        而分片形态下 `evidence is None` 是"这一支没查到"——后一种要告诉模型
-        "照常写、但不要挂引用"，前一种说这句话反而是误导（那里正文就在 prompt 里）。
+        三者不能合并，否则会把"这次没有材料"和"这一支没查到"说成同一件事：
+          - 有证据：告诉它引用只能从**本支**的 evidence 里抄（`BRANCH_EVIDENCE_RULES`）；
+            证据来自外部检索时再叠一句"这是外部抓的、不可信数据"
+            （`EXTERNAL_TRUST_RULES`）——它防的是抓回来的正文里写着指令。
+          - 有材料但这一支没命中：照常写满、引用留空（`BRANCH_NO_EVIDENCE_RULES`）。
+            "未检索到"不等于"材料里没有"，说成后者会让这一支整块消失。
+          - 纯主题（没有可检索材料：本来没传 / 材料太短被降级 / 外部也没搜到）：
+            拼 `DETAIL_NO_SOURCE_RULES`，让它别写 `source_refs`——没有材料时
+            `source_usage` 是空的，模型凭习惯写出的引用会让整棵树被判 `tree_invalid`。
+            前面那句 `CONTENT_FREEDOM_CONTRACT` 是**内容**契约（可以自由展开、
+            不要留空节点），与"引用留空"是一对，缺一句模型就退回"没依据就不写"。
         """
         if evidence is not None:
-            return base + "\n" + BRANCH_EVIDENCE_RULES
+            return base + "\n" + BRANCH_EVIDENCE_RULES + (
+                EXTERNAL_TRUST_RULES if _has_external_source(sources) else "")
         if slicing:
             return base + "\n" + BRANCH_NO_EVIDENCE_RULES
-        return base
+        return base + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES
 
     def evidence_suffix(evidence: _BranchEvidence | None) -> str:
         """把这一支的命中拼在 user 消息末尾。`None` 时一个字符都不加。"""
@@ -3575,8 +2828,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     #
     # `source_usage` 必须在**建树之前**定下来：契约的第二层校验要求每条
     # `source_ref.source_id` 都出现在 `source_usage` 里，缺一条整棵树就是
-    # `tree_invalid`。`_generate` 那条路由 `validate_generated_content` 重建它，
-    # 这里没有那个函数，只能自己拼——而"分片形态会产出引用"意味着不拼就一定会炸。
+    # `tree_invalid`。分片路不走 `validate_generated_content`（那条整树校验路已
+    # 随 `_generate` 删除），只能自己拼——而"这条路上会产出引用"意味着不拼就一定炸。
     #
     # 用 `_verify_sources(ctx)` 而不是局部 `sources`：这条路径的引用只可能落在
     # 请求内材料上（分片检索只跑 `sources`），但"校验认的来源集合"与"source_usage
@@ -3701,10 +2954,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 第五步（续）：引用核验。分片形态下树里的每一条引用都声称来自某次分支检索，
     # 这里逐条拿原文比对，站不住的一律剔掉——**引用准确率不能靠提示词保证**。
     #
-    # 与 `_generate` 的差别：那条路走 `validate_generated_content`，它给出的
-    # `UNSOURCED_NODE` 是逐节点一条的；分片出来的树动辄几百节点，几百条"没有
-    # 引用"的提示会把真正有用的诊断淹掉，也不给用户任何可操作的信息。所以这里
-    # 只留**聚合**结果，明细（按 code 计数）进 data。
+    # 为什么这里只留聚合结果：整树校验路（`validate_generated_content`，已随
+    # `_generate` 删除）给出的 `UNSOURCED_NODE` 是逐节点一条的；分片出来的树动辄
+    # 几百节点，几百条"没有引用"的提示会把真正有用的诊断淹掉，也不给用户任何
+    # 可操作的信息。所以这里只留**聚合**结果，明细（按 code 计数）进 data。
     refs_kept = refs_dropped = 0
     refs_by_code: dict[str, int] = {}
     if slicing:
@@ -3824,7 +3077,106 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     ctx.revision += 1
     count = _count_nodes(content.root)
 
+    # ---- 三条"这次依据从哪来 / 为什么没有依据"----------------------------------
+    #
+    # 三句话术互不相同，因为用户要能从 `content` 里读懂"为什么节点上没有引用"：
+    #
+    #   A. `MATERIAL_TOO_SHORT`  —— 材料太短，被换成了主题提示（有没有外部补全分开说）；
+    #   B. `GENERATION_FROM_EXTERNAL` —— 引用来自外部检索，可信度该怎么看；
+    #   C. `GENERATION_WITHOUT_EXTERNAL` —— 连外部都没搜到，只有模型自己的知识。
+    #
+    # 三条都**前置**（而不是 append）：前端的诊断面板只列前三条
+    # （`AgentPanel.DIAGNOSTIC_LIMIT=3`），而下面有十几条逐支告警
+    # （`SPARSE_BRANCH` / `BRANCH_NO_EVIDENCE` …）。append 的话用户看到的永远是
+    # "某支要点不足"，而"这次依据来自外部检索"被挤到看不见——那句话恰好是他判断
+    # 整棵树该信几成的唯一依据。A/B 的句子只挑一条（两句都在会读成两件不相干的事），
+    # 但诊断各自保留：遥测按 code 聚合，它们是正交的事实。
+    with_evidence = sum(1 for item in branch_evidence if item is not None)
+    evidence_fed = with_evidence > 0
+    external_empty = external is not None and not external.sources
+    external_used = external is not None and bool(external.sources)
+
+    lead: list[Diagnostic] = []
+    short_note = None
+    if short_material:
+        short_note = (
+            f"材料只有 {material_chars} 字，不足以支撑检索"
+            f"（低于 {SHORT_MATERIAL_CHARS} 字时整份材料塞得进一条引用，"
+            "引用落不到具体段落），这次按主题生成"
+        )
+        if evidence_fed:
+            # 有外部正文进了 prompt：说清"依据从哪来"，别让用户以为那 8 个字撑起一棵树。
+            short_note += (f"，并用外部检索到的 {len(sources)} 条资料"
+                           f"（{_external_source_names(sources)}）补全依据。")
+        elif external_used:
+            # 搜到了资料，但这批资料里没检索出可用片段（语义上等价于"没搜到"）。
+            short_note += "，只用模型自己的知识（外部资料没能检索出可用片段）。"
+        elif external is not None:
+            short_note += "，只用模型自己的知识（没有搜到外部资料）。"
+        else:
+            short_note += "，只用模型自己的知识（外部检索未开启）。"
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="MATERIAL_TOO_SHORT",
+            message=(
+                f"材料总字数只有 {material_chars} 字（阈值 {SHORT_MATERIAL_CHARS} 字）："
+                f"这个长度切不出可区分的检索单元，按材料生成只会得到"
+                f"「引用落不到具体段落」的假依据，所以这次没有走材料路径，"
+                f"{len(short_material)} 份材料只当作主题提示"
+                + ("，依据由外部检索补上" if evidence_fed else "，依据来自模型自己的知识")
+            ),
+        ))
+
+    # 外部检索走过、但一条都没拿到。两种原因分开说：
+    # "代理没开/源挂了"换个时间重试可能就有了，"网上确实没有"重试也没用。
+    external_note = None
+    if external_empty:
+        external_note = (f"外部检索出错（{external.failure}）" if external.failure
+                         else "没有搜到外部资料")
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EXTERNAL",
+            message=(
+                f"{external_note}：这张图只基于主题「{args.topic}」生成，"
+                "没有外部资料依据，节点上也不会有指向原文的引用"
+            ),
+        ))
+
+    # 外部资料真的成了依据。这不是告警（树是好的），但用户必须知道这批引用该按
+    # 什么标准看——逐字校验只保证"引文出自这个来源"，不保证"来源与主题相关"
+    # （实测 `Rust 所有权` 会拿到"农业"：rust 是锈病）。
+    external_used_note = None
+    if external_used:
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.info, code="GENERATION_FROM_EXTERNAL",
+            message=(
+                f"本次引用来自外部检索的 {len(external.sources)} 条资料"
+                f"（{_external_source_names(external.sources)}）；"
+                "逐字校验保证引文出自这些来源，不保证来源本身与主题高度相关"
+            ),
+        ))
+        if not short_material:
+            external_used_note = (
+                f"本次有 {len(external.sources)} 条依据来自外部检索"
+                f"（{_external_source_names(external.sources)}）："
+                "引用逐字可校验、能点回原文，但外部内容不像你上传的材料那样权威，"
+                "当作参考资料看即可。"
+            )
+    # 顺序是先因后果（材料太短在前，外部补全在后），与上面 `lead` 的顺序一致。
+    diagnostics[:0] = lead
+
     content_parts = [f"已生成导图「{content.title}」，共 {count} 个节点。"]
+    if short_note:
+        content_parts.append(short_note)
+    if external_note and not short_note:
+        # C：外部检索是**用户看得见的一次等待**（可能到 20 秒），它空手而归时必须在
+        # 用户读到的那句话里说清，否则"等了半分钟还是没有引用"无从解释。
+        content_parts.append(
+            f"{external_note}，这张图只基于主题「{args.topic}」生成，"
+            "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
+        )
+    if external_used_note:
+        # B：搜到并用了。与 C 是两个方向的同一件事——用户要能分清"没有引用是因为
+        # 没搜到"和"有引用是因为搜到了"。
+        content_parts.append(external_used_note)
     if skipped_set:
         content_parts.append(
             f"因模型调用额度不足，只展开了 {expanded}/{len(skeleton)} 个分支，"
@@ -3867,11 +3219,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         content_parts.append(
             "模型未使用可展开标记（expandable），本次按缺省全部可展开处理。"
         )
-    # 检索的事必须出现在 content 里：`rag` 形态下用户拿到的树有没有材料依据，
-    # 全看这一步。只说"共 N 个节点"会让一棵"20 支里有 8 支没查到依据"的树
-    # 与一棵全都查到证据的树看起来一模一样。
+    # 检索的事必须出现在 content 里：用户拿到的树有没有材料依据，全看这一步。
+    # 只说"共 N 个节点"会让一棵"20 支里有 8 支没查到依据"的树与一棵全都查到
+    # 证据的树看起来一模一样。
     if slicing:
-        with_evidence = sum(1 for item in branch_evidence if item is not None)
         # 扩展生效时每支实际发 1-3 条问法，这时只说"各检索一次"就与
         # `retrieval.queries` 的长度对不上——而用户看到的正是这句话。
         line = (
@@ -3998,6 +3349,23 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "dropped_by_code": refs_by_code,
             },
             "diagnostics": [item.model_dump() for item in diagnostics],
+            **({"external": {
+                # 只在外部检索真的走过时才有这个键：开关关着、或本来就有材料时，
+                # `data` 的键集与加这个能力之前逐字节相同（回归用例比的是键集）。
+                "hits": external.hits,
+                "sources": len(external.sources),
+                "seconds": round(external.elapsed, 3),
+                "failed": external.failure,
+            }} if external is not None else {}),
+            **({"material": {
+                # 材料明明传了、这次却没用：机器读的那一半（用户读的那一半在
+                # `content` 与 `MATERIAL_TOO_SHORT` 里）。数字放这里而不是只写进
+                # 一句话，是为了让"阈值调过之后还触发吗"能在日志里直接看出来。
+                "chars": material_chars,
+                "sources": len(short_material),
+                "threshold": SHORT_MATERIAL_CHARS,
+                "degraded": True,
+            }} if short_material else {}),
         },
     )
 
@@ -4863,20 +4231,19 @@ def _rag_filters(raw: dict[str, Any] | None) -> SourceFilter | None:
 def _material_inputs(sources: list[Source]) -> list[str]:
     """给 `plan_query` 的材料摘要：每份「标题 + 正文开头」压平成一段。
 
-    **这是 `rag` 形态下主动把正文塞进 LLM prompt 的两处之一**（另一处是
-    `_skeleton_outline` 拼进骨架的章节标题；检索命中不算：那就是检索的产出）。
+    **这是主动把正文塞进 LLM prompt 的两处之一**（另一处是 `_skeleton_outline`
+    拼进骨架的章节标题；检索命中不算：那就是检索的产出）。
     它的边界很小且是刻意的——只在前 200 字、只在 `MINDMAP_QUERY_EXPANSION` 打开
     时才走（默认关），而 planner 判断"该用哪些词、范围有多大"本来就需要看一眼
     材料长什么样，只给标题它只能靠猜。
 
-    所以"`rag` 形态下正文不出进程"这句话**不成立**，准确的四种说法：
-      - 进 prompt：只有清单（生成/展开/改树）+ 检索片段（`rag_query` 的返回）
-        + 这里的前 200 字（默认关）+ `mindmap_generate_deep` 骨架那一次的**标题行**
+    所以"正文不出进程"这句话**不成立**，准确的三种说法：
+      - 进 prompt：检索片段（`rag_query` 的返回、按支检索的命中）+ 这里的前 200 字
+        （默认关）+ `mindmap_generate_deep` 骨架那一次的**标题行**
         （`_skeleton_outline`，原文的子集，一条最多 40 字）；
       - 离开进程但不进 prompt：混合检索的 embedding 请求（每个参与打分的块发一次，
-        按 `sha256(quote)` 缓存），两种形态都一样，与这个开关无关；
-      - `full` 形态额外把每份正文整份放进 prompt。
-      - 三种形态共同点：**结构线索（标题行）会进，正文段不进**。目录不改变这一点，
+        按 `sha256(quote)` 缓存），与这个开关无关；
+      - 共同点：**结构线索（标题行）会进，正文段不进**。目录不改变这一点，
         它只是把"标题行"这条边从"顺带"变成了"明确的一条输入"。
 
     截断与份数上限全部交给 `_material_snippets`：两处各写一份"前 200 字、最多
@@ -4970,11 +4337,10 @@ def _verify_sources(ctx: RunContext) -> list[Source]:
     把一份校验器拒绝的来源收进来，用户看到引用无缘无故消失，却找不到任何一处
     说清原因。半份材料不该被当成"已解析"，这条判断的权威在校验器那边。
 
-    正文非空白这条也不是洁癖：`validate_generated_content` 会用这个列表重建
-    `source_usage`，而契约要求 `char_count >= 1`——把一份还没解析成功的空来源
-    带进去，整次生成会被判 `invalid_tree`，用户只是多勾了一个空文件却得到
-    "模型返回的导图不合法"。`_generate` 里本来就有同一道过滤（只喂真有正文的
-    来源），两处共用这一个函数之后，口径不会再分叉。
+    正文非空白这条也不是洁癖：契约要求 `source_usage` 的 `char_count >= 1`——把
+    一份还没解析成功的空来源带进去，整次生成会被判 `invalid_tree`，用户只是多勾了
+    一个空文件却得到"模型返回的导图不合法"。生成入口本来就有同一道过滤
+    （`_generate_deep` 只喂真有正文的来源），两处共用这一个函数之后口径不会分叉。
     """
     return [
         source for source in
@@ -5025,8 +4391,7 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     sources = _pick_sources(ctx, [])
     # 一次调用只读一次开关：这里要问它四遍（早退、库大小、检索入口、data 的键集），
     # 四次各读一次环境变量的话，"检索时看的是开、记账时看的是关"这种半开状态在
-    # 理论上就可能拼出来——与 `_generate` 里"提示词与输入必须出自同一次形态判定"
-    # 是同一条规矩。
+    # 理论上就可能拼出来——一次判定、多处使用是同一条规矩。
     library_on = library_search_enabled()
     # 开关关着时**一行都不往下走**：与 `07a2740` 逐字节相同的保证就在这里，
     # 包括"无来源直接 no_sources"这个早退（关掉库之后再走一遍检索是白花）。
@@ -5255,22 +4620,25 @@ def _batch_id(ctx: RunContext) -> str:
 
 
 # 意图 -> 允许的工具。这张表就是"模型这条路能走多远"的唯一声明。
+#
+# `create` 只有一条生成路：分片（`mindmap_generate_deep`）。整树一次成型的
+# `mindmap_generate` 已随 `MINDMAP_SOURCE_MODE=full` 形态一起删除
+# （决策见 `docs/ONE-PATH.md`）。形态不再参与裁剪——有没有来源，模型看到的
+# 生成工具都是同一个。
 _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
-    "create": ("mindmap_generate", "mindmap_generate_deep"),
+    "create": ("mindmap_generate_deep",),
     "expand": ("node_expand",),
     "edit": ("mindmap_edit",),
 }
 
-# 会读来源的意图。`create` 在 `full` 形态下不在里面：整张从零生成时正文已经在
-# prompt 里，再给检索入口只会让模型把"先查一下"当成规定动作（实测 10 次里 10 次
-# 都先查一遍，白白多花调用）。`rag` 形态下这个判断整个反转——它看不到正文，
-# 没有 `rag_query` 就一个字都写不出来，所以在 `build_registry` 里按形态补进来。
+# 会读来源的意图。`create` 不在里面：分片生成在工具内部自己检索（骨架之后每支一次、
+# 限额补查再各一次），模型再拿到 `rag_query` 只会把"先查一下"当成规定动作——
+# 实测 10 次里 10 次都先查一遍，把 `max_tool_calls` 用光，一次生成都没调。
 _SOURCE_AWARE_INTENTS = ("expand", "edit")
 
 # 注册顺序固定，便于日志与测试对照；用工厂而不是共享实例，避免一个 registry
 # 上的改动影响到另一个（ToolSpec 目前不可变，但这个保证不该靠约定维持）。
 _TOOL_ORDER = (
-    "mindmap_generate",
     "mindmap_generate_deep",
     "node_expand",
     "rag_query",
@@ -5278,16 +4646,6 @@ _TOOL_ORDER = (
 )
 
 _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
-    "mindmap_generate": lambda: ToolSpec(
-        name="mindmap_generate",
-        description=(
-            "一次调用生成一张完整思维导图，适合分支少、内容浅的简单主题。"
-            "只有当前还没有导图时可用；复杂主题（分支多、每支都要展开几个要点）"
-            "改用 mindmap_generate_deep，它更慢但更不容易被单次输出上限截断。"
-        ),
-        args_model=GenerateArgs,
-        fn=_generate,
-    ),
     "mindmap_generate_deep": lambda: ToolSpec(
         name="mindmap_generate_deep",
         description=(
@@ -5295,16 +4653,13 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
             "继续深挖由你在展开响应里用 expandable 声明，代码只按这个判断还问不问；"
             "默认一直问到所有支都到底、或者触到节点数与调用预算。"
             "可用 max_depth 收窄层数。最后按代码验收并只补不合格的那几支。"
-            "适合复杂主题——它每次只让模型输出一支，不受单次输出上限挤压，"
-            "因此比 mindmap_generate 更稳。"
-            "简单主题用 mindmap_generate（一次调用就够，更快）。"
+            "它每次只让模型输出一支，不受单次输出上限挤压，代价是 N+1 次调用。"
             # 这句必须与 `_generate_deep` 的实际行为一致：它现在**会**检索
             # （rag 形态下每支一次，服务端在工具内部做），也**会**在骨架那一次
-            # 看材料自带的章节标题。写成"不读来源"会让模型在带材料的请求里选错
-            # 工具，也会让读描述判断行为的人判断错。
+            # 看材料自带的章节标题。写成"不读来源"会让模型在带材料的请求里判断错。
             "带材料时它会先看一眼材料自带的章节标题来定一级骨架，再为每条一级分支"
             "各自检索一次并只让那一支看到自己的检索结果，"
-            "所以带材料的复杂主题同样可以用它；它不会把全文读进来。"
+            "所以带材料的主题同样可以用它；它不会把全文读进来。"
             "只有当前还没有导图时可用。"
         ),
         args_model=GenerateDeepArgs,
@@ -5349,35 +4704,24 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     失败三次才转向，白白烧掉调用额度。看不到这个工具，它就只能走对的那条路。
 
     裁剪规则：
-      - `create` 给 `mindmap_generate` 与 `mindmap_generate_deep` 两个，由模型
-        按主题复杂度自选（描述里写清了两者差别）
+      - `create` 只给分片生成（`mindmap_generate_deep`），没有第二个选项
       - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
       - `edit` 给 `mindmap_edit`，请求带来源时再加 `rag_query`
       - `expand` / `edit` 在请求带来源时加 `rag_query`：那两条路不读来源，
         模型只能自己查。
-      - **不**给 `create`：两条生成路都会在工具内部先检索一次（`mindmap_generate`
-        做一次主题预检索、`mindmap_generate_deep` 按支检索）。早先这里是反的——
-        那时整树还不预检索，不给工具模型就只能凭标题编；现在补上预检索之后，
-        再给工具反而让模型连查八次把 `max_tool_calls` 用光、一次生成都没调。
+      - **不**给 `create`：分片生成在工具内部自己检索（骨架之后每支一次、限额
+        补查再各一次）。早先这里是反的——那时整树还不预检索，不给工具模型就只能
+        凭标题编；现在补上预检索之后，再给工具反而让模型连查八次把
+        `max_tool_calls` 用光、一次生成都没调。
       - **请求不带来源、但知识库非空**时，任何意图都加 `rag_query`（见下）。
 
-    两个生成工具必须同时在场：只留一个，等于替用户决定了"这张图多大"。而
-    分片那条路的成本是 N+1 次调用，简单主题走它纯属浪费额度——这个判断
-    只有拿到主题的模型能做。
-
-    **有来源时是否撤掉 `mindmap_generate_deep`，按形态决定**：
-
-      - `full`：**撤掉**。正文整份已经在 prompt 里，模型自己就能扫全文；而它的
-        入参里没有任何来源字段、骨架与展开都只看主题，产出的树与材料脱钩，却会
-        以 ok=True 成功返回。这条不是"少给一个选项"，是"少给一条会给出错误答案
-        的路"——模型看不到它，就不会选中它。带材料的新建走 `mindmap_generate`
-        的 `full` 提示词（它给模型喂结构化来源、回填 source_usage 并逐字校验引用）。
-      - `rag`：**保留**（这一轮放开的那一条）。`_generate_deep` 现在会为每条
-        一级分支各检索一次（`docs/RAG-DECISIONS.md` 第 5 节的结构引导召回），
-        每支只看到自己的命中，引用也只能落在自己那批证据上。**整树一次生成意味着
-        只有一次检索机会**——`top_k=5` 对八千字材料约覆盖 25%，"没想到要问的
-        章节"会静默缺失；分片之后覆盖度由骨架决定，不由模型的查询创意决定。
-        在 `full` 下做这件事是白花（正文已在 prompt），所以那里的 discard 不变。
+    **为什么 `create` 只剩一条路**：整树一次成型的 `mindmap_generate` 随
+    `MINDMAP_SOURCE_MODE=full` 一起删除了（`docs/ONE-PATH.md`）。它唯一比这里
+    强的地方是"正文整份在 prompt 里，模型能自己扫全文"（实测覆盖 100%），而那
+    正是被删掉的形态；在"正文不进 prompt"之下，整树只有一次 `top_k=5` 的主题
+    预检索，对同一份 14,120 字材料覆盖 **5.1%**，分片按支检索覆盖 **30.5%**
+    （`scripts/measure_deep_slicing.py`，8 支、纯 BM25；`docs/RAG-DECISIONS.md`
+    第 5 节）。所以这不是"少给一个选项"，是"少给一条覆盖低六倍的路"。
 
     `rag_query` 只在**真有可查的东西**时才注册：没来源也没库的检索必然返回
     「没有找到」，注册它只会诱导模型拿它当"思考"用。这里的"有"包含知识库：
@@ -5390,18 +4734,14 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     宿主机库里恰好存了什么。未知意图按 `create` 兜底——宁可少给工具，也不要把
     破坏性工具塞进一个没预期到的新意图里。
     """
-    rag_mode = source_mode() == SOURCE_MODE_RAG
     if has_library is None:
         has_library = library_available()
     allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
     if has_sources:
-        if not rag_mode:
-            allowed.discard("mindmap_generate_deep")
-        # `create` 在 rag 形态下**不再**补 `rag_query`：`mindmap_generate` 与
-        # `mindmap_generate_deep` 都会在工具内部先检索一次（前者主题预检索、后者
-        # 按支检索），模型再自行查是纯浪费——实测它连查 8 次把 `max_tool_calls`
-        # 用光，一次生成都没调，用户拿到"工具调用次数已用完"和 0 个节点。
-        # `expand` / `edit` 仍需要：那两条路不读来源，模型只能自己查。
+        # `create` **不**补 `rag_query`：分片生成在工具内部先检索（骨架之后按支
+        # 一次、限额补查再各一次），模型再自行查是纯浪费——实测它连查 8 次把
+        # `max_tool_calls` 用光，一次生成都没调，用户拿到"工具调用次数已用完"和
+        # 0 个节点。`expand` / `edit` 仍需要：那两条路不读来源，模型只能自己查。
         if intent in _SOURCE_AWARE_INTENTS:
             allowed.add("rag_query")
     if has_library and not has_sources:

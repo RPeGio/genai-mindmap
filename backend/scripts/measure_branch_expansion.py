@@ -234,7 +234,6 @@ def run_group(
 
     patches = [
         patch.dict(os.environ, {
-            "MINDMAP_SOURCE_MODE": "rag",
             "MINDMAP_PARENT_RETRIEVAL": "1",
             "MINDMAP_QUERY_EXPANSION": "0" if expander is None else "1",
             # 没有凭证时 `chat_async` 会先检查配置；脚本化出口替换的是模块级

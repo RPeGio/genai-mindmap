@@ -46,7 +46,7 @@
 
 前端从 2026-11-10 起按 v2 发送（`frontend/src/api/types.ts` 已补字段），保存 / 打开 / 导出都带 `note` 与 `layout` / `theme`；`frontend/src/api/client.ts` 里原有的两个裁剪函数 `toContractV1()` / `toExportV1()` 已删除。三种导出取节点正文（`note`），没有正文时回落标题。
 
-`source_usage` 是可选的**整张导图来源摘要**：agent 的 `mindmap_generate` 按实际输入重建（`generation/service.py::validate_generated_content`），保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。直接文本生成时该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
+`source_usage` 是可选的**整张导图来源摘要**：agent 的 `mindmap_generate_deep` 在合并候选树时按实际输入重建（`backend/app/agent/tools.py::_generate_deep`），保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。没有来源的生成该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
 
 ## 已实现
 

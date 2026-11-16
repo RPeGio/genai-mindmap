@@ -18,12 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.contracts.mindmap import MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
-from app.generation.service import (
-    SOURCE_MODE_RAG,
-    GenerationError,
-    ensure_input_within_context,
-    source_mode,
-)
 from app.optimization.source_refs import EvidenceSpan
 
 logger = logging.getLogger(__name__)
@@ -320,11 +314,11 @@ class RunContext:
     # 区分"引用落在命中的子块里"与"引用落在父块里与查询无关的一半"的东西。
     #
     # 为什么存在这里而不是 `ToolResult.data`：hits 只活在 `_rag` 的返回值里，而
-    # 校验发生在 `mindmap_generate` 收尾（`validate_generated_content`），中间隔着
-    # 整个循环。`ToolResult.data` 是**一次调用**的产物，循环从不汇总它；要汇总就得
-    # 在 `service.run()` 里按工具名特判 `data["hits"]` 的形状，等于让循环认识检索
-    # 工具的私有字段。`RunContext` 本来就是"跨轮存活的可变状态"，证据正好是这种
-    # 东西，且 `_rag` 与 `_generate` 拿的是同一个 ctx，不需要任何新管道。
+    # 校验发生在生成工具的收尾（`tools._generate_deep` 的 `verify_source_refs`），
+    # 中间隔着整个循环。`ToolResult.data` 是**一次调用**的产物，循环从不汇总它；
+    # 要汇总就得在 `service.run()` 里按工具名特判 `data["hits"]` 的形状，等于让循环
+    # 认识检索工具的私有字段。`RunContext` 本来就是"跨轮存活的可变状态"，证据正好
+    # 是这种东西，且 `_rag` 与 `_generate_deep` 拿的是同一个 ctx，不需要新管道。
     evidence: list[EvidenceSpan] = field(default_factory=list)
     # 本次运行里从知识库回查出来的来源（持久 id -> Source），`_rag` 命中后填入。
     #
@@ -448,12 +442,12 @@ class AgentRunRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def sources_not_too_many(cls, data: Any) -> Any:
-        """份数上限：两种形态的"为什么不行"完全不同，文案必须分开。
+        """份数上限：正文不进 prompt，卡住的是**清单**。
 
-        - `rag`：正文不进 prompt，所以"材料字太多"根本不是问题；卡住的是**清单**。
-          清单列不下的材料，模型连"有这一份"都不知道——那比拒绝更糟，因为树看起来
-          是完整的，只是少了两块。
-        - `full`：每份正文都要进 prompt，份数上限与上下文是同一件事的两个方向。
+        清单列不下的材料，模型连"有这一份"都不知道——那比拒绝更糟，因为树看起来
+        是完整的，只是少了两块。原来的另一条测（`full` 形态下"正文合计装不装得进
+        上下文"）已随那个形态删除：正文从不进 prompt，那条预检量的是一个不存在的
+        对象（一份 25 万字材料现在只贡献一行清单，几十 token）。
 
         字段上的 `max_length` 仍然留着（OpenAPI 要有 `maxItems`，前端据此先拦一步），
         这里在它之前给出能照着做的文案：pydantic 的 "List should have at most 50
@@ -471,50 +465,19 @@ class AgentRunRequest(BaseModel):
         count = len(sources)
         if count <= MAX_SOURCES:
             return data
-        if source_mode() == SOURCE_MODE_RAG:
-            raise ValueError(
-                f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
-                f"rag 形态下正文不占上下文，卡住的是材料清单：清单只列得下 "
-                f"{MAX_SOURCES} 条，多出来的材料模型连存在都不知道。请分批生成。")
         raise ValueError(
             f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
-            "请分批生成。")
+            f"正文不占上下文，卡住的是材料清单：清单只列得下 "
+            f"{MAX_SOURCES} 条，多出来的材料模型连存在都不知道。请分批生成。")
 
-    @model_validator(mode="after")
-    def sources_within_context(self) -> "AgentRunRequest":
-        """`full` 形态下：来源正文合计要装得进模型上下文。
-
-        原先这里卡的是「合计 20000 字」。那个数按一句话主题拍的，没有实测依据，
-        而且与 pipeline 的同一口径互相抄写——两处一起错、一起被当成边界。真正
-        的边界只有一条：模型的上下文窗口装不装得下。所以改判 token，超了仍然
-        在开流之前拒绝，文案给出两条出路（精简 / 分批）。
-
-        **`rag` 形态下这条预检直接跳过**：正文根本不进 prompt，没有可测量的对象。
-        留着它的后果不是"保守"，是错——一份 25 万字的材料在 `rag` 形态下只贡献
-        一行清单（几十 token），却会在开流前被 422 拒掉，而它本来是能处理的。
-        清单自己的 token 上限由 `tools._material_manifest` 负责，超了截的是**清单项**，
-        不是拒绝整个请求：删掉两行索引，比劝用户去精简一份他并不需要精简的材料好。
-
-        份数上限是另一个量，见 `sources_not_too_many`（两种形态都要拦）。
-
-        另两处同名的 token 预检（`provider.complete_tools` 与
-        `generation.chat_async`）量的是**实际要发出去的消息**，不是材料体积：
-        `rag` 形态下那些消息里没有正文，自然不会被它们拦。
-
-        这里必须抛 `ValueError`：它发生在 FastAPI 解析请求体的时候，只有
-        ValidationError 才会被收成 422 并把文案带回前端；`GenerationError`
-        冒出去会变成 500，用户看到的是"服务器内部错误"。
-        """
-        if not self.sources or source_mode() == SOURCE_MODE_RAG:
-            return self
-        text = "\n".join(source.text or "" for source in self.sources)
-        if not text:
-            return self
-        try:
-            ensure_input_within_context(text, label="来源正文合计")
-        except GenerationError as exc:
-            raise ValueError(str(exc)) from exc
-        return self
+    # 这里**没有**"来源正文合计装得进上下文"的预检：正文不进 prompt，没有可测量的
+    # 对象。留着它的后果不是"保守"，是错——一份 25 万字的材料只贡献一行清单
+    # （几十 token），却会在开流前被 422 拒掉，而它本来是能处理的。清单自己的
+    # token 上限由 `tools._material_manifest` 负责（超了截的是**清单项**，不是拒绝
+    # 整个请求）。
+    #
+    # 另两处 token 预检（`provider.complete_tools` 与 `generation.chat_async`）量的
+    # 是**实际要发出去的消息**，不是材料体积：那些消息里没有正文，自然不会被它们拦。
 
 
 # ---------------------------------------------------------------- 事件流

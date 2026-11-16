@@ -62,11 +62,6 @@ BEHAVIOUR = (
     "MINDMAP_NLI_MODEL_DIR",
     "MINDMAP_NLI_MIN_FREE_MB",
     "MINDMAP_SOFFICE_CMD",
-    # 材料进 prompt 的形态（`full` / `rag`）。清空 = 用默认值（`rag`）。
-    # 不清的话，宿主机上留着 `MINDMAP_SOURCE_MODE=full` 会让 `test_source_mode.py`
-    # 里"正文不进 prompt"那几条在别的机器上悄悄变成假绿/假红——它是这个文件
-    # 存在的理由（"防护只该有一处"）的又一个例子。
-    "MINDMAP_SOURCE_MODE",
     # 知识库检索（`tools.library_search_enabled`）。**清空而不是置 0**：它默认开，
     # 而"默认开 + 临时库是空的 = 既有用例行为不变"正是接线时要验证的那条前提。
     # 置 0 会把那条前提整个跳过：所有用例都不会经过"查了一次空库"的那条路，

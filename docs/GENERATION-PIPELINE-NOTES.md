@@ -49,7 +49,11 @@
 
 ### 三、深度被三处压到两级
 
-带材料的新建走 `_generate()` → `SOURCED_DETAIL_PROMPT`，**一次调用生成整棵树，没有递归**。压深度的有三句话，一处比一处隐蔽：
+带材料的新建走 `_generate_deep()` → 骨架 + 按支检索 + 并发展开。**整树一次成型的
+`_generate()` 与其提示词已删除**（`docs/ONE-PATH.md`）：那条路的"一次调用写完整棵树"
+在正文不进 prompt 的前提下覆盖只有 5.1%，而分片按支检索是 30.5%。压深度的三句话
+（`PLAN_PROMPT` 的骨架规则、`BRANCH_EXPAND_PROMPT` 的"只写一层"、`SUBNODE_EXPAND_PROMPT`
+的路径锚点）仍是现行的三处约束，一处比一处隐蔽：
 
 | 位置 | 原文 | 后果 |
 |---|---|---|
@@ -77,13 +81,18 @@
 
 连续五次运行全部 5 层，没有一次退回 4 层。依据没松：逐节点把 label 里的数字串回原文检索，改前改后都是 0 处找不到；无引用节点从 1/103 变成 42/140，多出来的全是「结果（6）」「优化器（5.3）」这类组织性标题层，不是事实断言。
 
-### 四、流式挂错了路径
+### 四、流式挂错了路径（历史记录）
 
-`node_grow` 帧只在 `_generate_deep` → `ask_model` → `_GrowStream` 这条路上上报。而 `build_registry()` 在 `has_sources=True` 时会 `discard("mindmap_generate_deep")`（deep 不读材料，会产出一棵与材料无关的树还以 `ok=true` 返回，移除它是对的）。
+> **这一节描述的问题已经随着整树生成的删除而消失**：`mindmap_generate` 不再存在，
+> `node_grow` 也就只剩分片这一条上报路径（`_generate_deep` → `ask_model` →
+> `_GrowStream`），而分片现在是 `create` 唯一的生成路。下面保留原文，作为"为什么
+> 当初那条路不流式"的存档。
+
+`node_grow` 帧只在 `_generate_deep` → `ask_model` → `_GrowStream` 这条路上上报。而 `build_registry()` 当时在 `has_sources=True` 时会 `discard("mindmap_generate_deep")`（deep 不读材料，会产出一棵与材料无关的树还以 `ok=true` 返回，移除它是对的）。
 
 于是流式只存在于一条「不传材料、只给主题」的路径上，**真正在用的那条完全不流式**。`_generate` 的三处 `chat_async` 一个都没传 `on_delta`。
 
-两条路的增量提取还不能共用：deep 的响应是 `{"children":[{"label","expandable"}]}`，没有 id、位置靠调用方给的 slot 路径；`mindmap_generate` 输出完整树、自带 id。后者复用普通生成早已写好的 `parse_partial`（补括号把半截 JSON 变成可解析）与 `collect_new_nodes`（按 id 挑出真写完的节点、保序），另写一层 `id → 索引链` 的换算。
+两条路的增量提取没有共用：deep 的响应是 `{"children":[{"label","expandable"}]}`，没有 id、位置靠调用方给的 slot 路径；整树那条输出完整树、自带 id，另写了一层 `id → 索引链` 的换算。整树删除之后这条路也不再需要。
 
 `expandable` 一律传 `null`：整树提取器补出来的空 `children` 是解析中间态，不是模型在说「这支到底了」，不能当 `false` 用。
 

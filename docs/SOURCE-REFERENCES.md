@@ -63,11 +63,11 @@
 
 反过来，"证据已拼进 prompt、最终却一条引用都没有"是另一件事：模型没写，或写了但
 过不了第三层被剔光。`EVIDENCE_UNUSED`（warn）报出"给了几条证据、最后剩几条引用"，
-并在 `content` 里点明这不等于"材料里没有相关内容"。分母口径按路径各算各的：
-`mindmap_generate` 用主题预检索的命中数，`mindmap_generate_deep` 用按支证据去重后的
-条数（`whole` 兜底时各支拿到同一批，逐支相加会虚报），`node_expand` 用本次为这个
-节点检索的命中数。没有证据时它不报——那种情况归 `GENERATION_WITHOUT_EVIDENCE`
-与 `BRANCH_NO_EVIDENCE`。
+并在 `content` 里点明这不等于"材料里没有相关内容"。分母口径按**剩下的两条路**各算
+各的：`mindmap_generate_deep` 用按支证据去重后的条数（`whole` 兜底时各支拿到同一批，
+逐支相加会虚报），`node_expand` 用本次为这个节点检索的命中数。没有证据时它不报——
+那种情况归 `BRANCH_NO_EVIDENCE`。整树生成（`mindmap_generate`）连同它的主题预检索
+一起删除了（`docs/ONE-PATH.md`），所以"按一次主题检索的命中数"那个口径不再存在。
 
 子块约束保留下来是为了**可观测**：谁引了父块里与查询无关的部分，诊断里看得见；
 要求模型精确落在命中的那 200 字里过于苛刻，实测会成批剔掉合法引用。
@@ -114,15 +114,18 @@
 
 ## 生成、诊断与保存
 
-- `POST /api/agent/runs/stream` 的请求带 `sources: [...]` 时，`mindmap_generate`
-  把来源 ID 和完整原文以 JSON 边界交给模型；生成收尾按实际输入重建
-  `source_usage`，不信任模型提供的摘要。未知来源与确实对不上原文的引用会被剔除
+- `POST /api/agent/runs/stream` 的请求带 `sources: [...]` 时，`mindmap_generate_deep`
+  把**结构线索**（材料自带的章节标题行）交给骨架、把**按支检索的命中**交给每条分支
+  ——正文段本身一个字都不进 prompt（`MINDMAP_SOURCE_MODE=full` 那条"整份原文放进
+  prompt"的路已删除，见 `docs/ONE-PATH.md`）。`source_usage` 由工具自己按真实来源
+  拼出，不信任模型提供的摘要；未知来源与确实对不上原文的引用会被剔除
   （判定表见上节：父块越界与多处出现只告警、不剔除），原因通过 `diagnostics` 返回，
   并带上 `node_id`。节点本身保留，合法引用保留。
-- 不带来源的生成（`intent=create` 且没有 `sources`）没有可追溯的来源记录；
-  `validate_generated_content(sources=None)` 在契约校验前清空模型返回的摘要及所有
-  节点引用。`node_grow` 预览帧也不携带未经核验的引用——它只有 `label` 与
-  `expandable`。demo 不编造引用。
+- 不带来源的生成（`intent=create` 且没有 `sources`）没有可追溯的来源记录：
+  没有可检索材料时系统提示词里会加一句"不要写 source_refs"，而落在树上的引用在
+  合并前就被清空（`_refs_from` 没有本支证据时一条都不收）——`source_usage` 为空时
+  带引用的树过不了契约。`node_grow` 预览帧也不携带未经核验的引用——它只有 `label`
+  与 `expandable`。demo 不编造引用。
 - `POST /api/optimization/check` 和 `/api/optimization/suggest` 可额外传
   `sources` 执行第三层；省略时只做原有结构诊断，传 `[]` 会明确报告缺失原文。
   两个接口都不改写导图或数据库，重复来源 ID 返回 422。

@@ -327,7 +327,7 @@ class _Plan:
                     if system.startswith(PLAN_PROMPT))
 
 
-def _run_deep(sources: list[Source], *, mode: str = "rag"):
+def _run_deep(sources: list[Source]):
     request = AgentRunRequest(
         goal="整理管理办法", intent="create", sources=sources,
         budget=RunBudget(max_model_calls=20, max_tool_calls=8, max_output_tokens=32768),
@@ -336,8 +336,7 @@ def _run_deep(sources: list[Source], *, mode: str = "rag"):
                      sources_by_id={source.id: source for source in sources})
     model = _Plan()
     registry = build_registry("create", has_sources=True)
-    with patch("app.agent.tools.chat_async", new=model), \
-            patch("app.agent.tools.source_mode", new=lambda: mode):
+    with patch("app.agent.tools.chat_async", new=model):
         result = asyncio.run(registry.execute(
             ToolCall(call_id="c-deep", name="mindmap_generate_deep",
                      arguments={"topic": "管理办法", "branches": 3,
@@ -398,16 +397,6 @@ def test_outline_is_absent_when_material_has_no_outline():
     assert OUTLINE_HEADER not in model.plan_user
     # 与没有目录时逐字相同：主题 + 条数要求
     assert model.plan_user.startswith("主题：管理办法\n根据内容实际包含的方面")
-
-
-def test_full_mode_never_builds_an_outline():
-    """`full` 下正文整份在 prompt 里，目录是同一份内容的第二份拷贝——不拼。"""
-    sources = [_source(HIGH_COVERAGE)]
-    with patch("app.agent.tools._skeleton_outline") as spy:
-        result, model = _run_deep(sources, mode="full")
-    assert result.ok, result.content
-    assert spy.call_count == 0
-    assert OUTLINE_HEADER not in model.plan_user
 
 
 def test_plan_ask_without_outline_is_unchanged():

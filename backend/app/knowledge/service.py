@@ -1111,16 +1111,16 @@ def _hybrid_enabled() -> bool:
 # 模型从父块里挑一句与查询无关的话也照样通过逐字校验。
 #
 # 两条前提现在都不成立了：
-#   - `MINDMAP_SOURCE_MODE` 已默认 `rag`：正文不进 prompt，检索返回的块**就是**模型
-#     能看到的全部上下文，粒度不够就真的读不懂。这条正是原注释说的"这个开关是为
-#     '只给片段'的形态准备的"——那个形态已经是默认形态。
+#   - 正文不进 prompt（`MINDMAP_SOURCE_MODE=full` 那条路已删除）：检索返回的块
+#     **就是**模型能看到的全部上下文，粒度不够就真的读不懂。这条正是原注释说的
+#     "这个开关是为'只给片段'的形态准备的"——现在只剩这一种形态。
 #   - ②有了对策：命中区间（`leaf_start`/`leaf_end`）会随 hits 一路累积到
 #     `RunContext.evidence`，生成收尾时交给 `verify_source_refs(..., evidence=...)`，
 #     落在父块里但不在命中子块里的引用会被标 `SOURCE_REF_OUTSIDE_EVIDENCE`。
 #     它是 warn 级诊断、**不剔除引用**（要求模型精确落在命中的那 200 字里过于苛刻，
 #     实测会成批删掉合法引用）；接线在 `tools._rag` → `RunContext.record_evidence`
-#     → `_generate` → `validate_generated_content` 这条链上，**先接线、后翻默认值**
-#     的顺序是刻意的：反过来会有一段时间是"父块模式 + 无防护"。
+#     → `tools._generate_deep` → `verify_source_refs` 这条链上，**先接线、后翻
+#     默认值**的顺序是刻意的：反过来会有一段时间是"父块模式 + 无防护"。
 PARENT_RETRIEVAL_ENV = "MINDMAP_PARENT_RETRIEVAL"
 
 # 判定方向与 `_hybrid_enabled` 相反这件事没变，但含义反过来了：那个默认开，所以
@@ -2138,8 +2138,8 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
     的旧模块钉着这条）。
 
     为什么从"默认关"翻成"默认开"：原注释说这个能力是为"只给片段"的形态准备的，
-    那时返回的块就是模型能看到全部上下文，粒度不够就真的读不懂——而
-    `MINDMAP_SOURCE_MODE` 已经默认 `rag`，那个形态就是现在的默认形态。另一半
+    那时返回的块就是模型能看到全部上下文，粒度不够就真的读不懂——而正文不进
+    prompt 现在是**唯一**的形态（`MINDMAP_SOURCE_MODE=full` 已删除）。另一半
     顾虑（父块里与查询无关的段落也能通过逐字校验）已经有对策：命中的子块区间随
     hits 累积进 `RunContext.evidence`，生成收尾时交给
     `verify_source_refs(..., evidence=...)` 标 `SOURCE_REF_OUTSIDE_EVIDENCE`

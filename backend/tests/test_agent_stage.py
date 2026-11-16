@@ -89,6 +89,18 @@ def _tree() -> dict[str, Any]:
     }
 
 
+async def _deep_chat(system: str, user: str, **kwargs: Any) -> Any:
+    """分片生成的模型替身：骨架三条、每支一个要点。
+
+    这些用例测的是**外部检索的进度帧**（`_generate_deep` 里那两帧），所以替身只要
+    让流程跑完、让外部命中真的进入检索即可。分支标题与 `_hit()` 的正文有共同词项，
+    于是按支检索会命中——这也是"外部来源真的成了依据"的前提。
+    """
+    if system.startswith(agent_tools.PLAN_PROMPT):
+        return {"branches": ["总量控制", "配额分配", "价格机制"]}
+    return {"children": [{"label": "要点一", "expandable": False}]}
+
+
 def _tool_completion(call: ToolCall) -> Completion:
     return Completion(
         message={
@@ -122,12 +134,13 @@ class _ScriptedProvider:
 
 def _generate_once(ctx: RunContext) -> Any:
     async def chat(system: str, user: str, **kwargs: Any) -> Any:
-        return _tree()
+        return await _deep_chat(system, user)
 
     with patch.object(agent_tools, "chat_async", chat):
         return _run(agent_tools.build_registry("create").execute(
-            ToolCall(call_id="c-gen", name="mindmap_generate",
-                     arguments={"topic": TOPIC}), ctx))
+            ToolCall(call_id="c-gen", name="mindmap_generate_deep",
+                     arguments={"topic": TOPIC, "branches": 3,
+                                "points_per_branch": 2, "max_depth": 2}), ctx))
 
 
 # ---------------------------------------------------------------- 1 通道为 None
@@ -248,9 +261,11 @@ def _drain_with_stamps(monkeypatch, search: Any, *, external_on: bool = True) ->
     monkeypatch.setattr(agent_tools.external_knowledge, "search_external", search)
 
     async def chat(system: str, user: str, **kwargs: Any) -> Any:
-        return _tree()
+        return await _deep_chat(system, user)
 
-    call = ToolCall(call_id="c-gen", name="mindmap_generate", arguments={"topic": TOPIC})
+    call = ToolCall(call_id="c-gen", name="mindmap_generate_deep",
+                    arguments={"topic": TOPIC, "branches": 3,
+                               "points_per_branch": 2, "max_depth": 2})
     provider = _ScriptedProvider([_tool_completion(call), _stop_completion()])
     request = AgentRunRequest(goal=TOPIC, intent="create",
                               budget=RunBudget(max_model_calls=10, max_tool_calls=5,
@@ -358,12 +373,13 @@ def test_stage_frames_do_not_leak_into_tool_result(monkeypatch, intent):
     ctx = _ctx(emit)
 
     async def chat(system: str, user: str, **kwargs: Any) -> Any:
-        return _tree()
+        return await _deep_chat(system, user)
 
     with patch.object(agent_tools, "chat_async", chat):
         result = _run(agent_tools.build_registry(intent).execute(
-            ToolCall(call_id="c-gen", name="mindmap_generate",
-                     arguments={"topic": TOPIC}), ctx))
+            ToolCall(call_id="c-gen", name="mindmap_generate_deep",
+                     arguments={"topic": TOPIC, "branches": 3,
+                                "points_per_branch": 2, "max_depth": 2}), ctx))
 
     assert result.ok
     assert "stage" not in json.dumps(result.data, ensure_ascii=False)
