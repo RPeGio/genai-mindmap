@@ -577,6 +577,93 @@
         }
       }
     },
+    "/api/knowledge/library": {
+      "get": {
+        "tags": [
+          "知识增强"
+        ],
+        "summary": "List Library",
+        "description": "库里的材料列表，最近使用的在前。`total` 是库里的总数，不是返回条数。\n\n只读：不改任何状态，也不刷 `last_used_at`（\"看了一下列表\"不等于\"用到了\n这份材料\"——那个字段是 `prune` 保留与否的依据）。",
+        "operationId": "list_library_api_knowledge_library_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/knowledge/library/{source_id}": {
+      "get": {
+        "tags": [
+          "知识增强"
+        ],
+        "summary": "Read Library Source",
+        "description": "单份材料的正文预览（前 4000 字，`truncated` 说明是否截断）。",
+        "operationId": "read_library_source_api_knowledge_library__source_id__get",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibrarySource"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/health": {
       "get": {
         "tags": [
@@ -939,6 +1026,132 @@
           "manual"
         ],
         "title": "LayoutKind"
+      },
+      "LibraryEntry": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SourceKind"
+          },
+          "chars": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Chars"
+          },
+          "chunks": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Chunks"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "last_used_at": {
+            "type": "string",
+            "title": "Last Used At"
+          },
+          "cited_by": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cited By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_id",
+          "kind",
+          "chars",
+          "chunks",
+          "created_at",
+          "last_used_at",
+          "cited_by"
+        ],
+        "title": "LibraryEntry",
+        "description": "列表里的一份材料。**不含正文**，与 `library.list_sources` 同口径。"
+      },
+      "LibraryList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryEntry"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "total"
+        ],
+        "title": "LibraryList"
+      },
+      "LibrarySource": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SourceKind"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated",
+            "default": false
+          },
+          "total_chars": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total Chars"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_id",
+          "kind",
+          "text",
+          "total_chars"
+        ],
+        "title": "LibrarySource",
+        "description": "单份材料的正文预览。`truncated` 为真时必须让用户看到\"只是前 4000 字\"。"
       },
       "MapRecord": {
         "properties": {

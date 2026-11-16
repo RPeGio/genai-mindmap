@@ -267,6 +267,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/knowledge/library": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Library
+         * @description 库里的材料列表，最近使用的在前。`total` 是库里的总数，不是返回条数。
+         *
+         *     只读：不改任何状态，也不刷 `last_used_at`（"看了一下列表"不等于"用到了
+         *     这份材料"——那个字段是 `prune` 保留与否的依据）。
+         */
+        get: operations["list_library_api_knowledge_library_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/library/{source_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Library Source
+         * @description 单份材料的正文预览（前 4000 字，`truncated` 说明是否截断）。
+         */
+        get: operations["read_library_source_api_knowledge_library__source_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -430,6 +473,54 @@ export interface components {
          * @enum {string}
          */
         LayoutKind: "tree" | "vertical" | "logic" | "timeline" | "fishbone" | "manual";
+        /**
+         * LibraryEntry
+         * @description 列表里的一份材料。**不含正文**，与 `library.list_sources` 同口径。
+         */
+        LibraryEntry: {
+            /** Source Id */
+            source_id: string;
+            /** Filename */
+            filename?: string | null;
+            kind: components["schemas"]["SourceKind"];
+            /** Chars */
+            chars: number;
+            /** Chunks */
+            chunks: number;
+            /** Created At */
+            created_at: string;
+            /** Last Used At */
+            last_used_at: string;
+            /** Cited By */
+            cited_by: number;
+        };
+        /** LibraryList */
+        LibraryList: {
+            /** Items */
+            items?: components["schemas"]["LibraryEntry"][];
+            /** Total */
+            total: number;
+        };
+        /**
+         * LibrarySource
+         * @description 单份材料的正文预览。`truncated` 为真时必须让用户看到"只是前 4000 字"。
+         */
+        LibrarySource: {
+            /** Source Id */
+            source_id: string;
+            /** Filename */
+            filename?: string | null;
+            kind: components["schemas"]["SourceKind"];
+            /** Text */
+            text: string;
+            /**
+             * Truncated
+             * @default false
+             */
+            truncated: boolean;
+            /** Total Chars */
+            total_chars: number;
+        };
         /** MapRecord */
         MapRecord: {
             /** Id */
@@ -1305,6 +1396,68 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SearchResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_library_api_knowledge_library_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryList"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_library_source_api_knowledge_library__source_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibrarySource"];
                 };
             };
             /** @description Validation Error */

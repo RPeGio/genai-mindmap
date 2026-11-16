@@ -331,6 +331,18 @@ def list_sources(*, limit: int = 50) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def count() -> int:
+    """库里的来源总数（不受 `list_sources` 的 `limit` 影响）。
+
+    只给只读列表页显示"共 N 份"用。与 `agent.tools.library_source_count()`
+    的区别：那个数到 `LIBRARY_COUNT_LIMIT` 就停（它是给模型看的上限），
+    这个是真的 `COUNT(*)`。
+    """
+    with closing(_connect()) as conn, conn:
+        row = conn.execute(f"SELECT COUNT(*) AS total FROM {SOURCES_TABLE}").fetchone()
+    return int(row["total"])
+
+
 def recent(*, limit: int = 100) -> list[Source]:
     """最近使用过的 `limit` 份来源，**含正文**，最近使用的在前。
 
