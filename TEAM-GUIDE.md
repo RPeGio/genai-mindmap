@@ -85,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 6 组路由（14 个路径 / 16 个端点）
+    main.py            应用装配，注册 6 组路由（16 个路径 / 18 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       MindMapContent / Node / 请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -161,7 +161,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（14 个路径 / 16 个端点）
+## 5 接口一览（16 个路径 / 18 个端点）
 
 ```
 基础
