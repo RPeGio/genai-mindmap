@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import importlib.util
@@ -49,13 +50,18 @@ from app.agent.contracts import (
 )
 from app.agent.service import _INTENT_RULES, _RAG_INTENT_RULES, _system_text, run
 from app.agent.tools import (
+    BRANCH_EVIDENCE_RULES,
     GENERATE_EVIDENCE_RULES,
     MATERIAL_MANIFEST_MAX_ITEMS,
     MATERIAL_MANIFEST_TOKEN_LIMIT,
+    OUTLINE_HEADER,
+    GenerateDeepArgs,
+    _generate_deep,
     _material_manifest,
     _source_prompt_input,
     build_registry,
 )
+from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.source import AudioSentence, Source, SourceKind
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
@@ -70,6 +76,7 @@ from app.generation.service import (
     estimate_input_tokens,
     source_mode,
     thinking_block,
+    validate_generated_content,
 )
 from app.knowledge.service import search_parent
 
@@ -679,3 +686,302 @@ def test_too_many_materials_explain_a_reason_that_matches_the_mode():
     for message in (rag_message, full_message):
         # 份数超限与体积超限是两件事，不能混成一句话
         assert "超过模型上下文上限" not in message
+
+
+# ------------------------------------------- 七、开关的消费点：写成常量，不是散文
+#
+# `SOURCE_MODE` 是横切开关，"改一半"在这里是常态：检索接上了、提示词没接，或者
+# 生成路接上了、注册表没接。散文式的规矩（"改一个能力要检查所有路径"）挡不住它：
+# 它给不出可终止的判据，agent 无法回答"我枚举完了吗"；点了名反而制造虚假合规感。
+# 下面两节把它换成机器可判的东西：
+#
+#   1. 消费点**声明**成一个集合，与 AST 抽出来的真实集合比对（存在性）；
+#   2. 四条路各自按形态跑一遍，指纹差异按路径声明（方向性）。
+#
+# 两者互补：前者管"有没有多/少一条路"，后者管"那条路到底对不对"。
+
+# 本文件唯一的声明：允许读 `source_mode()` 的**外层函数名**集合。
+# **新增第五条路（某个函数第一次读这个开关）时必须同时改这里**——不改就是红灯，
+# 而且红在 diff 里就是这一行，看得见。
+#
+# 清单是跑出来的不是抄的：`tools.py` 里 5 个调用点落在 4 个外层函数上
+# （`_generate` 有两处：提示词分支与 `validate_generated_content` 的 evidence 门控）。
+# `_source_prompt_input` 是共享 helper（`_generate`、展开、改树都走它），它自己读开关；
+# `_rag` / `_expand` 刻意**不在**里面——那两条路与形态无关，`_rag` 里"这里不读
+# `source_mode()`"那句注释正是要由这条集合守住的。
+SOURCE_MODE_PATHS = {"_source_prompt_input", "_generate", "_generate_deep", "build_registry"}
+
+TOOLS_PATH = Path(__file__).resolve().parents[1] / "app" / "agent" / "tools.py"
+
+
+def _source_mode_call_sites() -> dict[str, list[int]]:
+    """`tools.py` 里每个 `source_mode()` 调用点 → (最内层外层函数名, 行号列表)。
+
+    只认 `Call`（`Name("source_mode")`）**不认 import**：从 `generation.service`
+    导进来那一行不是消费点。嵌套函数按最内层归属——调用发生在哪个函数体里，就是
+    哪条路在读开关，外层函数不该替它背账。
+    """
+    tree = ast.parse(TOOLS_PATH.read_text(encoding="utf-8"))
+    functions = [node for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    sites: dict[str, list[int]] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "source_mode"):
+            continue
+        owners = [fn for fn in functions if fn.lineno <= node.lineno <= fn.end_lineno]
+        assert owners, f"tools.py:{node.lineno} 的 source_mode() 不在任何函数里"
+        owner = max(owners, key=lambda fn: fn.lineno)     # 嵌套时取最内层
+        sites.setdefault(owner.name, []).append(node.lineno)
+    return sites
+
+
+def test_source_mode_consumers_are_declared():
+    """`source_mode()` 的消费点集合必须**逐字等于** `SOURCE_MODE_PATHS`。
+
+    **这条用例抓的是什么**：不是"某处写错了"，而是"某个消费点还活着、却没被声明"。
+    改一半的形态是——四条路里只接上三条，或者新加一条路读了开关而声明表里没有它。
+    两种都在这里表现为**集合不相等**，且报错直接给出差集（多出来的、少掉的）与全部
+    调用点行号，不需要谁去数。
+
+    为什么它比散文可靠：它是可终止的。AST 遍历完 `tools.py` 就是枚举完了，没有
+    "我是不是漏了第五条"这种无从回答的问题；而常量写在测试文件里，任何改动都会在
+    diff 里留下那一行。
+
+    **它抓不住什么**：抓住了"存在"，抓不住"正确"。声明四条、其中一条逻辑写反
+    （比如 `rag` 分支里忘了检索、`full` 分支里也读了证据），集合仍然相等，这里全绿。
+    那条得靠下面按路径参数化的行为用例——它钉的是方向，不是存在。
+    """
+    sites = _source_mode_call_sites()
+    actual = set(sites)
+    if actual == SOURCE_MODE_PATHS:
+        return
+    added = sorted(actual - SOURCE_MODE_PATHS)
+    removed = sorted(SOURCE_MODE_PATHS - actual)
+    listing = "\n".join(
+        f"    {name}：行 {', '.join(str(line) for line in sorted(sites[name]))}"
+        for name in sorted(sites)
+    )
+    pytest.fail(
+        "`source_mode()` 的消费点与 SOURCE_MODE_PATHS 不一致——"
+        "要么新加了一条路却没声明，要么声明里的那条已经不读开关了。\n"
+        f"  多出来的（读了开关但没声明）：{added or '无'}\n"
+        f"  少掉的（声明了但没读开关）：{removed or '无'}\n"
+        f"  实际调用点：\n{listing}"
+    )
+
+
+# ------------------------------------------- 八、按路径判：只改三条 = 一条 param 红
+#
+# 每条路径一个探针，各返回一组字符串"指纹"。同一路径在 `rag` 与 `full` 下各跑一次，
+# 差异集合与 `PATH_EXPECTATIONS` 对照：
+#
+#   - **声明为形态相关**的键：连方向一起钉（"变了"不等于"变对了"）；
+#   - **没声明的键**：两种形态下必须逐字相同（多出来的差异就是"悄悄接上的第五条路"）。
+#
+# 每条路径的差异点本来就不同（提示词分支 / 分片目录 / 注册表 / 无差异），所以四条
+# 一起红没有意义，**一条红才对得上"只改了三条"**。
+
+RETRIEVAL_TEXT = (
+    "第一章 总则。本制度适用于全部预算事项。\n"
+    "第八条 预算审批由财务经理核准后执行，超过五十万元报总经理审批。\n"
+    "第九条 每季度末做一次预算执行分析。"
+)
+# 目录要覆盖率 ≥60% 才会拼进骨架（见 `OUTLINE_MIN_COVERAGE`）：三个带标题的
+# 章节各撑一段正文，标题之外没有大段流水账。
+FILLER = "这一段是正文内容，用来把章节的长度撑开，本身不参与任何断言。" * 3
+OUTLINE_MATERIAL = (
+    "# 预算管理办法\n\n"
+    "## 预算审批\n\n" + FILLER + "\n\n"
+    "## 预算执行分析\n\n" + FILLER + "\n\n"
+    "## 绩效考核\n\n" + FILLER + "\n"
+)
+
+
+def _path_ctx(*, intent: str, sources: list[Source], candidate=None,
+              selected_ids: list[str] | None = None) -> RunContext:
+    """按路径造 ctx：意图、候选树、选中节点都由调用方给（展开路要后两个）。"""
+    request = AgentRunRequest(
+        goal="整理材料", intent=intent, sources=sources,
+        selected_ids=selected_ids or [],
+        budget=RunBudget(max_model_calls=8, max_tool_calls=8, max_output_tokens=32768),
+    )
+    return RunContext(request=request, candidate=candidate,
+                      sources_by_id={source.id: source for source in sources})
+
+
+def _fingerprint_rag(mode: str) -> dict[str, str]:
+    """`rag_query` 这条路：`_rag` 不读开关，两种形态必须**逐字相同**。
+
+    指纹取的是检索结果的形状（命中数、单条命中的键集、`method`、库开关那枚键）。
+    谁哪天在 `_rag` 里加一句"`rag` 形态才查库"，这里立刻红——AST 那节只能说明
+    "多了个读开关的地方"，这一条说明"多出来的那个读取真的改变了行为"。
+    """
+    ctx = _path_ctx(intent="expand", sources=[_material(RETRIEVAL_TEXT)])
+    result = asyncio.run(build_registry("expand", has_sources=True).execute(
+        ToolCall(call_id="c-rag", name="rag_query",
+                 arguments={"question": "预算由谁核准"}),
+        ctx,
+    ))
+    assert result.ok, f"{mode}: {result.content}"     # 前提：检索跑得通，指纹才非空
+    hits = result.data["hits"]
+    assert hits, f"{mode}: 样本与问句必须有共同词项，否则这条路的指纹是空的"
+    return {
+        "hits": str(len(hits)),
+        "hit_keys": ",".join(sorted(hits[0])),
+        "method": result.data["method"],
+        "library_key": "1" if "library_sources" in result.data else "0",
+    }
+
+
+def _fingerprint_generate(mode: str) -> dict[str, str]:
+    """`mindmap_generate` 这条路：三处随形态变，分别对应 `_generate` 的三件事。
+
+    - `source_array`：`_source_prompt_input` 的分叉（正文整份 JSON vs 材料清单）；
+    - `prompt_flavour`：system 提示词必须与输入出自**同一次**形态判定；
+    - `evidence_header`：`rag` 形态下这次主题预检索把命中拼进了 user；
+    - `validator_evidence`：`ctx.evidence` 只在 `rag` 下交给校验器（`full` 下
+      父块开会把合法引用误判成越界）。
+    """
+    source = _material(RETRIEVAL_TEXT)
+    seen: dict[str, object] = {}
+    real = validate_generated_content
+
+    def spy(content, *, sources=None, evidence=None):
+        seen["evidence"] = evidence
+        return real(content, sources=sources, evidence=evidence)
+
+    mocked = AsyncMock(return_value=TREE)
+    with patch("app.agent.tools.chat_async", new=mocked), \
+            patch("app.agent.tools.validate_generated_content", new=spy):
+        result = asyncio.run(build_registry("create", has_sources=True).execute(
+            ToolCall(call_id="c-gen", name="mindmap_generate",
+                     arguments={"topic": "预算审批"}),
+            _path_ctx(intent="create", sources=[source]),
+        ))
+    assert result.ok, f"{mode}: {result.content}"
+    assert "evidence" in seen, f"{mode}: 校验器一次都没被调用，指纹无从谈起"
+    system, user = mocked.await_args.args
+    flavour = "other"
+    if system.startswith(RAG_SOURCE_PROMPT):
+        flavour = "rag"
+    elif system.startswith(SOURCED_DETAIL_PROMPT):
+        flavour = "full"
+    return {
+        "source_array": "1" if "sources 数组" in user else "0",
+        "prompt_flavour": flavour,
+        "evidence_header": "1" if EVIDENCE_HEADER in user else "0",
+        "validator_evidence": "none" if seen.get("evidence") is None else "spans",
+    }
+
+
+def _fingerprint_generate_deep(mode: str) -> dict[str, str]:
+    """`mindmap_generate_deep` 这条路：分片检索与"给不给这个工具"都由形态决定。
+
+    直接调 `_generate_deep` 而不是走注册表：`full` 形态下注册表**有意**不给这个工具
+    （`build_registry` 按形态撤掉），走注册表在那一侧根本到不了函数体，也就量不到
+    "函数自己判没判形态"。注册表自己的决定用 `deep_offered` 单列一枚指纹。
+    """
+    source = _material(OUTLINE_MATERIAL)
+    mocked = AsyncMock(return_value={"branches": []})
+    with patch("app.agent.tools.chat_async", new=mocked):
+        result = asyncio.run(_generate_deep(
+            GenerateDeepArgs(topic="预算管理", branches=3),
+            _path_ctx(intent="create", sources=[source]),
+        ))
+    # 前提：走到骨架那一步就收尾（一个分支都不给），一次模型调用、没有后续噪音
+    assert result.data.get("code") == "too_few_branches", f"{mode}: {result.content}"
+    _, user = mocked.await_args.args
+    offered = "mindmap_generate_deep" in build_registry("create", has_sources=True).names()
+    return {
+        "skeleton_outline": "1" if OUTLINE_HEADER in user else "0",
+        "deep_offered": "1" if offered else "0",
+    }
+
+
+def _fingerprint_node_expand(mode: str) -> dict[str, str]:
+    """`node_expand` 这条路：`_expand` 不读开关，两种形态必须逐字相同。
+
+    指纹取整段 (system, ask) 的摘要 + "这一支的检索规则在不在"：展开时那次按节点
+    检索是形态无关的（`_expand_reference` 不看开关），把它改成"`full` 下不用查"
+    会让两个形态的摘要分叉、并让 `evidence_rules` 掉成 0。
+    """
+    source = _material(RETRIEVAL_TEXT)
+    candidate = MindMapContent(title="示例", root=Node(
+        id="root", label="根",
+        children=[Node(id="n1", label="预算审批", children=[])]))
+    ctx = _path_ctx(intent="expand", sources=[source], candidate=candidate,
+                    selected_ids=["n1"])
+    mocked = AsyncMock(return_value={"children": []})
+    with patch("app.agent.tools.chat_async", new=mocked):
+        result = asyncio.run(build_registry("expand", has_sources=True).execute(
+            ToolCall(call_id="c-expand", name="node_expand",
+                     arguments={"node_id": "n1", "count": 2}),
+            ctx,
+        ))
+    # 前提：模型回了空的 children 数组 → 一批里一个都没有，`invalid_points`
+    assert result.data.get("code") == "invalid_points", f"{mode}: {result.content}"
+    system, ask = mocked.await_args.args
+    return {
+        "evidence_rules": "1" if BRANCH_EVIDENCE_RULES in system else "0",
+        "prompt_digest": hashlib.sha1(
+            (system + "\x00" + ask).encode("utf-8")).hexdigest()[:12],
+    }
+
+
+_PATH_FINGERPRINTS = {
+    "rag": _fingerprint_rag,
+    "generate": _fingerprint_generate,
+    "generate_deep": _fingerprint_generate_deep,
+    "node_expand": _fingerprint_node_expand,
+}
+
+# 路径 -> 声明为"形态相关"的键及其 (rag 下的值, full 下的值)。
+# 值为空的路径是**控制组**：它按设计不随形态变，所以它的差异集合必须是空的——
+# "某个无关函数悄悄开始读开关"在这里立刻红。每条的差异点各自不同，正是"只改三条"
+# 会点亮一条 param 的原因。
+PATH_EXPECTATIONS: dict[str, dict[str, tuple[str, str]]] = {
+    "rag": {},
+    "generate": {
+        "source_array": ("0", "1"),
+        "prompt_flavour": ("rag", "full"),
+        "evidence_header": ("1", "0"),
+        "validator_evidence": ("spans", "none"),
+    },
+    "generate_deep": {
+        "skeleton_outline": ("1", "0"),
+        "deep_offered": ("1", "0"),
+    },
+    "node_expand": {},
+}
+
+
+@pytest.mark.parametrize("path", sorted(PATH_EXPECTATIONS))
+def test_each_path_only_varies_by_mode_where_declared(path):
+    """按**路径**而不是按函数判形态：四条路各跑一遍，差异必须与声明逐项相符。
+
+    与上一节的分工：AST 那条管"存在"（哪些函数读了开关），这条管"方向"（读了之后
+    行为对不对）。举例——把 `_generate` 里 `rag` 分支的那次预检索删掉，消费点集合
+    一个字都不变（AST 全绿），但这一条 `generate` param 立刻红：`evidence_header`
+    掉成 `0`；把 `_generate_deep` 的 `slicing` 改成恒真，`generate_deep` param 里
+    `skeleton_outline` 会变成 `("1","1")` 而期望是 `("1","0")`。
+
+    控制组不是凑数的：`rag` 与 `node_expand` 声明"零差异"，等于把"这两条路与形态
+    无关"从注释变成断言。真有谁给它们接上开关，红的正是那一条。
+    """
+    declared = PATH_EXPECTATIONS[path]
+    with _env(SOURCE_MODE_RAG):
+        rag = _PATH_FINGERPRINTS[path](SOURCE_MODE_RAG)
+    with _env(SOURCE_MODE_FULL):
+        full = _PATH_FINGERPRINTS[path](SOURCE_MODE_FULL)
+
+    assert set(rag) == set(full), f"路径 {path} 两次探针的指纹键不一致"
+    undeclared = {key: (rag[key], full[key]) for key in rag
+                  if key not in declared and rag[key] != full[key]}
+    assert not undeclared, (
+        f"路径 {path} 的这些指纹在 rag/full 下不同，却没在 PATH_EXPECTATIONS 里"
+        f"声明为形态相关：{undeclared}")
+    for key, expected in declared.items():
+        actual = (rag[key], full[key])
+        assert actual == expected, (
+            f"路径 {path} 的 {key}：期望 (rag, full) = {expected}，实际 {actual}")
