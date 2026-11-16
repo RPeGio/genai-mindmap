@@ -18,6 +18,9 @@
     python scripts/measure_external_relevance.py --rerank     # 三组：无门 / 门 / 门+rerank
     python scripts/measure_external_relevance.py --sweep      # 离线：阈值扫描（用分数缓存）
     python scripts/measure_external_relevance.py --probe-text-length  # 联网：分数对文本长度的敏感度
+    python scripts/measure_external_relevance.py --collect-single      # 联网：单方向池（同环境对照）
+    python scripts/measure_external_relevance.py --collect-directions  # 联网：方向池
+    python scripts/measure_external_relevance.py --directions          # 离线：四组对照
 
 `--collect` 之后的一切都是离线的：改判据、改阈值、改判定表，重跑 `--report` /
 `--variants` 即可，不再联网。`--rerank` / `--probe-text-length` 是例外——它们打的是
@@ -168,11 +171,59 @@ Need" 这种全英文命中算**相关**（它讲的就是 query 问的事，只
 `三条全相关` 的定义：这次返回的每一条（不足 3 条时按实际条数）都被判为相关；
 返回 0 条**不算**（没有可错的，也没有对的）。
 
+## 第四组：多方向检索（`--collect-single` / `--collect-directions` / `--directions`）
+
+前三组共用同一份候选池，所以"差异只可能来自判据"。这一组不是：拆方向之后每个方向
+各打一轮源，候选池本身换了。所以它必须**同一天抓两份池子**——单方向池（今天这台
+机器上五个源能给什么）与方向池（拆方向之后能给什么）——否则差异里混着源可用性。
+
+    python scripts/measure_external_relevance.py --collect-single      # 单方向池
+    python scripts/measure_external_relevance.py --collect-directions  # 方向池
+    python scripts/measure_external_relevance.py --directions          # 离线重放
+
+2026-11 实测（20 主题，本机 Clash Verge `127.0.0.1:7897`，DeepSeek 拆方向：
+
+    | 组 | 返回条数 | 噪声条目 | 三条全相关 | 成功率 | 覆盖方面数 | 耗时中位 |
+    |---|---|---|---|---|---|---|
+    | 无门（单方向） | 43 | 8 | 13/20 | 95% | 1.47 | 4.51s |
+    | 词面门（生产，单方向） | 43 | 8 | 13/20 | 95% | 1.47 | 4.51s |
+    | **词面门 + 拆方向** | **21** | **5** | **6/20** | **50%** | **0.79** | **6.65s** |
+    | 拆方向 + 按主题施门（诊断） | 32 | 11 | 5/20 | 65% | 0.95 | 6.65s |
+    | 拆方向 + 无门（诊断） | 60 | 42 | 1/20 | 100% | 0.68 | 6.65s |
+
+**结论：不值得接，所以 `MINDMAP_EXTERNAL_DIRECTIONS` 默认关。** 三条全相关 13/20
+→ 6/20、成功率 95% → 50%、耗时 +2.1 秒。噪声从 8 掉到 5 只是因为返回从 43 条掉到
+21 条——池内噪声率反而是 22.2% → **71.2%**（候选 72 → 146 条，相关 55 → 41 条）：
+三个方向各打一遍，源站对「碳中和政策」「内卷职场表现」这类组合短语的匹配退化，
+撞词的跑题命中大量进来。
+
+三个原因都不是"再调调"能消掉的，逐条有数据：
+
+1. **限定语闸把有料的主题砍空**。方向以主题原词开头时 `_phrase_terms(direction)`
+   退化成主题的判定词块（`_direction_gate` 的 docstring 量了这一点），所以必须再
+   加一道限定语闸；而限定语在这批源站的摘要里经常不出现：`幻觉` 的方向池里有 4 条
+   相关候选，过门后 0 条；`内卷` 2 条相关 → 0 条。
+2. **单条命中本来就够**。20 个主题里有 10 个，单方向路径那条维基正文的前 300 字
+   已经含 2-3 个方向限定语（`注意力机制`、`最终一致性`、`量子色动力学`、
+   `Byzantine fault tolerance` 各三条全中）。拆方向是在把一份已经多面的材料切成
+   单面的几份——任务里那句"碳中和的维基条目本身可能已涵盖政策/技术/案例"是成立的，
+   逐主题表最后一列就是这条的读数。
+3. **每方向预算太薄**。15 次 / 3 方向 = 每个源一次机会，任何一个源 429 就丢掉该方向
+   的一整个源；单方向路径有 9 次预算、维基能抓 3 条。实测方向池里"至少 1 条相关
+   候选"的主题只有 **12/20**，而单方向池是 16/20（历史口径）——池子本身就差一档。
+
+`--directions` 的逐主题表还给出两件东西：每个方向池的"候选/相关"、以及**单方向那条
+维基正文里已经出现了哪些方向限定语**。后者是这条结论最直接的一张证据。
+
+`measure_external_relevance.coverage.json` 是"覆盖方面数"的人工判定表（每条命中
+记它最贴近的那个方面），口径写在文件里的 `_README`。
+
 用法与产出见文件末尾 `main()`。
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import re
@@ -319,6 +370,7 @@ def _hit(spec: dict[str, Any]) -> external.ExternalHit:
         title=spec["title"], text=spec["text"], url=spec["url"],
         source_name=spec["source_name"], fetched_at="2026-01-01T00:00:00Z",
         language=spec["language"], raw_chars=spec.get("raw_chars", len(spec["text"])),
+        direction=spec.get("direction", ""),
     )
 
 
@@ -848,6 +900,340 @@ def variants() -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 第四组：多方向检索
+#
+# 与前三组有一处**根本区别**：前三组共用同一份候选池（`pool.jsonl`，一次联网抓回
+# 来的单 query 候选），所以"差异只可能来自判据"。这一组的候选池必然是另一份——每个
+# 方向各打一轮源，命中池是各方向候选的并集。所以它不能离线复用旧池，必须自己联网
+# 抓一次（`--collect-directions`），抓完之后所有判据变化都在离线重放。
+#
+# 抓取时**方向由 `plan_directions` 产出**（真实 DeepSeek 调用），然后把方向注入
+# `search_external(topic, directions=...)`——注入而不是让它自己拆，是为了同一份
+# 记录里的方向与候选严格对应：重放时不会因为模型这次给了别的方向而对不上。
+#
+# 人工判定沿用 `judged.json`（键是 `(topic, 标题)`，与命中来自哪个方向无关——判定
+# 的问题是"这条讲的是不是这个主题的事"）。覆盖方面数另需一张 `coverage.json`，
+# 因为"这条属于哪个方面"没法自动判：它要读标题和方向的意思。
+
+DIRECTIONS_POOL = Path(__file__).with_name("measure_external_relevance.directions.jsonl")
+# 同一时段、同一出口、同一批源跑一遍**单方向**（生产现状）的池子。为什么需要它：
+# 外部源的可用性会随小时漂（本次采集 OpenAlex 40/60 次 429），拿"今天的方向池"去比
+# "上个月的单方向池"，差异里混着源可用性——那不是在量拆方向。两份池子必须同一天抓。
+SINGLE_POOL = Path(__file__).with_name("measure_external_relevance.single.jsonl")
+COVERAGE_PATH = Path(__file__).with_name("measure_external_relevance.coverage.json")
+
+# 主题之间的间隔（秒）。多方向检索一个主题要发十几条请求，20 个主题连着跑会把
+# OpenAlex 的匿名限流（无 key 时按出口 IP 共享、并且对突发敏感）撞满——实测连续
+# 采集时一半的主题拿到 429，那样量出来的不是判据，是限流器的状态。
+COLLECT_INTERVAL = 2.0
+
+
+def _spec(hit: external.ExternalHit) -> dict[str, Any]:
+    """一条命中 → 可落盘的形状（正文只留 `POOL_TEXT_CHARS` 字，同 `_pool_capture`）。"""
+    return {
+        "source_name": hit.source_name,
+        "title": hit.title,
+        "text": hit.text[:POOL_TEXT_CHARS],
+        "url": hit.url,
+        "language": hit.language,
+        "raw_chars": hit.raw_chars,
+        "direction": hit.direction,
+    }
+
+
+def _direction_capture() -> tuple[list[dict[str, Any]], Any]:
+    """拦 `_search_one`：每个方向一轮的原始候选（**过门之前**）原样留下。
+
+    拦这个函数而不是 `_interleave`：多方向路径里 `_interleave` 会被调 N+1 次
+    （每方向一次 + 无），而 `_search_one` 恰好"一方向一次"，是唯一能给出
+    `{方向: 候选}` 对应关系的入口。
+    """
+    captured: list[dict[str, Any]] = []
+    original = external._search_one
+
+    def wrapped(query: str, limit: int, **kwargs):
+        hits = original(query, limit, **kwargs)
+        # 方向标签在这里补上：`_search_one` 返回的是**过门之前**的候选，而 `direction`
+        # 是 `_search_many` 在过门之后 `replace` 上去的。拦在这一层就得自己补，
+        # 否则落盘的 spec 里方向全空，报告里"政策那个方向拿回了什么"就无从回答。
+        captured.append({"direction": query,
+                         "hits": [{**_spec(hit), "direction": query} for hit in hits]})
+        return hits
+
+    external._search_one = wrapped
+
+    def restore() -> None:
+        external._search_one = original
+
+    return captured, restore
+
+
+def collect_directions() -> int:
+    """联网一次：每个主题拆方向 + 每方向打源，写 `directions.jsonl`。"""
+    rows: list[dict[str, Any]] = []
+    for topic, kind in TOPICS:
+        captured, restore = _direction_capture()
+        plan_started = time.perf_counter()
+        try:
+            directions = asyncio.run(external.plan_directions(topic))
+            plan_error = None
+        except Exception as exc:  # noqa: BLE001 — 实测脚本，异常本身就是数据
+            directions = [topic]
+            plan_error = f"{type(exc).__name__}: {exc}"
+        plan_seconds = time.perf_counter() - plan_started
+        started = time.perf_counter()
+        try:
+            hits = external.search_external(topic, directions=directions)
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            hits = []
+            error = f"{type(exc).__name__}: {exc}"
+        elapsed = time.perf_counter() - started
+        restore()
+        row = {
+            "topic": topic, "kind": kind,
+            "directions": directions,
+            "plan_seconds": round(plan_seconds, 3),
+            "seconds": round(elapsed, 3),
+            "error": error, "plan_error": plan_error,
+            "returned": [_spec(hit) for hit in hits],
+            "pools": captured,
+        }
+        rows.append(row)
+        print(json.dumps({k: row[k] for k in
+                          ("topic", "directions", "seconds", "plan_seconds")},
+                         ensure_ascii=False), flush=True)
+        time.sleep(COLLECT_INTERVAL)
+    DIRECTIONS_POOL.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+    print(f"\n写盘：{DIRECTIONS_POOL}（{len(rows)} 个主题）")
+    return 0
+
+
+def collect_single() -> int:
+    """同一时段跑一遍**单方向**（`directions=[topic]`），写 `single.jsonl`。
+
+    与 `collect` 的区别只有一处：这里强制不拆方向，量的就是"今天这台机器上、这五个
+    源能给什么"。它是方向池的同环境对照——没有它，对照表里的差异分不清是拆方向
+    带来的还是 OpenAlex 今天 429 带来的。
+    """
+    captured = _pool_capture()
+    rows: list[dict[str, Any]] = []
+    for topic, kind in TOPICS:
+        before = len(captured)
+        started = time.perf_counter()
+        try:
+            hits = external.search_external(topic, directions=[topic])
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            hits = []
+            error = f"{type(exc).__name__}: {exc}"
+        elapsed = time.perf_counter() - started
+        pools = captured[before:]
+        row = {
+            "topic": topic, "kind": kind, "seconds": round(elapsed, 3),
+            "error": error, "returned": [hit.title for hit in hits], "pools": pools,
+        }
+        rows.append(row)
+        print(json.dumps({k: row[k] for k in ("topic", "seconds", "returned", "error")},
+                         ensure_ascii=False), flush=True)
+        time.sleep(COLLECT_INTERVAL)
+    SINGLE_POOL.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+    print(f"\n写盘：{SINGLE_POOL}（{len(rows)} 个主题）")
+    return 0
+
+
+def _coverage() -> dict[str, list[list[str]]]:
+    """人工标注的覆盖表：`{主题: [[标题子串, 方面标签], ...]}`，按顺序第一条命中生效。"""
+    if not COVERAGE_PATH.exists():
+        return {}
+    payload = json.loads(COVERAGE_PATH.read_text(encoding="utf-8"))
+    return {topic: [(str(needle), str(label)) for needle, label in rules]
+            for topic, rules in payload.items() if not topic.startswith("_")}
+
+
+def _aspect(topic: str, title: str, rules: list[list[str]]) -> str | None:
+    for needle, label in rules:
+        if needle in title:
+            return label
+    return None
+
+
+def _multi_groups(row: dict[str, Any]) -> dict[str, list[external.ExternalHit]]:
+    """把一条方向记录重放成三种口径的命中列表（都未截断）：
+
+      - `multi+gate`：**生产口径**——按方向施门（`_direction_gate`）；
+      - `multi+topic_gate`：诊断——用主题过门（拆了方向但不改门，看门退化了会怎样）；
+      - `multi+no_gate`：诊断——不做任何词面过滤。
+
+    三组共用同一份方向候选池、同一套去重与轮转，所以差异只来自"怎么判相关"。
+    """
+    topic = row["topic"]
+    groups: dict[str, list[list[external.ExternalHit]]] = {
+        "multi+gate": [], "multi+topic_gate": [], "multi+no_gate": []}
+    for pool in row["pools"]:
+        direction = pool["direction"]
+        # 方向标签以池子的键为准：`direction` 字段是抓取时写在 spec 里的，旧记录
+        # （`_direction_capture` 补这个字段之前抓的）没有它——但池子的键一直有。
+        candidates = [_hit({**spec, "direction": spec.get("direction") or direction})
+                      for spec in pool["hits"]]
+        groups["multi+gate"].append(
+            external._direction_gate(topic, direction, candidates))
+        groups["multi+topic_gate"].append(external._relevant_hits(topic, candidates))
+        groups["multi+no_gate"].append(list(candidates))
+    merged = {}
+    for name, per_direction in groups.items():
+        deduped, _ = external._dedupe_by_url(per_direction)
+        ordered = [external._interleave(group, external.DIRECTION_HIT_LIMIT,
+                                        prefer_language=external._query_language(topic))
+                   for group in deduped]
+        merged[name] = external._interleave_directions(
+            ordered, external.DEFAULT_LIMIT)
+    return merged
+
+
+def directions_report() -> int:
+    """四组对照：无门 / 词面门 / 词面门+rerank / **词面门+拆方向**（另附两条诊断）。
+
+    基线池优先用 `single.jsonl`（同一天、同一出口抓的单方向池）：外部源的可用性会
+    随小时漂（本次 OpenAlex 40/60 次 429、快懂百科全程连不上），拿今天的池子比上个月
+    的池子，差异里混着源可用性。历史池（`pool.jsonl`）仍然读，只用来打 rerank 那一行
+    ——那行依赖按池子摘要缓存的分数，换池子就得重打一次 rerank。
+    """
+    _load_rules()
+    baseline_path = SINGLE_POOL if SINGLE_POOL.exists() else POOL
+    old_rows = [json.loads(line) for line in
+                baseline_path.read_text(encoding="utf-8").splitlines() if line]
+    if not DIRECTIONS_POOL.exists():
+        print(f"!! 方向池缺席：{DIRECTIONS_POOL}（先跑 --collect-directions）")
+        return 1
+    new_rows = [json.loads(line) for line in
+                DIRECTIONS_POOL.read_text(encoding="utf-8").splitlines() if line]
+    coverage = _coverage()
+    print(f"基线池：{baseline_path.name}；方向池：{DIRECTIONS_POOL.name}")
+
+    groups = ("no_gate", "gate", "multi+gate", "multi+topic_gate", "multi+no_gate")
+    totals = {name: {"count": 0, "noise": 0, "relevant": 0, "all_relevant": 0,
+                     "topics_hit": 0, "unjudged": 0, "seconds": []} for name in groups}
+    aspects = {name: 0 for name in groups}
+    aspect_topics = {name: 0 for name in groups}
+
+    def record(name: str, topic: str, hits: list, seconds: float) -> None:
+        titles = [hit.title for hit in hits]
+        stats = _stats(topic, titles)
+        t = totals[name]
+        t["count"] += stats["count"]
+        t["noise"] += stats["noise"]
+        t["relevant"] += stats["relevant"]
+        t["unjudged"] += stats["unjudged"]
+        t["topics_hit"] += 1 if titles else 0
+        t["all_relevant"] += 1 if stats["all_relevant"] else 0
+        t["seconds"].append(seconds)
+        rules = coverage.get(topic)
+        if rules:
+            labels = {_aspect(topic, title, rules) for title in titles}
+            labels.discard(None)
+            labels.discard("无关")
+            aspect_topics[name] += 1
+            aspects[name] += len(labels)
+
+    for row in old_rows:
+        topic = row["topic"]
+        pools = row["pools"]
+        specs = [spec for item in pools for spec in item["pool"]]
+        pool = [_hit(spec) for spec in specs]
+        limit = pools[0]["limit"] if pools else external.DEFAULT_LIMIT
+        prefer = pools[0]["prefer_language"] if pools else None
+        seconds = float(row["seconds"])
+        record("no_gate", topic,
+               external._interleave(pool, limit, prefer_language=prefer), seconds)
+        gated = external._relevant_hits(topic, pool)
+        record("gate", topic,
+               external._interleave(gated, limit, prefer_language=prefer), seconds)
+
+    for row in new_rows:
+        seconds = float(row["seconds"]) + float(row["plan_seconds"])
+        merged = _multi_groups(row)
+        for name in ("multi+gate", "multi+topic_gate", "multi+no_gate"):
+            record(name, row["topic"], merged[name], seconds)
+        print(json.dumps({
+            "topic": row["topic"], "directions": row["directions"],
+            "seconds": seconds,
+            "multi+gate": [f"{hit.direction}|{hit.source_name}|{hit.title}"
+                           for hit in merged["multi+gate"]],
+        }, ensure_ascii=False), flush=True)
+
+    print("\n| 组 | 返回条数 | 噪声条目 | 相关条目 | 三条全相关 | 成功率 | 覆盖方面数 | 耗时中位 |")
+    print("|---|---|---|---|---|---|---|---|")
+    for name in groups:
+        t = totals[name]
+        aspect = (f"{aspects[name] / aspect_topics[name]:.2f}"
+                  f"（{aspect_topics[name]} 个主题）" if aspect_topics[name] else "—")
+        print(f"| {name} | {t['count']} | {t['noise']} | {t['relevant']} "
+              f"| {t['all_relevant']}/{len(new_rows)} "
+              f"| {t['topics_hit'] / len(new_rows):.1%} | {aspect} "
+              f"| {_pct(t['seconds'], 0.5):.2f}s |")
+
+    print("\n逐主题（生产口径 vs 拆方向）：")
+    print("| 主题 | 方向 | 池内候选/相关 | 生产 3 条 | 拆方向 3 条 | 单方向维基正文已含的限定语 |")
+    print("|---|---|---|---|---|---|")
+    old_by_topic = {row["topic"]: row for row in old_rows}
+    ceiling = 0
+    for row in new_rows:
+        topic = row["topic"]
+        merged = _multi_groups(row)
+        pool_titles = [spec["title"] for pool in row["pools"] for spec in pool["hits"]]
+        relevant = [title for title in pool_titles if _judged(topic, title) is True]
+        if relevant:
+            ceiling += 1
+        old_pool = [spec for item in old_by_topic[topic]["pools"] for spec in item["pool"]]
+        old_titles = [f"{hit.source_name}/{hit.title[:22]}"
+                      for hit in external._interleave(
+                          external._relevant_hits(topic, [_hit(spec) for spec in old_pool]),
+                          external.DEFAULT_LIMIT,
+                          prefer_language=external._query_language(topic))]
+        new_titles = [f"{hit.direction[:8]}/{hit.title[:22]}"
+                      for hit in merged["multi+gate"]]
+        # 任务里那句"碳中和的维基条目本身可能已经涵盖三个方面"——直接量：方向里比主题
+        # 多出来的限定语，有几个出现在**单方向路径那条维基正文**里。
+        wiki = [_hit(spec) for spec in old_pool if spec["source_name"] == "wikipedia"]
+        covered = []
+        for direction in row["directions"]:
+            qualifier = external._direction_qualifier(topic, direction)
+            if not qualifier:
+                continue
+            grams, _ = external._qualifier_terms(qualifier)
+            if any(gram in hit.text for hit in wiki for gram in grams):
+                covered.append(qualifier)
+        print(f"| {topic} | {'、'.join(row['directions'])} "
+              f"| {len(pool_titles)}/{len(relevant)} "
+              f"| {'；'.join(old_titles) or '—'} | {'；'.join(new_titles) or '—'} "
+              f"| {'、'.join(covered) or '—'} |")
+    print(f"\n方向池里至少 1 条相关候选的主题（三条全相关的上限）：{ceiling}/{len(new_rows)}")
+
+    # "拆方向会不会让噪声变多"要量**候选级**而不是返回级：返回级受名额影响（返回少
+    # 了，噪声自然也少），看不出池子本身脏不脏。这里比的是两份池子的原始候选。
+    print("\n池内噪声率（候选级，未经门与名额）：")
+    for label, rows, pick in (("单方向", old_rows, lambda row: [
+            spec for item in row["pools"] for spec in item["pool"]]),
+        ("拆方向", new_rows, lambda row: [
+            spec for pool in row["pools"] for spec in pool["hits"]])):
+        total = relevant = noise = 0
+        for row in rows:
+            for spec in pick(row):
+                total += 1
+                verdict = _judged(row["topic"], spec["title"])
+                if verdict is True:
+                    relevant += 1
+                elif verdict is False:
+                    noise += 1
+        rate = noise / total if total else 0.0
+        print(f"  {label}：候选 {total} 条｜相关 {relevant}｜噪声 {noise}"
+              f"（{rate:.1%}）")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--collect", action="store_true", help="联网抓一次，写候选池")
@@ -859,6 +1245,12 @@ def main() -> int:
                         help="绝对阈值扫描：门+重排+过滤 / 纯语义+过滤（离线，用分数缓存）")
     parser.add_argument("--probe-text-length", action="store_true",
                         help="同一条候选在 200 字与 400 字正文下的分数（要联网）")
+    parser.add_argument("--collect-directions", action="store_true",
+                        help="联网：每主题拆方向 + 每方向打源，写 directions.jsonl")
+    parser.add_argument("--directions", action="store_true",
+                        help="四组对照：无门 / 词面门 / 门+rerank / 门+拆方向（离线）")
+    parser.add_argument("--collect-single", action="store_true",
+                        help="联网：同一时段抓一遍单方向池（方向池的同环境对照）")
     parser.add_argument("--refresh-scores", action="store_true",
                         help="忽略分数缓存，重新打一遍 rerank")
     args = parser.parse_args()
@@ -874,6 +1266,12 @@ def main() -> int:
         return sweep_report()
     if args.probe_text_length:
         return probe_text_length()
+    if args.collect_directions:
+        return collect_directions()
+    if args.collect_single:
+        return collect_single()
+    if args.directions:
+        return directions_report()
     parser.print_help()
     return 2
 

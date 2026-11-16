@@ -52,6 +52,35 @@ hit 形状、第二套引用格式、第二套校验。所以这个模块只做�
 生成：调用方（`agent.tools._generate`）拿不到结果就退回"只凭主题"的那条路。总预算
 （`REQUEST_LIMIT` 次请求 / `DEADLINE_SECONDS` 秒）是硬的，理由见 `_Budget`。
 
+## 多方向检索：查一遍 = 一个方面，短主题要的是几个方面
+
+`碳中和` 这样的主题，用户期待的是"政策 / 技术路径 / 企业案例"这类**多面覆盖**，而
+一条 query 只能打回一个方面。所以检索前先拆方向（`plan_directions`，**一次** LLM
+调用），每个方向各打一轮，合并去重后按方向轮转取样：
+
+    主题 → 2-4 个方向 → 每方向并行打源（各 2 条）→ URL 去重
+         → 按**方向**各自过词面门 → 方向内按源交替 → 跨方向轮转 → 取 limit 条
+
+三条约束是这个形状存在的前提，改动它们等于取消这个功能：
+
+  - **门按方向施加而不是按主题**（`_relevant_hits(direction, hits)`）。合并后的池子
+    里一条"讲碳中和但不讲政策"的命中，对方向「碳中和政策」就是噪声；拿主题去判它
+    反而放行。拆方向如果不动门，门就会从"判一条命中是不是这个 query 的东西"退化成
+    "判它是不是这个话题的东西"——粗一档，等于白拆。
+  - **跨方向轮转取样**（`_interleave_directions`）而不是直接 `_interleave`：后者按
+    **源**分桶，三个方向都命中维基时，维基桶的前 3 条会占满名额，很可能全来自方向 1
+    ——拆了三个方向，返回的还是同一个方面。方向内仍按源交替（`_interleave`），两层
+    交替各管一件事：方向内保源多样、跨方向保方面覆盖。
+  - **降级必须是一个方向**（`[topic]`）。拆方向的 LLM 调用失败/超时/没配置时，走的是
+    与 `3c40ba6` 完全相同的单方向路径（5 源、9 次请求 / 20 秒），不是"少拆一点"。
+
+预算分两层（`_Budget.take(slot)`）：全局 `MULTI_REQUEST_LIMIT`=15 次 / 20 秒；每个
+方向另有 `DIRECTION_REQUEST_LIMIT`=5 次的硬上限，3 方向 × 5 = 15 与全局正好对齐。
+每方向的请求数由"维基 1 次条目检索 + 1 次抓正文 + 三个论文源各 1 次"构成，所以
+**方向路径跳过快懂百科**：它只做精确词条命中（`/search` 被 robots 禁），而方向是
+「碳中和政策」这类组合短语，在它那里必然是 404——那一次请求是纯浪费，还会挤掉一个
+真能出结果的源。
+
 ## 代理
 
 外网直连在本机不通（实测：`zh.wikipedia.org` 连不上、`export.arxiv.org` 的 https
@@ -69,6 +98,7 @@ hit 形状、第二套引用格式、第二套校验。所以这个模块只做�
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import os
@@ -76,7 +106,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Sequence
 from urllib.parse import quote
@@ -85,6 +115,10 @@ from xml.etree import ElementTree
 import httpx
 
 from app.contracts.source import ISO_SECONDS_FORMAT
+# 模型出口与 JSON 解析**借用同一份实现**（`query_plan` 也是这么用的）：`parse_model_json`
+# 已经吃过"代码围栏 / 前后多写字 / 括号收支错位"这三类真实故障，在这里另写一套剥围栏
+# 逻辑等于把那些故障的两套判定带到两个模块里。
+from app.generation.service import chat_async, parse_model_json
 # 私有名跨模块引用：分词这件事已经有实现（`_token_list`），门必须与检索用同一套
 # "什么算同一个词"，另写一份就是两处真相。模块级导入而不是函数内懒导入——两者
 # 之间没有循环（`service` 不引用 `external`），懒导入只会把导入期错误推后。
@@ -110,6 +144,76 @@ REQUEST_TIMEOUT = 10.0
 #     就能把链路拖进无界循环；给多了则是"为几条候选把预算烧光"。
 DEADLINE_SECONDS = 20.0
 REQUEST_LIMIT = 9
+
+# 多方向检索的请求预算。15 = 3 个方向 × 5 次（每方向的次数构成见 `DIRECTION_SOURCES`
+# 与 `_wikipedia` 的 `exact_first` / `fetch_limit`）。**墙钟不放宽**：`DEADLINE_SECONDS`
+# 仍然是 20 秒，三个方向的源请求并行跑，所以"多了两轮检索"不会把等待变成三倍。
+MULTI_REQUEST_LIMIT = 15
+# 每方向的请求上限。它与 `MAX_DIRECTIONS` 相乘必须等于 `MULTI_REQUEST_LIMIT`：
+# 3 × 5 = 15。改其中一个而不改另一个，预算就会在"某个方向整轮被饿死"和"全局还有
+# 余量却没人能用"之间二选一——这两种都在实测里表现为"偶尔少一个方面的结果"。
+DIRECTION_REQUEST_LIMIT = 5
+# 默认最多拆几个方向。提示词要 2-4 个（给模型一点选择余地），代码取前
+# `max_directions` 个：多一个方向就多一条"名额被摊薄"的路径，而最终只要 3 条。
+MAX_DIRECTIONS = 3
+# 每方向最多留几条候选。**不是每方向 3 条**：3 方向 × 3 = 9 条候选去争最终 3 个名额，
+# 等于把名额浪费在"同方向的三条"上。2 是"一个方面能贡献两个视角"与"别挤掉别的方面"
+# 之间的取值。
+DIRECTION_HIT_LIMIT = 2
+# 方向路径里维基只抓 1 条正文。理由同上：第 2 条正文的边际价值低于"别的源还有一次
+# 请求额度"，而维基的逐条抓取是这条链上唯一会随 `limit` 线性涨请求数的地方。
+DIRECTION_WIKI_FETCH = 1
+# 方向路径的源清单：**跳过 baike**（精确词条命中，组合短语必然 404），见模块 docstring。
+DIRECTION_SOURCES: tuple[str, ...] = ("wikipedia", "openalex", "crossref", "arxiv")
+
+# 拆方向的 LLM 调用：单次、8 秒、不重试。与 `query_plan.TIMEOUT_SECONDS` 同一个量级，
+# 但单独一个名字——两条路径的预算将来可能不同，共用一个常量会把它们绑死。
+DIRECTION_TIMEOUT_SECONDS = 8.0
+# 2-4 个方向、每个十几个字 + JSON 结构，中文约 80 token。给 300 是留足余量：给大了
+# 只会让慢模型更慢，而预算只有 8 秒。
+DIRECTION_MAX_OUTPUT_TOKENS = 300
+# 方向的长度区间。提示词里要的是 6-20 字（写得具体一点才检索得出新东西），但**代码闸
+# 的下限放到 4**：实测合法方向的字数是「碳中和政策」5、「碳交易市场」5、「Rust 内存模型」
+# 9——6 字下限会把它们整批打掉，而那正是最自然的形状（主题原词 + 两个字的限定语）。
+#
+# **单位是"折算字数"而不是字符数**：英文主题的方向必然是英文（模型对 `transformer
+# architecture` 给的是 `transformer architecture 原理`，27 个字符），按字符数上限 20
+# 会把英文主题整批判死——实测三个英文主题全部降级成单方向就是这个原因。折算是
+# 1 个中文汉字 = 1，1 个英文词 = 2（一个英文词的检索价值大致相当于两个汉字）。
+DIRECTION_MIN_CHARS = 4
+DIRECTION_MAX_CHARS = 20
+# 纯英文方向的独立闸：2-8 个词、总长度 ≤ 60 字符。`Byzantine fault tolerance threat
+# models` 是 5 个词 39 字符，合法；而一段整句会在词数上暴露。
+DIRECTION_MIN_WORDS = 2
+DIRECTION_MAX_WORDS = 8
+DIRECTION_MAX_ASCII_CHARS = 60
+# 方向里的"英文词"：字母开头，允许 `C++` / `C#` / `node.js` 这类带符号的写法。
+_DIRECTION_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#._-]*")
+# 模型一次最多给几个方向。提示词写 2-4，这里是它的代码执行处：多给的部分直接截掉，
+# 而不是"多跑几个"。截到 4（提示词的上界）后再由 `max_directions` 收一次。
+DIRECTION_MAX_ITEMS = 4
+
+# 拆方向的开关。`MINDMAP_EXTERNAL_DIRECTIONS` **默认关**——量过了，是负收益：
+# 同一时段、同一出口、同一批源的两份池子（`scripts/measure_external_relevance.py
+# --collect-single` / `--collect-directions`，20 主题）上，三条全相关 13/20 → 6/20、
+# 成功率 95% → 50%、耗时中位 4.51 → 6.65 秒，噪声 8 → 5 只是因为返回从 43 条掉到
+# 21 条。三处原因都不是"再调调"能消掉的：
+#
+#   - **限定语闸把有料的主题砍空**：`幻觉` 的方向池里有 4 条相关候选，过门后 0 条；
+#     `内卷` 2 条相关 → 0 条。方向以主题原词开头时，`_phrase_terms(direction)` 退化成
+#     主题的判定词块，必须靠限定语补第二刀，而限定语在这批源站的摘要里经常不出现。
+#   - **单条命中本来就够**：20 个主题里有 10 个，单方向路径回来那条维基正文的前 300 字
+#     就已经含 2-3 个方向限定语（`注意力机制` 三条全中、`最终一致性` 三条全中）。
+#     拆方向是在把一份已经多面的材料切成单面的几份。
+#   - **每方向预算太薄**：15 次 / 3 方向 = 每源一次机会，任何一个源 429 就丢掉该方向的
+#     一整个源；单方向路径有 9 次预算、维基能抓 3 条，容错高得多。实测方向池里"至少
+#     1 条相关候选"的主题只有 12/20，而单方向池是 16/20——池子本身就差一档。
+#
+# 保留实现而不是删掉，是因为它把"为什么不行"变成了可复现的东西：打开开关、跑
+# `--collect-directions` / `--directions`，上面每个数字都能重算。默认关保证
+# `3c40ba6` 的行为逐字节不变（`_search_single` 就是它）。
+DIRECTIONS_ENV = "MINDMAP_EXTERNAL_DIRECTIONS"
+_TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
 # 单条正文的入库上限。8000 字大约是中文维基一个条目正文的两倍、arXiv 摘要的十几倍：
 # 再长的部分进不了 prompt（父块 450–700 字，一次检索最多给 5 条），留着只是占库。
@@ -149,6 +253,17 @@ USER_AGENT = (
     "genai-mindmap/0.1 (external knowledge retrieval; "
     "+https://example.invalid; research@example.invalid)"
 )
+
+# Crossref 的示好邮箱。多方向检索把请求密度抬到单方向的 3 倍（3 个方向各打一轮），
+# 实测会撞上匿名限流：同一出口 IP 一分钟内十几次请求后开始回 429。Crossref 明确支持
+# "polite pool"——把联系方式放进 UA（已经有了）**并且**放进 `mailto` 参数，限流额度
+# 按这个身份算。所以这既是礼貌，也是密度上去之后能不能用的分界。
+#
+# **OpenAlex 不传这个参数**：实测它的 `meta.notice` 原文写着 "The mailto parameter
+# doesn't raise this limit"——它只认 API key，`mailto` 一个字都不影响预算。给它加一个
+# 无效参数会让下一个读代码的人以为"限流已经处理过了"，那是比没有更坏的状态。
+# 它撞限流时的行为是 429 → 该源降级为空，与"源挂了"同一条路（见 `_openalex`）。
+POLITE_MAILTO = "research@example.invalid"
 
 # 响应体上限。2 MB 与 `generation.service._MAX_RESPONSE_BYTES` 同口径：外部源不是
 # 我们可以信任的一端，一个畸形响应不该把内存吃满。
@@ -198,6 +313,11 @@ class ExternalHit:
 
     刻意不含 `score`：外部源不给我们可信的相关性分数，编一个只会让下游误以为
     它和 `EvidenceHit` 是同一种东西。
+
+    `direction` 是这条命中来自哪个检索方向（`""` = 没拆方向，即单方向检索的既有
+    行为）。它**只用于说明与报告**：不是评分、不参与排序，`_interleave` 也只把它当
+    分组用（见 `_interleave_directions`）。带默认值是为了"没拆方向"那条路径的构造
+    点一个都不用改——降级必须与 `3c40ba6` 逐字节一致。
     """
 
     title: str
@@ -209,6 +329,24 @@ class ExternalHit:
     # 截断**之前**的长度。`len(text)` 在长条目上恒等于 `TEXT_MAX_CHARS`，
     # 靠它分不清"这份资料本来就这么长"与"被砍掉了九成"。
     raw_chars: int = 0
+    # 这条命中来自哪个方向。空串 = 单方向检索（既有行为）。
+    direction: str = ""
+
+
+@dataclass(frozen=True)
+class _Slot:
+    """一个方向在这次检索里的请求槽位：`key` 是它的名字，`limit` 是它的请求上限。
+
+    单独造一个类型而不是给 `take()` 传两个参数，是为了让"同一方向的四次 take 用同
+    一个槽位"这件事在调用处只是一个变量传递：`_wikipedia(query, budget, 2, slot=slot)`
+    里三次请求各自 `budget.take(slot)`，漏传一次就会多花掉别的方向的额度，而这种
+    泄漏在线程池里表现为"某个方向偶尔少一条"，最难查。
+
+    `key` 为空时**不做**单槽位计数（单方向路径），语义与 `take()` 不带参数相同。
+    """
+
+    key: str = ""
+    limit: int | None = None
 
 
 class _Budget:
@@ -216,6 +354,11 @@ class _Budget:
 
     五个源在线程里并行跑，所以计数必须加锁——"两个线程各自读到 8、各自发第 9 次"
     是典型的一读一写竞态，而它只在预算刚好用尽时出现，最难复现。
+
+    多方向检索时这是**一份**全局预算（`MULTI_REQUEST_LIMIT`），另有一个按槽位
+    （`_Slot`）计的维度：每个方向 5 次。两个维度在同一把锁里判、同一把锁里加，
+    所以"两个方向同时抢最后一次全局额度"不会双开。分两次加锁（先判槽位再判全局）
+    会留下一个窗口：两边都通过槽位判定、各自 +1，全局就超了 1 次。
 
     `take()` 同时给出本次请求可用的超时：`min(REQUEST_TIMEOUT, 剩余预算)`。不这么夹
     的话，第 9 次请求仍会拿到满额 10 秒，实际总耗时就能超出 20 秒的预算。
@@ -225,6 +368,8 @@ class _Budget:
         self._limit = max(int(limit), 0)
         self._deadline = time.monotonic() + max(float(seconds), 0.0)
         self._used = 0
+        # 槽位名 → 已用次数。键是方向的序号（`str(index)`），不值钱。
+        self._by_slot: dict[str, int] = {}
         self._lock = threading.Lock()
 
     @property
@@ -232,16 +377,36 @@ class _Budget:
         with self._lock:
             return self._used
 
-    def take(self) -> float | None:
+    def slot_used(self, key: str) -> int:
+        with self._lock:
+            return self._by_slot.get(key, 0)
+
+    def take(self, slot: _Slot | None = None) -> float | None:
         """拿一次请求额度，返回本次允许的超时；没额度或已过截止时间返回 None。"""
         with self._lock:
             if self._used >= self._limit:
                 return None
+            key = slot.key if slot is not None else ""
+            if key and slot is not None and slot.limit is not None:
+                if self._by_slot.get(key, 0) >= slot.limit:
+                    return None
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 return None
             self._used += 1
+            if key:
+                self._by_slot[key] = self._by_slot.get(key, 0) + 1
             return min(REQUEST_TIMEOUT, remaining)
+
+
+def _directions_enabled() -> bool:
+    """拆方向开关，**默认关**。显式设成 1 / true / yes / on 才开。
+
+    默认关的依据写在 `DIRECTIONS_ENV` 上面那段（三条全相关 13/20 → 6/20）。这里再
+    强调一句：它不是"功能没做完"，实现是完整的、有 29 条用例；它是"做完了、量过了、
+    现在的形态不划算"。要翻默认值，先让 `--directions` 的那张表达标。
+    """
+    return str(os.getenv(DIRECTIONS_ENV, "")).strip().lower() in _TRUTHY
 
 
 def _proxy() -> str | None:
@@ -380,13 +545,14 @@ def _wiki_pages(payload: Any) -> list[dict[str, Any]]:
 
 def _wiki_search_titles(
     client: httpx.Client, query: str, budget: _Budget, limit: int,
+    slot: _Slot | None = None,
 ) -> list[str]:
     """条目名检索：主题不是精确标题时（"碳中和 政策"），先找候选条目。
 
     维基的 `titles=` 是**精确**查找，不命中就只回 `missing`。没有这一步，
     "碳中和技术路径"这类输入会一条都拿不到——而它恰恰是最常见的输入形态。
     """
-    timeout = budget.take()
+    timeout = budget.take(slot)
     if timeout is None:
         return []
     response = _request(client, WIKIPEDIA_API, params={
@@ -404,7 +570,10 @@ def _wiki_search_titles(
     ]
 
 
-def _wikipedia(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
+def _wikipedia(
+    query: str, budget: _Budget, limit: int, *, slot: _Slot | None = None,
+    exact_first: bool = True, fetch_limit: int | None = None,
+) -> list[ExternalHit]:
     """中文维基：先试精确标题，不命中再走条目检索，然后逐条抓正文。
 
     请求次数的上界是 1（精确）+ 1（检索）+ limit（逐条）。每一次都过 `budget`：
@@ -412,28 +581,41 @@ def _wikipedia(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
 
     逐条抓取里的任何一次失败都**保留已拿到的条目**：第 2 条超时时把第 1 条一起丢掉，
     等于用一次抖动废掉整个源——而这两件事没有因果关系。
+
+    两个只给多方向路径用的开关（默认值与单方向路径的既有行为一致）：
+
+      - `exact_first=False`：跳过精确标题那一次。方向是「碳中和政策」这类组合短语，
+        `titles=` 几乎必然 `missing`，那一次请求是纯浪费——而每个方向只有 5 次额度。
+        跳过不等于放弃精确命中：条目检索（`list=search`）对"碳中和"这种真词条名
+        同样会把它排在第一，只是多花一次抓取请求。
+      - `fetch_limit`：逐条抓取的上限，独立于 `limit`（返回条数）。方向路径传 1，
+        因为"多抓一条正文"的边际价值低于"留一次额度给别的源"。
     """
     hits: list[ExternalHit] = []
+    fetch_max = limit if fetch_limit is None else max(min(limit, fetch_limit), 0)
     try:
         with _client() as client:
-            timeout = budget.take()
-            if timeout is None:
-                return []
-            payload = _request(client, WIKIPEDIA_API, params={
-                "action": "query", "prop": "extracts|info", "inprop": "url",
-                "explaintext": "1", "redirects": "1", "titles": query,
-                "format": "json", "formatversion": "2",
-            }, timeout=timeout).json()
-            pages = _wiki_pages(payload)
+            pages: list[dict[str, Any]] = []
+            if exact_first:
+                timeout = budget.take(slot)
+                if timeout is None:
+                    return []
+                payload = _request(client, WIKIPEDIA_API, params={
+                    "action": "query", "prop": "extracts|info", "inprop": "url",
+                    "explaintext": "1", "redirects": "1", "titles": query,
+                    "format": "json", "formatversion": "2",
+                }, timeout=timeout).json()
+                pages = _wiki_pages(payload)
 
-            if not pages:
-                # `[:limit]` 是必须的：`srlimit` 由**服务端**执行，而外部源不是可信的
+            if not pages and fetch_max > 0:
+                # `[:fetch_max]` 是必须的：`srlimit` 由**服务端**执行，而外部源不是可信的
                 # 一端——它回 8 条候选时，逐条抓取就会变成 8 次请求。即使 `budget`
                 # 最终会兜住次数，那也已经是"为了几条候选把预算烧光"了。
-                for title in _wiki_search_titles(client, query, budget, limit)[:limit]:
-                    if len(pages) >= limit:
+                for title in _wiki_search_titles(
+                        client, query, budget, fetch_max, slot)[:fetch_max]:
+                    if len(pages) >= fetch_max:
                         break
-                    timeout = budget.take()
+                    timeout = budget.take(slot)
                     if timeout is None:
                         break
                     try:
@@ -448,7 +630,7 @@ def _wikipedia(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
                         continue
                     pages.extend(_wiki_pages(payload))
 
-            for page in pages[:limit]:
+            for page in pages[:fetch_max]:
                 hit = _wikipedia_hit(page)
                 if hit is not None:
                     hits.append(hit)
@@ -489,14 +671,16 @@ def _arxiv_terms(query: str) -> str:
     return 'all:"' + re.sub(r'"', " ", query).strip() + '"'
 
 
-def _arxiv(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
+def _arxiv(
+    query: str, budget: _Budget, limit: int, *, slot: _Slot | None = None,
+) -> list[ExternalHit]:
     """arXiv Atom 接口。用 `xml.etree` 解析，不引新依赖。
 
     中文主题在这里通常返回 0 条（arXiv 的语料基本是英文），这不是 bug、也不该被
     翻译成英文再查：凭空翻译一个术语就是凭空造一条检索式，而用户输入的语言是
     他的意思的一部分。0 条时维基那条源仍然有结果。
     """
-    timeout = budget.take()
+    timeout = budget.take(slot)
     if timeout is None:
         return []
     try:
@@ -609,7 +793,9 @@ def _parse_openalex(payload: Any, limit: int) -> list[ExternalHit]:
     return hits
 
 
-def _openalex(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
+def _openalex(
+    query: str, budget: _Budget, limit: int, *, slot: _Slot | None = None,
+) -> list[ExternalHit]:
     """OpenAlex 检索。免费、无需 key，**对中文 query 直接有效**。
 
     实测 `search=碳中和` 返回 70562 条命中，取前 20 条里 20 条是中文标题、
@@ -622,7 +808,7 @@ def _openalex(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
     超了就是 429。429 走 `_request` 的 `status_code >= 400` 那条路，降级为空——
     这与"源挂了"在行为上一致，日志里会写明是 OpenAlex。
     """
-    timeout = budget.take()
+    timeout = budget.take(slot)
     if timeout is None:
         return []
     try:
@@ -683,7 +869,9 @@ def _parse_crossref(payload: Any, limit: int) -> list[ExternalHit]:
     return hits
 
 
-def _crossref(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
+def _crossref(
+    query: str, budget: _Budget, limit: int, *, slot: _Slot | None = None,
+) -> list[ExternalHit]:
     """Crossref 检索。免费、无需 key，对中文 query 有效（中文标题 19/20）。
 
     但**摘要覆盖率只有约一半**（实测 20 条里 9–12 条带 abstract）——剩下的
@@ -693,13 +881,14 @@ def _crossref(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
     `USER_AGENT` 里带了邮箱，正好满足 Crossref 的 polite pool 要求（它明确
     建议把联系方式放在 UA 或 `mailto` 参数里，别把匿名流量当默认）。
     """
-    timeout = budget.take()
+    timeout = budget.take(slot)
     if timeout is None:
         return []
     try:
         with _client() as client:
             payload = _request(client, CROSSREF_API, params={
                 "query": query, "rows": str(SOURCE_CANDIDATES),
+                "mailto": POLITE_MAILTO,
             }, timeout=timeout).json()
         return _parse_crossref(payload, limit)
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
@@ -767,7 +956,9 @@ def _parse_baike(page: str, limit: int, url: str = "") -> list[ExternalHit]:
     )]
 
 
-def _baike(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
+def _baike(
+    query: str, budget: _Budget, limit: int, *, slot: _Slot | None = None,
+) -> list[ExternalHit]:
     """快懂百科（`baike.com`，原互动百科）：**唯一实测 robots 允许的中文百科**。
 
     为什么是它而不是百度百科/知乎：那两个站的 `robots.txt` 在 `User-agent: *`
@@ -780,7 +971,7 @@ def _baike(query: str, budget: _Budget, limit: int) -> list[ExternalHit]:
     比中文维基（"碳中和" 2704 字）短得多。它的价值是**第二个中文百科视角**，
     不是替代维基。
     """
-    timeout = budget.take()
+    timeout = budget.take(slot)
     if timeout is None:
         return []
     try:
@@ -861,6 +1052,63 @@ def _run_source(name: str, fetch: Any) -> list[ExternalHit]:
         logger.warning("外部检索：%s 失败（%s）：%s",
                        name, type(exc).__name__, str(exc)[:160])
         return []
+
+
+# 单方向检索的源清单与顺序。**顺序不能改**：`_interleave` 按源的收集顺序建桶，
+# 而 `prefer_language` 用的是稳定排序——换了顺序，同一批命中会以另一种次序占名额。
+DEFAULT_SOURCES: tuple[str, ...] = ("wikipedia", "arxiv", "openalex", "crossref", "baike")
+
+
+def _search_one(
+    query: str, limit: int, *, budget: _Budget, slot: _Slot | None = None,
+    sources: Sequence[str] = DEFAULT_SOURCES, exact_first: bool = True,
+    fetch_limit: int | None = None,
+) -> list[ExternalHit]:
+    """打**一轮**源，返回全部候选：**不筛、不去重、不截断**。
+
+    这是两条路共用的那一轮（单方向 5 源、多方向的每个方向 4 源）。出口的三件事
+    留给调用方，因为它们的位置不同：
+
+      - 单方向：先聚合 → 按 query 过门 → `_interleave` 取前 `limit`；
+      - 多方向：先按**方向**过门 → 跨方向合并去重 → 方向内按源交替 → 跨方向轮转。
+
+    并行在这里而不是在调用方：串行时最坏耗时是五个 10 秒超时相加，而它们都只是
+    "多等一会儿"，没有任何顺序依赖。多方向时每个方向各有一个线程池，共享同一份
+    `_Budget`（全局 + 槽位两个维度，见 `_Budget.take`）。
+    """
+    registry: dict[str, Any] = {
+        "wikipedia": lambda: _wikipedia(
+            query, budget, limit, slot=slot, exact_first=exact_first,
+            fetch_limit=fetch_limit),
+        "arxiv": lambda: _arxiv(query, budget, limit, slot=slot),
+        "openalex": lambda: _openalex(query, budget, limit, slot=slot),
+        "crossref": lambda: _crossref(query, budget, limit, slot=slot),
+        "baike": lambda: _baike(query, budget, limit, slot=slot),
+    }
+    if slot is None and exact_first and fetch_limit is None:
+        # 单方向路径：按**三个位置参数**调用，与 `3c40ba6` 的形态完全一样。
+        # 这不是为了好看——既有用例（`tests/test_external_relevance.py` 的
+        # `_bare_sources`）把五个源替换成 `lambda q, budget, limit: ...`，多传一个
+        # kwarg 就会 TypeError。而"降级与基线逐字节一致"本来也包括**调用形态**。
+        registry = {
+            "wikipedia": lambda: _wikipedia(query, budget, limit),
+            "arxiv": lambda: _arxiv(query, budget, limit),
+            "openalex": lambda: _openalex(query, budget, limit),
+            "crossref": lambda: _crossref(query, budget, limit),
+            "baike": lambda: _baike(query, budget, limit),
+        }
+    planned = [(name, registry[name]) for name in sources if name in registry]
+    collected: list[ExternalHit] = []
+    if not planned:
+        return collected
+    with ThreadPoolExecutor(max_workers=len(planned)) as pool:
+        futures = [pool.submit(_run_source, name, fetch) for name, fetch in planned]
+        for (name, _), future in zip(planned, futures):
+            hits = future.result()
+            collected.extend(hits)
+            logger.debug("外部检索：%s 返回 %d 条（累计请求 %d 次）",
+                         name, len(hits), budget.used)
+    return collected
 
 
 # ---------------------------------------------------------------- 相关性门
@@ -964,6 +1212,96 @@ def _phrase_terms(text: str) -> frozenset[str]:
 def _hit_blob(hit: ExternalHit) -> str:
     """判定用的命中文本：标题 + 正文前 `RELEVANCE_CHARS` 字（理由见那个常量）。"""
     return f"{hit.title}\n{hit.text[:RELEVANCE_CHARS]}"
+
+
+def _qualifier_terms(text: str) -> tuple[frozenset[str], frozenset[str]]:
+    """限定语的判定词面：**全部中文 2-gram** + 全部英文整词。
+
+    与 `_phrase_terms` 的"只取头 3 字前缀"不同：这里要判的是"命中里有没有提到这个
+    限定语"，限定语本身只有 2-4 个字（`政策`、`技术路径`、`企业案例`），取前缀会
+    把「技术路径」压成「技术路」——一个几乎不可能原样出现的串。滑 2-gram 之后
+    「路径」「案例」这些真实会被写进标题的词才留得住。
+
+    代价是 2-gram 本来就宽（`路径` 在无关文章里也常见）。这是词面判据的天花板，
+    与 `_relevant_hits` 是同一类取舍：宁可放过几条同形噪声，也不能把方向整轮判成空的。
+    """
+    phrases: set[str] = set()
+    for run in _CJK_RUN_RE.findall(text):
+        for index in range(len(run) - 1):
+            gram = run[index:index + 2]
+            if not all(char in _LEADING_FILLER_CHARS for char in gram):
+                phrases.add(gram)
+    return frozenset(phrases), _word_terms(text)
+
+
+def _direction_qualifier(topic: str, direction: str) -> str:
+    """方向里**比主题多出来的那部分**：`碳中和政策` → `政策`；`Rust 内存模型` → `内存模型`。
+
+    这一步是"按方向施门"能成立的前提。方向按提示词的要求以主题原词开头，而
+    `_phrase_terms` 只取头 3 字——`_phrase_terms("碳中和政策")` 恰好等于
+    `_phrase_terms("碳中和")`。也就是说，直接拿方向去调 `_relevant_hits`，判据会
+    **退化成主题门**：一条"讲碳中和但完全不讲政策"的命中照样通过。拆方向的意义
+    就在这里丢掉。
+
+    切除用的是主题的判定词块/英文词在方向里最长的那一次匹配（不是"去掉方向前
+    若干字"）：模型偶尔会把主题写在后面（`政策视角下的碳中和`），按位置切就会
+    切出一段没有意义的尾巴。
+    """
+    if not direction:
+        return ""
+    anchors = [phrase for phrase in _phrase_terms(topic) if phrase in direction]
+    lowered = direction.lower()
+    anchors += [word for word in _word_terms(topic) if word in lowered]
+    if not anchors:
+        # 方向不含主题原词（比如主题「碳中和」、方向「碳交易市场」）。这时方向的
+        # 全文就是限定语——它得自己站得住。
+        return direction
+    anchor = max(anchors, key=len)
+    position = lowered.find(anchor.lower())
+    if position < 0:
+        return direction
+    rest = direction[:position] + " " + direction[position + len(anchor):]
+    return rest.strip(" \t\u3000，,、·:：-|/（）()")
+
+
+def _direction_gate(
+    topic: str, direction: str, hits: Sequence[ExternalHit],
+) -> list[ExternalHit]:
+    """**按方向**过词面门：先过既有那道门，再要求命中提到这个方向的限定语。
+
+    两道顺序不能换：第一道（`_relevant_hits(direction, ...)`）保证命中讲的是这个
+    主题，第二道（限定语）保证它讲的是**这个方面**。只有第二道时，一条只含"政策"
+    二字的无关文章也能进；只有第一道时，方向门退化成主题门（理由见
+    `_direction_qualifier`）。
+
+    第二道**不退回**：被限定语挡掉的命中不留作后备。理由与 `_relevant_hits` 的
+    "被滤掉的槽位由候选池补位"不同——那里的候选池是同一次查询的候选，这里的后备
+    是"另一个方向"的东西，挪过来只会让报告里"政策那个方向拿回了什么"变成谎话。
+    代价是某个方向可能一条都不剩（实测里维基对「碳中和政策」就是这样），那由
+    跨方向轮转从别的方向补名额，不是故障。
+    """
+    passed = _relevant_hits(direction, hits)
+    qualifier = _direction_qualifier(topic, direction)
+    if not qualifier:
+        return passed
+    phrases, words = _qualifier_terms(qualifier)
+    if not phrases and not words:
+        return passed
+    kept: list[ExternalHit] = []
+    dropped: list[str] = []
+    for hit in passed:
+        blob = _hit_blob(hit)
+        if any(gram in blob for gram in phrases) or words & _word_terms(blob):
+            kept.append(hit)
+        else:
+            dropped.append(f"{hit.source_name}/{hit.title[:40]}")
+    if dropped:
+        # 只记数量，不记方向文本：方向是主题的改写，泄漏程度与主题同级；而这条日志
+        # 每个方向都会触发一次，把文本抄进去等于在 info 级别重复一遍主题。
+        # "哪个方向挡了几条"由 `_search_many` 的汇总行回答（那是一行一条）。
+        logger.info("外部检索：限定语闸挡掉 %d 条（方向与主题的差异部分共 %d 字）",
+                    len(dropped), len(qualifier))
+    return kept
 
 
 def _relevant_hits(query: str, hits: Sequence[ExternalHit]) -> list[ExternalHit]:
@@ -1100,8 +1438,19 @@ def _relevant_hits(query: str, hits: Sequence[ExternalHit]) -> list[ExternalHit]
     return kept
 
 
-def search_external(query: str, *, limit: int = DEFAULT_LIMIT) -> list[ExternalHit]:
+def search_external(
+    query: str, *, limit: int = DEFAULT_LIMIT, directions: Sequence[str] | None = None,
+) -> list[ExternalHit]:
     """去外部源搜一次，返回最多 `limit` 条命中。**失败返回空列表，永不抛。**
+
+    这是整条外部检索的入口，两条路：
+
+      - **单方向**（默认；`directions` 只有一条，或开关关着，或拆方向失败）：五个源
+        并行打同一个 query，9 次请求 / 20 秒，出口一道按 query 的词面门 —— 与
+        `3c40ba6` 逐字节相同。
+      - **多方向**（`MINDMAP_EXTERNAL_DIRECTIONS=1` 且拆出 2-4 个方向）：每个方向各打
+        一轮 `DIRECTION_SOURCES`，15 次请求 / 20 秒、每方向 5 次，门按**各自的方向**施加，
+        合并去重后跨方向轮转。**默认关**，理由与实测见 `DIRECTIONS_ENV`。
 
     五个源并行跑：串行时最坏耗时是五个 10 秒超时相加，而它们都只是"多等一会儿"，
     没有任何顺序依赖。并行之后墙钟上界由 `DEADLINE_SECONDS` 那一份预算兜住。
@@ -1116,40 +1465,413 @@ def search_external(query: str, *, limit: int = DEFAULT_LIMIT) -> list[ExternalH
     用时与条数各记一行 info：这是用户点"生成"之后**多出来的一次外网等待**，
     混在总耗时里就永远看不出"慢在哪"（与 `_retrieve_topic` 的同一条规矩）。
 
-    出口还有一道**词面相关性门**（`_relevant_hits`，判据与实测见那里）：先把明显
-    与 query 无关的命中滤掉，再交替取前 `limit` 条。全被滤掉时返回空列表——这是
-    正确结果而不是故障，调用方会走"没搜到外部资料"的退化路径。
+    `directions` 是给调用方（测量脚本、用例）**注入**方向的出口：不传就自己拆
+    （`plan_directions`），传了就不调模型——拆方向的效果可以脱离模型单独量。
     """
     text = (query or "").strip()[:QUERY_MAX_CHARS]
     if not text or limit <= 0:
         return []
 
     started = time.perf_counter()
+    if directions is not None:
+        planned = list(directions)
+    elif _directions_enabled():
+        planned = _plan_directions_sync(text)
+    else:
+        # 开关关着：零 LLM 调用、零额外分支，与 `3c40ba6` 完全一致。
+        planned = [text]
+    usable: list[str] = []
+    for item in planned:
+        direction = (item or "").strip()
+        if direction and direction not in usable:
+            usable.append(direction)
+    usable = usable[:MAX_DIRECTIONS]
+
+    if len(usable) <= 1:
+        # 降级路径：**一个方向**。没有拆方向、拆出来只有一条、或拆失败——三者都走
+        # 这里，且与 `3c40ba6` 的单方向实现逐字节相同（同一份预算、同一批源、同一
+        # 道门、同一行日志）。"拆方向失败"不能顺带改变别的东西。
+        return _search_single(usable[0] if usable else text, limit, started)
+    return _search_many(text, usable, limit, started)
+
+
+def _plan_directions_sync(topic: str) -> list[str]:
+    """同步地拆方向。失败/超时/没配置时 `plan_directions` 自己返回 `[topic]`。
+
+    `search_external` 是同步函数（调用方 `agent.tools._external_sources` 用
+    `asyncio.to_thread` 把它丢进线程），所以这里要自己造事件循环。
+
+    已经在事件循环里的情况（有人直接在协程里调 `search_external`）**另起一个线程**：
+    `asyncio.run` 在运行中的 loop 里会抛 `RuntimeError`，而把异常当成"拆方向失败"
+    吞掉是错的——那会让一个调用方式的错误静默退化成"永远只有一个方向"。
+    """
+    coro = plan_directions(topic)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return list(asyncio.run(coro))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return list(pool.submit(asyncio.run, coro).result())
+
+
+def _search_single(query: str, limit: int, started: float) -> list[ExternalHit]:
+    """单方向检索：**这就是 `3c40ba6` 的 `search_external` 主体**，一行都没改。
+
+    单独成函数是为了让"降级"有唯一的落点：`search_external` 里任何一条拆方向失败
+    的支路都汇到这里，而不是各自复制一份预算与门。
+    """
     budget = _Budget(REQUEST_LIMIT, DEADLINE_SECONDS)
-    sources: tuple[tuple[str, Any], ...] = (
-        ("wikipedia", lambda: _wikipedia(text, budget, limit)),
-        ("arxiv", lambda: _arxiv(text, budget, limit)),
-        ("openalex", lambda: _openalex(text, budget, limit)),
-        ("crossref", lambda: _crossref(text, budget, limit)),
-        ("baike", lambda: _baike(text, budget, limit)),
-    )
-    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
-        futures = [pool.submit(_run_source, name, fetch) for name, fetch in sources]
-        collected: list[ExternalHit] = []
-        for (name, _), future in zip(sources, futures):
-            hits = future.result()
-            collected.extend(hits)
-            logger.debug("外部检索：%s 返回 %d 条（累计请求 %d 次）",
-                         name, len(hits), budget.used)
+    collected = _search_one(query, limit, budget=budget)
 
     # 门在**聚合之后、截断之前**：先从五个源拿全部候选，再按词面相关性筛，最后才
     # 交替取前 `limit` 条。顺序不能换——先截断再过滤时，一个被滤掉的噪声槽位是
     # 空的（3 条变 2 条），而候选池里本来还有真相关的条目可以补位。
-    relevant = _relevant_hits(text, collected)
-    hits = _interleave(relevant, limit, prefer_language=_query_language(text))
+    relevant = _relevant_hits(query, collected)
+    hits = _interleave(relevant, limit, prefer_language=_query_language(query))
     logger.info(
         "外部检索：%r 命中 %d 条（%s），候选 %d 条过门 %d 条，请求 %d 次，耗时 %.2fs",
-        text, len(hits), ", ".join(f"{hit.source_name}/{hit.title}" for hit in hits[:3]),
+        query, len(hits), ", ".join(f"{hit.source_name}/{hit.title}" for hit in hits[:3]),
         len(collected), len(relevant), budget.used, time.perf_counter() - started,
     )
     return hits
+
+
+def _search_many(
+    topic: str, directions: Sequence[str], limit: int, started: float,
+) -> list[ExternalHit]:
+    """多方向检索：方向之间并行，每个方向各自过门，合并去重后跨方向轮转。
+
+    五件事的先后顺序都不能换，理由见模块 docstring 的"多方向检索"一节：
+
+      1. 每方向一轮，共享 `MULTI_REQUEST_LIMIT` 全局预算 + `DIRECTION_REQUEST_LIMIT`
+         单方向预算；
+      2. **按方向**过词面门（`_direction_gate`：主题锚 + 该方向的限定语，不是按主题）；
+      3. 合并后按 URL 去重（不同方向命中同一条维基/论文是常态）；
+      4. 方向内按源交替（`_interleave`），每方向留 `DIRECTION_HIT_LIMIT` 条；
+      5. 跨方向轮转（`_interleave_directions`）取最终 `limit` 条。
+
+    门放在"合并去重"之前还是之后？这里放在**之前**：一条命中属于哪个方向，只有
+    那个方向的候选池知道；合并之后它已经变成"某条来自方向 2 的命中"，再用方向 2
+    去判它就得把方向标签跟着候选走一遍——那是同一个判断的第二种写法。
+    """
+    budget = _Budget(MULTI_REQUEST_LIMIT, DEADLINE_SECONDS)
+    slots = [_Slot(str(index), DIRECTION_REQUEST_LIMIT) for index in range(len(directions))]
+
+    def run(index: int) -> list[ExternalHit]:
+        direction = directions[index]
+        candidates = _search_one(
+            direction, DIRECTION_HIT_LIMIT, budget=budget, slot=slots[index],
+            sources=DIRECTION_SOURCES, exact_first=False,
+            fetch_limit=DIRECTION_WIKI_FETCH,
+        )
+        kept = _direction_gate(topic, direction, candidates)
+        logger.debug("外部检索：方向 #%d 候选 %d 条过门 %d 条（该方向已用 %d 次请求）",
+                     index, len(candidates), len(kept), budget.slot_used(slots[index].key))
+        return [replace(hit, direction=direction) for hit in kept]
+
+    with ThreadPoolExecutor(max_workers=max(len(directions), 1)) as pool:
+        per_direction = list(pool.map(run, range(len(directions))))
+
+    merged, duplicated = _dedupe_by_url(per_direction)
+    groups: list[list[ExternalHit]] = []
+    for group in merged:
+        groups.append(_interleave(group, DIRECTION_HIT_LIMIT,
+                                  prefer_language=_query_language(topic)))
+    hits = _interleave_directions(groups, limit)
+    logger.info(
+        "外部检索：方向 %d 个（%s）命中 %d 条（%s），候选 %d 条去重掉 %d 条，请求 %d 次，耗时 %.2fs",
+        len(directions), "、".join(directions), len(hits),
+        ", ".join(f"{hit.direction}/{hit.source_name}/{hit.title[:24]}" for hit in hits[:3]),
+        sum(len(group) for group in per_direction), duplicated, budget.used,
+        time.perf_counter() - started,
+    )
+    return hits
+
+
+def _hit_key(hit: ExternalHit) -> str:
+    """去重用的身份：**URL 优先**，没有 URL 时退回 `(source_name, title)`。
+
+    URL 要先去 fragment、去尾部斜杠：同一篇论文在两个方向上可能一个带 `#abstract`、
+    一个不带；那是同一个落地页。没有 URL 的命中（快懂百科在拿不到落地地址时、以及
+    各种样本）用源名 + 标题兜底——标题在两个方向上都一样时，那本来就是同一条。
+    """
+    url = (hit.url or "").strip().split("#", 1)[0].rstrip("/")
+    if url:
+        return url
+    return f"{hit.source_name}\x00{hit.title}"
+
+
+def _dedupe_by_url(
+    groups: Sequence[Sequence[ExternalHit]],
+) -> tuple[list[list[ExternalHit]], int]:
+    """跨方向按 URL 去重：**保留首次出现的方向**，返回 `(各组, 去掉几条)`。
+
+    保留首见而不是"合并方向标签"：一条命中只该有一个方向，否则报告里"政策那个方向
+    拿回了什么"就说不清（一条命中同时挂在两个方向下，两条线都算它的功劳）。代价是
+    "同一篇论文同时讲政策与技术"时第二个方向少一条——可接受，因为它本来就只该
+    贡献一次。
+    """
+    seen: set[str] = set()
+    kept: list[list[ExternalHit]] = []
+    dropped = 0
+    for group in groups:
+        survivors: list[ExternalHit] = []
+        for hit in group:
+            key = _hit_key(hit)
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+            survivors.append(hit)
+        kept.append(survivors)
+    return kept, dropped
+
+
+def _interleave_directions(
+    groups: Sequence[Sequence[ExternalHit]], limit: int,
+) -> list[ExternalHit]:
+    """跨方向轮流取：第 1 轮每个方向各取一条，第 2 轮再各取一条，直到 `limit`。
+
+    为什么不是直接用 `_interleave`（按源分桶）：三个方向都命中维基时，维基桶里的
+    前 3 条会占满名额，而它们很可能**全来自同一个方向**——拆了三个方向，返回的还是
+    同一个方面。方向内那层 `_interleave` 保的是源多样，这一层保的是方面覆盖，两层
+    各管一件事，缺一层都会退化成"某一维占满名额"。
+
+    `groups` 里的一组的顺序已经由 `_interleave` 排好（源交替），所以这里只负责
+    "先给谁名额"。空组自然跳过；全部取尽时提前结束。
+    """
+    merged: list[ExternalHit] = []
+    depth = 0
+    while len(merged) < limit:
+        progressed = False
+        for group in groups:
+            if len(merged) >= limit:
+                break
+            if depth < len(group):
+                merged.append(group[depth])
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
+    return merged
+
+
+# ---------------------------------------------------------------- 拆方向
+
+
+# 提示词。写法借 `query_plan.BRANCH_SYSTEM_PROMPT`：三条硬约束都用**正反例**
+# 写成"可对照的形状"，不用形容词；例子只用「碳中和」这类通用词并明确说"不要抄
+# 例子"，因为 2.3 那次编出的超导/离子阱正是"照着别处的词往下写"的产物。
+#
+# 与那个模块的差别是本质的：那边服务"在材料里找片段"（corrected/intents/hyde/
+# subqueries + 四道防发散闸），这边服务"一个主题从几个方面查"。语义不同，所以
+# 不复用 `plan_query`——复用会让两边互相绑死在对方的失败模式上。
+DIRECTION_SYSTEM_PROMPT = (
+    "你在为一次外部资料检索做规划：把一个主题拆成 2-4 个**检索方向**，每个方向各搜一轮。"
+    "你只输出一个 JSON 对象，不要写解释、不要加代码围栏、不要在 JSON 前后写字。\n"
+    "\n"
+    "形状：{\"directions\": [\"方向1\", \"方向2\", \"方向3\"]}\n"
+    "\n"
+    "每个方向的写法要求：\n"
+    "  - 6-20 个字，是可检索的短语，不是问句、不是整段话；\n"
+    "  - 必须**原样包含主题的写法**（主题是「碳中和」，方向就写成「碳中和政策」）；\n"
+    "  - 方向之间是主题的不同方面（政策 / 技术路径 / 企业案例 / 争议 / 产业），互不重复。\n"
+    "\n"
+    "三条硬规则，逐条守：\n"
+    "\n"
+    "1. 方向必须是主题的子方面，不能换领域。\n"
+    "   ❌ 主题是「碳中和」，方向写成「超导量子比特」「离子阱」——那是别的领域。\n"
+    "   ✅ 主题是「碳中和」，方向写成「碳中和政策」「碳中和技术路径」「碳中和企业案例」。\n"
+    "\n"
+    "2. 主题的写法逐字照抄，不要换同义词、不要翻译、不要改写。\n"
+    "   ❌ 主题「碳中和」→ 方向「碳抵消」「温室气体净零排放」（换了说法，检索会换一批源）。\n"
+    "   ✅ 主题「碳中和」→ 方向「碳中和政策」（原词在前，只追加限定语）。\n"
+    "\n"
+    "3. 不要编造主题里没有的机构、标准、文号、篇名、年份。\n"
+    "   ❌ 「碳中和 GB/T 36132-2018 合规要求」——那个文号是你编的。\n"
+    "   ✅ 「碳中和 标准与核算方法」。\n"
+    "\n"
+    "上面的例子只用来说明形状，不要把例子里的词写进你的结果。"
+)
+
+
+def _directions_message(topic: str) -> str:
+    """这一次的用户消息：只有主题。**不塞材料**——这条路上没有材料可塞。
+
+    没有材料时"锚定"全靠主题本身，所以提示词把"原样包含主题写法"写成硬规则，代码
+    侧再用 `_direction_anchored` 逐条核对（`query_plan` 那条"没有材料就返回空"的
+    代码闸在这里的等价物）。
+    """
+    return f"主题：{topic}\n\n只返回那个 JSON 对象。\n"
+
+
+def _directions_payload(raw: Any) -> dict[str, Any] | None:
+    """模型出口 → dict。`chat_async` 正常返回 dict；字符串形态再解析一次。
+
+    与 `query_plan._payload` 同一条规矩（用同一个解析器收尾），但**不复用它的函数**：
+    那是 query_plan 的私有实现，跨模块直接调私有名会让两个模块的改动互相牵制。
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = parse_model_json(raw)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _raw_directions(payload: dict[str, Any]) -> list[str]:
+    """取出候选方向：认 `directions` / `queries` 两种键，外加一个裸数组形状。
+
+    收多种键不是宽容，是"模型把数组换个名字"这件事的代价太低：为它丢掉一整次调用
+    的产出，等于让整条路径的成功率下降一截。
+    """
+    for key in ("directions", "queries", "aspects"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def _direction_length_ok(text: str) -> bool:
+    """方向的长度闸：中英混排按"折算字数"算，纯英文按词数算。
+
+    折算规则与理由见 `DIRECTION_MAX_CHARS` 上面那段：一个英文词算两个字。纯英文
+    方向再另设一道"2-8 个词、≤60 字符"的闸——`Byzantine fault tolerance threat
+    models` 五个词是合法的，而一段整句会在词数上先暴露。
+    """
+    cjk = sum(len(run) for run in _CJK_RUN_RE.findall(text))
+    words = _DIRECTION_WORD_RE.findall(text)
+    if cjk and words:
+        size = cjk + 2 * len(words)
+        return DIRECTION_MIN_CHARS <= size <= DIRECTION_MAX_CHARS
+    if cjk:
+        return DIRECTION_MIN_CHARS <= cjk <= DIRECTION_MAX_CHARS
+    if not words:
+        return False
+    return (DIRECTION_MIN_WORDS <= len(words) <= DIRECTION_MAX_WORDS
+            and len(text) <= DIRECTION_MAX_ASCII_CHARS)
+
+
+def _direction_anchored(topic: str, direction: str) -> str | None:
+    """方向能不能被主题**词面锚住**；能就返回清洗后的方向，不能返回 None。
+
+    这是"不许编造领域"的代码执行处。四条判据，任一成立即通过：
+
+      1. 方向包含主题的判定词块（`_phrase_terms(topic)` 的头 3 字）——「碳中和政策」
+         含「碳中和」；
+      2. 方向包含主题里的英文整词（≥3 字符）——「Rust 内存模型」含 `rust`；
+      3. 反向包含：主题里含**方向**的判定词块——主题「为什么中文大模型在长文本任务
+         上表现不稳定」，方向「中文大模型 长文本」的方向词块「中文大」出现在主题里。
+
+    为什么用"原词出现在方向里"而不是"与主题共享 bigram"：bigram 判据在这件事上
+    两头不讨好。它放不过「碳交易」这种**不含**主题原词但确实相关的子方面（`碳中`/
+    `中和` 与 `碳交`/`交易` 没有交集），也挡不住「中超联赛」这类只是撞了一个高频
+    汉字的编造（共享「中」）。既然两种口径在"合法的窄化方向"上都失手，就选那条
+    **可执行、可解释、且与提示词一致**的：提示词要求方向原样包含主题写法，代码按
+    同一句话核对。被拒的方向丢掉，不拼回去——拼成「碳中和 超导量子比特」比丢掉更糟。
+
+    长度闸（`DIRECTION_MIN_CHARS`-`DIRECTION_MAX_CHARS`）与"等于主题"的闸也在这里：
+    方向的字数区间是任务给的 6-20 字，而等于主题的那条是**白跑一路**（同一个 query
+    打两遍），它会让"3 个方向"实际只有 2 个方面。
+    """
+    text = " ".join((direction or "").split())
+    if not _direction_length_ok(text):
+        return None
+    if text == topic:
+        return None
+    if any(phrase in text for phrase in _phrase_terms(topic)):
+        return text
+    if _word_terms(topic) & _word_terms(text):
+        return text
+    if any(phrase in topic for phrase in _phrase_terms(text)):
+        return text
+    return None
+
+
+def _build_directions(payload: dict[str, Any], topic: str, max_directions: int) -> list[str]:
+    """从 payload 重建方向清单：逐条过锚定闸、去重保序、截到 `max_directions`。
+
+    全部被拒时返回**空列表**（不是 `[topic]`）——那是调用方的事：`plan_directions`
+    的契约是"拆不出来就 `[topic]`"，而空列表在这个函数里只表示"模型给的东西一条
+    都不能用"。两者分开，才能让日志区分"模型没答"与"模型答的东西全被拒"。
+    """
+    kept: list[str] = []
+    for item in _raw_directions(payload)[:DIRECTION_MAX_ITEMS]:
+        direction = _direction_anchored(topic, item)
+        if direction is not None and direction not in kept:
+            kept.append(direction)
+    return kept[:max(max_directions, 1)]
+
+
+def _log_directions(outcome: str, started: float, *, topics: int,
+                    directions: Sequence[str]) -> None:
+    """一行日志：**只有形状，没有内容**。
+
+    主题本身不记：它是用户的输入，可能是"我的合同违约金怎么算"这种不该出现在日志里
+    的东西；方向数、可用方向数、耗时足够回答"拆没拆、拆出几条、降没降级"。方向文本
+    也不记——它是主题的改写，泄漏程度与主题同级。
+    """
+    logger.info(
+        "外部检索拆方向 outcome=%s 耗时=%.0fms 条数=%d 可用=%d 长度=%d",
+        outcome, (time.perf_counter() - started) * 1000, topics, len(directions),
+        sum(len(item) for item in directions),
+    )
+
+
+async def plan_directions(topic: str, *, max_directions: int = MAX_DIRECTIONS) -> list[str]:
+    """把主题拆成 2-4 个检索方向；拆不出来返回 `[topic]`。**一次调用、8 秒、不重试。**
+
+    返回值的三种形态，调用方只需要认第一种与最后一种：
+
+      - `[topic]`：没配置模型、调用失败、超时、JSON 解不出、方向全被拒。**与"没有
+        这个功能"逐字节一致**——调用方（`search_external`）据此走单方向路径。
+      - 2-4 条方向：每条都是主题的子方面，且词面被主题锚住（`_direction_anchored`）。
+      - `[]`：主题为空。**没有方向可拆**，调用方拿到空列表时按"没搜到"处理。
+
+    为什么一次调用产出全部方向：3 个方向各调一次 = 3 次往返，而每次 8 秒预算，
+    2C2G 上不可能；一次调用产出 2-4 条的成本与产出 1 条几乎相同。
+
+    为什么不复用 `query_plan.plan_query`：那个函数服务"在材料里找片段"，产出是
+    corrected/intents/hyde/subqueries，还带四道防发散闸与"没有材料就不许扩"的代码闸。
+    这里没有材料、也不需要改写用户的问题——只需要"这个主题有哪几个方面"。语义不同，
+    复用会让两边绑死在对方的失败模式上（`query_plan` 的教训正是"不看材料就编领域"，
+    而这里**必然**没有材料，那条闸一开就是永久关闭）。
+    """
+    text = (topic or "").strip()[:QUERY_MAX_CHARS]
+    if not text:
+        return []
+    started = time.perf_counter()
+    outcome = "ok"
+    raw: Any = None
+    try:
+        # 只发一次，绝不重试：失败就是这次不拆方向，重试只会把 8 秒预算打穿。
+        raw = await asyncio.wait_for(
+            chat_async(DIRECTION_SYSTEM_PROMPT, _directions_message(text),
+                       max_tokens=DIRECTION_MAX_OUTPUT_TOKENS),
+            timeout=DIRECTION_TIMEOUT_SECONDS,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        outcome = "timeout"
+    # 与 `plan_query` 同样不拦 `CancelledError`：那是我方被取消（客户端断开），
+    # 不是模型坏了，吞掉它会让上层以为任务正常跑完了。
+    except Exception:  # noqa: BLE001 — 没配置/网络/解析都可能，全部降级
+        outcome = "error"
+    if outcome != "ok":
+        _log_directions(outcome, started, topics=1, directions=[text])
+        return [text]
+
+    payload = _directions_payload(raw)
+    if payload is None:
+        _log_directions("bad_json", started, topics=1, directions=[text])
+        return [text]
+    directions = _build_directions(payload, text, max_directions)
+    if not directions:
+        # 全被锚定闸拒掉：这次拆方向没有可用的东西，与"模型挂了"同一个结果。
+        # 不能返回模型给的原话——那些正是判据说"不是这个主题"的东西。
+        _log_directions("rejected", started, topics=1, directions=[text])
+        return [text]
+    _log_directions("ok", started, topics=1, directions=directions)
+    return directions

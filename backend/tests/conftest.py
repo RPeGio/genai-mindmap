@@ -82,6 +82,11 @@ BEHAVIOUR = (
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
             "MINDMAP_GRAPH_EXTRACTION", "MINDMAP_RERANK", "MINDMAP_GRAPH_SEARCH",
+            # 外部检索的多方向拆分（`external.DIRECTIONS_ENV`）。**置 0**：线上默认也是
+            # 关（实测三条全相关 13/20 → 6/20，见 `external.DIRECTIONS_ENV` 那段），
+            # 而这里置 0 让每条既有生成用例都不经过"多打两轮源 + 一次模型往返"，
+            # 需要它的用例自己 `setenv(..., "1")`。
+            "MINDMAP_EXTERNAL_DIRECTIONS",
             # 外部知识检索（`tools.external_knowledge_enabled`）**在这里置 0**，不在
             # BEHAVIOUR 里清空。它现在默认**开**（`dceae7e` 之后翻的，实测见 `tools.py`
             # 那段注释），清空等于让每一条生成用例都真的去搜一次外网：
