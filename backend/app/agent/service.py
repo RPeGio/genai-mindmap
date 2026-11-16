@@ -545,8 +545,12 @@ async def run(
     *,
     provider: ToolProvider | None = None,
     tools: ToolRegistry | None = None,
+    first_seq: int = 1,
 ) -> AsyncIterator[AgentEvent]:
     """跑一次多轮工具循环，边跑边发事件。
+
+    `first_seq` 只给 `router._frames` 用：它在调这里之前可能已经发过一帧
+    （材料入库后的 `sources`），所以要接着那个号往下编，否则两帧都叫 `seq=1`。
 
     终止只有四种：模型以 stop 收尾（done）、预算耗尽（error）、上游失败（error）、
     工具累计失败超过 `max_repairs`（error）。
@@ -571,7 +575,7 @@ async def run(
         # 占位树复用旧路径的 `_demo_content`：同一份占位结构只该有一个定义，
         # 两处各写一份，改文案时必然只改一处。
         demo = _demo_content(request.goal)
-        demo_seq = itertools.count(1)
+        demo_seq = itertools.count(first_seq)
         yield StageEvent(seq=next(demo_seq), stage="demo", detail="演示模式，不调用模型")
         yield SnapshotEvent(seq=next(demo_seq), content=demo)
         yield DoneEvent(seq=next(demo_seq), content=demo, usage={}, mode="demo")
@@ -590,7 +594,7 @@ async def run(
         sources_by_id={source.id: source for source in request.sources},
     )
     messages = _initial_messages(request)
-    seq = itertools.count(1)
+    seq = itertools.count(first_seq)
     started = time.monotonic()
     tool_calls = 0
     failures = 0

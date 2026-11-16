@@ -161,10 +161,13 @@ class SourcesFrameTest(unittest.TestCase):
     def test_sources_frame_comes_first_and_carries_the_mapping(self):
         source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文若干。")
         seen: list = []
+        kwargs_seen: dict = {}
 
-        async def fake_run(body):
+        async def fake_run(body, **kwargs):
+            # _frames 用 first_seq 让编号接着 sources 那帧往下走。
+            kwargs_seen.update(kwargs)
             seen.append(body)
-            yield DoneEvent(seq=1)
+            yield DoneEvent(seq=kwargs.get("first_seq", 1))
 
         with patch("app.agent.router.run", side_effect=fake_run):
             response = client.post(URL, json={
@@ -177,6 +180,8 @@ class SourcesFrameTest(unittest.TestCase):
         self.assertEqual(list(frames[0]["mapping"]), [source.id])
         # 换过 id 的 request 才交给循环：库里记的是新 id，导图引用要对得上。
         self.assertEqual([item.id for item in seen[0].sources], [frames[0]["mapping"][source.id]])
+        # 编号必须接着 sources 往下走：两帧都叫 seq=1 时，按 seq 排序的客户端会乱序。
+        self.assertEqual([frame["seq"] for frame in frames], [1, kwargs_seen["first_seq"]])
 
     def test_no_sources_frame_when_there_is_nothing_to_remap(self):
         with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):

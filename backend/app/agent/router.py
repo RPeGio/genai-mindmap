@@ -86,7 +86,9 @@ async def _frames(body: AgentRunRequest) -> AsyncIterator[str]:
             seq += 1
             yield encode_event(SourcesEvent(seq=seq, mapping=remembered.mapping))
             body = body.model_copy(update={"sources": remembered.sources})
-        async for event in run(body):
+        # `first_seq=seq + 1`：这一帧已经占掉 `seq`，循环里的编号接着往下发，
+        # 否则 `sources` 和首个 `stage` 会同时叫 `seq=1`（客户端按 seq 排序时会困惑）。
+        async for event in run(body, first_seq=seq + 1):
             seq = max(seq, getattr(event, "seq", 0))
             yield encode_event(event)
         finished = True
