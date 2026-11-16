@@ -52,10 +52,22 @@ from app.knowledge.service import EvidenceHit
 from app.optimization.source_refs import EvidenceSpan
 
 # 三段互不重叠的话：第一段永远不在命中区间里，第二段是命中区间。
+#
+# **总长度必须超过 `tools.SHORT_MATERIAL_CHARS`（300 字）**：低于它时 `_generate`
+# 会把材料降级成"主题提示"、不走检索，本文件里"证据区间"那几条就测不到东西了
+# （它们要的是"命中的那一段之外的引用被判成越界"）。所以后面补了三段正文——补的
+# 段落刻意与主题无关，不参与任何断言。
 MATERIAL = (
     "第一章 预算审批。预算由财务经理核准后执行，超过五十万元报总经理审批。\n"
     "第二章 报销时限。费用报销的时限是三十个自然日，逾期不再受理。\n"
     "第三章 绩效复核。考核分季度与年度两次，由直属上级打分。\n"
+    "第四章 归档。全部单据按季度归档，财务部每半年抽查一次。\n"
+    "第五章 培训。新员工入职后三十日内完成财务制度培训并考核。\n"
+    "第六章 附则。本制度自发布之日起施行，由财务部负责解释；"
+    "各部门可依据本制度制定实施细则，但不得与本制度相抵触。\n"
+    "第七章 违规处理。未按本制度履行审批手续的，财务部有权退回并暂停支付；"
+    "造成损失的，按公司相关规定追究经办人与审批人的责任。\n"
+    "第八章 采购。采购合同必须经过法务审核，金额超过五十万元另行招标。\n"
 )
 OUTSIDE = "预算由财务经理核准后执行"
 INSIDE = "费用报销的时限是三十个自然日"
@@ -296,7 +308,9 @@ def test_zero_evidence_allows_zero_citations_and_says_so():
     `GENERATION_WITHOUT_EVIDENCE` 是 warn 级诊断——它不参与 ok 判定。一棵"结构完整
     但没有任何依据"的图仍然可用，用户要能一眼看出它为什么没有引用。
     """
-    source = _source("甲乙丙丁戊己庚辛壬癸。")
+    # 正文要长过 `SHORT_MATERIAL_CHARS`：短了会先被"材料太短"的退化规则吃掉，
+    # 走的是 `MATERIAL_TOO_SHORT` 那条路，`GENERATION_WITHOUT_EVIDENCE` 根本不会出现。
+    source = _source("甲乙丙丁戊己庚辛壬癸。" * 30)
     with patch("app.agent.tools.search_parent", new=lambda *a, **k: []):
         result, (system, _user), ctx = _run_generate(
             [source], "量子色动力学的渐近自由", _tree())

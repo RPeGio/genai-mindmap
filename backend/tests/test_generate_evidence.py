@@ -42,6 +42,7 @@ from app.agent.tools import (
     GENERATE_EVIDENCE_HEADER,
     GENERATE_EVIDENCE_RULES,
     GENERATE_RETRIEVAL_TOP_K,
+    SHORT_MATERIAL_CHARS,
     _count_refs,
     _source_prompt_input,
     build_registry,
@@ -59,13 +60,24 @@ from app.generation.service import (
 )
 from app.knowledge.service import PARENT_RETRIEVAL_ENV, search_parent
 
-# 一份结构清楚的制度材料：三个章节，各有各的关键词。
+# 一份结构清楚的制度材料：四个章节，各有各的关键词。
+#
+# **必须长于 `tools.SHORT_MATERIAL_CHARS`（300 字）**：低于它时 `_generate` 会把材料
+# 降级成"主题提示"、压根不走检索（见那条规则的注释）。这份材料原来只有 146 字，
+# 降级规则上线后本文件的十条用例会一起变红——那说明它们测的已经不是"材料 → 检索
+# → 证据"这条路了。补一节到 300 字以上，是为了让它们继续测那条路。
 MATERIAL = (
     "第一章 总则\n\n本制度适用于全部预算事项，预算审批由部门负责人签核，"
     "超过额度的部分必须上报总经理复核。\n\n"
     "第二章 报销时限\n\n费用报销的时限是三十个自然日，逾期不再受理，"
     "票据缺失的申请一律退回并通知经办人补齐材料。\n\n"
-    "第三章 采购合规\n\n采购合同必须经过法务审核，金额超过五十万元另行招标。\n"
+    "第三章 采购合规\n\n采购合同必须经过法务审核，金额超过五十万元另行招标。\n\n"
+    "第四章 归档与审计\n\n全部单据按季度归档，财务部每半年抽查一次；"
+    "审计发现的问题要在十五个工作日内整改完毕并书面反馈。\n\n"
+    "第五章 附则\n\n本制度自发布之日起施行，由财务部负责解释；"
+    "各部门可依据本制度制定实施细则，但不得与本制度相抵触。\n\n"
+    "第六章 违规处理\n\n未按本制度履行审批手续的，财务部有权退回并暂停该笔支付；"
+    "造成损失的，按公司相关规定追究经办人与审批人的责任。\n"
 )
 
 # 与正文共享词项（报销/时限/预算/审批），所以主题检索必有命中。
@@ -75,8 +87,11 @@ TOPIC = "报销时限与预算审批"
 PASSAGE = "费用报销的时限是三十个自然日"
 
 # 与材料**零**共同词项的问法：这条路上检索必回空（用来钉"检索为空"那条分支）。
+#
+# 正文同样要长于 `SHORT_MATERIAL_CHARS`：这条用例测的是"材料够长、但检索没命中 →
+# 退回纯主题生成"，材料一短就会先被降级规则吃掉，落到的根本不是同一条分支。
 UNRELATED_TOPIC = "预算审批流程"
-UNRELATED_TEXT = "甲乙丙丁戊己庚辛壬癸。"
+UNRELATED_TEXT = "甲乙丙丁戊己庚辛壬癸。" * 30
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEGACY_COMMIT = "00a0d12"
@@ -143,6 +158,17 @@ def _evidence_payload(user: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------- 一、核心回归
+
+
+def test_material_fixture_is_long_enough_to_reach_the_material_path():
+    """本文件几条断言都假设"材料够长 → 走检索"。这条把那个前提变成被测的东西。
+
+    为什么需要它：`SHORT_MATERIAL_CHARS` 调高时，`MATERIAL` 会先掉进"材料太短"的
+    退化分支，本文件其余用例会以"提示词不对""没有 evidence"的形式零散地红——那看起来
+    像实现坏了，其实是夹具过期了。一条前置用例先说清原因，比七条用例各自报错好查。
+    """
+    assert len(MATERIAL) > SHORT_MATERIAL_CHARS
+    assert len(UNRELATED_TEXT) > SHORT_MATERIAL_CHARS
 
 
 def test_rag_generation_hands_the_retrieved_text_to_the_model(monkeypatch):

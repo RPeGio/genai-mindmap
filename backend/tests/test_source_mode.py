@@ -95,6 +95,16 @@ TREE = {
 # 正文里的独特标记：只要它出现在 prompt 里，就说明有正文漏进去了。
 MARKER = "ZZQX_MARKER"
 
+# 把测试材料撑过 `tools.SHORT_MATERIAL_CHARS`（300 字）的填充段。
+#
+# 为什么需要：低于阈值的材料会被 `_generate` 降级成"主题提示"、不走检索（见那条
+# 规则的注释），于是"清单 + 命中"这条路在本文件里压根到不了，几条用例会以
+# "system 不是 rag 提示词""没有命中段"的形式红。
+#
+# 措辞刻意不含"材料/整理/预算"这些词：好几条用例要求"标记词不出现"，而一个能命中
+# 主题的填充段会把命中带进 prompt，让那些断言失去意义。
+PAD = "第十四条 附则。本条只用于把正文撑到三百字以上，不参与任何断言。" * 10
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEGACY_COMMIT = "901b484"
 LEGACY_PATH = "backend/app/agent/tools.py"
@@ -167,7 +177,8 @@ def test_rag_mode_keeps_the_material_text_out_of_the_system_prompt():
     断言因此从"不含标记词"改成"标记词只出现在命中段之后"：长度或截断都不能
     满足这条，位置可以。
     """
-    source = _material(f"第一章 总则。{MARKER} 预算由财务经理核准。", filename="预算管理办法.docx")
+    source = _material(f"第一章 总则。{MARKER} 预算由财务经理核准。" + PAD,
+                       filename="预算管理办法.docx")
     with _env(SOURCE_MODE_RAG):
         system, user = _generate_prompt([source], topic="预算由谁核准")
 
@@ -203,7 +214,7 @@ def test_default_mode_is_rag():
     "删掉之后是 rag"正是线上不带配置时的实际路径。`patch.dict` 退出时会把整个
     环境恢复（包括我们 pop 掉的那个键），不需要手工还原。
     """
-    source = _material(f"正文 {MARKER}")
+    source = _material(f"正文 {MARKER}" + PAD)
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop(SOURCE_MODE_ENV, None)
         assert source_mode() == SOURCE_MODE_RAG
@@ -401,7 +412,7 @@ def test_rag_prompt_carries_the_citation_protocol():
         （`tools._retrieve_topic`），再让模型自行检索是重复的；
       - "可以多次检索…分开问" → 同上，模型手里已经有命中，再查拿不到新东西。
     """
-    source = _material(f"整理这些材料的说明：正文 {MARKER}")
+    source = _material(f"整理这些材料的说明：正文 {MARKER}" + PAD)
     with _env(SOURCE_MODE_RAG):
         system, user = _generate_prompt([source])
 
@@ -437,7 +448,7 @@ def test_audio_material_is_manifest_only():
     """
     audio = Source(
         id="audio-1", kind=SourceKind.audio, status="parsed", filename="会议纪要.mp3",
-        text="录音转写正文。",
+        text="录音转写正文。" + PAD,
         duration_seconds=192.0,
         sentences=[AudioSentence(text="第一句转写 ZZQX_SENTENCE", begin_ms=0, end_ms=900)],
     )
@@ -460,7 +471,7 @@ def test_invalid_mode_falls_back_to_rag_and_warns_once():
     逐次告警会把日志刷满，把真正要看的东西埋掉。
     """
     _WARNED_SOURCE_MODES.discard("zz-not-a-mode")
-    source = _material(f"正文 {MARKER}")
+    source = _material(f"正文 {MARKER}" + PAD)
     with patch.dict(os.environ, {SOURCE_MODE_ENV: "zz-not-a-mode"}):
         with unittest.TestCase().assertLogs("app.generation.service", level="WARNING") as logs:
             assert source_mode() == SOURCE_MODE_RAG
@@ -516,7 +527,7 @@ def test_loop_prompt_does_not_forbid_retrieval_in_rag_mode():
 def test_blank_source_is_left_out_of_the_manifest():
     """没正文的来源不进清单，也不进份数——它没有内容可查。"""
     blank = Source(id="blank-1", kind=SourceKind.text, status="pending", text=None)
-    usable = _material("有正文的一段材料。", source_id="ok-1")
+    usable = _material("有正文的一段材料。" + PAD, source_id="ok-1")
     with _env(SOURCE_MODE_RAG):
         _, user = _generate_prompt([blank, usable])
 
@@ -571,7 +582,17 @@ def test_loop_retrieves_first_then_generates_from_hits():
     """
     text = ("第一章 总则。本制度适用于全部预算事项。\n"
             "第八条 预算由财务经理核准后执行，超过五十万元报总经理审批。\n"
-            "第九条 每季度末做一次预算执行分析。")
+            "第九条 每季度末做一次预算执行分析。\n"
+            "第十条 预算执行中出现重大偏差的，责任部门要在十个工作日内提交书面说明。\n"
+            "第十一条 年度预算调整须经预算委员会审议，报总经理批准后执行。\n"
+            "第十二条 各责任部门应当在每月五日前报送上月预算执行情况。\n"
+            "第十三条 预算外支出单笔超过十万元的一律报总经理审批。\n"
+            "第十四条 各部门应当指定一名预算管理员，名单报财务部备案。\n"
+            "第十五条 预算执行情况纳入季度经营分析会，逐项对照年初目标。\n"
+            "第十六条 本制度由财务部负责解释，自发布之日起施行。"
+            # 撑过 `SHORT_MATERIAL_CHARS`：短了就不走检索，这条用例要的那次
+            # 主题预检索根本不会发生（`data` 里不会有 `retrieval` 键）。
+            + PAD)
     source = _material(text, filename="预算管理办法.docx", source_id="doc-1")
 
     # 先算一次真实命中：`_generate` 的主题预检索走 `search_parent`（无网络，纯 BM25）。
@@ -785,7 +806,19 @@ def test_source_mode_consumers_are_declared():
 RETRIEVAL_TEXT = (
     "第一章 总则。本制度适用于全部预算事项。\n"
     "第八条 预算审批由财务经理核准后执行，超过五十万元报总经理审批。\n"
-    "第九条 每季度末做一次预算执行分析。"
+    "第九条 每季度末做一次预算执行分析。\n"
+    # 下面几条只是把正文撑过 `SHORT_MATERIAL_CHARS`（300 字）：材料一短，
+    # `_generate` 会把它降级成"主题提示"，`rag` 路径根本不会走——而这条指纹
+    # 量的正是"两种形态在这条路上差在哪"。
+    "第十条 预算执行中出现重大偏差的，责任部门要在十个工作日内提交书面说明。\n"
+    "第十一条 年度预算调整须经预算委员会审议，报总经理批准后执行。\n"
+    "第十二条 各责任部门应当在每月五日前报送上月预算执行情况，"
+    "逾期未报的由财务部书面催办，并计入年度考核。\n"
+    "第十三条 预算外支出单笔超过十万元的一律报总经理审批，"
+    "不得以拆分方式规避审批程序。\n"
+    "第十四条 各部门应当指定一名预算管理员，负责本部门预算的编制、"
+    "执行跟踪与月度分析，名单报财务部备案。\n"
+    "第十五条 本制度由财务部负责解释，自发布之日起施行。"
 )
 # 目录要覆盖率 ≥60% 才会拼进骨架（见 `OUTLINE_MIN_COVERAGE`）：三个带标题的
 # 章节各撑一段正文，标题之外没有大段流水账。

@@ -79,6 +79,7 @@ from app.knowledge import external as external_knowledge
 from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
 from app.knowledge.service import (
+    LEAF_MAX_CHARS,
     EvidenceHit,
     SourceFilter,
     filter_sources,
@@ -292,36 +293,92 @@ def library_available() -> bool:
 #
 # 用户只输一个主题时（`request.sources` 为空），这条链路原先零检索、零引用：
 # `DETAIL_PROMPT + DETAIL_NO_SOURCE_RULES` 明确告诉模型"没有可标出处的材料"。
-# 打开这个开关之后，主题先被拿去外部源（中文维基 / arXiv）搜一次，命中转成
-# `Source` 入库，然后**原样走有来源那条路**——预检索、拼证据、引用校验一行不改。
+# 打开这个开关之后，主题先被拿去外部源（中文维基 / 快懂百科 / arXiv / OpenAlex /
+# Crossref）搜一次，命中转成 `Source` 入库，然后**原样走有来源那条路**——预检索、
+# 拼证据、引用校验一行不改。所以"主题生成"与"材料梳理"在路径上是同一条：
+# `_generate` 里那个 `if sources:` 才是主路，`else` 只是"连外部都没搜到"的兜底。
 #
-# 默认**关**，两个理由都不是"技术上做不到"：
+# 默认**开**（`dceae7e` 之后翻的）。翻之前先量过一轮，理由不再是"技术上做得到"：
 #
-#   1. 外部请求有不确定性（源挂掉、代理没开、公司网络封外网）。默认开会让"生成
-#      一张图"这个最基础的动作依赖一次外网往返——而这是用户唯一不能自己排查的
-#      那类失败。
-#   2. 内容可信度不同。上传材料是用户给的，可以假设权威；维基与 arXiv 参差。
-#      `source_refs` 的逐字校验只保证"这句话出自那个来源"，不保证"那个来源本身
-#      可信"——这个差别必须是一个显式的开关，不是默认行为。
+#   - 18 个真实主题 × 2 轮 = 36 次检索，35 次拿到 ≥1 条（97.2%）；唯一一次失败是
+#     首轮的"碳中和"（OpenAlex / Crossref 的 TLS 连接被掐、arXiv 502，整次 6 秒内
+#     全空），同一主题第二轮 2.0 秒拿到 3 条、3128 字——那是代理节点抖动，不是主题
+#     搜不到，所以按 97.2% 而不是 94.4% 记；
+#   - 延迟：中位 4.3–4.5 秒、P90 5.6–6.0 秒、最大 6.5 秒（墙钟上界仍是
+#     `external.DEADLINE_SECONDS=20`）；这个量级用户能感知到"在查资料"，但不至于
+#     以为卡死，而换来的是一棵**带引用**的树；
+#   - 中文主题 14 个，返回正文里中文字符占 68%——中文场景不是"能跑但全是英文论文"。
 #
-# 关着时与 `aeed033` 逐字节相同（`tests/test_external_knowledge.py` 钉着）：不
-# 发请求、不改提示词、`content` 与 `data` 一个键都不多。
+# **什么时候会失败**（都实测过，不是猜测）：
+#
+#   1. 代理没开 / 公司网络封外网：五个源全部连接被拒，5–6 秒后返回空，然后按纯
+#      主题生成（`content` 里会说"外部检索出错（ConnectError…）"）。生成本身不会
+#      失败——这条链的契约是"失败即空"，见 `_external_sources`。
+#   2. 快懂百科（`baike.com`）在带代理的机器上 18/18 全挂
+#      （`SSL: UNEXPECTED_EOF_WHILE_READING`），实际只有四个源在跑。它是"第二个
+#      中文百科视角"，挂了不影响 ≥1 条的成功率，所以没有因此回退默认值。
+#   3. **搜到 ≠ 搜得准**。代码术语与长问句上明显偏差：`C++ 移动语义` 三条命中里
+#      两条是语言学论文（"语义特征考察""语义记忆"）、`Rust 所有权` 拿到"农业"
+#      （rust 是锈病）、一条 19 字的长问句拿到"为什么足球走向世界…"。逐字校验只
+#      保证"这句话出自那个来源"，不保证"那个来源与主题相关"，所以 `content` 与
+#      `GENERATION_FROM_EXTERNAL` 诊断都会明说"依据来自外部检索"，让用户知道这批
+#      引用该按什么标准看。
+#
+# 关着（`MINDMAP_EXTERNAL_KNOWLEDGE=0`）时与 `dceae7e` 逐字节相同
+# （`tests/test_external_knowledge.py` 拿那一版的 `tools.py` 钉着）：一次外部请求
+# 都不发、提示词不动、`data` 里不多 `external` 键。显式关掉是"这台机器上不了网"
+# 时唯一该做的事——不是可选优化。
 EXTERNAL_KNOWLEDGE_ENV = "MINDMAP_EXTERNAL_KNOWLEDGE"
 EXTERNAL_KNOWLEDGE_TRUTHY = frozenset({"1", "on", "true", "yes"})
+EXTERNAL_KNOWLEDGE_DEFAULT = "1"
 
 # 一次检索最多拿几条外部命中。3 条与 `external.DEFAULT_LIMIT` 是同一个数（引用
 # 而不是重写一个 3）：那边是抓取层的默认，这边是"这次生成愿意为它花多少条清单
 # 位"，改一处忘另一处会让"库里存了 5 条、模型只看到 3 条"变得没人说得清。
 EXTERNAL_HIT_LIMIT = external_knowledge.DEFAULT_LIMIT
 
+# 材料总字数低于这个值时不走材料路径，改成"把短材料当主题提示 + 走外部检索/纯主题"
+# （`_generate` 的退化规则，话术见 `MATERIAL_TOO_SHORT`）。
+#
+# 取 `LEAF_MAX_CHARS`（300），而那个数的定义本身就是**引用字段的上限**
+# （`SourceRef.quote` 的 `max_length=300`，`knowledge/service.py` 里把它钉成同一个
+# 数并解释了为什么两处必须相等）。依据只有一句话：材料总字数不超过一条引用装得下
+# 的字数时，**整份材料都能塞进一条引用里**——引用不再"指向某处"，只是"复述全文"，
+# 定位与密度两件事同时失效，而这正是界面上"看不出哪些是编的"的来源。
+#
+# 两条同向的证据（用来核对 300 没有离谱，不是选它的理由）：
+#
+#   - `CHUNK_MIN_CHARS=150`：整篇低于 150 时 `_chunk_spans` 连切都不切，一段就是
+#     一块；低于 300 时连子块都只有一块（`_leaf_spans` 在 `end-start <= 300` 时
+#     直接返回整段），于是 `GENERATE_RETRIEVAL_TOP_K=5` 退化成 1 条、
+#     `search_parent` 的"哪一段支撑哪一句"退化成"整篇都在这一条里"；
+#   - 真实案例：8 字材料（`rust 学习路线`）走 `rag` 路径，一次检索只回 1 条 9 字
+#     命中，模型据此生成 72 个节点、其中 7 个带引用（密度 9.7%）——另外 65 个是
+#     模型自己的知识，而界面上它们与有引用的节点长得一模一样。
+SHORT_MATERIAL_CHARS = LEAF_MAX_CHARS
+
 
 def external_knowledge_enabled() -> bool:
-    """外部知识检索是否打开。**默认关**，显式写 `1/on/true/yes` 才算开。
+    """外部知识检索是否打开。**默认开**，显式写 `0/off/no` 等才算关。
 
-    判定方式与 `library_search_enabled` 一致，只把缺省值从 `"1"` 换成 `"0"`——
-    理由见上面那段注释，不是笔误。
+    判定方式与 `library_search_enabled` 一致（同一个 truthy 集合），但缺省值不同：
+    这里是 `"1"`，那个是 `"0"`。两处不该被"看起来不一致"改成一样——库检索依赖
+    本地索引（随时可用），外部检索依赖一次外网往返（理由与实测见上面那段注释）。
+
+    为什么默认开：主题生成原先在"一条依据都没有"的情况下产出整棵树，用户看不出
+    哪些节点是编的；外部检索把命中转成 `Source` 之后走的是与"材料梳理"完全相同的
+    RAG 链，引用逐字可校验、可点回原文。实测 97.2% 的主题能拿到 ≥1 条（数据同上），
+    6 秒以内返回——这个代价换"看得见的出处"是划算的。
+
+    什么时候会失败：代理没开/外网被封（5–6 秒后返回空，退回纯主题）、快懂百科在
+    代理下 100% 失败、以及"搜到了但相关度差"（逐字校验管不了相关性）。三种都在
+    `content` 与诊断里各自有一套说法，没有一种是静默的。
+
+    显式关掉时整条外部分支被跳过，行为与 `dceae7e` 逐字节相同——那是"这台机器
+    上不了网"时唯一该做的事。
     """
-    return os.getenv(EXTERNAL_KNOWLEDGE_ENV, "0").strip().lower() in EXTERNAL_KNOWLEDGE_TRUTHY
+    return (os.getenv(EXTERNAL_KNOWLEDGE_ENV, EXTERNAL_KNOWLEDGE_DEFAULT)
+            .strip().lower() in EXTERNAL_KNOWLEDGE_TRUTHY)
 
 
 # `source_name` → `SourceKind`。表而不是三元表达式：加一个新源时只能改这里一处，
@@ -1937,6 +1994,48 @@ def _external_source(hit: external_knowledge.ExternalHit) -> Source:
     )
 
 
+def _external_query(topic: str, short_sources: Sequence[Source]) -> str:
+    """这次外部检索用的查询词。
+
+    平时就是主题。**材料太短时把材料并进来**：一份 8 字的 `rust 学习路线` 当材料是
+    废物（切不出一块、引用落不到段落），当检索词却正好是用户想说的那件事——它往往
+    比一个空泛的主题更接近意思（"帮我规划学习路线"这种主题单独拿去搜，回来的全是
+    泛泛的"学习法"）。
+
+    两条去重规则只为了避免把同一句话查两遍：材料常常就是主题的复述（用户把主题
+    粘进上传框），拼起来会得到 `rust 学习路线 rust 学习路线`——`QUERY_MAX_CHARS=50`
+    还不知道会砍掉哪一半。
+
+    超长由抓取层自己截断（`external.QUERY_MAX_CHARS`），这里不重复一套长度规则。
+    """
+    base = (topic or "").strip()
+    hint = " ".join((source.text or "").strip() for source in short_sources).strip()
+    if not hint:
+        return base
+    if hint in base:
+        return base
+    if base and base in hint:
+        return hint
+    return f"{base} {hint}".strip()
+
+
+def _external_source_names(sources: Sequence[Source]) -> str:
+    """这批来源来自哪几个站，拼成"openalex、wikipedia"。
+
+    只用于给用户看的句子：`Source.metadata.tags` 的第一项就是抓取层的
+    `source_name`（见 `_external_source`），所以不需要第二张映射表。取不到时退回
+    `filename` 的前缀（`"wikipedia: 碳中和"` → `wikipedia`），再取不到就说"外部"——
+    一个说不出来源的句子没有意义，但也不该因此抛错。
+    """
+    names: list[str] = []
+    for source in sources:
+        tags = list(source.metadata.tags or [])
+        name = tags[0] if tags else (source.filename or "").split(":", 1)[0].strip()
+        if name and name not in names:
+            names.append(name)
+    return "、".join(names) or "外部"
+
+
 async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
     """主题 → 外部检索 → 入库 → 本次可用的来源。
 
@@ -2086,14 +2185,42 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 不过滤的话，一个还没解析成功的空来源会让 validate_generated_content
     # 重建 source_usage 时撞上 char_count >= 1，把整次生成判成失败——
     # 用户只是多勾了一个空文件，却得到"模型返回的导图不合法"。
-    sources = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
+    picked = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
+    # 材料太短 → 当成"没有材料"（理由与阈值见 `SHORT_MATERIAL_CHARS`）。
+    #
+    # 这里**不改 `ctx.request.sources`**：材料是用户给的，界面上还要显示它、它还在
+    # 收尾校验的可查来源里（`_verify_sources`）。被改掉的只是"这次喂给模型什么"——
+    # 一份 8 字的材料塞进 `rag` 路径之后，检索只会回 1 条 9 字命中，模型据此生成
+    # 72 个节点、7 个带引用，而界面看不出另外 65 个是它自己补的。
+    #
+    # 它仍然有用：作为外部检索的**主题提示**（`_external_query`）。所以这条退化
+    # 不是"丢掉用户的输入"，是"换个用法"。
+    #
+    # **只在 `rag` 形态生效**，这是阈值本身的推论而不是遗漏：`SHORT_MATERIAL_CHARS`
+    # 的全部依据是切块参数（一段切不出两个可区分的检索单元），而切块只发生在 `rag`。
+    # `full` 形态把正文整份放进 prompt，模型看得到每一个字，300 字以下的材料在那里
+    # 既没有"落不到段落"的问题、也不该因为短而被丢掉——那会白白损失几个真能挂上
+    # 引用的节点。
+    material_chars = sum(len((source.text or "").strip()) for source in picked)
+    short_material = (
+        picked
+        if 0 < material_chars < SHORT_MATERIAL_CHARS and source_mode() == SOURCE_MODE_RAG
+        else []
+    )
+    sources = [] if short_material else picked
     # 额度在调用**之前**占：请求一旦发出就是一次真实计费，哪怕它随后抛错。
     # 只在成功后记账会让预算在工具执行期间被超支使用（预算 1 实测跑出 4 次）。
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图。")
     ctx.extra_model_calls += 1
-    # 主题生成（请求没带任何材料）时先去外部知识源搜一次。默认关：关着时这整块
-    # 跳过，一次请求都不发、提示词与 `content` / `data` 与 `aeed033` 逐字节相同。
+    # 没有材料时先去外部知识源搜一次。默认开（实测与失败场景见 `EXTERNAL_KNOWLEDGE_ENV`
+    # 上面那段注释）；关着时这整块跳过，一次请求都不发、提示词与 `content` / `data`
+    # 与 `dceae7e` 逐字节相同。
+    #
+    # "没有材料"包含两种输入：本来就没传，以及传了但太短（`short_material`）。两者
+    # 走到这里是同一个理由——都拿不出可检索的正文；差别只在于后者的文字被并进了
+    # 查询词，而且它必须**被说出来**（`MATERIAL_TOO_SHORT`），否则用户会以为那 8 个字
+    # 被当成材料用了。
     #
     # 排在 `reserve_model_call` **之后**：额度已经占掉了，这时再去做一件"可能白等
     # 20 秒"的事，至少要保证后面的模型调用还有额度——反过来就是白等一场之后才
@@ -2105,8 +2232,21 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # `library.load` 回查自动成立，没有第二条链要维护。
     external: _ExternalFetch | None = None
     if not sources and external_knowledge_enabled():
-        external = await _external_sources(args.topic, ctx)
+        external = await _external_sources(_external_query(args.topic, short_material), ctx)
         sources = external.sources
+    # 太短的材料**不当语料、但当说明**：文字仍然进 prompt（用户写的东西一个字都
+    # 不丢），只是它不再产生 evidence、不再产生引用。上面那次外部检索也用它当了
+    # 查询词（`_external_query`），两处用的是同一份文字、不同的用途。
+    #
+    # 为什么不直接拼进 `args.topic`：主题是这张图的中心节点，把那 8 个字并进去会
+    # 改变 `content.title` 与检索问法；提示是附加说明，位置分开、语义才不混。
+    hint_block = ""
+    if short_material:
+        hint_block = (
+            "\n\n用户还附了这段文字（{chars} 字，太短，不足以作为可检索的材料，"
+            "只当作主题的补充说明，不要从它里面挑句子当引用）：\n{hint}"
+        ).format(chars=material_chars,
+                 hint=" ".join((source.text or "").strip() for source in short_material))
     # `rag` 形态下这一次主题检索的产物；`full` 形态与无来源那条路恒为 None。
     topic_evidence: _TopicEvidence | None = None
     try:
@@ -2148,7 +2288,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                         system,
                         _source_prompt_input(
                             sources, system=system, retrieval_hint=False
-                        ) + topic_evidence.text,
+                        ) + hint_block + topic_evidence.text,
                         max_tokens=_max_tokens(ctx), **stream_kwargs,
                     )
                 else:
@@ -2167,7 +2307,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                     # （聚合诊断 + `ToolResult.content`），"假装有依据"不可能。
                     system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
                     raw = await chat_async(
-                        system, args.topic, max_tokens=_max_tokens(ctx), **stream_kwargs,
+                        system, args.topic + hint_block, max_tokens=_max_tokens(ctx),
+                        **stream_kwargs,
                     )
             else:
                 # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
@@ -2179,17 +2320,22 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 )
         else:
             raw = await chat_async(
-                DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES, args.topic,
-                max_tokens=_max_tokens(ctx), **stream_kwargs,
+                DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES,
+                args.topic + hint_block, max_tokens=_max_tokens(ctx), **stream_kwargs,
             )
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
 
     # 退化成"只凭主题"的那一版：请求带了材料，但这次一条依据都没拿到。
     unsourced = bool(sources) and topic_evidence is not None and not topic_evidence.text
-    # 走了外部检索、但空手而归（开关打开 + 请求不带材料）。它走的也是"纯主题"
+    # 走了外部检索、但空手而归（开关打开 + 没有可用材料）。它走的也是"纯主题"
     # 那条路，但与"用户本来就想要一张纯主题的图"不是一回事：必须说出来。
     external_empty = external is not None and not external.sources
+    # 这次模型手上的依据是从外部抓来的（开关开 + 搜到了 + 走了 RAG）。
+    external_used = external is not None and bool(external.sources)
+    # 这次**真的把原文喂给了模型**（`rag` 且预检索有命中）。三句话术的分叉点：
+    # 材料太短时它决定"外部补全"还是"纯知识"，外部成功时它是"有引用"的前提。
+    evidence_fed = topic_evidence is not None and bool(topic_evidence.text)
 
     try:
         # `evidence` 只在这条链、且只在 `rag` 形态下交出去。
@@ -2289,6 +2435,80 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             ),
         ))
 
+    # 三种退化各自一条诊断 + 一句给用户的话。**三句话术互不相同**，因为用户要能
+    # 从 `content` 里读懂"这次为什么没有引用（或为什么有）"：
+    #
+    #   A. `MATERIAL_TOO_SHORT`  —— 材料太短，被换成了主题提示（有没有外部补全分开说）；
+    #   B. `GENERATION_FROM_EXTERNAL` —— 引用来自外部检索，可信度该怎么看；
+    #   C. `GENERATION_WITHOUT_EXTERNAL` —— 连外部都没搜到，只有模型自己的知识。
+    #
+    # A 与 C 可以同时出现（材料太短 + 外部也空手），那时 C 的**诊断**仍然保留
+    # （它有独立的 code，遥测与日志按 code 聚合），但 `content` 只留 A 的句子——
+    # 两句都在会读成"材料太短"和"没有外部资料"两件不相干的事，其实是一件事的两个面。
+    #
+    # A/B 收进 `lead` 再整体前置（而不是 append）：前端的诊断面板只列前三条
+    # （`AgentPanel.DIAGNOSTIC_LIMIT=3`），而 `validate_generated_content` 会先塞进
+    # 几十条逐节点告警（`UNSOURCED_NODE`——一棵 70 节点的树里大部分节点本来就不带
+    # 引用）。append 的话用户看到的是三条"某节点没有标出出处"，而"这次依据来自外部
+    # 检索"被挤到看不见——那句话恰好是他判断整棵树该信几成的唯一依据。
+    lead: list[Diagnostic] = []
+    short_note = None
+    if short_material:
+        short_note = (
+            f"材料只有 {material_chars} 字，不足以支撑检索"
+            f"（低于 {SHORT_MATERIAL_CHARS} 字时整份材料塞得进一条引用，"
+            "引用落不到具体段落），这次按主题生成"
+        )
+        if evidence_fed:
+            # 有外部正文进了 prompt：说清"依据从哪来"，别让用户以为那 8 个字撑起了一棵树。
+            short_note += (f"，并用外部检索到的 {len(sources)} 条资料"
+                           f"（{_external_source_names(sources)}）补全依据。")
+        elif external_used:
+            # 搜到了资料，但这批资料里没检索出可用片段（语义上等价于"没搜到"）。
+            short_note += "，只用模型自己的知识（外部资料没能检索出可用片段）。"
+        elif external is not None:
+            short_note += "，只用模型自己的知识（没有搜到外部资料）。"
+        else:
+            short_note += "，只用模型自己的知识（外部检索未开启）。"
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="MATERIAL_TOO_SHORT",
+            message=(
+                f"材料总字数只有 {material_chars} 字（阈值 {SHORT_MATERIAL_CHARS} 字）："
+                f"这个长度切不出可区分的检索单元，按材料生成只会得到"
+                f"「引用落不到具体段落」的假依据，所以这次没有走材料路径，"
+                f"{len(short_material)} 份材料只当作主题提示"
+                + ("，依据由外部检索补上" if evidence_fed else "，依据来自模型自己的知识")
+            ),
+        ))
+
+    # B：外部资料真的成了依据。这不是告警（树是好的），但用户必须知道这批引用
+    # 该按什么标准看——逐字校验只保证"引文出自这个来源"，不保证"来源与主题相关"
+    # （实测 `Rust 所有权` 会拿到"农业"：rust 是锈病）。
+    #
+    # 诊断与句子分开判：材料太短时**句子**由 A 的尾巴说（"并用外部检索到的 N 条
+    # 资料补全"），但诊断仍然要留——遥测按 code 聚合，"这次用了外部资料"是一条
+    # 独立的、与"材料太短"正交的事实。
+    external_used_note = None
+    if external_used:
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.info, code="GENERATION_FROM_EXTERNAL",
+            message=(
+                f"本次引用来自外部检索的 {len(external.sources)} 条资料"
+                f"（{_external_source_names(external.sources)}）；"
+                "逐字校验保证引文出自这些来源，不保证来源本身与主题高度相关"
+            ),
+        ))
+        if not short_material:
+            external_used_note = (
+                f"本次有 {len(external.sources)} 条依据来自外部检索"
+                f"（{_external_source_names(external.sources)}）："
+                "引用逐字可校验、能点回原文，但外部内容不像你上传的材料那样权威，"
+                "当作参考资料看即可。"
+            )
+
+    # 前置那两条"为什么"：顺序是先因后果（材料太短在前，外部补全在后）。
+    diagnostics = lead + diagnostics
+
     ctx.candidate = content
     ctx.revision += 1
     count = _count_nodes(content.root)
@@ -2318,20 +2538,29 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         ))
 
     summary = f"已生成导图「{content.title}」，共 {count} 个节点。"
-    if unsourced:
+    if short_note:
+        # A：材料太短。这一句自己就说明了"按主题生成 + 依据从哪来"，所以它出现时
+        # 不再叠 C 那句（否则读成两件不相干的事）与 `unsourced` 那句（材料路径压根
+        # 没走，没有"检索没命中"这回事）。
+        summary += short_note
+    elif unsourced:
         # 一句话必须写进 `content`：这是模型唯一会读回去的地方，也是遥测/日志里
         # 唯一的"这次没依据"信号。写进 data 不够——用户看的是这句话。
         summary += (
             f"{reason}，这张图只基于主题生成，不含任何材料依据；"
             "要一张有依据的图，请换一个更贴近材料内容的说法后重试。"
         )
-    if external_note:
-        # 外部检索是**用户看得见的一次等待**（可能到 20 秒），它空手而归时必须
-        # 在用户读到的那句话里说清，否则"等了半分钟还是没有引用"无从解释。
+    if external_note and not short_note:
+        # C：外部检索是**用户看得见的一次等待**（可能到 20 秒），它空手而归时必须在
+        # 用户读到的那句话里说清，否则"等了半分钟还是没有引用"无从解释。
         summary += (
             f"{external_note}，这张图只基于主题「{args.topic}」生成，"
             "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
         )
+    if external_used_note:
+        # B：搜到并用了。与 C 是两个方向的同一件事——用户要能分清"没有引用是因为
+        # 没搜到"和"有引用是因为搜到了"。
+        summary += external_used_note
     if evidence_unused:
         # 用户读到的只有这句话。此处最容易误判成"材料里没有相关内容"（那正是
         # `unsourced` 的含义），所以必须把"给了 N 条、落下来 0 条"摆出来，
@@ -2357,13 +2586,23 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "failed": topic_evidence.failure,
         }
     if external is not None:
-        # 只在外部队列真的走过时才有这个键：开关关着时 `data` 的键集与 `aeed033`
+        # 只在外部队列真的走过时才有这个键：开关关着时 `data` 的键集与 `dceae7e`
         # 逐字节相同（回归用例比的是键集，不只是值）。
         data["external"] = {
             "hits": external.hits,
             "sources": len(external.sources),
             "seconds": round(external.elapsed, 3),
             "failed": external.failure,
+        }
+    if short_material:
+        # 材料明明传了、这次却没用：机器读的那一半（用户读的那一半在 `content`
+        # 与 `MATERIAL_TOO_SHORT` 里）。数字放这里而不是只写进一句话，是为了让
+        # "阈值调过之后还触发吗"能在日志里直接看出来。
+        data["material"] = {
+            "chars": material_chars,
+            "sources": len(short_material),
+            "threshold": SHORT_MATERIAL_CHARS,
+            "degraded": True,
         }
     return ToolResult(ok=True, content=summary, data=data)
 

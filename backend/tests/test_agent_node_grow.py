@@ -575,8 +575,15 @@ def _sse(chunks: list[str], finish_reason: str | None = None,
 class GenerateGrowTest(unittest.TestCase):
     """带 id 的整树响应也必须在候选树完成前上报，而且不能影响最终生成。"""
 
+    # 正文要长过 `tools.SHORT_MATERIAL_CHARS`（300 字）：短了 `_generate` 会把材料
+    # 降级成"主题提示"、压根不走检索，而本类断言的正是"清单里没有正文、正文只经
+    # 检索命中进来"——材料一短，那两段（清单 / 命中）都不存在了。
+    # 标记句放在开头，填充段刻意不含"论文""原文"这类词。
+    PAPER_TEXT = ("论文原文。"
+                  + "第一章 背景。本节只用于把正文撑过降级阈值，不参与任何断言。" * 10)
+
     def _ctx(self, emit=None, *, with_sources=True):
-        sources = [Source(id="s1", kind="document", status="parsed", text="论文原文。")]
+        sources = [Source(id="s1", kind="document", status="parsed", text=self.PAPER_TEXT)]
         if not with_sources:
             sources = []
         request = AgentRunRequest(
