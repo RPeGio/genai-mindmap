@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ from app.agent.contracts import (
 )
 from app.agent.router import router
 from app.agent.stream import encode_event
+from app.contracts.source import Source, SourceKind
 from app.core.errors import register_error_handlers
 from app.generation.service import GenerationError
 
@@ -147,3 +149,57 @@ class LegacyRouteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourcesFrameTest(unittest.TestCase):
+    """材料入库后先发一帧 `sources`，把临时 id 换成持久 id。
+
+    这一帧必须排在 `run()` 的产物之前：前端要在收到任何 `node_grow` / `snapshot`
+    之前就知道"手上的来源 id 变了"，否则第一张图里的引用就已经指错。
+    """
+
+    def test_sources_frame_comes_first_and_carries_the_mapping(self):
+        source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文若干。")
+        seen: list = []
+
+        async def fake_run(body):
+            seen.append(body)
+            yield DoneEvent(seq=1)
+
+        with patch("app.agent.router.run", side_effect=fake_run):
+            response = client.post(URL, json={
+                "goal": "整理材料", "intent": "create",
+                "sources": [source.model_dump(mode="json")],
+            })
+
+        frames = _frames(response.text)
+        self.assertEqual(frames[0]["type"], "sources")
+        self.assertEqual(list(frames[0]["mapping"]), [source.id])
+        # 换过 id 的 request 才交给循环：库里记的是新 id，导图引用要对得上。
+        self.assertEqual([item.id for item in seen[0].sources], [frames[0]["mapping"][source.id]])
+
+    def test_no_sources_frame_when_there_is_nothing_to_remap(self):
+        with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):
+            response = client.post(URL, json={"goal": "做一张导图", "intent": "create"})
+
+        self.assertNotIn("sources", [frame["type"] for frame in _frames(response.text)])
+
+    def test_stream_still_ends_with_done_when_ingest_fails(self):
+        """入库失败不能把流打断：材料照样用，只是没进库。"""
+        source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文。")
+
+        def boom(sources):
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch("app.agent.router.remember_sources", boom):
+            with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):
+                response = client.post(URL, json={
+                    "goal": "整理", "intent": "create",
+                    "sources": [source.model_dump(mode="json")],
+                })
+
+        self.assertEqual(response.status_code, 200)
+        frames = _frames(response.text)
+        # 入库抛的是 sqlite3 错误，被包成 error 帧后仍然以尾。
+        self.assertEqual(frames[-1]["type"], "error")
+        self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))

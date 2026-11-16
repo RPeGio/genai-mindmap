@@ -13,12 +13,14 @@ import os
 from typing import AsyncIterator
 
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from app.agent.contracts import AgentEvent, AgentRunRequest, ErrorEvent
+from app.agent.contracts import AgentEvent, AgentRunRequest, ErrorEvent, SourcesEvent
 from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.generation.service import GenerationError
+from app.knowledge.remember import remember_sources
 
 router = APIRouter(prefix="/agent", tags=["AI 代理"])
 
@@ -73,6 +75,17 @@ async def _frames(body: AgentRunRequest) -> AsyncIterator[str]:
     # "async generator ignored GeneratorExit"，底层生成器的清理也被跳过。
     finished = False
     try:
+        # 材料入库排在事件流之前：入库会把临时 id 换成库里的持久 id，换完的
+        # id 必须同时送到前端（`sources` 帧）和生成上下文（重排后的 request）。
+        # 两边不一致时，导图里记的 `source_refs.source_id` 从这一轮起就指不到原文。
+        #
+        # 放线程池里跑：入库是同步 sqlite 写，50 份材料要几百毫秒，占着事件循环
+        # 会把这些毫秒变成"第一帧之前多等一会儿"。
+        remembered = await run_in_threadpool(remember_sources, body.sources)
+        if remembered.mapping:
+            seq += 1
+            yield encode_event(SourcesEvent(seq=seq, mapping=remembered.mapping))
+            body = body.model_copy(update={"sources": remembered.sources})
         async for event in run(body):
             seq = max(seq, getattr(event, "seq", 0))
             yield encode_event(event)

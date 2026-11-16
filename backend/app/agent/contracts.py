@@ -572,6 +572,23 @@ class NodeGrowEvent(_EventBase):
     expandable: bool | None = None
 
 
+class SourcesEvent(_EventBase):
+    """材料入库后，临时 id 被换成持久 id 的通知。
+
+    解析接口给每份材料发的是本次请求内有效的 uuid，而知识库认的是正文 sha256
+    推出来的持久 id。两套 id 并存时导图里记的 `source_refs.source_id` 在重新
+    打开后就谁也找不到。所以入库之后要把"旧 id → 持久 id"告诉前端，让它就地
+    替换手上的来源条目。
+
+    只在真有 id 变化时发：没有材料、或用不到库（开关关掉）时这一帧根本不出现，
+    既有帧序列逐字节不变。
+    """
+
+    type: Literal["sources"] = "sources"
+    # 旧 id → 持久 id。空字典不该发这一帧，前端也不必处理空表。
+    mapping: dict[str, str] = Field(default_factory=dict)
+
+
 class HeartbeatEvent(_EventBase):
     """等模型/等工具期间的"我还活着"帧。
 
@@ -621,7 +638,7 @@ class ErrorEvent(_EventBase):
 AgentEvent = Annotated[
     Union[
         StageEvent, ToolStartEvent, ToolEndEvent, OpsEvent, SnapshotEvent,
-        NodeGrowEvent, HeartbeatEvent, DoneEvent, ErrorEvent,
+        NodeGrowEvent, SourcesEvent, HeartbeatEvent, DoneEvent, ErrorEvent,
     ],
     Field(discriminator="type"),
 ]
