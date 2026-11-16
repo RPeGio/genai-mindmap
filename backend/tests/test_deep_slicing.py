@@ -275,6 +275,85 @@ def test_citable_quote_is_copied_into_source_refs(monkeypatch):
             assert node.source_refs, node.label
 
 
+def test_evidence_given_but_unused_is_reported(monkeypatch):
+    """每支都拿到证据、模型一条引用都不写 → `EVIDENCE_UNUSED`（warn）。
+
+    `_plain_chat` 就是这种模型：它读得到证据数组，但只保证流程跑完。产出出来的树
+    与"一条都没检索到"逐节点相同（全是无引用的要点），差别只在这条诊断里——不报
+    的话，检索成功与检索扑空在结果上完全无法区分。
+    """
+    monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
+    seen: dict[str, int] = {}
+
+    async def chat(system, user, *, max_tokens=None, on_delta=None):
+        if system.startswith(PLAN_PROMPT):
+            return _plan(*BRANCHES)
+        title = _branch_of(user)
+        seen[title] = len(_evidence_of(user))
+        return _two(title)              # 只看证据、不写引用
+
+    ctx = _ctx()
+    result = _run_deep(ctx, chat)
+
+    assert result.ok, result.content
+    with_evidence = sum(1 for count in seen.values() if count)
+    assert with_evidence, "前提：至少一支拿到了证据"
+    item = next(entry for entry in result.data["diagnostics"]
+                if entry["code"] == "EVIDENCE_UNUSED")
+    assert item["level"] == "warn"
+    # 两个数都在：几条分支/几条（去重后的）证据，最后剩几条引用
+    assert f"{with_evidence} 条分支拿到了材料依据" in item["message"]
+    assert "最终 0 条引用" in item["message"]
+    assert "模型一条引用都没有写" in item["message"]
+    # content 里也要有一句：用户读到的只有它
+    assert "按支检索给到的证据这次没有被用上" in result.content
+    assert result.data["source_refs"]["kept"] == 0
+    assert result.data["source_refs"]["dropped"] == 0
+    assert all(not node.source_refs for branch in ctx.candidate.root.children
+               for node in branch.children)
+
+
+def test_unused_evidence_is_not_reported_when_citations_survive(monkeypatch):
+    """有证据、有引用 → 不报：这条诊断只描述"零引用"，引用少但不是零不在其列。"""
+    monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
+
+    async def chat(system, user, *, max_tokens=None, on_delta=None):
+        if system.startswith(PLAN_PROMPT):
+            return _plan(*BRANCHES)
+        title = _branch_of(user)
+        entry = _evidence_of(user)[0]
+        ref = {"source_id": entry["source_id"], "quote": entry["quote"][:200]}
+        return {"children": [
+            {"label": f"{title}·一", "expandable": False, "source_refs": [ref]},
+            {"label": f"{title}·二", "expandable": False, "source_refs": [dict(ref)]},
+        ]}
+
+    result = _run_deep(_ctx(), chat)
+
+    assert result.ok, result.content
+    assert result.data["source_refs"]["kept"] > 0, "前提：引用留在了树上"
+    assert "EVIDENCE_UNUSED" not in _codes(result)
+
+
+def test_unused_evidence_is_not_reported_without_any_evidence(monkeypatch):
+    """一次都没命中（含整树兜底）→ 不报：那是"没有证据"，不是"证据没用上"。
+
+    这条界限必须钉住：`with_evidence == 0` 时如果把 `refs_kept == 0` 当成"零引用"
+    一律报，每棵检索扑空的树都会多一条无解的告警，而真正的问题已经由
+    `BRANCH_RETRIEVAL_FALLBACK` / `BRANCH_NO_EVIDENCE` 说清楚了。
+    """
+    monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
+    monkeypatch.setattr("app.agent.tools.search_parent", lambda *_a, **_k: [])
+
+    result = _run_deep(_ctx(), _plain_chat)
+
+    assert result.ok, result.content
+    codes = _codes(result)
+    assert "BRANCH_RETRIEVAL_FALLBACK" in codes
+    assert "EVIDENCE_UNUSED" not in codes
+    assert "没有被用上" not in result.content
+
+
 def test_quote_whitespace_is_never_normalised(monkeypatch):
     """引文首尾的空白不许被洗掉：`quote == text[start:end]` 是逐字约束。
 
