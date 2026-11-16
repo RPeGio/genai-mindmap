@@ -572,6 +572,26 @@ class NodeGrowEvent(_EventBase):
     expandable: bool | None = None
 
 
+class HeartbeatEvent(_EventBase):
+    """等模型/等工具期间的"我还活着"帧。
+
+    线上实测单轮静默能到 25 秒（3 路并发下模型思考）。这期间事件流里一个字节
+    都没有，中间链路只要有 30–60 秒的空闲超时（企业代理、Cloudflare、部分移动
+    网络）就会把连接掐断，用户看到"连接中断"，而模型其实还在跑、还在计费。
+    nginx 那边是 900 秒，救不了更靠前的链路。
+
+    心跳只做两件事：让连接上一直有字节流动；把"已经等了多少秒"送到页面。
+    它不携带任何业务信息，前端也不该把它当进度——真实进度由 `stage` /
+    `tool_start` / `node_grow` 负责。
+
+    `waited_ms` 是**本次静默**已经持续了多久（从上一帧之后算起），不是总耗时：
+    页面上"已等 N 秒"要说的是"卡了多久"，不是"跑了多久"。
+    """
+
+    type: Literal["heartbeat"] = "heartbeat"
+    waited_ms: int = Field(ge=0)
+
+
 class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
     content: MindMapContent | None = None
@@ -601,7 +621,7 @@ class ErrorEvent(_EventBase):
 AgentEvent = Annotated[
     Union[
         StageEvent, ToolStartEvent, ToolEndEvent, OpsEvent, SnapshotEvent,
-        NodeGrowEvent, DoneEvent, ErrorEvent,
+        NodeGrowEvent, HeartbeatEvent, DoneEvent, ErrorEvent,
     ],
     Field(discriminator="type"),
 ]

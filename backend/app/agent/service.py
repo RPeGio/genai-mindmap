@@ -28,6 +28,7 @@ from app.agent.contracts import (
     AgentRunRequest,
     DoneEvent,
     ErrorEvent,
+    HeartbeatEvent,
     NodeGrowEvent,
     OpsEvent,
     RunBudget,
@@ -62,6 +63,17 @@ MAX_NUDGES = 1
 
 # 推给界面的模型原话上限：这是排障用的摘要，不是把整篇输出搬进事件流。
 MODEL_TEXT_LIMIT = 4000
+
+# 静默多久补一帧心跳。
+#
+# 线上实测（3 路并发，GLM-5.3-Flash）最长静默 25 秒，单轮首字延迟平时 5–10 秒。
+# 这段时间事件流里一个字节都没有，中间链路只要有 30–60 秒的空闲超时（企业代理、
+# Cloudflare、部分移动网络）就会把连接掐断——用户看到"连接中断"，而模型其实还在
+# 跑、还在计费。nginx 那边配的是 900 秒，救不了更靠前的链路。
+#
+# 取 10 秒而不是 25 秒：必须小于最紧的常见空闲阈值（30 秒），且留一次重试余量。
+# 再小就是把流刷成噪音，用户看到的仍是"没进展"。
+HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 
 class AgentPlan(BaseModel):
@@ -360,6 +372,51 @@ def _node_grow(payload: dict[str, Any], seq: "itertools.count[int]") -> NodeGrow
         return None
 
 
+@dataclass
+class _Waited:
+    """装 `_await_quietly` 的返回值。
+
+    与 `_ToolOutcome` 同一个理由：那个函数是 async generator（要一边等一边 yield
+    心跳帧），而生成器没法 `return` 一个值。
+    """
+
+    value: Any = None
+
+
+async def _await_quietly(
+    awaitable: "asyncio.Future[Any] | Any",
+    seq: "itertools.count[int]",
+    out: _Waited,
+) -> AsyncIterator[HeartbeatEvent]:
+    """等一件事完成，期间按 `HEARTBEAT_INTERVAL_SECONDS` 补心跳帧。
+
+    只该包在**会产生长静默**的等待上（模型调用、工具内部执行）。心跳不带业务
+    含义，真实进度仍由 `stage` / `tool_start` / `node_grow` 负责。
+
+    被等的 awaitable 自己负责超时（调用方传的是 `asyncio.wait_for(...)`），这里不
+    另设时限：两处都判超时的话，哪个先到就成了第二份真相。
+    """
+    task = asyncio.ensure_future(awaitable)
+    silence_started = time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SECONDS)
+            if task in done:
+                # 在这一句里抛出被等者的异常（超时、上游失败），与直接 await 一致
+                out.value = task.result()
+                return
+            yield HeartbeatEvent(
+                seq=next(seq),
+                waited_ms=int((time.monotonic() - silence_started) * 1000),
+            )
+    finally:
+        # 客户端中途断开时调用方会被关掉：不取消这个任务，模型请求还在跑、还在计费。
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
 async def _run_tool(
     call: ToolCall,
     ctx: RunContext,
@@ -397,15 +454,30 @@ async def _run_tool(
     ctx.emit = emit
     task = asyncio.create_task(worker())
     deadline = time.monotonic() + timeout
+    silence_started = time.monotonic()
     try:
         while True:
-            try:
-                kind, payload = await asyncio.wait_for(
-                    updates.get(), timeout=max(0.0, deadline - time.monotonic()),
-                )
-            except (asyncio.TimeoutError, TimeoutError):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 outcome.timed_out = True
                 return
+            try:
+                # 按心跳间隔切分等待：工具里可能连着跑十几次模型调用，中途只有
+                # `node_grow` 偶尔冒一帧，其余时间同样是几十秒的空档。
+                kind, payload = await asyncio.wait_for(
+                    updates.get(), timeout=min(remaining, HEARTBEAT_INTERVAL_SECONDS),
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                if deadline - time.monotonic() <= 0:
+                    outcome.timed_out = True
+                    return
+                # 没到截止时间，只是又静默了一个心跳周期
+                yield HeartbeatEvent(
+                    seq=next(seq),
+                    waited_ms=int((time.monotonic() - silence_started) * 1000),
+                )
+                continue
+            silence_started = time.monotonic()
             if kind == "emit":
                 event = _node_grow(payload, seq)
                 if event is not None:
@@ -546,13 +618,24 @@ async def run(
 
         # 每轮刷新大纲：模型必须看到上一轮产出节点的真实 id，否则它无法精确改
         _refresh_outline(messages, ctx)
+        waited = _Waited()
         try:
             # 用剩余时间做超时，而不是让单次调用跑到 provider 自己的 60 秒上限：
             # 否则总时限形同虚设，一轮慢调用就能把预算耗尽而循环还在等。
-            completion = await asyncio.wait_for(
-                active_provider.complete_tools(messages, registry.specs(), budget=budget),
-                timeout=max(0.1, _remaining_seconds(budget, started)),
-            )
+            #
+            # 用 `_await_quietly` 而不是直接 await：单轮首字延迟平时 5–10 秒、
+            # 3 路并发下实测到过 25 秒，这段时间一帧都不发，链路空闲超时会掐断
+            # 连接（见 HEARTBEAT_INTERVAL_SECONDS 的注释）。
+            async with contextlib.aclosing(_await_quietly(
+                asyncio.wait_for(
+                    active_provider.complete_tools(messages, registry.specs(), budget=budget),
+                    timeout=max(0.1, _remaining_seconds(budget, started)),
+                ),
+                seq, waited,
+            )) as waiting:
+                async for beat in waiting:
+                    yield beat
+            completion = waited.value
         except asyncio.CancelledError:
             # 必须原样抛出：吞掉它会让"用户点了取消"变成一次正常结束
             raise
