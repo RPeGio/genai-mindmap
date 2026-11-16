@@ -145,7 +145,8 @@ DEEP_MIN_BREADTH = 2
 #   - 第一支跑完就预热了缓存，后面各支只 embed 自己那一条 query。
 # 实测（假向量、冷缓存）：8 支 = 8 次调用 / 10 批 / 76 条文本；20 支 = 20 次 / 22 批 /
 # 88 条文本。**不预热**时是 20 × 69 = 1380 条（56 批），17 倍——所以
-# `_retrieve_branches` 里第一支是串行的，那不是保守，是成本闸。
+# `_generate_deep` 里第一支仍然串行检索（预热闸见 `run_branch`），那不是保守，
+# 是成本闸。`_retrieve_branches` 是同一策略的批量实现。
 DEEP_BRANCH_TOP_K = 3
 
 # 一支最多发几路查询：标题 + 2 条同义问法（`query_plan.plan_branches`）。
@@ -1950,6 +1951,12 @@ async def _retrieve_branches(
 ) -> list[list[EvidenceHit] | None]:
     """N 支各检索一次：**第一支先单独跑，其余并行**。
 
+    `_generate_deep` 已改走逐支流水线（`run_branch`），**不再经过这个函数**。它留
+    下来是这条"批量检索"口径的唯一实现：预热策略、并发形状、第一支串行那道闸的
+    成本数字都写在这里，而流水线复用的正是同一条策略——只是把"其余支检索完才
+    展开"换成了"各自检索完就展开"。`tests/test_branch_expansion.py` 第 2 节还拿
+    它钉住"降级时每支只发标题、走 `search_parent`"，所以它不该跟着入口一起删。
+
     为什么要先串一条：`search_parent` 每次都要把本次候选块的向量拿到手，而块向量
     是按文本哈希缓存的（`knowledge.vector_cache`）。N 支同时发出去的后果是**每一支
     都认为自己是第一次**——实测 8 支冷启动发出 8 × 69 = 552 条向量文本（24 个批次），
@@ -2153,15 +2160,28 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     那一棵，两者不一致是正常的（预览可能多、可能少）。通道为 None 时这条路径
     **一行都不走**，工具行为与加预览之前完全相同。
 
-    **有材料时，骨架之后、并发展开之前，每条一级分支各检索一次**（分片 + 按支
-    检索，`docs/RAG-DECISIONS.md` 第 5 节）：query 是**分支标题本身**（不含主题，
-    理由与三组消融数字见 `_search_branch`），走 `search_parent`（父块返回，默认开），
+    **每一支的「检索 → 展开」是一条流水线**（分片 + 按支检索，`docs/RAG-DECISIONS.md`
+    第 5 节）：骨架落定后先检索第一支（它同时预热块向量缓存），之后**每一支自己的
+    检索一回来就发它自己的展开，不等其他支**。上一版是两阶段（全部检索完再一批
+    展开），骨架到第一个子节点之间隔着"最慢的一支检索"；流水线之后那段空窗只剩
+    第一支的检索。query 是**分支标题本身**（不含主题，理由与三组消融数字见
+    `_search_branch`），走 `search_parent`（父块返回，默认开），
     `top_k=DEEP_BRANCH_TOP_K`。这个工具读来源有两处，形态都不是全文：骨架那一次
     读的是**标题行**（`_skeleton_outline`，原文的子集），展开读的是**检索结果**。
 
-    为什么必须按支检索：模型看不到正文，整树一次生成 = **整棵树只有一次检索
-    机会**。`top_k=5` 对八千字材料约覆盖 25%、对三万字约 8%，于是"没想到要问的
-    章节"会静默缺失——用户拿到一份看起来正常但缺了几块的导图。分片之后覆盖度由
+    流水线有两条边界，改节奏时最容易漏的就是这两处：
+      - **块向量预热那道闸不能拆**：第一支仍然串行检索——N 支同时发出去会让缓存
+        逐个击穿，8 支的向量请求量从 76 条涨到 552 条（数字与实测口径见
+        `_retrieve_branches`）。闸门只需要**一支**跑完，不需要所有支，所以它与
+        流水线不冲突。
+      - **"全部支都没证据 → 整树兜底"需要一处屏障**：那个判定要等全部门落定，而
+        流水线不允许等。屏障因此只挡住**没拿到证据的那几支**（`settle_fallback`），
+        有证据的支照常展开；空支在等之前先让出并发名额，否则 20 支时名额会被占满
+        成死锁。
+
+    为什么必须按支检索：模型看不到正文，整棵树只有**每支各一次**检索机会。
+    `top_k=5` 对八千字材料约覆盖 25%、对三万字约 8%，于是"没想到要问的章节"
+    会静默缺失——用户拿到一份看起来正常但缺了几块的导图。分片之后覆盖度由
     **骨架**决定，不由模型的查询创意决定。
 
     三条硬约束（违反任意一条，这个能力就变成负资产）：
@@ -2389,11 +2409,47 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     branch_evidence: list[_BranchEvidence | None] = [None] * len(skeleton)
     retrieval_queries: list[str] = []
     retrieval_mode = "off"
+    # 检索的两份结局：`search_outcome` 按支记 "hits" / "empty" / "failed"（还没跑
+    # 为 None），屏障与兜底读它；`retrieval_failed` 单独留一份，是因为整树兜底会把
+    # outcome 整体改写成 "hits" 或 "empty"，而"这一支检索抛错过"是诊断要说明的
+    # 事实，不能跟着兜底一起消失。
+    search_done: list[bool] = [False] * len(skeleton)
+    search_outcome: list[str | None] = [None] * len(skeleton)
     retrieval_failed: list[int] = []
     retrieval_empty: list[int] = []
+    # 检索诊断延后到展开之后再汇总：它们原本紧跟在骨架诊断之后、展开期诊断
+    # （补查那条）之前，位置由这个下标钉住。
+    diagnostics_before_search = len(diagnostics)
+    retrieval_diagnostics: list[Diagnostic] = []
+    branch_titles: list[str] = []
+    # 第一支的检索结果（它同时是块向量预热的闸，见下面的检索段）。流水线里这支
+    # 不再重复检索第二次。
+    first_hits: list[EvidenceHit] | None = None
+    # 整树兜底的命中条数；None = 没走兜底。诊断在汇总处统一生成，这里只留事实。
+    whole_count: int | None = None
     # 分支标题 → 同义问法。没有可检索的材料时不做按支检索，所以这里恒为空——
     # 它同时是 `retrieval.expanded_branches` 的来源，两处共用一个变量才不会有半开状态。
     expansions: dict[str, list[str]] = {}
+
+    async def safe_search(title: str, index: int) -> list[EvidenceHit] | None:
+        """按支检索：**永不把异常抛进流水线**。
+
+        `_search_branch` 自己已经把检索异常收成 `None`（"没检索到"与"检索失败"
+        的区别在它那里定义），这里再兜一层是给"将来的检索栈会抛"留的位置：
+        流水线里没有 `_retrieve_branches` 那层 `gather` 接着，一个抛出去的异常会
+        让这一支变成"整支留空"，而它的语义只该是"这一支没查到证据"。
+
+        取消必须原样抛回去：那是上层被取消（客户端断开），不是这次检索失败。
+        """
+        try:
+            return await _search_branch(sources, title, expansions.get(title, ()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 检索失败只降级
+            logger.warning("分支检索抛错（%s / 第 %d 支）：%s: %s",
+                           title, index, type(exc).__name__, str(exc)[:160])
+            return None
+
     if slicing:
         branch_titles = [title for title, _ in skeleton]
         # 查询扩展：每支从"一条标题"变成"标题 + 至多 2 条同义问法"。`expansions`
@@ -2401,67 +2457,31 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         # 与这个能力上线之前逐字节相同。
         #
         # 位置必须在这里：扩展的输入是分支标题，而分支标题要等骨架落定；输出要
-        # 赶在 `_retrieve_branches` 之前，否则检索已经按标题跑完了。
+        # 赶在按支检索之前，否则检索已经按标题跑完了。
         expansions = await _expand_branches(sources, branch_titles)
         retrieval_queries = [
             query for title in branch_titles
             for query in _branch_queries(_branch_query(title), expansions.get(title, ()))
         ]
-        hits_by_branch = await _retrieve_branches(
-            sources, branch_titles, expansions=expansions)
         retrieval_mode = "branch"
-        retrieval_failed = [
-            index for index, hits in enumerate(hits_by_branch) if hits is None]
-        # 没有任何一支拿到证据（全抛错、全空，或两者混合）→ 退回整树一次检索。
-        # 不退回的话，每支都会带着"没有证据就留空"的提示词展开，产出一棵**空树**
-        # ——而"检索失败"不该等于"材料里没有"。这正是降级要彻底的那一条。
-        if all(not hits for hits in hits_by_branch):
-            whole = await _retrieve_whole(sources, args.topic, branch_titles)
-            retrieval_mode = "whole"
-            retrieval_queries = [" ".join([args.topic.strip(), *branch_titles]).strip()]
-            # 兜底命中要**原样给每一支**：这是"整树一次检索"的定义，每支看到的
-            # 是同一批证据；分片的收益在这一刻归零，但那好过一棵空树。
-            hits_by_branch = [whole for _ in hits_by_branch]
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.warn, code="BRANCH_RETRIEVAL_FALLBACK",
-                message=(
-                    f"{len(skeleton)} 条分支按支检索都没有拿到证据，已退回整树一次检索"
-                    f"（{len(whole)} 条命中，全部支共用）；分片检索的覆盖收益本次没有生效"
-                    if whole else
-                    f"{len(skeleton)} 条分支按支检索都没有拿到证据，整树兜底检索也没命中，"
-                    "各支将按「无依据」展开"
-                ),
-            ))
-        retrieval_empty = [
-            index for index, hits in enumerate(hits_by_branch)
-            if hits is not None and not hits]
-        for index, hits in enumerate(hits_by_branch):
-            if not hits:
-                continue
-            evidence = _branch_evidence(hits, sources)
-            branch_evidence[index] = evidence
-            # 累积进 `RunContext.evidence`：去重（四元组）与 200 条上限都在那里，
-            # 这里只管往里放。收尾的 `verify_source_refs` 读的也是它——两处同源，
-            # 否则"校验依据"与"模型看到的证据"会是两份不同的东西。
-            ctx.record_evidence(evidence.spans)
-        for index in retrieval_failed:
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.warn, code="BRANCH_RETRIEVAL_FAILED",
-                node_id=skeleton[index][1],
-                message=(
-                    f"分支「{skeleton[index][0]}」的检索出错，这一支按「无检索结果」展开"
-                    "（其余分支不受影响）"
-                ),
-            ))
-        for index in retrieval_empty:
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.info, code="BRANCH_NO_EVIDENCE",
-                node_id=skeleton[index][1],
-                message=(
-                    f"分支「{skeleton[index][0]}」的检索没有命中材料里的任何片段，"
-                    "这一支按自己的知识展开、不挂引用（未检索到不等于材料里没有）"
-                ),
-            ))
+        # 第一支先检索：它是**块向量缓存的预热闸**（为什么必须有这一闸、以及不
+        # 预热时 17 倍的请求量，见 `_retrieve_branches` 的 docstring）。流水线不
+        # 取消它——闸门只需要**一支**跑完，不需要等所有支，所以它挡住的只是它自己
+        # 那一次检索（0.6–0.9 秒），不再是"最慢的那一支"。
+        #
+        # "所有支都没拿到证据 → 退整整树一次检索"这条降级也没变，但它不能在
+        # 这里判：那个判定要等全部门落定，写在这里就把流水线拉回两阶段了。判定
+        # 搬到了 `settle_fallback`，由它只挡住没拿到证据的那几支。
+        if branch_titles:
+            first_hits = await safe_search(branch_titles[0], 0)
+            # 第一支**不管成没成**都算跑过了：`run_branch` 靠这个标记决定它要不要
+            # 再检索一次——失败时的 `None` 与"还没跑"是两件事，混成一个就会把这一
+            # 支检索两遍（成本翻倍，且它自己那支的候选块也白 embed 一次）。
+            search_done[0] = True
+            search_outcome[0] = (
+                "failed" if first_hits is None else ("hits" if first_hits else "empty"))
+            if first_hits is None:
+                retrieval_failed.append(0)
 
     def prompt_for(base: str, evidence: _BranchEvidence | None) -> str:
         """这一支该用哪份提示词：有证据 / 无证据（有材料、这一支没查到）/ 纯主题。
@@ -2602,44 +2622,200 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         ))
         return merged
 
-    async def expand_branch(title: str, branch_index: int) -> list[_Slot] | None:
+    async def expand_branch(
+        title: str, branch_index: int, evidence: _BranchEvidence | None,
+    ) -> list[_Slot] | None:
         """展开一条分支。额度不够返回 None——那是"没展开"，与"展开失败"是两件事。
 
-        **只带这一支的 hits**：`branch_evidence[branch_index]` 是这一步之前按
-        「主题 + 分支标题」单独检索出来的那一批，兄弟分支的证据一个字都不进来。
+        `evidence` 由调用方在**检索完成之后**传进来（`run_branch`）：它是这一支
+        自己的命中，兄弟分支的证据一个字都不进来。
+
+        **名额由调用方持有**：流水线把「检索 + 展开 + 补查」包在同一个名额里
+        （见 `run_branch`），所以这里不再自己拿锁——再拿一次会把这个非重入的
+        `Semaphore` 卡死。
 
         展开之后多一道判据：这一支要不要**补查一次**（`_needs_supplementary`）。
         判定与检索都在工具内部，所以仍然**不占** `max_tool_calls`——模型看到的只是
         一次 `mindmap_generate_deep` 调用。
         """
-        async with semaphore:
-            if not ctx.reserve_model_call():
-                return None
-            ctx.extra_model_calls += 1
-            evidence = branch_evidence[branch_index]
-            ask = (
-                f"整体主题：{args.topic}\n"
-                f"本条一级分支：{title}\n"
-                f"请给出 {need} 个子要点。"
-                f"{evidence_suffix(evidence)}"
-            )
-            # 这一路的产出挂在第 branch_index 条一级分支下面，所以父路径是
-            # `(branch_index,)`。
-            raw = await ask_model(
-                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask,
-                parent=(branch_index,), quota=allowance)
-            kept, _ = _trim_slots(
-                _candidate_slots(raw, point_budget, nested_levels, evidence=evidence),
-                allowance,
-            )
-            if not (slicing and _needs_supplementary(raw, kept)):
-                return kept
-            return await supplement(title, branch_index, kept)
+        if not ctx.reserve_model_call():
+            return None
+        ctx.extra_model_calls += 1
+        ask = (
+            f"整体主题：{args.topic}\n"
+            f"本条一级分支：{title}\n"
+            f"请给出 {need} 个子要点。"
+            f"{evidence_suffix(evidence)}"
+        )
+        # 这一路的产出挂在第 branch_index 条一级分支下面，所以父路径是
+        # `(branch_index,)`。
+        raw = await ask_model(
+            prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask,
+            parent=(branch_index,), quota=allowance)
+        kept, _ = _trim_slots(
+            _candidate_slots(raw, point_budget, nested_levels, evidence=evidence),
+            allowance,
+        )
+        if not (slicing and _needs_supplementary(raw, kept)):
+            return kept
+        return await supplement(title, branch_index, kept)
 
+    # ---- 流水线的两个闸：检索屏障与整树兜底 -------------------------------------
+    #
+    # 为什么需要一个屏障：**"所有支都没有证据 → 退整整树一次检索"这条降级要等
+    # 全部门落定才成立**。把它写进流水线有两种错法：一是把判定提前到骨架之后
+    # （那就得等全部检索，等于退回两阶段），二是干脆不判（全空时每支都按"无依据"
+    # 展开，交出一棵没有出处的树）。这一版的做法是——屏障只挡住**没拿到证据的那
+    # 几支**，有证据的支在屏障期间照样在自己那条流水线上展开。典型情形（有材料、
+    # 有命中）下无人等屏障，总时长与"没有兜底这件事"相同。
+    #
+    # 名额必须**先释放再等**：20 支的上限下若有 10 支空着、各自占着名额等屏障，
+    # 后面的支连检索都发不出去，屏障永远不会完成——那是死锁，不是慢。所以空支在
+    # `async with semaphore` 退出之后才 await 屏障，真正展开时再拿一次名额。
+    pending_searches = sum(1 for done in search_done if not done)
+    all_searched = asyncio.Event()
+    fallback_ready = asyncio.Event()
+    if pending_searches == 0:
+        all_searched.set()
+        fallback_ready.set()
+
+    def record_search(branch_index: int, hits: list[EvidenceHit] | None) -> None:
+        """记下这一支的检索结局，并在最后一支落定时打开屏障。"""
+        nonlocal pending_searches
+        search_done[branch_index] = True
+        search_outcome[branch_index] = (
+            "failed" if hits is None else ("hits" if hits else "empty"))
+        if hits is None:
+            retrieval_failed.append(branch_index)
+        pending_searches -= 1
+        if pending_searches <= 0:
+            all_searched.set()
+
+    async def settle_fallback() -> None:
+        """全部门落定之后判一次"是不是一条证据都没拿到"，是就整树兜底一次。
+
+        这是流水线上唯一的屏障，而它挡住的只有没拿到证据的那几支（见上面那段）。
+        代价与上一版相同：兜底那一次检索本来就要等所有支，只是它现在与"有证据的
+        支的展开"重叠，不再把整体推后一整轮。
+
+        `finally` 里无条件放行：兜底自己抛错（`_retrieve_whole` 已吞掉检索异常，
+        但 `_branch_evidence` 仍可能被将来的改动弄成会抛）也必须让空支继续走
+        "无证据展开"——否则 `fallback_ready` 永远不会置位，整条流水线挂死在这里。
+        """
+        nonlocal retrieval_mode, whole_count
+        try:
+            if not slicing:
+                return
+            await all_searched.wait()
+            if any(outcome == "hits" for outcome in search_outcome):
+                return
+            whole = await _retrieve_whole(sources, args.topic, branch_titles)
+            retrieval_mode = "whole"
+            retrieval_queries[:] = [" ".join([args.topic.strip(), *branch_titles]).strip()]
+            whole_count = len(whole)
+            # 兜底命中要**原样给每一支**：这是"整树一次检索"的定义，每支看到的
+            # 是同一批证据；分片的收益在这一刻归零，但那好过一棵空树。
+            for index in range(len(skeleton)):
+                if not whole:
+                    branch_evidence[index] = None
+                    search_outcome[index] = "empty"
+                    continue
+                evidence = _branch_evidence(whole, sources)
+                branch_evidence[index] = evidence
+                ctx.record_evidence(evidence.spans)
+                search_outcome[index] = "hits"
+        finally:
+            fallback_ready.set()
+
+    async def run_branch(title: str, branch_index: int) -> list[_Slot] | None:
+        """一支的「检索 → 展开」：**检索一回来就发它自己的展开，不等其他支**。
+
+        上一版是两阶段（`_retrieve_branches` 全部跑完 → `expand_branch` 一批并发）：
+        骨架落定到第一个子节点之间隔着"最慢的一支检索"，实测 1.5–2 秒。流水线之后
+        每一支的检索一回来就立刻发它自己的展开，空窗只剩**第一支的检索**——也就是
+        块向量预热的那一次（`first_hits`，已经在骨架之后先跑完了）。
+
+        一个名额 = 一支正在流水线上的活：`semaphore` 包住「检索 + 展开 + 补查」
+        整体，而不是只包展开。有证据的支在自己的名额里一路跑到底。
+
+        检索失败（`None`）与检索为空（`[]`）走同一条路：这一支按"无证据"展开，
+        与 `_search_branch` 的失败语义一致，且不牵连任何其他支（`safe_search` 保证
+        检索异常不会从这里漏出去）。
+        """
+        hits = first_hits if (slicing and search_done[branch_index]) else None
+        async with semaphore:
+            if slicing and not search_done[branch_index]:
+                hits = await safe_search(title, branch_index)
+                record_search(branch_index, hits)
+            if slicing:
+                if hits:
+                    evidence = _branch_evidence(hits, sources)
+                    branch_evidence[branch_index] = evidence
+                    # 累积进 `RunContext.evidence`：去重（四元组）与 200 条上限都在
+                    # 那里，这里只管往里放。收尾的 `verify_source_refs` 读的也是它
+                    # ——两处同源，否则"校验依据"与"模型看到的证据"是两份不同的东西。
+                    ctx.record_evidence(evidence.spans)
+                    return await expand_branch(title, branch_index, evidence)
+            else:
+                # `full` 形态不做按支检索：这一支从第一行起就没有证据。
+                return await expand_branch(title, branch_index, None)
+        # 没拿到证据：先让出名额再等屏障（死锁的理由见上面那段），兜底若给了
+        # 证据就带它展开，没给就按"无证据"展开。
+        await fallback_ready.wait()
+        async with semaphore:
+            return await expand_branch(title, branch_index, branch_evidence[branch_index])
+
+    # 第二步：流水线。`settle_fallback` 是唯一不被 semaphore 约束的任务——它只
+    # 等屏障，然后最多做一次整树兜底检索。
     results = await asyncio.gather(
-        *(expand_branch(title, index) for index, (title, _) in enumerate(skeleton)),
+        settle_fallback(),
+        *(run_branch(title, index) for index, (title, _) in enumerate(skeleton)),
         return_exceptions=True,
     )
+    settled, results = results[0], results[1:]
+    if isinstance(settled, BaseException):  # pragma: no cover — `finally` 已保证放行
+        logger.warning("按支检索的全空判定出错（不影响展开）：%s: %s",
+                       type(settled).__name__, str(settled)[:160])
+
+    # 检索诊断在这里补齐，顺序与上一版逐条相同（兜底 → 抛错 → 没命中），位置由
+    # `diagnostics_before_search` 钉住：骨架诊断之后、展开期诊断（补查那几条）之前。
+    # 流水线化让这些事实的**产生**时刻散落在各支里，但它们在诊断列表里的位置不该
+    # 因此变化——那是既有用例与用户看到的面板顺序。
+    if slicing:
+        retrieval_failed.sort()
+        retrieval_empty = sorted(
+            index for index, outcome in enumerate(search_outcome) if outcome == "empty")
+        if whole_count is not None:
+            retrieval_diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="BRANCH_RETRIEVAL_FALLBACK",
+                message=(
+                    f"{len(skeleton)} 条分支按支检索都没有拿到证据，已退回整树一次检索"
+                    f"（{whole_count} 条命中，全部支共用）；分片检索的覆盖收益本次没有生效"
+                    if whole_count else
+                    f"{len(skeleton)} 条分支按支检索都没有拿到证据，整树兜底检索也没命中，"
+                    "各支将按「无依据」展开"
+                ),
+            ))
+        for index in retrieval_failed:
+            retrieval_diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="BRANCH_RETRIEVAL_FAILED",
+                node_id=skeleton[index][1],
+                message=(
+                    f"分支「{skeleton[index][0]}」的检索出错，这一支按「无检索结果」展开"
+                    "（其余分支不受影响）"
+                ),
+            ))
+        for index in retrieval_empty:
+            retrieval_diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="BRANCH_NO_EVIDENCE",
+                node_id=skeleton[index][1],
+                message=(
+                    f"分支「{skeleton[index][0]}」的检索没有命中材料里的任何片段，"
+                    "这一支按自己的知识展开、不挂引用（未检索到不等于材料里没有）"
+                ),
+            ))
+        diagnostics[diagnostics_before_search:diagnostics_before_search] = (
+            retrieval_diagnostics)
 
     # 异常不许扩散到其他分支：某支 429 / 超时，只该让那一支空着。
     slots_by_branch: list[list[_Slot]] = []
