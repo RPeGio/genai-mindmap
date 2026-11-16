@@ -38,7 +38,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_LLM_MODE` | `demo`（仅 PDF 视觉这条） | `demo` 不联网走本地占位；`model` 才调模型。**PDF 视觉提取只在 `model` 下工作**。agent 生成只认显式的 `demo`：不设这个变量不会自动降级成占位图，缺模型配置会直接报错 |
 | `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
 | `MINDMAP_LLM_API_KEY` | — | 密钥，只从环境变量读 |
-| `MINDMAP_LLM_MODEL` | — | 模型名，当前用 `deepseek-chat` |
+| `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（经 `https://api.commandcode.ai/provider/v1`），先前用 `deepseek-flash` |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径 |
 | `MINDMAP_SOFFICE_CMD` | 自动探测 | 可选，LibreOffice 可执行文件路径 |
 | `DASHSCOPE_API_KEY` | — | 语音转写用。阿里云百炼控制台创建，`sk-` 开头 |
@@ -163,13 +163,28 @@ quantize_dynamic('model.onnx', 'model.int8.onnx', weight_type=QuantType.QInt8)
 ```bash
 cd backend
 export MINDMAP_LLM_MODE=model
-export MINDMAP_LLM_BASE_URL=https://api.deepseek.com/v1
-export MINDMAP_LLM_MODEL=deepseek-chat
+export MINDMAP_LLM_BASE_URL=https://api.commandcode.ai/provider/v1
+export MINDMAP_LLM_MODEL=z-ai/glm-5.3-flash
 export MINDMAP_LLM_API_KEY=<your-key>
 # 语音（可选，不配则语音上传返回 422，其余功能正常）
 export DASHSCOPE_API_KEY=<your-dashscope-key>
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+### 换模型服务商
+
+代码里没有写死任何一家服务商：请求只依赖 OpenAI 兼容的
+`POST {MINDMAP_LLM_BASE_URL}/chat/completions`，改三个环境变量即可换家。端点必须满足
+三条，缺一条会在运行时报错、而报错位置离原因很远，所以先在这里核：
+
+| 能力 | 怎么用 | 缺了会怎样 |
+|---|---|---|
+| `tools` / `tool_calls` | agent 的每一步都是工具调用，模型必须**真的**调 | 只回一段文字，事件流只有一个 `done`，页面提示"模型这次没有产出导图"，`done.text` 里是它当时的原话 |
+| `stream: true` | 生成与展开都走 SSE，边出边画 | 退回一次性请求，首屏要等到全部生成完 |
+| 足够大的 `max_tokens` | 默认要 65536 | 服务端 400 会写 `Range of max_tokens should be [1, N]` 或 `supports at most N`，后端**解析出 N 并自动降一次**（只在进程内存里，不落盘）；两条文案都对不上才抛错 |
+
+换家之后先跑一遍 `docs/DEPLOY.md` 第 7.6 节的自检，再在页面上各点一次纯主题生成与带材料生成——
+后者要能看到节点上的引用角标，否则多半是材料没被识别成 `parsed`（诊断里会有 `SOURCE_NOT_PARSED`）。
 
 检查：
 

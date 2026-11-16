@@ -2,7 +2,11 @@
 
 单独成文件是为了可替换。循环、预算、幂等、去重这些逻辑都在 `service.py`，
 它们不该因为换模型供应商而改一行——所以这里用 Protocol 定接口，真实实现只有
-一个 `DeepSeekProvider`，测试里换成按脚本回放的假实现。
+一个 `OpenAICompatibleProvider`，测试里换成按脚本回放的假实现。
+
+类名不带供应商名是刻意的：它只依赖 OpenAI 兼容的三件事——`tools` 能真的被调用、
+`stream: true` 能出增量、`max_tokens` 有上限可学（见 `docs/DEPLOY.md` 的
+「换模型服务商」）。DeepSeek、commandcode 这些只是同一份代码的两组环境变量。
 
 配置口径与 `generation/service.py::chat_async` 完全一致（同一组环境变量、
 同一个错误类型、同样的 2MB 响应上限）。刻意复用它的 `_config()` 而不是
@@ -69,7 +73,7 @@ def _estimate_request_tokens(
     return total
 
 
-class DeepSeekProvider:
+class OpenAICompatibleProvider:
     """走 OpenAI 兼容的 /chat/completions，带 tools 字段。"""
 
     async def complete_tools(
@@ -172,5 +176,5 @@ def _parse_completion(buffer: bytearray) -> Completion:
     )
 
 
-def default_provider() -> DeepSeekProvider:
-    return DeepSeekProvider()
+def default_provider() -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider()
