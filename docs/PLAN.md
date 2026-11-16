@@ -182,7 +182,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `MINDMAP_LLM_MODE` | `demo` | `demo` 不联网、返回本地占位；`model` 才调 Chat Completions 兼容接口。写成其他值会被拒 |
 | `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
 | `MINDMAP_LLM_API_KEY` | — | 调用密钥，只从环境变量读，不进代码库与日志 |
-| `MINDMAP_LLM_MODEL` | — | 模型名（当前用 `deepseek-chat`；`deepseek-flash` 是推理模型，reasoning token 波动大，未采用）。PDF 视觉识别与图片识别复用同一组变量 |
+| `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（端点 `https://api.commandcode.ai/provider/v1`），此前用 `deepseek-flash`。PDF 视觉识别与图片识别复用同一组变量 |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径，留空即取默认值 |
 | `DASHSCOPE_API_KEY` | — | 百炼语音转写（F07）。没配时 `.wav` 上传返回 422 |
 | `MINDMAP_SOFFICE_CMD` | — | `soffice` 完整路径；不配则从 `PATH` 找。`.doc`/`.ppt` 转换需要 |
@@ -253,3 +253,4 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.20 | 2026-11-13 | 部署自动化：新增 `.github/workflows/deploy.yml`，**打 tag 即发布**（构建前端 → `git archive` → scp → `install.sh --version <tag>` → 换 dist → reload → 用 `/api/health` 比对版本号自检，不一致让 job 红）；`docs/DEPLOY.md` 第 12 节写一次性配置（4 个 secret、部署专用 ed25519 密钥、22 端口必须公网可达的安全前提与 fail2ban）、日常发布与 `workflow_dispatch` 回滚。选择"Actions 推"而不是"服务器拉"的原因：这台 ECS 连不上 GitHub，self-hosted runner 也起不来 |
 | v1.21 | 2026-11-14 | CD 换成零入方向端口：ECS 实测出站已恢复（`curl https://github.com` 与 `api.github.com` 均 200），于是放弃"Actions 直连 SSH"（那要求 22 对 `0.0.0.0/0` 开放，是全套部署里最大的敞口），改为在 ECS 上装 **self-hosted runner**（标签 `genai-ecs`），构建仍放 GitHub 托管机、artifact 交给 runner 安装。新增 `deploy/cd-apply.sh`（root 拥有的唯一特权入口，由 `install.sh` 装到 `/usr/local/sbin/genai-cd-apply`）与 `deploy/install-runner.sh`（取 runner 最新版、建 `ghrunner` 用户、注册服务、写单行 sudoers）；`deploy.yml` 改成 `build` + `deploy` 两个 job；不再需要 `ECS_HOST`/`ECS_USER`/`ECS_SSH_KEY` 三个 secret，只用可选仓库变量 `ECS_DOMAIN`；`docs/DEPLOY.md` 第 12 节重写（为什么改、一次性配置三步、排障表） |
 | v1.22 | 2026-11-16 | 演示兜底：新增 `frontend/src/demo/presets.ts`（三张预置导图，打成独立 chunk 约 6.6 kB，生产也带）与右上角「演示示例」按钮，**只在用户点击时加载**——模型失败仍然如实报错，不自动顶替（否则演示现场分不清哪张是真生成的），载入后徽章显示「演示模式（非 AI 生成）」、`mapId` 为空所以第一次保存是新建。另修两处"材料不可用"的静默失败：`SOURCE_NOT_PARSED` 诊断（带了几份材料、几份没参与校验）与深层生成按 `source_usage` 过滤引用（此前整批 op 校验失败，白跑一轮模型） |
+| v1.23 | 2026-11-16 | 换模型服务商：线上从 `api.deepseek.com` + `deepseek-flash` 换成 `https://api.commandcode.ai/provider/v1` + `z-ai/glm-5.3-flash`（官方 API 峰谷计费，峰时价格翻倍，压测烧钱）。代码零改动即可换家——端点只要满足 `tools` 真被调用、`stream: true` 出增量、`max_tokens` 有上限可学。`agent/provider.py` 的 `DeepSeekProvider` 改名 `OpenAICompatibleProvider`（类名带供应商名会让下一个人以为换家要改代码）；`docs/DEPLOY.md` 第 8 节补「换模型服务商」三条硬要求与换家后的自检清单。换家实测 3/3 出图（80 / 69 / 51 节点），带材料那条 14 条引用逐字对上原文 |
