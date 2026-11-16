@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-16，合入上游 RAG 之后）：后端 1162 个测试（pytest，另有 19 个 subtest）、前端 409 个 vitest 用例（27 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-16，合入上游 RAG 与知识库入口之后）：后端 1188 个测试（pytest，另有 19 个 subtest）、前端 415 个 vitest 用例（27 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -94,17 +94,17 @@ backend/
     ingestion/         多模态输入 → Source（文本 / 文档 / 图片 / WAV）
     generation/        模型调用与上下文预算（demo / model）+ `stream_partial.py` 增量解析器
     optimization/      结构诊断与建议（三条结构规则 + 引用核验）
-    knowledge/         知识检索（桩）
+    knowledge/         知识库（只读入口 + 生成时入库）与检索桩
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               493 个测试（另有 19 个 subtest）
+  tests/               1188 个测试（另有 19 个 subtest）
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
     main.ts            入口（挂 Pinia 与 Vue Flow 样式）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、上传 1 个、导出 1 个、agent 流 1 个）
+    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、上传 1 个、导出 1 个、agent 流 1 个、知识库 2 个）
     api/types.ts       契约 v2 的 TS 镜像（手写，读起来比生成类型省事）
     api/schema.d.ts    openapi-typescript 从 backend/openapi.json 生成，勿手改
     api/contract-check.ts 编译期断言：镜像与生成类型的键集合、形状必须一致
@@ -119,7 +119,7 @@ frontend/
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
     stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               409 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 展开）
+  tests/               415 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 展开）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -193,6 +193,8 @@ PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
 代理与检索
 POST /api/agent/tasks              目标 → 阶段骨架（桩，implemented:false）
 POST /api/knowledge/search         检索（桩，返回空）
+GET  /api/knowledge/library        知识库列表（含被引用次数）
+GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）
 ```
 
 ---

@@ -173,9 +173,9 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 
 ## 10 配置项
 
-### 10.1 已实现（代码经 `os.getenv` 读取，共 11 项）
+### 10.1 已实现（代码经 `os.getenv` 读取）
 
-`.env` 文件不会自动加载，须在启动服务前设入进程环境变量；样例见 `backend/.env.example`。
+`.env` 文件不会自动加载，须在启动服务前设入进程环境变量；样例见 `backend/.env.example`。下表只列主要项，检索链路与图存储的几个开关（`MINDMAP_PARENT_RETRIEVAL`、`MINDMAP_GRAPH_SEARCH`、`MINDMAP_EMBEDDING_MODEL`、`MINDMAP_EMBEDDING_DIM`、`MINDMAP_NEO4J_URI/USER/PASSWORD/DATABASE`）和 `MINDMAP_VERSION` 见 `.env.example` 与 `docs/RAG-DECISIONS.md`。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -190,6 +190,8 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `MINDMAP_NLI_ENABLED` | `0` | 打开引用语义复核（ONNX 模型），否则只做机械核验 |
 | `MINDMAP_NLI_MODEL_DIR` | — | ONNX 模型目录（含 `model.onnx` / `tokenizer.json` / `config.json`） |
 | `MINDMAP_NLI_MIN_FREE_MB` | — | 加载模型前要求的最小可用内存，不够则跳过 NLI |
+| `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。线上置 `0` 做纯展示（等记忆模块落地再开）；**不影响** `GET /api/knowledge/library` 只读入口 |
+| `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库。只有 `"0"` 表示关。与上面那个开关独立 |
 
 ### 10.2 规划中（当前代码不读这些变量）
 
@@ -255,3 +257,4 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.22 | 2026-11-16 | 演示兜底：新增 `frontend/src/demo/presets.ts`（三张预置导图，打成独立 chunk 约 6.6 kB，生产也带）与右上角「演示示例」按钮，**只在用户点击时加载**——模型失败仍然如实报错，不自动顶替（否则演示现场分不清哪张是真生成的），载入后徽章显示「演示模式（非 AI 生成）」、`mapId` 为空所以第一次保存是新建。另修两处"材料不可用"的静默失败：`SOURCE_NOT_PARSED` 诊断（带了几份材料、几份没参与校验）与深层生成按 `source_usage` 过滤引用（此前整批 op 校验失败，白跑一轮模型） |
 | v1.23 | 2026-11-16 | 换模型服务商：线上从 `api.deepseek.com` + `deepseek-flash` 换成 `https://api.commandcode.ai/provider/v1` + `z-ai/glm-5.3-flash`（官方 API 峰谷计费，峰时价格翻倍，压测烧钱）。代码零改动即可换家——端点只要满足 `tools` 真被调用、`stream: true` 出增量、`max_tokens` 有上限可学。`agent/provider.py` 的 `DeepSeekProvider` 改名 `OpenAICompatibleProvider`（类名带供应商名会让下一个人以为换家要改代码）；`docs/DEPLOY.md` 第 8 节补「换模型服务商」三条硬要求与换家后的自检清单。换家实测 3/3 出图（80 / 69 / 51 节点），带材料那条 14 条引用逐字对上原文 |
 | v1.24 | 2026-11-16 | 长静默心跳：`/api/agent/runs/stream` 新增 `heartbeat` 帧（`{seq, type, waited_ms}`，静默每满 10 秒一帧），两个静默点都发——模型调用 `await` 期间与工具执行期间的等待队列；线上实测 3 路并发最长静默 25.1 秒，而中间链路常见空闲超时是 30–60 秒，超了就会静默掐断连接。前端把 `waitedMs` 接上（此前这个计数器没有任何写入方，`SourceInputs.vue` 的"已等待 N 秒"永不显示），静默达 10 秒时状态行文案换成"模型正在思考，已等 N 秒"（替掉阶段文案而非并列），任何非心跳帧到达即归零。心跳只保活、不带业务进度，EOF 无终态帧仍按连接中断处理 |
+| v1.25 | 2026-11-16 | 知识库只读入口：新增 `GET /api/knowledge/library`（列表 + 每份被几张已保存导图引用）与 `GET /api/knowledge/library/{source_id}`（正文前 4000 字），顶栏「知识库」抽屉展示，点开看正文。**材料在生成时才入库**（新 `backend/app/knowledge/remember.py`，开关 `MINDMAP_LIBRARY_REMEMBER`）——上传时还不知道这份材料会不会被用到，废文件会占满库且 `prune` 按 `last_used_at` 保留会一直留着它们。入库后持久 id 与解析时的临时 id 不同，所以事件流最前面多一帧 `sources`（`{seq, type:"sources", mapping:{旧:新}}`），前端就地改本地条目 id；之后保存的导图、节点引用、取原文都用持久 id，重开也能对上。`cited_by` 按"几张导图"计（`source_usage` 与节点 `source_refs` 都算、同图去重），不按命中次数——用户要的是"这份材料还在被用"。入口只读且**不受 `MINDMAP_LIBRARY_SEARCH` 影响**：那个开关管的是生成时要不要从库里捞材料，线上先置 0 做纯展示，等记忆模块落地再开。另修 404 文案：`HTTPException(detail=...)` 会被全局处理器兜成"请求处理失败（HTTP 404）"，改成 `AppError("not_found", …)` 后顶层 `message` 才是真正原因 |
