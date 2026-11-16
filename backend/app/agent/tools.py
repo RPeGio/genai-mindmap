@@ -324,6 +324,15 @@ def library_available() -> bool:
 #      `GENERATION_FROM_EXTERNAL` 诊断都会明说"依据来自外部检索"，让用户知道这批
 #      引用该按什么标准看。
 #
+#      现在抓取层有了一道**词面相关性门**（`external._relevant_hits`）：完全跑题的
+#      命中会被挡掉（`rust 学习路线` 的「陳淑樺」「小米澎湃OS」「流行性感冒」、
+#      `C++ 移动语义` 的「语义记忆」、`Rust 所有权` 的「农业」），实测噪声 22→10、
+#      三条全相关 10/20→12/20。但**同形异义挡不住**：`Rust 所有权` 那条小麦锈病
+#      论文（`Stripe Rust`）照样通过——判据看见 `Rust` 这个词形就放行；`rust 学习
+#      路线` 那条教学模式论文（"深度学习路线"）甚至原样包含查询词块。残余的 10 条
+#      噪声全是这一种，数字与天花板都在 `scripts/measure_external_relevance.py` 的
+#      docstring 里。
+#
 # 关着（`MINDMAP_EXTERNAL_KNOWLEDGE=0`）时与 `dceae7e` 逐字节相同
 # （`tests/test_external_knowledge.py` 拿那一版的 `tools.py` 钉着）：一次外部请求
 # 都不发、提示词不动、`data` 里不多 `external` 键。显式关掉是"这台机器上不了网"
@@ -336,6 +345,11 @@ EXTERNAL_KNOWLEDGE_DEFAULT = "1"
 # 而不是重写一个 3）：那边是抓取层的默认，这边是"这次生成愿意为它花多少条清单
 # 位"，改一处忘另一处会让"库里存了 5 条、模型只看到 3 条"变得没人说得清。
 EXTERNAL_HIT_LIMIT = external_knowledge.DEFAULT_LIMIT
+
+# 外部检索那两个 `stage` 帧的稳定标识（开始一帧、结束一帧，见 `_emit_stage`）。
+# 取 `"external_search"` 而不是中文：它是**标识**不是文案，要出现在 SSE 帧、日志与
+# 用例断言里；给人看的那句话在 `detail`（"正在检索外部资料…"），改文案不该动它。
+EXTERNAL_SEARCH_STAGE = "external_search"
 
 # 材料总字数低于这个值时不走材料路径，改成"把短材料当主题提示 + 走外部检索/纯主题"
 # （`_generate` 的退化规则，话术见 `MATERIAL_TOO_SHORT`）。
@@ -1205,6 +1219,40 @@ async def _emit_grow(
     })
 
 
+async def _emit_stage(
+    ctx: RunContext,
+    stage: str,
+    detail: str,
+    *,
+    count: int | None = None,
+) -> None:
+    """上报一帧阶段消息（`RunContext.emit` 的第二类帧，第一类是 `node_grow`）。
+
+    它存在的理由只有一个：**用户点完"生成"之后有一段静默**。外部检索要 4–6 秒
+    （实测中位 4.3s），这段时间里界面上什么都不动——`run()` 在 `await` 工具执行，
+    工具在等 HTTP 往返。看起来像卡死，而人已经准备再点一次。`node_grow` 解决不了
+    它：那一帧说的是"树长出第 N 个节点"，而检索阶段一个节点都还没有。
+
+    帧形状与 `node_grow` 同构（一个 `dict`，`type` 打头），由 `service._stage_frame`
+    转成带 seq 的 `StageEvent`、再经 `stream.encode_event` 出去的既有信封。
+    字段只有三个：`stage` 稳定标识 / `detail` 给人看的一句话 / `count` 数量结果。
+
+    `count` 只在"这件事有数量结果"时给（外部检索的结束帧给命中条数），不用 `0`
+    冒充"没有"：`0` 与 None 在这里含义不同——"一条都没搜到"是结论，"还没结束"
+    是过程，两者的界面表现必须不同。
+
+    通道为 None 时**一次 await 都不多发**，与加这帧之前逐字相同：没有 SSE 消费者
+    的路径（直接调工具的用例、库内调用）不该因为界面需要而多出任何行为。
+    """
+    emit = ctx.emit
+    if emit is None:
+        return
+    payload: dict[str, Any] = {"type": "stage", "stage": stage, "detail": detail}
+    if count is not None:
+        payload["count"] = count
+    await emit(payload)
+
+
 @dataclass
 class _GrowStream:
     """一路展开调用的增量上报器：delta 喂进来，`node_grow` 发出去。
@@ -2036,6 +2084,25 @@ def _external_source_names(sources: Sequence[Source]) -> str:
     return "、".join(names) or "外部"
 
 
+def _external_stage_text(fetch: _ExternalFetch) -> str:
+    """外部检索结束那一帧给人看的话。四种结果四句话。
+
+    用词与 `content` 里的 `GENERATION_WITHOUT_EXTERNAL` / `GENERATION_FROM_EXTERNAL`
+    对齐（"没有搜到外部资料"/"外部检索出错"）：同一次运行的界面与正文各说一套话，
+    用户会以为是两件事。
+
+    "找到了但没能入库"单独一句，因为把它说成"没有搜到"是谎报（抓到了，只是存不下），
+    而说成"已找到 N 条"又是空头支票（模型一条也用不上）。
+    """
+    if fetch.sources:
+        return f"已找到 {len(fetch.sources)} 条外部资料"
+    if fetch.hits:
+        return f"找到 {fetch.hits} 条外部资料，但没能存进资料库"
+    if fetch.failure:
+        return "外部检索没成功，按主题生成"
+    return "没有搜到外部资料，按主题生成"
+
+
 async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
     """主题 → 外部检索 → 入库 → 本次可用的来源。
 
@@ -2232,7 +2299,17 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # `library.load` 回查自动成立，没有第二条链要维护。
     external: _ExternalFetch | None = None
     if not sources and external_knowledge_enabled():
+        # 检索期间界面上什么都不动，看起来像卡死（实测中位 4.3 秒、最坏 20 秒）。
+        # 一帧"开始"、一帧"结束"，两帧都在 `_run_tool` 里被立刻转发出去——工具跑
+        # 在任务里，主循环一边等一边转帧，所以这行 await 不会把帧憋住。
+        await _emit_stage(ctx, EXTERNAL_SEARCH_STAGE, "正在检索外部资料…")
         external = await _external_sources(_external_query(args.topic, short_material), ctx)
+        # 结束帧**一定带 count**（包括 0）：前端靠"有没有这个字段"区分开始与结束，
+        # `0` 与"还没结束"必须分得开。
+        await _emit_stage(
+            ctx, EXTERNAL_SEARCH_STAGE, _external_stage_text(external),
+            count=len(external.sources),
+        )
         sources = external.sources
     # 太短的材料**不当语料、但当说明**：文字仍然进 prompt（用户写的东西一个字都
     # 不丢），只是它不再产生 evidence、不再产生引用。上面那次外部检索也用它当了

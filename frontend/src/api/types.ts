@@ -390,7 +390,17 @@ export interface RunDetail extends RunSummary {
  * `runGeneration` 里，一个 switch 能从头读到尾。
  */
 export type AgentEvent =
-  | { type: 'stage'; seq: number; stage: string; detail?: string }
+  /**
+   * 一句"现在在干什么"。
+   *
+   * `stage` 是**稳定标识**（`external_search`），不是文案——界面只显示 `detail`，
+   * `stage` 留给"按阶段换样式/抑制"与用例断言，所以它可以随时被后端加值，但已有
+   * 的值不会改。
+   *
+   * `count` 只在"这件事有数量结果"的帧上出现（外部检索的结束帧带命中条数）。
+   * 缺席＝还没结束，`0` ＝结束了但一条没找到，两者必须分得开。
+   */
+  | { type: 'stage'; seq: number; stage: string; detail?: string; count?: number }
   | { type: 'tool_start'; seq: number; call_id: string; name: string; args_summary?: Record<string, unknown> }
   | {
       type: 'tool_end';

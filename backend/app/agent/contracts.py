@@ -526,9 +526,22 @@ class _EventBase(BaseModel):
 
 
 class StageEvent(_EventBase):
+    """一句"现在在干什么"，以及（可选）这件事的条数结果。
+
+    `stage` 是**稳定标识**，`detail` 是给人看的那句话。前端只读 `detail`
+    （`store.runGeneration` 的 `case 'stage'`），`stage` 供日志、用例与"按阶段
+    换样式/抑制"用——所以它不必是人话，但**不能随手改**：`_stage_frame` 的用例
+    与遥测都按它对齐。
+
+    `count` 只在"这件事有个数量结果"的帧上出现：`external_search` 的结束帧带
+    命中条数，开始帧没有这个键（`exclude_none=True` 把它整条抹掉）。`0` 是有效
+    值，与"还没结束"必须分得开——"一条都没搜到"是用户要知道的正经结论。
+    """
+
     type: Literal["stage"] = "stage"
     stage: str
     detail: str = ""
+    count: int | None = Field(default=None, ge=0)
 
 
 class ToolStartEvent(_EventBase):

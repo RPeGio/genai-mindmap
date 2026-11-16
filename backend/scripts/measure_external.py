@@ -26,6 +26,12 @@
 "逐字校验只保证引文出自该来源"的直接后果，也是默认开之后 `content` 里必须说
 "依据来自外部检索"的理由。
 
+**搜准这件事后来单独量过**：抓取层现在有一道词面相关性门（`external._relevant_hits`），
+"有门 / 无门"的对照、噪声计数与天花板都在这条命令里（不需要联网，候选池已入库）：
+
+    python scripts/measure_external_relevance.py --report
+    python scripts/measure_external_relevance.py --variants
+
 用法（backend 目录下）：
 
     python scripts/measure_external.py

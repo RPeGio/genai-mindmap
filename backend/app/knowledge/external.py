@@ -85,6 +85,10 @@ from xml.etree import ElementTree
 import httpx
 
 from app.contracts.source import ISO_SECONDS_FORMAT
+# 私有名跨模块引用：分词这件事已经有实现（`_token_list`），门必须与检索用同一套
+# "什么算同一个词"，另写一份就是两处真相。模块级导入而不是函数内懒导入——两者
+# 之间没有循环（`service` 不引用 `external`），懒导入只会把导入期错误推后。
+from app.knowledge.service import _token_list
 
 logger = logging.getLogger(__name__)
 
@@ -859,6 +863,218 @@ def _run_source(name: str, fetch: Any) -> list[ExternalHit]:
         return []
 
 
+# ---------------------------------------------------------------- 相关性门
+
+# 判定用的三个数：看多长的正文、英文词多短算噪声、中文要求几个字。判据本身见
+# `_relevant_hits`，这几个数各自的来历见紧跟着的注释与 `_phrase_terms`。
+
+# 只看**标题 + 正文开头**。正文可以长到 `TEXT_MAX_CHARS`（8000）字，而判"这条讲的
+# 是不是 query 那件事"只需要开头：跑题命中在开篇就暴露了（实测 `rust 学习路线` 拿到
+# 「陳淑樺」，正文第一段就是歌手生平）。300 不是新数字——它是 `LEAF_MAX_CHARS` 与
+# `SourceRef.quote.max_length` 的同款口径，也就是"一条引用装得下的字数"：门放行的
+# 深度与引用能取证的深度重合，更靠后的正文本来就长不出一句可校验的引用。
+RELEVANCE_CHARS = 300
+
+# 参与判定的英文词最短长度。1–2 字符的词在中文主题的正文里是纯噪声（`ai`、`os`、
+# `ui`、`no`），命中它们说明不了任何事；3 是全大写缩写（TCP / GPT / OCR）的下界。
+MIN_ASCII_TERM = 3
+
+# 中文判定词块的长度：query 的中文段去掉开头虚词后，要求**头这么多个字**原样出现。
+# 3 的来历见 `_phrase_terms` 的 docstring（2 字等于 bigram 口径，更长会打死
+# "概念 + 限定语"这一类查询）。
+MIN_PHRASE_CHARS = 3
+
+# 只认"以字母开头"的英文词。`2024` / `3` 这种纯数字在任何正文里都有，拿它当相关
+# 证据等于没判。小写是因为 `_token_list` 已经把英文词全部小写化。
+_ASCII_TERM_RE = re.compile(r"^[a-z][a-z0-9]*$")
+
+# query 的中文词块 = 连续的 CJK 段。这是**切段**不是分词：真正的分词（中文 bigram /
+# 英文整词）只有 `_token_list` 一套，这里只负责把"中英混排"里的中文部分整段取出来，
+# 好让"移动语义"不被 `C++` 的空格切成两截。与 `_CJK_RE` 同一个字符区间。
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+# 句首虚词：出现在查询词块开头时没有判别力、要先跳过的字。
+#
+# 用途只有一处（`_phrase_terms`）：`为什么中文大模型…` 的前三个字全是虚词，不跳过
+# 的话判据会去匹配"为什么"，一篇讲足球的文章只要用了这三个字就能混进来。
+#
+# 为什么这张表**不含** `所`/`最`/`一`/`因`/`更`/`太`/`很`：它们同样是实词的开头
+# （`所有权`、`最终一致性`、`一致性`、`因果`、`更新`、`太阳`、`很少`）。混在一起
+# 会把 `所有权` 剥成 `有权`、把 `一致性` 剥成 `致性`——判据要求的那 3 个字随之变弱，
+# 噪声正好从这些缝里进来。
+#
+# 跳过句首虚词对召回没有代价：命中若含整个词块，必然也含跳完前缀后的那一段
+# （子串关系），所以这一步只会放宽"命中只给出核心词条"的情形。
+_LEADING_FILLER_CHARS = frozenset(
+    "的了着过是在和与及或而就也都还又再把被从对向为以于其之这那个们"
+    "我你他她它么呢吗吧啊呀嘛哦什怎"
+)
+
+
+def _word_terms(text: str) -> frozenset[str]:
+    """一段文字里的英文词（小写、≥`MIN_ASCII_TERM`、以字母开头）。
+
+    分词**直接用 `knowledge.service._token_list`**（BM25 那条路用的同一份实现），
+    不在这里另写一套：门与检索对"什么算同一个词"必须只有一个答案，两套实现迟早
+    分叉，而分叉的表现是"检索认为命中、门认为无关"这种谁也说不清的自相矛盾。
+    """
+    words: set[str] = set()
+    for token in _token_list(text):
+        if (token.isascii() and len(token) >= MIN_ASCII_TERM
+                and _ASCII_TERM_RE.match(token)):
+            words.add(token)
+    return frozenset(words)
+
+
+def _phrase_terms(text: str) -> frozenset[str]:
+    """query 的判定词块：每个中文连续段**去掉开头虚词后的头 `MIN_PHRASE_CHARS` 个字**。
+
+    为什么不是"整块出现"（第一版）：`碳中和技术路径` 的命中是维基的 `碳中和` 词条，
+    整块判据会把它判成无关——而"概念 + 限定语"是最常见的查询形状（`碳中和 技术路径`、
+    `Rust 所有权`、`深度学习 路线`）。既有用例
+    （`test_wikipedia_falls_back_to_search_when_title_misses`）钉的正是这件事：
+    搜不到精确标题时退回条目检索，`碳中和` 必须还能用。
+
+    为什么是**前缀**而不是任意 2 字窗口（任务最初给的 bigram 口径）：中文查询的
+    修饰语在前、中心词在后，命中往往只给出核心词条。任意窗口等于把尾部那个最泛的
+    中心词也当成证据——`一致性` 会命中"无线电一致性测试"、`学习路线` 会命中
+    "深度学习路线"的教学模式论文。取最左的内容字，留下的恰好是限定语。
+
+    为什么是 3 个字：2 字重合等于 bigram 口径（实测噪声一条不少、还误杀简繁）；
+    再长就把"概念 + 限定语"整类打死。3 是"一个中文实词"的下界，也是缩写
+    （`碳中和`/`注意力`）的长度。
+
+    开头虚词要先跳过去：`为什么中文大模型…` 的前 3 个字全是虚词，不跳的话判据会
+    去匹配"为什么"，一篇讲足球的文章只要用了这三个字就能混进来。跳完之后要求
+    `中文大` 出现——那才是这个查询的内容起点。
+    """
+    phrases: set[str] = set()
+    for run in _CJK_RUN_RE.findall(text):
+        start = 0
+        while start < len(run) and run[start] in _LEADING_FILLER_CHARS:
+            start += 1
+        core = run[start:]
+        if len(core) < 2:
+            # 整段都是虚词（`的了`、`为什么`）：没有可判的内容，不参与比对。
+            continue
+        phrases.add(core[:MIN_PHRASE_CHARS])
+    return frozenset(phrases)
+
+
+def _hit_blob(hit: ExternalHit) -> str:
+    """判定用的命中文本：标题 + 正文前 `RELEVANCE_CHARS` 字（理由见那个常量）。"""
+    return f"{hit.title}\n{hit.text[:RELEVANCE_CHARS]}"
+
+
+def _relevant_hits(query: str, hits: Sequence[ExternalHit]) -> list[ExternalHit]:
+    """按**词面**相关性过滤命中。判据见下方"判据"一节。
+
+    ## 为什么需要这道门
+
+    "搜到"不等于"搜准"：外部源按自己的相似度排序，而它们对中文主题的理解偏差
+    很大。实测 `rust 学习路线` 拿到「陳淑樺」维基页与一篇卢托斯拉夫斯基音乐论文；
+    `Rust 所有权` 拿到"农业"（rust 是锈病）；`C++ 移动语义` 三条里两条是语言学；
+    `zzqx 不存在的词` 也照样返回 3 条 crossref 垃圾。这些命中随后**会变成引用**
+    ——逐字可校验、能点回原文、界面上写着"依据来自外部检索"，而它们与主题毫无
+    关系。整条链最怕的正是这种失败形态：不是没有依据，是一份看起来正规的假依据。
+
+    ## 判据
+
+    命中必须在 `标题 + 正文前 300 字` 里**原样包含** query 的某个中文词块
+    （连续 CJK 段，≥2 字，非纯虚词），或包含 query 里的某个英文词
+    （≥3 字符，大小写不敏感，按整词比）。两条任一成立即保留。
+
+    ## 放行：判据说不出话时，沉默
+
+    两类命中不过判据也**放行**：
+
+      - **query 切不出任何可比词面**（纯符号、纯数字、`C++` 只剩一个被
+        `MIN_ASCII_TERM` 裁掉的 `c`）：判据在这里没有表决权，把"判不了"当成
+        "都不相关"会让这些主题一条资料都拿不到。
+      - **跨语言**：query 与命中在书写系统上没有交集（中文 query 配全英文命中，
+        或英文 query 配纯中文正文）。判据在那里无从比较，放行是为了不误杀
+        （实测救回 `consensus algorithm` 的中文正文 `Raft`）；代价见"天花板"。
+
+    ## 天花板（方法本身的上限，不是"没调好"）
+
+    词面重合只能证明"两边出现了同一串字符"，不能证明"讲的是同一件事"。三类它
+    永远分不开，实测各有实例（数据在 `scripts/measure_external_relevance.py`）：
+
+      - **同形异义**：`Rust`（语言）/ `rust`（锈病）、`Cursor`（编辑器）/ `cursor`
+        （光标）、`consensus`（共识算法）/ `Consensus`（RANSAC 的全名）、
+        `学习路线`（学习规划）/ `深度学习路线`（教学模式）。判据看见字符就放行。
+      - **简繁差异**：`用戶畫像` 不含 `用户画像`，一条真相关的维基条目会被滤掉
+        （实测 1 条）。要修得引入简繁映射表，那是一个新的数据依赖，代价大于收益。
+      - **跨语言**：中文 query 与全英文命中之间没有可比的字符。`注意力机制` 的相关
+        命中 `Attention Is All You Need` 靠放行才留得住；同一条放行也让
+        `Rust 所有权` 有可能收下纯英文的小麦锈病论文（实测未触发：那批命中带中文
+        摘要，不走放行支路；arXiv 全英文语料会走）。
+
+    ## 实测（`scripts/measure_external_relevance.py`，20 主题同一份候选池）
+
+    | | 无门 | 前缀 3 字 + 放行（本实现） |
+    |---|---|---|
+    | 返回条数 | 60 | 49 |
+    | 噪声条目（人工判定） | 22 | 10 |
+    | 三条全相关的主题 | 10/20 | 12/20 |
+    | 成功率（≥1 条） | 100% | 95% |
+    | 误杀（判为相关却被滤） | 0 | 1 |
+
+    同一份池子上另外两条口径的成绩，是"为什么不是它们"的依据：
+
+    | | 返回条数 | 噪声 | 三条全相关 | 成功率 | 误杀 |
+    |---|---|---|---|---|---|
+    | bigram（任务最初给的口径） | 59 | 22 | 9/20 | 100% | 2 |
+    | 整块词块（第一版） | 47 | 9 | 11/20 | 85% | 2 |
+
+    bigram 口径**噪声一条没少、三条全相关还掉了一个**：它挡下的只是"完全没共享
+    词面"的少数命中，而源站自己的排序已经很少返回那种东西；它唯一的"功劳"是误杀
+    ——`用戶畫像`（繁体）不含 `用户画像`（简体）。整块口径多砍了一条噪声，却把
+    `碳中和技术路径 → 碳中和` 这类"概念 + 限定语"查询整类打死（成功率掉到 85%）。
+
+    残余的 10 条噪声里 **9 条是靠词面命中的**（`幻觉` 的戏曲与决定论论文、`晶体学`
+    论文——正文写着"最终一致性因子为R=0.030"、`Rust` 的小麦锈病、`cursor` 的光标
+    论文、`学习路线` 的教学模式），另外 1 条是跨语言放行进来的。这道门一条都挡不住
+    ——那是词面判据的天花板，不是阈值问题。
+
+    要跨过这条线得用语义判据：`knowledge/rerank.score_documents(query, documents)`
+    已经能给出真正的相关性分数（`qwen3-rerank`），把它接在这道门之后是下一步。
+    **这次没接**：它是一次额外的外网模型调用（要 key、要延迟、要计费），而这批
+    数字只证明了词面门值得留下，没有证明多花一次调用能换来什么。
+    """
+    phrases = _phrase_terms(query)
+    words = _word_terms(query)
+    if not phrases and not words:
+        return list(hits)
+    # 跨语言放行的判据：query 与命中的**书写系统**有没有交集。中文 query 配一条全
+    # 英文命中时，两边没有任何可比的字符——那时判据说不出话，让它表决等于用"拼写
+    # 不同"判"内容无关"。实测放行这一支救回了 `consensus algorithm` 那条中文正文的
+    # `Raft`（不放行时它被误杀，名额转手给一条 RANSAC 噪声）。
+    #
+    # 代价要说清：全英文命中在中文 query 下一律放行，`Rust 所有权` 若拿到一篇纯英文
+    # 的小麦锈病论文也会进来。实测这批 OpenAlex 命中都带中文摘要（不走这一支），
+    # 所以没有触发；arXiv 是全英文语料，会走这一支。这个洞是"词面判据跨语言无定义"
+    # 的直接后果，不是实现取舍。
+    query_writes_cjk = bool(_CJK_RUN_RE.search(query))
+    kept: list[ExternalHit] = []
+    dropped: list[str] = []
+    for hit in hits:
+        blob = _hit_blob(hit)
+        if any(phrase in blob for phrase in phrases) or words & _word_terms(blob):
+            kept.append(hit)
+            continue
+        if bool(_CJK_RUN_RE.search(blob)) != query_writes_cjk:
+            kept.append(hit)
+            continue
+        dropped.append(f"{hit.source_name}/{hit.title[:60]}")
+    if dropped:
+        # info 而不是 debug：这道门**扔掉的是要变成引用的东西**，扔了哪几条必须
+        # 在日志里查得到，否则"这次怎么一条依据都没有"永远无从复盘。
+        logger.info("外部检索：%r 过滤掉 %d 条词面无关命中（%s）",
+                    (query or "")[:50], len(dropped), "；".join(dropped[:5]))
+    return kept
+
+
 def search_external(query: str, *, limit: int = DEFAULT_LIMIT) -> list[ExternalHit]:
     """去外部源搜一次，返回最多 `limit` 条命中。**失败返回空列表，永不抛。**
 
@@ -874,6 +1090,10 @@ def search_external(query: str, *, limit: int = DEFAULT_LIMIT) -> list[ExternalH
 
     用时与条数各记一行 info：这是用户点"生成"之后**多出来的一次外网等待**，
     混在总耗时里就永远看不出"慢在哪"（与 `_retrieve_topic` 的同一条规矩）。
+
+    出口还有一道**词面相关性门**（`_relevant_hits`，判据与实测见那里）：先把明显
+    与 query 无关的命中滤掉，再交替取前 `limit` 条。全被滤掉时返回空列表——这是
+    正确结果而不是故障，调用方会走"没搜到外部资料"的退化路径。
     """
     text = (query or "").strip()[:QUERY_MAX_CHARS]
     if not text or limit <= 0:
@@ -897,10 +1117,14 @@ def search_external(query: str, *, limit: int = DEFAULT_LIMIT) -> list[ExternalH
             logger.debug("外部检索：%s 返回 %d 条（累计请求 %d 次）",
                          name, len(hits), budget.used)
 
-    hits = _interleave(collected, limit, prefer_language=_query_language(text))
+    # 门在**聚合之后、截断之前**：先从五个源拿全部候选，再按词面相关性筛，最后才
+    # 交替取前 `limit` 条。顺序不能换——先截断再过滤时，一个被滤掉的噪声槽位是
+    # 空的（3 条变 2 条），而候选池里本来还有真相关的条目可以补位。
+    relevant = _relevant_hits(text, collected)
+    hits = _interleave(relevant, limit, prefer_language=_query_language(text))
     logger.info(
-        "外部检索：%r 命中 %d 条（%s），请求 %d 次，耗时 %.2fs",
+        "外部检索：%r 命中 %d 条（%s），候选 %d 条过门 %d 条，请求 %d 次，耗时 %.2fs",
         text, len(hits), ", ".join(f"{hit.source_name}/{hit.title}" for hit in hits[:3]),
-        budget.used, time.perf_counter() - started,
+        len(collected), len(relevant), budget.used, time.perf_counter() - started,
     )
     return hits

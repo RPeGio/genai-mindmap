@@ -334,6 +334,55 @@ def _node_grow(payload: dict[str, Any], seq: "itertools.count[int]") -> NodeGrow
         return None
 
 
+def _stage_frame(payload: dict[str, Any], seq: "itertools.count[int]") -> StageEvent | None:
+    """工具上报的阶段帧 → 带 seq 的 `StageEvent`；认不出来就丢掉。
+
+    与 `_node_grow` 同一套规矩，多一条 `count`：
+
+      - `stage` 必须是稳定标识（`external_search`），`detail` 是给人看的那句话；
+      - `count` 可以缺席（开始帧），给了就必须是非负整数。`0` 是**有效值**
+        （"一条都没搜到"是结论），与 None（"还没结束"）不是一回事，所以不能用
+        `count or None` 之类的写法折叠它们。
+
+    取号同样放在字段校验之后：校验失败的帧不占号，前端"seq 连续"这条判断才不会被
+    一串缺号误导成丢帧。
+    """
+    if payload.get("type") != "stage":
+        return None
+    stage = payload.get("stage")
+    detail = payload.get("detail", "")
+    count = payload.get("count")
+    if not isinstance(stage, str) or not stage or not isinstance(detail, str):
+        return None
+    # bool 是 int 的子类：`count=True` 会被 pydantic 收成 1，这里先挡掉。
+    # `>= 0` 也在这里判，不留给 pydantic：`next(seq)` 在构造之前求值，靠
+    # `ValidationError` 兜底的话，一个非法帧照样会领走一个号，而前端的"seq 连续"
+    # 判断会把它读成丢帧。
+    if count is not None and (
+            isinstance(count, bool) or not isinstance(count, int) or count < 0):
+        return None
+    try:
+        return StageEvent(seq=next(seq), stage=stage, detail=detail, count=count)
+    except ValidationError:
+        return None
+
+
+def _tool_frame(payload: dict[str, Any], seq: "itertools.count[int]") -> AgentEvent | None:
+    """工具上报的字典 → 事件帧。**多类帧的唯二分派点。**
+
+    工具层不认识 `seq`，只负责把"发生了什么"塞进一个 `dict`；哪类帧、按什么顺序
+    编号，全在这一层决定。目前两类：`node_grow`（树在长）与 `stage`（一件事在
+    进行/结束了）。认不出来的类型返回 None 丢掉——预览与阶段都是附加信息，一帧
+    坏掉不能打断正在跑的工具。
+    """
+    kind = payload.get("type")
+    if kind == "node_grow":
+        return _node_grow(payload, seq)
+    if kind == "stage":
+        return _stage_frame(payload, seq)
+    return None
+
+
 async def _run_tool(
     call: ToolCall,
     ctx: RunContext,
@@ -381,7 +430,7 @@ async def _run_tool(
                 outcome.timed_out = True
                 return
             if kind == "emit":
-                event = _node_grow(payload, seq)
+                event = _tool_frame(payload, seq)
                 if event is not None:
                     yield event
                 continue

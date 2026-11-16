@@ -84,6 +84,24 @@ interface CandidateBranch {
   children: number;
 }
 
+/**
+ * 外部检索那一行：取**最后一条** `external_search` 阶段帧。
+ *
+ * 为什么单独拎出来而不是只靠状态栏：检索时长为 4–6 秒（最坏 20 秒），这段时间
+ * 里工具行写着"正在生成导图"、画布不动，用户看不出后台在联网。开始帧与结束帧
+ * 共用同一个 `stage`，所以"取最后一条"天然实现了"检索结束后那句话变成已找到 N 条"。
+ *
+ * `detail` 是后端给的人话，这里不再翻译：同一句话在状态栏与面板里显示成两种说法，
+ * 用户会以为是两件事。
+ */
+const searchNote = computed(() => {
+  for (let index = store.agentEvents.length - 1; index >= 0; index -= 1) {
+    const event = store.agentEvents[index];
+    if (event.type === 'stage' && event.stage === 'external_search') return event;
+  }
+  return null;
+});
+
 /** 最多列几条分支：再往下列就不是"先看一眼"，而是让用户读长文了。 */
 const BRANCH_LIMIT = 12;
 
@@ -192,6 +210,10 @@ function cancel() {
         @click="cancel"
       >取消</button>
     </div>
+
+    <p v-if="searchNote" class="mt-1 text-[11px] leading-relaxed text-slate-500">
+      {{ searchNote.detail }}
+    </p>
 
     <ol v-if="calls.length" class="mt-2 flex flex-col gap-1">
       <li

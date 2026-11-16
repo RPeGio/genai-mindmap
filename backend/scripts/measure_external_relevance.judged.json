@@ -1,0 +1,89 @@
+{
+  "_README": [
+    "人工判定表：{主题: [[标题子串, 是否相关], ...]}。子串按顺序匹配，第一条命中的生效。",
+    "判定口径（与 measure_external_relevance.py 的 docstring 同一句话）：",
+    "  这条命中讲的是不是 query 问的那件事——看**主体对象**，不看词面。",
+    "  · 同形异义算无关：Rust(语言) vs rust(锈病)、Cursor(编辑器) vs cursor(光标/Curse)、",
+    "    consensus(共识算法) vs RANSAC(RANdom SAmple Consensus)；",
+    "  · 语义泛化算无关：query 问「Rust 所有权」，一条只讲「Rust 这门语言」的算相关",
+    "    （同一主体）；但 query 问「为什么中文大模型长文本不稳定」，「人工智能」词条算无关",
+    "    （主体是上位概念，回答不了问题）；",
+    "  · 跨语言不影响判定：英文/俄文命中只要讲的是那件事就算相关（相关性不是语言问题）。"
+  ],
+  "碳中和": [
+    ["碳中和", true], ["致中和", true], ["你“碳中和”了吗", true], ["试析", true],
+    ["碳达峰", true]
+  ],
+  "内卷": [
+    ["内卷", true], ["阶层", true], ["СЛЕНГА", true], ["人工智能与内卷", true]
+  ],
+  "注意力机制": [
+    ["注意力机制", true], ["人眼注视点", true]
+  ],
+  "幻觉": [
+    ["分叉幻觉论", false], ["整体决定论", false], ["叙事幻觉", false],
+    ["可能世界", false], ["戏曲", false], ["闪灵", false], ["不是“幻想”", false],
+    ["幻觉", true]
+  ],
+  "用户画像": [
+    ["用户画像", true], ["人物誌", true], ["浏览器指纹", false], ["百度指数", false]
+  ],
+  "最终一致性": [
+    ["最终一致性", true], ["八核簇合物", false], ["配合物", false], ["RRM", false],
+    ["快递", false]
+  ],
+  "量子色动力学": [
+    ["量子色动力学", true], ["量子色動力學", true]
+  ],
+  "C++ 移动语义": [
+    ["右值引用", true], ["语义记忆", false], ["语义特征", false], ["苗瑶语", false],
+    ["介词", false], ["HTML", false]
+  ],
+  "TCP 三次握手": [
+    ["传输控制协议", true], ["SYN Flood", true], ["TCP快速打开", true], ["QUIC", false]
+  ],
+  "光合作用": [
+    ["光合作用", true]
+  ],
+  "Rust 所有权": [
+    ["Rust (编程语言)", true], ["rust-claude-skills", true],
+    ["农业", false], ["加速世界", false], ["Stripe Rust", false], ["Wheat Leaf Rust", false]
+  ],
+  "transformer architecture": [
+    ["Transformer", true], ["transformer", true],
+    ["Attention Is All You Need", true], ["阿西什", false]
+  ],
+  "consensus algorithm": [
+    ["consensus", true], ["Consensus", true], ["Raft", true],
+    ["TiDB", false], ["隨機抽樣一致", false]
+  ],
+  "Byzantine fault tolerance": [
+    ["Byzantine", true], ["拜占庭", true], ["Zyzzyva", true],
+    ["共識機制", true], ["持有量證明", false]
+  ],
+  "加密货币的量子套利": [
+    ["货币", false], ["P/NP", false], ["三星", false], ["2023年", false],
+    ["数字阴影", false]
+  ],
+  "Cursor": [
+    ["Cursor (代码编辑器)", true], ["Anysphere", true],
+    ["tracking Data", false], ["Eye Cursor", false], ["CURSOR:", false],
+    ["Cursor Controls", false], ["Curse", false], ["bubble cursor", false],
+    ["GitHub Copilot", false], ["cursor", false]
+  ],
+  "茅台": [
+    ["茅台", true], ["舟台", false]
+  ],
+  "为什么中文大模型在长文本任务上表现不稳定": [
+    ["人工智能", false], ["涌现", false], ["中美关系", false], ["足球", false],
+    ["天能", false], ["纪实文学", false], ["Prose Poem", false]
+  ],
+  "rust 学习路线": [
+    ["陳淑樺", false], ["小米澎湃OS", false], ["流行性感冒", false],
+    ["鲁托斯拉夫斯基", false], ["VLC/RF", false], ["太阳爆发", false],
+    ["梳理·探究", false], ["红色旅游", false], ["学习投入度", false]
+  ],
+  "zzqx 不存在的词": [
+    ["耗散结构", false], ["初中英语", false], ["不端行为", false]
+  ]
+}
