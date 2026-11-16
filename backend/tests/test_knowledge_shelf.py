@@ -162,7 +162,10 @@ def test_unknown_source_is_404(client):
     response = client.get("/api/knowledge/library/没这份")
 
     assert response.status_code == 404
-    assert response.json()["detail"] == {"code": "not_found", "message": "这份来源不在知识库里"}
+    body = response.json()
+    # 统一错误体：`code` / `message` 在顶层，前端读的是这两项。
+    assert body["code"] == "not_found"
+    assert body["message"] == "这份来源不在知识库里"
 
 
 def test_listing_does_not_touch_last_used_at(client):

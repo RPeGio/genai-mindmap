@@ -8,8 +8,9 @@
 `MINDMAP_LIBRARY_SEARCH` 影响——那个开关管的是"生成时要不要从库里捞材料参与"，
 关掉它只应该让生成变回不查库，不该让用户看不见自己库里的东西。
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
+from app.core.errors import AppError
 from app.knowledge import shelf
 from app.knowledge.service import SearchRequest, SearchResponse, search
 
@@ -41,10 +42,9 @@ def list_library(limit: int = shelf.DEFAULT_LIMIT):
 @router.get("/library/{source_id}", response_model=shelf.LibrarySource)
 def read_library_source(source_id: str):
     """单份材料的正文预览（前 4000 字，`truncated` 说明是否截断）。"""
+    # 这里用 AppError 而不是 HTTPException：后者会被全局处理器兜成"请求处理失败
+    # （HTTP 404）"，前端读顶层 message，用户看到的就是那句没信息量的话。
     try:
         return shelf.read_entry(source_id)
-    except shelf.SourceNotFound:
-        raise HTTPException(
-            status_code=404,
-            detail={"code": "not_found", "message": "这份来源不在知识库里"},
-        ) from None
+    except shelf.SourceNotFound as error:
+        raise AppError("not_found", "这份来源不在知识库里", status=404) from error
