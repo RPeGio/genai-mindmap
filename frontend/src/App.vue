@@ -255,20 +255,33 @@ const libraryOpen = ref(false);
 const libraryEntries = ref<LibraryEntry[]>([]);
 const libraryTotal = ref(0);
 const libraryBusy = ref(false);
-const libraryError = ref('');
-/** 当前正在看正文的那一份；为 null 表示停在列表。 */
+/**
+ * 列表读不出来，和"某一份正文读不出来"是两件事。
+ *
+ * 共用一个 error 时，预览失败会把整个抽屉顶成一句错误文案——列表没了，
+ * 也退不回去，只能关掉重开。
+ */
+const libraryListError = ref('');
+/** 当前正在看正文的那一份；为 null 表示不在正文视图。 */
 const libraryPreview = ref<LibrarySource | null>(null);
+/** 正在打开（或打开失败停在原地）的那一份；非 null 时抽屉显示预览壳。 */
+const libraryOpening = ref<LibraryEntry | null>(null);
 const libraryPreviewBusy = ref(false);
+const libraryPreviewError = ref('');
+/** 只让最后点开的那一份落地：连续点两份时，慢的响应不能盖掉后点的。 */
+let libraryPreviewToken = 0;
 
 async function openLibrary(): Promise<void> {
   libraryOpen.value = true;
   libraryPreview.value = null;
+  libraryOpening.value = null;
+  libraryPreviewError.value = '';
   await loadLibrary();
 }
 
 async function loadLibrary(): Promise<void> {
   libraryBusy.value = true;
-  libraryError.value = '';
+  libraryListError.value = '';
   try {
     const payload = await listLibrary();
     libraryEntries.value = payload.items;
@@ -276,27 +289,41 @@ async function loadLibrary(): Promise<void> {
   } catch (error) {
     libraryEntries.value = [];
     libraryTotal.value = 0;
-    libraryError.value = `知识库没能读取：${(error as Error).message}`;
+    libraryListError.value = `知识库没能读取：${(error as Error).message}`;
   } finally {
     libraryBusy.value = false;
   }
 }
 
 async function openLibrarySource(entry: LibraryEntry): Promise<void> {
+  const token = ++libraryPreviewToken;
+  libraryOpening.value = entry;
+  libraryPreviewError.value = '';
   libraryPreviewBusy.value = true;
-  libraryError.value = '';
   try {
-    libraryPreview.value = await readLibrarySource(entry.source_id);
+    const source = await readLibrarySource(entry.source_id);
+    if (token !== libraryPreviewToken) return;
+    libraryPreview.value = source;
   } catch (error) {
-    libraryError.value = `正文没能读取：${(error as Error).message}`;
+    if (token !== libraryPreviewToken) return;
+    libraryPreviewError.value = `正文没能读取：${(error as Error).message}`;
   } finally {
-    libraryPreviewBusy.value = false;
+    if (token === libraryPreviewToken) libraryPreviewBusy.value = false;
   }
+}
+
+function backToLibrary(): void {
+  // 让在途预览失效：回到列表之后，迟到的正文不该自己弹出来
+  libraryPreviewToken += 1;
+  libraryPreview.value = null;
+  libraryOpening.value = null;
+  libraryPreviewError.value = '';
+  libraryPreviewBusy.value = false;
 }
 
 function closeLibrary(): void {
   libraryOpen.value = false;
-  libraryPreview.value = null;
+  backToLibrary();
 }
 
 /** 材料被几张已保存导图引用过；0 表示存了但从没进过任何一张图。 */
@@ -804,7 +831,7 @@ async function copyBody() {
 
       <div class="min-h-0 flex-1 overflow-y-auto px-4 py-3">
         <template v-if="libraryPreview">
-          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="libraryPreview = null">
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="backToLibrary()">
             ← 回到列表
           </button>
           <h3 class="mt-2 break-words text-sm font-medium text-slate-800">
@@ -822,14 +849,41 @@ async function copyBody() {
           </p>
         </template>
 
+        <!-- 打开中 / 打开失败：停在预览壳里，不把列表顶掉，也不逼用户关掉重开 -->
+        <template v-else-if="libraryOpening">
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="backToLibrary()">
+            ← 回到列表
+          </button>
+          <h3 class="mt-2 break-words text-sm font-medium text-slate-800">
+            {{ libraryOpening.filename || '未命名材料' }}
+          </h3>
+          <p class="mt-1 text-xs text-slate-400">
+            {{ SOURCE_LABELS[libraryOpening.kind] }} · {{ librarySize(libraryOpening) }}
+          </p>
+          <p v-if="libraryPreviewBusy" class="mt-3 text-xs text-slate-400">正在读取正文…</p>
+          <div
+            v-else-if="libraryPreviewError"
+            class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700"
+          >
+            <p>{{ libraryPreviewError }}</p>
+            <button
+              type="button"
+              class="mt-2 underline decoration-rose-300 hover:text-rose-900"
+              @click="openLibrarySource(libraryOpening)"
+            >
+              再试一次
+            </button>
+          </div>
+        </template>
+
         <template v-else>
-          <p class="text-xs leading-relaxed text-slate-500">
+          <p v-if="!libraryBusy && !libraryListError" class="text-xs leading-relaxed text-slate-500">
             生成时用到的材料会被收进这里，供以后复用。库里现在有
             <strong class="text-slate-700">{{ libraryTotal }}</strong> 份。
           </p>
           <p v-if="libraryBusy" class="mt-3 text-xs text-slate-400">正在读取…</p>
-          <p v-else-if="libraryError" class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
-            {{ libraryError }}
+          <p v-else-if="libraryListError" class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
+            {{ libraryListError }}
           </p>
           <p v-else-if="libraryEntries.length === 0" class="mt-3 text-xs leading-relaxed text-slate-400">
             还是空的。带着材料生成一次导图，用到的材料就会出现在这里。
@@ -856,8 +910,7 @@ async function copyBody() {
               </button>
             </li>
           </ul>
-          <p v-if="libraryPreviewBusy" class="mt-3 text-xs text-slate-400">正在读取正文…</p>
-          <p class="mt-4 text-xs leading-relaxed text-slate-400">
+          <p v-if="!libraryBusy && !libraryListError" class="mt-4 text-xs leading-relaxed text-slate-400">
             这里只是看：材料正文随库保存，删改请走运维脚本。上传后还没生成过的文件不会出现在这里。
           </p>
         </template>
