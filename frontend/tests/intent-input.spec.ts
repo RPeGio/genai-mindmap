@@ -46,6 +46,12 @@ function stubFetch(reply: () => Response) {
     const url = String(input);
     // 偏好是挂载时的背景请求，不属于"点这个按钮发出了什么"，不进 calls。
     if (isPrefsRequest(url)) return prefsReply(url);
+    if (url.endsWith('/health')) {
+      // 挂载时探一次版本号。它是背景请求，和"点这个入口发出了什么"无关。
+      return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
     calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   }));
@@ -255,7 +261,7 @@ describe('只给材料的场景', () => {
     const wrapper = mountApp();
     const sources = useSourcesStore();
     sources.items = [{
-      id: 's1', label: '机器学习导论.pdf', kind: 'document', state: 'ready',
+      key: 's1', id: 's1', label: '机器学习导论.pdf', kind: 'document', state: 'ready',
       source: material('机器学习导论.pdf'), error: '', seconds: 0,
     }];
     await wrapper.vm.$nextTick();
@@ -279,7 +285,7 @@ describe('只给材料的场景', () => {
     const wrapper = mountApp();
     const sources = useSourcesStore();
     sources.items = [{
-      id: 's1', label: '未命名.txt', kind: 'document', state: 'ready',
+      key: 's1', id: 's1', label: '未命名.txt', kind: 'document', state: 'ready',
       source: material('未命名.txt'), error: '', seconds: 0,
     }];
     await wrapper.vm.$nextTick();
@@ -311,11 +317,11 @@ describe('只给材料的场景', () => {
     const sources = useSourcesStore();
     sources.items = [
       {
-        id: 's1', label: 'IMG_2041.png', kind: 'image', state: 'ready',
+        key: 's1', id: 's1', label: 'IMG_2041.png', kind: 'image', state: 'ready',
         source: material('IMG_2041.png'), error: '', seconds: 0,
       },
       {
-        id: 's2', label: '碳中和路线图.pdf', kind: 'document', state: 'ready',
+        key: 's2', id: 's2', label: '碳中和路线图.pdf', kind: 'document', state: 'ready',
         source: material('碳中和路线图.pdf'), error: '', seconds: 0,
       },
     ];
@@ -328,7 +334,7 @@ describe('只给材料的场景', () => {
     const wrapper = mountApp();
     const sources = useSourcesStore();
     sources.items = [{
-      id: 's1', label: '算法导论.pdf', kind: 'document', state: 'failed',
+      key: 's1', id: 's1', label: '算法导论.pdf', kind: 'document', state: 'failed',
       source: null, error: '文档解析失败', seconds: 0,
     }];
     await wrapper.vm.$nextTick();
@@ -341,7 +347,7 @@ describe('只给材料的场景', () => {
     const wrapper = mountApp();
     const sources = useSourcesStore();
     sources.items = [{
-      id: 's1', label: '算法导论.pdf', kind: 'document', state: 'ready',
+      key: 's1', id: 's1', label: '算法导论.pdf', kind: 'document', state: 'ready',
       source: material('算法导论.pdf'), error: '', seconds: 0,
     }];
     sources.recording = true;

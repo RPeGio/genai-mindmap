@@ -6,7 +6,14 @@ import type { Source, SourceKind } from '../api/types';
 import { fileKind, MAX_AUDIO_BYTES, MAX_SOURCES, MAX_UPLOAD_BYTES, newSourceId, sourceInputError, textSource } from '../sources/input';
 
 export interface SourceItem {
-  /** 列表身份独立于服务端 Source.id；重试不会改变列表位置。 */
+  /**
+   * 这一行的本地身份：列表 key、`files`/`active` 的键，`remap` 永远不动它。
+   *
+   * 不能拿 `id` 兼任：两份内容相同的材料会被知识库收成同一份，映射之后
+   * `id` 允许相同，但行必须还是两行独立可删的。
+   */
+  key: string;
+  /** 材料在库里的标识；生成前是临时 id，入库后由 `remap` 换成持久 id。 */
   id: string;
   label: string;
   kind: SourceKind;
@@ -53,8 +60,23 @@ export const useSourcesStore = defineStore('sources', () => {
   let draining: Promise<void> | null = null;
 
   const parsing = computed(() => items.value.some(item => item.state === 'queued' || item.state === 'parsing'));
-  const readySources = computed(() => items.value.flatMap(item =>
-    item.state === 'ready' && item.source ? [item.source] : []));
+  /**
+   * 送去生成的材料，按 id 去重。
+   *
+   * 两份一模一样的材料会入库成同一条记录，`remap` 之后它们共享一个 id；
+   * 请求体里重复两次没有意义（后端按 id 建索引），`sourceInputError` 还会
+   * 判成"来源 ID 重复"把生成按钮锁死。
+   */
+  const readySources = computed(() => {
+    const seen = new Set<string>();
+    const sources: Source[] = [];
+    for (const item of items.value) {
+      if (item.state !== 'ready' || !item.source || seen.has(item.source.id)) continue;
+      seen.add(item.source.id);
+      sources.push(item.source);
+    }
+    return sources;
+  });
   const problem = computed(() => {
     if (parsing.value) return '来源正在解析，请等待完成后生成。';
     if (items.value.some(item => item.state === 'failed')) return '有来源解析失败，请重试或移除后生成。';
@@ -85,14 +107,14 @@ export const useSourcesStore = defineStore('sources', () => {
     if (!hasRoom(1)) return false;
     const source = textSource(text);
     items.value.push({
-      id: source.id, label: `文本 ${++textNumber}`, kind: 'text', state: 'ready',
-      source, error: '', seconds: 0,
+      key: source.id, id: source.id, label: `文本 ${++textNumber}`, kind: 'text',
+      state: 'ready', source, error: '', seconds: 0,
     });
     return true;
   }
 
   async function parseItem(item: SourceItem): Promise<void> {
-    const file = files.get(item.id);
+    const file = files.get(item.key);
     if (!file) return;
     item.error = '';
     item.seconds = 0;
@@ -106,14 +128,14 @@ export const useSourcesStore = defineStore('sources', () => {
     }
 
     const controller = new AbortController();
-    active.set(item.id, controller);
+    active.set(item.key, controller);
     item.state = 'parsing';
     const started = Date.now();
     const timer = setInterval(() => { item.seconds = Math.floor((Date.now() - started) / 1000); }, 1000);
     try {
       const source = await uploadDocument(file, controller.signal);
       // 已移除/清空的条目不能被迟到的响应重新加回来。
-      if (controller.signal.aborted || !files.has(item.id)) return;
+      if (controller.signal.aborted || !files.has(item.key)) return;
       if (source.status !== 'parsed' || !source.text?.trim()) {
         throw new Error(source.error?.trim() || '这个来源没有解析出可用文字，请重试或移除。');
       }
@@ -121,12 +143,12 @@ export const useSourcesStore = defineStore('sources', () => {
       item.kind = source.kind;
       item.state = 'ready';
     } catch (cause) {
-      if (controller.signal.aborted || !files.has(item.id)) return;
+      if (controller.signal.aborted || !files.has(item.key)) return;
       item.state = 'failed';
       item.error = cause instanceof Error ? cause.message : '上传失败，请重试。';
     } finally {
       clearInterval(timer);
-      active.delete(item.id);
+      active.delete(item.key);
     }
   }
 
@@ -137,7 +159,7 @@ export const useSourcesStore = defineStore('sources', () => {
    * 也不让本地 CPU 的解析两路抢核。
    */
   function laneOf(item: SourceItem): Lane {
-    const file = files.get(item.id);
+    const file = files.get(item.key);
     const kind = file ? fileKind(file) : item.kind;
     return kind === 'image' || kind === 'audio' ? 'media' : 'document';
   }
@@ -153,12 +175,12 @@ export const useSourcesStore = defineStore('sources', () => {
     const worker = async (): Promise<void> => {
       for (;;) {
         const next = items.value.find(item =>
-          item.state === 'queued' && !skipped.has(item.id) && laneOf(item) === lane);
+          item.state === 'queued' && !skipped.has(item.key) && laneOf(item) === lane);
         if (!next) return;
         await parseItem(next);
         // 没有对应 File 的异常条目不会进入任何终态，不跳过的话同一个 find
         // 会在原地转圈。
-        if (next.state === 'queued') skipped.add(next.id);
+        if (next.state === 'queued') skipped.add(next.key);
       }
     };
     await Promise.all(Array.from({ length: limit }, () => worker()));
@@ -184,27 +206,46 @@ export const useSourcesStore = defineStore('sources', () => {
   async function addFiles(selected: File[]): Promise<void> {
     if (!selected.length || !hasRoom(selected.length)) return;
     for (const file of selected) {
-      const id = newSourceId();
-      files.set(id, file);
+      const key = newSourceId();
+      files.set(key, file);
       items.value.push({
-        id, label: file.name, kind: fileKind(file), state: 'queued',
+        key, id: key, label: file.name, kind: fileKind(file), state: 'queued',
         source: null, error: '', seconds: 0,
       });
     }
     await drain();
   }
 
-  async function retry(id: string): Promise<void> {
-    const item = items.value.find(entry => entry.id === id);
+  async function retry(key: string): Promise<void> {
+    const item = items.value.find(entry => entry.key === key);
     if (!item || item.state !== 'failed') return;
     item.state = 'queued';
     await drain();
   }
 
-  function remove(id: string): void {
-    active.get(id)?.abort();
-    files.delete(id);
-    items.value = items.value.filter(item => item.id !== id);
+  /**
+   * 按服务端给的对照表把来源 id 换成持久 id。
+   *
+   * 生成开始时后端会把材料写进知识库，同时用 `sources` 帧告诉前端"旧 id → 新 id"。
+   * 只换 id：`item.source.id` 是导图引用与引用计数用的，`item.id` 是给用户看的
+   * 材料标识。行身份是 `item.key`，`files`/`active` 都挂在它上面，这里一律不碰——
+   * 两份内容相同的材料映射到同一个持久 id 时，两行才还能各自删除、各自解析。
+   */
+  function remap(ids: Record<string, string>): void {
+    const entries = Object.entries(ids);
+    if (!entries.length) return;
+    for (const item of items.value) {
+      const next = ids[item.id] ?? (item.source ? ids[item.source.id] : undefined);
+      if (!next || next === item.id) continue;
+      if (item.source) item.source = { ...item.source, id: next };
+      item.id = next;
+    }
+  }
+
+  function remove(key: string): void {
+    active.get(key)?.abort();
+    files.delete(key);
+    items.value = items.value.filter(item => item.key !== key);
     error.value = '';
   }
 
@@ -219,6 +260,6 @@ export const useSourcesStore = defineStore('sources', () => {
   onScopeDispose(clear);
   return {
     items, error, parsing, recording, readySources, problem, materialProblem,
-    addText, addFiles, retry, remove, clear,
+    addText, addFiles, retry, remove, clear, remap,
   };
 });

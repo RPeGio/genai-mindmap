@@ -409,7 +409,7 @@ def test_run_id_is_validated_and_extra_fields_still_forbidden():
 def _routed_with(provider, registry):
     """把 `_frames` 调用的 `run` 换成"真循环 + 假 provider"。"""
 
-    def routed(request, *, on_close=None):
+    def routed(request, *, on_close=None, first_seq=None):
         return service_run(request, provider=provider, tools=registry, on_close=on_close)
 
     return routed

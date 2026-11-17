@@ -79,9 +79,12 @@ class ScriptedProvider:
     def __init__(self, script: list[Any]) -> None:
         self._script = list(script)
         self.calls = 0
+        # 记下每次看到的 messages，用来断言"提醒"确实发给了模型
+        self.seen: list[list[dict[str, Any]]] = []
 
     async def complete_tools(self, messages, tools, *, budget):
         self.calls += 1
+        self.seen.append([dict(message) for message in messages])
         if not self._script:
             raise AssertionError("脚本已用完，循环比预期多调了一次模型")
         item = self._script.pop(0)
@@ -146,7 +149,10 @@ def test_tool_failure_logs_reason_and_usage_without_material_or_tree(caplog):
     end = next(event for event in events if event.type == "tool_end")
     assert end.result_summary["code"] == "invalid_map"
     assert end.result_summary["message"] == "引用与原文不匹配"
-    assert _failure_logs(caplog) == [{
+    # 这一轮最后是一句 stop 且没有候选，循环会额外记一条 no_tool_call 的诊断
+    # （见 service.py 里那段注释）；这里只关心工具失败那一条。
+    tool_failures = [e for e in _failure_logs(caplog) if e["code"] != "no_tool_call"]
+    assert tool_failures == [{
         "call_id": "failure-1", "tool": "echo", "code": "invalid_map",
         "message": "引用与原文不匹配", "model_calls_used": 2, "tool_calls_used": 1,
     }]
@@ -278,16 +284,58 @@ def test_repair_budget_logs_both_the_tool_failure_and_the_stop_reason(caplog):
 
 class BasicFlowTest(unittest.TestCase):
     def test_stop_without_tools_ends_with_done(self):
-        """模型直接给文字收尾：只发 done，不发工具事件。"""
-        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry("create"))
+        """模型直接给文字收尾：只发 done，不发工具事件。
+
+        整轮零工具调用会先被提醒一次，所以脚本给两段文字：提醒之后仍然只写字，
+        循环就认了——这时的行为才是这条用例要固定的"只发 done"。
+        """
+        events = _collect(
+            _request(), ScriptedProvider([_completion(), _completion()]), build_registry("create")
+        )
         types = [event.type for event in events]
         self.assertEqual(types, ["stage", "done"])
         self.assertEqual(events[-1].content, None)  # create 且没有快照
 
     def test_seq_is_continuous_from_one(self):
         """seq 必须从 1 连续递增：前端靠它判断丢帧和乱序。"""
-        events = _collect(_request(), ScriptedProvider([_completion()]), build_registry("create"))
+        events = _collect(
+            _request(), ScriptedProvider([_completion(), _completion()]), build_registry("create")
+        )
         self.assertEqual([event.seq for event in events], [1, 2])
+
+    def test_text_only_failure_carries_the_model_words(self):
+        """没产出导图时，done 帧要带上模型的原话与思考。
+
+        线上出现过"模型只写字、不调工具"：那时接口层只有一帧 done，`journalctl`
+        里也未必捞得到告警，页面上唯一能说清原因的就是这两个字段。
+        """
+        said = Completion(
+            message={
+                "role": "assistant",
+                "content": "导图大概是：机器学习分监督和无监督……",
+                "reasoning_content": "看到 mindmap_generate 了，但直接说更简单。",
+            },
+            finish_reason="stop",
+        )
+        events = _collect(_request(), ScriptedProvider([said, said]), build_registry("create"))
+
+        self.assertEqual(events[-1].type, "done")
+        self.assertIsNone(events[-1].content)
+        self.assertIn("机器学习分监督和无监督", events[-1].text)
+        self.assertIn("直接说更简单", events[-1].reasoning)
+
+    def test_successful_result_does_not_carry_model_text(self):
+        """有产出时不带原话：那是正常结果，不需要把整篇输出塞进事件流。"""
+        snapshot = MindMapContent(**TREE)
+        events = _collect(
+            AgentRunRequest(goal="扩一下", intent="create", snapshot=snapshot),
+            ScriptedProvider([_completion(), _completion()]),
+            build_registry("create"),
+        )
+        self.assertEqual(events[-1].type, "done")
+        self.assertIsNotNone(events[-1].content)
+        self.assertEqual(events[-1].text, "")
+        self.assertEqual(events[-1].reasoning, "")
 
     def test_tool_result_is_filled_back_by_call_id(self):
         """工具结果要按 tool_call_id 回填，且下一轮能看到它。"""
@@ -1052,6 +1100,142 @@ class SourcesContextTest(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("超过单次请求上限", message)
         self.assertIn("清单", message)
+
+# ---------------------------------------------------------------------------
+# 模型只用文字回答、没调工具：先提醒一次，再不行才认
+# ---------------------------------------------------------------------------
+
+
+def _candidate_handler(args, ctx):
+    ctx.candidate = MindMapContent.model_validate(TREE)
+    return ToolResult(ok=True, content="ok", data={"content": TREE})
+
+
+def test_nudges_once_when_model_answers_in_text(caplog):
+    """线上实测的形态：模型把导图说明成一段文字，一条工具调用都没有。
+
+    这时不该直接给用户一个空结果，而是明确要求它走工具再试一轮。
+    """
+    provider = ScriptedProvider([
+        _completion(content="Rust 的学习路线大致是：基础语法、所有权、并发……", finish="stop"),
+        _completion([ToolCall(call_id="gen-1", name="echo", arguments={"text": "生成"})],
+                    finish="tool_calls"),
+        _completion(),
+    ])
+    events = _collect(_request(), provider, _registry(_candidate_handler))
+    done = next(event for event in events if event.type == "done")
+    assert done.content is not None, "提醒之后模型改走了工具，结果不该是空的"
+    assert [_e.name for _e in events if _e.type == "tool_start"] == ["echo"]
+    assert provider.calls == 3
+    # 第二次请求里必须能看到那句提醒，否则模型没有理由改变做法
+    nudge = provider.seen[1][-1]
+    assert nudge["role"] == "user" and "必须调用" in nudge["content"]
+    assert any("no_tool_call" in json.loads(r.args[0])["code"] for r in caplog.records
+               if r.name == "app.agent.service")
+
+
+def test_gives_up_after_one_nudge(caplog):
+    """提醒过还是只写字，就认：返回空结果，别在演示里反复空转额度。"""
+    provider = ScriptedProvider([
+        _completion(content="好的", finish="stop"),
+        _completion(content="还是文字", finish="stop"),
+    ])
+    events = _collect(_request(), provider, _registry(_candidate_handler))
+    done = next(event for event in events if event.type == "done")
+    assert done.content is None
+    assert provider.calls == 2, "只该提醒一次，不该无限重试"
+    logged = [json.loads(r.args[0]) for r in caplog.records if r.name == "app.agent.service"]
+    assert [entry["code"] for entry in logged] == ["no_tool_call", "no_tool_call"]
+
+
+class HeartbeatTest(unittest.TestCase):
+    """长静默期间要有心跳帧。
+
+    线上实测 3 路并发时单轮静默到过 25 秒，那段时间事件流里一个字节都没有；
+    中间链路只要有 30–60 秒空闲超时就掐断连接，用户看到"连接中断"，而模型还在
+    跑、还在计费。心跳的两个作用就是：不让连接空转，以及把"已等多久"送到页面。
+
+    用例把 `HEARTBEAT_INTERVAL_SECONDS` 压到毫秒级，靠真实等待驱动，不打桩时间——
+    这里的时序就是被测对象，把时间换成假时钟等于把要验的东西一起换掉了。
+    """
+
+    def test_heartbeats_during_a_slow_model_call(self):
+        class SlowProvider:
+            """第一次调用睡一会儿（模拟首字延迟），之后正常收尾。"""
+
+            def __init__(self):
+                self.calls = 0
+
+            async def complete_tools(self, messages, tools, *, budget):
+                self.calls += 1
+                if self.calls == 1:
+                    await asyncio.sleep(0.12)
+                    return _completion([ToolCall(call_id="gen-1", name="echo",
+                                                 arguments={"text": "生成"})],
+                                       finish="tool_calls")
+                return _completion()
+
+        with patch("app.agent.service.HEARTBEAT_INTERVAL_SECONDS", 0.01):
+            events = _collect(_request(), SlowProvider(), _registry(_candidate_handler))
+
+        beats = [event for event in events if event.type == "heartbeat"]
+        self.assertGreaterEqual(len(beats), 2, "静默 120 毫秒、心跳 10 毫秒，该发好几帧")
+        # 心跳只带"静默了多久"，不该夹带业务信息
+        self.assertTrue(all(beat.waited_ms >= 0 for beat in beats))
+        self.assertGreaterEqual(beats[-1].waited_ms, beats[0].waited_ms)
+        # seq 仍从 1 连续递增：心跳不能破坏前端"缺号即丢帧"的判断
+        self.assertEqual([event.seq for event in events], list(range(1, len(events) + 1)))
+        self.assertEqual(events[0].type, "stage")
+        self.assertEqual(events[-1].type, "done")
+
+    def test_heartbeats_during_a_slow_tool(self):
+        async def slow(args, ctx):
+            ctx.reserve_model_call()
+            await asyncio.sleep(0.12)
+            return ToolResult(ok=True, content="ok")
+
+        call = ToolCall(call_id="slow-1", name="echo", arguments={"text": "x"})
+        with patch("app.agent.service.HEARTBEAT_INTERVAL_SECONDS", 0.01):
+            events = _collect(
+                _request(),
+                ScriptedProvider([_completion([call], finish="tool_calls"), _completion()]),
+                _registry(slow),
+            )
+
+        types = [event.type for event in events]
+        beats = [event for event in events if event.type == "heartbeat"]
+        self.assertGreaterEqual(len(beats), 2)
+        # 心跳必须夹在 tool_start 与 tool_end 之间：工具的静默期就是这里
+        self.assertLess(types.index("tool_start"), types.index("heartbeat"))
+        self.assertLess(types.index("heartbeat"), types.index("tool_end"))
+
+    def test_no_heartbeat_when_calls_are_fast(self):
+        """快调用不该冒出心跳：那只会把事件流刷成噪音。
+
+        给两段文字脚本：零工具调用会先被提醒一次（`MAX_NUDGES`），
+        这条用例要验的是"没有心跳"，不是提醒行为。
+        """
+        events = _collect(
+            _request(), ScriptedProvider([_completion(), _completion()]), build_registry("create")
+        )
+        self.assertEqual([event.type for event in events], ["stage", "done"])
+
+    def test_heartbeat_stops_when_budget_runs_out(self):
+        """心跳不能把超时拖成无限静默：到了截止时间仍要正常收尾。"""
+
+        async def sleep_forever(args, ctx):
+            ctx.reserve_model_call()
+            await asyncio.Event().wait()
+
+        call = ToolCall(call_id="timeout-1", name="echo", arguments={"text": "x"})
+        with patch("app.agent.service.HEARTBEAT_INTERVAL_SECONDS", 0.01):
+            events = _collect(
+                _request(budget=RunBudget(max_seconds=0.1)),
+                ScriptedProvider([_completion([call], finish="tool_calls")]),
+                _registry(sleep_forever),
+            )
+        self.assertEqual(events[-1].type, "error")
+        self.assertEqual(events[-1].limit, "max_seconds")
 
 
 if __name__ == "__main__":

@@ -103,7 +103,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 前端
 
-前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图；输入侧支持文本、文档、图片与浏览器录音（`src/components/SourceInputs.vue`、`src/audio/`），导出走 PUML / Markdown / OPML 三种格式，Agent 面板（`src/components/AgentPanel.vue`）把工具循环产出的候选挂到副本上、点接受才落到画布。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
+前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图；输入侧支持文本、文档、图片与浏览器录音（`src/components/SourceInputs.vue`、`src/audio/`），导出走 PUML / Markdown / OPML 三种格式，Agent 面板（`src/components/AgentPanel.vue`）把工具循环产出的候选挂到副本上、点接受才落到画布，顶栏「知识库」抽屉列出库里材料、每份被几张导图引用、点开看正文前 4000 字。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
 
 | 位置 | 选型 |
 |---|---|
@@ -120,7 +120,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 后端
 
-FastAPI + Pydantic v2，6 组路由（14 个路径 / 16 个端点）统一挂在 `/api` 下。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `knowledge/search` 与 `agent/tasks` 两个桩），没有返回 501 的路由。模型调用集中在 `backend/app/agent/` 的工具循环（`mindmap_generate_deep` / `node_expand` / `rag_query` / `mindmap_edit`，`POST /api/agent/runs/stream` 是生成与编辑的唯一入口）与 `backend/app/generation/` 的底层 `chat_async`：设 `MINDMAP_LLM_MODE=demo` 时不联网、直接发占位树（agent 不把"没配置"默认降级成 demo，缺省则缺模型配置会报错），设 `model` 才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`。生成结果不自动保存：先落候选、用户接受后进画布，再显式保存（带版本号的乐观锁，冲突返回 409）。
+FastAPI + Pydantic v2，8 组路由（23 个路径 / 30 个端点）统一挂在 `/api` 下。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `knowledge/search` 与 `agent/tasks` 两个桩），没有返回 501 的路由。模型调用集中在 `backend/app/agent/` 的工具循环（`mindmap_generate_deep` / `node_expand` / `rag_query` / `add_node` / `update_node` / `remove_node` / `move_node` / `add_edge` / `remove_edge` / `mindmap_edit` / `audit_tree`，`POST /api/agent/runs/stream` 是生成与编辑的唯一入口）与 `backend/app/generation/` 的底层 `chat_async`：设 `MINDMAP_LLM_MODE=demo` 时不联网、直接发占位树（agent 不把"没配置"默认降级成 demo，缺省则缺模型配置会报错），设 `model` 才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`（PUML / Markdown / OPML / JSON）。生成结果不自动保存：先落候选、用户接受后进画布，再显式保存（带版本号的乐观锁，冲突返回 409）。
 
 ### 核心模块开发
 

@@ -7,7 +7,7 @@
 
 **agent 没有 demo 模式。**
 
-`MINDMAP_LLM_MODE` 这个变量只在两个地方被读：`backend/app/generation/service.py`（普通生成）和 `backend/app/ingestion/vision_pdf.py`（PDF 视觉识别）。agent 侧完全没有分支——`agent/provider.py::default_provider()` 直接返回 `DeepSeekProvider()`，每一次工具调用都是真实的模型请求。
+`MINDMAP_LLM_MODE` 这个变量只在两个地方被读：`backend/app/generation/service.py`（普通生成）和 `backend/app/ingestion/vision_pdf.py`（PDF 视觉识别）。agent 侧完全没有分支——`agent/provider.py::default_provider()` 直接返回 `OpenAICompatibleProvider()`，每一次工具调用都是真实的模型请求。
 
 也就是说：
 
@@ -43,11 +43,15 @@ agent 能不能用，由两个独立的环境变量决定，**两个都要开**�
 ```powershell
 cd D:\genai-mindmap\backend
 $env:MINDMAP_LLM_MODE='model'
-$env:MINDMAP_LLM_BASE_URL='https://api.deepseek.com/v1'
+$env:MINDMAP_LLM_BASE_URL='https://api.commandcode.ai/provider/v1'
 $env:MINDMAP_LLM_API_KEY='你的key'
-$env:MINDMAP_LLM_MODEL='deepseek-chat'
+$env:MINDMAP_LLM_MODEL='z-ai/glm-5.3-flash'
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+这三个变量是**任意 OpenAI 兼容端点**的通用三件套，换服务商只改它们，代码不用动
+（端点要满足 `tools` 真被调用、`stream: true` 能出增量、`max_tokens` 有上限可学，
+细则见 `docs/DEPLOY.md` 的「换模型服务商」）。
 
 看到 `Application startup complete` 与 `Uvicorn running on http://127.0.0.1:8000` 即可。
 

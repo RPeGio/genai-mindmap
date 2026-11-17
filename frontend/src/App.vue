@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
@@ -7,18 +7,39 @@ import AgentPanel from './components/AgentPanel.vue';
 import ImportMindmap from './components/ImportMindmap.vue';
 import SourceInputs from './components/SourceInputs.vue';
 import { SOURCE_LABELS, materialTitle } from './sources/input';
-import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
+import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
+import type { LibraryEntry, LibrarySource } from './api/types';
 import type { SampleMap } from './dev/samples';
+import type { DemoPreset } from './demo/presets';
 import { displayBody, bodySource, INITIAL_STATUS, useMindMapStore } from './stores/mindmap';
+import { useSourcesStore } from './stores/sources';
 import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from './stores/options';
 import { DIAGRAM_PREF_KEY, THINKING_PREF_KEY, usePrefsStore } from './stores/prefs';
 import PrefsPanel from './components/PrefsPanel.vue';
-import { useSourcesStore } from './stores/sources';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
 import type { DiagramTypeChoice, EdgeKind } from './api/types';
 
 const store = useMindMapStore();
+
+/**
+ * 状态行第二行：正常时是阶段文案，长静默时换成「模型正在思考」。
+ *
+ * 后端只在静默达到 10 秒才发心跳，所以 `waitedMs >= 10` 基本等价于"已经静默 10 秒"。
+ * 阈值再写一遍是为了前端自己也站得住：万一别处的实现改成更密的保活帧，这里不会
+ * 1 秒就把阶段文案顶掉。
+ *
+ * 两句话不并存：静默超阈值时阶段文案被**替换**，不是叠在一起——那会让人以为
+ * 两件事同时在发生。
+ */
+const SILENT_HINT_SECONDS = 10;
+const stageLine = computed(() => {
+  if (!store.busy) return '';
+  if (store.waitedMs >= SILENT_HINT_SECONDS) {
+    return `模型正在思考，已等 ${store.waitedMs} 秒`;
+  }
+  return store.stageText;
+});
 const sources = useSourcesStore();
 
 /**
@@ -45,6 +66,17 @@ const copied = ref('');
  */
 const notice = ref<{ kind: 'ok' | 'error'; text: string } | null>(null);
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 后端自报的版本号（线上是 tag，本机是 dev）；拉不到就是空串。 */
+const appVersion = ref('');
+
+/** 标题旁那个小徽章：tag 自带 `v` 前缀，别显示成 `vv0.4.7`；dev 就写 dev。 */
+const versionLabel = computed(() => {
+  const raw = appVersion.value.trim();
+  if (!raw) return '';
+  if (raw === 'dev') return 'dev';
+  return /^v/i.test(raw) ? raw : `v${raw}`;
+});
 
 function flash(kind: 'ok' | 'error', text: string): void {
   if (noticeTimer) clearTimeout(noticeTimer);
@@ -532,6 +564,176 @@ function confirmDiscard(action: string): boolean {
   return window.confirm(`当前有未保存的修改，${action}会丢掉这些修改，继续？`);
 }
 
+/**
+ * 演示用的预置导图：**只在用户点按钮时加载**，模型失败时不会自动顶上。
+ *
+ * 内容单独成块（动态 import），主包不因为演示数据变大。约定与理由写在
+ * `frontend/src/demo/presets.ts` 的文件头。
+ */
+const demoOpen = ref(false);
+const demoPresets = ref<DemoPreset[]>([]);
+const demoBusy = ref(false);
+
+async function openDemoPresets(): Promise<void> {
+  demoOpen.value = true;
+  if (demoPresets.value.length || demoBusy.value) return;
+  demoBusy.value = true;
+  try {
+    const mod = await import('./demo/presets');
+    demoPresets.value = mod.DEMO_PRESETS;
+  } catch {
+    store.status = '预置导图没能加载，刷新页面再试一次。';
+    demoOpen.value = false;
+  } finally {
+    demoBusy.value = false;
+  }
+}
+
+function loadDemoPreset(preset: DemoPreset): void {
+  if (!confirmDiscard(`载入「${preset.label}」`)) return;
+  store.loadPreset(preset);
+  demoOpen.value = false;
+  flash('ok', `已载入预置导图：${preset.label}`);
+}
+
+// ---- 知识库（只读） ----
+/**
+ * 库里有什么材料、每份被几张已保存导图引用、点开看正文预览。
+ *
+ * 只读：不提供删除、不提供"从这里选材料去生成"。后者的开关是
+ * `MINDMAP_LIBRARY_SEARCH`，与本面板无关——线上那个开关关着，这个入口照样能用。
+ * 材料是在**生成时**入库的，所以刚上传还没生成过的文件不会出现在这里。
+ */
+const libraryOpen = ref(false);
+const libraryEntries = ref<LibraryEntry[]>([]);
+const libraryTotal = ref(0);
+const libraryBusy = ref(false);
+/**
+ * 列表读不出来，和"某一份正文读不出来"是两件事。
+ *
+ * 共用一个 error 时，预览失败会把整个抽屉顶成一句错误文案——列表没了，
+ * 也退不回去，只能关掉重开。
+ */
+const libraryListError = ref('');
+/** 当前正在看正文的那一份；为 null 表示不在正文视图。 */
+const libraryPreview = ref<LibrarySource | null>(null);
+/** 正在打开（或打开失败停在原地）的那一份；非 null 时抽屉显示预览壳。 */
+const libraryOpening = ref<LibraryEntry | null>(null);
+const libraryPreviewBusy = ref(false);
+const libraryPreviewError = ref('');
+/** 只让最后点开的那一份落地：连续点两份时，慢的响应不能盖掉后点的。 */
+let libraryPreviewToken = 0;
+/**
+ * 抽屉声明了 `aria-modal`，就得按模态对待：打开时焦点移进去，Tab 圈在里面，
+ * 关闭时还给原来那个按钮——否则键盘用户能 Tab 到背后的画布上。
+ */
+const libraryPanel = ref<HTMLElement | null>(null);
+const libraryCloseButton = ref<HTMLButtonElement | null>(null);
+let libraryOpener: HTMLElement | null = null;
+
+async function openLibrary(): Promise<void> {
+  // 记下是谁打开的：关闭时焦点要还回去。
+  libraryOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  libraryOpen.value = true;
+  libraryPreview.value = null;
+  libraryOpening.value = null;
+  libraryPreviewError.value = '';
+  await loadLibrary();
+  await nextTick();
+  libraryCloseButton.value?.focus();
+}
+
+async function loadLibrary(): Promise<void> {
+  libraryBusy.value = true;
+  libraryListError.value = '';
+  try {
+    const payload = await listLibrary();
+    libraryEntries.value = payload.items;
+    libraryTotal.value = payload.total;
+  } catch (error) {
+    libraryEntries.value = [];
+    libraryTotal.value = 0;
+    libraryListError.value = `知识库没能读取：${(error as Error).message}`;
+  } finally {
+    libraryBusy.value = false;
+  }
+}
+
+async function openLibrarySource(entry: LibraryEntry): Promise<void> {
+  const token = ++libraryPreviewToken;
+  libraryOpening.value = entry;
+  libraryPreviewError.value = '';
+  libraryPreviewBusy.value = true;
+  try {
+    const source = await readLibrarySource(entry.source_id);
+    if (token !== libraryPreviewToken) return;
+    libraryPreview.value = source;
+  } catch (error) {
+    if (token !== libraryPreviewToken) return;
+    libraryPreviewError.value = `正文没能读取：${(error as Error).message}`;
+  } finally {
+    if (token === libraryPreviewToken) libraryPreviewBusy.value = false;
+  }
+}
+
+function backToLibrary(): void {
+  // 让在途预览失效：回到列表之后，迟到的正文不该自己弹出来
+  libraryPreviewToken += 1;
+  libraryPreview.value = null;
+  libraryOpening.value = null;
+  libraryPreviewError.value = '';
+  libraryPreviewBusy.value = false;
+}
+
+function closeLibrary(): void {
+  libraryOpen.value = false;
+  backToLibrary();
+  // 焦点还给打开它的按钮；节点可能已经不在 DOM 里（列表刷新过），所以判一下。
+  const opener = libraryOpener;
+  libraryOpener = null;
+  if (opener && opener.isConnected) opener.focus();
+}
+
+/** 把 Tab 圈在抽屉里。返回 true 表示这次按键已被接住。 */
+function trapLibraryFocus(event: KeyboardEvent): boolean {
+  const panel = libraryPanel.value;
+  if (!panel) return false;
+  const focusable = Array.from(panel.querySelectorAll<HTMLElement>(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+  )).filter(element => !element.hasAttribute('disabled'));
+  if (focusable.length === 0) return false;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  const inside = active instanceof HTMLElement && panel.contains(active);
+  if (event.shiftKey && (!inside || active === first)) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && (!inside || active === last)) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
+/** 材料被几张已保存导图引用过；0 表示存了但从没进过任何一张图。 */
+function citationLabel(count: number): string {
+  return count > 0 ? `被 ${count} 张导图引用` : '还没有导图引用它';
+}
+
+function librarySize(entry: LibraryEntry): string {
+  return `${entry.chars} 字 · ${entry.chunks} 段`;
+}
+
+function formatStamp(value: string): string {
+  const when = new Date(value);
+  if (Number.isNaN(when.getTime())) return '—';
+  return when.toLocaleString('zh-CN', { hour12: false });
+}
+
 const exporting = ref(false);
 // 必须由 Vue 管住选中值：把占位项写成 disabled 时，浏览器会把第一个可用项
 // （PlantUML）当成初始选中，用户第一次点它就等于"值没变"，change 不触发，
@@ -615,6 +817,15 @@ const resumableText = computed(() => {
 
 /** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
 function onKeydown(event: KeyboardEvent) {
+  // 知识库抽屉是模态的：Esc 先关它，Tab 也不能跑到背后的画布上。
+  if (libraryOpen.value) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeLibrary();
+      return;
+    }
+    if (event.key === 'Tab' && trapLibraryFocus(event)) return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     saveNow();
@@ -637,7 +848,24 @@ onMounted(() => {
   // 启动即拉偏好：生成面板的两个下拉要在用户动手之前就填好，否则第一次生成总是
   // "没带偏好"的那一次——而那正是最该被记住偏好的那一次。
   void prefs.load();
+  void loadVersion();
 });
+
+/**
+ * 后端版本号，显示在标题旁。
+ *
+ * 拉不到就留空：版本号是装潢，不该因为它让页面多一个错误提示——用户真正
+ * 关心的是"域名上跑的是不是刚部署的那份"，而后端不可用时页面本来也做不了事。
+ */
+async function loadVersion() {
+  try {
+    // 有些测试替身会回一个不带 version 的对象，这里统一收敛成字符串：
+    // 徽章是装潢，不能因为字段缺失把整个页面带崩。
+    appVersion.value = String((await getHealth())?.version ?? '');
+  } catch {
+    appVersion.value = '';
+  }
+}
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
@@ -679,6 +907,11 @@ async function copyBody() {
     <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-2">
       <div class="flex items-center gap-3">
         <h1 class="text-sm font-semibold">生成式 AI 思维导图</h1>
+        <span
+          v-if="versionLabel"
+          class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-500"
+          :title="`后端版本 ${appVersion}`"
+        >{{ versionLabel }}</span>
         <div v-if="samples.length" class="flex items-center gap-1 text-xs text-slate-500">
           <span class="mr-1">布局示例</span>
           <button
@@ -704,6 +937,20 @@ async function copyBody() {
           @click="saveNow"
         >
           保存
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+          @click="openDemoPresets"
+        >
+          演示示例
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+          @click="openLibrary"
+        >
+          知识库
         </button>
         <button
           type="button"
@@ -939,9 +1186,7 @@ async function copyBody() {
             @click="submitIntent"
           >{{ intentButton }}</button>
           <p v-if="showStatus" role="status" class="text-[11px] leading-tight text-slate-500">{{ store.status }}</p>
-          <p v-if="store.stageText" class="text-[11px] leading-tight text-slate-400">
-            {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
-          </p>
+          <p v-if="stageLine" class="text-[11px] leading-tight text-slate-400">{{ stageLine }}</p>
         </div>
         <MindMapCanvas />
       </section>
@@ -1324,6 +1569,170 @@ async function copyBody() {
         </p>
       </div>
     </aside>
+
+    <!-- 遮罩：点空白处也算关闭。抽屉本身 z-40，盖在它上面 -->
+    <div
+      v-if="libraryOpen"
+      class="fixed inset-0 z-30 bg-slate-900/20"
+      aria-hidden="true"
+      @click="closeLibrary()"
+    />
+
+    <aside
+      v-if="libraryOpen"
+      ref="libraryPanel"
+      class="fixed inset-y-0 right-0 z-40 flex w-[480px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="library-title"
+    >
+      <div class="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+        <h2 id="library-title" class="text-sm font-semibold">知识库</h2>
+        <button
+          ref="libraryCloseButton"
+          type="button"
+          class="text-xs text-slate-500 hover:text-slate-900"
+          @click="closeLibrary()"
+        >
+          关闭
+        </button>
+      </div>
+
+      <div class="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        <template v-if="libraryPreview">
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="backToLibrary()">
+            ← 回到列表
+          </button>
+          <h3 class="mt-2 break-words text-sm font-medium text-slate-800">
+            {{ libraryPreview.filename || '未命名材料' }}
+          </h3>
+          <p class="mt-1 text-xs text-slate-400">
+            {{ SOURCE_LABELS[libraryPreview.kind] }} · 共 {{ libraryPreview.total_chars }} 字
+          </p>
+          <pre class="mt-3 whitespace-pre-wrap break-words font-sans text-xs leading-relaxed text-slate-700">{{ libraryPreview.text }}</pre>
+          <p
+            v-if="libraryPreview.truncated"
+            class="mt-3 rounded-md bg-amber-50 p-3 text-xs leading-relaxed text-amber-700"
+          >
+            这里只显示前 4000 字，全文共 {{ libraryPreview.total_chars }} 字。
+          </p>
+        </template>
+
+        <!-- 打开中 / 打开失败：停在预览壳里，不把列表顶掉，也不逼用户关掉重开 -->
+        <template v-else-if="libraryOpening">
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="backToLibrary()">
+            ← 回到列表
+          </button>
+          <h3 class="mt-2 break-words text-sm font-medium text-slate-800">
+            {{ libraryOpening.filename || '未命名材料' }}
+          </h3>
+          <p class="mt-1 text-xs text-slate-400">
+            {{ SOURCE_LABELS[libraryOpening.kind] }} · {{ librarySize(libraryOpening) }}
+          </p>
+          <p v-if="libraryPreviewBusy" class="mt-3 text-xs text-slate-400">正在读取正文…</p>
+          <div
+            v-else-if="libraryPreviewError"
+            class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700"
+          >
+            <p>{{ libraryPreviewError }}</p>
+            <button
+              type="button"
+              class="mt-2 underline decoration-rose-300 hover:text-rose-900"
+              @click="openLibrarySource(libraryOpening)"
+            >
+              再试一次
+            </button>
+          </div>
+        </template>
+
+        <template v-else>
+          <p v-if="!libraryBusy && !libraryListError" class="text-xs leading-relaxed text-slate-500">
+            生成时用到的材料会被收进这里，供以后复用。库里现在有
+            <strong class="text-slate-700">{{ libraryTotal }}</strong> 份。
+            <!-- 库里超过一页时必须说明"只显示了一部分"，否则用户会以为材料丢了 -->
+            <span v-if="libraryTotal > libraryEntries.length">
+              这里只显示最近 <strong class="text-slate-700">{{ libraryEntries.length }}</strong> 份。
+            </span>
+          </p>
+          <p v-if="libraryBusy" class="mt-3 text-xs text-slate-400">正在读取…</p>
+          <p v-else-if="libraryListError" class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
+            {{ libraryListError }}
+          </p>
+          <p v-else-if="libraryEntries.length === 0" class="mt-3 text-xs leading-relaxed text-slate-400">
+            还是空的。带着材料生成一次导图，用到的材料就会出现在这里。
+          </p>
+          <ul v-else class="mt-3 divide-y divide-slate-100">
+            <li v-for="entry in libraryEntries" :key="entry.source_id" class="py-2">
+              <button
+                type="button"
+                class="flex w-full items-start justify-between gap-3 text-left hover:bg-slate-50"
+                @click="openLibrarySource(entry)"
+              >
+                <span class="min-w-0">
+                  <span class="block break-words text-sm text-slate-800">{{ entry.filename || '未命名材料' }}</span>
+                  <span
+                    class="mt-0.5 block text-xs text-slate-400"
+                    :title="`最近使用：${formatStamp(entry.last_used_at)}；收录：${formatStamp(entry.created_at)}`"
+                  >
+                    {{ SOURCE_LABELS[entry.kind] }} · {{ librarySize(entry) }} · 最近使用 {{ formatStamp(entry.last_used_at) }}
+                  </span>
+                </span>
+                <span
+                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px]"
+                  :class="entry.cited_by > 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'"
+                >
+                  {{ citationLabel(entry.cited_by) }}
+                </span>
+              </button>
+            </li>
+          </ul>
+          <p v-if="!libraryBusy && !libraryListError" class="mt-4 text-xs leading-relaxed text-slate-400">
+            这里只是看：材料正文随库保存，删改请走运维脚本。上传后还没生成过的文件不会出现在这里。
+          </p>
+        </template>
+      </div>
+    </aside>
+
+    <div
+      v-if="demoOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="demo-title"
+    >
+      <div class="flex max-h-[70vh] w-full max-w-lg flex-col rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+        <div class="flex items-center justify-between">
+          <h2 id="demo-title" class="text-sm font-semibold">预置演示导图</h2>
+          <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="demoOpen = false">
+            关闭
+          </button>
+        </div>
+        <p class="mt-2 text-xs leading-relaxed text-slate-500">
+          这些图随页面一起打包，不经过模型，用来在演示时快速摆出一张完整的图。
+          它们不会自动顶替模型失败的提示——要哪张，自己点。
+        </p>
+        <p v-if="demoBusy" class="mt-3 text-xs text-slate-400">正在加载…</p>
+        <ul v-else class="mt-3 flex-1 divide-y divide-slate-100 overflow-y-auto">
+          <li
+            v-for="preset in demoPresets"
+            :key="preset.id"
+            class="flex items-start justify-between gap-3 py-2"
+          >
+            <div class="min-w-0">
+              <p class="text-sm text-slate-800">{{ preset.label }}</p>
+              <p class="text-xs leading-relaxed text-slate-400">{{ preset.description }}</p>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 rounded-md border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              @click="loadDemoPreset(preset)"
+            >
+              载入
+            </button>
+          </li>
+        </ul>
+      </div>
+    </div>
 
     <div
       v-if="store.listOpen"

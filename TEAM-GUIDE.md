@@ -68,11 +68,13 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-10）：后端 488 个测试（pytest，另有 19 个 subtest）、前端 358 个 vitest 用例（23 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-16，合入上游 RAG 与知识库入口之后）：后端 1209 个测试（pytest，另有 19 个 subtest）、前端 426 个 vitest 用例（27 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
 开发服务器左上角有一排「布局示例」按钮（单节点 / 向右 / 向左 / 向下 / 双向）：点一下就能不经过后端装载一份示例导图，用来肉眼检查布局与文本截断。数据在 `frontend/src/dev/samples.ts`，只在 `npm run dev` 下按需加载，生产构建里不进包。
+
+右上角另有「演示示例」按钮，装的是**生产也带**的三张预置导图（Rust 学习路线 / RAG 方案选型 / 一次产品评审），数据在 `frontend/src/demo/presets.ts`，打成独立 chunk（约 6.6 kB），点按钮时才取。它只在用户点的时候加载：模型生成失败仍然如实报错，不会自动拿预置图顶替——演示时哪张是真生成的、哪张是预置的，必须一眼分得清（预置图载入后顶部徽章显示「演示模式（非 AI 生成）」，`mapId` 为空，第一次保存会新建记录而不是覆盖已有导图）。
 
 `unittest` 默认可能将进度输出到 stderr；这本身不代表失败。请同时检查最后的 `OK` 和 `$LASTEXITCODE`，测试成功时退出码应为 0。
 
@@ -83,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 6 组路由（14 个路径 / 16 个端点）
+    main.py            应用装配，注册 6 组路由（16 个路径 / 18 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       MindMapContent / Node / 请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -92,17 +94,17 @@ backend/
     ingestion/         多模态输入 → Source（文本 / 文档 / 图片 / WAV）
     generation/        模型调用与上下文预算（demo / model）+ `stream_partial.py` 增量解析器
     optimization/      结构诊断与建议（三条结构规则 + 引用核验）
-    knowledge/         知识检索（桩）
+    knowledge/         知识库（只读入口 + 生成时入库）与检索桩
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               488 个测试（另有 19 个 subtest）
+  tests/               1209 个测试（另有 19 个 subtest）
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
     main.ts            入口（挂 Pinia 与 Vue Flow 样式）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、上传 1 个、导出 1 个、agent 流 1 个）
+    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、上传 1 个、导出 1 个、agent 流 1 个、知识库 2 个）
     api/types.ts       契约 v2 的 TS 镜像（手写，读起来比生成类型省事）
     api/schema.d.ts    openapi-typescript 从 backend/openapi.json 生成，勿手改
     api/contract-check.ts 编译期断言：镜像与生成类型的键集合、形状必须一致
@@ -117,7 +119,7 @@ frontend/
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
     stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               358 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent）
+  tests/               426 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 展开）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -159,7 +161,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（14 个路径 / 16 个端点）
+## 5 接口一览（16 个路径 / 18 个端点）
 
 ```
 基础
@@ -191,6 +193,8 @@ PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
 代理与检索
 POST /api/agent/tasks              目标 → 阶段骨架（桩，implemented:false）
 POST /api/knowledge/search         检索（桩，返回空）
+GET  /api/knowledge/library        知识库列表（含被引用次数）
+GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）
 ```
 
 ---
@@ -242,7 +246,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 1. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
 2. **v2 的界面渲染**（RPeGio，F09/F10）：契约 v2 两端已落地，缺的是画布的多布局与主题样式渲染；`relations` / `style` / `pos` 目前只落库、没有界面读它们。
 3. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
-4. **上线**（RPeGio，F22，2026-11-10 已出可执行方案）：`deploy/install.sh` 一条命令在 Alibaba Cloud Linux 3 上装完 systemd + nginx + Python 3.12，同源反代因此不需要 CORS，Basic Auth 挡在前面，步骤见 `docs/DEPLOY.md` 第 7 节。**没做**：`Dockerfile` 与 compose——2C2G 上构建 docling+torch 镜像容易 OOM，演示窗口只有一个，容器化等验收后再补。
+4. **上线**（RPeGio，F22，2026-11-10 已出可执行方案）：`deploy/install.sh` 一条命令在 Alibaba Cloud Linux 3 上装完 systemd + nginx + Python 3.12，同源反代因此不需要 CORS，Basic Auth 挡在前面，步骤见 `docs/DEPLOY.md` 第 9 节。**没做**：`Dockerfile` 与 compose——2C2G 上构建 docling+torch 镜像容易 OOM，演示窗口只有一个，容器化等验收后再补。
 
 已完成：**把引用搬到界面上**（F08，2026-11-07，`fc8f82f`）——节点右上角显示引用条数，选中后在右侧详情面板列出来源名与位置（`第 19–37 字`，有页码时一并给出），点一条在抽屉里看原文并把命中句标黄；原文不落库，跨会话只剩生成时记下的 `quote`。
 

@@ -7,6 +7,8 @@ import type {
   EditHealth,
   EditSummary,
   ImportResult,
+  LibraryList,
+  LibrarySource,
   MapRecord,
   MindMapContent,
   Pref,
@@ -74,6 +76,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) throw await toApiError(response);
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+// ---- 基础服务 ----
+
+/**
+ * 后端自己报的版本。线上由 `deploy/install.sh` 写进 `MINDMAP_VERSION`，
+ * 本机跑源码时是 `dev`——页面标题旁显示它，用来确认域名上跑的是哪一次部署。
+ */
+export interface Health {
+  status: string;
+  version: string;
+}
+
+export function getHealth(): Promise<Health> {
+  return request<Health>('/health');
 }
 
 // ---- 保存与打开 ----
@@ -385,6 +402,21 @@ export function deletePref(key: string): Promise<void> {
  */
 export function listPrefSuggestions(): Promise<PrefSuggestion[]> {
   return request<PrefSuggestion[]>('/prefs/suggestions');
+}
+
+// ---- 知识库 ----
+
+/**
+ * 库里的材料列表。**不受 `MINDMAP_LIBRARY_SEARCH` 影响**：那个开关管的是
+ * "生成时要不要从库里捞材料"，这里只是把库里有什么显示出来。
+ */
+export function listLibrary(limit = 50): Promise<LibraryList> {
+  return request<LibraryList>(`/knowledge/library?limit=${limit}`);
+}
+
+/** 单份材料的正文预览（后端最多回 4000 字，`truncated` 标明是否截断）。 */
+export function readLibrarySource(id: string): Promise<LibrarySource> {
+  return request<LibrarySource>(`/knowledge/library/${encodeURIComponent(id)}`);
 }
 
 // ---- 导出 ----

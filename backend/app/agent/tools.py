@@ -1286,6 +1286,20 @@ def _ref_from(item: Any, evidence: _BranchEvidence) -> dict[str, Any] | None:
     return ref
 
 
+def _ref_source_id(ref: Any) -> str | None:
+    """一条 `source_ref` 指向哪个来源。
+
+    槽位里的引用是**已经摊平成 op 草案的 dict**（`_refs_from` 的产物），但同一段
+    代码也可能拿到 `SourceRef` 实例——两种形状都要认，否则过滤时一半数据会
+    `AttributeError`（测试先撞上，线上则是整批 op 失败）。
+    """
+    if isinstance(ref, dict):
+        value = ref.get("source_id")
+    else:
+        value = getattr(ref, "source_id", None)
+    return value if isinstance(value, str) else None
+
+
 def _refs_from(item: dict[str, Any], evidence: _BranchEvidence | None) -> list[dict[str, Any]]:
     """一个子项上带的 `source_refs`。没有证据可依据时**一条都不收**。
 
@@ -3568,6 +3582,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 列出的集合"必须是同一个，否则将来任何一方向库扩展都会先在契约校验上炸一次，
     # 而那次失败看起来会像"模型返回的树不合法"。
     verify_sources = _verify_sources(ctx) if slicing else []
+    # 这次"认哪些来源"的集合：`source_usage` 与引用过滤共用它，两处口径必须一致
+    # （见 `emit` 里那句注释：不一致会让整批 op 校验失败）。
+    allowed_source_ids = {source.id for source in verify_sources}
     content = MindMapContent(
         title=root_label,
         root=Node(
@@ -3607,7 +3624,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     slot_states: dict[str, str] = {}
 
     def emit(parent_id: str, key: str, slots: list[_Slot]) -> None:
-        """把候选子树摊平成 add 草案：父节点一定排在它自己的子节点前面。"""
+        """把候选子树摊平成 add 草案：父节点一定排在自己子节点前面。"""
         for position, slot in enumerate(slots):
             child_key = f"{key}-{position}"
             child_id = f"{TEMP_ID_PREFIX}d{child_key}"
@@ -3622,8 +3639,15 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 # 长文本走这里落进树，画布上的 label 才可能真的短。
                 "detail": slot.detail,
                 # 引用在 `_refs_from` 里已经清洗过（本支证据、契约形状、条数），
-                # 这里原样带上：这一层再"顺手补一条"就会把校验过的引用变成没校验过的。
-                "source_refs": list(slot.source_refs),
+                # 这里只再按"这次认哪些来源"筛一遍：`source_usage` 是用
+                # `verify_sources` 拼的，而契约要求每条 `source_ref.source_id`
+                # 都在它里面。请求带了材料但没一份通过 `_verify_sources`（比如
+                # 客户端漏了 `status: "parsed"`）时，模型仍会按材料清单写引用，
+                # 不过滤就会整批 op 校验失败、这次调用白跑。
+                "source_refs": [
+                    ref for ref in slot.source_refs
+                    if _ref_source_id(ref) in allowed_source_ids
+                ],
             })
             if slot.children:
                 emit(child_id, child_key, slot.children)
@@ -4123,6 +4147,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             f"语义复核：{len(nli_diagnostics)} 条引用的论断与引文做过蕴含判定，{tail}；"
             "该判定是概率评分，不改变任何引用的存在与否。"
         )
+
+    readiness = _source_readiness_diagnostic(ctx)
+    if readiness is not None:
+        diagnostics.append(readiness)
 
     return ToolResult(
         ok=True,
@@ -5235,6 +5263,54 @@ def _verify_sources(ctx: RunContext) -> list[Source]:
         # 省略掉：口径分叉的代价是一类没有日志的静默剔除（见 docstring）。
         if source.status == "parsed" and (source.text or "").strip()
     ]
+
+
+def _source_readiness_diagnostic(ctx: RunContext) -> Diagnostic | None:
+    """本次带了材料、但有材料进不了校验时，说清"为什么这张图没有引用"。
+
+    为什么需要这条：`_verify_sources` 的判断是"`status == "parsed"` 且正文非空白"，
+    不满足的来源会被**静默剔除**——不抛异常、不记日志，引用于是在 `remove_invalid`
+    那一步消失。而契约里 `Source.status` 的默认值是 `"pending"`
+    （`app/contracts/source.py`），所以任何没显式标成 `parsed` 的调用方都会看到
+    "材料明明在请求里、引用一条都没有"，且找不到任何解释。
+
+    前端自己构造来源时会显式写 `status: "parsed"`，今天不会踩；但这是"没有日志的
+    失败"，与仓库那条"异常必须上报"的规矩冲突——把它变成界面上看得见的一句话，
+    代价只是一条 warn 诊断。
+
+    只在**请求自带的材料**上有话说：库来源由 `_remember_library_hits` 自己负责，
+    它们没进来时不该归咎于用户勾了哪份文件。
+    """
+    requested = list(ctx.request.sources)
+    if not requested:
+        return None
+    usable = {id(source) for source in _verify_sources(ctx)}
+    dropped = [source for source in requested if id(source) not in usable]
+    if not dropped:
+        return None
+
+    pending = sum(1 for source in dropped if source.status != "parsed")
+    empty = sum(1 for source in dropped if source.status == "parsed")
+    reasons = []
+    if pending:
+        reasons.append(f"{pending} 份未标记为已解析")
+    if empty:
+        reasons.append(f"{empty} 份正文为空")
+    reason_text = "、".join(reasons) or "状态不可用"
+
+    if len(dropped) == len(requested):
+        message = (
+            f"本次带进来的 {len(requested)} 份材料都没有参与校验（{reason_text}），"
+            "因此这张图不会有任何引用——它是根据主题生成的，不是从这些材料里整理出来的。"
+        )
+    else:
+        message = (
+            f"本次带进来的 {len(requested)} 份材料里有 {len(dropped)} 份没有参与校验"
+            f"（{reason_text}），引用只可能来自其余 {len(requested) - len(dropped)} 份。"
+        )
+    return Diagnostic(
+        level=DiagnosticLevel.warn, code="SOURCE_NOT_PARSED", message=message,
+    )
 
 
 def _remember_library_hits(hits: list[EvidenceHit], ctx: RunContext) -> int:

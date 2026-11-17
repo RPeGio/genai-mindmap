@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -29,16 +30,18 @@ from app.agent.contracts import (
     DoneEvent,
     ErrorEvent,
     SnapshotEvent,
+    SourcesEvent,
 )
 from app.agent.diagram_intent import apply as apply_diagram_intent
 from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.core.errors import AppError
 from app.generation.service import GenerationError
-
-router = APIRouter(prefix="/agent", tags=["AI 代理"])
+from app.knowledge.remember import remember_sources
 
 logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/agent", tags=["AI 代理"])
 
 # SSE 的三条响应头对三条开流路径都成立，收在一处：漏掉 `X-Accel-Buffering`
 # 的那条路会在反向代理后面攒够一批才发，看起来像"卡了几十秒才出结果"。
@@ -186,10 +189,27 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         captured["ctx"] = candidate
 
     try:
+        # 材料入库排在事件流之前：入库会把临时 id 换成库里的持久 id，换完的
+        # id 必须同时送到前端（`sources` 帧）和生成上下文（重排后的 request）。
+        #
+        # **没有材料时整段跳过**：`remember_sources([])` 是空操作，而没有入库就
+        # 没有"第一帧之前的静默"，那行注释帧也就没有送出去的理由。无条件发会让
+        # "不带材料的请求，帧与加这段之前逐字节相同"这条不变量失效——那正是老
+        # 客户端最依赖的一条。
+        if body.sources:
+            yield ": 正在把材料收进知识库\n\n"
+            remembered = await run_in_threadpool(remember_sources, body.sources)
+            if remembered.mapping:
+                seq += 1
+                yield encode_event(SourcesEvent(seq=seq, mapping=remembered.mapping))
+                body = body.model_copy(update={"sources": remembered.sources})
         # `aclosing` 不是为了好看：客户端断开时这里被关掉，不显式关内层生成器，
         # 它的收尾（取消工具任务、交回候选）要等垃圾回收才执行——那段时间工具里
         # 的模型请求还在跑、还在计费。
-        async with contextlib.aclosing(run(body, on_close=on_close)) as events:
+        # `first_seq=seq+1`：`sources` 帧已占掉 seq，循环里的编号接着往下发。
+        async with contextlib.aclosing(
+            run(body, on_close=on_close, first_seq=seq + 1)
+        ) as events:
             async for event in events:
                 seq = max(seq, getattr(event, "seq", 0))
                 if isinstance(event, DoneEvent):
@@ -209,12 +229,16 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         yield encode_event(ErrorEvent(seq=seq + 1, code="generation_failed", message=str(exc)))
         finished = True
     except Exception as exc:  # noqa: BLE001 — 兜底：任何未预期异常都要变成可读的一帧
+        # 只给用户一句能看懂的话。异常类型与原文（可能带绝对路径、库结构、上游
+        # 地址）只进日志：出站帧是要给浏览器看的，不是排障现场。
+        logger.exception("生成过程中出现未预期异常（%s），已收成 agent_failed 帧",
+                         type(exc).__name__)
         resolved = runs.STATUS_FAILED
-        failure = {"code": "agent_failed", "message": f"{type(exc).__name__}: {exc}"}
+        failure = {"code": "agent_failed", "message": "生成过程中出现未预期错误，请稍后重试"}
         yield encode_event(ErrorEvent(
             seq=seq + 1,
             code="agent_failed",
-            message=f"生成过程中出错：{type(exc).__name__}: {exc}",
+            message="生成过程中出错了，请稍后重试。",
         ))
         finished = True
     finally:

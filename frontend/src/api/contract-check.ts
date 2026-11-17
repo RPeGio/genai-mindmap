@@ -34,6 +34,9 @@ import type { components } from './schema';
 import type {
   ImportResult,
   ImportWarning,
+  LibraryEntry,
+  LibraryList,
+  LibrarySource,
   MapRecord,
   MindEdge,
   MindMapContent,
@@ -90,6 +93,9 @@ export const checks = {
   savedPrefKeys: true satisfies SameKeys<SavedPref, Schemas['Saved']>,
   prefSuggestionKeys: true satisfies
     SameKeys<PrefSuggestion, Schemas['app__prefs__service__Suggestion']>,
+  libraryEntryKeys: true satisfies SameKeys<LibraryEntry, Schemas['LibraryEntry']>,
+  libraryListKeys: true satisfies SameKeys<LibraryList, Schemas['LibraryList']>,
+  librarySourceKeys: true satisfies SameKeys<LibrarySource, Schemas['LibrarySource']>,
 
   // ---- 字段形状 ----
   contentShape: true satisfies SameShape<MindMapContent, Schemas['MindMapContent-Output']>,
@@ -114,4 +120,7 @@ export const checks = {
   // 因为"界面上能显示哪两种来源"这件事本来就不该只在镜像里知道。
   prefSuggestionShape: true satisfies
     SameShape<PrefSuggestion, Schemas['app__prefs__service__Suggestion']>,
+  libraryEntryShape: true satisfies SameShape<LibraryEntry, Schemas['LibraryEntry']>,
+  libraryListShape: true satisfies SameShape<LibraryList, Schemas['LibraryList']>,
+  librarySourceShape: true satisfies SameShape<LibrarySource, Schemas['LibrarySource']>,
 };

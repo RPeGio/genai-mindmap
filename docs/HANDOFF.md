@@ -16,7 +16,9 @@
 
 ## 待确认
 
-目前没有待确认项。
+| 编号 | 日期 | 提出人 | 决策 | 影响面 | 未回复期间的默认做法 |
+|---|---|---|---|---|---|
+| H3 | 2026-11-11 | RPeGio | `main` 转为生产分支：`main` ← `dev` ← `feat/*`，里程碑时 `dev` → `main` 并在 `main` 上打 tag，**ECS 只跟 `main`**，更新与回滚都以 tag 为准；`dev` 保留为集成分支，未验证完的改动不落到生产 | `docs/PLAN.md` Q37、`docs/DEPLOY.md` 7.1 与第 8 节、`START_HERE.md` 分支规则；代码零改动 | 功能改动照旧开 PR 到 `dev`；只有 RPeGio 确认过的里程碑才合 `main` 并打 tag。若陈嘉涛反对，回退成本很低：本行改「已否决」，删掉 `docs/PLAN.md` Q37 与 `docs/DEPLOY.md` 里按 tag 更新的写法即可 |
 
 ## 已确认
 

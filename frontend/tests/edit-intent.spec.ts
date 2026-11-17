@@ -43,6 +43,12 @@ function stubFetch(reply: () => Response) {
     // 偏好是挂载时的背景请求（生成面板带预填）。它不属于这里被测的"这个入口发出
     // 什么"，进 calls 只会让 `calls[0]` 指向一个 GET。
     if (isPrefsRequest(url)) return prefsReply(url);
+    if (url.endsWith('/health')) {
+      // 挂载时探一次版本号。它是背景请求，和"点这个入口发出了什么"无关。
+      return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
     calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   });

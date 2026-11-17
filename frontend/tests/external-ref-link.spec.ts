@@ -65,7 +65,7 @@ function externalSource(url: string | null): Source {
 /** 把一份外部来源塞进本次会话（`readySources` 由 `items` 派生）。 */
 function mountSource(source: Source): void {
   useSourcesStore().items.push({
-    id: source.id, label: source.filename ?? '外部来源', kind: source.kind,
+    key: source.id, id: source.id, label: source.filename ?? '外部来源', kind: source.kind,
     state: 'ready', source, error: '', seconds: 0,
   });
 }

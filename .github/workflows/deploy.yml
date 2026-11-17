@@ -1,0 +1,107 @@
+name: Deploy
+
+# 触发：打 tag 即发布；也可以手动指定一个旧 tag 回滚。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要部署的 tag（必须已存在，例如 v0.4.8-deploy）"
+        required: true
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # 在 GitHub 托管的机器上构建：不占 ECS 的 2G 内存，也不用给它装 node。
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 解析版本号
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          tar -czf ../frontend-dist.tar.gz -C dist .
+
+      - name: 打包源码
+        run: git archive --format=tar.gz -o source.tar.gz "${{ steps.v.outputs.version }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ steps.v.outputs.version }}
+          path: |
+            source.tar.gz
+            frontend-dist.tar.gz
+          retention-days: 7
+
+  # 在 ECS 上跑（self-hosted runner）：只出站，不需要任何入方向端口。
+  deploy:
+    needs: build
+    runs-on: [self-hosted, linux, x64, genai-ecs]
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: 解析版本号
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ steps.v.outputs.version }}
+          path: /tmp/genai-release
+
+      - name: 安装
+        env:
+          DOMAIN: ${{ vars.ECS_DOMAIN || 'genai-mindmap.rpegio.top' }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          sudo -n /usr/local/sbin/genai-cd-apply \
+            --domain "$DOMAIN" \
+            --version "$VERSION" \
+            --source /tmp/genai-release/source.tar.gz \
+            --dist /tmp/genai-release/frontend-dist.tar.gz
+
+      - name: 上线自检
+        env:
+          DOMAIN: ${{ vars.ECS_DOMAIN || 'genai-mindmap.rpegio.top' }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          got="$(curl -fsS --retry 5 --retry-delay 3 "https://${DOMAIN}/api/health" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
+          echo "线上版本：$got"
+          test "$got" = "$VERSION" || {
+            echo "::error::线上版本是 $got，与期望的 $VERSION 不一致"
+            exit 1
+          }

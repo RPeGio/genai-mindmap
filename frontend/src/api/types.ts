@@ -454,6 +454,41 @@ export interface CreateTextSourceResponse {
   source: Source;
 }
 
+// ---- 知识库 ----
+
+/**
+ * 知识库里的一份材料。字段与 `backend/app/knowledge/shelf.py` 的 `LibraryEntry` 对应。
+ *
+ * `cited_by` 是"被几张**已保存导图**引用"：一张图的 `source_usage` 与它节点的
+ * `source_refs` 都算，同图内去重。它回答的是"这份材料我到底用没用过"。
+ */
+export interface LibraryEntry {
+  source_id: string;
+  filename?: string | null;
+  kind: SourceKind;
+  chars: number;
+  chunks: number;
+  created_at: string;
+  last_used_at: string;
+  cited_by: number;
+}
+
+/** 列表页：`total` 是库里的总数，不是 `items.length`。 */
+export interface LibraryList {
+  items: LibraryEntry[];
+  total: number;
+}
+
+/** 单份材料的正文预览；`truncated` 为真时界面必须说明"只是前 4000 字"。 */
+export interface LibrarySource {
+  source_id: string;
+  filename?: string | null;
+  kind: SourceKind;
+  text: string;
+  truncated: boolean;
+  total_chars: number;
+}
+
 // ---- agent 运行 ----
 
 /**
@@ -580,6 +615,15 @@ export type AgentEvent =
    * 缺席＝还没结束，`0` ＝结束了但一条没找到，两者必须分得开。
    */
   | { type: 'stage'; seq: number; stage: string; detail?: string; count?: number }
+  /**
+   * 材料入库后的 id 对照表：旧 id → 库里的持久 id。
+   *
+   * 解析接口给的是本次请求内有效的 uuid，而知识库认自己的持久 id；导图里记的
+   * `source_refs.source_id` 必须用后者，否则重新打开后引用指不到原文。收到这一帧
+   * 就把手上的来源条目就地换掉（`item.source.id` 与 `item.id` 一起换，后者是
+   * 会话内反向索引的键）。没有 id 变化时这一帧不出现。
+   */
+  | { type: 'sources'; seq: number; mapping: Record<string, string> }
   | { type: 'tool_start'; seq: number; call_id: string; name: string; args_summary?: Record<string, unknown> }
   | {
       type: 'tool_end';
@@ -608,6 +652,13 @@ export type AgentEvent =
       expandable: boolean | null;
     }
   | { type: 'snapshot'; seq: number; content: MindMapContent }
+  /**
+   * 长静默期间的保活帧。
+   *
+   * 线上实测单轮静默到过 25 秒，那段时间事件流里一个字节都没有，中间链路的空闲
+   * 超时会掐断连接。它不带业务进度：真实进度看 `stage` / `tool_start` / `node_grow`。
+   */
+  | { type: 'heartbeat'; seq: number; waited_ms: number }
   | {
       type: 'done';
       seq: number;
@@ -620,6 +671,14 @@ export type AgentEvent =
        * 是没填 mode 的旧版本——那是"没说"，不是"模型"。
        */
       mode?: 'demo' | 'model' | null;
+      /**
+       * 收尾这一轮模型说的话，**只在没产出导图时**由后端填（已截断）。
+       *
+       * 线上出现过"模型只写字、不调工具"，那时只有这一帧能说明原因；页面上
+       * 直接显示，排障不用登服务器翻日志。
+       */
+      text?: string;
+      reasoning?: string;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
 

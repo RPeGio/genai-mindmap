@@ -29,6 +29,7 @@ from app.agent.contracts import (
     AgentRunRequest,
     DoneEvent,
     ErrorEvent,
+    HeartbeatEvent,
     NodeGrowEvent,
     OpsEvent,
     RunBudget,
@@ -64,6 +65,24 @@ logger = logging.getLogger(__name__)
 
 # 校验异常可能带上模型输出，日志只需足够定位的摘要，不能随材料或树的大小增长。
 MAX_LOG_MESSAGE_CHARS = 500
+
+# 模型把工具当"可选"、直接用文字回答时，最多再提醒几次。
+# 只提醒一次：推理型模型被叫一次通常就改走工具了，叫不动的话继续空转只会烧额度。
+MAX_NUDGES = 1
+
+# 推给界面的模型原话上限：这是排障用的摘要，不是把整篇输出搬进事件流。
+MODEL_TEXT_LIMIT = 4000
+
+# 静默多久补一帧心跳。
+#
+# 线上实测（3 路并发，GLM-5.3-Flash）最长静默 25 秒，单轮首字延迟平时 5–10 秒。
+# 这段时间事件流里一个字节都没有，中间链路只要有 30–60 秒的空闲超时（企业代理、
+# Cloudflare、部分移动网络）就会把连接掐断——用户看到"连接中断"，而模型其实还在
+# 跑、还在计费。nginx 那边配的是 900 秒，救不了更靠前的链路。
+#
+# 取 10 秒而不是 25 秒：必须小于最紧的常见空闲阈值（30 秒），且留一次重试余量。
+# 再小就是把流刷成噪音，用户看到的仍是"没进展"。
+HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 
 class AgentPlan(BaseModel):
@@ -284,6 +303,25 @@ def _refresh_outline(messages: list[dict[str, Any]], ctx: RunContext) -> None:
     光大纲就把上下文吃满了。
     """
     messages[0] = {"role": "system", "content": _system_text(ctx.request, ctx.candidate)}
+
+
+def _nudge_text(registry: ToolRegistry) -> str:
+    """模型只用文字回答、没调工具时的提醒。
+
+    推理型模型（实测 `deepseek-flash`）会把工具理解成"需要时再用"，于是把导图
+    直接说成一段文字，接口层只能返回空结果。提醒必须把要求说死：走工具、别用
+    文字描述内容、现在就调。
+    """
+    names = "、".join(registry.names()) or "可用工具"
+    return (
+        "你刚才没有调用任何工具，只写了文字，这次结果里没有任何导图。"
+        f"现在必须调用 {names} 把导图作为工具参数提交："
+        "不要用文字描述导图内容，也不要解释你要怎么做，直接发出工具调用。"
+    )
+
+
+def _clip(text: str, limit: int = MODEL_TEXT_LIMIT) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _dedupe_key(call: ToolCall) -> str:
@@ -621,6 +659,49 @@ def _tool_frame(payload: dict[str, Any], seq: "itertools.count[int]") -> AgentEv
     if kind == "stage":
         return _stage_frame(payload, seq)
     return None
+@dataclass
+class _Waited:
+    """装 `_await_quietly` 的返回值。
+
+    与 `_ToolOutcome` 同一个理由：那个函数是 async generator（要一边等一边 yield
+    心跳帧），而生成器没法 `return` 一个值。
+    """
+
+    value: Any = None
+
+
+async def _await_quietly(
+    awaitable: "asyncio.Future[Any] | Any",
+    seq: "itertools.count[int]",
+    out: _Waited,
+) -> AsyncIterator[HeartbeatEvent]:
+    """等一件事完成，期间按 `HEARTBEAT_INTERVAL_SECONDS` 补心跳帧。
+
+    只该包在**会产生长静默**的等待上（模型调用、工具内部执行）。心跳不带业务
+    含义，真实进度仍由 `stage` / `tool_start` / `node_grow` 负责。
+
+    被等的 awaitable 自己负责超时（调用方传的是 `asyncio.wait_for(...)`），这里不
+    另设时限：两处都判超时的话，哪个先到就成了第二份真相。
+    """
+    task = asyncio.ensure_future(awaitable)
+    silence_started = time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SECONDS)
+            if task in done:
+                # 在这一句里抛出被等者的异常（超时、上游失败），与直接 await 一致
+                out.value = task.result()
+                return
+            yield HeartbeatEvent(
+                seq=next(seq),
+                waited_ms=int((time.monotonic() - silence_started) * 1000),
+            )
+    finally:
+        # 客户端中途断开时调用方会被关掉：不取消这个任务，模型请求还在跑、还在计费。
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 async def _run_tool(
@@ -660,15 +741,30 @@ async def _run_tool(
     ctx.emit = emit
     task = asyncio.create_task(worker())
     deadline = time.monotonic() + timeout
+    silence_started = time.monotonic()
     try:
         while True:
-            try:
-                kind, payload = await asyncio.wait_for(
-                    updates.get(), timeout=max(0.0, deadline - time.monotonic()),
-                )
-            except (asyncio.TimeoutError, TimeoutError):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 outcome.timed_out = True
                 return
+            try:
+                # 按心跳间隔切分等待：工具里可能连着跑十几次模型调用，中途只有
+                # `node_grow` 偶尔冒一帧，其余时间同样是几十秒的空档。
+                kind, payload = await asyncio.wait_for(
+                    updates.get(), timeout=min(remaining, HEARTBEAT_INTERVAL_SECONDS),
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                if deadline - time.monotonic() <= 0:
+                    outcome.timed_out = True
+                    return
+                # 没到截止时间，只是又静默了一个心跳周期
+                yield HeartbeatEvent(
+                    seq=next(seq),
+                    waited_ms=int((time.monotonic() - silence_started) * 1000),
+                )
+                continue
+            silence_started = time.monotonic()
             if kind == "emit":
                 event = _tool_frame(payload, seq)
                 if event is not None:
@@ -760,9 +856,12 @@ async def run(
     provider: ToolProvider | None = None,
     tools: ToolRegistry | None = None,
     on_close: Callable[[MindMapContent | None], None] | None = None,
+    first_seq: int = 1,
 ) -> AsyncIterator[AgentEvent]:
     """跑一次多轮工具循环，边跑边发事件。
 
+    `first_seq` 只给 `router._frames` 用：它在调这里之前可能已经发过一帧
+    （材料入库后的 `sources`），所以要接着那个号往下编，否则两帧都叫 `seq=1`。
     这一层只做一件事：**在生成器被关掉时把 `ctx.candidate` 交出去**。循环本体在
     `_loop` 里，一行都没改。
 
@@ -794,7 +893,9 @@ async def run(
         diagram_stripped=intent.stripped,
     )
     try:
-        async with contextlib.aclosing(_loop(request, ctx, provider=provider, tools=tools)) as events:
+        async with contextlib.aclosing(
+            _loop(request, ctx, first_seq=first_seq, provider=provider, tools=tools)
+        ) as events:
             async for event in events:
                 yield event
     finally:
@@ -806,11 +907,11 @@ async def _loop(
     request: AgentRunRequest,
     ctx: RunContext,
     *,
+    first_seq: int = 1,
     provider: ToolProvider | None = None,
     tools: ToolRegistry | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """多轮工具循环本体。
-
     终止只有四种：模型以 stop 收尾（done）、预算耗尽（error）、上游失败（error）、
     工具累计失败超过 `max_repairs`（error）。
     不存在"静默截断后假装成功"——那会让前端拿到一棵看起来正常、实际缺了一半
@@ -838,7 +939,7 @@ async def _loop(
         # 不写这里的话，演示模式的 run 会以"没产出"收尾，回放时前端只看到
         # 一句"模型这次没有产出导图"。
         ctx.candidate = demo
-        demo_seq = itertools.count(1)
+        demo_seq = itertools.count(first_seq)
         yield StageEvent(seq=next(demo_seq), stage="demo", detail="演示模式，不调用模型")
         yield SnapshotEvent(seq=next(demo_seq), content=demo)
         yield DoneEvent(seq=next(demo_seq), content=demo, usage={}, mode="demo")
@@ -857,10 +958,11 @@ async def _loop(
     )
     budget = request.budget
     messages = _initial_messages(request)
-    seq = itertools.count(1)
+    seq = itertools.count(first_seq)
     started = time.monotonic()
     tool_calls = 0
     failures = 0
+    nudges = 0
     usage_total: dict[str, Any] = {}
     last_call: ToolCall | None = None
     # 防线二的状态：树的内容指纹 + 连续多少次调用没让它变。
@@ -890,13 +992,24 @@ async def _loop(
 
         # 每轮刷新大纲：模型必须看到上一轮产出节点的真实 id，否则它无法精确改
         _refresh_outline(messages, ctx)
+        waited = _Waited()
         try:
             # 用剩余时间做超时，而不是让单次调用跑到 provider 自己的 60 秒上限：
             # 否则总时限形同虚设，一轮慢调用就能把预算耗尽而循环还在等。
-            completion = await asyncio.wait_for(
-                active_provider.complete_tools(messages, registry.specs(), budget=budget),
-                timeout=max(0.1, _remaining_seconds(budget, started)),
-            )
+            #
+            # 用 `_await_quietly` 而不是直接 await：单轮首字延迟平时 5–10 秒、
+            # 3 路并发下实测到过 25 秒，这段时间一帧都不发，链路空闲超时会掐断
+            # 连接（见 HEARTBEAT_INTERVAL_SECONDS 的注释）。
+            async with contextlib.aclosing(_await_quietly(
+                asyncio.wait_for(
+                    active_provider.complete_tools(messages, registry.specs(), budget=budget),
+                    timeout=max(0.1, _remaining_seconds(budget, started)),
+                ),
+                seq, waited,
+            )) as waiting:
+                async for beat in waiting:
+                    yield beat
+            completion = waited.value
         except asyncio.CancelledError:
             # 必须原样抛出：吞掉它会让"用户点了取消"变成一次正常结束
             raise
@@ -944,8 +1057,32 @@ async def _loop(
                 yield StageEvent(seq=next(seq), stage="audit_pending", detail=reminder)
                 continue
             if completion.finish_reason == "stop":
-                yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
-                                mode="model")
+                # 模型一句"好的"就收工、一个工具都没调：接口层会正常返回 done，
+                # 前端只能显示"模型这次没有产出导图"，看不出模型到底说了什么。
+                # 把它的原话记进日志（截断），下次这类空结果才有得查。
+                said = str(completion.message.get("content") or "").strip()
+                reasoning = str(completion.message.get("reasoning_content") or "").strip()
+                if ctx.candidate is None:
+                    _log_failure(
+                        ctx, tool_calls, code="no_tool_call",
+                        message=f"模型没有调用任何工具就结束，原话：{said[:200] or '（空回复）'}",
+                        level=logging.WARNING,
+                    )
+                    if nudges < MAX_NUDGES and tool_calls == 0:
+                        # 整轮一个工具都没调过、也没有产出：这是模型把导图当"作文"
+                        # 写了。把要求说死再给它一次机会；已经调过工具才开始写字的
+                        # 情况不在此列（那是它可以收尾的形态，提醒只会打乱节奏）。
+                        # 只提醒一次，叫不动就认，不在演示里空烧额度。
+                        nudges += 1
+                        messages.append({"role": "user", "content": _nudge_text(registry)})
+                        continue
+                yield DoneEvent(
+                    seq=next(seq), content=ctx.candidate, usage=usage_total, mode="model",
+                    # 没产出时把原话带上：页面上直接能看到模型说了什么，排障不用
+                    # 登服务器翻 journalctl。有产出就不填，那是正常结果。
+                    text="" if ctx.candidate is not None else _clip(said),
+                    reasoning="" if ctx.candidate is not None else _clip(reasoning),
+                )
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
                 _log_failure(ctx, tool_calls, code="unexpected_finish", message=message)

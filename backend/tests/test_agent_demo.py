@@ -116,13 +116,16 @@ class NotDemoModeTest(unittest.TestCase):
         """
         provider = _ScriptedProvider([
             Completion(message={"role": "assistant", "content": "好了"}, finish_reason="stop"),
+            # 零工具调用的收尾会先被提醒一次（见 service.MAX_NUDGES）；第二段
+            # 仍然只写字，循环就认了。这条用例只关心"没走 demo、真的调了模型"。
+            Completion(message={"role": "assistant", "content": "还是文字"}, finish_reason="stop"),
         ])
         request = AgentRunRequest(goal=TOPIC, intent="create")
 
         with patch.dict(os.environ, {"MINDMAP_LLM_MODE": ""}):
             events = _drain(request, provider)
 
-        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.calls, 2)
         self.assertEqual(events[-1].type, "done")
         self.assertIsNone(events[-1].content)
         self.assertEqual(events[-1].mode, "model")

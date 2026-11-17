@@ -173,16 +173,16 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 
 ## 10 配置项
 
-### 10.1 已实现（代码经 `os.getenv` 读取，共 11 项）
+### 10.1 已实现（代码经 `os.getenv` 读取）
 
-`.env` 文件不会自动加载，须在启动服务前设入进程环境变量；样例见 `backend/.env.example`。
+`.env` 文件不会自动加载，须在启动服务前设入进程环境变量；样例见 `backend/.env.example`。下表只列主要项，检索链路与图存储的几个开关（`MINDMAP_PARENT_RETRIEVAL`、`MINDMAP_GRAPH_SEARCH`、`MINDMAP_EMBEDDING_MODEL`、`MINDMAP_EMBEDDING_DIM`、`MINDMAP_NEO4J_URI/USER/PASSWORD/DATABASE`）和 `MINDMAP_VERSION` 见 `.env.example` 与 `docs/RAG-DECISIONS.md`。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MINDMAP_LLM_MODE` | `demo` | `demo` 不联网、返回本地占位；`model` 才调 Chat Completions 兼容接口。写成其他值会被拒 |
 | `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
 | `MINDMAP_LLM_API_KEY` | — | 调用密钥，只从环境变量读，不进代码库与日志 |
-| `MINDMAP_LLM_MODEL` | — | 模型名（当前用 `deepseek-chat`；`deepseek-flash` 是推理模型，reasoning token 波动大，未采用）。PDF 视觉识别与图片识别复用同一组变量 |
+| `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（端点 `https://api.commandcode.ai/provider/v1`），此前用 `deepseek-flash`。PDF 视觉识别与图片识别复用同一组变量 |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径，留空即取默认值 |
 | `DASHSCOPE_API_KEY` | — | 百炼语音转写（F07）。没配时 `.wav` 上传返回 422 |
 | `MINDMAP_SOFFICE_CMD` | — | `soffice` 完整路径；不配则从 `PATH` 找。`.doc`/`.ppt` 转换需要 |
@@ -190,6 +190,8 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `MINDMAP_NLI_ENABLED` | `0` | 打开引用语义复核（ONNX 模型），否则只做机械核验 |
 | `MINDMAP_NLI_MODEL_DIR` | — | ONNX 模型目录（含 `model.onnx` / `tokenizer.json` / `config.json`） |
 | `MINDMAP_NLI_MIN_FREE_MB` | — | 加载模型前要求的最小可用内存，不够则跳过 NLI |
+| `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。线上置 `0` 做纯展示（等记忆模块落地再开）；**不影响** `GET /api/knowledge/library` 只读入口 |
+| `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库。只有 `"0"` 表示关。与上面那个开关独立 |
 
 ### 10.2 规划中（当前代码不读这些变量）
 
@@ -245,5 +247,14 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.12 | 2026-11-10 | 契约 v2 在后端落地（P3 第一步）：`schema_version`、`note`、`layout`（新增 `vertical`）、`theme`、`relations`、`style`/`pos`/`collapsed` 进 `backend/app/contracts/mindmap.py`；旧记录读时补默认值（`migrate_content()`），不跑一次性脚本；导出改取 `note or label`；v1 请求体继续接受 |
 | v1.13 | 2026-11-10 | 契约 v2 前端接线（P3 第二步）：详情面板可直接编辑节点正文（`note`，≤2000 字），保存 / 打开 / 导出都按 v2 发，`toContractV1()` 与 `toExportV1()` 删除；朝向（`layout` + `theme.direction`）随内容持久化，重新打开能恢复原布局，向下对应 `layout: vertical`；`relations` / `style` / `pos` / `collapsed` 原样透传不丢。H1 结案（陈嘉涛已在 PR #13 认可） |
 | v1.14 | 2026-11-10 | 契约类型生成与漂移防线：新增 `backend/scripts/export_openapi.py` 导出 `backend/openapi.json` 快照，`npm run gen:api` 用 openapi-typescript 生成 `frontend/src/api/schema.d.ts`；手写镜像保留，但由 `frontend/src/api/contract-check.ts` 在 `vue-tsc` 期间断言与生成类型一致（键集合 + 抹平可空性后的形状）；`pytest` 增快照过期检查、CI 两个 job 各加"重新生成 + `git diff --exit-code`" |
-| v1.15 | 2026-11-10 | ECS 上线骨架（F22 部分实现）：`deploy/install.sh`（Alibaba Cloud Linux 3：dnf 依赖 → swap → `genai` 服务账号与目录 → uv 装 CPython 3.12 与依赖 → systemd → nginx 站点 + Basic Auth + 每日备份 cron）、`deploy/genai-mindmap.service`、`deploy/nginx.conf`（同源反代、SSE 关缓冲、上传 24m、读超时 900s）、`deploy/backup.sh`（`sqlite .backup` 而非 `cp`）、`docs/DEPLOY.md` 第 7、8 节。仍然不做 Docker/compose |
-| v1.16 | 2026-11-11 | `main` 转为生产分支（`Q37`）：里程碑 `dev` → `main` + 打 tag，ECS 只跟 `main`；`docs/DEPLOY.md` 第 7.1、8 节按此改写（生产 clone 默认分支、更新走 tag、回滚步骤与契约回滚的数据风险）；`START_HERE.md` 分支规则同步 |
+| v1.15 | 2026-11-10 | ECS 上线骨架（F22 部分实现）：`deploy/install.sh`（Alibaba Cloud Linux 3：dnf 依赖 → swap → `genai` 服务账号与目录 → uv 装 CPython 3.12 与依赖 → systemd → nginx 站点 + Basic Auth + 每日备份 cron）、`deploy/genai-mindmap.service`、`deploy/nginx.conf`（同源反代、SSE 关缓冲、上传 24m、读超时 900s）、`deploy/backup.sh`（`sqlite .backup` 而非 `cp`）、`docs/DEPLOY.md` 第 9、10 节。仍然不做 Docker/compose |
+| v1.16 | 2026-11-11 | `main` 转为生产分支（`Q37`）：里程碑 `dev` → `main` + 打 tag，ECS 只跟 `main`；`docs/DEPLOY.md` 第 9.1、10 节按此改写（生产 clone 默认分支、更新走 tag、回滚步骤与契约回滚的数据风险）；`START_HERE.md` 分支规则同步 |
+| v1.17 | 2026-11-11 | 部署骨架按交叉复核修八处：日志目录交给 systemd `LogsDirectory`（原 `ReadWritePaths` 指向不存在目录会 226/NAMESPACE）；`EnvironmentFile` 去掉 `-`，缺文件即启动失败而非静默回落只读路径；`TimeoutStopSec` 20 → 660 对齐 600 秒生成预算；nginx 的 `listen [::]:80` 改为按 IPv6 可用性生成（`nginx -t` 查不出 bind 失败）；`/opt` 下 dist 补 SELinux 上下文 `httpd_sys_content_t`；certbot 改 `certonly --webroot`，443 由 `deploy/nginx-tls.conf` 渲染，重跑安装脚本不再冲掉 TLS；覆盖前把代码快照到 `/var/lib/genai-mindmap/releases/`，第 10 节回滚改为解包快照（`/opt` 不是 git 工作区，`git switch` 改不到在跑的代码）；`Q37` 登记进 `docs/HANDOFF.md` 的 H3 |
+| v1.18 | 2026-11-11 | 依赖安装不再依赖公网：`deploy/setup-python.sh` 的 PyPI 源改成"公网阿里云 → ECS 内网镜像 → 官方"依次尝试（http 源自动带 `--trusted-host`），新增 `docs/DEPLOY.md` 第 11 节讲出网受限时的探测与离线安装；同时修掉 DEPLOY 章节号重复——原 ECS 两节顺延为第 9、10 节，交叉引用（`deploy/install.sh`、`START_HERE.md`、`TEAM-GUIDE.md`、`FEATURES_AND_OWNERS.md`）一并改指 |
+| v1.19 | 2026-11-13 | 可观测性（线上排障被"看不见模型说了什么"卡住）：`/api/health` 的 `version` 改为读 `MINDMAP_VERSION`（缺省 `dev`），页面标题旁显示版本徽章；`done` 事件在没有产出候选时带 `text` / `reasoning`（各截断 4000 字），右侧"模型协作"面板直接显示模型原话与思考，不再依赖 `journalctl` 里那条未必出现的 WARNING；`deploy/install.sh` 新增 `--version` 参数（tar 包没有 `.git`，`git describe` 拿不到 tag） |
+| v1.20 | 2026-11-13 | 部署自动化：新增 `.github/workflows/deploy.yml`，**打 tag 即发布**（构建前端 → `git archive` → scp → `install.sh --version <tag>` → 换 dist → reload → 用 `/api/health` 比对版本号自检，不一致让 job 红）；`docs/DEPLOY.md` 第 12 节写一次性配置（4 个 secret、部署专用 ed25519 密钥、22 端口必须公网可达的安全前提与 fail2ban）、日常发布与 `workflow_dispatch` 回滚。选择"Actions 推"而不是"服务器拉"的原因：这台 ECS 连不上 GitHub，self-hosted runner 也起不来 |
+| v1.21 | 2026-11-14 | CD 换成零入方向端口：ECS 实测出站已恢复（`curl https://github.com` 与 `api.github.com` 均 200），于是放弃"Actions 直连 SSH"（那要求 22 对 `0.0.0.0/0` 开放，是全套部署里最大的敞口），改为在 ECS 上装 **self-hosted runner**（标签 `genai-ecs`），构建仍放 GitHub 托管机、artifact 交给 runner 安装。新增 `deploy/cd-apply.sh`（root 拥有的唯一特权入口，由 `install.sh` 装到 `/usr/local/sbin/genai-cd-apply`）与 `deploy/install-runner.sh`（取 runner 最新版、建 `ghrunner` 用户、注册服务、写单行 sudoers）；`deploy.yml` 改成 `build` + `deploy` 两个 job；不再需要 `ECS_HOST`/`ECS_USER`/`ECS_SSH_KEY` 三个 secret，只用可选仓库变量 `ECS_DOMAIN`；`docs/DEPLOY.md` 第 12 节重写（为什么改、一次性配置三步、排障表） |
+| v1.22 | 2026-11-16 | 演示兜底：新增 `frontend/src/demo/presets.ts`（三张预置导图，打成独立 chunk 约 6.6 kB，生产也带）与右上角「演示示例」按钮，**只在用户点击时加载**——模型失败仍然如实报错，不自动顶替（否则演示现场分不清哪张是真生成的），载入后徽章显示「演示模式（非 AI 生成）」、`mapId` 为空所以第一次保存是新建。另修两处"材料不可用"的静默失败：`SOURCE_NOT_PARSED` 诊断（带了几份材料、几份没参与校验）与深层生成按 `source_usage` 过滤引用（此前整批 op 校验失败，白跑一轮模型） |
+| v1.23 | 2026-11-16 | 换模型服务商：线上从 `api.deepseek.com` + `deepseek-flash` 换成 `https://api.commandcode.ai/provider/v1` + `z-ai/glm-5.3-flash`（官方 API 峰谷计费，峰时价格翻倍，压测烧钱）。代码零改动即可换家——端点只要满足 `tools` 真被调用、`stream: true` 出增量、`max_tokens` 有上限可学。`agent/provider.py` 的 `DeepSeekProvider` 改名 `OpenAICompatibleProvider`（类名带供应商名会让下一个人以为换家要改代码）；`docs/DEPLOY.md` 第 8 节补「换模型服务商」三条硬要求与换家后的自检清单。换家实测 3/3 出图（80 / 69 / 51 节点），带材料那条 14 条引用逐字对上原文 |
+| v1.24 | 2026-11-16 | 长静默心跳：`/api/agent/runs/stream` 新增 `heartbeat` 帧（`{seq, type, waited_ms}`，静默每满 10 秒一帧），两个静默点都发——模型调用 `await` 期间与工具执行期间的等待队列；线上实测 3 路并发最长静默 25.1 秒，而中间链路常见空闲超时是 30–60 秒，超了就会静默掐断连接。前端把 `waitedMs` 接上（此前这个计数器没有任何写入方，`SourceInputs.vue` 的"已等待 N 秒"永不显示），静默达 10 秒时状态行文案换成"模型正在思考，已等 N 秒"（替掉阶段文案而非并列），任何非心跳帧到达即归零。心跳只保活、不带业务进度，EOF 无终态帧仍按连接中断处理 |
+| v1.25 | 2026-11-16 | 知识库只读入口：新增 `GET /api/knowledge/library`（列表 + 每份被几张已保存导图引用）与 `GET /api/knowledge/library/{source_id}`（正文前 4000 字），顶栏「知识库」抽屉展示，点开看正文。**材料在生成时才入库**（新 `backend/app/knowledge/remember.py`，开关 `MINDMAP_LIBRARY_REMEMBER`）——上传时还不知道这份材料会不会被用到，废文件会占满库且 `prune` 按 `last_used_at` 保留会一直留着它们。入库后持久 id 与解析时的临时 id 不同，所以事件流最前面多一帧 `sources`（`{seq, type:"sources", mapping:{旧:新}}`），前端就地改本地条目 id；之后保存的导图、节点引用、取原文都用持久 id，重开也能对上。`cited_by` 按"几张导图"计（`source_usage` 与节点 `source_refs` 都算、同图去重），不按命中次数——用户要的是"这份材料还在被用"。入口只读且**不受 `MINDMAP_LIBRARY_SEARCH` 影响**：那个开关管的是生成时要不要从库里捞材料，线上先置 0 做纯展示，等记忆模块落地再开。另修 404 文案：`HTTPException(detail=...)` 会被全局处理器兜成"请求处理失败（HTTP 404）"，改成 `AppError("not_found", …)` 后顶层 `message` 才是真正原因 |

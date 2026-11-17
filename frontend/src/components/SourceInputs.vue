@@ -44,6 +44,7 @@ const problem = computed(() => sources.materialProblem);
  */
 const showRefState = computed(() => !!store.content);
 
+
 function refCount(sourceId: string): number {
   return store.refIndex.counts[sourceId] ?? 0;
 }
@@ -142,7 +143,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       添加多个来源后一起生成；不加材料也行，直接在画布右上角写一个主题。
     </p>
     <ul v-else aria-label="待生成来源" class="flex flex-col gap-2">
-      <li v-for="item in sources.items" :key="item.id" class="rounded-md border border-slate-200 p-2">
+      <li v-for="item in sources.items" :key="item.key" class="rounded-md border border-slate-200 p-2">
         <div class="flex items-start gap-2 text-xs">
           <span class="shrink-0 rounded bg-slate-100 px-1 py-0.5 text-slate-500">{{ SOURCE_LABELS[item.kind] }}</span>
           <span class="min-w-0 flex-1 break-words font-medium text-slate-700">{{ item.label }}</span>
@@ -151,7 +152,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
             class="shrink-0 text-slate-400 hover:text-rose-600 disabled:opacity-50"
             :aria-label="`移除 ${item.label}`"
             :disabled="generating"
-            @click="sources.remove(item.id)"
+            @click="sources.remove(item.key)"
           >移除</button>
         </div>
         <p v-if="item.state === 'queued'" class="mt-1 text-xs text-slate-500">等待解析…</p>
@@ -193,7 +194,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
         </template>
         <template v-else-if="item.state === 'failed'">
           <p role="alert" class="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-rose-700">{{ item.error }}</p>
-          <button type="button" class="mt-1 text-xs text-slate-700 underline disabled:opacity-50" :disabled="generating" @click="sources.retry(item.id)">
+          <button type="button" class="mt-1 text-xs text-slate-700 underline disabled:opacity-50" :disabled="generating" @click="sources.retry(item.key)">
             重试解析
           </button>
         </template>

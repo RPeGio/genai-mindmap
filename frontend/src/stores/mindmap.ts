@@ -9,6 +9,7 @@ import { acceptEvent, diffEdits, EDIT_EVENT_LIMIT, type EditActor, type EditEven
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
+import { useSourcesStore } from './sources';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -611,7 +612,11 @@ function flatten(root: MindNode): FlatNode[] {
  */
 export const INITIAL_STATUS = '写一个主题后生成，节点会边生成边出现。';
 
-export const useMindMapStore = defineStore('mindmap', () => {  const content = ref<MindMapContent | null>(null);
+export const useMindMapStore = defineStore('mindmap', () => {
+  // 只为了在收到 `sources` 帧时把来源 id 换成持久 id（见 runGeneration）。
+  // 依赖方向是单向的：sources 不认识 mindmap，反过来才会。
+  const sourcesStore = useSourcesStore();
+  const content = ref<MindMapContent | null>(null);
   /**
    * 这张图是怎么来的。顶栏那一小块徽标按它换文案。
    *
@@ -2461,6 +2466,24 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
   }
 
   /**
+   * 载入一张预置的演示导图（内容见 `frontend/src/demo/presets.ts`）。
+   *
+   * 复用 `preview` 的"换图即换会话"处理：不做的话，上一张图在途的保存响应回来时
+   * 会把旧 id 写进 `mapId`，画布是新图、身份却是旧图。`mapId` 保持为空，所以第一次
+   * 保存会新建记录，不会覆盖别人的图。
+   *
+   * 只改一句状态文案：预置图是内容完整的演示材料，不是"用来看布局的示例"。
+   */
+  function loadPreset(preset: {
+    label: string;
+    content: MindMapContent;
+    direction: Direction;
+  }) {
+    preview(preset.content, preset.direction);
+    status.value = `已载入预置演示导图「${preset.label}」：可以直接改，也可以保存成一张新导图。`;
+  }
+
+  /**
    * 掐掉在途的 agent 运行。
    *
    * 取消只是停止这一轮：画布上的 `content` 从来没被这一轮碰过（候选落地要用户
@@ -2477,6 +2500,9 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     // 取消/换图同理：长到一半的预览属于已经结束的那一次运行。
     clearAgentPreview();
     stageText.value = '';
+    // 这一轮已经结束，"等了多久"不再有意义：不清的话，静默超 10s 后点取消，
+    // 界面会一边写"已取消。"、一边挂着"模型正在思考，已等 20 秒"。
+    waitedMs.value = 0;
     status.value = '已取消。';
   }
 
@@ -2647,10 +2673,26 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，
         // 否则旧回调会把新请求刚设好的 stageText / status / candidate 覆盖掉。
         if (controller !== ctrl) return;
+        // 心跳不进 `agentEvents`：它只驱动状态行的"已等 N 秒"，面板里没有任何地方
+        // 读它。而每帧都整数组复制是 O(n²)——长静默会累积几十帧，没必要为纯保活
+        // 的帧付这个成本。
+        if (event.type === 'heartbeat') {
+          waitedMs.value = Math.round(event.waited_ms / 1000);
+          return;
+        }
         agentEvents.value = [...agentEvents.value, event];
+        // 真进度帧到了，静默就结束了：等待计时必须跟着归零，否则「已等 25 秒」
+        // 会一直挂在状态行上，看起来像卡住了——而那会儿节点已经在长。
+        waitedMs.value = 0;
         switch (event.type) {
           case 'stage':
             stageText.value = event.detail || event.stage;
+            break;
+          case 'sources':
+            // 后端刚把材料写进知识库，临时 id 已被换成持久 id。不换的话这张图里
+            // 的 `source_refs.source_id` 重新打开后指不到原文——引用计数、点开看
+            // 原文、会话内反向索引全部失效，而且是静默失效。
+            sourcesStore.remap(event.mapping);
             break;
           case 'tool_start':
             // 状态行显示的也是人话：用户读不到 `mindmap_generate` 这种函数名。
@@ -2739,6 +2781,8 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
         agentRunning.value = false;
         busy.value = false;
         stageText.value = '';
+        // 断流/异常退出时同理：这一轮已经结束，别再留着"模型正在思考"。
+        waitedMs.value = 0;
       }
     }
   }
@@ -2948,6 +2992,7 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     cancel,
     preview,
     importMap,
+    loadPreset,
     select,
     locate,
     setDirection,

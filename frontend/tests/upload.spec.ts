@@ -51,6 +51,15 @@ function stubFetch(handler: (call: Call) => Response | Promise<Response>) {
       // 偏好是挂载时的背景请求（生成面板带预填），不属于这里被测的上传/生成动作：
       // 它既不该进 `calls`，也不该被各用例的 handler 当成"下一个业务请求"。
       if (isPrefsRequest(call.url)) return prefsReply(call.url);
+      // 页面挂载时会探一次 /api/health 取版本号。它和这里的业务断言无关，
+      // 单独答掉且不计入 calls——否则"只发了一个请求"这类断言会被它带偏。
+      if (call.url.endsWith('/health')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'ok', version: 'test' }),
+        } as unknown as Response;
+      }
       calls.push(call);
       return handler(call);
     }),
@@ -281,7 +290,7 @@ describe('多来源输入界面', () => {
     stubFetch(() => jsonResponse({ source: source({ kind: 'audio', filename: audioFile.name }) }));
     const { wrapper, sources } = mountApp();
     sources.items = [{
-      id: 'text-1', label: '文本 1', kind: 'text', state: 'ready',
+      key: 'text-1', id: 'text-1', label: '文本 1', kind: 'text', state: 'ready',
       source: { ...source(), id: 'text-1', kind: 'text', filename: null, text: '讨论主题' },
       error: '', seconds: 0,
     }];

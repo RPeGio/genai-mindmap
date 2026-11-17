@@ -57,6 +57,13 @@ function stubFetch(reply: () => Response) {
     const url = String(input);
     // 偏好是挂载时的背景请求，不属于"点一次展开发出了什么"，不进 calls。
     if (isPrefsRequest(url)) return prefsReply(url);
+    // 页面挂载时会探一次 /api/health 取版本号，不算业务请求
+    if (url.endsWith('/api/health')) {
+      return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
     calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   });

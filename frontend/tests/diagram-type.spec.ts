@@ -53,6 +53,12 @@ function stubFetch(reply: () => Response) {
     // 偏好那两个请求是挂载时的背景动作（生成面板要带着偏好预填），不属于这里
     // 被测的"选了图型之后请求体长什么样"，所以不进 calls。
     if (isPrefsRequest(url)) return prefsReply(url);
+    if (url.endsWith('/health')) {
+      // 挂载时探一次版本号。它是背景请求，和"点这个入口发出了什么"无关。
+      return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
     calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   }));
