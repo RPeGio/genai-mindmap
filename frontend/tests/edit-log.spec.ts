@@ -53,17 +53,55 @@ describe('diffEdits：改了什么', () => {
     }]);
   });
 
-  it('删一棵子树：每个节点一条 remove，各自带删除前的层数', () => {
+  it('删一整支：只有一条 remove，带着整支的节点数', () => {
     const before = content(node('root', '主题', [node('a', '甲', [node('b', '乙', [node('c', '丙')])])]));
 
     const events = diffEdits(before, content(node('root', '主题', [])), { actor: 'user', at: AT });
 
-    expect(events.map(event => [event.kind, event.nodeId, event.depth])).toEqual([
-      ['remove', 'a', 2],
-      ['remove', 'b', 3],
-      ['remove', 'c', 4],
+    // 每个后代各记一条会让 removed_depth 在 2…5 层各留几条，读起来像"每层都在被删"，
+    // 而真实动作只有一个：删掉了一支。
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      kind: 'remove', nodeId: 'a', depth: 2, subtreeSize: 3,
+    });
+    expect(events[0].before).toBe('甲');
+    expect(events[0].after).toBeUndefined();
+  });
+
+  it('删一个叶节点：subtreeSize 是 1（零散删除）', () => {
+    const before = content(node('root', '主题', [node('a', '甲'), node('b', '乙')]));
+    const after = content(node('root', '主题', [node('b', '乙')]));
+
+    expect(diffEdits(before, after, { actor: 'user', at: AT })).toEqual([{
+      actor: 'user', at: AT, kind: 'remove', nodeId: 'a', before: '甲', depth: 2, subtreeSize: 1,
+    }]);
+  });
+
+  it('删两支：每支各一条，各自数各自的节点', () => {
+    const before = content(node('root', '主题', [
+      node('a', '甲', [node('a1', '甲1')]),
+      node('b', '乙', [node('b1', '乙1'), node('b2', '乙2', [node('b21', '乙21')])]),
+    ]));
+
+    const events = diffEdits(before, content(node('root', '主题', [])), { actor: 'user', at: AT });
+
+    expect(events.map(event => [event.nodeId, event.subtreeSize, event.depth])).toEqual([
+      ['a', 2, 2],
+      ['b', 4, 2],
     ]);
-    expect(events.every(event => event.before && event.after === undefined)).toBe(true);
+  });
+
+  it('删节点但子节点被改派活下来：subtreeSize 只数真的消失的那个', () => {
+    // 直接用"旧子树的节点数"会把活下来的 a1 也算进去，于是"删了 1 个"被读成"删了 2 个"。
+    const before = content(node('root', '主题', [node('a', '甲', [node('a1', '甲1')])]));
+    const after = content(node('root', '主题', [node('a1', '甲1')]));
+
+    const events = diffEdits(before, after, { actor: 'user', at: AT });
+
+    expect(events.map(event => [event.kind, event.nodeId, event.subtreeSize ?? null])).toEqual([
+      ['move', 'a1', null],
+      ['remove', 'a', 1],
+    ]);
   });
 
   it('换父是 move，前后是两边的父标题', () => {
@@ -249,20 +287,100 @@ describe('store：事件攒到保存时提交', () => {
     await store.runGeneration('把甲改个名', 'edit');
     expect(store.acceptCandidate()).toBe('applied');
 
-    expect(store.pendingEdits.length).toBeGreaterThan(0);
-    expect(store.pendingEdits.every(event => event.actor === 'agent')).toBe(true);
-    expect(store.pendingEdits[0].runId).toMatch(/^run-/);
-    expect(store.pendingEdits[0].after).toBe('改过的甲');
+    const changes = store.pendingEdits.filter(event => event.kind !== 'accept');
+    expect(changes.length).toBeGreaterThan(0);
+    expect(changes.every(event => event.actor === 'agent')).toBe(true);
+    expect(changes[0].runId).toMatch(/^run-/);
+    expect(changes[0].after).toBe('改过的甲');
   });
 
-  it('create 意图接受候选不产生事件（整棵树都是新的）', async () => {
+  it('create 意图接受候选：一条 accept，changeCount 为 0', async () => {
+    // 整棵树不是 diff，但"接受"这个动作必须留痕——否则"一字未改"与"从没用过"
+    // 在表里是同一件事，而缺的正是那个分母。
     const store = useMindMapStore();
     stubFetch(() => streamWithDone(tree()));
 
     await store.runGeneration('做一张图', 'create');
+    expect(store.acceptCandidate()).toBe('applied');
+
+    expect(store.pendingEdits).toHaveLength(1);
+    expect(store.pendingEdits[0]).toMatchObject({
+      actor: 'user', kind: 'accept', changeCount: 0,
+    });
+    expect(store.pendingEdits[0].nodeId).toBeUndefined();
+    expect(store.pendingEdits[0].field).toBeUndefined();
+    expect(store.pendingEdits[0].runId).toMatch(/^run-/);
+  });
+
+  it('expand 意图接受候选也记一条 accept，changeCount 是这次改动的条数', async () => {
+    const store = useMindMapStore();
+    store.preview(tree(), 'right');
+    store.select('a');
+    const grown = content(node('root', '主题', [node('a', '甲', [node('b', '乙'), node('a1', '新增')])]));
+    stubFetch(() => streamWithDone(grown));
+
+    await store.runGeneration('展开甲', 'expand');
+    expect(store.acceptCandidate()).toBe('applied');
+
+    const accepts = store.pendingEdits.filter(event => event.kind === 'accept');
+    expect(accepts).toHaveLength(1);
+    expect(accepts[0].actor).toBe('user');
+    // 新增一个子节点 = 1 条 add，加上 accept 自己两条事件。
+    expect(accepts[0].changeCount).toBe(1);
+    expect(store.pendingEdits).toHaveLength(2);
+    expect(store.pendingEdits[0]).toMatchObject({ actor: 'agent', kind: 'add' });
+  });
+
+  it('edit 意图接受一份"什么都没改"的候选：仍然记一条 accept(0)', async () => {
+    // 用户点了应用，模型交回来的树一模一样。这也是"用户接受了生成结果"的一次真实
+    // 观测，跳过它等于把正样本删掉。
+    const store = useMindMapStore();
+    store.preview(tree(), 'right');
+    stubFetch(() => streamWithDone(tree()));
+
+    await store.runGeneration('什么也别改', 'edit');
+    expect(store.acceptCandidate()).toBe('applied');
+
+    expect(store.pendingEdits).toHaveLength(1);
+    expect(store.pendingEdits[0]).toMatchObject({
+      actor: 'user', kind: 'accept', changeCount: 0,
+    });
+  });
+
+  it('accept 与它带来的改动共享同一个 at', async () => {
+    const store = useMindMapStore();
+    store.preview(tree(), 'right');
+    stubFetch(() => streamWithDone(content(node('root', '主题', [node('a', '改过的甲', [node('b', '乙')])]))));
+
+    await store.runGeneration('把甲改个名', 'edit');
     store.acceptCandidate();
 
-    expect(store.pendingEdits).toEqual([]);
+    // 同一个 at 是"这次操作产生了哪几条事件"的唯一分组依据（GROUP BY at）。
+    expect(new Set(store.pendingEdits.map(event => event.at)).size).toBe(1);
+  });
+
+  it('删整支只写一条 remove，subtreeSize 是整支的节点数', () => {
+    const store = useMindMapStore();
+    store.preview(content(node('root', '主题', [
+      node('a', '甲', [node('b', '乙', [node('c', '丙')])]),
+    ])), 'right');
+
+    store.deleteNode('a');
+
+    expect(store.pendingEdits).toHaveLength(1);
+    expect(store.pendingEdits[0]).toMatchObject({
+      actor: 'user', kind: 'remove', nodeId: 'a', depth: 2, subtreeSize: 3,
+    });
+  });
+
+  it('删一个叶节点：subtreeSize 是 1', () => {
+    const store = useMindMapStore();
+    store.preview(tree(), 'right');
+
+    store.deleteNode('b');
+
+    expect(store.pendingEdits).toHaveLength(1);
+    expect(store.pendingEdits[0]).toMatchObject({ kind: 'remove', nodeId: 'b', subtreeSize: 1 });
   });
 
   it('保存成功后清空', async () => {
@@ -319,11 +437,21 @@ describe('store：事件攒到保存时提交', () => {
 
   it('单次保存最多 500 条，剩下的留到下一次', async () => {
     const store = useMindMapStore();
-    const kids = Array.from({ length: 520 }, (_, index) => node(`k${index}`, `节点${index}`));
-    store.preview(content(node('root', '主题', [node('big', '大块', kids)])), 'right');
-
-    store.deleteNode('big');
-    expect(store.pendingEdits).toHaveLength(521);
+    store.preview(tree(), 'right');
+    // 直接填队列：这一条验的是 `save()` 的分批，不是"怎么攒出 521 条"。真改 521 次
+    // 会让每次改动都把整棵树序列化进撤销栈，满套件并发跑时会被挤到超时——那个耗时
+    // 与被测行为无关。怎么攒出这些事件由上面那些用例各自钉住。
+    const total = EDIT_EVENT_LIMIT + 21;
+    store.pendingEdits = Array.from({ length: total }, (_, index) => ({
+      actor: 'user' as const,
+      kind: 'update' as const,
+      field: 'label' as const,
+      nodeId: `n${index}`,
+      before: '甲',
+      after: '乙',
+      depth: 2,
+      at: '2026-11-17T09:31:02.123Z',
+    }));
 
     stubFetch(() => jsonResponse(RECORD));
     await store.save();
@@ -341,6 +469,37 @@ describe('store：事件攒到保存时提交', () => {
     expect(store.pendingEdits).toHaveLength(0);
   });
 
+  it('subtree_size 以 snake_case 进请求体', async () => {
+    const store = useMindMapStore();
+    store.preview(tree(), 'right');
+    store.deleteNode('a');
+    stubFetch(() => jsonResponse(RECORD));
+
+    await store.save();
+
+    const post = calls.find(call => call.method === 'POST')!;
+    expect((post.body.events as Record<string, unknown>[])[0]).toMatchObject({
+      kind: 'remove', node_id: 'a', subtree_size: 2,
+    });
+  });
+
+  it('accept 的 change_count 以 snake_case 进请求体', async () => {
+    const store = useMindMapStore();
+    stubFetch(() => streamWithDone(tree()));
+    await store.runGeneration('做一张图', 'create');
+    store.acceptCandidate();
+
+    stubFetch(() => jsonResponse(RECORD));
+    await store.save();
+
+    const post = calls.find(call => call.method === 'POST')!;
+    // 后端 `EditEventIn` 是 `extra="forbid"`：字段名漂移的表现是保存直接 422，
+    // 所以这一条只能靠"请求体里真的叫 change_count"来钉。
+    expect((post.body.events as Record<string, unknown>[])[0]).toMatchObject({
+      actor: 'user', kind: 'accept', change_count: 0,
+    });
+  });
+
   it('撤销与重做不产生事件', () => {
     const store = useMindMapStore();
     store.preview(tree(), 'right');
@@ -355,8 +514,7 @@ describe('store：事件攒到保存时提交', () => {
     expect(store.pendingEdits).toHaveLength(before);
   });
 
-  it('换图把上一张图的事件作废，不会串到新记录上', () => {
-    const store = useMindMapStore();
+  it('换图把上一张图的事件作废，不会串到新记录上', () => {    const store = useMindMapStore();
     store.preview(tree(), 'right');
     store.commitLabel('a', '新标题');
     expect(store.pendingEdits).toHaveLength(1);

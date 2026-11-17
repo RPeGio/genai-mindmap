@@ -684,13 +684,22 @@ export interface PrefSuggestion {
 /** 一条改动。`at` 与 `depth` 的语义见 `src/mindmap/edit-log.ts`。 */
 export interface EditEventPayload {
   actor: 'user' | 'agent';
-  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style';
+  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept';
   node_id?: string;
   field?: 'label' | 'title' | 'detail' | 'note' | 'color' | 'icon';
   /** 摘要，不是内容（`detail`/`note` 只存 `"1800字"` 这种长度）。 */
   before?: string;
   after?: string;
   depth?: number;
+  /**
+   * 这条 `remove` 一共删掉几个节点（含自己）。`1` = 零散删除，`12` = 整支一起删。
+   *
+   * 只有 `kind='remove'` 有值；`subtree_size` 为空的老数据是"当时没记"，统计里
+   * 单列成 `removed_subtree.size_unknown`，不会被当成 `1` 混进 `removed_depth`。
+   */
+  subtree_size?: number;
+  /** 这次 `accept` 带来的改动条数，`0` = 一字未改。只有 `kind='accept'` 有值。 */
+  change_count?: number;
   run_id?: string;
   at: string;
 }
@@ -715,11 +724,46 @@ export interface EditEventRow extends EditEventPayload {
  */
 export interface EditSummary {
   total: number;
+  /** 最近一条事件的**入库**时刻；空表是 `null`（不是空串）。死表探测器的读数。 */
+  last_event_at: string | null;
   by_actor: Record<string, number>;
   by_kind: Record<string, number>;
   by_field: Record<string, number>;
-  /** 变短的标题改动。`count` 为 0 时两个平均值为 `null`（不是 0）。 */
+  /** 变短的标题改动，**只算 `actor='user'`**。`count` 为 0 时两个平均值为 `null`。 */
   label_shrunk: { count: number; avg_before: number | null; avg_after: number | null };
-  /** 删掉的节点按层分布，键是层数（根=1）的字符串形式。 */
+  /**
+   * 删掉的节点按层分布，键是层数（根=1）的字符串形式。
+   *
+   * **只统计零散删除**（`subtree_size = 1`）：一条 remove 现在代表一整棵被删的
+   * 子树，根所在的层不等于"这一层的内容被嫌弃"。
+   */
   removed_depth: Record<string, number>;
+  /**
+   * 删除规模直方图：`{size_1: 5, size_12: 1, size_unknown: 2}`。
+   *
+   * `size_unknown` 是加列之前的老数据（`subtree_size` 为 NULL），它们**不进**
+   * `removed_depth`——否则那次"每层都在被删"的污染还在。
+   */
+  removed_subtree: Record<string, number>;
+}
+
+/**
+ * 跨图的链路健康检查（`GET /mindmaps/edits/health`）。
+ *
+ * 判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**——每次应用候选都记
+ * 一条 `accept`，连一字未改也记。所以"昨日有保存、昨日零事件"只能是链路断了
+ * （前端在发、后端在丢）。这正是那张表能静默坏上 40 分钟的原因：它没有死表探测器。
+ */
+export interface EditHealth {
+  /** 统计窗口：UTC 昨日整天（`[window_start, window_end)`，与库里时间格式一致）。 */
+  window_start: string;
+  window_end: string;
+  /** 昨日有编辑事件的图数（`COUNT(DISTINCT map_id)`）。 */
+  edited_maps: number;
+  /** 昨日保存过的图数。`mindmaps.updated_at` 只留最后一次保存，所以这是下界。 */
+  saved_maps: number;
+  /** `saved_maps > 0 && edited_maps === 0`：日志链路可能是断的。 */
+  chain_suspect: boolean;
+  /** 一句话结论，界面直接显示。 */
+  detail: string;
 }

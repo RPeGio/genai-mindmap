@@ -43,12 +43,14 @@ move。所以 index 变化只有在**该父节点的子 id 集合完全没变**�
 ```ts
 type EditEvent = {
   actor: 'user' | 'agent'
-  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style'
+  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept'
   nodeId?: string          // edge 事件填源节点；title 事件没有节点
   field?: EditField        // 只在 update / style 上有值
   before?: string          // 摘要，不是内容
   after?: string
   depth?: number           // 节点层数，根是 1
+  subtreeSize?: number     // remove：这条一共删掉几个节点（含自己）
+  changeCount?: number     // accept：这次接受带来几处改动，0 = 一字未改
   runId?: string           // 这次改动动的是哪个 run 的产物
   at: string               // 同一次提交共享同一个值
 }
@@ -66,10 +68,39 @@ type EditEvent = {
 | `color` / `icon` | 原值或 `"无"` | 它是键不是内容 |
 | `move` | 父标题或 `"第2位"` | id 对统计没用，标题读得懂 |
 | `edge` | `"A → B（是）"` | 边只有 id，人对不上 |
-| `depth` | 层数，`remove` 填删除前所在层 | `removed_depth` 直接 `GROUP BY` 它 |
+| `depth` | 层数，`remove` 填删除前所在层 | `removed_depth` 按它分组（只对零散删除） |
+| `subtreeSize` | `remove` 删掉的节点数，含自己 | 一整支被删只该有一条事件 |
+| `changeCount` | `accept` 带来的改动条数 | `0` 就是"一字未改"，最强的正样本 |
 
 `depth` 是这一版最容易被忽略、又最值钱的一个字段：没有它，"删掉的集中在第几层"
 就只能靠事后猜。
+
+## 二·五、三处"新增"，都是为了不让结论朝一个方向偏
+
+**① `accept`：补上分母。** `create` 意图接受候选时 diff 是 0 条，于是"生成完一字
+不改直接保存"在 `edit_events` 里是 0 行，与"这个用户从没用过"完全不可区分。10 张图
+里 9 张一字未改、1 张改 10 处，只统计改动会得出"标题被普遍改短"，然后去把 16 字上限
+压到 12——而那 9 张本来合适的图在表里根本没出现过。**缺的不是样本，是分母**，偏差
+方向永远朝"生成质量更差"。
+
+所以每次应用候选（`create` / `expand` / `edit` 三条路）都记**一条** `accept`，不管
+改了几处；它 `actor='user'`（点应用的是用户）、`node_id` / `field` / `depth` 全空。
+`changeCount` 用**独立的整数列**而不是塞进 `after`：`after` 的语义是"截断后的文本
+摘要"，把计数混进去，`CAST(after AS INTEGER)` 会对每一条文字摘要静默返回 0——一个看
+起来合理、实际全错的聚合，比报错糟得多。
+
+**② `subtreeSize`：别把"删了一支"读成"每层都在删"。** 以前删一整支会在 depth 2…5
+各留几条 `remove`，`removed_depth` 看起来"每层都在被删"，于是"初次生成挖太深"这个
+结论**直接不成立**（不是方向偏）。现在一条 `remove` 代表一整棵被删的子树：只有"父节
+点还在新树里"的那个节点是子树根，后代不各记一条。数的是**真的消失了**的节点——删除
+时子节点被改派到别处活下来，只有根自己算 1。
+
+统计随之分叉：`removed_depth` 只统计 `subtree_size = 1` 的零散删除；`removed_subtree`
+是删除规模直方图 `{size_1: 5, size_12: 1, size_unknown: 2}`。加列之前的老数据是
+`NULL`，**不做回填**，只进 `size_unknown`，不进 `removed_depth`——否则那次污染还在。
+
+**③ `label_shrunk` 只看 `user`。** `agent` 的改动是"模型自己又改了一遍"，不是用户的
+偏好。实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条（多出来的是 agent 的 13→10）。
 
 ## 三、提交时机：并进保存请求，不另开端点
 
@@ -94,24 +125,46 @@ type EditEvent = {
 | 不记 | 理由 |
 |---|---|
 | 撤销 / 重做 | 一次被撤销的编辑不是用户的最终意图。记了它，`label_shrunk` 会同时收到"18→9"和"9→18"，平均值被拉回中性、次数却翻倍——比不记更糟。"用户反复撤销"该是另一个指标，这一版不做。 |
-| `create` 接受候选 | 整棵树都是"新增"，那不是 diff，是把整棵树重念一遍。与 `diffCandidate` 对 `create` 返回 `null` 同一条判断。 |
+| `create` 接受候选的**整棵树** | 整棵树都是"新增"，那不是 diff，是把整棵树重念一遍。与 `diffCandidate` 对 `create` 返回 `null` 同一条判断。注意这条只否掉了"整棵树"这个载荷，**没有否掉"接受"这个动作**——动作记成一条 `accept`（见二·五）。 |
 | 换朝向 / 换布局 | 它写在 `content` 里，但回答不了"生成侧该改什么"，记下来只是噪音。 |
+
+## 四·五、死表探测器：一张永远 0 行的表不会自己喊
+
+`user_prefs` 有"尚未生效"这种标记，`edit_events` 原本没有——于是"永远是 0 行"这种
+故障能静默存在很久。实测有过 40 分钟：8000 跑着旧代码，前端在发事件、后端在丢，而每
+一张图的 `summary.total` 都是 0，看起来和"没人改过"一模一样。
+
+两条读数：
+
+- 单图：`summary` 多了 `last_event_at`（最近一条事件的**入库**时刻，空表是 `null`）。
+  `total=0` 与"这张图没人改过"长得一样，`last_event_at=null` 说的是另一件事——这张
+  图从来没有过任何事件。
+- 跨图：`GET /api/mindmaps/edits/health` 给昨日编辑过的图数 / 昨日保存的图数。
+  **判据："保存了但没有任何事件"在正常情况下不该发生**（每次应用候选都记一条
+  `accept`，连一字未改也记），所以 `saved > 0 且 edited == 0` 就是链路断了。
+
+两个方向不对称，这很重要：链路真断时它**一定**报警；反过来只会漏报（`saved_maps`
+是下界：`mindmaps` 只留最后一次保存时刻），不会因为"数据少"就报成健康。唯一的误报
+窗口是跨零点那一次保存——`updated_at` 写在事件之前几毫秒，可能落进相邻两天。
 
 ## 五、局限：不要让日志看起来能回答所有问题
 
 一次真实跑批（20 节点的旧图，用户改 12 条标题、上 3 个色、写 2 条备注、挪 1 个节点、
-加 4 个、删 10 个，再让 agent 应用一轮候选）得到：
+加 4 个、零散删 7 个、把一支 4 个节点的整支删掉，再让 agent 应用一轮候选）得到：
 
 ```
-total 38   by_actor {user:32, agent:6}
-by_kind {update:20, remove:10, add:4, style:3, move:1}
+total 37   by_actor {user:31, agent:6}      ← user 里那条是 accept
+by_kind {update:20, remove:8, add:4, style:3, move:1, accept:1}
 by_field {label:16, color:3, detail:2, note:2}
-label_shrunk {count:13, avg_before:14.4, avg_after:6.0}
-removed_depth {3:2, 4:7, 5:1}
+label_shrunk {count:13, avg_before:14.4, avg_after:6.0}   ← 只算 user
+removed_depth {3:2, 4:4, 5:1}                             ← 只算零散删除（7 条）
+removed_subtree {size_1:7, size_4:1}                      ← 另有一支 4 个节点整支被删
+last_event_at "2026-11-17T09:35:11.208Z"
 ```
 
-看起来能直接推导出两条处方：**标题太长了**（13 条缩短，14.4 → 6.0 字）、**生成挖得
-太深**（删掉的 10 个里 7 个在第 4 层）。这两条推论**都可能是错的**，而且错法各不相同：
+看起来能直接推导出三条处方：**标题太长了**（13 条缩短，14.4 → 6.0 字）、**生成挖得
+太深**（零散删掉的 7 个里 4 个在第 4 层）、**有一整支不该生成**（4 个节点被一次删掉）。
+这三条推论**都可能是错的**，而且错法各不相同：
 
 - **缩短 ≠ 太长。** 用户也可能只是在压缩视觉密度，或者这张图本来就要放进一页 PPT。
   工具有个"画布 24 字截断"，用户把 14 字改成 6 字也可能是在给节点框留白。
@@ -122,12 +175,22 @@ removed_depth {3:2, 4:7, 5:1}
   "被删的那句话写了什么"——按这一版的取舍，`label` 存了全文，所以**这一条其实能查**：
   `GET /edits` 里 `kind='remove'` 的 `before` 就是那些标题。这是设计里少有的"事后
   还能补查"的地方。
-- **`by_actor` 分不清"改"和"接受"。** `agent` 的 6 条是用户点了「应用」之后一次性
-  落地的，它不代表用户认同每一处——用户可能只想改 1 条，接受了 6 条。真正表示
-  "用户不满"的信号只有 `user` 那 32 条。
-- **样本量。** 38 条来自一张图。一张图的改动分布与"这个人怎么用这个工具"是两件事，
+- **整支被删 ≠ 某一层被嫌弃。** `size_4` 那条说的是"这一支整体没用"，它可能很浅也
+  可能很深；`removed_depth` 现在只数零散删除，正是为了让这两件事别混成一条。
+- **`by_actor` 里 `user` 含一条 `accept`。** "用户亲手改的"是 `user` 事件减去
+  `accept`；`agent` 那 6 条是用户点了「应用」之后一次性落地的，不代表用户认同每一处
+  ——用户可能只想改 1 条，接受了 6 条。`changeCount` 给的是"这次接受带来几处"，而
+  "用户是不是根本没动"要看它等于 0 的那些事件。
+- **"改了又改回去"会被记成两次改动。** 撤销重做刻意不记，但用户手工把 9 字改回 18
+  字是一次真实的 `label` 改动：`label_shrunk` 收到 18→9，也收到 9→18（后者不计入
+  `count`，因为没变短）；两条都留在 `by_field` 里。要判"这个用户改来改去"需要按
+  `node_id` 串时间线，这一版没有这个视图。
+- **"用户删了自己刚加的节点"与"删了模型生成的节点"分不开。** 两者都是
+  `kind='remove'`。要分开必须顺着 `nodeId` 回溯"它是这棵树里本来就有的、还是本次
+  会话里 `add` 出来的"——可行，但要一次跨事件的关联查询，这一版不做。
+- **样本量。** 37 条来自一张图。一张图的改动分布与"这个人怎么用这个工具"是两件事，
   而这张表只按 `map_id` 存。要回答后者，得跨图聚合（`GROUP BY map_id` 再平均），
-  这一版没有这个接口。
+  这一版没有这个接口（`/edits/health` 只回答"链路还活着吗"）。
 
 一句话：**这张表能告诉你"改动集中在哪"，不能告诉你"为什么"。** 前者已经够砍掉一
 大半的猜测（不用再开会讨论"用户到底嫌哪里不好"），后者仍然得靠看具体的那几十条
@@ -138,11 +201,11 @@ removed_depth {3:2, 4:7, 5:1}
 
 | 位置 | 内容 |
 |---|---|
-| `frontend/src/mindmap/edit-log.ts` | 类型 + `diffEdits` 纯函数（三条判断都在这里） |
-| `frontend/src/stores/mindmap.ts` | `pendingEdits` / `pushHistory(actor)` / `collectEdits`；`save()` 里分批提交、成功才清 |
-| `frontend/src/api/client.ts` | `saveBody`（空数组不发字段）、`getEditSummary`、`listEditEvents` |
-| `backend/app/contracts/edits.py` | `EditEventIn` / `EditEventRow` / `EditSummary` |
-| `backend/app/mindmaps/edits.py` | `record` / `summary` / `recent` / `clear` |
-| `backend/app/mindmaps/repository.py` | `edit_events` 表与索引 |
-| `backend/tests/test_edit_events.py` | 23 条：落库、统计、两个关键指标、五个边界 |
-| `frontend/tests/edit-log.spec.ts` | 23 条：diff 正确性、actor 区分、只存长度、500 上限、清空时机、撤销不记 |
+| `frontend/src/mindmap/edit-log.ts` | 类型 + `diffEdits` / `acceptEvent` 纯函数（三条判断与两处"分母"都在这里） |
+| `frontend/src/stores/mindmap.ts` | `pendingEdits` / `pushHistory(actor, runId, accept)` / `collectEdits`；`save()` 里分批提交、成功才清 |
+| `frontend/src/api/client.ts` | `saveBody`（空数组不发字段）、`getEditSummary`、`listEditEvents`、`getEditHealth` |
+| `backend/app/contracts/edits.py` | `EditEventIn` / `EditEventRow` / `EditSummary` / `EditHealth` |
+| `backend/app/mindmaps/edits.py` | `record` / `summary` / `health` / `recent` / `clear` |
+| `backend/app/mindmaps/repository.py` | `edit_events` 表、索引与幂等补列（`_ensure_columns`） |
+| `backend/tests/test_edit_events.py` | 36 条：落库、统计、三个关键指标、两处分母、旧表补列、五个边界 |
+| `frontend/tests/edit-log.spec.ts` | 33 条：diff 正确性、actor 区分、子树规模、accept 三条路、只存长度、500 上限、清空时机、撤销不记 |

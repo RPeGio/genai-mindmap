@@ -15,6 +15,22 @@ def db_path() -> Path:
     return Path(configured) if configured else Path(__file__).resolve().parents[2] / "data" / "mindmaps.db"
 
 
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """给已有的表补上后来才加的列。幂等。
+
+    `CREATE TABLE IF NOT EXISTS` 只保证"表存在"，不保证"列齐全"：表一旦建过，后面往
+    DDL 里加多少列都不会生效。这里显式补，是因为那张表已经有几百行真实数据，而缺列的
+    后果不是报错，是 `edits.record()` 的 INSERT 抛错被自己吞掉——**事件全部静默丢失**。
+
+    不做数据回填：新列在老行上是 NULL，而 NULL 在这里有确切含义（"当时没记"），
+    比一个编出来的 0 诚实。
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, declaration in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,8 +94,17 @@ def connect() -> sqlite3.Connection:
     # `before` / `after` 是**摘要**不是内容（`detail` 只存 `"1800字"`）：一份 2000 字
     # 的正文进这张表，它就变成了第二个 `mindmaps.content`。
     #
-    # `depth` 是节点层数（根=1）。`removed_depth` 直接对它 `GROUP BY`——"删掉的
-    # 集中在第 3 层"就是"初次生成挖得太深"的证据，这是这一版最想要的两个数之一。
+    # `depth` 是节点层数（根=1）。`removed_depth` 只对 `subtree_size = 1` 的零散删除
+    # 分组——"删掉的集中在第 3 层"就是"初次生成挖得太深"的证据，而一整支被删时根所在
+    # 的层并不代表"这一层被嫌弃"。
+    #
+    # `subtree_size` 是这条 remove 一共删掉几个节点（含自己）。一条事件代表**一整棵**
+    # 被删的子树：每个后代各记一条会让 `removed_depth` 在 2…5 层各留几条，看起来
+    # "每层都在被删"，而真实动作只有一个。
+    #
+    # `change_count` 是 `kind='accept'` 那条事件的载荷：这次接受带来几处改动，0 = 一字
+    # 未改。**与 `after` 分列**：`after` 是文本摘要，把计数混进去，`CAST(after AS INTEGER)`
+    # 会对每条文字摘要静默返回 0——一个看起来合理、实际全错的聚合。
     #
     # `at` 由前端给（事件发生的时刻），`recorded_at` 是入库时刻。分开是为了能诊断
     # "事件说它 09:31 发生、实际 09:35 才入库"——前端的时钟不可信。
@@ -97,9 +122,16 @@ def connect() -> sqlite3.Connection:
         before      TEXT,
         after       TEXT,
         depth       INTEGER,
+        subtree_size INTEGER,
+        change_count INTEGER,
         at          TEXT NOT NULL,
         recorded_at TEXT NOT NULL
     )""")
+    # `CREATE TABLE IF NOT EXISTS` 不会给**已经存在**的表补列，而线上那张表早就有
+    # 565 行了。少了这一步，`edits.record()` 的 INSERT 会因为"no such column"抛错，
+    # 被它自己的 `except` 吞掉 → **所有事件静默不落库**，正好是这张表最擅长的那种坏法
+    # （`total` 一直是 0，看着和"没人改过"一模一样）。所以补列必须幂等且在这里做。
+    _ensure_columns(conn, "edit_events", {"subtree_size": "INTEGER", "change_count": "INTEGER"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edit_events_map ON edit_events(map_id, at)")
     # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
     # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"

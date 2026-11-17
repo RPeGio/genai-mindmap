@@ -5,7 +5,7 @@ import { computed, ref } from 'vue';
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunResolved, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
-import { diffEdits, EDIT_EVENT_LIMIT, type EditActor, type EditEvent } from '../mindmap/edit-log';
+import { acceptEvent, diffEdits, EDIT_EVENT_LIMIT, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
@@ -684,8 +684,17 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
    *
    * `pushHistory()` 设置、`collectEdits()` 消费并清空。抄引用而不是抄序列化：
    * `applyContent` 每次都是整体替换 `content.value`，旧树不会被后续修改带跑。
+   *
+   * `content` 允许为 `null`：`create` 意图接受候选时画布本来是空的，那一步没有
+   * "改动之前那棵树"，但**仍然要记一条 `accept`**（否则"一字未改"在表里是 0 行，
+   * 与"从没用过"不可区分）。`accept` 为真只出现在 `acceptCandidate()` 的两条分支上。
    */
-  let editBase: { content: MindMapContent; actor: EditActor; runId?: string } | null = null;
+  let editBase: {
+    content: MindMapContent | null;
+    actor: EditActor;
+    runId?: string;
+    accept?: boolean;
+  } | null = null;
 
   const saving = ref(false);
 
@@ -1616,13 +1625,18 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
    * `agent` 只有 `acceptCandidate()` 传（用户只点了一下「应用」，改动是模型算的）。
    * 区分只能靠参数——`pushHistory()` 返回之后 `content.value` 已经是新树，那时候
    * 再想看出"谁改的"是不可能的。
+   *
+   * `accept` 只有 `acceptCandidate()` 传：它让 `collectEdits()` **无条件**多记一条
+   * `kind='accept'`，哪怕这次接受一处都没改。理由见 `mindmap/edit-log.ts` 文件头
+   * ——缺了它，那 9 张一字未改的图根本不在表里，统计只剩"改过的那些"，偏差永远朝
+   * "生成质量更差"。
    */
-  function pushHistory(actor: EditActor = 'user', runId?: string) {
+  function pushHistory(actor: EditActor = 'user', runId?: string, accept = false) {
     const current = content.value;
     if (!current) return;
     recordPast(JSON.stringify(current));
     future.value = [];
-    editBase = { content: current, actor, ...(runId ? { runId } : {}) };
+    editBase = { content: current, actor, ...(runId ? { runId } : {}), accept };
   }
 
   /** 还能撤销几步、占了多少字节：界面与测试都靠它确认字节上限真的生效。 */
@@ -1657,6 +1671,10 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
    * 一次提交内所有事件共享同一个 `at`：它是"这次操作产生了几条事件"的唯一分组依据
    * （一个字段一条事件，见 `edit-log.ts` 文件头）。
    *
+   * **应用候选时这一批的最后一定有一条 `accept`**（`base.accept`），`changeCount`
+   * 是本批改动条数。哪怕一条都没有，那条 `accept` 也照样落库——"一字未改"是最强的
+   * 正样本，跳过它等于把分母删掉。
+   *
    * 不在这里截断：截断发生在提交那一刻（`save()`），这样"超了多少条"能如实上报；
    * 在这里截掉的话，超出的部分连数都不知道。
    */
@@ -1664,11 +1682,19 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     const base = editBase;
     editBase = null;
     if (!base) return;
+    const at = new Date().toISOString();
     const events = diffEdits(base.content, after, {
       actor: base.actor,
-      at: new Date().toISOString(),
+      at,
       ...(base.runId ? { runId: base.runId } : {}),
     });
+    if (base.accept) {
+      // 排在这批最后：读起来像"这次接受的总结"，而不是"先接受、再改"。
+      events.push(acceptEvent(events.length, {
+        at,
+        ...(base.runId ? { runId: base.runId } : {}),
+      }));
+    }
     if (!events.length) return;
     pendingEdits.value = [...pendingEdits.value, ...events];
   }
@@ -1679,14 +1705,16 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
    * 与 `pushHistory()` 只差一处：画布本来是空白时也要留下一步（`'null'` 就是
    * JSON 里的空画布），否则用户点了「应用到画布」就再也退不回接受之前的样子。
    *
-   * 刻意**不设 `editBase`**：整棵树都是"新增"，那不是 diff，是把整棵树重念一遍
-   * （与 `diffCandidate` 对 `create` 返回 `null` 同一条判断，理由见 `edit-log.ts`）。
+   * **不给 `editBase.content` 填树**（本来就是空的），但 `accept` 置真：整棵树不是
+   * diff，所以本批改动是 0 条，而"接受"这个动作必须留一条 `accept` —— 它正是
+   * "生成完一字不改"的唯一证据（与 `diffCandidate` 对 `create` 返回 `null` 是同一条
+   * 判断，理由见 `edit-log.ts`）。
    */
-  function pushHistoryOrEmpty() {
+  function pushHistoryOrEmpty(runId?: string) {
     recordPast(snapshot() ?? 'null');
     // 树从这里长出新的分支了，重做栈必须失效。
     future.value = [];
-    editBase = null;
+    editBase = { content: null, actor: 'user', ...(runId ? { runId } : {}), accept: true };
   }
 
   /** 选中的节点可能已被删掉：兜底清空，免得详情面板指向不存在的节点。 */
@@ -2813,14 +2841,18 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
       saving.value = false;
       resetHistory();
       // 新作品不接上一张图的历史：撤销栈里只留「接受之前」这一步。
-      pushHistoryOrEmpty();
+      // 这次接受仍要记一条 `accept`（`changeCount` 为 0：整棵树不是 diff）。
+      pushHistoryOrEmpty(activeRunId ?? undefined);
     } else {
       // 改的是现有这张图：身份、版本、历史都沿用，撤销回到改动前的那棵树。
       //
       // `actor` 必须是 `agent`：这条路上用户只点了一下「应用」，改动是模型算出来的。
       // `runId` 顺手带上——统计里"agent 改了多少、其中几次是同一个 run 反复改"
       // 只能靠它回答，而它过了 `reportRunResolution()` 就没了。
-      pushHistory('agent', activeRunId ?? undefined);
+      //
+      // 第三个参数 `accept` 置真：这一批最后一定跟着一条 `actor='user'` 的
+      // `kind='accept'`，哪怕 diff 为空（用户接受了"没有改动"的候选，那也是事实）。
+      pushHistory('agent', activeRunId ?? undefined, true);
     }
     content.value = candidate.value;
     // 候选落地当下的 diff：`pushHistory` 已抄下改动前那棵树。

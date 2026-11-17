@@ -4,6 +4,7 @@ import type {
   CreateTextSourceResponse,
   EditEventPayload,
   EditEventRow,
+  EditHealth,
   EditSummary,
   ImportResult,
   MapRecord,
@@ -97,6 +98,8 @@ function toEventPayload(event: EditEvent): EditEventPayload {
     ...(event.before !== undefined ? { before: event.before } : {}),
     ...(event.after !== undefined ? { after: event.after } : {}),
     ...(event.depth !== undefined ? { depth: event.depth } : {}),
+    ...(event.subtreeSize !== undefined ? { subtree_size: event.subtreeSize } : {}),
+    ...(event.changeCount !== undefined ? { change_count: event.changeCount } : {}),
     ...(event.runId !== undefined ? { run_id: event.runId } : {}),
   };
 }
@@ -178,6 +181,18 @@ export function listEditEvents(id: string, limit = 50): Promise<EditEventRow[]> 
   return request<EditEventRow[]>(
     `/mindmaps/${encodeURIComponent(id)}/edits?limit=${encodeURIComponent(limit)}`,
   );
+}
+
+/**
+ * 跨图的链路健康检查：昨日编辑过的图数 / 昨日保存的图数。
+ *
+ * 单张图的 `summary` 只能回答"这张图记了什么"，回答不了"这张表还在工作吗"——
+ * 一条事件都收不到时，每张图的 `total` 都是 0，而 0 看起来和"没人改过"一模一样。
+ * **"保存了却一条事件都没有"在正常情况下不该发生**（每次应用候选都记一条 `accept`），
+ * 所以这个比值是断链的可见证据。
+ */
+export function getEditHealth(): Promise<EditHealth> {
+  return request<EditHealth>('/mindmaps/edits/health');
 }
 
 // ---- agent 流式运行 ----

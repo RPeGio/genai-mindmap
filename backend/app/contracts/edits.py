@@ -6,7 +6,7 @@ import `contracts.mindmap`。事件模型留在仓储层的话，`contracts → 
 mindmaps.repository → contracts` 就成环了，只能靠函数内 import 打补丁——那是症状，
 不是解法。
 
-四个刻意的取舍（数字怎么读全靠它们）：
+六个刻意的取舍（数字怎么读全靠它们）：
 
   - **`before` / `after` 是摘要，不是内容。** `label` 存全文（≤200 字，统计要算
     长度），`detail` / `note` 只存 `"1800字"`。一份 2000 字的正文进日志表，它就
@@ -16,7 +16,18 @@ mindmaps.repository → contracts` 就成环了，只能靠函数内 import 打�
     父节点的 `children`，但把它们也标成 `children` 会让那条恒等式失效，而
     `by_kind` 已经把"加了多少、删了多少"说清楚了。
   - **`depth` 是节点层数（根=1）**，`remove` 事件填删除前所在层。`removed_depth`
-    直接对它 `GROUP BY`："删掉的集中在第 3 层"就是"初次生成挖得太深"的证据。
+    只对 `subtree_size = 1` 的零散删除分组："删掉的集中在第 3 层"就是"初次生成
+    挖得太深"的证据；成规模的删除另走 `removed_subtree`，因为一整支被删时根所在
+    的层并不代表"这一层被嫌弃"。
+  - **`subtree_size` 是"这条 remove 一共删掉几个节点"（含自己）。** 一条事件代表
+    一整棵被删的子树，不是每个后代各一条——否则 depth 2…5 各留几条，看起来"每层
+    都在被删"，真实动作却只有一个。加列之前的老数据是 `NULL`（当时没记），统计把
+    它们单列成 `removed_subtree["size_unknown"]`，**不**当成 1。
+  - **`kind="accept"` 是一次"应用候选"，不是改动。** 每次接受记一条，`change_count`
+    是这次接受带来的改动条数，`0` = 一字未改。没有它，"生成完一字不改直接保存"在
+    表里是 0 行，与"用户从没用过"不可区分——缺的不是样本而是分母，偏差永远朝
+    "生成质量更差"。它复用 `after` 会把计数伪装成文本摘要（`CAST(after AS INTEGER)`
+    对每条文字摘要静默返回 0），所以用一个独立的整数列。
   - **时间有两个。** `at` 是前端说的事件时刻（可能漂移：用户改系统时间、页面开了
     很久），`recorded_at` 是入库时刻（永远可信）。
 """
@@ -38,8 +49,10 @@ MAX_SUMMARY_CHARS = 400
 
 #: 与前端 `mindmap/edit-log.ts` 的三个联合类型逐字对应。写成 `Literal` 而不是 `str`：
 #: 它们会进 OpenAPI，前端镜像那边是同一份字面量联合，两端对齐靠契约。
+#:
+#: `accept` 与其余六种并列：它不是"改了什么"，而是"本来可以改却没改"的那个分母。
 EditActor = Literal["user", "agent"]
-EditKind = Literal["add", "remove", "update", "move", "edge", "style"]
+EditKind = Literal["add", "remove", "update", "move", "edge", "style", "accept"]
 EditField = Literal["label", "title", "detail", "note", "color", "icon"]
 
 
@@ -62,6 +75,18 @@ class EditEventIn(BaseModel):
     #: 层数，根是 1。上限给到 64 而不是 `MAX_TREE_DEPTH`：日志是历史记录，一张按
     #: 旧契约存的深树被删掉时，拒收会让整次保存失败，而它已经是事实。
     depth: int | None = Field(default=None, ge=1, le=64)
+    #: 这条 `remove` 一共删掉几个节点（含自己）。`1` = 零散删除，`12` = 整支一起删。
+    #:
+    #: 下限是 1（"删掉 0 个节点"没有意义）；**不设上限**，理由与 `depth` 的 64 相同：
+    #: 一张按旧契约存的、节点数超过现上限的深树被删掉时，拒收会让整次保存失败，而
+    #: 那已经是事实。少一个上界比丢一次真实保存可接受得多。
+    subtree_size: int | None = Field(default=None, ge=1)
+    #: 这次 `accept` 带来的改动条数，`0` = 一字未改。只有 `kind="accept"` 有值。
+    #:
+    #: 不进 `after`：`after` 的语义是"截断后的文本摘要"，把计数塞进去会让
+    #: `CAST(after AS INTEGER)` 对每一条文字摘要静默返回 0——一个看起来合理、实际
+    #: 全错的聚合，比报错糟得多。下限 0，同样不设上限（它是个实测计数，不是用户输入）。
+    change_count: int | None = Field(default=None, ge=0)
     #: 这次改动动的是哪个 run 的产物。只有"应用候选"那一步对得上，手工编辑留空。
     run_id: str | None = Field(default=None, max_length=100)
     #: 事件发生的时刻（前端 `new Date().toISOString()`）。**可为空**：拿不到合法
@@ -93,7 +118,12 @@ class EditEventRow(EditEventIn):
 
 
 class LabelShrunk(BaseModel):
-    """标题被改短的统计。
+    """标题被改短的统计，**只统计 `actor="user"`**。
+
+    过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（用户点了应用），它不
+    反映用户的偏好。混进来时 `count` 会比用户的真实条数多（实测 B 图 3 条 user 的
+    缩短被算成 4 条，多出来的那条是 agent 的 13→10 字），而"用户的缩短偏好"正是这
+    个数字要回答的东西。
 
     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：
@@ -117,12 +147,51 @@ class EditSummary(BaseModel):
     """
 
     total: int
+    #: 最近一条事件的**入库**时刻（`recorded_at`，不是前端给的 `at`）；空表是 `None`。
+    #:
+    #: 它是这张表的死表探测器：`total=0` 与"这张图没人改过"长得一样，而
+    #: `last_event_at=null` 说的是另一件事——**从来没有任何事件进过这张表**。
+    last_event_at: str | None = None
     by_actor: dict[str, int]
     by_kind: dict[str, int]
     by_field: dict[str, int]
     label_shrunk: LabelShrunk
-    #: 删除的节点按层分布（根=1）。键在 JSON 里是字符串，前端声明为 `Record<string, number>`。
+    #: 删除的节点按层分布（根=1）。**只含零散删除**（`subtree_size = 1`）。键在 JSON
+    #: 里是字符串，前端声明为 `Record<string, number>`。
     removed_depth: dict[int, int]
+    #: 删除规模直方图：`{"size_1": 5, "size_12": 1, "size_unknown": 2}`。
+    #:
+    #: 键带 `size_` 前缀而不是裸数字：它和 `size_unknown` 是同一个轴上的两组投影，
+    #: 混排在同一层字典里，裸键 `"unknown"` 与 `"1"` 会读成两个不相干的东西。
+    #: `size_unknown` 是加列之前的老数据（`subtree_size` 为 NULL），它们**不进**
+    #: `removed_depth`——否则"每层都在被删"那次污染还在。
+    removed_subtree: dict[str, int]
+
+
+class EditHealth(BaseModel):
+    """跨图的日志链路健康检查（`GET /mindmaps/edits/health`）。
+
+    判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次应用候选都记
+    一条 `accept`（连一字未改也记），所以"昨日有保存、昨日零事件"只能是链路断了
+    ——前端在发、后端在丢，或者事件根本没进请求体。实测有过 40 分钟这个状态（8000
+    跑旧代码），而当时没有任何告警：单图的 `total=0` 看着和"没人改过"一模一样。
+
+    窗口是 **UTC 昨日整天**（`[window_start, window_end)`）：库里所有时间戳都是
+    `...Z`，按本地日切会让边界那几个小时归错天，而这里要判的只是"有没有发生过"，
+    不值得为它引入一处时区配置。
+    """
+
+    window_start: str
+    window_end: str
+    #: 昨日有编辑事件的图数（`COUNT(DISTINCT map_id)`）。
+    edited_maps: int
+    #: 昨日保存过的图数。`mindmaps` 只留最后一次保存时刻，所以这是**下界**：
+    #: 一张昨天存过、今天又存过的图不会出现在昨天的窗里。下界只会漏报，不会误报。
+    saved_maps: int
+    #: `saved_maps > 0 and edited_maps == 0`：链路可能是断的。
+    chain_suspect: bool
+    #: 一句话结论，界面可直接显示。
+    detail: str
 
 
 __all__ = [
@@ -130,6 +199,7 @@ __all__ = [
     "EditEventIn",
     "EditEventRow",
     "EditField",
+    "EditHealth",
     "EditKind",
     "EditSummary",
     "LabelShrunk",

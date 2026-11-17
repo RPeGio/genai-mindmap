@@ -38,9 +38,20 @@
  *  - **撤销 / 重做**：一次被撤销的编辑不是用户的最终意图。记了它，`label_shrunk`
  *    会同时收到"18→9"和"9→18"两条，平均值被拉回中性、次数却翻倍——比不记更糟。
  *    要审计"用户反复撤销"该是另一个指标，这一版不做。
- *  - **create 意图接受候选**（空画布 → 一整棵树）：整棵树都是"新增"，那不是 diff，
- *    是把整棵树重念一遍。与 `stores/mindmap.ts::diffCandidate` 对 `create` 返回
- *    `null` 是同一条判断。
+ *  - **create 意图接受候选的整棵树**（空画布 → 一整棵树）：整棵树都是"新增"，
+ *    那不是 diff，是把整棵树重念一遍。与 `stores/mindmap.ts::diffCandidate` 对
+ *    `create` 返回 `null` 是同一条判断。**注意这条只否掉了"整棵树"这个载荷，
+ *    没有否掉"接受"这个动作本身**——动作记成一条 `accept`（见下）。
+ *
+ * ## 为什么必须有一条 `accept`：它是"一字未改"这个最强正样本的唯一落点
+ *
+ * `create` 意图接受候选时 diff 为 0 条，于是"生成完一字不改直接保存"在表里是 0 行，
+ * 与"这个用户从没用过"完全不可区分。**缺的不是样本，是分母**：10 张图里 9 张一字
+ * 未改、1 张改 10 处，只统计改动会得出"标题被普遍改短"的结论，然后去压生成侧的上限
+ * ——而那 9 张本来合适的图在表里根本没出现过，偏差方向永远朝"生成质量更差"。
+ *
+ * 所以每次"应用候选"（`create` / `expand` / `edit` 三条路）都记**一条** `accept`，
+ * 不管改了几处；`changeCount` 就是这次接受带来的改动条数，`0` 表示一字未改。
  */
 import type { MindEdge, MindMapContent, MindNode } from '../api/types';
 import { charLength } from './edits';
@@ -54,8 +65,12 @@ export type EditActor = 'user' | 'agent';
  * `update` 是节点**内容**，`style` 是节点**外观**。分成两种而不是都叫 `update`：
  * "用户在调样式上花了多少改动"本身是个信号（样式占比高说明生成侧的视觉默认值不对），
  * 混进 update 就再也拆不出来了。
+ *
+ * `accept` 不是"改动"，是**一次应用候选**：它没有节点、没有字段、没有层数，只有一个
+ * `changeCount`。它和其余六种并列而不是另开一张表，因为它回答的是同一个问题的一
+ * 另一半——"改了什么"要有"本来可以不改"作分母，否则 9 张一字未改的图不存在于表里。
  */
-export type EditKind = 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style';
+export type EditKind = 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept';
 
 /**
  * 改动落在哪个字段上。**只有 `kind` 为 `update` / `style` 的事件才有值。**
@@ -94,8 +109,31 @@ export interface EditEvent {
    * `remove` 填删除前所在层，`add` / `move` / `update` / `style` 填改动后的层。
    * 统计里的 `removed_depth` 直接读它，回答"删掉的集中在第几层"——第 3 层最多
    * 就说明初次生成挖得太深。
+   *
+   * **它只对"零散删除"有意义**：一条 `remove` 现在代表一整棵被删的子树，根在第 3 层
+   * 不等于"第 3 层的内容被嫌弃"。所以 `removed_depth` 只统计 `subtreeSize === 1`，
+   * 成规模的删除进 `removed_subtree`（见 `subtreeSize`）。
    */
   depth?: number;
+  /**
+   * 这条 `remove` 一共删掉几个节点（**含它自己**）。只有 `kind === 'remove'` 有值。
+   *
+   * 删一个叶节点是 `1`；删一整支 12 个节点是**一条**事件、`subtreeSize === 12`。
+   * "每个后代各记一条"会让 `removed_depth` 在 2…5 层各留几条，读起来像"每层都在被
+   * 删"，而真实动作只有一个——于是"初次生成挖太深"这个结论直接不成立（不是方向偏）。
+   *
+   * 数的是**真的消失了**的节点：删除时子节点被改派到别处活下来，只有根自己算 1。
+   */
+  subtreeSize?: number;
+  /**
+   * 这次接受带来的改动条数。只有 `kind === 'accept'` 有值，`0` = 一字未改。
+   *
+   * 它不进 `after`：`after` 的语义是"截断后的文本摘要"，把计数塞进去会让
+   * `CAST(after AS INTEGER)` 对每一条文字摘要静默返回 0——一个看起来合理、
+   * 实际全错的聚合，正是这张表最不能出的错。
+   */
+  changeCount?: number;
+
   /** 这次改动动的是哪个 run 的产物。只有应用候选那一步能对上，手工编辑留空。 */
   runId?: string;
   /** ISO 时刻。**同一次提交内所有事件共享同一个值**，它是"一次操作"的分组键。 */
@@ -153,6 +191,21 @@ function indexTree(root: MindNode): TreeIndex {
   };
   walk(root, 1);
   return { entries, siblingKeys };
+}
+
+/**
+ * 这棵（旧树上的）子树里**真的消失了**几个节点，含根自己。
+ *
+ * 不能直接用"子树节点数"：一个节点被删掉、它的子节点却被改派到别处活下来时，
+ * 只有它自己消失，`subtreeSize` 就该是 1。所以逐个 id 对着新树查——树的结构保证
+ * "后代还在 ⇒ 祖先还在"，于是递归能如实数出跟着一起走的那些人。
+ *
+ * 只有**被删子树的根**会调用它（后代不是根，不重复走），所以整体仍是 O(n)。
+ */
+function vanishedSize(node: MindNode, newIndex: TreeIndex): number {
+  let count = newIndex.entries.has(node.id) ? 0 : 1;
+  for (const child of node.children) count += vanishedSize(child, newIndex);
+  return count;
 }
 
 function clip(text: string): string {
@@ -286,9 +339,14 @@ export function diffEdits(
 
   for (const [id, entry] of oldIndex.entries) {
     if (newIndex.entries.has(id)) continue;
+    // 只给"被删子树的根"记一条。父节点也没了的那些后代是这棵树的一部分，它们的
+    // 删除已经被祖先那条事件涵盖了；每个后代各记一条，`removed_depth` 就会在
+    // 2…5 层各留几条，读起来像"每层都在被删"，而真实动作只有一个：删掉了一整支。
+    if (entry.parentId !== null && !newIndex.entries.has(entry.parentId)) continue;
     emit({
       kind: 'remove', nodeId: id,
       before: clip(entry.node.label.trim()), depth: entry.depth,
+      subtreeSize: vanishedSize(entry.node, newIndex),
     });
   }
 
@@ -317,4 +375,31 @@ export function diffEdits(
   }
 
   return events;
+}
+
+/** `acceptEvent` 需要的东西：时刻与 run。actor 是固定的 `user`，见下。 */
+export interface AcceptOptions {
+  /** 与这次接受带来的那批改动**同一个** `at`（`GROUP BY at` 才能还原成一次操作）。 */
+  at: string;
+  runId?: string;
+}
+
+/**
+ * "应用候选"这条事件：每次接受记一条，`changeCount === 0` 表示一字未改。
+ *
+ * **actor 固定 `user`**，而不是用这次 diff 的 `agent`：点「应用到画布」的是用户。
+ * 两者说的是不同的事——`agent` 那批事件是"模型想要什么"，这一条是"用户同意了"。
+ * 混成同一个 actor，`by_actor.user` 就再也分不清"用户亲手改的"与"用户点头接受的"。
+ *
+ * `runId` 带上：`create` 意图在此之前**一条 run 线索都没有**（整棵树不是 diff），
+ * 于是"哪次生成被应用了"只有 `runs.applied_at` 一个地方记得，且只记得最后一次。
+ */
+export function acceptEvent(changeCount: number, options: AcceptOptions): EditEvent {
+  return {
+    actor: 'user',
+    kind: 'accept',
+    at: options.at,
+    changeCount,
+    ...(options.runId ? { runId: options.runId } : {}),
+  };
 }

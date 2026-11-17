@@ -13,7 +13,13 @@ import logging
 from contextlib import closing
 from typing import Sequence
 
-from app.contracts.edits import EditEventIn, EditEventRow, EditSummary, LabelShrunk
+from app.contracts.edits import (
+    EditEventIn,
+    EditEventRow,
+    EditHealth,
+    EditSummary,
+    LabelShrunk,
+)
 from app.mindmaps import repository
 
 logger = logging.getLogger(__name__)
@@ -42,16 +48,17 @@ def record(map_id: str, events: Sequence[EditEventIn]) -> int:
         return 0
     rows = [
         (map_id, event.run_id, event.actor, event.kind, event.node_id, event.field,
-         event.before, event.after, event.depth, event.at)
+         event.before, event.after, event.depth, event.subtree_size, event.change_count,
+         event.at)
         for event in events
     ]
     try:
         with closing(repository.connect()) as conn, conn:
             conn.executemany(
                 f"""INSERT INTO edit_events
-                        (map_id, run_id, actor, kind, node_id, field, before, after, depth, at,
-                         recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, {_NOW}), {_NOW})""",
+                        (map_id, run_id, actor, kind, node_id, field, before, after, depth,
+                         subtree_size, change_count, at, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, {_NOW}), {_NOW})""",
                 rows,
             )
     except Exception:  # noqa: BLE001 — 统计写失败不该让用户的保存失败
@@ -75,42 +82,62 @@ def _count_by(conn, column: str, map_id: str) -> dict:
 def summary(map_id: str) -> EditSummary:
     """这张图的改动统计。**这是这一版真正的交付物。**
 
-    `label_shrunk` 与 `removed_depth` 是特意要的两个数，因为它们直接对应生成侧
-    该改什么：
+    `label_shrunk` 与 `removed_depth` / `removed_subtree` 是特意要的三个数，因为它们
+    直接对应生成侧该改什么：
 
-      - 标题普遍被缩短 → 生成侧 16 字上限可能还是太长，或者提示词让它写得太长；
-      - 删掉的集中在第 3 层 → 初次深度太深。
+      - 标题普遍被缩短（**只算 user**）→ 生成侧 16 字上限可能还是太长，或者提示词
+        让它写得太长；
+      - 零散删掉的集中在第 3 层 → 初次深度太深；
+      - 删掉的是整支还是零散 → "整支被删"更像"这一支根本不该生成"，与"挖太深"是
+        两件事，混在一起读会得出错的处方。
 
-    但它们只说"发生了什么"，不说"为什么"——局限见这一版的交付说明。
+    但它们只说"发生了什么"，不说"为什么"——局限见 `docs/EDIT-LOG.md`。
     """
     with closing(repository.connect()) as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM edit_events WHERE map_id = ?", (map_id,)).fetchone()[0]
+        totals = conn.execute(
+            "SELECT COUNT(*), MAX(recorded_at) FROM edit_events WHERE map_id = ?",
+            (map_id,)).fetchone()
+        total, last_event_at = totals[0], totals[1]
         by_actor = _count_by(conn, "actor", map_id)
         by_kind = _count_by(conn, "kind", map_id)
         by_field = _count_by(conn, "field", map_id)
 
         # `length()` 对 TEXT 在 UTF-8 下按**字符**算，与前端 `charLength`（码点）
-        # 同一口径。只算 field='label'：`title`（导图标题）的改动是另一件事，混进来
-        # 会让"节点标题被改短"这个信号被导图标题稀释。
+        # 同一口径。两处过滤各管一件事：
+        #  - `field='label'`：`title`（导图标题）的改动是另一件事，混进来会让"节点
+        #    标题被改短"这个信号被导图标题稀释；
+        #  - `actor='user'`：`agent` 那批是"用户点了应用、模型又改了一遍"，性质完全
+        #    不同。实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条。
         shrunk = conn.execute(
             """SELECT COUNT(*), AVG(length(before)), AVG(length(after))
                FROM edit_events
-               WHERE map_id = ? AND field = 'label'
+               WHERE map_id = ? AND field = 'label' AND actor = 'user'
                  AND before IS NOT NULL AND after IS NOT NULL
                  AND length(after) < length(before)""",
             (map_id,),
         ).fetchone()
 
+        # **只统计零散删除。** 一条 remove 现在代表一整棵被删的子树，根所在的层不等于
+        # "这一层的内容被嫌弃"；`subtree_size IS NULL` 的老数据同理（当时没记，无法
+        # 判断它是零散还是整支），两者都不进这个分布——否则"每层都在被删"那次污染还在。
         depths = conn.execute(
             """SELECT depth, COUNT(*) FROM edit_events
                WHERE map_id = ? AND kind = 'remove' AND depth IS NOT NULL
+                 AND subtree_size = 1
                GROUP BY depth ORDER BY depth""",
+            (map_id,),
+        ).fetchall()
+
+        sizes = conn.execute(
+            """SELECT subtree_size, COUNT(*) FROM edit_events
+               WHERE map_id = ? AND kind = 'remove'
+               GROUP BY subtree_size""",
             (map_id,),
         ).fetchall()
 
     return EditSummary(
         total=total,
+        last_event_at=last_event_at,
         by_actor=by_actor,
         by_kind=by_kind,
         by_field=by_field,
@@ -120,6 +147,67 @@ def summary(map_id: str) -> EditSummary:
             avg_after=round(shrunk[2], 1) if shrunk[2] is not None else None,
         ),
         removed_depth={row[0]: row[1] for row in depths},
+        removed_subtree=_subtree_histogram(sizes),
+    )
+
+
+def _subtree_histogram(rows: Sequence[tuple[int | None, int]]) -> dict[str, int]:
+    """`[(subtree_size, 次数)]` → `{"size_1": 5, "size_12": 1, "size_unknown": 2}`。
+
+    排序固定（规模升序、`size_unknown` 最后）：同样的数据永远同样的输出，两次调用
+    之间不会因为 SQLite 的扫描顺序而抖动——抖动的统计没法对比"这周和上周"。
+    """
+    ordered = sorted(rows, key=lambda row: (1, 0) if row[0] is None else (0, row[0]))
+    return {
+        "size_unknown" if row[0] is None else f"size_{row[0]}": row[1]
+        for row in ordered
+    }
+
+
+def health() -> EditHealth:
+    """跨图的链路健康检查：昨日编辑过的图数 vs 昨日保存的图数。
+
+    判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次应用候选都记
+    一条 `accept`（连一字未改也记），所以 `saved > 0 且 edited == 0` 只能是链路断了。
+
+    两个方向不对称，这很重要：链路真断时这个判据**一定**报警（事件收不到 → edited
+    恒为 0）；反过来它只会漏报，不会因为"数据少"而误报成健康。唯一的误报窗口是跨
+    零点那一次保存——`updated_at` 写在事件之前几毫秒，两者可能落进相邻两天，于是
+    "昨天存了一张、事件记在今天"。代价是一天至多一次假警报，比不上为它引入一套时间
+    窗口膨胀逻辑。
+
+    `saved_maps` 是**下界**：`mindmaps` 只留最后一次保存时刻，昨天存过、今天又存过的
+    图不在昨天的窗里。下界只会让报警更难触发（漏报），不会凭空报警。
+    """
+    with closing(repository.connect()) as conn:
+        window_start, window_end = conn.execute(
+            "SELECT date('now','-1 day') || 'T00:00:00.000Z', "
+            "       date('now') || 'T00:00:00.000Z'").fetchone()
+        edited = conn.execute(
+            """SELECT COUNT(DISTINCT map_id) FROM edit_events
+               WHERE recorded_at >= ? AND recorded_at < ?""",
+            (window_start, window_end)).fetchone()[0]
+        saved = conn.execute(
+            "SELECT COUNT(*) FROM mindmaps WHERE updated_at >= ? AND updated_at < ?",
+            (window_start, window_end)).fetchone()[0]
+
+    suspect = saved > 0 and edited == 0
+    if suspect:
+        detail = (f"昨日保存了 {saved} 张图，却没有收到任何编辑事件——日志链路可能断了："
+                  "前端在发、后端在丢，或事件根本没进请求体。")
+    elif saved == 0:
+        detail = (f"昨日没有保存（{edited} 张图有编辑事件）——没有保存时零事件是正常的，"
+                  "判据不适用。")
+    else:
+        detail = f"昨日保存 {saved} 张图，其中 {edited} 张有编辑事件，链路正常。"
+
+    return EditHealth(
+        window_start=window_start,
+        window_end=window_end,
+        edited_maps=edited,
+        saved_maps=saved,
+        chain_suspect=suspect,
+        detail=detail,
     )
 
 
@@ -143,8 +231,9 @@ def recent(map_id: str, limit: int = RECENT_DEFAULT) -> list[EditEventRow]:
         EditEventRow(
             id=row["id"], map_id=row["map_id"], run_id=row["run_id"], actor=row["actor"],
             kind=row["kind"], node_id=row["node_id"], field=row["field"],
-            before=row["before"], after=row["after"], depth=row["depth"], at=row["at"],
-            recorded_at=row["recorded_at"],
+            before=row["before"], after=row["after"], depth=row["depth"],
+            subtree_size=row["subtree_size"], change_count=row["change_count"],
+            at=row["at"], recorded_at=row["recorded_at"],
         )
         for row in rows
     ]
@@ -162,6 +251,7 @@ __all__ = [
     "RECENT_DEFAULT",
     "RECENT_LIMIT",
     "clear",
+    "health",
     "recent",
     "record",
     "summary",

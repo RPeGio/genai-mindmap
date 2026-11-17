@@ -22,6 +22,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mindmaps/edits/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Edits Health
+         * @description 昨日编辑过的图数 / 昨日保存的图数：**死表探测器**。
+         *
+         *     `user_prefs` 有"尚未生效"这种标记，`edit_events` 原本没有——于是"永远是 0 行"
+         *     这种故障能静默存在很久。实测有过 40 分钟：8000 跑着旧代码，前端在发事件、
+         *     后端在丢，而每一张图的 `summary.total` 都是 0，看起来和"没人改过"一模一样。
+         *
+         *     跨图而不是按图，是因为"这张表还在工作吗"根本不是某一张图的属性。
+         */
+        get: operations["edits_health_api_mindmaps_edits_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/mindmaps/{map_id}": {
         parameters: {
             query?: never;
@@ -722,7 +748,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "add" | "remove" | "update" | "move" | "edge" | "style";
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept";
             /** Node Id */
             node_id?: string | null;
             /** Field */
@@ -733,6 +759,10 @@ export interface components {
             after?: string | null;
             /** Depth */
             depth?: number | null;
+            /** Subtree Size */
+            subtree_size?: number | null;
+            /** Change Count */
+            change_count?: number | null;
             /** Run Id */
             run_id?: string | null;
             /** At */
@@ -752,7 +782,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "add" | "remove" | "update" | "move" | "edge" | "style";
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept";
             /** Node Id */
             node_id?: string | null;
             /** Field */
@@ -763,6 +793,10 @@ export interface components {
             after?: string | null;
             /** Depth */
             depth?: number | null;
+            /** Subtree Size */
+            subtree_size?: number | null;
+            /** Change Count */
+            change_count?: number | null;
             /** Run Id */
             run_id?: string | null;
             /** At */
@@ -773,6 +807,33 @@ export interface components {
             map_id: string;
             /** Recorded At */
             recorded_at: string;
+        };
+        /**
+         * EditHealth
+         * @description 跨图的日志链路健康检查（`GET /mindmaps/edits/health`）。
+         *
+         *     判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次应用候选都记
+         *     一条 `accept`（连一字未改也记），所以"昨日有保存、昨日零事件"只能是链路断了
+         *     ——前端在发、后端在丢，或者事件根本没进请求体。实测有过 40 分钟这个状态（8000
+         *     跑旧代码），而当时没有任何告警：单图的 `total=0` 看着和"没人改过"一模一样。
+         *
+         *     窗口是 **UTC 昨日整天**（`[window_start, window_end)`）：库里所有时间戳都是
+         *     `...Z`，按本地日切会让边界那几个小时归错天，而这里要判的只是"有没有发生过"，
+         *     不值得为它引入一处时区配置。
+         */
+        EditHealth: {
+            /** Window Start */
+            window_start: string;
+            /** Window End */
+            window_end: string;
+            /** Edited Maps */
+            edited_maps: number;
+            /** Saved Maps */
+            saved_maps: number;
+            /** Chain Suspect */
+            chain_suspect: boolean;
+            /** Detail */
+            detail: string;
         };
         /**
          * EditSummary
@@ -788,6 +849,8 @@ export interface components {
         EditSummary: {
             /** Total */
             total: number;
+            /** Last Event At */
+            last_event_at?: string | null;
             /** By Actor */
             by_actor: {
                 [key: string]: number;
@@ -803,6 +866,10 @@ export interface components {
             label_shrunk: components["schemas"]["LabelShrunk"];
             /** Removed Depth */
             removed_depth: {
+                [key: string]: number;
+            };
+            /** Removed Subtree */
+            removed_subtree: {
                 [key: string]: number;
             };
         };
@@ -846,7 +913,12 @@ export interface components {
         };
         /**
          * LabelShrunk
-         * @description 标题被改短的统计。
+         * @description 标题被改短的统计，**只统计 `actor="user"`**。
+         *
+         *     过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（用户点了应用），它不
+         *     反映用户的偏好。混进来时 `count` 会比用户的真实条数多（实测 B 图 3 条 user 的
+         *     缩短被算成 4 条，多出来的那条是 agent 的 13→10 字），而"用户的缩短偏好"正是这
+         *     个数字要回答的东西。
          *
          *     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
          *     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：
@@ -1558,6 +1630,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    edits_health_api_mindmaps_edits_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditHealth"];
                 };
             };
         };

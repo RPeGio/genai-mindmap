@@ -12,7 +12,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from app.contracts.edits import EditEventRow, EditSummary
+from app.contracts.edits import EditEventRow, EditHealth, EditSummary
 from app.contracts.mindmap import MapRecord, SaveRequest, UpdateRequest
 from app.mindmaps import edits, repository
 
@@ -47,6 +47,23 @@ def create_map(body: SaveRequest):
     record = repository.create_map(body.content)
     _record_edits(body, record.id)
     return record
+
+
+# 跨图的健康检查，**必须排在 `/{map_id}` 系列之前**。理由与下面 `edits/summary`
+# 那条注释同源：`/edits/health` 与 `/{map_id}/edits` 都是两个路径段，现在靠第二段
+# 是 `health` 还是 `edits` 区分；一旦哪天有人把这里改成 `/{map_id}/health`，顺序就
+# 不再是"看不出来但没事"，而是直接串路。放在前面最便宜。
+@router.get("/edits/health", response_model=EditHealth)
+def edits_health():
+    """昨日编辑过的图数 / 昨日保存的图数：**死表探测器**。
+
+    `user_prefs` 有"尚未生效"这种标记，`edit_events` 原本没有——于是"永远是 0 行"
+    这种故障能静默存在很久。实测有过 40 分钟：8000 跑着旧代码，前端在发事件、
+    后端在丢，而每一张图的 `summary.total` 都是 0，看起来和"没人改过"一模一样。
+
+    跨图而不是按图，是因为"这张表还在工作吗"根本不是某一张图的属性。
+    """
+    return edits.health()
 
 
 @router.get("/{map_id}", response_model=MapRecord)

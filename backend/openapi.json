@@ -69,6 +69,28 @@
         }
       }
     },
+    "/api/mindmaps/edits/health": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Edits Health",
+        "description": "昨日编辑过的图数 / 昨日保存的图数：**死表探测器**。\n\n`user_prefs` 有\"尚未生效\"这种标记，`edit_events` 原本没有——于是\"永远是 0 行\"\n这种故障能静默存在很久。实测有过 40 分钟：8000 跑着旧代码，前端在发事件、\n后端在丢，而每一张图的 `summary.total` 都是 0，看起来和\"没人改过\"一模一样。\n\n跨图而不是按图，是因为\"这张表还在工作吗\"根本不是某一张图的属性。",
+        "operationId": "edits_health_api_mindmaps_edits_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditHealth"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/mindmaps/{map_id}": {
       "get": {
         "tags": [
@@ -1547,7 +1569,8 @@
               "update",
               "move",
               "edge",
-              "style"
+              "style",
+              "accept"
             ],
             "title": "Kind"
           },
@@ -1618,6 +1641,30 @@
               }
             ],
             "title": "Depth"
+          },
+          "subtree_size": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtree Size"
+          },
+          "change_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Count"
           },
           "run_id": {
             "anyOf": [
@@ -1670,7 +1717,8 @@
               "update",
               "move",
               "edge",
-              "style"
+              "style",
+              "accept"
             ],
             "title": "Kind"
           },
@@ -1742,6 +1790,30 @@
             ],
             "title": "Depth"
           },
+          "subtree_size": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtree Size"
+          },
+          "change_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Count"
+          },
           "run_id": {
             "anyOf": [
               {
@@ -1784,11 +1856,61 @@
         "title": "EditEventRow",
         "description": "落库后的一行：载荷 + 自增 id + 服务端写入时刻。"
       },
+      "EditHealth": {
+        "properties": {
+          "window_start": {
+            "type": "string",
+            "title": "Window Start"
+          },
+          "window_end": {
+            "type": "string",
+            "title": "Window End"
+          },
+          "edited_maps": {
+            "type": "integer",
+            "title": "Edited Maps"
+          },
+          "saved_maps": {
+            "type": "integer",
+            "title": "Saved Maps"
+          },
+          "chain_suspect": {
+            "type": "boolean",
+            "title": "Chain Suspect"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "window_start",
+          "window_end",
+          "edited_maps",
+          "saved_maps",
+          "chain_suspect",
+          "detail"
+        ],
+        "title": "EditHealth",
+        "description": "跨图的日志链路健康检查（`GET /mindmaps/edits/health`）。\n\n判据只有一句：**\"保存了但没有任何事件\"在正常情况下不该发生**。每次应用候选都记\n一条 `accept`（连一字未改也记），所以\"昨日有保存、昨日零事件\"只能是链路断了\n——前端在发、后端在丢，或者事件根本没进请求体。实测有过 40 分钟这个状态（8000\n跑旧代码），而当时没有任何告警：单图的 `total=0` 看着和\"没人改过\"一模一样。\n\n窗口是 **UTC 昨日整天**（`[window_start, window_end)`）：库里所有时间戳都是\n`...Z`，按本地日切会让边界那几个小时归错天，而这里要判的只是\"有没有发生过\"，\n不值得为它引入一处时区配置。"
+      },
       "EditSummary": {
         "properties": {
           "total": {
             "type": "integer",
             "title": "Total"
+          },
+          "last_event_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Event At"
           },
           "by_actor": {
             "additionalProperties": {
@@ -1820,6 +1942,13 @@
             },
             "type": "object",
             "title": "Removed Depth"
+          },
+          "removed_subtree": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Removed Subtree"
           }
         },
         "type": "object",
@@ -1829,7 +1958,8 @@
           "by_kind",
           "by_field",
           "label_shrunk",
-          "removed_depth"
+          "removed_depth",
+          "removed_subtree"
         ],
         "title": "EditSummary",
         "description": "`GET /mindmaps/{id}/edits/summary` 的响应。\n\n两条恒等式让数字可以先自校验再读结论：\n\n  - `sum(by_actor) == total`；\n  - `sum(by_field) == by_kind[\"update\"] + by_kind[\"style\"]`。\n\n对不上就说明有写入路径绕过了契约，而不是\"统计有点怪\"。"
@@ -1951,7 +2081,7 @@
         },
         "type": "object",
         "title": "LabelShrunk",
-        "description": "标题被改短的统计。\n\n`avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。\n两个平均值的差（18.3 → 9.1）就是\"缩短了多少\"，比只看 count 有信息量得多：\n从 18 缩到 9 是\"太长了\"，从 18 缩到 17 只是\"改了个字\"。"
+        "description": "标题被改短的统计，**只统计 `actor=\"user\"`**。\n\n过滤 actor 的理由：`agent` 的改动是\"模型自己又改了一遍\"（用户点了应用），它不\n反映用户的偏好。混进来时 `count` 会比用户的真实条数多（实测 B 图 3 条 user 的\n缩短被算成 4 条，多出来的那条是 agent 的 13→10 字），而\"用户的缩短偏好\"正是这\n个数字要回答的东西。\n\n`avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。\n两个平均值的差（18.3 → 9.1）就是\"缩短了多少\"，比只看 count 有信息量得多：\n从 18 缩到 9 是\"太长了\"，从 18 缩到 17 只是\"改了个字\"。"
       },
       "LayoutKind": {
         "type": "string",
