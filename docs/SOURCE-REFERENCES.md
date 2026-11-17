@@ -61,6 +61,14 @@
 `rag` 形态一次证据都没检索到时允许零引用，由 `GENERATION_WITHOUT_EVIDENCE`（warn）
 说明这次没有依据——诊断从不参与成功判定。
 
+反过来，"证据已拼进 prompt、最终却一条引用都没有"是另一件事：模型没写，或写了但
+过不了第三层被剔光。`EVIDENCE_UNUSED`（warn）报出"给了几条证据、最后剩几条引用"，
+并在 `content` 里点明这不等于"材料里没有相关内容"。分母口径按**剩下的两条路**各算
+各的：`mindmap_generate_deep` 用按支证据去重后的条数（`whole` 兜底时各支拿到同一批，
+逐支相加会虚报），`node_expand` 用本次为这个节点检索的命中数。没有证据时它不报——
+那种情况归 `BRANCH_NO_EVIDENCE`。整树生成（`mindmap_generate`）连同它的主题预检索
+一起删除了（`docs/ONE-PATH.md`），所以"按一次主题检索的命中数"那个口径不再存在。
+
 子块约束保留下来是为了**可观测**：谁引了父块里与查询无关的部分，诊断里看得见；
 要求模型精确落在命中的那 200 字里过于苛刻，实测会成批剔掉合法引用。
 
@@ -69,22 +77,88 @@
 前三层都是机械判据，它们管不住一种情况：引文逐字对得上，但节点论断与原文
 **语义相反**（原文「只在小数据集上验证」，节点写成「已在大规模数据上验证」）。
 
-`app/optimization/nli.py` 用一个小型 ONNX cross-encoder 对「节点标签 ↔ 引文」
-再判一次语义蕴含，**只产出诊断，不改变任何引用**：
+`app/optimization/nli.py` 用一个小型 ONNX cross-encoder 对「节点论断 ↔ 引文」
+判一次语义蕴含，**只产出诊断，不改变任何引用**：
 
 | 判定 | 诊断 |
 | --- | --- |
 | contradiction | `SOURCE_REF_CONTRADICTED`（warn），引用保留 |
 | entailment / neutral | `SOURCE_REF_NLI`（info），附置信度 |
 
+hypothesis 是 **`label` + `detail`**（`source_refs._claim_of`），不是 `label`：
+
+```
+预算审批流程。五万元以内由财务经理核准，超过五十万元报总经理审批。
+```
+
+拿"预算审批流程"这种名词短语当 hypothesis，模型能回答的只有"这段引文提到这个
+短语了吗"——一段话几乎不可能**否定**一个名词短语的存在，它顶多不提它。真模型
+实测（Erlangshen int8，20 条真实引文）：只给 `label` 时模式相反的论断一条都抓
+不到，全被盖成 entailment；换成 `label + detail` 之后才出现三档分布。
+
 设计约束：概率模型不得推翻确定性判据。冲突时引用留着、同时给出警告，
-由人判断。没有 `quote` 也没有字符区间的引用直接跳过——拿整篇原文去比一个
-节点标签，NLI 只会给 neutral。
+由人判断。没有 `quote` 也没有字符区间的引用直接跳过——拿整篇原文去比一句
+论断，NLI 只会给 neutral。
 
 **默认关闭**（`MINDMAP_NLI_ENABLED` 未设即关）。关闭时连 `onnxruntime`
 都不会 import，`annotate_nli` 立刻返回空列表。启用需要
 `MINDMAP_NLI_MODEL_DIR` 指向含 `model.onnx` / `tokenizer.json` / `config.json`
 的目录。加载前有内存闸门（默认 700 MB，Linux 可检测）。
+
+**生成路径的第二道闸**（`MINDMAP_NLI_ON_GENERATE`，默认**开**）：模型启用之后，
+`_generate_deep` 的收尾就默认跑一次语义复核——这条路径是这一层唯一的消费方，
+默认关会让"接了"与"没接"在部署上无法区分。成本实测（
+`scripts/measure_generation_diagnostics.py`，脚本化分片生成 + 等价延迟）：
+
+| 骨架 | 树 / 引用 | 15 ms/条 | 44 ms/条 |
+|---|---|---|---|
+| 8 支（默认量级） | 33 节点 / 24 条 | 0.37 s | 1.07 s |
+| 20 支（工具上限） | 61 节点 / 40 条 | 0.62 s | 1.78 s |
+
+撞满 `MAX_NLI_CHECKS=100` 才是 1.5–4.4 s，那种图设 `MINDMAP_NLI_ON_GENERATE=0`。
+**必须在线程池里跑**：同步调一次 374 ms 的 NLI，事件循环心跳 0 次（整段被独占）；
+`to_thread` 之后同一段心跳 25 次、最大停顿 16 ms。
+
+分片路留存的引用**必带 `quote`**（实测 24/24、40/40，且同时带字符区间）：
+`_check_reference` 把"只有区间没引文"和"两者都无"都判 `UNVERIFIED_SOURCE_REF`
+并剔除，而收尾那一步是 `remove_invalid=True`。所以"没有 quote 就跳过"这条规则
+在生成路上不触发。
+
+### 实测：这一层到底抓不抓得到「语义相反」
+
+模型是真模型（Erlangshen-Roberta-110M-NLI int8 98.3 MB / mDeBERTa-v3-base-xnli
+int8 302.6 MB，onnxruntime CPU），材料是本仓库 `docs/RAG-DECISIONS.md`，引文逐字
+来自原文。三组：**A** 忠实论断 20 条（论断与引文同向）、**B** 反向论断 10 条
+（论断与引文相反，即这一层唯一声称能抓的故障）、**C** 真分片生成出来的 24 条
+引用（`detail` 为空，走回退）。
+
+| 组 | claim | entailment | neutral | contradiction |
+|---|---|---|---|---|
+| A 忠实 20 | 旧：`label` | 20 (100%) | 0 | 0 |
+| A 忠实 20 | 新：`label + detail` | 19 (95%) | 1 (5%) | 0 |
+| B 反向 10 | 旧：`label` | **10 (100%)** | 0 | **0** |
+| B 反向 10 | 新：`label + detail` | 6 (60%) | 3 (30%) | **1 (10%)** |
+| C 真实 24 | 旧 = 新（`detail` 空） | 20 (83%) | 0 | 4 (17%) |
+
+同一批数据换 mDeBERTa：A 组 旧 50%/50%/0 → 新 80%/20%/0；B 组 旧 10%/90%/0 →
+新 10%/90%/0（**一条也没抓到**）；C 组 38%/62%/0。
+
+三条结论都有数字支撑：
+
+1. **旧 claim 不是"灌一堆 neutral"，是把错的方向盖成"有原文支持"**。B 组 10 条
+   写反的论断，Erlangshen 给 100% entailment（置信 0.49–0.91），mDeBERTa 给 90%
+   neutral。前者比中性更糟——它让错误看起来被引文支持。
+2. **新 claim 能把反例的 contradiction 概率从 5–7% 抬到 16–39%，但 top-1 只抓到
+   1/10**。信号真的进来了，可还不够压过 entailment。两个模型、同一批样本，召回
+   上限都是 10%。
+3. **旧 claim 在真实数据上产出的 warn 是噪声**。C 组那 4 条 contradiction 里 3 条
+   claim 是 markdown 表格行（`| 扫描件 PDF | 0 |`、`| 4 | 单换行 \n |`），被判
+   "与原文相反"——`annotate_nli` 会把它们逐条报成 `SOURCE_REF_CONTRADICTED`。
+
+合起来：这一层在真反向样本上召回 10%，在真引用上精确率 25%（1 真 / 3 假），
+成本 36–55 ms/条（238 字引文，int8，本机 i5-13500H）。`DEFAULT_ON_GENERATE=True`
+的依据是"低于每次生成多等三秒"，而按真实引文长度算 24 条是 0.9–1.3 s、100 条是
+3.6–5.5 s——量级仍成立，但 0.37–1.07 s 那组数字是等价延迟注入的，不是真模型。
 
 实测参考：
 
@@ -92,6 +166,13 @@
 |---|---|---|---|---|---|
 | `typeform/mobilebert-uncased-mnli` int8 | 25.7 MB | +83.5 MB | 9.9 s | 11–23 ms | 0/4 |
 | `IDEA-CCNL/Erlangshen-Roberta-110M-NLI` int8 | 98.3 MB | +140.3 MB | 1.4 s | 15–44 ms | 6/6 |
+
+"单次推理"那一列是在**短样本**上量的。同一台机器、同一个 int8 模型，耗时随 premise
+长度变化很大：引文 50 字 11.8 ms、238 字 36.4 ms、300 字 54.7 ms、400 字 721 ms、
+1200 字 1159 ms（Erlangshen，本机 i5-13500H）。300→400 字之间有一个台阶，同样的
+台阶在 fp32 权重上也有、只是位置不同（150→200 字），所以它更像本机 CPU 线程调度的
+产物而不是模型固有的；但父块级引文（450–700 字）一旦进了 `judge()`，成本就得按
+台阶之上算。
 
 **英文模型对中文完全失效**，不是「偏弱」：它对「完全不能识别图像」vs「本系统可以识别图像」给 `entailment 0.52`，对「数据库采用主从架构」这种无关内容给 `entailment 0.65`——四条中文用例全判成蕴含，说明它只在数词汇重叠，没有识别否定结构。中文场景必须用中文模型。
 
@@ -106,15 +187,18 @@
 
 ## 生成、诊断与保存
 
-- `POST /api/agent/runs/stream` 的请求带 `sources: [...]` 时，`mindmap_generate`
-  把来源 ID 和完整原文以 JSON 边界交给模型；生成收尾按实际输入重建
-  `source_usage`，不信任模型提供的摘要。未知来源与确实对不上原文的引用会被剔除
+- `POST /api/agent/runs/stream` 的请求带 `sources: [...]` 时，`mindmap_generate_deep`
+  把**结构线索**（材料自带的章节标题行）交给骨架、把**按支检索的命中**交给每条分支
+  ——正文段本身一个字都不进 prompt（`MINDMAP_SOURCE_MODE=full` 那条"整份原文放进
+  prompt"的路已删除，见 `docs/ONE-PATH.md`）。`source_usage` 由工具自己按真实来源
+  拼出，不信任模型提供的摘要；未知来源与确实对不上原文的引用会被剔除
   （判定表见上节：父块越界与多处出现只告警、不剔除），原因通过 `diagnostics` 返回，
   并带上 `node_id`。节点本身保留，合法引用保留。
-- 不带来源的生成（`intent=create` 且没有 `sources`）没有可追溯的来源记录；
-  `validate_generated_content(sources=None)` 在契约校验前清空模型返回的摘要及所有
-  节点引用。`node_grow` 预览帧也不携带未经核验的引用——它只有 `label` 与
-  `expandable`。demo 不编造引用。
+- 不带来源的生成（`intent=create` 且没有 `sources`）没有可追溯的来源记录：
+  没有可检索材料时系统提示词里会加一句"不要写 source_refs"，而落在树上的引用在
+  合并前就被清空（`_refs_from` 没有本支证据时一条都不收）——`source_usage` 为空时
+  带引用的树过不了契约。`node_grow` 预览帧也不携带未经核验的引用——它只有 `label`
+  与 `expandable`。demo 不编造引用。
 - `POST /api/optimization/check` 和 `/api/optimization/suggest` 可额外传
   `sources` 执行第三层；省略时只做原有结构诊断，传 `[]` 会明确报告缺失原文。
   两个接口都不改写导图或数据库，重复来源 ID 返回 422。

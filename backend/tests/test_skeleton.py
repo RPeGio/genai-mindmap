@@ -117,7 +117,14 @@ class SkeletonTest(unittest.TestCase):
         saved = json.loads(saved_raw)
         status, reloaded = request("GET", "/api/mindmaps/" + saved["id"])
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(reloaded)["content"]["source_usage"], [usage])
+        # `SourceUsage.url` 是这一轮新增的可选字段（外部检索来源的原文地址）。
+        # 用户上传的文本来源没有原文地址，所以它恒为 null——契约的可选字段在
+        # 序列化时会带回默认值，这不算"没原样带回来"。去掉它再比，是为了让这条
+        # 用例继续守"原样带回"这件事本身，而不是被一个新默认值绑住。
+        restored = json.loads(reloaded)["content"]["source_usage"]
+        self.assertEqual([{k: v for k, v in item.items() if k != "url"} for item in restored],
+                         [usage])
+        self.assertEqual([item.get("url") for item in restored], [None])
 
     def test_optimization_detects_duplicate(self):
         status, raw = request("POST", "/api/optimization/check", {"content": MAP})

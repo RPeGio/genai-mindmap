@@ -6,6 +6,7 @@ import App from '../src/App.vue';
 import type { LibraryEntry, LibraryList, LibrarySource, MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；
 // 界面测试只关心输入区与详情面板，画布替换成占位元素。
@@ -49,11 +50,14 @@ function mountApp() {
 /**
  * 只数业务请求。
  *
- * 页面挂载时会探一次 `/api/health` 取版本号；断言"不该发请求"的用例关心的是
- * 生成、保存这类业务请求，把它算进去只会得到一个假失败。
+ * 页面挂载时会做两件与本次动作无关的事：探一次 `/api/health` 取版本号、拉一次
+ * 偏好（生成面板的两个下拉要带着它）。断言"不该发请求"的用例关心的是生成、保存
+ * 这类业务请求，把它们算进去只会得到一个假失败。
  */
 function apiCalls(fetchMock: ReturnType<typeof vi.fn>) {
-  return fetchMock.mock.calls.filter(([url]) => !String(url).endsWith('/health'));
+  return fetchMock.mock.calls.filter(
+    ([url]) => !String(url).endsWith('/health') && !isPrefsRequest(String(url)),
+  );
 }
 
 /**
@@ -64,6 +68,14 @@ function apiCalls(fetchMock: ReturnType<typeof vi.fn>) {
  * 自己写的那段会被重新生成覆盖。
  */
 const NOTE_TEXTAREA = 'textarea[aria-label="我的备注"]';
+
+/**
+ * 画布右上角那个框（合并后的 #2）：**唯一**说一句话的地方。
+ *
+ * 按 id 定位而不是 `get('textarea')`：左侧材料区还有一个「粘贴材料正文」的
+ * textarea，按标签取会随组件顺序拿到错误的那一个。
+ */
+const INTENT = 'textarea#intent';
 
 /**
  * 按文字找按钮：开发期示例选择器会异步插入一排按钮，
@@ -80,16 +92,23 @@ afterEach(() => {
 });
 
 describe('App', () => {
-  it('空输入时不发请求，并提示用户', async () => {
-    const fetchMock = vi.fn();
+  it('空输入时按钮是禁用的，并说明「要写一个主题」', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      return streamReply([]);
+    });
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
-    await buttonByText(wrapper, '生成导图').trigger('click');
+    // 没主题、没材料：按钮点不动，原因写在那行提示里。合并之前这里是"点得下去、
+    // 然后弹一句「请在下方输入主题或文本」"——那个提示指向的框现在已经不存在了。
+    const submit = wrapper.get('[data-test="intent-box"] button');
+    expect(submit.attributes('disabled')).toBeDefined();
+    await submit.trigger('click');
 
     expect(apiCalls(fetchMock)).toHaveLength(0);
-    // 提示必须点明是哪个框：用户把主题写进「导图标题」再点生成，界面毫无动静。
-    expect(wrapper.get('[role="status"]').text()).toContain('「输入主题或文本」');
+    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('写一个主题，或者先在左侧添加材料');
   });
 
   it('点生成把请求打到 agent 路由，候选不自动落画布', async () => {
@@ -100,7 +119,7 @@ describe('App', () => {
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('机器学习');
+    await wrapper.get(INTENT).setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
 
     // 生成只剩这一条通道
@@ -120,7 +139,7 @@ describe('App', () => {
     vi.stubGlobal('fetch', vi.fn(async () => streamReply([doneFrame(mode)])));
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('机器学习');
+    await wrapper.get(INTENT).setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
     await buttonByText(wrapper, '应用到画布').trigger('click');
@@ -146,7 +165,7 @@ describe('App', () => {
     );
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('x');
+    await wrapper.get(INTENT).setValue('x');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() =>
       expect(wrapper.get('[role="status"]').text()).toContain('模型服务暂时不可用'));
@@ -160,20 +179,25 @@ describe('App', () => {
     );
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('x');
+    await wrapper.get(INTENT).setValue('x');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() =>
       expect(wrapper.get('[role="status"]').text()).toContain('模型返回超时'));
   });
 
   it('开发期示例按钮不经过后端就能装载导图', async () => {
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      return streamReply([]);
+    });
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
     await vi.waitFor(() => expect(buttonByText(wrapper, '单节点')).toBeTruthy());
     await buttonByText(wrapper, '单节点').trigger('click');
 
+    // 示例装载走的是本地 `dev/samples`，一条生成/保存请求都不该有。
     expect(apiCalls(fetchMock)).toHaveLength(0);
     expect(wrapper.text()).toContain('1 个节点');
     expect(wrapper.text()).toContain('演示模式');
@@ -797,5 +821,82 @@ describe('知识库入口', () => {
     await buttonByText(wrapper, '知识库').trigger('click');
     await vi.waitFor(() => expect(wrapper.text()).toContain('还是空的'));
     expect(wrapper.text()).toContain('带着材料生成一次导图');
+  });
+});
+
+/**
+ * 心跳与"模型正在思考"这一行现在住在 `App.vue` 画布右上角的意图框里。
+ *
+ * 合并上游之前它挂在左侧材料区（`SourceInputs.vue`），上游把"生成主题/怎么改"
+ * 整块搬到了画布右上角，材料区退回纯材料——状态行跟着搬走，用例也就得跟着搬。
+ * 起手仍要接住 `/health` 与偏好两个背景请求，否则第一条业务断言就会被页面挂载
+ * 自己发出的请求带偏。
+ */
+describe('静默提示', () => {
+  function mountWithBackground(): VueWrapper {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
+      }
+      return streamReply([]);
+    }));
+    return mountApp();
+  }
+
+  it('静默到 10 秒时把阶段文案换成「模型正在思考」，两句话不并存', async () => {
+    const wrapper = mountWithBackground();
+    const store = useMindMapStore();
+    store.agentRunning = true;
+    store.stageText = '正在定框架';
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('正在定框架');
+    expect(wrapper.text()).not.toContain('模型正在思考');
+
+    store.waitedMs = 12;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('模型正在思考，已等 12 秒');
+    // 阶段文案被顶掉，不是两句叠在一起
+    expect(wrapper.text()).not.toContain('正在定框架');
+  });
+
+  it('10 秒以内仍显示阶段文案，括号里补等了几秒', async () => {
+    const wrapper = mountWithBackground();
+    const store = useMindMapStore();
+    store.agentRunning = true;
+    store.stageText = '正在定框架';
+    store.waitedMs = 3;
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).toContain('正在定框架');
+    // 心跳最小间隔就是 10 秒，`waitedMs < 10` 只在测试里造得出来；但上游的状态行
+    // 本来就会在括号里补一句"已等待"，这里断言的是那句话仍跟着阶段文案一起出现，
+    // 而"模型正在思考"这句替身要到 10 秒才顶上来。
+    expect(wrapper.text()).toContain('已等待 3 秒');
+    expect(wrapper.text()).not.toContain('模型正在思考');
+  });
+
+  it('没有阶段文案时也不因为等待计时凭空多出一行', async () => {
+    const wrapper = mountWithBackground();
+    const store = useMindMapStore();
+    store.agentRunning = true;
+    store.stageText = '';
+    store.waitedMs = 0;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).not.toContain('正在思考');
+  });
+
+  it('这一轮结束之后，残留的等待计时不再渲染', async () => {
+    // store 会在取消/断流时归零，但渲染不该依赖"没忘"：多一道守卫，
+    // 界面就不可能在"已取消。"底下再挂一句"模型正在思考"。
+    const wrapper = mountWithBackground();
+    const store = useMindMapStore();
+    store.stageText = '正在定框架';
+    store.waitedMs = 20;
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).not.toContain('模型正在思考');
+    expect(wrapper.text()).not.toContain('正在定框架');
   });
 });

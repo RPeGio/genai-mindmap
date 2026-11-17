@@ -5,6 +5,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import { NODE_SIZE } from './layout/tidy';
+import MindEdge from './MindEdge.vue';
 import MindNode from './MindNode.vue';
 
 const store = useMindMapStore();
@@ -13,9 +14,17 @@ const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveE
 
 // 预览与候选节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
 // 画布这边不必自己判断来源，点不中就是点不中。
-onNodeClick(({ node }) => store.select(node.id));
+//
+// 按住 Ctrl / Cmd / Shift 点是**追加选区**：「改这张图」吃的是整个选区（用户圈三个
+// 节点说「这几个合并成一个」，模型得知道是哪三个）。不加修饰键的单击仍然是
+// "只看这一个"，并把追加选区清掉——那才是用户在画布上随手点一下的预期。
+onNodeClick(({ node, event }) => {
+  const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+  if (additive) store.toggleSelect(node.id);
+  else store.select(node.id);
+});
 onNodeDoubleClick(({ node }) => store.beginEdit(node.id));
-onPaneClick(() => store.select(null));
+onPaneClick(() => store.clearSelection());
 // 用户手动平移或缩放后停止自动适配，否则每长一个节点视图就会被拽回全图。
 onMoveEnd(() => {
   store.viewAdjusted = true;
@@ -136,15 +145,26 @@ onBeforeUnmount(() => {
           @cancel="store.endEdit()"
         />
       </template>
+      <!--
+        附加边（条件分支 / 汇合 / 回退）。注册成 `edge-mindEdge` 就够——
+        `stores/mindmap` 只给附加边挂 `type: 'mindEdge'`，父子线仍然走内置的
+        smoothstep。两条路分开是刻意的：父子线是布局的一部分（必须跟着 tidy 的
+        句柄走），附加边是叠加语义（要标签、要按 kind 换画法），合成一个组件只会
+        让父子线的渲染被附加边的逻辑拖住。
+      -->
+      <template #edge-mindEdge="edgeProps">
+        <MindEdge v-bind="edgeProps" />
+      </template>
     </VueFlow>
 
     <!-- 空态用「画布上一个节点都没有」判断，而不是「content 为空」：生成中预览
-         会长出节点，这时再压一条占位文字，正好盖住用户想看的生长过程。 -->
+         会长出节点，这时再压一条占位文字，正好盖住用户想看的生长过程。
+         文案要指出**输入框在哪**：合并之后左侧只剩材料区，老用户会先往左看。 -->
     <p
       v-if="store.nodeCount === 0 && !store.busy"
       class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-slate-400"
     >
-      还没有导图，先在左侧输入内容。
+      还没有导图：在右上角写个主题，或先在左侧添加材料。
     </p>
     <p
       v-else-if="store.nodeCount === 0 && store.busy"

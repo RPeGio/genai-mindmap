@@ -11,6 +11,12 @@
 判据，等于把「诚实性来自判据的机械性，而不是来自模型的自觉」这条原则
 反过来用。两者冲突时两边都保留，由人判断。
 
+**hypothesis 是论断，不是标题**：消费方 `source_refs.annotate_nli` 传的是
+`label` + `detail`（见那边的 `_claim_of`）。拿 4–10 个字的节点标题当 hypothesis
+时，一段 200 字的引文根本不可能"否定"一个名词短语，判定只会落在 entailment /
+neutral——真模型实测里 10 条写反的论断全被盖成 entailment。这一层的判别力有
+多少，全看喂进来的 claim 是不是一句可判真假的论断。
+
 **默认关闭**：模型 + onnxruntime 在 2C2G 上约 100 MB 峰值（权重 25.7 MB，
 运行时另算）。部署机还要留给 Docling 和语音模块，所以默认不加载。
 启用需要同时给两个环境变量：
@@ -20,8 +26,17 @@
 
 关闭时**零开销**：连 onnxruntime 都不 import，`available()` 只读一个环境变量。
 
+**两道开关，问的不是同一件事**（`MINDMAP_NLI_ENABLED` 与
+`MINDMAP_NLI_ON_GENERATE`）：前者是"这台机器能不能跑 NLI"，后者是"每次生成
+都跑一遍值不值"。生成路径是这一层唯一的消费方（`optimization` 路由那条只读
+体检只跑机械判据），所以模型启用之后它默认就在生成收尾跑一次；实测成本
+（24 条引用 0.37–1.07 s、40 条 0.62–1.79 s）低于"每次生成多等三秒"的界，
+撞满 100 条上限时才需要 `MINDMAP_NLI_ON_GENERATE=0` 关掉。`available()` 为假
+时它一次都不发生。
+
 稳定接口：
     available() -> bool
+    on_generate() -> bool                      # 这次生成要不要跑语义复核
     judge(claim, evidence) -> dict | None      # {"score": float, "label": str, "probs": {...}}
     reset() -> None                            # 测试用：丢弃已加载的模型
 
@@ -39,6 +54,37 @@ import threading
 ENABLED_ENV = "MINDMAP_NLI_ENABLED"
 MODEL_DIR_ENV = "MINDMAP_NLI_MODEL_DIR"
 MIN_FREE_MB_ENV = "MINDMAP_NLI_MIN_FREE_MB"
+# 生成路径上的第二道闸：`ENABLED_ENV` 只回答"这台机器能不能跑 NLI"，回答不了
+# "每次生成都跑一遍值不值"。
+ON_GENERATE_ENV = "MINDMAP_NLI_ON_GENERATE"
+# 缺省值按实测（`scripts/measure_generation_diagnostics.py`，脚本化分片生成 +
+# 等价延迟）：8 支树 24 条引用 → 0.37–1.07 s；20 支（工具上限）40 条 → 0.62–1.79 s。
+# 都低于 3 s，所以模型已启用时**默认就跑**——否则这个开关形同虚设，"接了"与
+# "没接"在部署上无法区分。撞满 `MAX_NLI_CHECKS=100` 时是 1.5–4.4 s，那种图
+# （层数更深、每节点都带引用）要省时间就把 `ON_GENERATE_ENV` 设成 0。
+#
+# **上面那组数字是"等价延迟"注入出来的，不是真模型**。真模型（Erlangshen int8，
+# 98.3 MB）在本机实测：引文 238 字（分片生成的真实中位）单条 36–55 ms、300 字
+# 55 ms、400 字以上跳到 700–1160 ms（同样的台阶在 fp32 上也出现，位置不同——
+# 更像本机 CPU 线程调度的产物，不是模型固有；但只要父块级引文（450–700 字）
+# 进来了就一定会踩到）。按 238 字算，24 条引用是 **约 0.9–1.3 s**、100 条是
+# **3.6–5.5 s**，与上表的量级一致；踩到台阶的图上限就不可控了。
+#
+# **默认关**，依据是真模型实测（Erlangshen int8，98.3 MB，`scripts/measure_nli_claim.py`）：
+#   - 召回：10 条人工写反的论断，claim 改成 `label + detail` 后 contradiction 概率
+#     从 5–7% 抬到 16–39%，但 **top-1 只抓到 1/10**（mDeBERTa 一条没抓到）。
+#     降阈值救不了——0.3 只多抓 1 条，噪声一条不少。
+#   - 假 warn：24 条真实引用里 **4 条**被判 contradiction，全是 markdown 表格行
+#     片段（`| 扫描件 PDF | 0 |`、`| 4 | 单换行 \n |`）。逐条报 warn 会淹掉真问题。
+#   - 成本：238 字引文 36–55 ms/条，24 条 **约 10.6 s**、100 条约 44 s；引文过
+#     300 字有台阶跳到 700–1160 ms，而父块级引文（450–700 字）必然踩到。
+#
+# 关掉不等于这层没用，而是**它现在消费错了东西**：`annotate_nli` 只读
+# `contradiction`，而新 claim 真正多出来的信号是 `entailment`（mDeBERTa 上
+# 50%→80%）。要救这一层该消费的是 **neutral**——"引文没支持这条论断，该补证据"，
+# 那是可操作的；contradiction 人看到也只能自己去核。改 claim 是必要条件，不是
+# 充分条件，所以先把默认关掉，等消费端改完再翻回来。
+DEFAULT_ON_GENERATE = False
 
 # 实测占用：英文 mobilebert-uncased-mnli（25.7 MB int8）加载后 +83.5 MB；
 # 中文 Erlangshen-Roberta-110M-NLI（98.3 MB int8）加载后 +140.3 MB。
@@ -46,10 +92,29 @@ MIN_FREE_MB_ENV = "MINDMAP_NLI_MIN_FREE_MB"
 # （峰值约 250 MB，与 NLI 不同时发生）留出空间。
 DEFAULT_MIN_FREE_MB = 300
 
-# cross-encoder 的位置编码上限是 512 token，中文约 1:1.5，截到 1200 字符
-# 既能覆盖一页正文的主体，又不会让单次推理拖到秒级。
+# cross-encoder 的位置编码上限是 512 token，字符级预截断只是"别把整篇文章塞进去"。
+#
+# **真正生效的是 token 上限，不是这两个字符数**：`enable_truncation(max_length=512)`
+# 默认按 longest_first 截——超了先截最长的那一段，而最长的那段通常是 premise
+# （引文）。所以字符预截断给多了，代价不是"多算几个 token"，而是**静默丢掉引文的
+# 后半段**。实测（Erlangshen，bert-base-chinese 词表）：1200 个汉字 → 1200+ token，
+# 单句编码就已经撞满 512，注释里原先写的"中文约 1:1.5"是高估——实测 1 汉字 ≈ 1.05
+# token（子词合并抵消了 `##` 前缀，净结果接近一字一 token）。
 MAX_EVIDENCE_CHARS = 1200
-MAX_CLAIM_CHARS = 200
+
+# hypothesis（论断）的字符上限。这个数是从 token 预算反推的，不是拍的：
+#
+#     claim 额度 = 512（tokenizer 硬上限）
+#                − 168（引文实测中位：238 字 → 168 token）
+#                −   3（[CLS] / [SEP] / [SEP]）
+#                ≈ 341 token ≈ 340 字符（中文 1 字符 ≈ 1.05 token）
+#
+# 实测对照（同一段 238 字引文）：claim 320 字 → 合计 440 token，安全，premise 可见
+# 窗口完整；claim 423 字 → 合计 592 token，被截到 512，premise 可见窗口从 164 token
+# 掉到 84 token——**证据被砍掉一半，比论断被截更糟**。所以 340 是"论断能写满三个
+# 句子、又不挤占证据"的上界。上一版的 200 只够写一句半，配上原来那个"claim 是节点
+# 标签"的用法（几个字）从未被撞到过，接上 `detail` 之后就必须重算。
+MAX_CLAIM_CHARS = 340
 
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
@@ -201,6 +266,28 @@ def available() -> bool:
     return _load() is not None
 
 
+def on_generate() -> bool:
+    """这次生成要不要跑语义复核。
+
+    与 `available()` 是两道独立的闸，缺一不可：
+
+      - `available()` 为假（没开 `ENABLED_ENV` 或模型加载失败）→ 恒为假。生成
+        路径连 `annotate_nli` 都不会调进去，重依赖也一个都不 import。
+      - 模型可用但 `ON_GENERATE_ENV` 显式设成 0 → 假。这条留在人手里的理由只有
+        成本：一次生成的引用条数 × 单条推理时间，实测见 `DEFAULT_ON_GENERATE`。
+
+    **不探测模型**：这里只读环境变量，与 `available()` 分开正是为了"开关关着时
+    连一次加载尝试都不发生"——把两者合并成一个函数就会在判定阶段把 100 MB 权重
+    拉进内存，只为了回答一个"要不要用它"的问题。
+    """
+    if not _enabled():
+        return False
+    raw = str(os.getenv(ON_GENERATE_ENV, "")).strip().lower()
+    if not raw:
+        return DEFAULT_ON_GENERATE
+    return raw in _TRUTHY
+
+
 def judge(claim: str, evidence: str) -> dict | None:
     """语义蕴含打分。不可用时返回 None，绝不抛异常。"""
     backend = _load()
@@ -226,6 +313,7 @@ def info() -> dict:
     return {
         "enabled": _enabled(),
         "available": available(),
+        "on_generate": on_generate(),
         "model_dir": _model_dir(),
         "reason": _cache["reason"],
         "min_free_mb": _min_free_mb(),

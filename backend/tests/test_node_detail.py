@@ -27,6 +27,7 @@ from app.contracts.mindmap import (
     clip_label,
 )
 from app.contracts.ops import OpBatch
+from app.generation.service import validate_generated_content
 
 
 def _content(**node_extra) -> dict:
@@ -293,44 +294,26 @@ def test_root_label_is_clipped_too():
     assert ctx.candidate.title == ctx.candidate.root.label
 
 
-def test_whole_tree_generation_clips_labels_too():
-    """整树生成（`mindmap_generate`）的 label 同样被裁到 16 字。
+def test_whole_tree_payload_clips_labels_too():
+    """整树形态的输入（dict）交给 `validate_generated_content` 时 label 同样被裁到 16 字。
 
     分片那条路在 `_slot_from` 里裁，整树这条在 `validate_generated_content` 里裁——
     两条路各裁一次、共用同一个契约常量。少裁任何一条，画布上就有一半的节点又变回
-    "一句话标题"。
+    "一句话标题"。这条用例原来跑在 `mindmap_generate` 上；那个工具已删除
+    （`docs/ONE-PATH.md`），但"接受一整棵树作为模型输出"的入口函数还在，判据照旧。
     """
-    import asyncio
-    from unittest.mock import AsyncMock, patch
-
-    from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
-    from app.agent.tools import build_registry
-
     long_label = "关于预算审批流程中申请与复核两段的责任划分说明"
+    tree = {"title": "预算", "root": {"id": "r", "label": long_label, "children": [
+        {"id": f"b{index}", "label": f"{long_label}{index}", "children": []}
+        for index in range(3)
+    ]}}
 
-    async def fake(system, user, *, max_tokens=None, on_delta=None):
-        return {"title": "预算", "root": {"id": "r", "label": long_label, "children": [
-            {"id": f"b{index}", "label": f"{long_label}{index}", "children": []}
-            for index in range(3)
-        ]}}
+    content, diagnostics = validate_generated_content(tree)
 
-    request = AgentRunRequest(
-        goal="做一张导图", intent="create",
-        budget=RunBudget(max_model_calls=5, max_output_tokens=32768),
-    )
-    ctx = RunContext(request=request, sources_by_id={})
-    with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-        result = asyncio.run(build_registry("create").execute(
-            ToolCall(call_id="c", name="mindmap_generate", arguments={"topic": "预算"}),
-            ctx,
-        ))
-    assert result.ok, result.content
-    root = ctx.candidate.root
-    assert len(root.label) <= GENERATED_LABEL_MAX_CHARS
-    for branch in root.children:
+    assert len(content.root.label) <= GENERATED_LABEL_MAX_CHARS
+    for branch in content.root.children:
         assert len(branch.label) <= GENERATED_LABEL_MAX_CHARS
-    codes = [item["code"] for item in result.data["diagnostics"]]
-    assert "LABEL_CLIPPED_TO_GENERATED" in codes
+    assert "LABEL_CLIPPED_TO_GENERATED" in [item.code for item in diagnostics]
 
 
 def test_node_model_rejects_unknown_fields():

@@ -201,6 +201,50 @@ def test_children_get_source_refs_on_the_node_not_in_detail():
     assert "测试方案的风险控制" not in (first.detail or "")
     assert second.source_refs == []
     assert result.data["refs"]["kept"] == len(first.source_refs)
+    # 有引用就不报「证据没用上」：判据是"最终 0 条"，不是"有引用被剔"
+    assert "EVIDENCE_UNUSED" not in [item["code"] for item in result.data["diagnostics"]]
+
+
+def test_evidence_unused_is_reported_when_children_carry_no_refs():
+    """检索到原文、新节点却一个引用都没有 → `EVIDENCE_UNUSED`（warn）。
+
+    `node_expand` 原来只有一句 `content`（"模型这次没有写出可核验的引用"），而
+    `content` 只活在这次工具调用的返回值里：收尾的整树视图、遥测、前端诊断面板
+    读的都是 diagnostics。有命中不等于有引用——这两件事在树上长得一模一样。
+    """
+    source = _source()
+    ctx = _ctx(_content(), sources=[source])
+    result = _expand(ctx, AsyncMock(return_value=_children("冒烟", "回归")), count=2)
+
+    assert result.ok, result.content
+    item = next(entry for entry in result.data["diagnostics"]
+                if entry["code"] == "EVIDENCE_UNUSED")
+    assert item["level"] == "warn"
+    # 给了几条证据、剩下几条引用，两个数都在
+    assert f"检索到 {result.data['retrieval']['hits']} 条原文" in item["message"]
+    assert "最终 0 条 source_refs" in item["message"]
+    assert "模型一条引用都没有写" in item["message"]
+    assert result.data["refs"] == {"kept": 0, "dropped": 0}
+    assert all(not child.source_refs for child in _risk(ctx.candidate).children)
+    # `content` 那句话照旧在：它是模型下一轮读得到的唯一提示
+    assert "没有写出可核验的引用" in result.content
+
+
+def test_unused_evidence_is_not_reported_without_material():
+    """没有材料（请求没带、图上也没有出处）→ 压根不检索，也就不会报。
+
+    这条界限与 `_expand_system` 的三态同源：`attempted=False` 时连"没查"都不说，
+    再多一条"证据没用上"会让一次普通的无材料展开看起来像出了故障。
+    """
+    ctx = _ctx(_content())
+    result = _expand(ctx, AsyncMock(return_value=_children("冒烟", "回归")), count=2)
+
+    assert result.ok, result.content
+    assert result.data["materials"]["mode"] == "none"
+    assert not result.data["retrieval"]["hits"]
+    codes = [item["code"] for item in result.data["diagnostics"]]
+    assert "EVIDENCE_UNUSED" not in codes
+    assert "没有写出可核验的引用" not in result.content
 
 
 # ---------------------------------------------------------------- 路径上下文

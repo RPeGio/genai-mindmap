@@ -474,6 +474,11 @@ describe('保存', () => {
           root: { id: 'nr', label: '新根', children: [] },
         });
       }
+      // 接受候选会顺手给服务端记一笔"这次候选被采纳了"。它是 204、不参与保存
+      // 时序，不在这里应答的话会掉进下面那个"攒着不返回"的分支，把保存卡死。
+      if (url.includes('/agent/runs/')) {
+        return jsonResponse(null, 204);
+      }
       await new Promise<void>(resolve => { releaseSave = resolve; });
       return jsonResponse({
         id: 'm1', version: 2, content: sample(), updated_at: '2026-11-04T01:00:00Z',

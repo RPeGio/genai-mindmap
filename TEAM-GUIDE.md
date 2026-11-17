@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-16，合入上游 RAG 与知识库入口之后）：后端 1209 个测试（pytest，另有 19 个 subtest）、前端 426 个 vitest 用例（27 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-17，合入上游 agent 运行台账 / 偏好 / 导入导图之后）：后端 1630 个测试（pytest，另有 29 个 subtest）、前端 610 个 vitest 用例（39 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 6 组路由（16 个路径 / 18 个端点）
+    main.py            应用装配，注册 8 组路由（25 个路径 / 28 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       MindMapContent / Node / 请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -98,7 +98,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               1209 个测试（另有 19 个 subtest）
+  tests/               1630 个测试（另有 29 个 subtest）
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -119,7 +119,7 @@ frontend/
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
     stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               426 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 展开）
+  tests/               610 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 展开 / 导入 / 偏好）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -138,7 +138,7 @@ START_HERE.md          原始的骨架说明
 
 ## 4 现在到底有什么
 
-**能用的**：文本生成导图（demo 或真实模型，走 agent 的 `mindmap_generate`，复杂主题走 `mindmap_generate_deep`）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 候选确认，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）。
+**能用的**：文本生成导图（demo 或真实模型，走 agent 的分片生成 `mindmap_generate_deep`——骨架 + 按支检索 + 并发展开；整树一次成型的旧路已删除，见 `docs/ONE-PATH.md`）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 候选确认，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）。
 
 **是桩的**：知识检索（返回空 + `implemented:false`）、`POST /api/agent/tasks`（返回固定四阶段，不产生导图；真正的 agent 走 `/agent/runs/stream`）。
 
@@ -161,7 +161,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（16 个路径 / 18 个端点）
+## 5 接口一览（25 个路径 / 28 个端点）
 
 ```
 基础
@@ -170,10 +170,25 @@ GET  /api/health
 生成（唯一入口）
 POST /api/agent/runs/stream        目标 + 来源 + 当前树 → SSE v2 事件与候选
 
+运行台账（上游 2026-11-17）
+GET  /api/agent/runs               最近的运行（?status= & unapplied= & limit=）
+GET  /api/agent/runs/{run_id}      单次运行的完整结果（含候选草稿）
+POST /api/agent/runs/{run_id}/applied    标记"这份草稿已经用过了"
+POST /api/agent/runs/{run_id}/dismissed  标记"别再提醒我"
+
 输入（多来源）
 POST /api/ingestion/text           文本 → Source
 POST /api/ingestion/files          上传文档 / 图片 / WAV → Source（multipart，≤10MB，音频 ≤20MB）
 GET  /api/ingestion/formats        支持的扩展名与上传上限
+
+导入已有导图（上游 2026-11-17，只解析不落库）
+POST /api/mindmaps/import          XMind / FreeMind / OPML / PUML / Markdown / JSON → MindMapContent
+
+用户偏好（上游 2026-11-17）
+GET  /api/prefs                    全部偏好
+PUT  /api/prefs/{pref_key}         写一条（带 source）
+DELETE /api/prefs/{pref_key}       删一条
+GET  /api/prefs/suggestions        建议写入的偏好（模型观察到的）
 
 优化
 POST /api/optimization/check       导图 → 诊断（可带 sources 做引用核验）
@@ -183,6 +198,7 @@ POST /api/optimization/suggest     导图 → 候选建议 + 诊断
 POST /api/export/puml              导图 → PlantUML 文本
 POST /api/export/markdown          导图 → Markdown 文本
 POST /api/export/opml              导图 → OPML 文本
+POST /api/export/json              导图 → 可再导入的 JSON
 
 保存
 GET  /api/mindmaps                 列表

@@ -62,16 +62,15 @@ BEHAVIOUR = (
     "MINDMAP_NLI_MODEL_DIR",
     "MINDMAP_NLI_MIN_FREE_MB",
     "MINDMAP_SOFFICE_CMD",
-    # 材料进 prompt 的形态（`full` / `rag`）。清空 = 用默认值（`rag`）。
-    # 不清的话，宿主机上留着 `MINDMAP_SOURCE_MODE=full` 会让 `test_source_mode.py`
-    # 里"正文不进 prompt"那几条在别的机器上悄悄变成假绿/假红——它是这个文件
-    # 存在的理由（"防护只该有一处"）的又一个例子。
-    "MINDMAP_SOURCE_MODE",
     # 知识库检索（`tools.library_search_enabled`）。**清空而不是置 0**：它默认开，
     # 而"默认开 + 临时库是空的 = 既有用例行为不变"正是接线时要验证的那条前提。
     # 置 0 会把那条前提整个跳过：所有用例都不会经过"查了一次空库"的那条路，
     # 于是"库空时逐字节不变"永远没被人跑过。需要关掉的用例自己 `setenv(..., "0")`。
     "MINDMAP_LIBRARY_SEARCH",
+    # 外部检索的代理地址（`knowledge/external.py`）。清空 = 用默认的 Clash Verge 地址；
+    # 不清的话，宿主机上为别的用途配的代理会让外部源的请求目标随机器漂。
+    # 单测一律替换 `external._client`，这条只是防止"以为在测 A、其实连了 B"。
+    "MINDMAP_EXTERNAL_PROXY",
     # 重排模型名（`knowledge/rerank.py`）。清空 = 用默认值。不清的话宿主机上换个
     # 模型名会让 `tests/test_rerank.py` 里断言请求体的几条换一个字符串。
     "MINDMAP_RERANK_MODEL",
@@ -87,7 +86,21 @@ BEHAVIOUR = (
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
-            "MINDMAP_GRAPH_EXTRACTION", "MINDMAP_RERANK", "MINDMAP_GRAPH_SEARCH")
+            "MINDMAP_GRAPH_EXTRACTION", "MINDMAP_RERANK", "MINDMAP_GRAPH_SEARCH",
+            # 外部检索的多方向拆分（`external.DIRECTIONS_ENV`）。**置 0**：线上默认也是
+            # 关（实测三条全相关 13/20 → 6/20，见 `external.DIRECTIONS_ENV` 那段），
+            # 而这里置 0 让每条既有生成用例都不经过"多打两轮源 + 一次模型往返"，
+            # 需要它的用例自己 `setenv(..., "1")`。
+            "MINDMAP_EXTERNAL_DIRECTIONS",
+            # 外部知识检索（`tools.external_knowledge_enabled`）**在这里置 0**，不在
+            # BEHAVIOUR 里清空。它现在默认**开**（`dceae7e` 之后翻的，实测见 `tools.py`
+            # 那段注释），清空等于让每一条生成用例都真的去搜一次外网：
+            # `no_real_http` 会把请求变成断言失败，而 `_external_sources` 会把它当
+            # "外部源全挂"吞掉，于是每条用例都多出一句"没有搜到外部资料"和多一个
+            # `external` 键——几百条断言一起变红。需要它的用例自己 `setenv(..., "1")`；
+            # "默认开"这件事由 `test_external_knowledge.py` 的一条专门用例
+            # （`delenv` + 直接问 `external_knowledge_enabled()`）钉着。
+            "MINDMAP_EXTERNAL_KNOWLEDGE")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。

@@ -1,4 +1,4 @@
-"""五个业务工具的行为测试。
+"""四个业务工具的行为测试。
 
 生成与展开都要调模型，这里全部用 mock 替换掉 `chat_async`：工具里值得测的是
 「拿到模型结果之后怎么落到候选树上」，以及各种前置条件与失败路径，调真模型
@@ -11,11 +11,10 @@
 并发被限在 3 个以内、要点不足时只补那一支而不是整张重来。这三条一旦退化，
 单次调用会被打回「一次出一整棵树」，而那正是这条路径要解决的问题。
 
-**本文件按模块固定成 `MINDMAP_SOURCE_MODE=full`**（见下面的 `_full_source_mode`）。
-这里的一批用例钉的是"正文整份进 prompt"这条形态的契约：结构化 sources 数组、
-超预算二分裁剪、来源 id 原样透传——它们在 `rag` 形态下没有意义（那里正文根本
-不进 prompt）。`rag` 形态的行为在 `tests/test_source_mode.py`，默认值也是在那里
-钉的，所以这里的固定不会把"默认到底是不是 rag"藏起来。
+`create` 只有这一条生成路：整树一次成型的 `mindmap_generate` 已随
+`MINDMAP_SOURCE_MODE=full` 形态一起删除（`docs/ONE-PATH.md`）。它那批"正文整份
+进 prompt"的契约（结构化 sources 数组、超预算二分裁剪）随形态一起消失，所以
+本文件不再有 `full` 形态的 fixture。
 """
 from __future__ import annotations
 
@@ -24,8 +23,6 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.provider import _MAX_TOKENS_CAP
 from app.agent.tools import (
@@ -33,25 +30,16 @@ from app.agent.tools import (
     DEEP_CONCURRENCY,
     MAX_OUTPUT_TOKENS_CAP,
     PLAN_PROMPT,
-    SOURCE_TRUNCATED_HINT,
-    _source_prompt_input,
+    SUBNODE_EXPAND_PROMPT,
     build_registry,
 )
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
 from app.generation.service import (
-    CONTEXT_TOKEN_LIMIT,
-    DETAIL_PROMPT,
-    SOURCED_DETAIL_PROMPT,
-    SOURCED_THINKING_GUARD,
-    THINKING_MODELS,
     GenerationError,
-    estimate_input_tokens,
 )
 
-# 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
-# 路径，`MIN_BRANCHES = 3` 会拦下更少的树。这里的 2 分支结构会直接变成一次
-# invalid_map，测的就不再是"生成成功之后怎么落候选树"了。
+# 一级分支必须是 3 条：`mindmap_generate_deep` 走 `MIN_BRANCHES = 3` 那道关。
 TREE = {
     "title": "示例",
     "root": {
@@ -64,22 +52,6 @@ TREE = {
         ],
     },
 }
-
-
-@pytest.fixture(autouse=True)
-def _full_source_mode(clean_env, monkeypatch):
-    """整个模块跑在 `full` 形态下（理由见模块 docstring）。
-
-    必须显式依赖 `clean_env`：那个 fixture 会把 `MINDMAP_SOURCE_MODE` 删掉
-    （宿主机上留着 `full` 不该影响别的文件），同作用域的两条 autouse 之间没有
-    可靠顺序，只有依赖关系能定住"先清、后设"。
-
-    用 fixture 而不是逐条 `patch.dict`：这个文件里 unittest 用例与裸 pytest 函数
-    混着写，逐条加装饰器必然漏——而漏掉的那条在 `rag` 形态下会静默变成"另一个
-    测试"，不是报错。
-    """
-    monkeypatch.setenv("MINDMAP_SOURCE_MODE", "full")
-    yield
 
 
 def _content() -> MindMapContent:
@@ -113,15 +85,6 @@ def _call(name: str, **arguments) -> ToolCall:
 
 def _run(coro):
     return asyncio.run(coro)
-
-
-def _prompt_payload(user: str) -> list[dict]:
-    """取出 `_source_prompt_input` 里那段 JSON 数组（**只有 `full` 形态有**）。
-
-    `rag` 形态的输入是纯文本清单，拿它来解析只会得到一条 JSONDecodeError。
-    那一边的断言在 `tests/test_source_mode.py`。
-    """
-    return json.loads(user.split("\n", 1)[1])
 
 
 def _plan(*titles: str) -> dict:
@@ -164,240 +127,6 @@ def _flagged(*items: tuple[str, bool]) -> dict:
 def _subnode_label(user: str) -> str:
     """从二级以下的展开消息里取出这次展开的是哪个节点。"""
     return user.split("本节点：", 1)[1].split("\n", 1)[0]
-
-
-class GenerateToolTest(unittest.TestCase):
-    def test_rejects_when_intent_is_not_create(self):
-        ctx = _ctx(intent="edit")
-        result = _run(build_registry("create").execute(_call("mindmap_generate", topic="x"), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "wrong_intent")
-
-    def test_rejects_when_map_already_exists(self):
-        ctx = _ctx(candidate=_content())
-        result = _run(build_registry("create").execute(_call("mindmap_generate", topic="x"), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "map_exists")
-
-    def test_success_sets_candidate_and_revision(self):
-        ctx = _ctx()
-        with patch("app.agent.tools.chat_async", new=AsyncMock(return_value=TREE)):
-            result = _run(build_registry("create").execute(_call("mindmap_generate", topic="机器学习"), ctx))
-        self.assertTrue(result.ok, result.content)
-        self.assertIsNotNone(ctx.candidate)
-        self.assertEqual(ctx.candidate.root.id, "root")
-        self.assertEqual(ctx.revision, 1)
-        self.assertEqual(result.data["node_count"], 5)
-
-    def test_invalid_model_output_is_reported_not_raised(self):
-        ctx = _ctx()
-        broken = {"title": "示例", "root": {"id": "root", "label": "根", "children": [
-            {"id": "root", "label": "重复 id", "children": []},
-        ]}}
-        with patch("app.agent.tools.chat_async", new=AsyncMock(return_value=broken)):
-            result = _run(build_registry("create").execute(_call("mindmap_generate", topic="x"), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "invalid_map")
-        self.assertIsNone(ctx.candidate)
-
-    def test_sourced_input_carries_every_source_id_and_text(self):
-        """有来源时喂给模型的必须是带 source_id 的结构化数组。
-
-        `SOURCED_DETAIL_PROMPT` 要求模型按 source_id 写 `source_refs`。早先这里
-        传的是 `_understand()` 的纯文本合并，一个 id 都没有——模型只能凭空编
-        引用，引用功能等于从来没通过。
-        """
-        first = Source(kind=SourceKind.text, status="parsed", text="第一段原始材料。")
-        second = Source(kind=SourceKind.text, status="parsed", text="第二段原始材料。")
-        ctx = _ctx(sources=[first, second])
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="整理这些材料"), ctx))
-
-        self.assertTrue(result.ok, result.content)
-        system, user = mocked.await_args.args
-        # 思维模型块拼在基础提示词之后，所以只断言前缀：整串还带着「思考方式」那一段
-        self.assertTrue(system.startswith(SOURCED_DETAIL_PROMPT))
-        self.assertIn(first.id, user)
-        self.assertIn(second.id, user)
-        self.assertEqual(
-            _prompt_payload(user),
-            [
-                {"source_id": first.id, "text": "第一段原始材料。"},
-                {"source_id": second.id, "text": "第二段原始材料。"},
-            ],
-        )
-
-    def test_oversized_source_is_truncated_with_hint(self):
-        """正文刚好占满窗口时，还要给系统提示词、JSON 与截断提示留空间。"""
-        quote = "只在完整原文末尾出现的引文"
-        long_text = "字" * (int(CONTEXT_TOKEN_LIMIT * 1.5) - len(quote)) + quote
-        source = Source(kind=SourceKind.text, status="parsed", text=long_text)
-        ctx = _ctx(sources=[source])
-        tree = json.loads(json.dumps(TREE))
-        tree["root"]["source_refs"] = [{"source_id": source.id, "quote": quote}]
-        mocked = AsyncMock(return_value=tree)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="整理"), ctx))
-
-        self.assertTrue(result.ok, result.content)
-        system, user = mocked.await_args.args
-        text = _prompt_payload(user)[0]["text"]
-        self.assertTrue(text.endswith(SOURCE_TRUNCATED_HINT))
-        self.assertLess(len(text), len(long_text))
-        self.assertLessEqual(
-            estimate_input_tokens(system) + estimate_input_tokens(user), CONTEXT_TOKEN_LIMIT,
-        )
-        self.assertNotIn(quote, text)
-        # 模型输入被裁剪，不代表校验也能裁剪：末尾的合法原文引用必须仍然有效。
-        self.assertEqual(ctx.candidate.root.source_refs[0].quote, quote)
-        self.assertEqual(source.text, long_text)
-
-    def test_source_within_budget_is_sent_in_full(self):
-        unit = "英文原文 English material.\n"
-        long_text = unit * (CONTEXT_TOKEN_LIMIT // len(unit))
-        source = Source(kind=SourceKind.text, status="parsed", text=long_text)
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="整理"), _ctx(sources=[source])))
-
-        self.assertTrue(result.ok, result.content)
-        system, user = mocked.await_args.args
-        self.assertLessEqual(
-            estimate_input_tokens(system) + estimate_input_tokens(user), CONTEXT_TOKEN_LIMIT,
-        )
-        self.assertEqual(_prompt_payload(user), [{"source_id": source.id, "text": long_text}])
-        self.assertNotIn(SOURCE_TRUNCATED_HINT, user)
-
-    def test_source_without_text_is_ignored_instead_of_breaking_generation(self):
-        """空来源不该拖垮整次生成：它只是没正文，不是模型出错。"""
-        blank = Source(kind=SourceKind.text, status="pending", text=None)
-        usable = Source(kind=SourceKind.text, status="parsed", text="有正文的一段材料。")
-        ctx = _ctx(sources=[blank, usable])
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="整理"), ctx))
-
-        self.assertTrue(result.ok, result.content)
-        _, user = mocked.await_args.args
-        self.assertEqual([item["source_id"] for item in _prompt_payload(user)], [usable.id])
-
-    def test_only_blank_sources_falls_back_to_topic_prompt(self):
-        ctx = _ctx(sources=[Source(kind=SourceKind.text, status="failed", text="   ")])
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="机器学习"), ctx))
-
-        self.assertTrue(result.ok, result.content)
-        system, user = mocked.await_args.args
-        self.assertTrue(system.startswith(DETAIL_PROMPT))
-        self.assertEqual(user, "机器学习")
-
-    def test_thinking_model_feynman_reaches_the_prompt(self):
-        """选中的思维模型必须真的进到提示词里，否则下拉框只是个装饰。
-
-        断言用整段 prompt 而不是「费曼」三个字：表里 `label` 才是给人看的中文名，
-        `prompt` 才是给模型看的思考步骤——只有后者出现在提示词里才算生效。
-        """
-        ctx = _ctx(thinking_model="feynman")
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="机器学习"), ctx))
-
-        self.assertTrue(result.ok, result.content)
-        system, _ = mocked.await_args.args
-        self.assertIn(THINKING_MODELS["feynman"]["prompt"], system)
-        self.assertIn("思考方式", system)
-        # 别的模型不该混进来
-        self.assertNotIn(THINKING_MODELS["critical"]["prompt"], system)
-
-    def test_thinking_model_defaults_to_general_when_omitted(self):
-        """缺省走 default：不选的时候也该有拆解步骤，而不是空一块。"""
-        ctx = _ctx()
-        self.assertEqual(ctx.request.thinking_model, "default")
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="机器学习"), ctx))
-
-        self.assertTrue(result.ok, result.content)
-        system, _ = mocked.await_args.args
-        self.assertIn(THINKING_MODELS["default"]["prompt"], system)
-
-    def test_sourced_path_keeps_material_bounded(self):
-        """有来源时思维模型只改「整理角度」：限定句必须一起拼进去。
-
-        少了这句，费曼模型的「必须举反例」会被当成展开许可，模型开始补写
-        材料里根本没有的内容——那正是 `SOURCED_DETAIL_PROMPT` 要防的事。
-        """
-        ctx = _ctx(sources=[Source(kind=SourceKind.text, status="parsed", text="原文。")],
-                   thinking_model="feynman")
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="整理材料"), ctx))
-
-        self.assertTrue(result.ok, result.content)
-        system, _ = mocked.await_args.args
-        self.assertIn(THINKING_MODELS["feynman"]["prompt"], system)
-        self.assertIn(SOURCED_THINKING_GUARD, system)
-        # 限定句在思维步骤之后：读起来是"按这个方式整理，但只限材料范围内"
-        self.assertGreater(system.index(SOURCED_THINKING_GUARD),
-                           system.index(THINKING_MODELS["feynman"]["prompt"]))
-
-    def test_model_call_budget_blocks_before_calling_out(self):
-        """额度用完后工具不再调用模型：省下的是真金白银。"""
-        ctx = _ctx()
-        ctx.model_calls_used = ctx.request.budget.max_model_calls
-        mocked = AsyncMock(return_value=TREE)
-        with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(
-                _call("mindmap_generate", topic="x"), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "budget_exhausted")
-        mocked.assert_not_called()
-
-
-@pytest.mark.parametrize("unit", ["a", "字", '中A\\"\n'])
-def test_source_clipping_keeps_the_longest_prefix_within_token_budget(unit):
-    text = unit * (CONTEXT_TOKEN_LIMIT * 4)
-    source = Source(id="long-source", kind=SourceKind.text, status="parsed", text=text)
-    system = SOURCED_DETAIL_PROMPT + SOURCED_THINKING_GUARD
-    user = _source_prompt_input([source], system=system)
-    payload = _prompt_payload(user)
-    clipped = payload[0]["text"]
-    assert clipped.endswith(SOURCE_TRUNCATED_HINT)
-    kept = clipped.removesuffix(SOURCE_TRUNCATED_HINT)
-    assert kept and text.startswith(kept)
-    assert estimate_input_tokens(user) + estimate_input_tokens(system) <= CONTEXT_TOKEN_LIMIT
-
-    # 不只断言「没超限」：再多保留一个原字符就放不下，才证明没有另一个字符上限。
-    payload[0]["text"] = text[:len(kept) + 1] + SOURCE_TRUNCATED_HINT
-    longer = user.split("\n", 1)[0] + "\n" + json.dumps(payload, ensure_ascii=False)
-    assert estimate_input_tokens(longer) + estimate_input_tokens(system) > CONTEXT_TOKEN_LIMIT
-    assert source.text == text
-
-
-def test_multiple_sources_share_one_token_budget():
-    sources = [
-        Source(id=f"s{index}", kind=SourceKind.text, status="parsed",
-               text="字" * CONTEXT_TOKEN_LIMIT)
-        for index in range(2)
-    ]
-    system = SOURCED_DETAIL_PROMPT
-    user = _source_prompt_input(sources, system=system)
-    payload = _prompt_payload(user)
-    assert estimate_input_tokens(user) + estimate_input_tokens(system) <= CONTEXT_TOKEN_LIMIT
-    assert [item["source_id"] for item in payload] == [source.id for source in sources]
-    assert payload[0]["text"] == sources[0].text
-    assert payload[1]["text"].endswith(SOURCE_TRUNCATED_HINT)
-    assert sources[1].text == "字" * CONTEXT_TOKEN_LIMIT
 
 
 class GenerateDeepToolTest(unittest.TestCase):
@@ -824,7 +553,10 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertIn("8", plan_users[8])
         self.assertNotEqual(plan_users[3], plan_users[8])
         for text in plan_users.values():
-            self.assertIn("20 字", text)
+            # 长度口径与系统提示词、代码截断同源（16，见 `GENERATED_LABEL_MAX_CHARS`）。
+            # 这里曾经钉的是 20，而 `PLAN_PROMPT` 说 16、`_skeleton_titles` 按 16 截
+            # ——三处两个数，模型照 user 写、写出来就被截。
+            self.assertIn("16 字", text)
             self.assertIn("互不重叠", text)
 
 
@@ -1510,11 +1242,17 @@ class EditToolTest(unittest.TestCase):
         self.assertEqual(ctx.revision, 0)
 
 
-class SelectionScopeTest(unittest.TestCase):
-    """选中集合划定的可改范围。
+class SelectionHintTest(unittest.TestCase):
+    """选中集合是**上下文提示**，不是作用域。
 
-    两层防线都要测：注册表按意图裁剪，执行层再按选中子树收窄。只测其中一层，
-    另一层配错时就没有任何东西守着"别改用户没选中的分支"。
+    这里守两件事，方向相反但都必须成立：
+
+      1. 注册表按意图裁剪仍然是**硬**的（expand 下连 `mindmap_edit` 都看不到），
+         否则模型会在展开时去删别的分支；
+      2. 选区本身**不硬拦**：动到选区之外的节点照样执行，只在结果里附一句
+         "这几处不在你选中的范围"。写成硬拦截会挡掉「整张图都加上时间维度」
+         与「压缩这一支」（真正的目标是三个不相邻节点的公共祖先，它不在选区里）
+         这两种本来正确的改动。
     """
 
     def test_expand_selection_rejects_edit_of_other_branch(self):
@@ -1522,49 +1260,57 @@ class SelectionScopeTest(unittest.TestCase):
         before = ctx.candidate.model_dump()
         ops = [{"op": "remove", "id": "b"}]
 
-        # 第一层：expand 意图的注册表里压根没有 mindmap_edit
+        # 注册表这一层仍然是硬的：expand 意图里压根没有 mindmap_edit
         registry = build_registry("expand")
         self.assertNotIn("mindmap_edit", registry.names())
         blocked = _run(registry.execute(_call("mindmap_edit", ops=ops), ctx))
         self.assertFalse(blocked.ok)
         self.assertEqual(blocked.data["code"], "unknown_tool")
 
-        # 第二层：就算注册表被误配（这里直接喂一个 edit 的 registry），执行层也拦
-        executed = _run(build_registry("edit").execute(_call("mindmap_edit", ops=ops), ctx))
-        self.assertFalse(executed.ok)
-        self.assertEqual(executed.data["code"], "out_of_selection")
-
         self.assertEqual(ctx.candidate.model_dump(), before)
         self.assertEqual(ctx.revision, 0)
 
-    def test_edit_inside_selection_is_allowed(self):
-        """收窄不等于禁用：选中 A 时改 A 的子树必须照常成功。"""
+    def test_edit_outside_selection_still_applies_and_says_so(self):
+        """选中 a 却改 b：改动生效，结果里点名 b 并提醒模型交代原因。"""
+        ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
+        result = _run(build_registry("edit").execute(_call(
+            "mindmap_edit", ops=[{"op": "update", "id": "b", "changes": {"label": "乙改"}}]), ctx))
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], ["b"])
+        self.assertIn("不在用户选中的节点范围内", result.content)
+        node = next(child for child in ctx.candidate.root.children if child.id == "b")
+        self.assertEqual(node.label, "乙改")
+
+    def test_edit_inside_selection_has_no_hint(self):
+        """收窄不等于禁用：选中 A 时改 A 的子树必须照常成功，且不多一句提示。"""
         ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
         result = _run(build_registry("edit").execute(_call(
             "mindmap_edit", ops=[{"op": "update", "id": "a1", "changes": {"label": "甲一改"}}]), ctx))
         self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], [])
+        self.assertNotIn("不在用户选中的节点范围内", result.content)
         node = next(child for child in ctx.candidate.root.children if child.id == "a")
         self.assertEqual(node.children[0].label, "甲一改")
 
-    def test_move_target_outside_selection_is_rejected(self):
-        """move 的落脚点也在范围里：不能把选中子树挂到未选中的分支下。"""
+    def test_move_target_outside_selection_is_allowed(self):
+        """把选中子树挂到未选中的分支下也是允许的（移出选区同样是"扩权"）。"""
         ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
-        before = ctx.candidate.model_dump()
         result = _run(build_registry("edit").execute(_call(
             "mindmap_edit", ops=[{"op": "move", "id": "a1", "new_parent_id": "b"}]), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "out_of_selection")
-        self.assertEqual(ctx.candidate.model_dump(), before)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], ["b"])
+        b = next(child for child in ctx.candidate.root.children if child.id == "b")
+        self.assertEqual([child.id for child in b.children], ["a1"])
 
-    def test_add_under_unselected_parent_is_rejected(self):
+    def test_add_under_unselected_parent_is_allowed(self):
         """add 看的是 parent_id：新节点的 id 是临时名，比它没有意义。"""
         ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
         result = _run(build_registry("edit").execute(_call("mindmap_edit", ops=[
             {"op": "add", "id": "$new", "parent_id": "b", "label": "丙"},
         ]), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "out_of_selection")
-        self.assertEqual(ctx.revision, 0)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], ["b"])
+        self.assertEqual(ctx.revision, 1)
 
 
 class DeepBudgetFloorTest(unittest.TestCase):
@@ -1600,25 +1346,25 @@ class DeepBudgetFloorTest(unittest.TestCase):
 
 
 class RegistryTest(unittest.TestCase):
-    def test_create_intent_offers_both_generate_tools(self):
-        """create 下两个生成工具同时在场：简单/复杂由模型按描述自选。"""
-        self.assertEqual(
-            build_registry("create").names(),
-            ["mindmap_generate", "mindmap_generate_deep"],
-        )
+    def test_create_intent_offers_only_the_sliced_generator(self):
+        """create 下只有一个生成工具：形态已经不存在，没有第二个选项可选。"""
+        self.assertEqual(build_registry("create").names(), ["mindmap_generate_deep"])
 
-    def test_deep_generate_is_absent_when_sources_are_attached(self):
-        """带材料时不给分片生成。
+    def test_sources_do_not_change_the_create_registry(self):
+        """带材料与不带材料给出同一个生成工具。
 
-        它的入参里没有任何来源字段，骨架与展开都只看主题：产出的树与材料无关，
-        却会以 ok=True 成功返回。看不到这个工具，模型就不会选中它。
+        这是这次删除的核心断言：早先"带材料撤掉分片、改用整树"是**形态**决定的，
+        现在带材料就是分片自己的事（骨架看章节标题、每支各检索一次），注册表
+        不该因此换掉工具。
         """
-        with_sources = build_registry("create", has_sources=True).names()
-        self.assertNotIn("mindmap_generate_deep", with_sources)
-        self.assertIn("mindmap_generate", with_sources)
-
-        without_sources = build_registry("create", has_sources=False).names()
-        self.assertIn("mindmap_generate_deep", without_sources)
+        self.assertEqual(
+            build_registry("create", has_sources=True).names(),
+            ["mindmap_generate_deep"],
+        )
+        self.assertEqual(
+            build_registry("create", has_sources=False).names(),
+            ["mindmap_generate_deep"],
+        )
 
     def test_deep_generate_is_absent_for_expand_and_edit(self):
         """分片生成只在 create 里有：expand / edit 下连入口都不该出现。"""
@@ -1642,18 +1388,88 @@ class RegistryTest(unittest.TestCase):
     def test_edit_intent_offers_edit_but_not_generate(self):
         names = build_registry("edit", has_sources=True).names()
         self.assertIn("mindmap_edit", names)
-        self.assertNotIn("mindmap_generate", names)
+        self.assertNotIn("mindmap_generate_deep", names)
         self.assertIn("rag_query", names)
 
     def test_edit_without_sources_has_no_rag(self):
-        """没有来源时的检索必然返回"没找到"，注册它只会诱导模型乱查。"""
-        self.assertEqual(build_registry("edit").names(), ["mindmap_edit"])
+        """没有来源时的检索必然返回"没找到"，注册它只会诱导模型乱查。
+
+        `edit` 有七个写工具（四个节点 + 两个边 + 批量）。这里断言的是**集合**：顺序由
+        `_TOOL_ORDER` 决定，另有专门的用例钉它，不该让"多一个工具"把这条判断
+        变成一个数字游戏。
+        """
+        self.assertEqual(
+            set(build_registry("edit").names()),
+            {"add_node", "update_node", "remove_node", "move_node",
+             "add_edge", "remove_edge", "mindmap_edit"},
+        )
+        self.assertNotIn("rag_query", build_registry("edit").names())
 
     def test_unknown_tool_lists_available(self):
         result = _run(build_registry("create").execute(_call("generate_mindmap", topic="x"), _ctx()))
         self.assertFalse(result.ok)
         self.assertEqual(result.data["code"], "unknown_tool")
         self.assertIn("mindmap_generate", result.content)
+
+
+class BranchVisualsTest(unittest.TestCase):
+    """视觉元素**只挂在一级分支上**。
+
+    一组 80 节点的树如果每个节点都有图标，图标就不再指示任何东西，只是把画布弄花。
+    这条边界有两道防线，用例各钉一条：
+
+      1. 提示词里明说"只给一级分支"（并给了 ❌/✅ 对照）；
+      2. 代码根本不读子节点上的 color/icon（`_slot_from` 没有这两个字段），
+         所以模型写了也落不到树上——这一条才是硬的。
+    """
+
+    def test_only_top_level_branches_get_color_and_icon(self):
+        ctx = _ctx(max_model_calls=10)
+        plan = {"branches": [
+            {"label": "范围", "color": "blue", "icon": "🎯"},
+            {"label": "原理", "color": "teal", "icon": "📊"},
+            {"label": "风险", "color": "#2563eb", "icon": "用放大镜"},
+        ]}
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return plan
+            # 子节点上也写 color/icon：模型的常见越界，必须被忽略而不是落树。
+            return {"children": [
+                {"label": "要点一", "color": "red", "icon": "🔧"},
+                {"label": "要点二"},
+            ]}
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        branches = ctx.candidate.root.children
+        # 第 3 支模型写了 `#2563eb`（非法，归一成 None），**由调色板补色**：
+        # 模型已占用 blue / teal，按 `NODE_COLORS` 顺序第一个没人用的就是 green。
+        # 这条断言改过——原来第 3 支是 None，那时缺色就留空，画布上一支没颜色与
+        # "这一支是另一组"没法区分（见 `_fill_branch_colors`）。
+        self.assertEqual([b.color for b in branches], ["blue", "teal", "green"])
+        # 非法 hex 与"写成文字的图标"都被丢掉，而不是让整次骨架失败
+        self.assertEqual([b.icon for b in branches], ["🎯", "📊", None])
+
+        for branch in branches:
+            for child in branch.children:
+                self.assertIsNone(child.color, "子节点不该带颜色")
+                self.assertIsNone(child.icon, "子节点不该带图标")
+        # 根节点也没有视觉元素：它是中心主题，颜色由主题决定
+        self.assertIsNone(ctx.candidate.root.color)
+
+    def test_prompts_state_the_boundary_with_contrast_examples(self):
+        """提示词要写清边界，并给 ❌/✅ 对照——只写"只给一级"模型会忽略。"""
+        self.assertIn("一级分支", PLAN_PROMPT)
+        self.assertIn("✅ 正确", PLAN_PROMPT)
+        self.assertIn("❌ 错误", PLAN_PROMPT)
+        # 展开那一层明确说"不要写"，否则模型每次都会顺手补一个图标
+        self.assertIn("不要给子项写 color 或 icon", BRANCH_EXPAND_PROMPT)
+        self.assertIn("不要给子项写 color 或 icon", SUBNODE_EXPAND_PROMPT)
 
 
 class LimitAlignmentTest(unittest.TestCase):

@@ -59,9 +59,32 @@ const boxClass = computed(() => {
       ? 'border-dashed border-slate-200 bg-white text-slate-400 opacity-40'
       : 'border-dashed border-slate-300 bg-white text-slate-600 opacity-60';
   }
+  // 候选改动过的节点描一圈琥珀色：画布画的是已应用的 `content`，候选要用户点
+  // 「应用」才生效，所以不给标记的话，用户只能盲点。新增的节点在这里**标不出来**
+  // （它在 content 里还不存在），那部分差异由侧栏的改动清单负责。
+  if (props.data.changed) {
+    return 'border-amber-500 bg-white text-slate-700 ring-2 ring-amber-300';
+  }
   if (props.selected) return 'border-slate-900 bg-white font-medium shadow-md';
   if (props.data.depth === 0) return 'border-slate-900 bg-slate-900 font-medium text-white';
   return 'border-slate-300 bg-white text-slate-700 hover:border-slate-400';
+});
+
+/**
+ * 语义色：键挂在 `data-node-color` 上，**色值交给 CSS**（`styles.css` 里的
+ * `--mind-color-*`）。
+ *
+ * 不在这里拼 `style="border-color:#2563eb"` 是有代价的：一旦写进节点样式，暗色
+ * 主题下就是一堆刺眼的亮蓝，而那是已经存进库里的数据，改不回来。挂键之后，
+ * 换主题只改 CSS，导图一个字都不用动。
+ *
+ * 根节点的底色是深色实底（`boxClass` 里的 `bg-slate-900`），CSS 那边只给它染
+ * 左边一道；其余节点染边框 + 淡底。
+ */
+const colorAttrs = computed(() => {
+  const color = props.data.color;
+  if (!color) return {};
+  return { 'data-node-color': color, 'data-node-depth': String(props.data.depth) };
 });
 
 const card = ref(false);
@@ -173,6 +196,8 @@ onBeforeUnmount(() => clearTimeout(timer));
       class="flex h-12 w-[180px] items-center justify-center rounded-md border px-3 text-center text-sm leading-tight"
       :class="boxClass"
       :title="data.fullLabel"
+      :data-node-color="colorAttrs['data-node-color']"
+      :data-node-depth="colorAttrs['data-node-depth']"
       tabindex="0"
     >
       <input
@@ -187,7 +212,15 @@ onBeforeUnmount(() => clearTimeout(timer));
         @input="onDraftInput"
         @blur="finish(true)"
       />
-      <span v-else class="line-clamp-2 break-words">{{ data.label }}</span>
+      <span v-else class="line-clamp-2 break-words">
+        <!--
+          图标画在标题前面。emoji 不做成图标库的 id：零依赖、跨平台、`<span>`
+          直接渲染，而图标库要为一个纯装饰字段新增一份依赖（`package.json` 里
+          目前没有 `lucide-vue-next` 之类）。`aria-hidden` + 外面那层 `title`
+          已经带上了完整标题，读屏读 emoji 的名字只是噪音。
+        -->
+        <span v-if="data.icon" class="mr-1" aria-hidden="true">{{ data.icon }}</span>{{ data.label }}
+      </span>
     </div>
 
     <!--

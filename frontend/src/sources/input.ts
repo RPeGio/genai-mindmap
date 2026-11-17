@@ -21,6 +21,9 @@ export const FILE_ACCEPT = '.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md
 
 export const SOURCE_LABELS: Record<SourceKind, string> = {
   text: '文本', markdown: 'Markdown', document: '文档', image: '图片', audio: '语音',
+  // 外部检索抓回来的两类。文案要明确说"外"，否则用户会以为这是自己上传的材料
+  // ——两者的可信度与责任归属都不一样。
+  web: '网页', paper: '论文',
 };
 
 let sourceSequence = 0;
@@ -62,6 +65,113 @@ export function textSource(text: string): Source {
     span: null, status: 'parsed', error: null, parsed_pages: null,
     truncated: false, failed_pages: [],
   };
+}
+
+// ---- 材料标题能不能当主题 ---------------------------------------------------
+//
+// 「只上传材料、不写主题」是很自然的用法：用户上传一份 PDF，期待的就是"把它整理成
+// 导图"。后端的 `mindmap_generate_deep` 只需要一个 `topic` 字符串，所以标题可以由
+// 前端补上——但**只能是材料标题里真的带信息的那种**。
+//
+// `未命名.txt` / `扫描件.pdf` / `IMG_001.png` 的长度都过得了"非空"这道关，可它们
+// 描述的是**文件**而不是**内容**。拿它当中心主题，模型只能围绕"未命名"猜，产出一张
+// 以垃圾词为根的图——这比直接要求用户补一句主题更糟：他想不通自己错在哪。
+// 所以判据是"这个标题有没有携带信息"，不满足就退回「请写一个主题」。
+
+/** 与 `FILE_ACCEPT` 同一份扩展名。只认这一份白名单，不按"最后一个点"切。 */
+const TITLE_EXTENSIONS = [
+  '.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls',
+  '.html', '.htm', '.md', '.asciidoc', '.adoc', '.txt',
+  '.wav', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',
+];
+
+/**
+ * 通用词：描述的是文件本身，不是内容。归一化（去空白、小写）之后**全等**才算命中。
+ *
+ * 不做子串判断：`机器学习文档` 命中 `文档` 就把一个真标题判死，而它明明能用。
+ */
+const GENERIC_TITLE_WORDS = new Set([
+  '未命名', '无标题', '新建', '新建文档', '新建文本文档', '文档', '文件', '附件',
+  '扫描件', '扫描', '图片', '照片', '截图', '屏幕截图', '截屏', '录屏', '录音', '音频', '语音',
+  '草稿', '副本', '测试', '临时', '主题', '材料', '资料', '内容', '示例',
+  'untitled', 'unnamed', 'document', 'doc', 'file', 'attachment', 'scan', 'image', 'img',
+  'photo', 'screenshot', 'screen shot', 'audio', 'voice', 'draft', 'copy', 'test', 'tmp',
+  'temp', 'new', 'sample', 'demo',
+]);
+
+/** 设备/文件编号式名字：`IMG_001`、`DSC1234`、`微信截图_20241117`。 */
+const DEVICE_NAME = /^(img|dsc|dscn|dscf|pxl|mvimg|screenshot|scan|wx|mmexport|screenshot)[-_ ]?\d+$/;
+
+/** 主题至少两个字、至多三十个字：一个字的标题当不了中心主题，超长的多半是文件名。 */
+export const TOPIC_MIN_CHARS = 2;
+export const TOPIC_MAX_CHARS = 30;
+
+export interface MaterialTitle {
+  /** 能当主题的标题（已去扩展名）；空串 = 这批材料里没有能用的。 */
+  topic: string;
+  /** 标题取自哪份材料；`topic` 非空时才有。 */
+  from: string;
+  /** 没有可用标题时的一句话原因，`topic` 非空时是空串。 */
+  reason: string;
+}
+
+/** 文件名去掉扩展名。`方案 v1.2` 这种名字不能被切成 `方案 v1`。 */
+export function fileTitle(filename: string): string {
+  const name = filename.trim();
+  const lower = name.toLowerCase();
+  const hit = TITLE_EXTENSIONS.find(extension => lower.endsWith(extension));
+  return (hit ? name.slice(0, name.length - hit.length) : name).trim();
+}
+
+/** 剪掉「(2)」「- 副本」这类后缀，再压掉多余空白。 */
+function normalizeTitle(stem: string): string {
+  return stem
+    .replace(/\s*[（(]\d+[)）]\s*$/, '')
+    .replace(/[-_ ]*(副本|拷贝|copy)\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 这个标题为什么当不了主题；空串 = 能用。 */
+function titleProblem(title: string): string {
+  const chars = Array.from(title).length;
+  if (!chars) return '材料标题是空的';
+  if (chars < TOPIC_MIN_CHARS) return `材料标题「${title}」太短`;
+  if (chars > TOPIC_MAX_CHARS) return '材料标题太长，不像一个主题';
+  const key = title.toLowerCase();
+  if (GENERIC_TITLE_WORDS.has(key)) return `材料标题「${title}」是通用词`;
+  if (DEVICE_NAME.test(key.replace(/\s+/g, ''))) return `材料标题「${title}」像个文件编号`;
+  // 去掉数字/空白/标点之后还剩什么：`20241117`、`第 1 章` 剩下的都不够两个字。
+  const letters = Array.from(title.replace(/[\d\s\p{P}\p{S}]/gu, ''));
+  if (letters.length < TOPIC_MIN_CHARS) return `材料标题「${title}」里只有数字或符号`;
+  return '';
+}
+
+/**
+ * 从材料里挑一个能当主题的标题。
+ *
+ * 按顺序取**第一份可用**的：文件名才是标题的载体（粘贴的文本来源没有 `filename`，
+ * 它天然给不出主题）。第一份不可用时会继续往后看——用户传了 `未命名.txt` 与
+ * `机器学习导论.pdf`，用后者当主题显然比逼他再写一句主题更省事。
+ */
+export function materialTitle(sources: Source[]): MaterialTitle {
+  const titled = sources.filter(source => (source.filename ?? '').trim());
+  if (!titled.length) {
+    return {
+      topic: '',
+      from: '',
+      reason: sources.length ? '粘贴的材料没有标题' : '',
+    };
+  }
+  let firstProblem = '';
+  for (const source of titled) {
+    const title = normalizeTitle(fileTitle(source.filename ?? ''));
+    const problem = titleProblem(title);
+    if (!problem) return { topic: title, from: source.filename ?? '', reason: '' };
+    // 只留第一份的原因：那是用户最先看到、也最容易认出来的那个名字。
+    if (!firstProblem) firstProblem = problem;
+  }
+  return { topic: '', from: '', reason: firstProblem };
 }
 
 /** 每份来源单独提示缺页与截断，不能被随后加入的文件覆盖。 */

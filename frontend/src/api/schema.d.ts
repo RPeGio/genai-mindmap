@@ -40,6 +40,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mindmaps/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import Mindmap */
+        post: operations["import_mindmap_api_mindmaps_import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/optimization/check": {
         parameters: {
             query?: never;
@@ -136,6 +153,30 @@ export interface paths {
          * @description 导出 OPML，便于导入 XMind 等工具。
          */
         post: operations["export_opml_api_export_opml_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/export/json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export Json
+         * @description 导出 JSON（`MindMapContent` 的序列化）。
+         *
+         *     这是唯一**无损**的格式，也是「导出 → 手改 → 导入」的保底：另外三种都只有
+         *     一个文字槽位，往返一次 `note` / `detail` / 颜色 / 图型会退化（见
+         *     `app/export/service.py::to_json` 的 docstring）。
+         */
+        post: operations["export_json_api_export_json_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -239,6 +280,172 @@ export interface paths {
         /** Stream Run */
         post: operations["stream_run_api_agent_runs_stream_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Runs
+         * @description 运行台账。默认回答的是"上次跑完、我还没处理的是哪一次"。
+         *
+         *     `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出草稿的那次
+         *     同样要能被捡起来**——否则"关掉页面那 40 秒"照样白花，只是从内存白花变成写进
+         *     数据库白花。
+         *
+         *     这条查询就是这张表草稿列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
+         */
+        get: operations["list_runs_api_agent_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Run */
+        get: operations["get_run_api_agent_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}/applied": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark Run Applied
+         * @description 候选进了画布。前端在「应用」成功后调用一次，幂等。
+         *
+         *     "done 但已应用"与"done 但没应用"只能靠这个时间戳分开：候选可能被 PUT 到一张
+         *     已有导图上（推不出新记录），也可能应用之后又被撤销。用 `mindmaps` 表反推，
+         *     得到的全是猜。
+         */
+        post: operations["mark_run_applied_api_agent_runs__run_id__applied_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}/dismissed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark Run Dismissed
+         * @description 用户主动丢弃了这份候选。与"应用过"分开记：下次进页面不该再问同一次。
+         */
+        post: operations["mark_run_dismissed_api_agent_runs__run_id__dismissed_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs/suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Suggestions
+         * @description 从历史运行里提出候选建议。**只读，不落库**。
+         *
+         *     判据在 `service.suggestions()` 里写死：最近 3 次有效选择都是同一个值，且与
+         *     当前偏好不同。用户点了"设为默认"才会走 `PUT`，点了"不用"则什么都不发生——
+         *     没有写入就没有记录，一次拒绝不需要留下痕迹。
+         */
+        get: operations["list_suggestions_api_prefs_suggestions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Prefs
+         * @description 面板的全部内容：键、值、来源、两个时间戳，以及**上次生效**。
+         *
+         *     `last_applied_at` 是这一层最该被读的一列：它来自 `runs.request.prefs_applied`，
+         *     也就是"哪几次运行真的带着这条偏好跑过"。它为空不一定是错，但**所有条目都为空**
+         *     就一定说明读路径没接上——那时面板上写满"尚未生效"，不用翻日志就能看出来。
+         */
+        get: operations["list_prefs_api_prefs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs/{pref_key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set Pref
+         * @description 写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。
+         *
+         *     非法值（A 类枚举外、C 类超条数/超字数）由 `service.set` 抛 `PrefError`，
+         *     `core/errors.py` 的统一出口会把它变成 `{code, message, detail, request_id}`：
+         *     错误码分得开，界面才能显示"请先删除一条"而不是一句泛泛的失败。
+         */
+        put: operations["set_pref_api_prefs__pref_key__put"];
+        post?: never;
+        /**
+         * Delete Pref
+         * @description 删一条。硬删，没有软删。
+         *
+         *     404 而不是幂等 204：界面上"这条已经不在了"和"我删了但没删掉"必须分得开，
+         *     否则下一次刷新面板会看见它还在，而用户以为删过了。
+         */
+        delete: operations["delete_pref_api_prefs__pref_key__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -362,12 +569,18 @@ export interface components {
              * @enum {string}
              */
             intent: "create" | "expand" | "edit";
+            /** Run Id */
+            run_id?: string | null;
             /**
              * Thinking Model
              * @default default
              * @enum {string}
              */
             thinking_model: "default" | "first-principles" | "feynman" | "systematic" | "critical";
+            /** Diagram Type */
+            diagram_type?: ("tree" | "flowchart" | "fishbone") | null;
+            /** Prefs Applied */
+            prefs_applied?: string[];
             snapshot?: components["schemas"]["MindMapContent-Input"] | null;
             /** Selected Ids */
             selected_ids?: string[];
@@ -401,6 +614,11 @@ export interface components {
         };
         /** Body_create_file_source_api_ingestion_files_post */
         Body_create_file_source_api_ingestion_files_post: {
+            /** File */
+            file: string;
+        };
+        /** Body_import_mindmap_api_mindmaps_import_post */
+        Body_import_mindmap_api_mindmaps_import_post: {
             /** File */
             file: string;
         };
@@ -451,10 +669,60 @@ export interface components {
          * @enum {string}
          */
         DiagnosticLevel: "info" | "warn" | "error";
+        /**
+         * Edge
+         * @description 跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。
+         *
+         *     **为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处
+         *     依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`
+         *     的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、
+         *     前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力
+         *     并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。
+         *
+         *     三件事刻意不做，每一条都有具体后果：
+         *
+         *       - **不要求同父**。连到另一条 subtree 上正是"汇合"的定义；加一条"必须
+         *         同父"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。
+         *       - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有
+         *         "最长环 ≤ `MAX_EDGE_CYCLE_NODES`"，而且是 warn。
+         *       - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），
+         *         边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的
+         *         位置就没了——这是"树 + 边"能成立的前提之一。
+         */
+        Edge: {
+            /** Id */
+            id: string;
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+            /** Label */
+            label?: string | null;
+            /** Kind */
+            kind?: ("flow" | "branch" | "loop") | null;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** ImportResponse */
+        ImportResponse: {
+            content: components["schemas"]["MindMapContent-Output"];
+            /** Warnings */
+            warnings: components["schemas"]["ImportWarningPayload"][];
+            /** Source Format */
+            source_format: string;
+        };
+        /**
+         * ImportWarningPayload
+         * @description 一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。
+         */
+        ImportWarningPayload: {
+            /** Code */
+            code: string;
+            /** Message */
+            message: string;
         };
         /** KnowledgeHit */
         KnowledgeHit: {
@@ -552,6 +820,14 @@ export interface components {
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+            /**
+             * Diagram Type
+             * @default tree
+             * @enum {string}
+             */
+            diagram_type: "tree" | "flowchart" | "fishbone";
         };
         /** MindMapContent */
         "MindMapContent-Output": {
@@ -571,6 +847,14 @@ export interface components {
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+            /**
+             * Diagram Type
+             * @default tree
+             * @enum {string}
+             */
+            diagram_type: "tree" | "flowchart" | "fishbone";
         };
         /** Node */
         "Node-Input": {
@@ -595,6 +879,10 @@ export interface components {
              * @default false
              */
             collapsed: boolean;
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
@@ -623,12 +911,31 @@ export interface components {
              * @default false
              */
             collapsed: boolean;
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;
         };
-        /** NodeStyle */
+        /**
+         * NodeStyle
+         * @description 节点样式（v2 预留字段，界面对它只做透传保存）。
+         *
+         *     `style.color` 与 `Node.color` **不是同一个东西**，两者的关系必须写清楚，
+         *     否则下一个人会以为它们是"新旧两版"而随手改坏一处：
+         *
+         *       - `NodeStyle.color` 是 `#RRGGBB`，来源是导入/将来的取色器，**界面不渲染**。
+         *         它是"用户画的那个色"，逐像素还原用。
+         *       - `Node.color` 是**调色板键**（`blue`/`green`/…），界面按它渲染，能跟着
+         *         主题（暗色/亮色）自动适配。
+         *
+         *     两个字段同时存在时 **`Node.color` 优先**：语义色是渲染意图，hex 是历史值。
+         *     `Node.color` 为 `None` 时才回落到…也不回落——`style.color` 仍然不渲染，
+         *     它只是被保留下来，免得用户点一次保存就把导入的颜色丢掉。
+         */
         NodeStyle: {
             /** Color */
             color?: string | null;
@@ -661,6 +968,49 @@ export interface components {
             x: number;
             /** Y */
             y: number;
+        };
+        /**
+         * Pref
+         * @description 一条偏好。
+         *
+         *     `last_applied_at` 不是存在 `user_prefs` 里的列，是**反查**出来的：它来自
+         *     `runs.request.prefs_applied`，也就是"哪几次运行真的带着这条偏好跑过"。
+         *     这一位是这张表的死表探测器——写进去却从来没有任何一次运行报告它，就说明
+         *     读路径根本没接上，而这件事不需要看日志，打开面板就能看出来。
+         *
+         *     匹配键是 `key=value` 整串而不是 `key`：用户把鱼骨图改成流程图之后，旧值的
+         *     生效记录不该继续挂在它身上，界面该如实回到"尚未生效"。
+         */
+        Pref: {
+            /** Key */
+            key: string;
+            /** Value */
+            value: string;
+            /**
+             * Scope
+             * @default global
+             */
+            scope: string;
+            /**
+             * Source
+             * @default user_explicit
+             * @enum {string}
+             */
+            source: "user_explicit" | "suggestion_accepted";
+            /** Source Run Id */
+            source_run_id?: string | null;
+            /**
+             * Created At
+             * @default
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @default
+             */
+            updated_at: string;
+            /** Last Applied At */
+            last_applied_at?: string | null;
         };
         /**
          * Relation
@@ -716,7 +1066,7 @@ export interface components {
             max_model_calls: number;
             /**
              * Max Tool Calls
-             * @default 8
+             * @default 50
              */
             max_tool_calls: number;
             /**
@@ -735,9 +1085,76 @@ export interface components {
              */
             max_repairs: number;
         };
+        /**
+         * RunDetail
+         * @description 单条：带候选正文与失败原因。
+         */
+        RunDetail: {
+            /** Run Id */
+            run_id: string;
+            /** Status */
+            status: string;
+            /** Intent */
+            intent: string;
+            /** Goal */
+            goal: string;
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Applied At */
+            applied_at?: string | null;
+            /** Dismissed At */
+            dismissed_at?: string | null;
+            /** Candidate */
+            candidate?: unknown | null;
+            /** Failure */
+            failure?: {
+                [key: string]: unknown;
+            } | null;
+            /** Mode */
+            mode?: string | null;
+        };
+        /**
+         * RunSummary
+         * @description 列表里的一行：**不带候选正文**。
+         *
+         *     候选是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句
+         *     "上次有一次生成完成了"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。
+         */
+        RunSummary: {
+            /** Run Id */
+            run_id: string;
+            /** Status */
+            status: string;
+            /** Intent */
+            intent: string;
+            /** Goal */
+            goal: string;
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Applied At */
+            applied_at?: string | null;
+            /** Dismissed At */
+            dismissed_at?: string | null;
+        };
         /** SaveRequest */
         SaveRequest: {
             content: components["schemas"]["MindMapContent-Input"];
+        };
+        /**
+         * Saved
+         * @description `set()` 的结果。
+         *
+         *     `changed=False` 是"这次提交没有改变任何东西"——同值重复提交不刷 `updated_at`。
+         *     不返回这个布尔值，界面上就会出现"我刚设过"的假象：时间戳变了，实际什么都没变。
+         */
+        Saved: {
+            pref: components["schemas"]["Pref"];
+            /** Changed */
+            changed: boolean;
         };
         /** SearchRequest */
         SearchRequest: {
@@ -758,6 +1175,26 @@ export interface components {
              * @default false
              */
             implemented: boolean;
+        };
+        /**
+         * SetPrefRequest
+         * @description `PUT /prefs/{key}` 的请求体。
+         *
+         *     `source` 允许调用方声明"这条是我点了建议才写的"：两种来源在界面上显示不同
+         *     的标签（"你设置的" / "系统建议（你已同意）"），而那个区别只有写入的那一刻
+         *     知道——事后再去猜"这条是不是建议来的"是猜不出来的。
+         */
+        SetPrefRequest: {
+            /** Value */
+            value: string;
+            /**
+             * Source
+             * @default user_explicit
+             * @enum {string}
+             */
+            source: "user_explicit" | "suggestion_accepted";
+            /** Source Run Id */
+            source_run_id?: string | null;
         };
         /** Source */
         Source: {
@@ -798,7 +1235,7 @@ export interface components {
          * SourceKind
          * @enum {string}
          */
-        SourceKind: "text" | "markdown" | "document" | "image" | "audio";
+        SourceKind: "text" | "markdown" | "document" | "image" | "audio" | "web" | "paper";
         /**
          * SourceMetadata
          * @description 来源的描述性元数据：检索前过滤的依据，不参与正文解析。
@@ -828,6 +1265,10 @@ export interface components {
             category?: string | null;
             /** Tags */
             tags?: string[];
+            /** Url */
+            url?: string | null;
+            /** Raw Chars */
+            raw_chars?: number | null;
         };
         /**
          * SourceRef
@@ -871,27 +1312,15 @@ export interface components {
             filename?: string | null;
             /** Char Count */
             char_count: number;
+            /** Url */
+            url?: string | null;
         };
         /** SuggestResponse */
         SuggestResponse: {
             /** Suggestions */
-            suggestions?: components["schemas"]["Suggestion"][];
+            suggestions?: components["schemas"]["app__contracts__diagnostic__Suggestion"][];
             /** Diagnostics */
             diagnostics?: components["schemas"]["Diagnostic"][];
-        };
-        /** Suggestion */
-        Suggestion: {
-            /** Id */
-            id?: string;
-            kind: components["schemas"]["SuggestionKind"];
-            /** Node Id */
-            node_id?: string | null;
-            /** Message */
-            message: string;
-            /** Evidence */
-            evidence?: string | null;
-            /** Confidence */
-            confidence?: number | null;
         };
         /**
          * SuggestionKind
@@ -939,6 +1368,36 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /** Suggestion */
+        app__contracts__diagnostic__Suggestion: {
+            /** Id */
+            id?: string;
+            kind: components["schemas"]["SuggestionKind"];
+            /** Node Id */
+            node_id?: string | null;
+            /** Message */
+            message: string;
+            /** Evidence */
+            evidence?: string | null;
+            /** Confidence */
+            confidence?: number | null;
+        };
+        /**
+         * Suggestion
+         * @description 一条**候选**建议。它不是偏好，落库必须经过用户点一次。
+         */
+        app__prefs__service__Suggestion: {
+            /** Key */
+            key: string;
+            /** Value */
+            value: string;
+            /** Label */
+            label: string;
+            /** Count */
+            count: number;
+            /** Message */
+            message: string;
         };
     };
     responses: never;
@@ -1055,6 +1514,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MapRecord"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_mindmap_api_mindmaps_import_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_import_mindmap_api_mindmaps_import_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1227,6 +1719,37 @@ export interface operations {
             };
         };
     };
+    export_json_api_export_json_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     create_text_source_api_ingestion_text_post: {
         parameters: {
             query?: never;
@@ -1367,6 +1890,234 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_runs_api_agent_runs_get: {
+        parameters: {
+            query?: {
+                /** @description 只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。 */
+                status?: ("done" | "cancelled" | "failed" | "running") | null;
+                /** @description 只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。 */
+                unapplied?: boolean;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunSummary"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_run_api_agent_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mark_run_applied_api_agent_runs__run_id__applied_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mark_run_dismissed_api_agent_runs__run_id__dismissed_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_suggestions_api_prefs_suggestions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["app__prefs__service__Suggestion"][];
+                };
+            };
+        };
+    };
+    list_prefs_api_prefs_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Pref"][];
+                };
+            };
+        };
+    };
+    set_pref_api_prefs__pref_key__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPrefRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Saved"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_pref_api_prefs__pref_key__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

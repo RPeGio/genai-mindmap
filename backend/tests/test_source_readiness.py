@@ -6,19 +6,23 @@
 没显式标成 `parsed` 的调用方会看到"材料在请求里、引用一条都没有、什么都查不到"。
 
 这组用例钉的就是这条路：材料被剔除时输出 `SOURCE_NOT_PARSED`，没被剔除时不出。
+
+生成侧现在是唯一一条路（`docs/ONE-PATH.md`）：`MINDMAP_SOURCE_MODE` 与它的 `full`
+分支已随上游删除，`create` 意图下面只剩 `mindmap_generate_deep`。所以模型替身要
+按分片生成的两段提示词分别作答——骨架一次、每条一级分支各一次。
 """
 from __future__ import annotations
 
 import asyncio
-import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
-from app.agent.tools import build_registry
+from app.agent.tools import PLAN_PROMPT, build_registry
 from app.contracts.source import Source, SourceKind
-from app.generation.service import SOURCE_MODE_ENV, SOURCE_MODE_FULL
 
 MATERIAL = "预算由财务经理核准后执行，超过五十万元报总经理审批。"
+
+BRANCHES = ["预算审批", "绩效考核", "预算执行分析"]
 
 
 def _source(status: str = "parsed", text: str = MATERIAL, source_id: str = "doc-1") -> Source:
@@ -35,33 +39,30 @@ def _ctx(sources: list[Source]) -> RunContext:
                       sources_by_id={source.id: source for source in sources})
 
 
-def _tree() -> dict:
-    """三条一级分支（`MIN_BRANCHES` 的下限），不带引用。"""
-    return {
-        "title": "制度要点",
-        "root": {
-            "id": "root", "label": "制度要点",
-            "children": [
-                {"id": f"b{index}", "label": f"分支{index}",
-                 "children": [{"id": f"b{index}-1", "label": f"要点{index}", "children": []}]}
-                for index in range(3)
-            ],
-        },
-    }
-
-
 def _diagnostics(sources: list[Source]) -> list[dict]:
+    """跑一次深层生成，取回它给出的诊断。
+
+    替身不看证据，只保证流水线跑完：骨架给三条分支，每支两个要点。这里被测的是
+    "材料进不了校验时有没有一句话"，树长什么样与本文件无关。
+    """
+
+    async def chat(system: str, user: str, *, max_tokens=None, on_delta=None) -> dict:
+        if system.startswith(PLAN_PROMPT):
+            return {"branches": list(BRANCHES)}
+        return {"children": [{"label": "要点一", "expandable": False},
+                             {"label": "要点二", "expandable": False}]}
+
     ctx = _ctx(sources)
-    mocked = AsyncMock(return_value=_tree())
-    with patch.dict(os.environ, {SOURCE_MODE_ENV: SOURCE_MODE_FULL}), \
-            patch("app.agent.tools.chat_async", new=mocked):
+    with patch("app.agent.tools.chat_async", new=chat):
         result = asyncio.run(
             build_registry("create", has_sources=bool(sources)).execute(
-                ToolCall(call_id="c-gen", name="mindmap_generate",
-                         arguments={"topic": "制度要点"}),
+                ToolCall(call_id="c-gen", name="mindmap_generate_deep",
+                         arguments={"topic": "制度要点", "branches": 3,
+                                    "points_per_branch": 2}),
                 ctx,
             )
         )
+    assert result.ok, result.content
     return result.data["diagnostics"]
 
 

@@ -10,3 +10,90 @@ body {
   margin: 0;
   font-family: system-ui, "Microsoft YaHei", sans-serif;
 }
+
+/*
+ * 节点语义色的调色板。
+ *
+ * 后端 `Node.color` 只存**键**（`blue` / `green` / …，见
+ * `backend/app/contracts/mindmap.py::NODE_COLORS`），色值全部在这里。
+ * 这样切一次主题只改这一块，导图数据一个字节都不用动：
+ *
+ *   - 亮色：下面的 `:root`；
+ *   - 暗色：在 `@media (prefers-color-scheme: dark)` 里重定义同一批变量。
+ *
+ * 若把色值写进节点样式（`style="border-color:#2563eb"`），暗色主题下就是一堆
+ * 刺眼的亮蓝——而那是**已经存进库里的数据**，改不回来。
+ *
+ * 命名与后端的 `NODE_COLOR_CSS_PREFIX` 对齐：`--mind-color-<key>`。
+ * `backend/tests/test_node_visuals.py` 会逐个比对调色板键与这里定义的变量，
+ * 漏一个就红——静默漏一个的表现是那个颜色画出来是默认灰，没有任何报错。
+ */
+:root {
+  --mind-color-blue: #2563eb;
+  --mind-color-green: #16a34a;
+  --mind-color-amber: #d97706;
+  --mind-color-red: #dc2626;
+  --mind-color-purple: #7c3aed;
+  --mind-color-teal: #0d9488;
+  --mind-color-pink: #db2777;
+  --mind-color-gray: #475569;
+
+  /* 节点底色 = 语义色与画布底色的混合比例（0–100%）。单独拎出来是因为它要在
+     暗色主题里调——同一个 10% 在深色底上会太脏，而那不该逼着人改色值。 */
+  --mind-color-tint: 10%;
+  --mind-color-surface: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mind-color-blue: #60a5fa;
+    --mind-color-green: #4ade80;
+    --mind-color-amber: #fbbf24;
+    --mind-color-red: #f87171;
+    --mind-color-purple: #a78bfa;
+    --mind-color-teal: #2dd4bf;
+    --mind-color-pink: #f472b6;
+    --mind-color-gray: #94a3b8;
+    --mind-color-tint: 22%;
+    --mind-color-surface: #1e293b;
+  }
+}
+
+/*
+ * 一个带语义色的节点。
+ *
+ * 键 → 变量的映射只有这一张表：`[data-node-color="blue"]` 把 `--mind-node-accent`
+ * 绑到 `--mind-color-blue`，样式规则只认 `--mind-node-accent`。加一个颜色只需要
+ * 上面一组变量 + 这里一行，不必再写一遍边框/底色的规则。
+ *
+ * 这些规则**不放进 `@layer`**：Tailwind 的工具类在 `utilities` 层里，而层外规则
+ * 一律优先。节点框身上还有 `bg-white` / `border-slate-300` 这些类，不压过它们的话
+ * 颜色就永远画不出来——而"加了字段但看不到效果"是最难查的一种。
+ */
+[data-node-color] {
+  border-color: var(--mind-node-accent);
+}
+
+[data-node-color="blue"] { --mind-node-accent: var(--mind-color-blue); }
+[data-node-color="green"] { --mind-node-accent: var(--mind-color-green); }
+[data-node-color="amber"] { --mind-node-accent: var(--mind-color-amber); }
+[data-node-color="red"] { --mind-node-accent: var(--mind-color-red); }
+[data-node-color="purple"] { --mind-node-accent: var(--mind-color-purple); }
+[data-node-color="teal"] { --mind-node-accent: var(--mind-color-teal); }
+[data-node-color="pink"] { --mind-node-accent: var(--mind-color-pink); }
+[data-node-color="gray"] { --mind-node-accent: var(--mind-color-gray); }
+
+[data-node-color]:not([data-node-depth="0"]) {
+  background-color: color-mix(
+    in srgb,
+    var(--mind-node-accent) var(--mind-color-tint),
+    var(--mind-color-surface)
+  );
+}
+
+/* 根节点是深色实底：语义色只染左边一道。给它铺一层淡色底，中心主题会变成一块
+   彩色积木，而它恰恰是该最"重"的那一个。 */
+[data-node-color][data-node-depth="0"] {
+  border-left-width: 4px;
+  border-left-color: var(--mind-node-accent);
+}

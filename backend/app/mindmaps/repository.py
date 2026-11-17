@@ -27,6 +27,52 @@ def connect() -> sqlite3.Connection:
         id TEXT PRIMARY KEY, version INTEGER NOT NULL,
         content TEXT NOT NULL, updated_at TEXT NOT NULL
     )""")
+    # `runs` 是 agent 运行的身份行（见 `app/agent/runs.py`）。它必须与 `mindmaps`
+    # 同一时刻建好：那张表的写入方是 SSE 生成器的 `finally`，而那条路上**不允许**
+    # 再有一次"发现表不存在 → 建表"的分支——被取消时多一个可能抛错的分支，就等于
+    # 把唯一要落库的草稿丢掉。
+    #
+    # 三列时间戳各管一件事，别合并：`updated_at` 是这一行最后一次状态变化（提示里
+    # 那个"12:03"用它），`applied_at` 是候选真的进了画布，`dismissed_at` 是用户
+    # 主动说"这份不要了"。合并成"处理过了"一个布尔值，就再也分不清"应用过"与
+    # "嫌弃过"，而"上次生成的导图去哪了"正是靠这个区别回答的。
+    conn.execute("""CREATE TABLE IF NOT EXISTS runs (
+        run_id       TEXT PRIMARY KEY,
+        status       TEXT NOT NULL,
+        request      TEXT,
+        candidate    TEXT,
+        failure      TEXT,
+        mode         TEXT,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL,
+        applied_at   TEXT,
+        dismissed_at TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
+    # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
+    # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该
+    # 再有一次"发现表不存在 → 建表"的分支。
+    #
+    # `pref_key` 是主键，这是整个设计的关键：**同一件事只能有一条**。"4 层"与
+    # "6 层"不会两条并存互相矛盾——写就是 upsert，后写的赢。自由文本做不到这件事。
+    #
+    # `scope` 现在恒为 `'global'`，留着它不是预留"会话/工作区"——那两层在我们的
+    # 结构里根本不是偏好（会话是 `runs` + `snapshot`，工作区是 `mindmaps.content`，
+    # 见 `docs/RESEARCH-AGENT-MEMORY.md`）。它存在的唯一理由是让"这条偏好属于哪
+    # 一层"在库里有据可查，而不是靠读代码猜。
+    #
+    # `source` 只有两个值：`user_explicit`（用户自己设的）与 `suggestion_accepted`
+    # （系统从历史运行里提了候选、用户点了同意）。**没有第三个**：模型没有写记忆的
+    # 权限，也没有"系统自动学到的"这一类。
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_prefs (
+        pref_key      TEXT PRIMARY KEY,
+        pref_value    TEXT NOT NULL,
+        scope         TEXT NOT NULL DEFAULT 'global',
+        source        TEXT NOT NULL,
+        source_run_id TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )""")
     # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
     # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"
     # 的窗口（与 `_record` 读时补齐 schema_version 是同一条理由）。

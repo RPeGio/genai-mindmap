@@ -42,14 +42,17 @@ from app.knowledge.query_plan import BRANCH_SYSTEM_PROMPT, plan_branches
 
 TITLES = ("预算审批", "绩效考核", "预算执行分析")
 
+# **两份材料合计必须超过 `SHORT_MATERIAL_CHARS=300`**：低于它时生成入口会把材料
+# 降级成"主题提示"（`MATERIAL_TOO_SHORT`）、根本不检索，本文件测的按支召回就一条
+# 都不会发生。重复次数是为此调的，不参与任何断言。
 BUDGET = (
     "预算审批由财务经理核准后执行，超过五十万元的支出报总经理审批。"
     "每季度末做一次预算执行分析，偏差超过百分之十的需要书面说明原因并交财务部备案。"
-) * 2
+) * 4
 PERFORMANCE = (
     "绩效考核分季度与年度两次，由直属上级打分并交人力资源部复核。"
     "连续两个季度不合格的进入改进期，改进期内不得晋升也不参与年度评优。"
-) * 2
+) * 4
 
 
 def run(coro):
@@ -397,7 +400,6 @@ def _run_deep(monkeypatch, chat, expansion=None):
             return {"branches": list(TITLES)}
         return {"children": [{"label": "要点", "expandable": False}]}
 
-    monkeypatch.setenv("MINDMAP_SOURCE_MODE", "rag")
     monkeypatch.setenv("MINDMAP_QUERY_EXPANSION", "1" if expansion is not None else "0")
     monkeypatch.setattr("app.agent.tools.chat_async", tool_chat)
     if expansion is not None:

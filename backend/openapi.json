@@ -161,6 +161,47 @@
         }
       }
     },
+    "/api/mindmaps/import": {
+      "post": {
+        "tags": [
+          "导入"
+        ],
+        "summary": "Import Mindmap",
+        "operationId": "import_mindmap_api_mindmaps_import_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_import_mindmap_api_mindmaps_import_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/optimization/check": {
       "post": {
         "tags": [
@@ -323,6 +364,41 @@
         "summary": "Export Opml",
         "description": "导出 OPML，便于导入 XMind 等工具。",
         "operationId": "export_opml_api_export_opml_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/export/json": {
+      "post": {
+        "tags": [
+          "导出"
+        ],
+        "summary": "Export Json",
+        "description": "导出 JSON（`MindMapContent` 的序列化）。\n\n这是唯一**无损**的格式，也是「导出 → 手改 → 导入」的保底：另外三种都只有\n一个文字槽位，往返一次 `note` / `detail` / 颜色 / 图型会退化（见\n`app/export/service.py::to_json` 的 docstring）。",
+        "operationId": "export_json_api_export_json_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -521,6 +597,345 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs": {
+      "get": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "List Runs",
+        "description": "运行台账。默认回答的是\"上次跑完、我还没处理的是哪一次\"。\n\n`status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出草稿的那次\n同样要能被捡起来**——否则\"关掉页面那 40 秒\"照样白花，只是从内存白花变成写进\n数据库白花。\n\n这条查询就是这张表草稿列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。",
+        "operationId": "list_runs_api_agent_runs_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "done",
+                    "cancelled",
+                    "failed",
+                    "running"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。",
+              "title": "Status"
+            },
+            "description": "只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。"
+          },
+          {
+            "name": "unapplied",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。",
+              "default": true,
+              "title": "Unapplied"
+            },
+            "description": "只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunSummary"
+                  },
+                  "title": "Response List Runs Api Agent Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Get Run",
+        "operationId": "get_run_api_agent_runs__run_id__get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}/applied": {
+      "post": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Mark Run Applied",
+        "description": "候选进了画布。前端在「应用」成功后调用一次，幂等。\n\n\"done 但已应用\"与\"done 但没应用\"只能靠这个时间戳分开：候选可能被 PUT 到一张\n已有导图上（推不出新记录），也可能应用之后又被撤销。用 `mindmaps` 表反推，\n得到的全是猜。",
+        "operationId": "mark_run_applied_api_agent_runs__run_id__applied_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}/dismissed": {
+      "post": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Mark Run Dismissed",
+        "description": "用户主动丢弃了这份候选。与\"应用过\"分开记：下次进页面不该再问同一次。",
+        "operationId": "mark_run_dismissed_api_agent_runs__run_id__dismissed_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs/suggestions": {
+      "get": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "List Suggestions",
+        "description": "从历史运行里提出候选建议。**只读，不落库**。\n\n判据在 `service.suggestions()` 里写死：最近 3 次有效选择都是同一个值，且与\n当前偏好不同。用户点了\"设为默认\"才会走 `PUT`，点了\"不用\"则什么都不发生——\n没有写入就没有记录，一次拒绝不需要留下痕迹。",
+        "operationId": "list_suggestions_api_prefs_suggestions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/app__prefs__service__Suggestion"
+                  },
+                  "type": "array",
+                  "title": "Response List Suggestions Api Prefs Suggestions Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs": {
+      "get": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "List Prefs",
+        "description": "面板的全部内容：键、值、来源、两个时间戳，以及**上次生效**。\n\n`last_applied_at` 是这一层最该被读的一列：它来自 `runs.request.prefs_applied`，\n也就是\"哪几次运行真的带着这条偏好跑过\"。它为空不一定是错，但**所有条目都为空**\n就一定说明读路径没接上——那时面板上写满\"尚未生效\"，不用翻日志就能看出来。",
+        "operationId": "list_prefs_api_prefs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Pref"
+                  },
+                  "type": "array",
+                  "title": "Response List Prefs Api Prefs Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs/{pref_key}": {
+      "put": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "Set Pref",
+        "description": "写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。\n\n非法值（A 类枚举外、C 类超条数/超字数）由 `service.set` 抛 `PrefError`，\n`core/errors.py` 的统一出口会把它变成 `{code, message, detail, request_id}`：\n错误码分得开，界面才能显示\"请先删除一条\"而不是一句泛泛的失败。",
+        "operationId": "set_pref_api_prefs__pref_key__put",
+        "parameters": [
+          {
+            "name": "pref_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pref Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPrefRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Saved"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "Delete Pref",
+        "description": "删一条。硬删，没有软删。\n\n404 而不是幂等 204：界面上\"这条已经不在了\"和\"我删了但没删掉\"必须分得开，\n否则下一次刷新面板会看见它还在，而用户以为删过了。",
+        "operationId": "delete_pref_api_prefs__pref_key__delete",
+        "parameters": [
+          {
+            "name": "pref_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pref Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
           },
           "422": {
             "description": "Validation Error",
@@ -738,6 +1153,20 @@
             "title": "Intent",
             "default": "create"
           },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
           "thinking_model": {
             "type": "string",
             "enum": [
@@ -749,6 +1178,30 @@
             ],
             "title": "Thinking Model",
             "default": "default"
+          },
+          "diagram_type": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "tree",
+                  "flowchart",
+                  "fishbone"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagram Type"
+          },
+          "prefs_applied": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Prefs Applied"
           },
           "snapshot": {
             "anyOf": [
@@ -846,6 +1299,20 @@
           "file"
         ],
         "title": "Body_create_file_source_api_ingestion_files_post"
+      },
+      "Body_import_mindmap_api_mindmaps_import_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_import_mindmap_api_mindmaps_import_post"
       },
       "CheckRequest": {
         "properties": {
@@ -982,6 +1449,65 @@
         ],
         "title": "DiagnosticLevel"
       },
+      "Edge": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "source": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Target"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "flow",
+                  "branch",
+                  "loop"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "target"
+        ],
+        "title": "Edge",
+        "description": "跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。\n\n**为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处\n依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`\n的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、\n前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力\n并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。\n\n三件事刻意不做，每一条都有具体后果：\n\n  - **不要求同父**。连到另一条 subtree 上正是\"汇合\"的定义；加一条\"必须\n    同父\"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。\n  - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有\n    \"最长环 ≤ `MAX_EDGE_CYCLE_NODES`\"，而且是 warn。\n  - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），\n    边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的\n    位置就没了——这是\"树 + 边\"能成立的前提之一。"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -994,6 +1520,50 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "ImportResponse": {
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Output"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/ImportWarningPayload"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "source_format": {
+            "type": "string",
+            "title": "Source Format"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content",
+          "warnings",
+          "source_format"
+        ],
+        "title": "ImportResponse"
+      },
+      "ImportWarningPayload": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ImportWarningPayload",
+        "description": "一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。"
       },
       "KnowledgeHit": {
         "properties": {
@@ -1227,6 +1797,23 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "diagram_type": {
+            "type": "string",
+            "enum": [
+              "tree",
+              "flowchart",
+              "fishbone"
+            ],
+            "title": "Diagram Type",
+            "default": "tree"
           }
         },
         "additionalProperties": false,
@@ -1276,6 +1863,23 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "diagram_type": {
+            "type": "string",
+            "enum": [
+              "tree",
+              "flowchart",
+              "fishbone"
+            ],
+            "title": "Diagram Type",
+            "default": "tree"
           }
         },
         "additionalProperties": false,
@@ -1346,6 +1950,39 @@
             "type": "boolean",
             "title": "Collapsed",
             "default": false
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
           },
           "style": {
             "anyOf": [
@@ -1445,6 +2082,39 @@
             "title": "Collapsed",
             "default": false
           },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
           "style": {
             "anyOf": [
               {
@@ -1531,7 +2201,8 @@
         },
         "additionalProperties": false,
         "type": "object",
-        "title": "NodeStyle"
+        "title": "NodeStyle",
+        "description": "节点样式（v2 预留字段，界面对它只做透传保存）。\n\n`style.color` 与 `Node.color` **不是同一个东西**，两者的关系必须写清楚，\n否则下一个人会以为它们是\"新旧两版\"而随手改坏一处：\n\n  - `NodeStyle.color` 是 `#RRGGBB`，来源是导入/将来的取色器，**界面不渲染**。\n    它是\"用户画的那个色\"，逐像素还原用。\n  - `Node.color` 是**调色板键**（`blue`/`green`/…），界面按它渲染，能跟着\n    主题（暗色/亮色）自动适配。\n\n两个字段同时存在时 **`Node.color` 优先**：语义色是渲染意图，hex 是历史值。\n`Node.color` 为 `None` 时才回落到…也不回落——`style.color` 仍然不渲染，\n它只是被保留下来，免得用户点一次保存就把导入的颜色丢掉。"
       },
       "Position": {
         "properties": {
@@ -1556,6 +2227,72 @@
         ],
         "title": "Position",
         "description": "节点坐标。只有 `layout == \"manual\"` 时有意义——自动布局的坐标是算出来的，\n存进数据只会在下次换布局时被当成用户意图。"
+      },
+      "Pref": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope",
+            "default": "global"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "user_explicit",
+              "suggestion_accepted"
+            ],
+            "title": "Source",
+            "default": "user_explicit"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At",
+            "default": ""
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At",
+            "default": ""
+          },
+          "last_applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Applied At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "Pref",
+        "description": "一条偏好。\n\n`last_applied_at` 不是存在 `user_prefs` 里的列，是**反查**出来的：它来自\n`runs.request.prefs_applied`，也就是\"哪几次运行真的带着这条偏好跑过\"。\n这一位是这张表的死表探测器——写进去却从来没有任何一次运行报告它，就说明\n读路径根本没接上，而这件事不需要看日志，打开面板就能看出来。\n\n匹配键是 `key=value` 整串而不是 `key`：用户把鱼骨图改成流程图之后，旧值的\n生效记录不该继续挂在它身上，界面该如实回到\"尚未生效\"。"
       },
       "Relation": {
         "properties": {
@@ -1647,10 +2384,10 @@
           },
           "max_tool_calls": {
             "type": "integer",
-            "maximum": 50.0,
+            "maximum": 120.0,
             "minimum": 1.0,
             "title": "Max Tool Calls",
-            "default": 8
+            "default": 50
           },
           "max_seconds": {
             "type": "number",
@@ -1679,6 +2416,162 @@
         "title": "RunBudget",
         "description": "一次 run 的资源上限。\n\n`max_model_calls` 数的是**真实调用次数**，不是外层轮数：循环里每一轮 provider\n调用、以及工具内部的每一次 `chat_async` 调用都算一次，共用 `RunContext` 上\n同一个账本。默认值按最贵的一条路（六支分片）算，算式见字段注释：\n「查 → 建 → 改 → 修」这种多轮对话只用其中几次，多出来的余量不会被无故花掉。\n\n`max_output_tokens` 同时约束两条出口：provider 那一轮，以及工具内部每一次\n`chat_async`——参数由 `tools._max_tokens()` 夹到 provider 认的上限再发出去。\n只约束前者时，工具内这条出口等于没有边界。\n\n`max_repairs` 约束的是**工具执行失败次数**（`ToolResult.ok == False` 的次数），\n与模型调用次数无关：一次成功的模型响应里发三个工具、其中两个失败，只消耗\n这里两次。全轮共享而不是按轮重置——按轮重置等于给模型无限次重试，\n每次重试都照样计费。"
       },
+      "RunDetail": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          },
+          "dismissed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dismissed At"
+          },
+          "candidate": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate"
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "intent",
+          "goal",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunDetail",
+        "description": "单条：带候选正文与失败原因。"
+      },
+      "RunSummary": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          },
+          "dismissed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dismissed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "intent",
+          "goal",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunSummary",
+        "description": "列表里的一行：**不带候选正文**。\n\n候选是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句\n\"上次有一次生成完成了\"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。"
+      },
       "SaveRequest": {
         "properties": {
           "content": {
@@ -1690,6 +2583,25 @@
           "content"
         ],
         "title": "SaveRequest"
+      },
+      "Saved": {
+        "properties": {
+          "pref": {
+            "$ref": "#/components/schemas/Pref"
+          },
+          "changed": {
+            "type": "boolean",
+            "title": "Changed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "pref",
+          "changed"
+        ],
+        "title": "Saved",
+        "description": "`set()` 的结果。\n\n`changed=False` 是\"这次提交没有改变任何东西\"——同值重复提交不刷 `updated_at`。\n不返回这个布尔值，界面上就会出现\"我刚设过\"的假象：时间戳变了，实际什么都没变。"
       },
       "SearchRequest": {
         "properties": {
@@ -1731,6 +2643,41 @@
         },
         "type": "object",
         "title": "SearchResponse"
+      },
+      "SetPrefRequest": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "user_explicit",
+              "suggestion_accepted"
+            ],
+            "title": "Source",
+            "default": "user_explicit"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "SetPrefRequest",
+        "description": "`PUT /prefs/{key}` 的请求体。\n\n`source` 允许调用方声明\"这条是我点了建议才写的\"：两种来源在界面上显示不同\n的标签（\"你设置的\" / \"系统建议（你已同意）\"），而那个区别只有写入的那一刻\n知道——事后再去猜\"这条是不是建议来的\"是猜不出来的。"
       },
       "Source": {
         "properties": {
@@ -1866,7 +2813,9 @@
           "markdown",
           "document",
           "image",
-          "audio"
+          "audio",
+          "web",
+          "paper"
         ],
         "title": "SourceKind"
       },
@@ -1922,6 +2871,29 @@
             },
             "type": "array",
             "title": "Tags"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "raw_chars": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Chars"
           }
         },
         "additionalProperties": false,
@@ -2061,6 +3033,17 @@
             "type": "integer",
             "minimum": 1.0,
             "title": "Char Count"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
           }
         },
         "additionalProperties": false,
@@ -2077,7 +3060,7 @@
         "properties": {
           "suggestions": {
             "items": {
-              "$ref": "#/components/schemas/Suggestion"
+              "$ref": "#/components/schemas/app__contracts__diagnostic__Suggestion"
             },
             "type": "array",
             "title": "Suggestions"
@@ -2092,63 +3075,6 @@
         },
         "type": "object",
         "title": "SuggestResponse"
-      },
-      "Suggestion": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/SuggestionKind"
-          },
-          "node_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Node Id"
-          },
-          "message": {
-            "type": "string",
-            "title": "Message"
-          },
-          "evidence": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Evidence"
-          },
-          "confidence": {
-            "anyOf": [
-              {
-                "type": "number",
-                "maximum": 1.0,
-                "minimum": 0.0
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Confidence"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "kind",
-          "message"
-        ],
-        "title": "Suggestion"
       },
       "SuggestionKind": {
         "type": "string",
@@ -2269,6 +3195,98 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "app__contracts__diagnostic__Suggestion": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SuggestionKind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind",
+          "message"
+        ],
+        "title": "Suggestion"
+      },
+      "app__prefs__service__Suggestion": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "label",
+          "count",
+          "message"
+        ],
+        "title": "Suggestion",
+        "description": "一条**候选**建议。它不是偏好，落库必须经过用户点一次。"
       }
     }
   }

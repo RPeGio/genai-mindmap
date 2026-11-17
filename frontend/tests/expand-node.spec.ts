@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这一组用例只关心
 // 详情面板上那个按钮与它发出的请求，画布整体换成占位元素。
@@ -61,6 +62,8 @@ function stubFetch(reply: () => Response) {
         headers: { 'content-type': 'application/json' },
       });
     }
+    // 偏好是挂载时的背景请求，不属于"点一次展开发出了什么"，不进 calls。
+    if (isPrefsRequest(url)) return prefsReply(url);
     calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   });

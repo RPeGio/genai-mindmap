@@ -1,13 +1,19 @@
-"""导出格式的纯映射（F20）。三种都不联网、不读盘。
+"""导出格式的纯映射（F20）。四种都不联网、不读盘。
 
-重点盯两件事：层级是否正确，以及标签里的特殊字符会不会把输出弄成非法格式。
+重点盯三件事：层级是否正确、标签里的特殊字符会不会把输出弄成非法格式，以及
+**新增 JSON 出口之后三种文本格式的输出有没有变**（`ByteIdenticalTest`）。后一条
+是"能导出什么就能导入什么"的护栏：`app/importing/` 要读得回这四种形状，任何对
+导出形状的顺手改动都会让闭环断裂，而断裂的表现是"用户导出改一改就丢东西"——
+那种 bug 只有逐字节用例守得住。
+
 模型生成的标签是自由文本，出现引号、尖括号、星号、换行都完全可能。
 """
+import json
 import unittest
 import xml.etree.ElementTree as ET
 
 from app.contracts.mindmap import MindMapContent
-from app.export.service import to_markdown, to_opml, to_puml
+from app.export.service import to_json, to_markdown, to_opml, to_puml
 
 
 def build(title="季度规划", root_label="产品", children=None):
@@ -109,7 +115,9 @@ class NewlineTest(unittest.TestCase):
 
         puml = to_puml(content)
         self.assertIn("* 第一行 第二行", puml)          # 仍在同一行
-        self.assertEqual(len([line for line in puml.split("\n") if line.strip()]), 4)
+        # 五行：`@startmindmap`、图型注释、根、一个子节点、`@endmindmap`。
+        # 注释行也必须是**一行**——它带着图型名，换行会把文件头撑成两行注释。
+        self.assertEqual(len([line for line in puml.split("\n") if line.strip()]), 5)
 
         md = to_markdown(content)
         self.assertEqual(md.count("- 第一行 第二行"), 1)   # 没有拆成两个列表项
@@ -153,6 +161,80 @@ class NoteTextTest(unittest.TestCase):
         })
         self.assertIn("- 第一行 第二行", to_markdown(content))
         ET.fromstring(to_opml(content))
+
+
+class ByteIdenticalTest(unittest.TestCase):
+    """三种既有格式的输出**逐字节**钉死。
+
+    加 JSON 导出（`to_json`）是为导入闭环补齐的最后一块，但它坐在
+    `export/service.py` 里——同一个文件还放着另外三个函数。这条用例的作用是把
+    "新增一个出口"与"改动旧出口"分开：任何对 markdown / opml / puml 的意外改动
+    （哪怕只是多一个空格）都会在这里红，而不是等用户发现导出的文件与上次不同。
+    """
+
+    def test_markdown_is_byte_identical(self):
+        self.assertEqual(
+            to_markdown(SAMPLE),
+            "# 季度规划\n\n- 产品\n  - 市场\n    - 竞品调研\n    - 用户访谈\n"
+            "  - 技术\n    - 架构设计\n      - 存储选型\n")
+
+    def test_opml_is_byte_identical(self):
+        self.assertEqual(
+            to_opml(SAMPLE),
+            '<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head>\n'
+            "    <title>季度规划</title>\n  </head>\n  <body>\n"
+            '    <outline text="产品">\n      <outline text="市场">\n'
+            '        <outline text="竞品调研">\n        </outline>\n'
+            '        <outline text="用户访谈">\n        </outline>\n      </outline>\n'
+            '      <outline text="技术">\n        <outline text="架构设计">\n'
+            '          <outline text="存储选型">\n          </outline>\n'
+            "        </outline>\n      </outline>\n    </outline>\n  </body>\n</opml>\n")
+
+    def test_puml_is_byte_identical(self):
+        self.assertEqual(
+            to_puml(SAMPLE),
+            "@startmindmap\n' 图型：思维导图（tree）\n* 产品\n** 市场\n*** 竞品调研\n"
+            "*** 用户访谈\n** 技术\n*** 架构设计\n**** 存储选型\n@endmindmap\n")
+
+
+class JsonExportTest(unittest.TestCase):
+    """JSON 是导入侧的保底：它必须能原样再导入。"""
+
+    def test_output_round_trips_into_the_same_tree(self):
+        from app.importing.service import parse_import
+
+        text = to_json(SAMPLE)
+        restored = parse_import("map.json", text.encode("utf-8")).content
+
+        def shape(node):
+            return (node.label, [shape(child) for child in node.children])
+
+        self.assertEqual(shape(restored.root), shape(SAMPLE.root))
+        self.assertEqual(restored.title, SAMPLE.title)
+
+    def test_json_keeps_fields_the_text_formats_lose(self):
+        """正文、颜色、图型、边：三种文本格式都只有一个文字槽位，JSON 全保住。"""
+        content = MindMapContent.model_validate({
+            "title": "t", "diagram_type": "flowchart",
+            "root": {"id": "r", "label": "标题", "note": "正文",
+                     "children": [{"id": "a", "label": "甲", "color": "red"},
+                                  {"id": "b", "label": "乙"}]},
+            "edges": [{"id": "e", "source": "a", "target": "b", "label": "是"}],
+        })
+        payload = json.loads(to_json(content))
+        self.assertEqual(payload["root"]["note"], "正文")
+        self.assertEqual(payload["root"]["children"][0]["color"], "red")
+        self.assertEqual(payload["diagram_type"], "flowchart")
+        self.assertEqual(payload["edges"][0]["label"], "是")
+        # 中文不转义：这份文件是给人改的
+        self.assertIn("正文", to_json(content))
+
+    def test_json_is_not_affected_by_text_escaping(self):
+        """尖括号与星号在 JSON 里原样保留（markdown/puml 必须转义它们）。"""
+        content = MindMapContent.model_validate({
+            "title": "t", "root": {"id": "r", "label": "Map<K,V> *态", "children": []}})
+        payload = json.loads(to_json(content))
+        self.assertEqual(payload["root"]["label"], "Map<K,V> *态")
 
 
 if __name__ == "__main__":
