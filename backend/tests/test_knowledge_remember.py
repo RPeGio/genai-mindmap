@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 import pytest
@@ -101,6 +102,30 @@ def test_library_failure_does_not_break_the_batch(tmp_path, monkeypatch):
 
     assert result.sources == sources
     assert result.mapping == {}
+
+
+def test_unexpected_error_is_contained_and_logged(tmp_path, monkeypatch, caplog):
+    """不在已知清单里的意外同样不许穿透：入库是旁路，没有拖垮生成的权力。
+
+    现实里的意外不止 `ValueError`/`sqlite3.Error`/`OSError`：旧记录的 metadata
+    过不了 pydantic 校验、编码器内部状态不对，都可能在这里冒头。异常一旦穿到
+    `agent/router.py` 的兜底分支，整轮生成就变成 `agent_failed`——一份材料的
+    记账失败不该有这个后果。
+    """
+    def boom(source):
+        raise RuntimeError("意外：编码器内部状态不对")
+
+    monkeypatch.setattr(library, "ingest", boom)
+    sources = [_source("甲。"), _source("乙。")]
+
+    with caplog.at_level(logging.ERROR, logger=remember.__name__):
+        result = remember.remember_sources(sources)
+
+    assert result.sources == sources
+    assert result.mapping == {}
+    # 必须带 exc_info：否则线上只知道"没入进去"，不知道是哪一层炸的。
+    logged = [record for record in caplog.records if "材料没能进知识库" in record.getMessage()]
+    assert logged and all(record.exc_info for record in logged)
 
 
 def test_switch_off_does_not_touch_the_library(tmp_path, monkeypatch):

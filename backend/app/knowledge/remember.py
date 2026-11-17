@@ -52,6 +52,10 @@ def remember_sources(sources: list[Source]) -> Remembered:
     在请求里了，这一轮照样能生成导图，只是这批材料下次不能从库里复用。
     失败时保留原 uuid——那意味着这张图的引用重新打开后指不到原文，但至少
     本次会话内的引用（前端按会话内的 source 解析）仍然有效。
+
+    因此这里兜到底：已知异常（空正文、库故障）按 warning 记，其余任何意外按
+    exception 记完整栈——这条支路不该有能力中断生成，异常一旦穿出去就会被
+    `agent/router.py` 兜成 `agent_failed`，整轮生成不跑。
     """
     if not sources or not remember_enabled():
         return Remembered(sources=list(sources))
@@ -64,6 +68,14 @@ def remember_sources(sources: list[Source]) -> Remembered:
         except (ValueError, sqlite3.Error, OSError) as exc:
             # ValueError 是空正文（不该进库），其余是库本身的问题。
             logger.warning(
+                "材料没能进知识库（%s: %s），本次仍按原样使用：%s",
+                type(exc).__name__, str(exc)[:160], source.filename or source.id,
+            )
+            kept.append(source)
+            continue
+        except Exception as exc:  # noqa: BLE001 - 入库是旁路，必须兜住一切
+            # 不在已知清单里的意外同样不许穿透：记完整栈，方便下次从日志里查。
+            logger.exception(
                 "材料没能进知识库（%s: %s），本次仍按原样使用：%s",
                 type(exc).__name__, str(exc)[:160], source.filename or source.id,
             )
