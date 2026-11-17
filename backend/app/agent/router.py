@@ -9,6 +9,7 @@ HTTP 状态码已经发出去了，后续只能以流内的 `error` 帧表达。
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import AsyncIterator
 
@@ -21,6 +22,8 @@ from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.generation.service import GenerationError
 from app.knowledge.remember import remember_sources
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["AI 代理"])
 
@@ -96,10 +99,14 @@ async def _frames(body: AgentRunRequest) -> AsyncIterator[str]:
         yield encode_event(ErrorEvent(seq=seq + 1, code="generation_failed", message=str(exc)))
         finished = True
     except Exception as exc:  # noqa: BLE001 — 兜底：任何未预期异常都要变成可读的一帧
+        # 只给用户一句能看懂的话。异常类型与原文（可能带绝对路径、库结构、上游
+        # 地址）只进日志：出站帧是要给浏览器看的，不是排障现场。
+        logger.exception("生成过程中出现未预期异常（%s），已收成 agent_failed 帧",
+                         type(exc).__name__)
         yield encode_event(ErrorEvent(
             seq=seq + 1,
             code="agent_failed",
-            message=f"生成过程中出错：{type(exc).__name__}: {exc}",
+            message="生成过程中出错了，请稍后重试。",
         ))
         finished = True
     if finished:

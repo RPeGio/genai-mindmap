@@ -102,16 +102,23 @@ class StreamRouteTest(unittest.TestCase):
         self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))
 
     def test_unexpected_exception_is_also_a_frame(self):
+        """未预期异常要变成可读的一帧，而且不把内部细节（类型/路径）漏给浏览器。"""
         async def boom():
-            raise RuntimeError("内部错误")
+            raise RuntimeError("内部错误：/srv/genai-mindmap/data/mindmaps.db")
             yield  # pragma: no cover
 
         with patch("app.agent.router.run", return_value=boom()):
-            response = client.post(URL, json={"goal": "x", "intent": "create"})
+            with self.assertLogs("app.agent.router", level="ERROR") as captured:
+                response = client.post(URL, json={"goal": "x", "intent": "create"})
         frames = _frames(response.text)
         self.assertEqual(frames[-1]["type"], "error")
         self.assertEqual(frames[-1]["code"], "agent_failed")
-        self.assertIn("RuntimeError", frames[-1]["message"])
+        # 出站帧只给一句能看懂的话；异常类型、原文（可能带绝对路径/库结构）只进日志。
+        self.assertEqual(frames[-1]["message"], "生成过程中出错了，请稍后重试。")
+        self.assertNotIn("RuntimeError", response.text)
+        self.assertNotIn("mindmaps.db", response.text)
+        # 但日志里必须有它，否则线上就查不到是哪一层炸的。
+        self.assertTrue(any("RuntimeError" in line for line in captured.output))
 
     def test_agent_disabled_returns_503_before_stream(self):
         with patch.dict("os.environ", {"MINDMAP_AGENT_ENABLED": "0"}):
