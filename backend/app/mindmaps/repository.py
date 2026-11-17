@@ -46,6 +46,30 @@ def connect() -> sqlite3.Connection:
         dismissed_at TEXT
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
+    # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
+    # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该
+    # 再有一次"发现表不存在 → 建表"的分支。
+    #
+    # `pref_key` 是主键，这是整个设计的关键：**同一件事只能有一条**。"4 层"与
+    # "6 层"不会两条并存互相矛盾——写就是 upsert，后写的赢。自由文本做不到这件事。
+    #
+    # `scope` 现在恒为 `'global'`，留着它不是预留"会话/工作区"——那两层在我们的
+    # 结构里根本不是偏好（会话是 `runs` + `snapshot`，工作区是 `mindmaps.content`，
+    # 见 `docs/RESEARCH-AGENT-MEMORY.md`）。它存在的唯一理由是让"这条偏好属于哪
+    # 一层"在库里有据可查，而不是靠读代码猜。
+    #
+    # `source` 只有两个值：`user_explicit`（用户自己设的）与 `suggestion_accepted`
+    # （系统从历史运行里提了候选、用户点了同意）。**没有第三个**：模型没有写记忆的
+    # 权限，也没有"系统自动学到的"这一类。
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_prefs (
+        pref_key      TEXT PRIMARY KEY,
+        pref_value    TEXT NOT NULL,
+        scope         TEXT NOT NULL DEFAULT 'global',
+        source        TEXT NOT NULL,
+        source_run_id TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )""")
     # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
     # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"
     # 的窗口（与 `_record` 读时补齐 schema_version 是同一条理由）。

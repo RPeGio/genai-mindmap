@@ -9,6 +9,7 @@ from app.ingestion.router import router as ingestion_router
 from app.knowledge.router import router as knowledge_router
 from app.mindmaps.router import router as mindmap_router
 from app.optimization.router import router as optimization_router
+from app.prefs.router import router as prefs_router
 
 app = FastAPI(title="生成式 AI 思维导图", version="0.2.0")
 # 所有错误出口统一成 {code, message, detail, request_id}，见 app/core/errors.py
@@ -16,7 +17,10 @@ register_error_handlers(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["GET", "POST", "PUT"],
+    # 偏好面板要能删（`DELETE /api/prefs/{key}`）。只列出 GET/POST/PUT 时，浏览器
+    # 的预检会把 DELETE 挡在门外，而错误在界面上表现为一句没有信息量的
+    # "Failed to fetch"——那正是"删不掉"最难查的一种形状。
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -27,6 +31,7 @@ app.include_router(optimization_router, prefix="/api")  # 结构诊断与建议
 app.include_router(export_router, prefix="/api")       # 导出 puml
 app.include_router(ingestion_router, prefix="/api")    # 多模态输入
 app.include_router(agent_router, prefix="/api")        # AI 代理：文本/多来源 → 导图
+app.include_router(prefs_router, prefix="/api")         # 用户偏好：面板读 / 改 / 删
 
 # 已规划、接口已固定、实现待补
 app.include_router(knowledge_router, prefix="/api")    # 知识检索（返回空）

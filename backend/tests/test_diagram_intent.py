@@ -242,9 +242,15 @@ class TestApplyOnTheRequest:
         assert "diagram_source" not in schema["properties"]
         assert "diagram_stripped" not in schema["properties"]
         assert "diagram_source" not in AgentRunRequest.model_fields
+        # `prefs_applied` 反过来**是**公开字段，而且必须留在契约里：它由前端标
+        # （"下拉里这个值来自偏好、用户没动过"），后端只负责原样落进
+        # `runs.request`——那面是"这条偏好到底生没生效"的唯一证据来源。它是
+        # "这次请求实际带着什么"的元数据，不是"这次图型是什么"，所以与上面两个
+        # 私有属性不冲突。
         assert json.loads(_request("x").model_dump_json()) == {
             "goal": "x", "intent": "create", "thinking_model": "default",
             "run_id": None, "diagram_type": None, "snapshot": None,
+            "prefs_applied": [],
             "selected_ids": [], "sources": [],
             "budget": _request("x").budget.model_dump(),
         }

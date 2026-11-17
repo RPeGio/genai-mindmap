@@ -539,6 +539,15 @@ export interface RunOptions {
    * 而用户看不到这件事正在发生。
    */
   selection?: string[];
+  /**
+   * 这一次运行**实际带着哪些偏好**（`["diagram_type.default=fishbone"]`）。
+   *
+   * 只由界面那层填：只有它知道"下拉里这个值是偏好预填的、用户没动过"。`store`
+   * 不自己算——它看不出一个值和它的来源，把推断写在这里就会和界面各算一份。
+   *
+   * 落进 `runs.request.prefs_applied`，是偏好面板上"上次生效"的唯一数据源。
+   */
+  prefsApplied?: string[];
 }
 
 /**
@@ -2505,6 +2514,9 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
       //   - `expand` / `edit` 不生成骨架，后端的编辑工具集里连生成工具都没有。
       //     那两个意图带图型只会让"图型只在新建时生效"这条边界变成一句空话。
       if (intent === 'create' && diagramType !== 'auto') body.diagram_type = diagramType;
+      // 空数组不发：老后端对多出来的字段是 `extra="forbid"`，而"这次一条偏好都没用上"
+      // 与"这个字段不存在"对读的人来说是同一件事。
+      if (options.prefsApplied?.length) body.prefs_applied = [...options.prefsApplied];
 
       await runAgentStream(body, event => {
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，

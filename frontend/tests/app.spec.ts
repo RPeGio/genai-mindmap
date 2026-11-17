@@ -6,6 +6,7 @@ import App from '../src/App.vue';
 import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；
 // 界面测试只关心输入区与详情面板，画布替换成占位元素。
@@ -73,13 +74,24 @@ function buttonByText(wrapper: VueWrapper, text: string) {
   return found;
 }
 
+/** 这次被测动作真的打出去的 URL（偏好那几个背景请求不算）。 */
+function agentUrls(mock: ReturnType<typeof vi.fn>): string[] {
+  return mock.mock.calls
+    .map(call => String(call[0]))
+    .filter(url => !isPrefsRequest(url));
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe('App', () => {
   it('空输入时按钮是禁用的，并说明「要写一个主题」', async () => {
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      return streamReply([]);
+    });
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
@@ -89,7 +101,9 @@ describe('App', () => {
     expect(submit.attributes('disabled')).toBeDefined();
     await submit.trigger('click');
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    // 挂载时会拉一次偏好（生成面板的两个下拉要带着它），所以断言的粒度是
+    // "没有发出生成请求"，而不是"一次 fetch 都没有"。
+    expect(agentUrls(fetchMock)).toEqual([]);
     expect(wrapper.get('[data-test="intent-box"]').text()).toContain('写一个主题，或者先在左侧添加材料');
   });
 
@@ -168,14 +182,19 @@ describe('App', () => {
   });
 
   it('开发期示例按钮不经过后端就能装载导图', async () => {
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      return streamReply([]);
+    });
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
     await vi.waitFor(() => expect(buttonByText(wrapper, '单节点')).toBeTruthy());
     await buttonByText(wrapper, '单节点').trigger('click');
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    // 示例装载走的是本地 `dev/samples`，一条生成/保存请求都不该有。
+    expect(agentUrls(fetchMock)).toEqual([]);
     expect(wrapper.text()).toContain('1 个节点');
     expect(wrapper.text()).toContain('演示模式');
   });

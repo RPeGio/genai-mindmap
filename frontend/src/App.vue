@@ -11,10 +11,12 @@ import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat
 import type { SampleMap } from './dev/samples';
 import { displayBody, bodySource, INITIAL_STATUS, useMindMapStore } from './stores/mindmap';
 import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from './stores/options';
+import { DIAGRAM_PREF_KEY, THINKING_PREF_KEY, usePrefsStore } from './stores/prefs';
+import PrefsPanel from './components/PrefsPanel.vue';
 import { useSourcesStore } from './stores/sources';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
-import type { EdgeKind } from './api/types';
+import type { DiagramTypeChoice, EdgeKind } from './api/types';
 
 const store = useMindMapStore();
 const sources = useSourcesStore();
@@ -278,7 +280,52 @@ function expandBranch() {
  * 生成；两条路的改动都只落在候选上，用户点「应用」才进画布。
  */
 const options = useGenerationOptions();
+const prefs = usePrefsStore();
 const intentText = ref('');
+
+/**
+ * 「以后都这样」的两个勾选。
+ *
+ * 这是这个功能的**主要写入源**：用户生成时顺手说一句"以后都这样"，比让他专门去
+ * 打开一个偏好面板设置一次可靠得多——面板是"回来以后才记得"的东西，而这句勾选
+ * 与动作在同一个位置、同一刻。
+ *
+ * 勾上之后在**提交时**才写：勾了又改主意的人不该在库里留下一行。
+ */
+const stickyDiagram = ref(false);
+const stickyThinking = ref(false);
+
+/**
+ * 偏好 → 预填。`prefs.defaults` 一变就重新填（面板里改一条，下拉跟着变）。
+ *
+ * `applyDefaults` 内部只填"用户没手动改过"的那两个——用户刚选过的值是他的意图，
+ * 不能被一条偏好顶回去。
+ */
+watch(() => prefs.defaults, defaults => options.applyDefaults(defaults),
+  { immediate: true, deep: true });
+
+/**
+ * 提交前把「以后都这样」落库，并让选项重新跟随偏好。
+ *
+ * `forget()` + `applyDefaults()` 这两步不能省：不调的话，用户手动选了流程图、勾了
+ * "以后都这样"，而 `prefilled` 还是 false——这次生成的 `prefs_applied` 就是空的，
+ * 面板上那条偏好显示"尚未生效"，明明它刚刚生效过。顺序是"先写、再让选项回到
+ * 跟随偏好、最后算 appliedKeys"。
+ */
+async function syncStickyPrefs(): Promise<void> {
+  if (intentState.value !== 'create') return;
+  const writes: Promise<boolean>[] = [];
+  if (stickyDiagram.value && options.diagramType !== 'auto') {
+    writes.push(prefs.save(DIAGRAM_PREF_KEY, options.diagramType));
+  }
+  if (stickyThinking.value) {
+    writes.push(prefs.save(THINKING_PREF_KEY, options.thinkingModel));
+  }
+  if (!writes.length) return;
+  await Promise.all(writes);
+  options.forget();
+  options.applyDefaults(prefs.defaults);
+}
 
 /**
  * 三态：有没有图、有没有选区。
@@ -414,11 +461,18 @@ async function submitIntent() {
   const selection = intentState.value === 'create' ? [] : [...store.selectedIds];
   const intent = intentState.value === 'create' ? 'create' : 'edit';
   intentText.value = '';
+  // 「以后都这样」落库要**先于**生成：这一次请求的 `prefs_applied` 得能记上它，
+  // 否则用户刚勾完就看到面板上写着"尚未生效"。
+  await syncStickyPrefs();
   // 材料照传：`edit` 路径不读来源，但后端会按节点的 `source_refs` 找回原文，
   // 与展开那条路同一份处理（`tools._expand_sources`）。
   await store.runGeneration(
     goal, intent, sources.readySources,
-    options.thinkingModel, options.diagramType, { selection },
+    options.thinkingModel, options.diagramType,
+    // `prefs_applied` 由这里标：只有前端知道"下拉里这个值是偏好预填的、用户没动过"。
+    // 后端开流前不会把偏好塞进 `diagram_type`——那会让"用户没说"与"用户选了"再也
+    // 分不开，而事后排查"这次为什么不一样"全靠这两个值分得清。
+    { selection, prefsApplied: options.appliedKeys() },
   );
 }
 
@@ -580,6 +634,9 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onMounted(() => {
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('beforeunload', onBeforeUnload);
+  // 启动即拉偏好：生成面板的两个下拉要在用户动手之前就填好，否则第一次生成总是
+  // "没带偏好"的那一次——而那正是最该被记住偏好的那一次。
+  void prefs.load();
 });
 
 onBeforeUnmount(() => {
@@ -811,30 +868,65 @@ async function copyBody() {
               <label for="thinking-model" class="w-14 shrink-0">拆解方式</label>
               <select
                 id="thinking-model"
-                v-model="options.thinkingModel"
+                :value="options.thinkingModel"
                 :disabled="runBlocked"
                 title="按这种方式拆解主题"
                 class="min-w-0 flex-1 rounded border border-slate-300 px-1 py-1 text-[11px] outline-none focus:border-slate-500 disabled:opacity-50"
+                @change="options.chooseThinking(($event.target as HTMLSelectElement).value)"
               >
                 <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
               </select>
             </div>
-            <p class="text-[11px] leading-tight text-slate-400">按这种方式拆解主题</p>
+            <div class="flex items-center justify-between gap-2 text-[11px]">
+              <!--
+                来源标注：`（来自你的偏好）`。这句是「预填」与「偷偷填」的分界——
+                用户必须看得见这个值不是他此刻选的，而是从偏好带过来的，否则
+                `runs.request.diagram_type` 里那个值会被读成"他选了流程图"。
+              -->
+              <p class="leading-tight text-slate-400">
+                按这种方式拆解主题
+                <span v-if="options.prefilled.thinking" class="text-sky-700">（来自你的偏好：{{ options.thinkingLabel }}）</span>
+              </p>
+              <label class="flex shrink-0 items-center gap-1 text-slate-500">
+                <input
+                  v-model="stickyThinking"
+                  type="checkbox"
+                  :disabled="runBlocked"
+                  data-test="sticky-thinking"
+                />
+                以后都这样
+              </label>
+            </div>
             <div class="flex items-center gap-1.5 text-[11px] text-slate-500">
               <label for="diagram-type" class="w-14 shrink-0">图型</label>
               <select
                 id="diagram-type"
-                v-model="options.diagramType"
+                :value="options.diagramType"
                 :disabled="runBlocked"
                 title="这张图要画成什么形状"
                 class="min-w-0 flex-1 rounded border border-slate-300 px-1 py-1 text-[11px] outline-none focus:border-slate-500 disabled:opacity-50"
+                @change="options.chooseDiagram(($event.target as HTMLSelectElement).value as DiagramTypeChoice)"
               >
                 <option v-for="item in DIAGRAM_TYPE_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
               </select>
             </div>
-            <!-- 说明必须跟着选项变：图型不是自解释的。选「鱼骨图」却按话题分六支的人
-                 会以为模型没听懂他的话，这一行就是"这个选项到底改了什么"。 -->
-            <p class="text-[11px] leading-tight text-slate-400">{{ options.diagramHint }}</p>
+            <div class="flex items-center justify-between gap-2 text-[11px]">
+              <!-- 说明必须跟着选项变：图型不是自解释的。选「鱼骨图」却按话题分六支的人
+                   会以为模型没听懂他的话，这一行就是"这个选项到底改了什么"。 -->
+              <p class="leading-tight text-slate-400">
+                {{ options.diagramHint }}
+                <span v-if="options.prefilled.diagram" class="text-sky-700">（来自你的偏好：{{ options.diagramLabel }}）</span>
+              </p>
+              <label class="flex shrink-0 items-center gap-1 text-slate-500">
+                <input
+                  v-model="stickyDiagram"
+                  type="checkbox"
+                  :disabled="runBlocked"
+                  data-test="sticky-diagram"
+                />
+                以后都这样
+              </label>
+            </div>
           </template>
           <p
             class="text-[11px] leading-tight"
@@ -855,6 +947,12 @@ async function copyBody() {
       </section>
 
       <aside class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l border-slate-200 bg-white p-4">
+        <!--
+          偏好面板摆在最上面：它是"系统记住了什么"的唯一可见位置，而一条写进去却
+          从不被读的记忆等于没写。摆在最下面的话，用户要滚过节点详情才看得到，
+          那就是实际上不存在。
+        -->
+        <PrefsPanel />
         <!--
           上次运行留下的结果。**只是一条提示，不是弹窗**：用户可能正在做别的事，
           打断他比让他知道这件事更烦。点「查看」把那份候选载入现有的确认流程

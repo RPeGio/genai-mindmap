@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { DiagramTypeChoice, MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 /**
  * 「拆解方式」与「图型」从界面到请求体，以及"选了之后到底改了什么"那一行说明。
@@ -48,7 +49,11 @@ const content = (label = '根'): MindMapContent => ({
 function stubFetch(reply: () => Response) {
   const calls: Array<{ url: string; body: unknown }> = [];
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    const url = String(input);
+    // 偏好那两个请求是挂载时的背景动作（生成面板要带着偏好预填），不属于这里
+    // 被测的"选了图型之后请求体长什么样"，所以不进 calls。
+    if (isPrefsRequest(url)) return prefsReply(url);
+    calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   }));
   return calls;

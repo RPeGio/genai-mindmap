@@ -8,6 +8,7 @@ import type { MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 import { MAX_INPUT_CHARS, MAX_UPLOAD_BYTES } from '../src/sources/input';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这里只验证上传入口与提示区。
 vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
@@ -47,6 +48,9 @@ function stubFetch(handler: (call: Call) => Response | Promise<Response>) {
         body: init?.body,
         headers: init?.headers,
       };
+      // 偏好是挂载时的背景请求（生成面板带预填），不属于这里被测的上传/生成动作：
+      // 它既不该进 `calls`，也不该被各用例的 handler 当成"下一个业务请求"。
+      if (isPrefsRequest(call.url)) return prefsReply(call.url);
       calls.push(call);
       return handler(call);
     }),

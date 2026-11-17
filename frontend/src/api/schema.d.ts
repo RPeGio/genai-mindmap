@@ -372,6 +372,85 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/prefs/suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Suggestions
+         * @description 从历史运行里提出候选建议。**只读，不落库**。
+         *
+         *     判据在 `service.suggestions()` 里写死：最近 3 次有效选择都是同一个值，且与
+         *     当前偏好不同。用户点了"设为默认"才会走 `PUT`，点了"不用"则什么都不发生——
+         *     没有写入就没有记录，一次拒绝不需要留下痕迹。
+         */
+        get: operations["list_suggestions_api_prefs_suggestions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Prefs
+         * @description 面板的全部内容：键、值、来源、两个时间戳，以及**上次生效**。
+         *
+         *     `last_applied_at` 是这一层最该被读的一列：它来自 `runs.request.prefs_applied`，
+         *     也就是"哪几次运行真的带着这条偏好跑过"。它为空不一定是错，但**所有条目都为空**
+         *     就一定说明读路径没接上——那时面板上写满"尚未生效"，不用翻日志就能看出来。
+         */
+        get: operations["list_prefs_api_prefs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs/{pref_key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set Pref
+         * @description 写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。
+         *
+         *     非法值（A 类枚举外、C 类超条数/超字数）由 `service.set` 抛 `PrefError`，
+         *     `core/errors.py` 的统一出口会把它变成 `{code, message, detail, request_id}`：
+         *     错误码分得开，界面才能显示"请先删除一条"而不是一句泛泛的失败。
+         */
+        put: operations["set_pref_api_prefs__pref_key__put"];
+        post?: never;
+        /**
+         * Delete Pref
+         * @description 删一条。硬删，没有软删。
+         *
+         *     404 而不是幂等 204：界面上"这条已经不在了"和"我删了但没删掉"必须分得开，
+         *     否则下一次刷新面板会看见它还在，而用户以为删过了。
+         */
+        delete: operations["delete_pref_api_prefs__pref_key__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/knowledge/search": {
         parameters: {
             query?: never;
@@ -454,6 +533,8 @@ export interface components {
             thinking_model: "default" | "first-principles" | "feynman" | "systematic" | "critical";
             /** Diagram Type */
             diagram_type?: ("tree" | "flowchart" | "fishbone") | null;
+            /** Prefs Applied */
+            prefs_applied?: string[];
             snapshot?: components["schemas"]["MindMapContent-Input"] | null;
             /** Selected Ids */
             selected_ids?: string[];
@@ -795,6 +876,49 @@ export interface components {
             y: number;
         };
         /**
+         * Pref
+         * @description 一条偏好。
+         *
+         *     `last_applied_at` 不是存在 `user_prefs` 里的列，是**反查**出来的：它来自
+         *     `runs.request.prefs_applied`，也就是"哪几次运行真的带着这条偏好跑过"。
+         *     这一位是这张表的死表探测器——写进去却从来没有任何一次运行报告它，就说明
+         *     读路径根本没接上，而这件事不需要看日志，打开面板就能看出来。
+         *
+         *     匹配键是 `key=value` 整串而不是 `key`：用户把鱼骨图改成流程图之后，旧值的
+         *     生效记录不该继续挂在它身上，界面该如实回到"尚未生效"。
+         */
+        Pref: {
+            /** Key */
+            key: string;
+            /** Value */
+            value: string;
+            /**
+             * Scope
+             * @default global
+             */
+            scope: string;
+            /**
+             * Source
+             * @default user_explicit
+             * @enum {string}
+             */
+            source: "user_explicit" | "suggestion_accepted";
+            /** Source Run Id */
+            source_run_id?: string | null;
+            /**
+             * Created At
+             * @default
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @default
+             */
+            updated_at: string;
+            /** Last Applied At */
+            last_applied_at?: string | null;
+        };
+        /**
          * Relation
          * @description 跨节点的关系线。来源与目标是节点 id，必须都在树里。
          */
@@ -926,6 +1050,18 @@ export interface components {
         SaveRequest: {
             content: components["schemas"]["MindMapContent-Input"];
         };
+        /**
+         * Saved
+         * @description `set()` 的结果。
+         *
+         *     `changed=False` 是"这次提交没有改变任何东西"——同值重复提交不刷 `updated_at`。
+         *     不返回这个布尔值，界面上就会出现"我刚设过"的假象：时间戳变了，实际什么都没变。
+         */
+        Saved: {
+            pref: components["schemas"]["Pref"];
+            /** Changed */
+            changed: boolean;
+        };
         /** SearchRequest */
         SearchRequest: {
             /** Query */
@@ -945,6 +1081,26 @@ export interface components {
              * @default false
              */
             implemented: boolean;
+        };
+        /**
+         * SetPrefRequest
+         * @description `PUT /prefs/{key}` 的请求体。
+         *
+         *     `source` 允许调用方声明"这条是我点了建议才写的"：两种来源在界面上显示不同
+         *     的标签（"你设置的" / "系统建议（你已同意）"），而那个区别只有写入的那一刻
+         *     知道——事后再去猜"这条是不是建议来的"是猜不出来的。
+         */
+        SetPrefRequest: {
+            /** Value */
+            value: string;
+            /**
+             * Source
+             * @default user_explicit
+             * @enum {string}
+             */
+            source: "user_explicit" | "suggestion_accepted";
+            /** Source Run Id */
+            source_run_id?: string | null;
         };
         /** Source */
         Source: {
@@ -1068,23 +1224,9 @@ export interface components {
         /** SuggestResponse */
         SuggestResponse: {
             /** Suggestions */
-            suggestions?: components["schemas"]["Suggestion"][];
+            suggestions?: components["schemas"]["app__contracts__diagnostic__Suggestion"][];
             /** Diagnostics */
             diagnostics?: components["schemas"]["Diagnostic"][];
-        };
-        /** Suggestion */
-        Suggestion: {
-            /** Id */
-            id?: string;
-            kind: components["schemas"]["SuggestionKind"];
-            /** Node Id */
-            node_id?: string | null;
-            /** Message */
-            message: string;
-            /** Evidence */
-            evidence?: string | null;
-            /** Confidence */
-            confidence?: number | null;
         };
         /**
          * SuggestionKind
@@ -1132,6 +1274,36 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /** Suggestion */
+        app__contracts__diagnostic__Suggestion: {
+            /** Id */
+            id?: string;
+            kind: components["schemas"]["SuggestionKind"];
+            /** Node Id */
+            node_id?: string | null;
+            /** Message */
+            message: string;
+            /** Evidence */
+            evidence?: string | null;
+            /** Confidence */
+            confidence?: number | null;
+        };
+        /**
+         * Suggestion
+         * @description 一条**候选**建议。它不是偏好，落库必须经过用户点一次。
+         */
+        app__prefs__service__Suggestion: {
+            /** Key */
+            key: string;
+            /** Value */
+            value: string;
+            /** Label */
+            label: string;
+            /** Count */
+            count: number;
+            /** Message */
+            message: string;
         };
     };
     responses: never;
@@ -1737,6 +1909,110 @@ export interface operations {
             header?: never;
             path: {
                 run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_suggestions_api_prefs_suggestions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["app__prefs__service__Suggestion"][];
+                };
+            };
+        };
+    };
+    list_prefs_api_prefs_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Pref"][];
+                };
+            };
+        };
+    };
+    set_pref_api_prefs__pref_key__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPrefRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Saved"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_pref_api_prefs__pref_key__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
             };
             cookie?: never;
         };

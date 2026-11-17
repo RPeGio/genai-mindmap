@@ -7,6 +7,7 @@ import type { MindMapContent, Source } from '../src/api/types';
 import { textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 /**
  * 画布右上角那个框（合并后的 #2）：**唯一**说一句话的地方。
@@ -42,7 +43,10 @@ function agentReply(frames: unknown[]): Response {
 function stubFetch(reply: () => Response) {
   const calls: Array<{ url: string; body: unknown }> = [];
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    const url = String(input);
+    // 偏好是挂载时的背景请求，不属于"点这个按钮发出了什么"，不进 calls。
+    if (isPrefsRequest(url)) return prefsReply(url);
+    calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   }));
   return calls;

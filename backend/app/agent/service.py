@@ -57,6 +57,7 @@ from app.generation.service import (
     GenerationError,
     _demo_content,
 )
+from app.prefs import service as prefs
 
 DEFAULT_STAGES = ["目标澄清", "要点拆解", "分支展开", "风险与验证"]
 logger = logging.getLogger(__name__)
@@ -219,18 +220,47 @@ def _intent_rule(request: AgentRunRequest) -> str:
     return _INTENT_RULES.get(request.intent, "")
 
 
+def _notes_text() -> str:
+    """C 类偏好（自由文本备注）那一段；没有备注时返回**空串**。
+
+    **只有 C 类进 prompt**。A 类（图型 / 拆解方式）与 B 类（要不要 emoji）是
+    结构化字段，它们的正确位置是请求层与生成侧的后处理——让模型"不必记"，而不是
+    让模型"记着"：一个 `diagram_type: "fishbone"` 字段比十行"用户喜欢鱼骨图"可靠
+    得多，而且不花 token。
+
+    超限时**从最旧的截断**并把条数记进日志（`AGENTS.md`：降级要留下降过级的痕迹）。
+    这里不往上抛：一条备注装不下不该让整次生成失败，而用户看到的"我写了 8 条它只
+    用了 5 条"必须有一个可查的出处。
+    """
+    text, dropped = prefs.prompt_notes()
+    if dropped:
+        logger.warning(
+            "偏好备注超过 %d 条 / %d 字的上限，最旧的 %d 条这次没有进提示词",
+            prefs.MAX_NOTES, prefs.MAX_NOTE_CHARS, dropped)
+    return text
+
+
 def _system_text(request: AgentRunRequest, content: MindMapContent | None) -> str:
     """这次运行要下发的 system。
 
-    四段的顺序有讲究，不能随手调：**身份 → 这次做什么 → 这次对着哪儿 → 树**。
+    五段的顺序有讲究，不能随手调：
+    **身份 → 这个人是谁 → 这次做什么 → 这次对着哪儿 → 树**。
+
+    备注（C 类偏好）排在 `_SYSTEM_BASE` **之后**、意图规则**之前**：意图规则是
+    "这次要做什么"的强约束，备注是"这个人是谁"的背景，**背景不该盖住这次的指令**。
+    排在前面的原因不是重要性，是阅读顺序——模型先读到"这个人的习惯"，再读到"这次
+    必须怎么做"，冲突时后者自然更近。备注那一段自己也写了让位的话（`NOTE_HEADER`）。
+
     选区排在"当前导图"之前，因为它描述的是"接下来那句话指哪儿"，先读到它，
     后面那棵大纲才有一个"重点看这几支"的读法。
 
-    空段整段跳过（`if part`）：没有选区时 `selection_text` 返回空串，直接 join
-    会在 system 里留一行空白，看起来像"这里本该有东西但没填上"。
+    空段整段跳过（`if part`）：没有选区时 `selection_text` 返回空串、没有备注时
+    `_notes_text` 也一样，直接 join 会在 system 里留一行空白，看起来像"这里本该有
+    东西但没填上"。
     """
     return "\n".join(part for part in (
         _SYSTEM_BASE,
+        _notes_text(),
         _intent_rule(request),
         selection_text(request, content),
         "当前导图：",

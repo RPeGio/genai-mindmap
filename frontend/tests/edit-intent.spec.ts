@@ -6,6 +6,7 @@ import App from '../src/App.vue';
 import AgentPanel from '../src/components/AgentPanel.vue';
 import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这一组用例只关心
 // 「改这张图」入口与候选 diff，画布换成占位元素。
@@ -38,7 +39,11 @@ function agentReply(frames: unknown[]): Response {
 function stubFetch(reply: () => Response) {
   const calls: Array<{ url: string; body: unknown }> = [];
   const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    const url = String(input);
+    // 偏好是挂载时的背景请求（生成面板带预填）。它不属于这里被测的"这个入口发出
+    // 什么"，进 calls 只会让 `calls[0]` 指向一个 GET。
+    if (isPrefsRequest(url)) return prefsReply(url);
+    calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
   });
   vi.stubGlobal('fetch', mock);

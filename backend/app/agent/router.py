@@ -114,6 +114,12 @@ def _request_summary(body: AgentRunRequest) -> dict[str, Any]:
         # 所以"用户打字说了鱼骨图"这件事在台账里是 `fishbone`，不是 `None`——
         # 否则最该被查的那一次恰恰查不出来。
         "diagram_type": body.diagram_type,
+        # 这次真的生效了哪些偏好。它是偏好面板上"上次生效：…"的唯一数据源，
+        # 也是"改一个值 → 生成一次 → 产物确实变了"这条验收链在库里的落点。
+        #
+        # 记在这里而不是另起一张表：它描述的是**这一次请求**，与 `goal` / `intent`
+        # 同一个粒度。单独一张表只会多一条永远要 JOIN 才能回答"这次为什么不一样"。
+        "prefs_applied": list(body.prefs_applied),
         "selected_ids": list(body.selected_ids),
         "source_ids": [source.id for source in body.sources],
     }

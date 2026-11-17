@@ -5,8 +5,11 @@ import type {
   ImportResult,
   MapRecord,
   MindMapContent,
+  Pref,
+  PrefSuggestion,
   RunDetail,
   RunSummary,
+  SavedPref,
   Source,
 } from './types';
 
@@ -247,6 +250,51 @@ export async function uploadDocument(file: File, signal?: AbortSignal): Promise<
     throw new ApiError(response.status, 'empty_source', '后端没有返回解析结果，请重试。');
   }
   return body.source;
+}
+
+// ---- 用户偏好 ----
+
+/**
+ * 全部偏好，带每条的"上次生效"。
+ *
+ * 启动时调一次，结果填进 `usePrefs` 与 `useGenerationOptions`：偏好面板要列它，
+ * 生成面板的下拉要拿它当预填值。**两处读同一份**——各拉一次会先制造"面板改完、
+ * 下拉没变"的空窗。
+ */
+export function listPrefs(): Promise<Pref[]> {
+  return request<Pref[]>('/prefs');
+}
+
+/**
+ * 写一条。`changed=false` 表示这次提交没有改变任何东西（同值）。
+ *
+ * `source` 只有用户在建议里点"设为默认"时才传 `suggestion_accepted`：两种来源在
+ * 面板上显示不同的标签，而那个区别只有写入的这一刻知道。
+ */
+export function setPref(
+  key: string,
+  value: string,
+  source: 'user_explicit' | 'suggestion_accepted' = 'user_explicit',
+): Promise<SavedPref> {
+  return request<SavedPref>(`/prefs/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ value, source }),
+  });
+}
+
+/** 删一条。**硬删**：没有软删，也就不存在"删了但还能翻出来"这种界面谎言。 */
+export function deletePref(key: string): Promise<void> {
+  return request<void>(`/prefs/${encodeURIComponent(key)}`, { method: 'DELETE' });
+}
+
+/**
+ * 候选建议，**只读不落库**。
+ *
+ * 用户点"设为默认"才会走 `setPref`；点了"不用"则什么都不发生——一次拒绝不需要
+ * 留下任何记录。
+ */
+export function listPrefSuggestions(): Promise<PrefSuggestion[]> {
+  return request<PrefSuggestion[]>('/prefs/suggestions');
 }
 
 // ---- 导出 ----

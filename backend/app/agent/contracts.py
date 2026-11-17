@@ -566,6 +566,17 @@ class AgentRunRequest(BaseModel):
     # 是什么），与工具结果的 `data["diagram"]`（它是怎么定下来的）。
     _diagram_source: str | None = PrivateAttr(default=None)
     _diagram_stripped: str | None = PrivateAttr(default=None)
+    # 这一次运行**实际带着哪些偏好**，形如 `["diagram_type.default=fishbone"]`。
+    #
+    # 由调用方（前端）标，不由后端补：只有前端知道"下拉里这个值是偏好预填的、
+    # 用户没动过"。后端开流前把偏好塞进 `diagram_type` 是不行的——那会让上面那条
+    # "`None` 与 `tree` 必须分得开"的性质失效，事后排查会看到"用户选了流程图"
+    # 而用户根本没选过。
+    #
+    # 它落进 `runs.request.prefs_applied`，是偏好面板上"上次生效"的**唯一**数据源。
+    # 少了它，一条偏好写进去之后没有任何办法证明它影响过任何一次生成——那正是
+    # "心里记着"与"真的在起作用"的区别。
+    prefs_applied: list[str] = Field(default_factory=list, max_length=50)
     snapshot: MindMapContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)

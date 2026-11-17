@@ -65,10 +65,14 @@
 | `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
 | `GET /api/mindmaps/{map_id}` | 无 | 导图记录 | 不存在 404 |
 | `PUT /api/mindmaps/{map_id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
-| `POST /api/agent/runs/stream` | `{"run_id":"…","goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `done` / `error`；`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`，所以 demo / model 帧必带，缺字段只说明对面"没说"），产物是**候选** | 目标为空 422；来源合计超出模型上下文 422；同一个 `run_id` 正在跑 409（`run_in_progress`）；预算用尽或模型失败以 `error` 事件下发 |
+| `POST /api/agent/runs/stream` | `{"run_id":"…","goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"prefs_applied":["diagram_type.default=fishbone"],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `done` / `error`；`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`，所以 demo / model 帧必带，缺字段只说明对面"没说"），产物是**候选** | 目标为空 422；来源合计超出模型上下文 422；同一个 `run_id` 正在跑 409（`run_in_progress`）；预算用尽或模型失败以 `error` 事件下发 |
 | `GET /api/agent/runs` | 查询参数 `status`（`done` / `cancelled` / `failed` / `running`，可省略）、`unapplied`（默认 `true`）、`limit`（1–100，默认 20） | 运行台账数组（`run_id` / `status` / `intent` / `goal` / 时间戳），**不含候选正文**。`status` 省略时取 `done` + `cancelled` 中"有草稿且既没应用也没丢弃"的 | — |
 | `GET /api/agent/runs/{run_id}` | 无 | 同上再加 `candidate`（整棵树）、`failure`、`mode` | 不存在 404 |
 | `POST /api/agent/runs/{run_id}/applied`<br>`POST /api/agent/runs/{run_id}/dismissed` | 无 | 204；幂等（只打第一个时间戳） | 不存在 404 |
+| `GET /api/prefs` | 无 | 全部偏好：`key` / `value` / `scope` / `source` / 两个时间戳，以及 `last_applied_at`（来自 `runs.request.prefs_applied`，为空 = 从未生效） | — |
+| `PUT /api/prefs/{pref_key}` | `{"value":"…","source":"user_explicit / suggestion_accepted","source_run_id":null}` | `{"pref":…,"changed":true/false}`；同值重复提交 `changed=false` 且不刷新 `updated_at` | 键非法 / 枚举外 / 备注超 8 条或 500 字 400（`pref_key_invalid` / `pref_value_invalid` / `pref_limit_exceeded`） |
+| `DELETE /api/prefs/{pref_key}` | 无 | 204，硬删（没有软删） | 不存在 404（与"删了但还在"必须分得开） |
+| `GET /api/prefs/suggestions` | 无 | 候选建议数组（`key` / `value` / `label` / `count` / `message`）。**只读不落库**：最近 3 次有效选择都是同一个值、且与当前偏好不同才提 | — |
 
 **流式接口只有一套帧格式**，就是 `/api/agent/runs/stream` 的这套；旧的 `/api/generations/stream`（`stage` / `skeleton` / `node` / `done` / `error` + 末尾 `data: [DONE]`）已连路由一起删除。`backend/app/generation/stream_partial.py` 现在只剩增量解析器（`parse_partial` / `collect_new_nodes`），供 agent 的 `node_grow` 预览调用，不再有帧拼装。
 

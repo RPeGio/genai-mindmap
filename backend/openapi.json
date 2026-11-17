@@ -811,6 +811,145 @@
         }
       }
     },
+    "/api/prefs/suggestions": {
+      "get": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "List Suggestions",
+        "description": "从历史运行里提出候选建议。**只读，不落库**。\n\n判据在 `service.suggestions()` 里写死：最近 3 次有效选择都是同一个值，且与\n当前偏好不同。用户点了\"设为默认\"才会走 `PUT`，点了\"不用\"则什么都不发生——\n没有写入就没有记录，一次拒绝不需要留下痕迹。",
+        "operationId": "list_suggestions_api_prefs_suggestions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/app__prefs__service__Suggestion"
+                  },
+                  "type": "array",
+                  "title": "Response List Suggestions Api Prefs Suggestions Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs": {
+      "get": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "List Prefs",
+        "description": "面板的全部内容：键、值、来源、两个时间戳，以及**上次生效**。\n\n`last_applied_at` 是这一层最该被读的一列：它来自 `runs.request.prefs_applied`，\n也就是\"哪几次运行真的带着这条偏好跑过\"。它为空不一定是错，但**所有条目都为空**\n就一定说明读路径没接上——那时面板上写满\"尚未生效\"，不用翻日志就能看出来。",
+        "operationId": "list_prefs_api_prefs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Pref"
+                  },
+                  "type": "array",
+                  "title": "Response List Prefs Api Prefs Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs/{pref_key}": {
+      "put": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "Set Pref",
+        "description": "写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。\n\n非法值（A 类枚举外、C 类超条数/超字数）由 `service.set` 抛 `PrefError`，\n`core/errors.py` 的统一出口会把它变成 `{code, message, detail, request_id}`：\n错误码分得开，界面才能显示\"请先删除一条\"而不是一句泛泛的失败。",
+        "operationId": "set_pref_api_prefs__pref_key__put",
+        "parameters": [
+          {
+            "name": "pref_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pref Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPrefRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Saved"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "Delete Pref",
+        "description": "删一条。硬删，没有软删。\n\n404 而不是幂等 204：界面上\"这条已经不在了\"和\"我删了但没删掉\"必须分得开，\n否则下一次刷新面板会看见它还在，而用户以为删过了。",
+        "operationId": "delete_pref_api_prefs__pref_key__delete",
+        "parameters": [
+          {
+            "name": "pref_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pref Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/knowledge/search": {
       "post": {
         "tags": [
@@ -960,6 +1099,14 @@
               }
             ],
             "title": "Diagram Type"
+          },
+          "prefs_applied": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Prefs Applied"
           },
           "snapshot": {
             "anyOf": [
@@ -1860,6 +2007,72 @@
         "title": "Position",
         "description": "节点坐标。只有 `layout == \"manual\"` 时有意义——自动布局的坐标是算出来的，\n存进数据只会在下次换布局时被当成用户意图。"
       },
+      "Pref": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope",
+            "default": "global"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "user_explicit",
+              "suggestion_accepted"
+            ],
+            "title": "Source",
+            "default": "user_explicit"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At",
+            "default": ""
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At",
+            "default": ""
+          },
+          "last_applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Applied At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "Pref",
+        "description": "一条偏好。\n\n`last_applied_at` 不是存在 `user_prefs` 里的列，是**反查**出来的：它来自\n`runs.request.prefs_applied`，也就是\"哪几次运行真的带着这条偏好跑过\"。\n这一位是这张表的死表探测器——写进去却从来没有任何一次运行报告它，就说明\n读路径根本没接上，而这件事不需要看日志，打开面板就能看出来。\n\n匹配键是 `key=value` 整串而不是 `key`：用户把鱼骨图改成流程图之后，旧值的\n生效记录不该继续挂在它身上，界面该如实回到\"尚未生效\"。"
+      },
       "Relation": {
         "properties": {
           "id": {
@@ -2150,6 +2363,25 @@
         ],
         "title": "SaveRequest"
       },
+      "Saved": {
+        "properties": {
+          "pref": {
+            "$ref": "#/components/schemas/Pref"
+          },
+          "changed": {
+            "type": "boolean",
+            "title": "Changed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "pref",
+          "changed"
+        ],
+        "title": "Saved",
+        "description": "`set()` 的结果。\n\n`changed=False` 是\"这次提交没有改变任何东西\"——同值重复提交不刷 `updated_at`。\n不返回这个布尔值，界面上就会出现\"我刚设过\"的假象：时间戳变了，实际什么都没变。"
+      },
       "SearchRequest": {
         "properties": {
           "query": {
@@ -2190,6 +2422,41 @@
         },
         "type": "object",
         "title": "SearchResponse"
+      },
+      "SetPrefRequest": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "user_explicit",
+              "suggestion_accepted"
+            ],
+            "title": "Source",
+            "default": "user_explicit"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "SetPrefRequest",
+        "description": "`PUT /prefs/{key}` 的请求体。\n\n`source` 允许调用方声明\"这条是我点了建议才写的\"：两种来源在界面上显示不同\n的标签（\"你设置的\" / \"系统建议（你已同意）\"），而那个区别只有写入的那一刻\n知道——事后再去猜\"这条是不是建议来的\"是猜不出来的。"
       },
       "Source": {
         "properties": {
@@ -2572,7 +2839,7 @@
         "properties": {
           "suggestions": {
             "items": {
-              "$ref": "#/components/schemas/Suggestion"
+              "$ref": "#/components/schemas/app__contracts__diagnostic__Suggestion"
             },
             "type": "array",
             "title": "Suggestions"
@@ -2587,63 +2854,6 @@
         },
         "type": "object",
         "title": "SuggestResponse"
-      },
-      "Suggestion": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/SuggestionKind"
-          },
-          "node_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Node Id"
-          },
-          "message": {
-            "type": "string",
-            "title": "Message"
-          },
-          "evidence": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Evidence"
-          },
-          "confidence": {
-            "anyOf": [
-              {
-                "type": "number",
-                "maximum": 1.0,
-                "minimum": 0.0
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Confidence"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "kind",
-          "message"
-        ],
-        "title": "Suggestion"
       },
       "SuggestionKind": {
         "type": "string",
@@ -2764,6 +2974,98 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "app__contracts__diagnostic__Suggestion": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SuggestionKind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind",
+          "message"
+        ],
+        "title": "Suggestion"
+      },
+      "app__prefs__service__Suggestion": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "label",
+          "count",
+          "message"
+        ],
+        "title": "Suggestion",
+        "description": "一条**候选**建议。它不是偏好，落库必须经过用户点一次。"
       }
     }
   }

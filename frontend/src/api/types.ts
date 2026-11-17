@@ -511,6 +511,17 @@ export interface AgentRunRequest {
    * 只有 `create` 会用它：`expand` / `edit` 不生成骨架，图型对它们没有意义。
    */
   diagram_type?: DiagramType | null;
+  /**
+   * 这一次运行**实际带着哪些偏好**，形如 `["diagram_type.default=fishbone"]`。
+   *
+   * 由前端标（镜像后端 `AgentRunRequest.prefs_applied`），因为只有这里知道
+   * "下拉里这个值是偏好预填的、用户没动过"。后端**不会**把这个值塞进
+   * `diagram_type`——那会让"用户没说"与"用户选了"再也分不开。
+   *
+   * 它落进 `runs.request.prefs_applied`，是偏好面板上"上次生效"的唯一数据源。
+   * 没有它，一条偏好写进去之后没有任何办法证明它影响过任何一次生成。
+   */
+  prefs_applied?: string[];
   snapshot?: MindMapContent | null;
   selected_ids?: string[];
   /**
@@ -611,3 +622,53 @@ export type AgentEvent =
       mode?: 'demo' | 'model' | null;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
+
+// ---- 用户偏好 ----
+
+/**
+ * 一条偏好（镜像后端 `prefs.service.Pref`）。
+ *
+ * 三层记忆里唯一缺的那一层——**跨请求、关于这个人的稳定事实**。会话那层是
+ * `RunSummary`/候选树，工作区那层是 `MindMapContent` 本身。
+ */
+export interface Pref {
+  /** 键即主键：同一件事只能有一条。`diagram_type.default` / `note.1` …… */
+  key: string;
+  value: string;
+  scope: string;
+  /** `user_explicit` 是用户自己设的，`suggestion_accepted` 是点了建议才写的。 */
+  source: 'user_explicit' | 'suggestion_accepted';
+  source_run_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  /**
+   * 上一次**真的生效**是什么时候（来自 `runs.request.prefs_applied`）。
+   *
+   * 这一位是这张表的死表探测器：`null` 表示"这条偏好从没影响过任何一次生成"。
+   * 一条全都为 `null` 的面板，就是"写进去但没人读"的样子——不用翻日志。
+   */
+  last_applied_at?: string | null;
+}
+
+/** `PUT /prefs/{key}` 的响应：写入后的行，以及这次有没有真的改变。 */
+export interface SavedPref {
+  pref: Pref;
+  /** 同值重复提交是 `false`，且 `updated_at` 不刷新——不制造"我刚设过"的假象。 */
+  changed: boolean;
+}
+
+/**
+ * 一条**候选**建议（镜像后端 `prefs.service.Suggestion`）。
+ *
+ * 它不是偏好，只是一个判断："最近 3 次都是同一个值"。落库必须经过用户点一次，
+ * 因为实测同一主题两分钟内有过两次相反的图型要求——自动总结会在那里写出两条
+ * 互相矛盾的事实。
+ */
+export interface PrefSuggestion {
+  key: string;
+  value: string;
+  /** 值的中文名（"流程图"），供界面直接显示。 */
+  label: string;
+  count: number;
+  message: string;
+}

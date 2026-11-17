@@ -97,6 +97,7 @@ from app.knowledge.service import (
 )
 from app.optimization import nli
 from app.optimization.service import check
+from app.prefs import service as prefs
 from app.optimization.source_refs import (
     MAX_NLI_CHECKS,
     EvidenceSpan,
@@ -2893,6 +2894,24 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         taken.add(branch_id)
         skeleton.append((branch.label, branch_id))
         branch_visual[branch_id] = branch
+
+    # B 类偏好：`icon.enabled=false` 时一级分支不带 emoji。
+    #
+    # 位置在**视觉元素唯一落进树的地方**（`branch_visual` 是下面建树的唯一来源），
+    # 所以一条判断同时覆盖三个图型的全部产出，不用在 `tree` / `flowchart` /
+    # `fishbone` 三条路上各写一遍。
+    #
+    # 为什么在这里剥、而不是让 `_skeleton_branches` 去问数据库：那个函数是纯解析，
+    # 用例直接调它，它不该忽然开始认库。也为什么不改提示词里那句"建议每条分支都给
+    # icon"：为省几十个 token 把三份骨架提示词常量都改成函数，代价大于收益；而用户
+    # 能看到的结果（树上没有 emoji）与改提示词完全一致。
+    #
+    # 只剥不给：偏好是关掉的，没有"换成另一个图标"这回事。
+    if not prefs.icons_enabled():
+        branch_visual = {
+            branch_id: replace(branch, icon=None)
+            for branch_id, branch in branch_visual.items()
+        }
 
     # ---- 附加边（只有 flowchart 会有）-----------------------------------------
     # 位置必须在这里：边端点是**骨架层的节点 id**，而 id 刚在上面的循环里分配完。
