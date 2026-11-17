@@ -944,6 +944,7 @@ describe('面板文案与候选骨架', () => {
 
 describe('材料入库后的 id 重映射', () => {
   const readyItem = (id: string) => ({
+    key: id,
     id,
     label: '资料.pdf',
     kind: 'document' as const,
@@ -966,6 +967,28 @@ describe('材料入库后的 id 重映射', () => {
     expect(sourcesStore.items[0].id).toBe('持久-1');
     expect(sourcesStore.items[0].source?.id).toBe('持久-1');
     expect(sourcesStore.readySources[0].id).toBe('持久-1');
+  });
+
+  it('两份材料认领成同一个持久 id：列表仍是两行，删一行只删一行', async () => {
+    const wrapper = mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+    const sourcesStore = useSourcesStore();
+    sourcesStore.items = [readyItem('tmp-a'), readyItem('tmp-b')];
+    sourcesStore.remap({ 'tmp-a': '持久-同', 'tmp-b': '持久-同' });
+    await wrapper.vm.$nextTick();
+
+    const rows = wrapper.findAll('ul[aria-label="待生成来源"] > li');
+    expect(rows).toHaveLength(2);
+    // 两行的 id 相同不能当成"重复 key"：行身份挂在 key 上
+    expect(sourcesStore.items.map(item => item.key)).toEqual(['tmp-a', 'tmp-b']);
+
+    const removes = rows[0].findAll('button').filter(button => button.text() === '移除');
+    await removes[0].trigger('click');
+
+    expect(wrapper.findAll('ul[aria-label="待生成来源"] > li')).toHaveLength(1);
+    expect(sourcesStore.items.map(item => item.key)).toEqual(['tmp-b']);
   });
 
   it('没有这一帧时来源原样不动', async () => {

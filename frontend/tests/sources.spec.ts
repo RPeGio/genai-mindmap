@@ -106,7 +106,7 @@ describe('来源收集', () => {
     expect(store.items.map(item => item.state)).toEqual(['ready', 'failed', 'ready']);
     expect(store.items[1].error).toBe('图片识别暂不可用');
     expect(store.problem).toContain('重试或移除');
-    await store.retry(store.items[1].id);
+    await store.retry(store.items[1].key);
     expect(store.readySources.map(source => source.id)).toEqual(['a', 'b', 'c']);
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(store.problem).toBe('');
@@ -122,7 +122,7 @@ describe('来源收集', () => {
     expect(store.parsing).toBe(true);
     expect(store.items.map(item => item.state)).toEqual(['parsing', 'queued']);
     if (action === 'clear') store.clear();
-    else store.items.map(item => item.id).forEach(id => store.remove(id));
+    else store.items.map(item => item.key).forEach(key => store.remove(key));
     expect(signal.aborted).toBe(true);
     pending.resolve(json({ source: parsed() }));
     await task;
@@ -289,6 +289,33 @@ describe('来源收集', () => {
     const store = useSourcesStore();
     expect(store.addText(' \n\t ')).toBe(false);
     expect(store.items).toEqual([]);
+  });
+});
+
+describe('入库认领之后的行身份', () => {
+  it('两份相同内容的材料映射到同一个持久 id：行还是两行，只删一行', () => {
+    const store = useSourcesStore();
+    store.addText('同一段正文');
+    store.addText('同一段正文');
+    const [first, second] = store.items;
+    expect(first.key).not.toBe(second.key);
+
+    // 知识库按正文判重：两份内容一样，入库后就是同一条材料
+    store.remap({ [first.id]: '持久-同', [second.id]: '持久-同' });
+
+    // id 允许相同，行身份不变，各自还能删
+    expect(store.items.map(item => item.key)).toEqual([first.key, second.key]);
+    expect(store.items.map(item => item.id)).toEqual(['持久-同', '持久-同']);
+    expect(store.items.map(item => item.source?.id)).toEqual(['持久-同', '持久-同']);
+
+    // 同一个 id 只送一次：重复送会被 sourceInputError 判成"来源 ID 重复"，
+    // 生成按钮直接锁死，而这恰恰是正常入库之后的状态
+    expect(store.readySources).toHaveLength(1);
+    expect(store.problem).toBe('');
+
+    store.remove(first.key);
+    expect(store.items).toHaveLength(1);
+    expect(store.items[0].key).toBe(second.key);
   });
 });
 
