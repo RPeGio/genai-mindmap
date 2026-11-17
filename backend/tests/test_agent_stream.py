@@ -196,6 +196,25 @@ class SourcesFrameTest(unittest.TestCase):
 
         self.assertNotIn("sources", [frame["type"] for frame in _frames(response.text)])
 
+    def test_first_bytes_are_a_comment_frame(self):
+        """入库在首帧之前，客户端要先看到"连接已建立"：首块是一行 SSE 注释。
+
+        注释帧不占 `seq`、`postSse` 解析时也不认它，所以真正的第一帧仍是 `sources`；
+        但它在响应体最前面，代理与浏览器能立刻知道这条流开始了。
+        """
+        source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文。")
+
+        with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):
+            response = client.post(URL, json={
+                "goal": "整理", "intent": "create",
+                "sources": [source.model_dump(mode="json")],
+            })
+
+        self.assertTrue(response.text.startswith(": 正在把材料收进知识库\n\n"))
+        frames = _frames(response.text)
+        self.assertEqual(frames[0]["type"], "sources")
+        self.assertEqual(frames[0]["seq"], 1)
+
     def test_stream_still_ends_with_done_when_ingest_fails(self):
         """入库失败不能把流打断：材料照样用，只是没进库。"""
         source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文。")

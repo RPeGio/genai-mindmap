@@ -80,6 +80,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from uuid import uuid4
@@ -211,6 +212,19 @@ def ingest(source: Source) -> str:
 
     空正文抛 `ValueError`：空材料没有可检索的内容，落一行只会让 `list_sources`
     与 `prune` 的计数变脏。调用方（`graph_ingest`）在判定正文为空之后才调这里。
+
+    一次只写一份、自己开连接：脚本与单条补录用。生成前那批几十份材料请走
+    `ingest_many`——它把 N 次连接/事务压成一次，撞上写锁时不必排队等 N 个超时。
+    """
+    with closing(_connect()) as conn, conn:
+        return _ingest_one(conn, source)
+
+
+def _ingest_one(conn: sqlite3.Connection, source: Source) -> str:
+    """在调用方给的连接/事务里写一份来源，返回持久 id。
+
+    单份的写入包在自己的 `SAVEPOINT` 里：批量入库共用一个事务，一份失败只能回滚
+    它自己，不能把同批已经写好的材料一起带走。
     """
     text = source.text or ""
     if not text.strip():
@@ -223,7 +237,8 @@ def ingest(source: Source) -> str:
             "正文指纹与解析时不一致（声明 %s… 实际 %s…）：以正文为准",
             declared[:8], digest[:8])
 
-    with closing(_connect()) as conn, conn:
+    conn.execute("SAVEPOINT ingest_one")
+    try:
         row = conn.execute(
             f"SELECT id FROM {SOURCES_TABLE} WHERE content_hash = ?", (digest,)
         ).fetchone()
@@ -246,10 +261,8 @@ def ingest(source: Source) -> str:
             )
         except sqlite3.IntegrityError:
             # 并发的两次上传同一份材料：唯一约束替"先查后写"的窗口兜底。
-            # 先回滚再回查——语句级失败之后事务处于"已中止"状态，不回滚就继续
-            # 发语句，SQLite 会报 "cannot start a transaction within a transaction"
-            # 之类与真正原因无关的错。
-            conn.rollback()
+            # 回滚到本份的 SAVEPOINT 而不是整库回滚——同批别的材料不能被带走。
+            conn.execute("ROLLBACK TO ingest_one")
             existing = conn.execute(
                 f"SELECT id FROM {SOURCES_TABLE} WHERE content_hash = ?", (digest,)
             ).fetchone()
@@ -265,9 +278,62 @@ def ingest(source: Source) -> str:
         conn.executemany(
             f"INSERT OR IGNORE INTO {CHUNKS_TABLE} "
             "(source_id, start, end, level, parent) VALUES (?, ?, ?, ?, ?)", rows)
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK TO ingest_one")
+        except sqlite3.Error:         # pragma: no cover - 连接已坏时原始异常更重要
+            pass
+        raise
+    finally:
+        try:
+            conn.execute("RELEASE ingest_one")
+        except sqlite3.Error:         # pragma: no cover - 连接已坏时原始异常更重要
+            pass
+
     logger.info("知识库入库 来源=%s 正文=%d 字 切块=%d 行",
                 source_id[:8], len(text), len(rows))
     return source_id
+
+
+def ingest_many(
+    sources: list[Source], *, deadline: float | None = None,
+) -> list[str | None]:
+    """一次连接、一个事务地把一批来源写进库，逐份给结果。
+
+    返回与 `sources` 等长的列表：成功是持久 id，失败（空正文、库故障、意外）是
+    `None`——调用方保留那份材料的临时 id 继续用，不中断生成。
+
+    `deadline` 是 `time.monotonic()` 的绝对时刻：入库是生成前的旁路，到点就放弃
+    剩下的。理由见 `docs/AGENT_STREAM_PROTOCOL.md` 的入库说明：SQLite 被并发写锁
+    挡住时一次 `connect` 最久等 10 秒，50 份串行就是几分钟静默，比"少记几份"严重
+    得多。
+    """
+    if not sources:
+        return []
+
+    results: list[str | None] = []
+    with closing(_connect()) as conn, conn:
+        for source in sources:
+            if deadline is not None and time.monotonic() > deadline:
+                logger.warning("入库超过预算，剩余 %d 份本次不记",
+                               len(sources) - len(results))
+                results.extend([None] * (len(sources) - len(results)))
+                break
+            try:
+                results.append(_ingest_one(conn, source))
+            except (ValueError, sqlite3.Error, OSError) as exc:
+                # ValueError 是空正文（不该进库），其余是库本身的问题。
+                logger.warning(
+                    "材料没能进知识库（%s: %s），本次仍按原样使用：%s",
+                    type(exc).__name__, str(exc)[:160],
+                    source.filename or source.id)
+                results.append(None)
+            except Exception:  # noqa: BLE001 - 单份的意外不许带走同批其它材料
+                logger.exception(
+                    "材料没能进知识库（意外），本次仍按原样使用：%s",
+                    source.filename or source.id)
+                results.append(None)
+    return results
 
 
 def _to_source(row: sqlite3.Row) -> Source:

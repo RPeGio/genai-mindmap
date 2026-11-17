@@ -82,8 +82,11 @@ async def _frames(body: AgentRunRequest) -> AsyncIterator[str]:
         # id 必须同时送到前端（`sources` 帧）和生成上下文（重排后的 request）。
         # 两边不一致时，导图里记的 `source_refs.source_id` 从这一轮起就指不到原文。
         #
-        # 放线程池里跑：入库是同步 sqlite 写，50 份材料要几百毫秒，占着事件循环
-        # 会把这些毫秒变成"第一帧之前多等一会儿"。
+        # 放线程池里跑：入库是同步 sqlite 写。但入库是"第一帧之前"的工作，几十份
+        # 材料串起来可能安静好几秒——客户端这时连"连接已建立"都还看不到。所以先
+        # 刷一行 SSE 注释帧把首字节送出去：`postSse` 只认 `data: ` 行，注释会被
+        # 安全忽略，也不需要占 `seq`（`sources` 帧仍是 seq 1）。
+        yield ": 正在把材料收进知识库\n\n"
         remembered = await run_in_threadpool(remember_sources, body.sources)
         if remembered.mapping:
             seq += 1

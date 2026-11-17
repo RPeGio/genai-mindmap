@@ -92,10 +92,10 @@ def test_blank_material_keeps_its_id_and_does_not_raise(tmp_path):
 
 def test_library_failure_does_not_break_the_batch(tmp_path, monkeypatch):
     """库写不进去时整批保留原 id：生成照跑，只是这批材料不能复用。"""
-    def boom(source):
+    def boom(sources, *, deadline=None):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(library, "ingest", boom)
+    monkeypatch.setattr(library, "ingest_many", boom)
     sources = [_source("甲。"), _source("乙。")]
 
     result = remember.remember_sources(sources)
@@ -112,10 +112,10 @@ def test_unexpected_error_is_contained_and_logged(tmp_path, monkeypatch, caplog)
     `agent/router.py` 的兜底分支，整轮生成就变成 `agent_failed`——一份材料的
     记账失败不该有这个后果。
     """
-    def boom(source):
+    def boom(sources, *, deadline=None):
         raise RuntimeError("意外：编码器内部状态不对")
 
-    monkeypatch.setattr(library, "ingest", boom)
+    monkeypatch.setattr(library, "ingest_many", boom)
     sources = [_source("甲。"), _source("乙。")]
 
     with caplog.at_level(logging.ERROR, logger=remember.__name__):
@@ -126,6 +126,39 @@ def test_unexpected_error_is_contained_and_logged(tmp_path, monkeypatch, caplog)
     # 必须带 exc_info：否则线上只知道"没入进去"，不知道是哪一层炸的。
     logged = [record for record in caplog.records if "材料没能进知识库" in record.getMessage()]
     assert logged and all(record.exc_info for record in logged)
+
+
+def test_one_connection_for_the_whole_batch(tmp_path, monkeypatch):
+    """整批材料只开一次连接：每份各连一次，撞上写锁就是 N 个 10 秒的静默。
+
+    入库发生在第一帧之前，这条路径上的等待客户端完全感知不到。
+    """
+    opened: list[int] = []
+    real_connect = library._connect
+
+    def counted():
+        opened.append(1)
+        return real_connect()
+
+    monkeypatch.setattr(library, "_connect", counted)
+    sources = [_source(f"第 {index} 份正文。") for index in range(5)]
+
+    result = remember.remember_sources(sources)
+
+    assert len(opened) == 1
+    assert len(result.mapping) == 5
+
+
+def test_budget_exhausted_keeps_everything_temporary(tmp_path, monkeypatch):
+    """超预算就全按临时 id 继续：少记几份，好过让生成在首帧前安静几分钟。"""
+    monkeypatch.setattr(remember, "REMEMBER_BUDGET_SECONDS", -1.0)
+    sources = [_source("甲。"), _source("乙。")]
+
+    result = remember.remember_sources(sources)
+
+    assert result.sources == sources
+    assert result.mapping == {}
+    assert library.list_sources() == []
 
 
 def test_switch_off_does_not_touch_the_library(tmp_path, monkeypatch):

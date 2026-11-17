@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
+import time
 from dataclasses import dataclass, field
 
 from app.contracts.source import Source
@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # 默认开：入库是知识库入口能显示出东西的唯一来源，默认关等于这个入口永远空白。
 # 需要一个"完全不写库"的部署时，在环境里置 0。
 REMEMBER_ENV = "MINDMAP_LIBRARY_REMEMBER"
+
+# 入库整段的总预算。入库发生在第一帧之前，SQLite 被并发写锁挡住时一次 connect
+# 最久等 10 秒——50 份串起来就是几分钟静默，而客户端这时连"连接已建立"都看不到。
+# 到点就放弃剩下的材料、按临时 id 继续生成：记上账是旁路，不能压过生成本身。
+REMEMBER_BUDGET_SECONDS = 5.0
 
 
 def remember_enabled() -> bool:
@@ -46,12 +51,17 @@ class Remembered:
 
 
 def remember_sources(sources: list[Source]) -> Remembered:
-    """逐份入库，返回换了 id 的材料清单。
+    """一次连接、一个事务地把材料收进库，返回换了 id 的材料清单。
 
     **单份失败不影响整次生成**：入库是记账，不是生成的前置条件。素材正文已经
     在请求里了，这一轮照样能生成导图，只是这批材料下次不能从库里复用。
     失败时保留原 uuid——那意味着这张图的引用重新打开后指不到原文，但至少
     本次会话内的引用（前端按会话内的 source 解析）仍然有效。
+
+    **批量化是因为入库发生在首帧之前**：几十份材料各开一次连接、各撞一次写锁
+    超时，就是几十次 10 秒的静默，而这时 SSE 还一帧都没发。现在整批共用一个
+    连接一个事务，并且有总预算（`REMEMBER_BUDGET_SECONDS`），超预算的剩余材料
+    按临时 id 继续——这批记上账比记得全重要。
 
     因此这里兜到底：已知异常（空正文、库故障）按 warning 记，其余任何意外按
     exception 记完整栈——这条支路不该有能力中断生成，异常一旦穿出去就会被
@@ -60,28 +70,20 @@ def remember_sources(sources: list[Source]) -> Remembered:
     if not sources or not remember_enabled():
         return Remembered(sources=list(sources))
 
+    deadline = time.monotonic() + REMEMBER_BUDGET_SECONDS
+    try:
+        persistent_ids = knowledge_library.ingest_many(sources, deadline=deadline)
+    except Exception as exc:  # noqa: BLE001 - 入库是旁路，必须兜住一切
+        # 批量入口已逐份兜底，走到这里说明连连接都建不起来：记完整栈，全按原样用。
+        logger.exception(
+            "材料没能进知识库（%s: %s），这一轮按原样继续",
+            type(exc).__name__, str(exc)[:160])
+        return Remembered(sources=list(sources))
+
     mapping: dict[str, str] = {}
     kept: list[Source] = []
-    for source in sources:
-        try:
-            persistent_id = knowledge_library.ingest(source)
-        except (ValueError, sqlite3.Error, OSError) as exc:
-            # ValueError 是空正文（不该进库），其余是库本身的问题。
-            logger.warning(
-                "材料没能进知识库（%s: %s），本次仍按原样使用：%s",
-                type(exc).__name__, str(exc)[:160], source.filename or source.id,
-            )
-            kept.append(source)
-            continue
-        except Exception as exc:  # noqa: BLE001 - 入库是旁路，必须兜住一切
-            # 不在已知清单里的意外同样不许穿透：记完整栈，方便下次从日志里查。
-            logger.exception(
-                "材料没能进知识库（%s: %s），本次仍按原样使用：%s",
-                type(exc).__name__, str(exc)[:160], source.filename or source.id,
-            )
-            kept.append(source)
-            continue
-        if persistent_id == source.id:
+    for source, persistent_id in zip(sources, persistent_ids):
+        if not persistent_id or persistent_id == source.id:
             kept.append(source)
             continue
         mapping[source.id] = persistent_id
@@ -90,6 +92,7 @@ def remember_sources(sources: list[Source]) -> Remembered:
 
 
 __all__ = [
+    "REMEMBER_BUDGET_SECONDS",
     "REMEMBER_ENV",
     "Remembered",
     "remember_enabled",
