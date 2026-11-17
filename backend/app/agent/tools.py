@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Literal, Sequence
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -49,11 +50,15 @@ from app.agent.stream_items import StreamItem, closed_items
 from app.contracts import mindmap as mindmap_contract
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import (
+    EDGE_KINDS,
     GENERATED_LABEL_MAX_CHARS,
+    MAX_EDGE_LABEL_CHARS,
+    MAX_EDGES,
     MAX_NODE_DETAIL_CHARS,
     MAX_NODE_ICON_CHARS,
     MAX_TREE_NODES,
     NODE_COLORS,
+    Edge,
     MindMapContent,
     Node,
     clip_label,
@@ -78,6 +83,7 @@ from app.generation.service import (
 from app.knowledge import external as external_knowledge
 from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
+from app.mindmaps.edges import UNRESOLVED_ENDPOINT, clean_edges
 from app.knowledge.service import (
     LEAF_MAX_CHARS,
     EvidenceHit,
@@ -521,6 +527,24 @@ class GenerateDeepArgs(BaseModel):
         default=DEEP_DEFAULT_DEPTH, ge=2, le=DEEP_MAX_DEPTH,
         description="往下展开到第几层（root 之下算起）：2 只有两层，3 可到三级节点",
     )
+    # 图型。三者共用同一套「骨架 → 按支展开 → 验收」流水线，差别只在**骨架那一次
+    # 的提示词**与"要不要解析 edges"：
+    #
+    #   - `tree`：思维导图。一级分支是话题分类，不产出边。**默认值，行为与加这个
+    #     字段之前逐字节相同**（`tests/test_edges.py` 拿 `e3ba390` 的旧模块钉着）。
+    #   - `flowchart`：流程图。一级分支必须是**阶段**（按执行顺序排列），骨架可以
+    #     带 `edges`：判断节点的两个出口各挂一条 `branch` 边（带"是"/"否"），
+    #     回退挂 `loop` 边。这是"树 + 附加边"唯一能表达有环/有汇合的地方。
+    #   - `fishbone`：鱼骨图。一级分支固定为六个类别（人/机/料/法/环/测），
+    #     不产出边——鱼骨图的关系全部由层级表达，多画线只会让它变乱。
+    #
+    # 为什么不做成三个工具：三者除了骨架提示词以外每一步（并发、预算、检索、
+    # 验收、诊断）都一样。拆成三个工具等于把那条流水线抄三份，而抄出来的第二份
+    # 迟早与第一份在某个边界上分叉。
+    diagram_type: Literal["tree", "flowchart", "fishbone"] = Field(
+        default="tree",
+        description="图型：tree 思维导图（默认）/ flowchart 流程图（可带附加边）/ fishbone 鱼骨图",
+    )
 
 
 class ExpandArgs(BaseModel):
@@ -682,6 +706,45 @@ class MoveNodeArgs(BaseModel):
     )
 
 
+class AddEdgeArgs(BaseModel):
+    """`add_edge`：在两个**已有**节点之间连一条附加边（流程图的条件分支 / 回退）。
+
+    三个字段的取值全部来自当前大纲：`source` / `target` 是节点 id（不是标题），
+    `kind` 只收三个值。之所以不给"按标题找节点"的方便写法：标题在树里可以重复，
+    而按重复的标题找节点会连错线——那是一种在画布上看起来"就是我要的"，但节点
+    根本不是同一个的静默错误。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    source: str = Field(min_length=1, max_length=100, description="起点节点 id，取自当前大纲")
+    target: str = Field(min_length=1, max_length=100, description="终点节点 id，取自当前大纲")
+    label: str | None = Field(
+        default=None, max_length=MAX_EDGE_LABEL_CHARS,
+        description="可选：边上的文字，例如「是」「否」「通过」「驳回」",
+    )
+    kind: str | None = Field(
+        default=None, max_length=20,
+        description="可选：flow 顺序跳转 / branch 条件出口 / loop 回退；省略等于 flow",
+    )
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_in_set(cls, value: str | None) -> str | None:
+        """非法 `kind` 在**参数层**就报错（与 `color` / `icon` 同一个位置）。
+
+        放在这里而不是执行器里：执行器的错误会带上 `ops.0.target` 这种路径，
+        对模型来说那句 `ops.0` 毫无信息量——它只知道"我调的是 add_edge"。
+        """
+        return _check_kind_arg(value)
+
+
+class RemoveEdgeArgs(BaseModel):
+    """`remove_edge`：删一条附加边（不动节点）。"""
+
+    model_config = ConfigDict(extra="forbid")
+    edge_id: str = Field(min_length=1, max_length=100, description="边 id，取自当前大纲里的附加关系")
+
+
 # ---------------------------------------------------------------- 辅助
 
 
@@ -720,7 +783,12 @@ def _clip_tree(content: MindMapContent, limit: int) -> tuple[MindMapContent, int
     kept_ids = _node_ids(root)
     relations = [item for item in content.relations
                  if item.source in kept_ids and item.target in kept_ids]
-    trimmed = content.model_copy(update={"root": root, "relations": relations})
+    # 附加边同一套：端点被裁掉的边留着就是 dangling，而 dangling 在契约层是**硬拒**
+    # ——不在这里一起裁，"少几个节点"会变成"整张图存不回去"，错误还指向某条边。
+    edges = [edge for edge in content.edges
+             if edge.source in kept_ids and edge.target in kept_ids]
+    trimmed = content.model_copy(
+        update={"root": root, "relations": relations, "edges": edges})
     # 走一次 dump/validate：`model_copy` 不做校验，而这里是"结构被代码改过"的唯一
     # 一处，不校验就等于相信自己的算术。
     trimmed = MindMapContent.model_validate(trimmed.model_dump())
@@ -916,6 +984,89 @@ def _skeleton_branches(raw: Any) -> list[_SkeletonBranch]:
 def _skeleton_titles(raw: Any) -> list[str]:
     """只要标题时的便捷入口（诊断、用例与旧调用方读它）。"""
     return [branch.label for branch in _skeleton_branches(raw)]
+
+
+def _skeleton_edges(
+    raw: Any, skeleton: Sequence[tuple[str, str]], root_id: str,
+) -> list[Edge]:
+    """把骨架响应里的 `edges` 解析成契约边，端点用**序号 / "root" / 分支标题**指定。
+
+    为什么端点不能是节点 id：真实 id 是 `new_node_id` 在服务端分配的，模型在
+    写响应时根本不知道它。所以约定三种它能可靠写对的写法：
+
+      - 整数 `0`（或字符串 `"0"`）：一级分支的下标，0 起；
+      - `"root"`：中心主题；
+      - 分支标题原文（`"形式审查"`）：容忍——模型经常无视"写序号"照自己的习惯
+        写标题，为一个端点写法把整批边丢掉不值得。
+
+    三种都对不上就是 dangling：**静默丢掉**（由 `clean_edges` 统一处理并报一条
+    聚合的 `EDGE_DANGLING`）。这里不逐条报，因为 `edges` 只是骨架的附加产物，
+    一条写错的边不该在用户的诊断列表里占一行。
+
+    `kind` / `label` 的归一：不认识的 kind 落成 `None`（等于 `flow`，前端有默认
+    画法），label 按契约截到 40 字。**不为这些字段丢边**——一条"是/否"写成
+    `"yes"` 的边仍然表达了那条跳转，丢掉它反而让流程缺一条分支。
+    """
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("edges")
+    if not isinstance(items, list):
+        return []
+
+    by_index = {index: branch_id for index, (_, branch_id) in enumerate(skeleton)}
+    by_label = {title.strip(): branch_id for title, branch_id in skeleton}
+
+    def resolve(value: Any) -> str | None:
+        if isinstance(value, bool):  # bool 是 int 的子类，`True` 会撞上 1
+            return None
+        if isinstance(value, int):
+            return by_index.get(value)
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        if text.lower() == "root":
+            return root_id
+        if text.lstrip("-").isdigit():
+            return by_index.get(int(text))
+        return by_label.get(text)
+
+    edges: list[Edge] = []
+    for ordinal, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        unresolved = UNRESOLVED_ENDPOINT
+        source = resolve(item.get("source"))
+        target = resolve(item.get("target"))
+        if source is None or target is None:
+            # 端点解析不出来（序号越界、写了不存在的标题）：换成一个哨兵端点，
+            # 交给 `clean_edges` 按 dangling 丢掉并记 `EDGE_DANGLING`。
+            #
+            # 这里**不能**塞成"指向自己"：自环是被静默丢弃的，那样一来"模型写了
+            # 一个不存在的分支序号"在诊断里一个字都不会出现，图默默少一条分支。
+            source = target = unresolved
+        kind = item.get("kind")
+        edges.append(Edge(
+            id=f"e_{ordinal}_{uuid4().hex[:12]}",
+            source=source,
+            target=target,
+            label=clip_edge_label(item.get("label")),
+            kind=kind if kind in EDGE_KINDS else None,
+        ))
+    return edges
+
+
+def clip_edge_label(value: Any) -> str | None:
+    """边标签归一：非字符串/空白 → `None`，过长按码点截到契约上限。
+
+    截断而不是丢弃：一条 45 字的标签说明模型没照提示词写，但它表达的跳转是真
+    的——把整条边丢掉会让流程图少一个出口，那比文字长了 5 个字严重得多。
+    """
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    return text[:MAX_EDGE_LABEL_CHARS] if text else None
 
 
 @dataclass(frozen=True)
@@ -1702,6 +1853,86 @@ PLAN_PROMPT = (
     "（icon 塞了两个 emoji，而且骨架不要写子节点）"
 )
 
+# 流程图骨架。与 `PLAN_PROMPT` 共用同一套 JSON 骨架（`branches` 的形状一字不差），
+# 只多两个东西：**一级分支必须是阶段**，以及**一个 edges 数组**。
+#
+# 为什么阶段必须是流程推进的环节而不是话题分类：流程图的主干 = 执行的先后顺序，
+# 而"话题分类"之间本来就没有方向。模型按分类给一级分支，画出来是一张思维导图；
+# 按阶段给，父链才真的等于"下一步"。
+#
+# 为什么边只连 root 与一级分支：展开阶段的响应里**没有节点 id**（模型写的是
+# label/detail），那里产不出可引用的边。子层的关系由父子表达，跨支的汇合/回退
+# 才用边——这与 `Edge` 的 docstring 是同一条边界。
+#
+# 为什么用**序号**而不是节点 id：真实 id 是服务端分配的，模型根本不知道。
+# 让它写 `"n_3f2a"` 只会得到一堆 dangling。序号（`0` 起）与 `"root"` 是它能可靠
+# 写对的东西，解析时由 `_skeleton_edges` 换回真实 id。
+FLOW_PLAN_PROMPT = (
+    "你在为一张**流程图**只定主干骨架：先定出流程的阶段，再给出阶段之间的跳转关系，"
+    "不写任何子要点。只返回一个 JSON 对象，不要代码围栏，格式为 "
+    '{"branches":[{"label":"提交申请","color":"blue","icon":"📝"},'
+    '{"label":"形式审查","color":"amber","icon":"🔍"},'
+    '{"label":"实质审查","color":"teal","icon":"🧪"}],'
+    '"edges":[{"source":"root","target":0,"kind":"flow"},'
+    '{"source":1,"target":2,"label":"是","kind":"branch"},'
+    '{"source":1,"target":0,"label":"驳回","kind":"loop"}]}。'
+    f"每条一级分支是一个**流程阶段**（谁在什么条件下做什么，往前推进的一环），"
+    f"不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；**按执行顺序排列**，彼此不重叠；"
+    "不要编号，不要解释，不要编造具体数据、人名或文献。"
+    # edges 的三条硬规矩，每条都对应一个真实会画错的形态。
+    "edges 里 source / target 只能写**一级分支的序号（0 起）**或字符串 \"root\"，"
+    "不要写节点标题，也不要自己编 id。"
+    "edges 只连 root 与一级分支，**不要连子节点**（子层的关系由父子层级表达）。"
+    "kind 只能是 flow / branch / loop："
+    "flow 表示跳过若干阶段的顺序跳转（相邻阶段的先后已经由 branches 的顺序表达，不要重复画）；"
+    "branch 表示判断节点的两个出口，**必须带 label**，写「是」或「否」；"
+    "loop 表示回退/返工，**必须带 label**，写回到哪一步（例如「驳回」）。"
+    "label 不超过 40 字。没有条件跳转与回退时 edges 给空数组 []——不要为了凑数画线。"
+    # 视觉元素：规格与思维导图一致（见 `PLAN_PROMPT`），否则模型会写十六进制与文字图标。
+    f"color 与 icon 是给**一级分支**的视觉标记，建议每条分支都给（可选，不必勉强）："
+    f"color 只能取 {' / '.join(NODE_COLORS)} 之一；"
+    f"icon 是**一个** emoji，不超过 {MAX_NODE_ICON_CHARS} 个字符。"
+    "✅ 正确："
+    '{"branches":[{"label":"提交申请"},{"label":"形式审查"},{"label":"付款"}],'
+    '"edges":[{"source":1,"target":2,"label":"是","kind":"branch"},'
+    '{"source":1,"target":0,"label":"驳回","kind":"loop"}]}'
+    "❌ 错误："
+    '{"branches":[{"label":"提交申请"},{"label":"形式审查"}],'
+    '"edges":[{"source":"提交申请","target":"形式审查","kind":"flow"}]}'
+    "（端点写成了标题，不是序号）"
+    "❌ 错误："
+    '{"edges":[{"source":0,"target":1,"kind":"branch"}]}'
+    "（branch 边没有 label，画出来只有一个色块，看不出走哪条）"
+    "❌ 错误："
+    '{"edges":[{"source":0,"target":1,"kind":"next"}]}'
+    "（kind 只能是 flow / branch / loop）"
+)
+
+# 鱼骨图骨架。一级分支**固定**为六个类别，这是鱼骨图的定义而不是风格选择：
+# 换一套分类，画出来就不再是鱼骨图。代码侧只做"忽略 edges"，不做"校验是不是
+# 正好这六条"——模型偶尔多给一条（比如把"测"拆成"测量"与"测试"）不该判失败，
+# 而少给一条时用户自己加更便宜。
+FISHBONE_PLAN_PROMPT = (
+    "你在为一张**鱼骨图（因果分析）**只定骨架，不写任何子要点。"
+    "只返回一个 JSON 对象，不要代码围栏，格式为 "
+    '{"branches":[{"label":"人","color":"blue","icon":"👤"},'
+    '{"label":"机","color":"teal","icon":"⚙️"},'
+    '{"label":"料","color":"amber","icon":"📦"},'
+    '{"label":"法","color":"purple","icon":"📐"},'
+    '{"label":"环","color":"green","icon":"🌐"},'
+    '{"label":"测","color":"red","icon":"📏"}]}。'
+    "一级分支**必须正好是这六个类别**，顺序也照这个：人 / 机 / 料 / 法 / 环 / 测，"
+    "每条不超过一个字到两个字，不要改写成别的话题分类。"
+    "**不要输出 edges**：鱼骨图的关系全部由层级表达，多画线只会把图弄乱。"
+    f"color 只能取 {' / '.join(NODE_COLORS)} 之一；"
+    f"icon 是**一个** emoji，不超过 {MAX_NODE_ICON_CHARS} 个字符。"
+    "✅ 正确："
+    '{"branches":[{"label":"人","color":"blue"},{"label":"机","color":"teal"}]}'
+    "❌ 错误："
+    '{"branches":[{"label":"人员管理"},{"label":"设备维护"}]}'
+    "（改成了话题分类，不是固定类别）"
+)
+
 # 骨架提示词里那段"材料自带的章节"的表头。测试用它断言"目录拼进去了没有"，
 # 所以必须是**一个字符串常量**而不是散在 `_skeleton_outline` 里的字面量——
 # 两处各写一遍，改一处忘一处时，用例会绿着而提示词已经不再是那个形状。
@@ -1747,7 +1978,9 @@ def _skeleton_outline(sources: list[Source]) -> str:
     return "\n".join(lines)
 
 
-def _plan_ask(topic: str, branches: int, *, outline: str = "") -> str:
+def _plan_ask(
+    topic: str, branches: int, *, outline: str = "", diagram_type: str = "tree",
+) -> str:
     """骨架调用的 user 消息。
 
     期望分支数必须写进 user：只靠 system 里的通用说明时，请求 3 支与 8 支的
@@ -1759,6 +1992,12 @@ def _plan_ask(topic: str, branches: int, *, outline: str = "") -> str:
     条数要求之前**：顺序即权重，先给它看材料的结构，再让它数条数——反过来先
     见到"最多 8 条"时，它倾向凑满 8 条再找话说。空串表示这份材料没有可用目录，
     那一字不加（与加目录之前逐字相同）。
+
+    `diagram_type` 只影响末尾补的那一两句：`tree` 时**一个字符都不加**（有逐字节
+    回归用例钉着），`flowchart` 补"阶段顺序 + edges 只连骨架"，`fishbone` 补
+    "六个类别固定"。system 里的图型差异（`FLOW_PLAN_PROMPT` 等）与这里的分工是
+    「规则在 system，这一次的重点在 user」——与 `PLAN_PROMPT` / 本函数的既有分工
+    一致。
     """
     parts = [f"主题：{topic}"]
     if outline:
@@ -1771,6 +2010,12 @@ def _plan_ask(topic: str, branches: int, *, outline: str = "") -> str:
     # 一级分支标题从中间断掉。三条口径现在都读同一个常量。
     parts.append(
         f"每条不超过 {GENERATED_LABEL_MAX_CHARS} 字，互不重叠，按逻辑顺序排列。")
+    if diagram_type == "flowchart":
+        parts.append(
+            "这次是流程图：一级分支按**执行先后**排列，每条是一个流程阶段；"
+            "有判断出口或回退时，用 edges 补上（source/target 写序号或 \"root\"）。")
+    elif diagram_type == "fishbone":
+        parts.append("这次是鱼骨图：一级分支固定为人 / 机 / 料 / 法 / 环 / 测 六条，不要输出 edges。")
     return "\n".join(parts)
 
 
@@ -2546,12 +2791,24 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # `DETAIL_NO_SOURCE_RULES`）：它们是纯文本契约、不含输出格式，不会与
     # `PLAN_PROMPT` 的"只返回 branches"打架。有材料时一个字都不加——那时引用的
     # 规矩由每支的 `BRANCH_EVIDENCE_RULES` / `BRANCH_NO_EVIDENCE_RULES` 说。
-    plan_system = PLAN_PROMPT if slicing else (
-        PLAN_PROMPT + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
+    #
+    # 图型只在**这一处**分叉：三套提示词都要求同一个 JSON 骨架，流水线其余部分
+    # 一行都不用改。`tree` 这一支是逐字节回归的守卫点——它的两个字符串变量与
+    # 加 `diagram_type` 之前完全相同。
+    base_plan = (
+        PLAN_PROMPT if args.diagram_type == "tree"
+        else FLOW_PLAN_PROMPT if args.diagram_type == "flowchart"
+        else FISHBONE_PLAN_PROMPT
+    )
+    plan_system = base_plan if slicing else (
+        base_plan + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
     try:
         raw_plan = await ask_model(
             plan_system,
-            _plan_ask(args.topic, args.branches, outline=outline) + hint_block)
+            _plan_ask(
+                args.topic, args.branches, outline=outline,
+                diagram_type=args.diagram_type,
+            ) + hint_block)
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 
@@ -2590,6 +2847,23 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         taken.add(branch_id)
         skeleton.append((branch.label, branch_id))
         branch_visual[branch_id] = branch
+
+    # ---- 附加边（只有 flowchart 会有）-----------------------------------------
+    # 位置必须在这里：边端点是**骨架层的节点 id**，而 id 刚在上面的循环里分配完。
+    # `fishbone` 与 `tree` 一进来就是空列表，后面所有地方（落树、导出、前端）
+    # 都不用判图型——空列表走的是同一条路，这正是"树 + 边"这个折中省下来的东西。
+    #
+    # `clean_edges` 负责丢掉自环、dangling、重复、超限与超长环，并把每一类都记成
+    # 一条 warn。**不在这里硬拒**：边是骨架的附加产物，一条写错的边不该把已经
+    # 花掉的那次骨架调用连同整棵树判废。
+    edges: list[Edge] = []
+    if args.diagram_type == "flowchart":
+        # 端点只可能是 root 或一级分支——`_skeleton_edges` 的解析表就是这么建的，
+        # 所以这里能构造的 id 集合也只需要这两个。
+        skeleton_ids = {root_id} | {branch_id for _, branch_id in skeleton}
+        edges, edge_diag = clean_edges(
+            _skeleton_edges(raw_plan, skeleton, root_id), skeleton_ids)
+        diagnostics.extend(edge_diag)
 
     # 骨架落定的这一刻就把根与一级分支报出去：它们不需要等任何展开调用，而
     # 展开是并发的、动辄十几秒，先让用户看见框架比多等一个字段值不值的问题更值。
@@ -3240,6 +3514,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                         char_count=len((source.text or "").strip()))
             for source in verify_sources
         ],
+        # `tree` / `fishbone` 到这里是空列表：上面那段只在 flowchart 时填它。
+        edges=edges,
     )
 
     drafts: list[dict[str, Any]] = []
@@ -3730,6 +4006,21 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "按支检索给到的证据这次没有被用上：这不代表「材料里没有相关内容」，"
                 "换一个更贴近原文的分支说法重试可能就好了。"
             )
+    # 附加边必须出现在 content 里：用户选的是流程图，而"这张图上有几条条件分支、
+    # 几条回退"正是他判断"画出来像不像他想要的流程"的第一个信号。只说节点数时，
+    # 一棵有 6 条回退线的流程图与一棵纯思维导图在文字上长得一模一样。
+    if args.diagram_type != "tree":
+        if edges:
+            branches_n = sum(1 for edge in edges if edge.kind == "branch")
+            loops_n = sum(1 for edge in edges if edge.kind == "loop")
+            content_parts.append(
+                f"附加关系：{len(edges)} 条（条件分支 {branches_n} 条、回退 {loops_n} 条）。"
+            )
+        else:
+            content_parts.append(
+                "这次没有生成附加关系（条件分支 / 回退）：流程是一条直链，"
+                "用节点展开补细节即可。"
+            )
     content_parts.append(
         f"按 {max_depth} 层预算展开，实际 {audit.deepest + 1} 层（含中心主题），各层节点数："
         f"{' / '.join(str(audit.depths.get(depth, 0)) for depth in range(audit.deepest + 1))}。"
@@ -3828,6 +4119,21 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 # 已被 `_PER_NODE_REF_CODES` 挡掉），不是 `check()` 的原始产出量。
                 "reported": len(health),
             },
+            # 图型与附加边：`diagram_type` 是**输入**（用户选的），`edges.count`
+            # 是**产出**。两个都报，因为"选了流程图但一条边都没画出来"与"选了
+            # 思维导图"在树上长得一样，而前者是要去补的动作。
+            #
+            # **只在非 `tree` 时加这个键**，与 `external` / `material` 同一条规矩：
+            # `tree` 是默认值，它的 `data` 键集必须与加 `diagram_type` 之前逐字节
+            # 相同（`tests/test_edges.py` 拿 `e3ba390` 的旧模块整份比对）。
+            **({"diagram": {
+                "type": args.diagram_type,
+                "edges": len(edges),
+                "edge_kinds": {
+                    kind: sum(1 for edge in edges if (edge.kind or "flow") == kind)
+                    for kind in EDGE_KINDS
+                },
+            }} if args.diagram_type != "tree" else {}),
             "nli": {
                 "on_generate": nli_attempted,
                 "limit": MAX_NLI_CHECKS,
@@ -5339,6 +5645,11 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
 
     parent = find_parent(content.root, args.node_id)
     removed = [item.label for item in _iter_nodes(node)]
+    # 被连带删掉的边：源或目标落在**这棵子树**里（含子孙）。必须在提交前算，
+    # 提交之后就只剩一个已经删干净的新树，"删了几条线"这个数就没了。
+    doomed = _node_ids(node)
+    removed_edges = [edge for edge in content.edges
+                     if edge.source in doomed or edge.target in doomed]
     draft = {"op": "remove", "id": args.node_id}
 
     committed = _commit_drafts(ctx, content, [draft])
@@ -5350,12 +5661,17 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
     if len(removed) > 1:
         # 级联必须说出来：用户看到的是一次"少了一整片"，而模型以为只删了一个。
         summary += f"及其 {len(removed) - 1} 个子孙节点（共 {len(removed)} 个）"
+    if removed_edges:
+        # 连带删边也要说出来，理由同上：模型看不到画布，不说它会以为线还在。
+        summary += f"，同时删掉了 {len(removed_edges)} 条与它相关的附加关系"
     summary += "。画布上可以撤销。"
     return _single_result(
         ctx, updated, batch, id_map, summary,
         changed=[args.node_id] + ([parent.id] if parent is not None else []),
         removed_nodes=removed,
         removed_count=len(removed),
+        removed_edges=[edge.id for edge in removed_edges],
+        removed_edge_count=len(removed_edges),
         parent_id=parent.id if parent is not None else None,
     )
 
@@ -5454,6 +5770,132 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
 def _subtree_height(node: Node) -> int:
     """节点自己算一层的子树高度（叶子是 1）。"""
     return 1 + max((_subtree_height(child) for child in node.children), default=0)
+
+
+def _check_kind_arg(value: str | None) -> str | None:
+    """工具参数里的 `kind`：只收三个值，空串是"不声明"（等于 flow）。
+
+    与 `_check_color_arg` 同一条方向：**非法值报错**，不静默改成 `None`。
+    模型写 `kind: "next"` 时，静默落成 `flow` 会让它以为"我标了条件分支"，
+    而画布上那条线是普通箭头——两边都不知道发生了什么。错误信息里列出三个
+    合法值，它下一轮就能改对。
+    """
+    if value is None:
+        return None
+    key = value.strip().lower()
+    if not key:
+        return None
+    if key not in EDGE_KINDS:
+        raise ValueError(f"kind 只能是 {'/'.join(EDGE_KINDS)} 之一，收到 {value!r}")
+    return key
+
+
+def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
+    """在**两个已有节点**之间连一条附加边。
+
+    与 `add_node` 是同一条落树路（`_commit_drafts` → `apply_ops`）：整批原子，
+    失败时 `ctx.candidate` 一个字都不动。预检放在这里而不是全交给执行器，是为了
+    报错更准（"起点节点不存在"能指到 `source` 那个参数，而不是一句"第 0 条 op 失败"）。
+
+    允许**成环**（A→B 之后 B→A）：那正是回退线，是流程图的核心需求。上限只有
+    "单图 200 条边"（`MAX_EDGES`，与契约的诊断口径同一个数）——超过时明确拒绝
+    并说明，而不是让第 201 条在保存时被 422 打回。
+    """
+    content = _require_candidate(ctx)
+    if isinstance(content, ToolResult):
+        return content
+
+    scope_error = _scope_guard(content, ctx, args.source)
+    if scope_error is not None:
+        return scope_error
+    scope_error = _scope_guard(content, ctx, args.target)
+    if scope_error is not None:
+        return scope_error
+
+    source = find_node(content.root, args.source)
+    if source is None:
+        return _fail("node_not_found", f"起点节点 {args.source} 不存在。")
+    target = find_node(content.root, args.target)
+    if target is None:
+        return _fail("node_not_found", f"终点节点 {args.target} 不存在。")
+    if args.source == args.target:
+        return _fail(
+            "self_loop",
+            f"「{source.label}」不能连到自己：自环在画布上只会渲染成一个点。",
+        )
+    if any(edge.source == args.source and edge.target == args.target
+           and edge.label == (args.label or None) for edge in content.edges):
+        same = f"（标签「{args.label}」）" if args.label else ""
+        return _fail(
+            "duplicate_edge",
+            f"「{source.label}」→「{target.label}」{same} 这条边已经存在。"
+            "要两条平行边，请给不同的 label（例如「是」与「否」）。",
+        )
+    if len(content.edges) >= MAX_EDGES:
+        return _fail(
+            "too_many_edges",
+            f"这张图已经有 {len(content.edges)} 条附加边，达到上限 {MAX_EDGES} 条，"
+            "加不了新边。请先删掉一些用不上的关系。",
+            edge_count=len(content.edges), edge_limit=MAX_EDGES,
+        )
+
+    draft = {
+        "op": "add_edge",
+        # 临时 id 由 `normalize_ops` 换成真实边 id（`e_` 前缀）。
+        "id": f"{TEMP_ID_PREFIX}edge1",
+        "source": args.source,
+        "target": args.target,
+        "label": args.label,
+        "kind": args.kind,
+    }
+    committed = _commit_drafts(ctx, content, [draft])
+    if isinstance(committed, ToolResult):
+        return committed
+    updated, batch, id_map = committed
+    edge_id = id_map.get(f"{TEMP_ID_PREFIX}edge1", f"{TEMP_ID_PREFIX}edge1")
+
+    label_text = f"（{args.label}）" if args.label else ""
+    kind_text = {"branch": "条件分支", "loop": "回退", None: "顺序跳转", "flow": "顺序跳转"}
+    summary = (
+        f"已连接「{source.label}」→「{target.label}」{label_text}，"
+        f"类型：{kind_text.get(args.kind or 'flow', '顺序跳转')}（边 id {edge_id}）。"
+    )
+    return _single_result(
+        ctx, updated, batch, id_map, summary,
+        changed=[args.source, args.target],
+        edge_id=edge_id, source=args.source, target=args.target,
+        edge_count=len(updated.edges),
+    )
+
+
+def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
+    """删一条附加边。**不动节点**：删线不改结构，所以不检查节点数/层数。
+
+    存在的边才删得掉：给一个不存在的 id 直接报 `edge_not_found`，而不是
+    "默默成功"——后者会让模型以为那条线没了，而画布上仍然挂着。
+    """
+    content = _require_candidate(ctx)
+    if isinstance(content, ToolResult):
+        return content
+
+    edge = next((item for item in content.edges if item.id == args.edge_id), None)
+    if edge is None:
+        return _fail("edge_not_found", f"边 {args.edge_id} 不存在。")
+
+    committed = _commit_drafts(ctx, content, [{"op": "remove_edge", "id": args.edge_id}])
+    if isinstance(committed, ToolResult):
+        return committed
+    updated, batch, id_map = committed
+
+    summary = f"已删除「{edge.source}」→「{edge.target}」这条附加关系"
+    if edge.label:
+        summary += f"（{edge.label}）"
+    summary += f"；现在还剩 {len(updated.edges)} 条。"
+    return _single_result(
+        ctx, updated, batch, id_map, summary,
+        changed=[edge.source, edge.target],
+        edge_id=args.edge_id, edge_count=len(updated.edges),
+    )
 
 
 def _top_level_changes(item: EditOp) -> dict[str, Any]:
@@ -5601,7 +6043,10 @@ def _batch_id(ctx: RunContext) -> str:
 _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
     "create": ("mindmap_generate_deep",),
     "expand": ("node_expand",),
-    "edit": ("add_node", "update_node", "remove_node", "move_node", "mindmap_edit"),
+    "edit": (
+        "add_node", "update_node", "remove_node", "move_node",
+        "add_edge", "remove_edge", "mindmap_edit",
+    ),
 }
 
 # 会读来源的意图。`create` 不在里面：分片生成在工具内部自己检索（骨架之后每支一次、
@@ -5623,6 +6068,8 @@ _TOOL_ORDER = (
     "update_node",
     "remove_node",
     "move_node",
+    "add_edge",
+    "remove_edge",
     "mindmap_edit",
 )
 
@@ -5641,6 +6088,11 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
             "带材料时它会先看一眼材料自带的章节标题来定一级骨架，再为每条一级分支"
             "各自检索一次并只让那一支看到自己的检索结果，"
             "所以带材料的主题同样可以用它；它不会把全文读进来。"
+            # 图型必须说出来：模型看不到"我该画流程还是画导图"的界面，只能靠这句
+            # 判断。不说的话它一律按默认的 tree 走，用户选了流程图也拿到思维导图。
+            "diagram_type 选图型：tree 思维导图（默认，按话题分解）；"
+            "flowchart 流程图（一级分支是阶段，会额外给出条件分支与回退的连线）；"
+            "fishbone 鱼骨图（一级分支固定为人/机/料/法/环/测）。"
             "只有当前还没有导图时可用。"
         ),
         args_model=GenerateDeepArgs,
@@ -5702,6 +6154,10 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
         description=(
             "删**一个**节点，**连同它的整棵子树**（级联删除：不把子节点挂到父节点上，"
             "也不要求先删子节点）。根节点不能删。"
+            # 连带删边必须写进描述：模型看不到画布，它只知道"我删了一个节点"。
+            # 不说的话，它下一轮会奇怪"为什么我画的回退线没了"，甚至去重建一条。
+            "**与这个节点相关的附加关系（边）会一起删掉**：源或目标命中被删节点"
+            "（含它的子孙）的边都不再存在，因为端点没了。"
             "返回里带被删掉的节点标题，删错了可以照着重建；画布上还能撤销。"
             "想保留子节点，请先用 move_node 把要留的那些挪到别的父节点下。"
         ),
@@ -5732,6 +6188,34 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
         ),
         args_model=EditArgs,
         fn=_edit,
+    ),
+    # 两条边工具。刻意**不进** `mindmap_edit` 的 op 表：批量的 `EditOp` 只覆盖
+    # 四种树操作，而边是"附加关系"——把它塞进同一张表会让批量工具的提示词再长
+    # 一截，而模型在批量里连边的情况本来就少（一条边改一次，开销只是多一次调用）。
+    "add_edge": lambda: ToolSpec(
+        name="add_edge",
+        description=(
+            "在**两个已有节点**之间连一条附加关系（跨父子节点的连线，不是父子层级）。"
+            "用在流程图里：判断节点的两个出口各连一条 kind=branch 的边、"
+            "带 label「是」/「否」；回退/返工连一条 kind=loop 的边、label 写「驳回」。"
+            "source / target 必须是**当前大纲里已有的节点 id**，不能是标题；"
+            "可以成环（A→B 之后 B→A），这正是回退线。"
+            "label ≤ 40 字；同一条 source→target 上要挂两条线请给不同的 label。"
+            f"整图最多 {MAX_EDGES} 条边，超了会被拒。"
+            "原子：失败时一个 op 都不落。"
+        ),
+        args_model=AddEdgeArgs,
+        fn=_add_edge,
+    ),
+    "remove_edge": lambda: ToolSpec(
+        name="remove_edge",
+        description=(
+            "删**一条**附加关系（边），不动任何节点——树的结构一个字节都不变。"
+            "edge_id 取自当前大纲里的附加关系列表。"
+            "要删节点请用 remove_node（它会连带删掉与那个节点相关的边）。"
+        ),
+        args_model=RemoveEdgeArgs,
+        fn=_remove_edge,
     ),
 }
 

@@ -99,10 +99,18 @@ def _assert_untouched(ctx: RunContext, before: MindMapContent) -> None:
 # ---------------------------------------------------------------- 注册表
 
 
-def test_edit_intent_registers_all_five_write_tools():
-    """`edit` 意图下五个写工具都给：四个细粒度 + 批量兜底。"""
+def test_edit_intent_registers_all_seven_write_tools():
+    """`edit` 意图下七个写工具都给：四个节点 + 两个边 + 批量兜底。
+
+    边工具与节点工具**并列**而不是塞进 `mindmap_edit` 的 op 表：一条边改一次，
+    开销只是多一次调用；而把两种东西混进同一张 op 表会让批量工具的提示词再长
+    一截，模型在批量里连边的情况本来就少。
+    """
     names = build_registry("edit", has_library=False).names()
-    assert set(names) == {"add_node", "update_node", "remove_node", "move_node", "mindmap_edit"}
+    assert set(names) == {
+        "add_node", "update_node", "remove_node", "move_node",
+        "add_edge", "remove_edge", "mindmap_edit",
+    }
 
 
 def test_create_and_expand_registries_are_unchanged():

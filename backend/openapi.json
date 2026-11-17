@@ -1101,6 +1101,65 @@
         ],
         "title": "DiagnosticLevel"
       },
+      "Edge": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "source": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Target"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "flow",
+                  "branch",
+                  "loop"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "target"
+        ],
+        "title": "Edge",
+        "description": "跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。\n\n**为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处\n依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`\n的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、\n前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力\n并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。\n\n三件事刻意不做，每一条都有具体后果：\n\n  - **不要求同父**。连到另一条 subtree 上正是\"汇合\"的定义；加一条\"必须\n    同父\"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。\n  - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有\n    \"最长环 ≤ `MAX_EDGE_CYCLE_NODES`\"，而且是 warn。\n  - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），\n    边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的\n    位置就没了——这是\"树 + 边\"能成立的前提之一。"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1220,6 +1279,13 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
           }
         },
         "additionalProperties": false,
@@ -1269,6 +1335,13 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
           }
         },
         "additionalProperties": false,

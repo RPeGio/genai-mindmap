@@ -30,6 +30,43 @@ MAX_TREE_DEPTH = 8
 # 再多的画布也读不清——那时用户要的其实是子节点，不是连线。
 MAX_RELATIONS = 200
 
+# 附加边（`MindMapContent.edges`）的条数上限。200 与 `MAX_RELATIONS` 同口径：
+# 一张 1000 节点的图里"跨父子节点的附加关系"超过 200 条时，画布已经读不清了——
+# 那时用户要的其实是节点，不是连线。
+#
+# 与 `relations` 的差别只有一处，但那处很重要：**这是 warn 口径，不是硬边界**。
+# relations 超过 200 由 `Field(max_length=...)` 直接拒；edges 超过 200 只报
+# `EDGE_LIMIT`（见 `app/mindmaps/edges.py`），图照常能存、能画。理由是 flow
+# 图里边的数量天然随分支数增长，为了几条多出来的连线把整张图判失败，代价方向
+# 完全错了。硬边界在下面的 `MAX_EDGES_LIMIT`，它只挡真正会让传输/渲染出问题
+# 的量级。
+MAX_EDGES = 200
+
+# `edges` 的承载硬边界 = 10 × 产品口径。它挡的是"一份 JSON 里塞十万条边"这种
+# 滥用，不是"这张图画得有点密"。两个数分开，等于把"该告警"和"不能接受"分开。
+MAX_EDGES_LIMIT = MAX_EDGES * 10
+
+# 边上的文字上限。边上只该放一个词或一小句（"是" / "否" / "通过" / "驳回"），
+# 40 字够写「驳回：材料不全，退回补正」。再长的内容属于节点详情（`detail`）。
+MAX_EDGE_LABEL_CHARS = 40
+
+# 最长环的节点数。流程图里的环是**回退/返工**，一屏能看懂的回路不超过十来个
+# 节点；再长的环在画布上会绕成一团，用户看不出从哪里回到哪里。超了报
+# `EDGE_CYCLE_TOO_LONG`（warn），不硬拒——把已经画出来的图整张判失败，代价
+# 远大于"这个环有点长"这件事本身。
+MAX_EDGE_CYCLE_NODES = 12
+
+# 边的语义类型。三个值对应三种画法（前端的自定义边组件按它换样式）：
+#   - `flow`：主干上的顺序跳转（默认，画实线箭头）
+#   - `branch`：判断节点的条件出口（"是"/"否"两种去向，换色）
+#   - `loop`：回退（虚线 + 箭头，一眼看出"流程往回走"）
+#
+# 为什么是 `Literal` 而不是自由字符串：颜色/线型要按它选，而自由字符串的意思
+# 是"每一个没见过的值都渲染成默认样式"——那三个值就白定义了。模型写错时契约层
+# 会拒，模型能照着错误信息改对；渲染层则永远只处理这三支。
+EDGE_KINDS = ("flow", "branch", "loop")
+EdgeKind = Literal["flow", "branch", "loop"]
+
 # 节点标题（`label`）的**契约上限**= 200。这是给旧图留的读取口径：库里那些
 # 一句话当标题的记录（实测 20–30 字，最长的一批贴着 200）必须照常打得开。
 MAX_NODE_LABEL_CHARS = 200
@@ -236,6 +273,44 @@ class LayoutKind(str, Enum):
     manual = "manual"      # 用户拖拽后进入，pos 生效
 
 
+class Edge(BaseModel):
+    """跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。
+
+    **为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处
+    依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`
+    的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、
+    前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力
+    并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。
+
+    三件事刻意不做，每一条都有具体后果：
+
+      - **不要求同父**。连到另一条 subtree 上正是"汇合"的定义；加一条"必须
+        同父"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。
+      - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有
+        "最长环 ≤ `MAX_EDGE_CYCLE_NODES`"，而且是 warn。
+      - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），
+        边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的
+        位置就没了——这是"树 + 边"能成立的前提之一。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=100)
+    source: str = Field(min_length=1, max_length=100)
+    target: str = Field(min_length=1, max_length=100)
+    # 边上的文字：「是」/「否」/「通过」/「驳回」。`None` 是"这条边没有文字"，
+    # 不是空串——空串会让前端多一个"有标签但画出来什么都没有"的分支。
+    label: str | None = Field(default=None, max_length=MAX_EDGE_LABEL_CHARS)
+    # 语义类型，决定画法（见 `EDGE_KINDS`）。`None` 等于 `flow`：多数边就是普通
+    # 的顺序箭头，逼调用方为每一条都声明 kind 只会得到一堆 `flow`。
+    kind: EdgeKind | None = None
+
+    @field_validator("label")
+    @classmethod
+    def blank_label_as_none(cls, value: str | None) -> str | None:
+        """纯空白的标签等于没有标签（与 `Node.note` / `Node.detail` 同一条规矩）。"""
+        return value if value and value.strip() else None
+
+
 class Node(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=100)
@@ -325,6 +400,11 @@ class MindMapContent(BaseModel):
     theme: Theme = Field(default_factory=Theme)
     relations: list[Relation] = Field(default_factory=list, max_length=MAX_RELATIONS)
     source_usage: list[SourceUsage] = Field(default_factory=list, max_length=50)
+    # 跨父子节点的附加边。**默认空列表**，旧图缺这个键时 Pydantic 直接补一个空
+    # 列表——这就是"旧图零迁移"的全部实现，不需要改库、不需要停机、不需要
+    # `schema_version` 升级（树 + 边的**树**那一半形状没变，读完写回时多出来的
+    # `edges: []` 是无害的默认值）。
+    edges: list[Edge] = Field(default_factory=list)
 
     @field_validator("title")
     @classmethod
@@ -333,6 +413,30 @@ class MindMapContent(BaseModel):
         if not text:
             raise ValueError("导图标题不能为空")
         return text
+
+    @field_validator("edges")
+    @classmethod
+    def dedupe_edges(cls, value: list[Edge]) -> list[Edge]:
+        """按 `(source, target, label)` 去重，**保留第一条**。
+
+        为什么去重键里有 `label`：判断节点的两个出口指向同一个目标是完全正常的
+        流程（"是"和"否"都回到主流程），把它们当成重复边删掉，图上就少了一条
+        分支说明。反过来，两个端点与文字都一样的边没有任何表达差异，留着只会让
+        画布上叠一条看不出来的重线。
+
+        为什么是"去重"而不是"报错"：重复边是**幂等**输入——模型重试一次、用户
+        点两次"连线"都会产生它，而它不改变图的意思。为一条信息量为零的边让整张
+        图 422，代价方向错了。真正需要硬拒的是 dangling 与自环（见 `validate_tree`）。
+        """
+        unique: list[Edge] = []
+        seen: set[tuple[str, str, str | None]] = set()
+        for edge in value:
+            key = (edge.source, edge.target, edge.label)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(edge)
+        return unique
 
     @model_validator(mode="after")
     def validate_tree(self) -> MindMapContent:
@@ -382,11 +486,36 @@ class MindMapContent(BaseModel):
             if key in relation_keys:
                 raise ValueError("同一对节点之间的同类关系不能重复添加")
             relation_keys.add(key)
+
+        if len(self.edges) > MAX_EDGES_LIMIT:
+            raise ValueError(f"附加边最多 {MAX_EDGES_LIMIT} 条")
+        edge_ids: set[str] = set()
+        for edge in self.edges:
+            if edge.id in edge_ids:
+                raise ValueError(f"边 ID 必须唯一，重复的是 {edge.id}")
+            edge_ids.add(edge.id)
+            # dangling 在这里**硬拒**，与 EDGE_LIMIT / EDGE_CYCLE_TOO_LONG 那两个
+            # 只报 warn 的码不同。理由不是严格，是渲染：前端按 id 找节点算端点，
+            # 找不到就是一条 `source: undefined` 的边，Vue Flow 会抛错而不是跳过，
+            # 整张画布白屏。所以"指向不存在的节点"永远不能进到落库/渲染的图里；
+            # 生成路径会在构造之前先把这种边滤掉并报 `EDGE_DANGLING`（见
+            # `app/mindmaps/edges.py::clean_edges`），两条路都不让脏边活下来。
+            if edge.source not in seen:
+                raise ValueError(f"边 {edge.id} 的起点节点 {edge.source} 不在导图中")
+            if edge.target not in seen:
+                raise ValueError(f"边 {edge.id} 的终点节点 {edge.target} 不在导图中")
+            # 自环画不出来——它只会渲染成一个点，用户看不出那里有一条线，
+            # 却会因为"边数 +1"而困惑。而"节点到自己"这件事在图上没有语义。
+            if edge.source == edge.target:
+                raise ValueError(f"边 {edge.id} 的起点与终点不能是同一个节点（自环无法绘制）")
         return self
 
 
 # v1 记录里缺的字段。只补顶层：Node 的新字段由 Pydantic 默认值补齐，不需要
 # 递归改写——那会让"迁移"变成"重写整棵树"，一旦某个字段语义变过就再难回头。
+#
+# `edges` **不在**这张表里：它有字段默认值（`default_factory=list`），旧图缺这个键
+# 时 Pydantic 直接补空列表，不需要迁移脚本改写库里那份 JSON。这就是"旧图零迁移"。
 V1_TO_V2_DEFAULTS: dict[str, object] = {
     "schema_version": 2,
     "layout": LayoutKind.tree.value,

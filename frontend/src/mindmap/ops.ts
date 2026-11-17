@@ -1,21 +1,23 @@
 import type {
+  MindEdge,
   MindMapContent,
   MindMapOp,
   MindNode,
   NodeColor,
   OpBatch,
   SourceRef,
-  SourceUsage,
 } from '../api/types';
 import {
   charLength,
   cloneTree,
+  EDGE_KINDS,
   findNode,
   findParent,
   isNodeColor,
   LIMITS,
   NODE_COLORS,
   removeNode,
+  subtreeIds,
 } from './edits';
 
 /**
@@ -27,7 +29,7 @@ import {
  * 需要契约类型的地方继续从本文件 import 也可以——下面做了 re-export，
  * 现有调用方的路径不用改。
  */
-export type { AddOp, MindMapOp, MoveOp, OpBatch, RemoveOp, UpdateOp } from '../api/types';
+export type { AddEdgeOp, AddOp, MindMapOp, MoveOp, OpBatch, RemoveEdgeOp, RemoveOp, UpdateOp } from '../api/types';
 
 /** 单个 op 失败。`path` 形如 `ops.2.id`，会作为工具结果回给模型。 */
 export class OpError extends Error {
@@ -120,7 +122,9 @@ function insertChildAt(root: MindNode, parentId: string, index: number, child: M
  * 失败一律抛 `tree_invalid` + path `ops`：没有任何一条 op 能单独定位到问题，
  * 硬塞一个下标只会误导模型去改一条本来正确的 op。
  */
-function assertTreeValid(root: MindNode, sourceUsage: SourceUsage[]): void {
+function assertTreeValid(content: MindMapContent): void {
+  const root = content.root;
+  const sourceUsage = content.source_usage ?? [];
   const invalid = (message: string): never => {
     throw new OpError('tree_invalid', 'ops', message);
   };
@@ -177,6 +181,21 @@ function assertTreeValid(root: MindNode, sourceUsage: SourceUsage[]): void {
     }
 
     for (const child of node.children) stack.push({ node: child, depth: depth + 1 });
+  }
+
+  // 附加边：只拦后端会硬拒的那两种（dangling / 自环），与契约
+  // `MindMapContent.validate_tree` 同口径。条数与环长不拦——它们在后端是 warn，
+  // 前端拦下来会让一张 250 条边的旧图再也存不回去。
+  const edgeIds = new Set<string>();
+  for (const edge of content.edges ?? []) {
+    if (edgeIds.has(edge.id)) invalid(`边 ID 必须唯一，重复的是 ${edge.id}`);
+    edgeIds.add(edge.id);
+    if (!seen.has(edge.source)) invalid(`边 ${edge.id} 的起点节点 ${edge.source} 不在导图中`);
+    if (!seen.has(edge.target)) invalid(`边 ${edge.id} 的终点节点 ${edge.target} 不在导图中`);
+    if (edge.source === edge.target) invalid(`边 ${edge.id} 的起点与终点不能是同一个节点`);
+    if (charLength(edge.label ?? '') > LIMITS.edgeLabel) {
+      invalid(`边 ${edge.id} 的文字超过 ${LIMITS.edgeLabel} 个字`);
+    }
   }
 }
 
@@ -308,11 +327,86 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         if (op.id === next.root.id) {
           throw new OpError('cannot_remove_root', path('id'), '根节点不能删除');
         }
-        if (!findNode(next.root, op.id)) {
+        const doomed = findNode(next.root, op.id);
+        if (!doomed) {
           throw new OpError('node_not_found', path('id'), `节点 ${op.id} 不存在`);
         }
         next.root = removeNode(next.root, op.id);
+        // 连带删边（与后端 `_apply_remove` 逐条对齐）：源或目标命中**被删子树**
+        // 的边全部消失。只清被点名那一个节点的话，子孙身上的边会悬空，下一次
+        // 缆校验就报 dangling，而那条报错指的位置与用户做的事隔得很远。
+        const removedIds = subtreeIds(doomed);
+        next.edges = (next.edges ?? []).filter(
+          edge => !removedIds.has(edge.source) && !removedIds.has(edge.target),
+        );
         changed.add(op.id);
+        break;
+      }
+
+      case 'add_edge': {
+        const source = findNode(next.root, op.source);
+        if (!source) {
+          throw new OpError('node_not_found', path('source'), `起点节点 ${op.source} 不存在`);
+        }
+        if (!findNode(next.root, op.target)) {
+          throw new OpError('node_not_found', path('target'), `终点节点 ${op.target} 不存在`);
+        }
+        if (op.source === op.target) {
+          throw new OpError(
+            'self_loop',
+            path('target'),
+            `${op.source} 不能连到自己：自环在画布上只会渲染成一个点`,
+          );
+        }
+        const edges = next.edges ?? [];
+        if (edges.some(edge => edge.id === op.id)) {
+          throw new OpError('duplicate_edge', path('id'), `边 id ${op.id} 已经存在`);
+        }
+        const label = (op.label ?? '').trim() || null;
+        if (edges.some(edge => edge.source === op.source && edge.target === op.target
+          && (edge.label ?? null) === label)) {
+          throw new OpError(
+            'duplicate_edge',
+            path('target'),
+            `${op.source} → ${op.target}${label ? `（${label}）` : ''} 这条边已经存在`,
+          );
+        }
+        if (op.kind != null && !(EDGE_KINDS as readonly string[]).includes(op.kind)) {
+          throw new OpError(
+            'invalid_kind',
+            path('kind'),
+            `边的类型只能是 ${EDGE_KINDS.join('/')} 之一，收到 ${String(op.kind)}`,
+          );
+        }
+        if (edges.length >= LIMITS.edges) {
+          throw new OpError(
+            'too_many_edges',
+            path('id'),
+            `这张图已经有 ${edges.length} 条附加边，达到上限 ${LIMITS.edges} 条`,
+          );
+        }
+        const edge: MindEdge = {
+          id: op.id,
+          source: op.source,
+          target: op.target,
+          label,
+          kind: op.kind ?? null,
+        };
+        next.edges = [...edges, edge];
+        changed.add(op.source);
+        changed.add(op.target);
+        break;
+      }
+
+      case 'remove_edge': {
+        const edges = next.edges ?? [];
+        const hit = edges.find(edge => edge.id === op.id);
+        if (!hit) {
+          throw new OpError('edge_not_found', path('id'), `边 ${op.id} 不存在`);
+        }
+        next.edges = edges.filter(edge => edge.id !== op.id);
+        changed.add(hit.source);
+        changed.add(hit.target);
         break;
       }
 
@@ -370,7 +464,7 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
     }
   });
 
-  assertTreeValid(next.root, next.source_usage ?? []);
+  assertTreeValid(next);
 
   return { content: next, changed_ids: Array.from(changed) };
 }
@@ -405,6 +499,18 @@ export function normalizeOps(
     return fresh;
   };
 
+  /** 边 id 走 `e_` 前缀（与后端 `new_edge_id` 同口径），端点是节点 id 走上面那个。 */
+  const realEdgeIdOf = (id: string): string => {
+    if (!id.startsWith('$')) return id;
+    const cached = idMap.get(id);
+    if (cached !== undefined) return cached;
+    let fresh = `e_${fullRandomId().replace(/-/g, '').slice(0, 32)}`;
+    while (used.has(fresh)) fresh = `e_${fullRandomId().replace(/-/g, '').slice(0, 32)}`;
+    used.add(fresh);
+    idMap.set(id, fresh);
+    return fresh;
+  };
+
   const ops = drafts.map((draft): MindMapOp => {
     switch (draft.op) {
       case 'add':
@@ -416,6 +522,18 @@ export function normalizeOps(
         return { ...draft, id: realIdOf(draft.id) };
       case 'move':
         return { ...draft, id: realIdOf(draft.id), new_parent_id: realIdOf(draft.new_parent_id) };
+      case 'add_edge':
+        // 端点也是临时名：同一批里"先建两个节点、再用它们的 `$` 名连一条边"
+        // 是合法且常用的一种形状（模型一条批次描述整段流程时就会这样写）。
+        return {
+          ...draft,
+          id: realEdgeIdOf(draft.id),
+          source: realIdOf(draft.source),
+          target: realIdOf(draft.target),
+        };
+      case 'remove_edge':
+        // 边 id 可能是刚在**同一条批次**里 add 出来的临时名。
+        return { ...draft, id: realEdgeIdOf(draft.id) };
     }
   });
 

@@ -180,12 +180,16 @@ const DIFF_LIMIT = 8;
 const shownDiff = computed(() => (diff.value ?? []).slice(0, DIFF_LIMIT));
 const hiddenDiff = computed(() => Math.max(0, (diff.value?.length ?? 0) - shownDiff.value.length));
 
-/** 四种改动的中文标签。用徽标而不是句子：一屏能扫完"哪几处被动了"。 */
+/** 六种改动的中文标签。用徽标而不是句子：一屏能扫完"哪几处被动了"。 */
 const DIFF_LABELS: Record<CandidateChange['kind'], string> = {
   added: '新增',
   removed: '删除',
   updated: '修改',
   moved: '移动',
+  // 边单独两个徽标：连线不改层级，"新增"与"新增关系"混在一起时，用户分不清
+  // 清单上这一条是要去看节点内容还是去看流程走向。
+  edge_added: '连关系',
+  edge_removed: '断关系',
 };
 
 /** 颜色也在这里区分一次：删除用玫红，新增用翠绿，其余中性。 */
@@ -194,6 +198,8 @@ const DIFF_CLASS: Record<CandidateChange['kind'], string> = {
   removed: 'bg-rose-100 text-rose-700',
   updated: 'bg-amber-100 text-amber-800',
   moved: 'bg-sky-100 text-sky-700',
+  edge_added: 'bg-indigo-100 text-indigo-700',
+  edge_removed: 'bg-orange-100 text-orange-700',
 };
 
 /**

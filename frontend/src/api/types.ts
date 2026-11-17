@@ -165,7 +165,31 @@ export interface MoveOp {
   index: number;
 }
 
-export type MindMapOp = AddOp | UpdateOp | RemoveOp | MoveOp;
+/**
+ * 连一条附加边（`MindMapContent.edges`）。
+ *
+ * `id` 是**边 id**，不是节点 id：它只要求在边集合里唯一。服务端在规范化阶段
+ * 分配（`e_` 前缀），模型草案里用 `$tmp1` 这类临时名。
+ *
+ * `source` / `target` 必须是已有节点，且**允许成环**（A→B 之后 B→A 就是回退线）。
+ */
+export interface AddEdgeOp {
+  op: 'add_edge';
+  id: string;
+  source: string;
+  target: string;
+  /** 边上的文字（≤40 字）。`null` 表示没有文字。 */
+  label?: string | null;
+  kind?: EdgeKind | null;
+}
+
+/** 删一条附加边。不动节点：删线之后树一个字节都不变。 */
+export interface RemoveEdgeOp {
+  op: 'remove_edge';
+  id: string;
+}
+
+export type MindMapOp = AddOp | UpdateOp | RemoveOp | MoveOp | AddEdgeOp | RemoveEdgeOp;
 
 /** 整批原子生效。 */
 export interface OpBatch {
@@ -190,6 +214,42 @@ export interface MindMapContent {
   theme?: MindMapTheme;
   /** 契约 v2：节点之间的非层级关系。界面不渲染，原样透传保存。 */
   relations?: MindRelation[];
+  /**
+   * 跨父子节点的**附加边**：流程图里的条件跳转、汇合、回退。
+   *
+   * 树仍然是骨架（布局、展开、限额全部由它决定），这个字段只补上树表达不了的
+   * 那一类关系——**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 边**。
+   *
+   * 三个必须记住的性质：
+   *
+   *  - **不参与布局**。节点坐标仍由 `layoutTidy(root)` 算，边只画连线；否则每加
+   *    一条线整个画布都会重排，用户刚记住的位置就没了。
+   *  - **允许环**（A→B→A 就是回退线），也**允许跨子树**（那正是汇合）。
+   *  - **可选、缺省空**：旧图没有这个字段时按空数组处理，全部节点与行为不变。
+   */
+  edges?: MindEdge[];
+}
+
+/**
+ * 边的语义类型。与后端 `mindmap.EDGE_KINDS` 一一对应。
+ *
+ * 三个值各对应一种画法（`canvas/MindEdge.vue`）：`flow` 实线箭头、`branch` 换色、
+ * `loop` 虚线。所以它是联合类型而不是 `string`——拼错一个值在编译期就红，而不是
+ * 等到画出来是一条"看起来像普通箭头"的线才有人发现。
+ */
+export type EdgeKind = 'flow' | 'branch' | 'loop';
+
+/** 与后端 `app/contracts/mindmap.py::Edge` 一致的附加边。 */
+export interface MindEdge {
+  id: string;
+  /** 起点节点 id（必须在树里）。 */
+  source: string;
+  /** 终点节点 id（必须在树里）。 */
+  target: string;
+  /** 边上的文字（≤40 字）："是" / "否" / "通过" / "驳回"。 */
+  label?: string | null;
+  /** 语义类型；`undefined` / `null` 按 `flow` 画。 */
+  kind?: EdgeKind | null;
 }
 
 /** 与 `backend/app/contracts/mindmap.py::LayoutKind` 一致。 */

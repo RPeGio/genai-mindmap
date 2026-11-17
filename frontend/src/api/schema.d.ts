@@ -494,6 +494,38 @@ export interface components {
          * @enum {string}
          */
         DiagnosticLevel: "info" | "warn" | "error";
+        /**
+         * Edge
+         * @description 跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。
+         *
+         *     **为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处
+         *     依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`
+         *     的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、
+         *     前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力
+         *     并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。
+         *
+         *     三件事刻意不做，每一条都有具体后果：
+         *
+         *       - **不要求同父**。连到另一条 subtree 上正是"汇合"的定义；加一条"必须
+         *         同父"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。
+         *       - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有
+         *         "最长环 ≤ `MAX_EDGE_CYCLE_NODES`"，而且是 warn。
+         *       - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），
+         *         边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的
+         *         位置就没了——这是"树 + 边"能成立的前提之一。
+         */
+        Edge: {
+            /** Id */
+            id: string;
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+            /** Label */
+            label?: string | null;
+            /** Kind */
+            kind?: ("flow" | "branch" | "loop") | null;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -547,6 +579,8 @@ export interface components {
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
         };
         /** MindMapContent */
         "MindMapContent-Output": {
@@ -566,6 +600,8 @@ export interface components {
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
         };
         /** Node */
         "Node-Input": {

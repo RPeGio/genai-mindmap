@@ -19,11 +19,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.contracts.source import SourceRef
 from app.contracts.mindmap import (
+    MAX_EDGE_LABEL_CHARS,
     MAX_NODE_DETAIL_CHARS,
     MAX_NODE_ICON_CHARS,
     MAX_NODE_LABEL_CHARS,
     MAX_TREE_NODES,
     NODE_COLORS,
+    EdgeKind,
 )
 
 
@@ -150,7 +152,7 @@ class RemoveOp(_OpBase):
 class MoveOp(_OpBase):
     """把节点（连同子树）挂到另一个父节点下。
 
-    这是四个 op 里唯一能改变拓扑的，也是唯一能造出环的：把 A 移到它自己的
+    这是四个**树** op 里唯一能改变拓扑的，也是唯一能造出环的：把 A 移到它自己的
     子孙下面，树就不再是一棵树。环检测在执行器里，不在这里——契约层拿不到
     整棵树，做不了这个判断。
     """
@@ -161,8 +163,51 @@ class MoveOp(_OpBase):
     index: int = Field(ge=0)
 
 
+class AddEdgeOp(_OpBase):
+    """挂一条附加边（`MindMapContent.edges`）。
+
+    与 `AddOp` 的两处关键差别：
+
+      - **`id` 是边的 id，不是节点的 id**。它只要求在边集合里唯一，与节点 id
+        互不干扰；服务端在规范化阶段分配（`agent/ops.py::new_edge_id`），模型
+        草案里用 `$tmp1` 这类临时名。
+      - **`source` / `target` 必须是已有节点**。这两个字段同样接受 `$` 临时名
+        ——"先在 add 里建两个节点、再用它们的临时 id 连一条边"是一条合法的批次，
+        而且正是批量工具最有用的一种形状。
+
+    `label` / `kind` 的语义与契约里的 `Edge` 完全一致（`kind` 用 `Literal`，
+    不接受自由字符串；`label` ≤ 40 字，纯空白归一成 `None`）。
+    """
+
+    op: Literal["add_edge"]
+    id: str = Field(min_length=1, max_length=100)
+    source: str = Field(min_length=1, max_length=100)
+    target: str = Field(min_length=1, max_length=100)
+    label: str | None = Field(default=None, max_length=MAX_EDGE_LABEL_CHARS)
+    kind: EdgeKind | None = None
+
+    @field_validator("label")
+    @classmethod
+    def blank_label_as_none(cls, value: str | None) -> str | None:
+        """纯空白的标签等于没有标签——与 `mindmap.Edge` 同一条归一。"""
+        return value if value and value.strip() else None
+
+
+class RemoveEdgeOp(_OpBase):
+    """删一条附加边。
+
+    只删边，**不动节点**：边不是结构，删掉它之后树完全不变。这与 `RemoveOp`
+    （级联删子树）是两件不同量级的事，所以分成两个 op 而不是给 `remove` 加一个
+    `edge: true` 开关——那会让"删节点"与"删线"在同一条路径上分叉，而两者的
+    失败语义、返回内容、撤销粒度都不一样。
+    """
+
+    op: Literal["remove_edge"]
+    id: str = Field(min_length=1, max_length=100)
+
+
 MindMapOp = Annotated[
-    Union[AddOp, UpdateOp, RemoveOp, MoveOp],
+    Union[AddOp, UpdateOp, RemoveOp, MoveOp, AddEdgeOp, RemoveEdgeOp],
     Field(discriminator="op"),
 ]
 

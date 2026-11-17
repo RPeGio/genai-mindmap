@@ -11,7 +11,8 @@ import type { SampleMap } from './dev/samples';
 import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
 import { useSourcesStore } from './stores/sources';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
-import { NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
+import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
+import type { EdgeKind } from './api/types';
 
 const store = useMindMapStore();
 const sources = useSourcesStore();
@@ -130,6 +131,70 @@ function commitNoteDraft() {
 function resetNoteDraft() {
   noteDraft.value = store.selectedNode?.node.note ?? '';
 }
+
+// ---- 附加关系（流程图的条件分支 / 汇合 / 回退）--------------------------------
+//
+// 最小可用入口，三条理由让它必须存在：
+//   1. 模型只在 `flowchart` 生成时给边，用户手里一张 `tree` 图永远补不出流程；
+//   2. 模型给的边可能是错的，而"删掉那条画错的回退线"没有别的入口；
+//   3. 边不参与布局，所以增删它不会重排画布——这件事只有在界面上点一次才看得出。
+
+/** 新边连到哪个节点（下拉框的值）。默认空：用户得自己挑，不替他猜。 */
+const edgeTarget = ref('');
+const edgeLabel = ref('');
+const edgeKind = ref<EdgeKind>('branch');
+
+/** 候选目标：当前树里除选中节点之外的所有节点。自环在契约层就是硬拒的，列出来也没用。 */
+const edgeTargets = computed(() => {
+  const current = selected.value?.node.id;
+  return store.flatNodes
+    .filter(entry => entry.node.id !== current)
+    .map(entry => ({ id: entry.node.id, label: entry.node.label.trim(), depth: entry.depth }));
+});
+
+/** 边端点的显示名：`id → 标题`。删边/列边都要它，用户认标题不认 id。 */
+const edgeNodeName = computed(() => {
+  const names = new Map(store.flatNodes.map(entry => [entry.node.id, entry.node.label.trim()]));
+  return (id: string) => names.get(id) ?? id;
+});
+
+/** 选中节点相关的边，拼成"谁 → 谁（标签）"给列表用。 */
+const selectedEdgeRows = computed(() => store.selectedEdges.map(edge => ({
+  id: edge.id,
+  text: `${edgeNodeName.value(edge.source)} → ${edgeNodeName.value(edge.target)}`,
+  label: edge.label ?? '',
+  kind: edge.kind ?? 'flow',
+})));
+
+const edgeHint = computed(() => {
+  if (!selected.value) return '';
+  if (!store.content) return '先生成或打开一张导图。';
+  if (store.busy) return '正在生成，完成之后才能加关系。';
+  if (store.contentEdges.length >= 200) return '附加关系已到上限（200 条），请先删掉一些。';
+  if (!edgeTarget.value) return '选一个终点节点，再点「连一条关系」。';
+  return '关系只画连线，不会改变节点位置。';
+});
+
+function connectEdge() {
+  const source = selected.value?.node.id;
+  const target = edgeTarget.value;
+  if (!source || !target) return;
+  if (store.connectNodes(source, target, edgeLabel.value, edgeKind.value)) {
+    edgeLabel.value = '';
+    edgeTarget.value = '';
+  }
+}
+
+function disconnectEdge(edgeId: string) {
+  store.deleteEdge(edgeId);
+}
+
+// 换选中节点时清掉上一轮的目标：留着它会让"给甲连到乙"在切到丙之后变成
+// "给丙连到乙"，而用户以为自己点的还是甲。
+watch(() => selected.value?.node.id ?? null, () => {
+  edgeTarget.value = '';
+  edgeLabel.value = '';
+});
 
 /**
  * 「展开这一支」按钮的状态。
@@ -710,6 +775,84 @@ async function copyBody() {
           <p v-else class="border-t border-slate-200 pt-3 text-xs text-slate-400">
             这个节点没有来源引用。
           </p>
+
+          <!--
+            附加关系（流程图的条件分支 / 汇合 / 回退）。
+
+            这一段是**唯一**的手工补边入口：模型只在 flowchart 生成时给边，
+            而它给错的那些（比如画到了错的出口、或者本该是顺序却标成了回退）
+            没有别的地方能改。删边同样在这里——画布上点线不做选中，因为节点
+            已经有选中态了，两套选中语义混在一起会让「Delete 删什么」变得不可预测。
+          -->
+          <section class="flex flex-col gap-2 border-t border-slate-200 pt-3" aria-label="附加关系">
+            <h3 class="text-xs font-medium text-slate-500">
+              附加关系（{{ selectedEdgeRows.length }}）
+            </h3>
+            <ul v-if="selectedEdgeRows.length" class="flex flex-col gap-1">
+              <li
+                v-for="row in selectedEdgeRows"
+                :key="row.id"
+                class="flex items-center gap-2 rounded-md border border-slate-200 px-2 py-1"
+                :class="row.kind === 'loop' ? 'border-amber-200 bg-amber-50' : ''"
+              >
+                <span class="min-w-0 flex-1 truncate text-xs text-slate-700" :title="row.text">
+                  {{ row.text }}
+                  <span v-if="row.label" class="text-slate-500">（{{ row.label }}）</span>
+                </span>
+                <button
+                  type="button"
+                  class="shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                  :title="`删除这条关系（${row.id}）`"
+                  @click="disconnectEdge(row.id)"
+                >
+                  删除
+                </button>
+              </li>
+            </ul>
+            <p v-else class="text-xs text-slate-400">
+              这个节点没有附加关系。流程图里的条件分支与回退线都记在这里。
+            </p>
+
+            <div class="flex items-center gap-1">
+              <select
+                v-model="edgeTarget"
+                aria-label="关系终点"
+                class="min-w-0 flex-1 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700"
+              >
+                <option value="">连到哪个节点…</option>
+                <option v-for="item in edgeTargets" :key="item.id" :value="item.id">
+                  {{ '·'.repeat(item.depth) }} {{ item.label }}
+                </option>
+              </select>
+              <select
+                v-model="edgeKind"
+                aria-label="关系类型"
+                class="w-24 shrink-0 rounded-md border border-slate-300 bg-white px-1 py-1.5 text-xs text-slate-700"
+              >
+                <option v-for="kind in EDGE_KINDS" :key="kind" :value="kind">
+                  {{ EDGE_KIND_LABELS[kind] }}
+                </option>
+              </select>
+            </div>
+            <div class="flex items-center gap-1">
+              <input
+                v-model="edgeLabel"
+                aria-label="关系说明"
+                class="min-w-0 flex-1 rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-700"
+                :maxlength="40"
+                placeholder="边上的文字：是 / 否 / 驳回"
+              />
+              <button
+                type="button"
+                class="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                :disabled="!edgeTarget || store.busy"
+                @click="connectEdge"
+              >
+                连一条关系
+              </button>
+            </div>
+            <p class="text-[11px] leading-relaxed text-slate-400">{{ edgeHint }}</p>
+          </section>
           <div class="grid grid-cols-2 gap-2">
             <button
               type="button"

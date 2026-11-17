@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunResolved, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
+import type { AgentEvent, AgentRunRequest, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
@@ -11,16 +11,20 @@ import { sourceInputError } from '../sources/input';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
+  addEdge as addEdgeToContent,
   addSibling,
   charLength,
   countNodes,
+  edgesOf,
   findNode,
   findParent,
   LIMITS,
+  removeEdge as removeEdgeFromContent,
   removeNode,
   renameNode,
   setNodeNote,
   setNodeVisual,
+  subtreeIds,
   validateDraft,
 } from '../mindmap/edits';
 
@@ -87,10 +91,19 @@ export function bodySource(node: MindNode): BodySource {
  * 用户面对「候选已就绪」只能盲点「应用」——他不知道 agent 动了哪几个节点、动了什么。
  */
 export interface CandidateChange {
-  kind: 'added' | 'removed' | 'updated' | 'moved';
-  /** 节点 id。新增的节点在画布上还不存在，`locate` 会静默忽略它。 */
+  /**
+   * 改动种类。前四种是**节点**：`added` / `removed` / `updated` / `moved`；
+   * 后两种是**附加边**（`edge_added` / `edge_removed`）。
+   *
+   * 边单独两种而不是复用 `added` / `removed`：`id` 的语义不同（边 id vs 节点 id），
+   * 而清单上要能一眼分清"这张图多了几个节点"与"多了几条连线"——前者是要看内容
+   * 的地方，后者是要看流程走向的地方。混在一起时，一条"新增关系"会被读成
+   * "新增节点"，用户点它跳不到任何地方。
+   */
+  kind: 'added' | 'removed' | 'updated' | 'moved' | 'edge_added' | 'edge_removed';
+  /** 节点 id（前四种）或边 id（后两种）。 */
   id: string;
-  /** 显示用标题：更新/移动取**新**标题，删除取原标题。 */
+  /** 显示用标题：更新/移动取**新**标题，删除取原标题。边则显示「A → B（是）」。 */
   label: string;
   /** 一句话说明改了什么（"标题 → 新标题"、"颜色 blue→red"、"移到「甲」下"）。 */
   detail: string;
@@ -176,6 +189,57 @@ export function diffCandidate(base: MindNode | null, next: MindNode): CandidateC
 }
 
 /**
+ * 两份**边集合**之间的差异（附加关系：条件分支 / 汇合 / 回退）。
+ *
+ * 与 `diffCandidate`（对比两份树）并列而不是合并进去：树对比走的是"前序遍历 +
+ * 父 id"，边对比走的是"按 id 对齐的集合差"，两种算法的输入形状不同，硬塞进一个
+ * 函数只会让两边都长出分支。调用方（`candidateDiff`）把两份结果拼起来。
+ *
+ * `nameOf` 把节点 id 换成标题：清单上写「形式审查 → 付款（是）」比写两个 32 位
+ * hex 有用得多，而边本身只有 id。
+ *
+ * `kind` 不同的同 id 边按"改过"上报（`edge_added`），不新增第三种 kind：画布上
+ * 它就是同一条线换了画法，用户要看的也是"这条线变了"。
+ */
+export function diffEdges(
+  base: readonly MindEdge[],
+  next: readonly MindEdge[],
+  nameOf: (id: string) => string,
+): CandidateChange[] {
+  const describe = (edge: MindEdge): string => {
+    const text = `${nameOf(edge.source)} → ${nameOf(edge.target)}`;
+    return edge.label ? `${text}（${edge.label}）` : text;
+  };
+  const before = new Map(base.map(edge => [edge.id, edge]));
+  const changes: CandidateChange[] = [];
+
+  for (const edge of next) {
+    const old = before.get(edge.id);
+    if (!old) {
+      changes.push({
+        kind: 'edge_added', id: edge.id, label: describe(edge),
+        detail: edge.kind === 'loop' ? '新增回退线' : edge.kind === 'branch' ? '新增条件分支' : '新增连线',
+      });
+      continue;
+    }
+    if ((old.label ?? null) !== (edge.label ?? null) || (old.kind ?? null) !== (edge.kind ?? null)) {
+      changes.push({
+        kind: 'edge_added', id: edge.id, label: describe(edge),
+        detail: `关系说明改为「${edge.label ?? edge.kind ?? '无'}」`,
+      });
+    }
+  }
+  for (const [id, edge] of before) {
+    if (!next.some(item => item.id === id)) {
+      changes.push({
+        kind: 'edge_removed', id, label: describe(edge), detail: '删除了一条附加关系',
+      });
+    }
+  }
+  return changes;
+}
+
+/**
  * agent 工具名 → 用户读得懂的说法。
  *
  * 映射只此一份：面板（要带耗时）与状态行（不带）都从这里取。两处各写一份的话，
@@ -192,6 +256,10 @@ const AGENT_TOOL_LABELS: Record<string, { running: string; done: string }> = {
   update_node: { running: '正在改节点', done: '已改节点' },
   remove_node: { running: '正在删节点', done: '已删节点' },
   move_node: { running: '正在移动节点', done: '已移动节点' },
+  // 两条边工具。文案要让人看出"它在连线"，而不是"它在改结构"——连线不改层级，
+  // 用户盯着画布时看到的是"多了一个箭头"，不是"某个节点换了位置"。
+  add_edge: { running: '正在连关系', done: '已连关系' },
+  remove_edge: { running: '正在删关系', done: '已删关系' },
 };
 
 /**
@@ -394,6 +462,13 @@ interface RenderSource {
   kind: RenderKind;
   /** 预览节点的可展开性（派生 id → expandable）；非预览时是空表。 */
   expandable: Map<string, boolean | null>;
+  /**
+   * 附加边。**只画不参与布局**：节点坐标仍然由 `layoutTidy(root)` 决定。
+   *
+   * 这是"树 + 边"能成立的前提之一——边要是参与布局，用户每连一条线，整张画布
+   * 都会重排，他刚记住的位置就没了。预览（生成中）没有边，是空数组。
+   */
+  edges: MindEdge[];
 }
 
 /** 共用的空表：非预览来源不需要这份映射，别每次重算都新建一个。 */
@@ -950,15 +1025,21 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const renderSource = computed<RenderSource | null>(() => {
     if (content.value) {
-      return { root: content.value.root, kind: 'content', expandable: NO_EXPANDABLE };
+      return {
+        root: content.value.root, kind: 'content', expandable: NO_EXPANDABLE,
+        edges: edgesOf(content.value),
+      };
     }
     if (candidate.value) {
-      return { root: candidate.value.root, kind: 'candidate', expandable: NO_EXPANDABLE };
+      return {
+        root: candidate.value.root, kind: 'candidate', expandable: NO_EXPANDABLE,
+        edges: edgesOf(candidate.value),
+      };
     }
     if (agentPreview.value) {
       const expandable = new Map<string, boolean | null>();
       const root = previewSubtree(agentPreview.value, [], expandable);
-      return { root, kind: 'preview', expandable };
+      return { root, kind: 'preview', expandable, edges: [] };
     }
     return null;
   });
@@ -971,6 +1052,61 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const flatNodes = computed<FlatNode[]>(() => {
     const source = renderSource.value;
     return source ? flatten(source.root) : [];
+  });
+
+  /**
+   * 附加边在画布上的几何信息：用哪两个句柄。
+   *
+   * 附件的两端往往**不是父子**（汇合、回退跨越两个 subtree），所以不能像父子线
+   * 那样只按 depth 猜方向，只能看两者的实际坐标：`childSide(from, to, direction)`
+   * 给出的就是"从 from 看 to 在哪一侧"，接线端点即可。
+   *
+   * 端点找不到（不该发生：契约层硬拒 dangling，这里只是兜底）就跳过这条边，
+   * 而不是画一条 `source: undefined` 的线——Vue Flow 会因此抛错，整张画布白屏。
+   */
+  const attachEdges = computed(() => {
+    const current = layout.value;
+    const source = renderSource.value;
+    if (!current || !source) return [];
+
+    const out: Array<{ edge: MindEdge; side: ChildSide; targetSide: ChildSide }> = [];
+    for (const edge of source.edges) {
+      const from = current.positions.get(edge.source);
+      const to = current.positions.get(edge.target);
+      if (!from || !to) continue;
+      const side = childSide(from, to, direction.value);
+      // 与父子线同一套端点约定（见 `edges` 里 targetHandle 那一行）：从哪一侧出去，
+      // 就从对面那侧进来。
+      const targetSide: ChildSide = side === 'left' ? 'right' : side === 'right' ? 'left' : 'top';
+      out.push({ edge, side, targetSide });
+    }
+    return out;
+  });
+
+  /**
+   * 每个节点要为附加边多开哪几个句柄。
+   *
+   * `MindNode.vue` 只渲染 `data.in` / `data.out` 里列出的句柄，而那两个数组原本只
+   * 按**父子线**算。一条从叶子指向远处的回退线，源节点根本没有子节点、也就没有
+   * 任何 `out-*` 句柄——Vue Flow 找不到句柄时线会从头节点中心乱连（或干脆不画），
+   * 而报错只出现在浏览器控制台。
+   */
+  const edgeSideIndex = computed(() => {
+    const index = new Map<string, { out: ChildSide[]; in: ChildSide[] }>();
+    const ensure = (id: string) => {
+      const hit = index.get(id);
+      if (hit) return hit;
+      const fresh = { out: [] as ChildSide[], in: [] as ChildSide[] };
+      index.set(id, fresh);
+      return fresh;
+    };
+    for (const { edge, side, targetSide } of attachEdges.value) {
+      const from = ensure(edge.source);
+      if (!from.out.includes(side)) from.out.push(side);
+      const to = ensure(edge.target);
+      if (!to.in.includes(targetSide)) to.in.push(targetSide);
+    }
+    return index;
   });
 
   const nodes = computed<MindFlowNode[]>(() => {
@@ -1001,6 +1137,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
       if (parentPoint) {
         const side = childSide(parentPoint, point, direction.value);
         inSides.push(side === 'left' ? 'right' : side === 'right' ? 'left' : 'top');
+      }
+
+      // 附加边也要句柄（理由见 `edgeSideIndex`）。并进来而不是替换：一个节点
+      // 可以同时有父子线和回退线，两侧的句柄都要在。
+      const extra = edgeSideIndex.value.get(node.id);
+      if (extra) {
+        for (const side of extra.out) if (!outSides.includes(side)) outSides.push(side);
+        for (const side of extra.in) if (!inSides.includes(side)) inSides.push(side);
       }
 
       return {
@@ -1062,6 +1206,30 @@ export const useMindMapStore = defineStore('mindmap', () => {
         type: 'smoothstep',
       });
     }
+
+    // 附加边（汇合 / 回退 / 条件跳转）。用自定义类型 `mindEdge`：它要画标签、
+    // 按 kind 换颜色/线型，而内置的 smoothstep 做不到（见 `canvas/MindEdge.vue`）。
+    //
+    // 与父子线不同的两点，都在这里定死：
+    //   - 用 `data` 传 label/kind，而不是 Vue Flow 的 `label` 字段：那个会被渲染成
+    //     一个默认标签块，样式没法跟着 kind 变。
+    //   - id 前缀 `attach:`，避免与 `${parentId}->${node.id}` 这种父子线 id 撞车
+    //     （两个节点之间可以同时存在父子线与一条回退线，id 撞了只会剩一条）。
+    for (const { edge, side, targetSide } of attachEdges.value) {
+      out.push({
+        id: `attach:${edge.id}`,
+        source: edge.source,
+        sourceHandle: `out-${side}`,
+        target: edge.target,
+        targetHandle: `in-${targetSide}`,
+        type: 'mindEdge',
+        data: {
+          label: edge.label ?? undefined,
+          kind: edge.kind ?? 'flow',
+          edgeId: edge.id,
+        },
+      });
+    }
     return out;
   });
 
@@ -1083,6 +1251,28 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const selectedRefs = computed<SourceRef[]>(() => selectedNode.value?.node.source_refs ?? []);
 
   /**
+   * 已应用内容里的**全部**附加边。
+   *
+   * 只读 `content` 而不是 `renderSource`：侧栏的「附加关系」区块要能删边、要能
+   * 显示"这条线的端点是谁"，而候选/预览里的边在用户点「应用」之前并不是他的作品。
+   * 画布那条路（`edges` computed）才跟着 `renderSource` 走。
+   */
+  const contentEdges = computed<MindEdge[]>(() => edgesOf(content.value));
+
+  /**
+   * 与当前选中节点相关的边（源或目标命中它）。
+   *
+   * 侧栏只用这一份而不是全量：一张流程图可能有几十条线，全列出来用户得自己在
+   * 里面找"这条跟选中的节点有关系吗"。而"改这条线 / 删这条线"的操作入口，本来看
+   * 的就是选中节点周围那几条。
+   */
+  const selectedEdges = computed<MindEdge[]>(() => {
+    const id = selectedId.value;
+    if (!id) return [];
+    return contentEdges.value.filter(edge => edge.source === id || edge.target === id);
+  });
+
+  /**
    * 来源的反向索引。
    *
    * 只从 `content` 算：画布上可能正画着候选或预览节点，把它们算进引用统计会让
@@ -1102,7 +1292,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const next = candidate.value;
     if (!next) return null;
     if (candidateIntent === 'create') return null;
-    return diffCandidate(content.value?.root ?? null, next.root);
+    const before = content.value;
+    const nodeChanges = diffCandidate(before?.root ?? null, next.root) ?? [];
+    // 边单独算一份再拼起来（理由见 `diffEdges`）。基线没有树时上面已经返回 null，
+    // 走到这里 `before` 一定存在。
+    const names = new Map(flatNodes.value.map(entry => [entry.node.id, displayTitle(entry.node)]));
+    const nameOf = (id: string) => names.get(id) ?? id;
+    return [
+      ...nodeChanges,
+      ...diffEdges(edgesOf(before), edgesOf(next), nameOf),
+    ];
   });
 
   /**
@@ -1110,11 +1309,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *
    * 新增的节点没有 id 可高亮（它在 `content` 里根本不存在），删除的节点还在
    * `content` 里所以能高亮——那正是"这个节点会消失，你看一眼再决定"。
+   *
+   * `edge_*` 两种改动被排除：它们的 `id` 是**边 id**，与节点 id 是两套命名空间，
+   * 混进来只会让一个随机字符串去"高亮"某个可能同名的节点。
    */
   const changedNodeIds = computed<Set<string>>(() => {
     const diff = candidateDiff.value;
     if (!diff) return new Set<string>();
-    return new Set(diff.filter(item => item.kind !== 'added').map(item => item.id));
+    const nodeKinds = new Set<CandidateChange['kind']>(['removed', 'updated', 'moved']);
+    return new Set(diff.filter(item => nodeKinds.has(item.kind)).map(item => item.id));
   });
 
   /**
@@ -1440,10 +1643,65 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (!findNode(content.value.root, id)) return;
 
     const parent = findParent(content.value.root, id);
-    if (!applyContent({ ...content.value, root: removeNode(content.value.root, id) }, true)) return;
+    // 连带删边：命中**这棵子树**任意节点的边全部消失，与后端 `_apply_remove` 同一
+    // 语义。只清被点名的那一个节点的话，子孙身上的边会悬空，而 dangling 是契约层
+    // 的硬拒——下一次保存就 422，用户却只是"删了一个节点"。
+    const doomed = subtreeIds(findNode(content.value.root, id)!);
+    const keptEdges = edgesOf(content.value).filter(
+      edge => !doomed.has(edge.source) && !doomed.has(edge.target),
+    );
+    const nextContent: MindMapContent = {
+      ...content.value,
+      root: removeNode(content.value.root, id),
+      edges: keptEdges,
+    };
+    if (!applyContent(nextContent, true)) return;
     selectedId.value = parent?.id ?? null;
     editingId.value = null;
     status.value = '已删除该节点及其子节点，可撤销。';
+  }
+
+  /**
+   * 在当前树里连一条**附加关系**（侧栏「连一条关系」的入口）。
+   *
+   * 三件事与 `addEdge`（`edits.ts` 的纯函数）分工，这里只做"界面语义"那部分：
+   *   - **节点必须存在**：面板上的下拉框只会列出真实节点，但 store 是公开 API，
+   *     别处（测试、将来的快捷键）传进来的 id 也要走同一条判据；
+   *   - **自环与重复在 `addEdge` 里抛错**，这里转成 `status` 文案而不是异常：
+   *     用户点错一次不该让整个组件树炸掉；
+   *   - **记一步撤销**：连线是内容修改，凭什么不能 Ctrl+Z。
+   */
+  function connectNodes(
+    source: string, target: string, label?: string | null, kind?: EdgeKind | null,
+  ): boolean {
+    if (!content.value) return false;
+    if (!findNode(content.value.root, source) || !findNode(content.value.root, target)) {
+      status.value = '端点节点不存在';
+      return false;
+    }
+    if (edgesOf(content.value).length >= LIMITS.edges) {
+      status.value = `最多 ${LIMITS.edges} 条附加关系，请先删掉一些`;
+      return false;
+    }
+    let next: MindMapContent;
+    try {
+      next = addEdgeToContent(content.value, source, target, label, kind).content;
+    } catch (error) {
+      status.value = error instanceof Error ? error.message : '这条关系加不上';
+      return false;
+    }
+    if (!applyContent(next, true)) return false;
+    status.value = '已加一条附加关系，记得保存。';
+    return true;
+  }
+
+  /** 删一条附加关系。删线不动结构，所以不检查节点数/层数，也不需要重算布局。 */
+  function deleteEdge(edgeId: string): boolean {
+    if (!content.value) return false;
+    if (!edgesOf(content.value).some(edge => edge.id === edgeId)) return false;
+    if (!applyContent(removeEdgeFromContent(content.value, edgeId), true)) return false;
+    status.value = '已删除这条附加关系，可撤销。';
+    return true;
   }
 
   function undo() {
@@ -2178,6 +2436,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     nodes,
     edges,
     nodeCount,
+    // 附加关系：当前树上的全部边 + 与"选中节点"相关的那几条（侧栏用）。
+    contentEdges,
+    selectedEdges,
+    connectNodes,
+    deleteEdge,
     selectedNode,
     selectedRefs,
     refIndex,

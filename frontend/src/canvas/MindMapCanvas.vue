@@ -5,6 +5,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import { NODE_SIZE } from './layout/tidy';
+import MindEdge from './MindEdge.vue';
 import MindNode from './MindNode.vue';
 
 const store = useMindMapStore();
@@ -135,6 +136,16 @@ onBeforeUnmount(() => {
           @next="label => store.commitAndAddChild(label)"
           @cancel="store.endEdit()"
         />
+      </template>
+      <!--
+        附加边（条件分支 / 汇合 / 回退）。注册成 `edge-mindEdge` 就够——
+        `stores/mindmap` 只给附加边挂 `type: 'mindEdge'`，父子线仍然走内置的
+        smoothstep。两条路分开是刻意的：父子线是布局的一部分（必须跟着 tidy 的
+        句柄走），附加边是叠加语义（要标签、要按 kind 换画法），合成一个组件只会
+        让父子线的渲染被附加边的逻辑拖住。
+      -->
+      <template #edge-mindEdge="edgeProps">
+        <MindEdge v-bind="edgeProps" />
       </template>
     </VueFlow>
 

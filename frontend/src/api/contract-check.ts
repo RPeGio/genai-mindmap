@@ -33,6 +33,7 @@
 import type { components } from './schema';
 import type {
   MapRecord,
+  MindEdge,
   MindMapContent,
   MindMapTheme,
   MindNode,
@@ -68,6 +69,7 @@ export const checks = {
   styleKeys: true satisfies SameKeys<NodeStyle, Schemas['NodeStyle']>,
   positionKeys: true satisfies SameKeys<NodePosition, Schemas['Position']>,
   relationKeys: true satisfies SameKeys<MindRelation, Schemas['Relation']>,
+  edgeKeys: true satisfies SameKeys<MindEdge, Schemas['Edge']>,
   sourceKeys: true satisfies SameKeys<Source, Schemas['Source']>,
   sourceRefKeys: true satisfies SameKeys<SourceRef, Schemas['SourceRef']>,
   sourceSpanKeys: true satisfies SameKeys<SourceSpan, Schemas['SourceSpan']>,
@@ -81,6 +83,7 @@ export const checks = {
   styleShape: true satisfies SameShape<NodeStyle, Schemas['NodeStyle']>,
   positionShape: true satisfies SameShape<NodePosition, Schemas['Position']>,
   relationShape: true satisfies SameShape<MindRelation, Schemas['Relation']>,
+  edgeShape: true satisfies SameShape<MindEdge, Schemas['Edge']>,
   sourceShape: true satisfies SameShape<Source, Schemas['Source']>,
   sourceRefShape: true satisfies SameShape<SourceRef, Schemas['SourceRef']>,
   sourceSpanShape: true satisfies SameShape<SourceSpan, Schemas['SourceSpan']>,
