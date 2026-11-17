@@ -352,16 +352,16 @@ def test_queries_embed_concurrently(monkeypatch):
     calls = _fake_embed(monkeypatch, delay=0.15)
     sources = [_source(BOTH), _source(ONLY_BUDGET)]
 
-    started = time.perf_counter()
     run(search_multi(sources, list(queries), 3))
-    elapsed = time.perf_counter() - started
 
     windows = [c for c in calls if len(c["texts"]) == 1 and c["texts"][0] in queries]
     assert len(windows) == len(queries)
-    # 所有 query 调用的时间窗有公共交集 = 它们真的同时在跑
+    # 所有 query 调用的时间窗有公共交集 = 它们真的同时在跑。窗口是 `_fake_embed`
+    # 自己的 sleep 撑开的，与机器负载无关——这才是"并发"的结构断言。
     assert max(c["start"] for c in windows) < min(c["end"] for c in windows)
-    # 串行至少 3 × 0.15；并发只需要一个 0.15 加上调度开销
-    assert elapsed < 0.15 * 2.2
+    # 这里**不**钉总耗时。原先还有一条 `elapsed < 0.15 * 2.2`：总耗时里含检索、
+    # 线程池启动与线程调度，这些都不归"并发"管，机器一有负载就会偶发失败（全量跑
+    # 里已经上演过一次）；真串行时上面的交集断言必挂，墙钟是多余的第二重假设。
     assert all(c["thread"] != threading.main_thread().name for c in windows)
 
 
