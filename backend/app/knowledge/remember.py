@@ -45,7 +45,9 @@ REMEMBER_BUDGET_SECONDS = 5.0
 # 不该出现在首帧之前的关键路径上。
 PRUNE_TRIGGER_COUNT = 240
 PRUNE_INTERVAL_SECONDS = 3600.0
-_prune_checked_at = 0.0
+# `-inf` 而不是 `0.0`：`time.monotonic()` 的零点不保证早于一小时前（刚开机的机器、
+# 容器里尤其如此），拿 0.0 当"很久以前"，第一次检查可能在启动后一小时内被节流掉。
+_prune_checked_at = float("-inf")
 _prune_lock = threading.Lock()
 
 

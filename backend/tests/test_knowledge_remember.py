@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import sqlite3
 import threading
@@ -199,7 +200,9 @@ def test_switch_only_recognises_zero(monkeypatch, value, expected):
 
 def test_big_library_triggers_a_background_prune(tmp_path, monkeypatch):
     """库明显超过保留上限时，入库顺手触发一次淘汰，但跑在后台线程里。"""
-    monkeypatch.setattr(remember, "_prune_checked_at", 0.0)
+    # 把节流关掉而不是把 `_prune_checked_at` 拨到 0.0：`time.monotonic()` 的零点
+    # 不保证早于一小时前（CI 的机器就是刚开机的），0.0 会被当成"刚刚检查过"。
+    monkeypatch.setattr(remember, "PRUNE_INTERVAL_SECONDS", 0.0)
     monkeypatch.setattr(library, "count", lambda: remember.PRUNE_TRIGGER_COUNT + 1)
     done = threading.Event()
     calls: list[int] = []
@@ -219,14 +222,17 @@ def test_big_library_triggers_a_background_prune(tmp_path, monkeypatch):
 
 def test_small_library_does_not_prune(tmp_path, monkeypatch):
     """没到阈值就不碰库：240 的余量就是为了避免"刚好 201 份就开始删"。"""
-    monkeypatch.setattr(remember, "_prune_checked_at", 0.0)
-    monkeypatch.setattr(library, "count", lambda: remember.PRUNE_TRIGGER_COUNT)
+    monkeypatch.setattr(remember, "PRUNE_INTERVAL_SECONDS", 0.0)
+    counts: list[int] = []
+    monkeypatch.setattr(library, "count", lambda: counts.append(1) or remember.PRUNE_TRIGGER_COUNT)
     calls: list[int] = []
     monkeypatch.setattr(library, "prune", lambda **kwargs: calls.append(1) or 0)
 
     remember.remember_sources([_source("正文。")])
 
     time.sleep(0.05)  # 真起了线程的话，这点时间足够它跑到 prune
+    # 查过了条数（真的走到阈值判断），只是没到阈值，所以不淘汰。
+    assert counts == [1]
     assert calls == []
 
 
@@ -243,9 +249,30 @@ def test_prune_check_is_throttled_per_interval(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_first_check_survives_a_small_monotonic_clock(monkeypatch):
+    """进程起来后的第一次检查必须放行，哪怕 `monotonic()` 才走到 30 秒。
+
+    `time.monotonic()` 的零点不是系统启动时间：刚开机的 CI/容器上它可能只有几十
+    秒。初值若写成 `0.0`，`now - 0.0 < 3600` 成立，进程起来后第一个小时的入库都
+    不会查条数——库里堆到 240 份以上也照旧不淘汰。这条用例把初值与时钟一起钉住。
+    """
+    importlib.reload(remember)  # 回到模块初值（前面的用例改过 `_prune_checked_at`）
+    assert remember._prune_checked_at == float("-inf")
+
+    monkeypatch.setattr(remember.time, "monotonic", lambda: 30.0)
+    counts: list[int] = []
+    monkeypatch.setattr(library, "count",
+                        lambda: counts.append(1) or remember.PRUNE_TRIGGER_COUNT)
+    monkeypatch.setattr(library, "prune", lambda **kwargs: 0)
+
+    remember._maybe_prune()
+
+    assert counts == [1]
+
+
 def test_count_failure_does_not_affect_ingest(tmp_path, monkeypatch, caplog):
     """淘汰前的条数都读不到，入库本身仍必须成功、也不许抛。"""
-    monkeypatch.setattr(remember, "_prune_checked_at", 0.0)
+    monkeypatch.setattr(remember, "PRUNE_INTERVAL_SECONDS", 0.0)
 
     def boom() -> int:
         raise sqlite3.OperationalError("no such table: library_sources")
