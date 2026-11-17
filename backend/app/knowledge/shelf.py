@@ -77,6 +77,14 @@ class SourceNotFound(LookupError):
     """库里没有这个 id。路由层翻成 404，与"导图不存在"同一套措辞。"""
 
 
+class LibraryUnavailable(RuntimeError):
+    """库本身读不出来（表被删、文件被锁），**不是**"没有这份材料"。
+
+    两者必须分开：404 告诉用户"这份材料没了，重试也没用"，503 才是"稍后再看"。
+    混成 404 会让人以为材料被删了，而这恰恰是排查时最误导的一条反馈。
+    """
+
+
 def _cited_counts() -> dict[str, int]:
     """每个持久 source_id 被几张**已保存导图**引用。
 
@@ -156,7 +164,7 @@ def list_entries(*, limit: int = DEFAULT_LIMIT) -> LibraryList:
 
 
 def read_entry(source_id: str) -> LibrarySource:
-    """单份来源的正文预览。不存在抛 `SourceNotFound`。
+    """单份来源的正文预览。不存在抛 `SourceNotFound`，库读不出来抛 `LibraryUnavailable`。
 
     `truncated` / `total_chars` 两个字段是给界面的：只截了前 4000 字就必须说清，
     否则用户会拿预览当全文，回头在导图里引用一句"材料里其实没有"的话。
@@ -164,9 +172,9 @@ def read_entry(source_id: str) -> LibrarySource:
     try:
         source = knowledge_library.load(source_id)
     except (sqlite3.Error, OSError) as exc:
-        logger.warning("读不到知识库（%s），按未找到处理：%s",
+        logger.warning("读不到知识库（%s），预览按不可用处理：%s",
                        type(exc).__name__, str(exc)[:160])
-        raise SourceNotFound(source_id) from exc
+        raise LibraryUnavailable(source_id) from exc
     if source is None:
         raise SourceNotFound(source_id)
 
@@ -189,6 +197,7 @@ __all__ = [
     "LibraryEntry",
     "LibraryList",
     "LibrarySource",
+    "LibraryUnavailable",
     "SourceNotFound",
     "list_entries",
     "read_entry",

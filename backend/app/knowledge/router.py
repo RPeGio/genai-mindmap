@@ -44,7 +44,14 @@ def read_library_source(source_id: str):
     """单份材料的正文预览（前 4000 字，`truncated` 说明是否截断）。"""
     # 这里用 AppError 而不是 HTTPException：后者会被全局处理器兜成"请求处理失败
     # （HTTP 404）"，前端读顶层 message，用户看到的就是那句没信息量的话。
+    #
+    # 404 与 503 必须分开：前者是"这份材料没了，重试也没用"，后者是"库暂时读不
+    # 出来，稍后再看"。把库故障说成 404，用户会以为材料被删了。
     try:
         return shelf.read_entry(source_id)
     except shelf.SourceNotFound as error:
         raise AppError("not_found", "这份来源不在知识库里", status=404) from error
+    except shelf.LibraryUnavailable as error:
+        raise AppError(
+            "library_unavailable", "知识库暂时读不出来，请稍后重试", status=503,
+        ) from error

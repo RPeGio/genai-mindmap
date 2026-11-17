@@ -12,7 +12,9 @@
    `total_chars` 要报全文长度；否则用户会拿前 4000 字当全文。
 4. **库坏了不等于入口挂了**。库读不出来时列表返回空 + `total=0`，不抛 500；
    导图表里有一行坏 JSON 时该行跳过、`cited_by` 按 0 计，列表照常返回——
-   这条路上"库坏了"的正确表现是一条空列表，而不是整页打不开。
+   这条路上"库坏了"的正确表现是一条空列表，而不是整页打不开。预览这条路上
+   库故障也不能冒充 404：材料不存在与库读不出来是两件事（503 `library_unavailable`
+   vs 404 `not_found`），混在一起会让用户以为材料被删了。
 
 全部离线：`conftest.py` 已清空凭证、开关置 0、数据库落在本次用例的 `tmp_path`。
 """
@@ -212,13 +214,24 @@ def test_listing_survives_a_broken_library(client, monkeypatch):
     assert response.json() == {"items": [], "total": 0}
 
 
-def test_missing_source_becomes_404_when_library_breaks(client, monkeypatch):
+def test_broken_library_on_preview_is_503_not_404(client, monkeypatch):
+    """库本身读不出来 ≠ 这份材料不存在：前者 503，后者 404。
+
+    原来的实现把 sqlite 故障翻成 `SourceNotFound`，前端于是说"这份来源不在知识
+    库里"——用户会以为材料被删了，怎么重试都没用。真正的 404 由
+    `test_unknown_source_is_404` 覆盖。
+    """
     def boom(source_id):
         raise sqlite3.OperationalError("no such table: library_sources")
 
     monkeypatch.setattr(library, "load", boom)
 
-    assert client.get("/api/knowledge/library/任意id").status_code == 404
+    response = client.get("/api/knowledge/library/任意id")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["code"] == "library_unavailable"
+    assert body["message"] == "知识库暂时读不出来，请稍后重试"
 
 
 def test_listing_survives_a_corrupt_map_row(client):
