@@ -1,4 +1,4 @@
-import type { MindMapContent, MindNode } from '../api/types';
+import type { MindMapContent, MindNode, NodeColor } from '../api/types';
 
 /**
  * 与服务端 Pydantic 约束逐条对应（`backend/app/contracts/mindmap.py`）：
@@ -14,7 +14,52 @@ export const LIMITS = {
   /** 生成产出的说明（契约 `Node.detail`）。与 `note` 同容量、不同语义。 */
   detail: 2000,
   title: 200,
+  /** 节点图标（契约 `MAX_NODE_ICON_CHARS`）。emoji 组合字符也要放得下。 */
+  icon: 16,
 } as const;
+
+/**
+ * 节点语义色的**运行时清单**，与后端 `mindmap.NODE_COLORS` 一一对应。
+ *
+ * 放在这里而不是 `api/types.ts`：那个文件是纯类型镜像，而这里是"契约里的数字与
+ * 枚举值"的镜像（`LIMITS` 就在同一个位置、同一条理由）。调色板要**两处共读**：
+ * 渲染层按它挑 CSS 变量，详情面板的下拉框按它列选项。写死在组件里，加一个颜色
+ * 就要改两个文件，而漏掉的那个不会报错——只是那个颜色永远选不到。
+ *
+ * 顺序就是下拉框里的顺序：先主色，再语义（正向/注意/风险），最后是中性。
+ */
+export const NODE_COLORS = [
+  'blue', 'green', 'amber', 'red', 'purple', 'teal', 'pink', 'gray',
+] as const satisfies readonly NodeColor[];
+
+/** 调色板键 → 下拉框里给人看的中文名。键本身是渲染用的标识，不该直接上屏。 */
+export const NODE_COLOR_LABELS: Record<NodeColor, string> = {
+  blue: '蓝（主色）',
+  green: '绿（结论）',
+  amber: '琥珀（注意）',
+  red: '红（风险）',
+  purple: '紫（并列主题）',
+  teal: '青（过程）',
+  pink: '粉（人/组织）',
+  gray: '灰（背景）',
+};
+
+/**
+ * 一个值是不是调色板键。
+ *
+ * 执行器用它拒绝 `color: '#2563eb'` 这种 op——**两端必须同一口径**：后端
+ * `ops._palette_color` 会抛 ValidationError，前端放过去的话，模型看到的反馈
+ * 取决于调用的是哪一端。
+ */
+export function isNodeColor(value: unknown): value is NodeColor {
+  return typeof value === 'string' && (NODE_COLORS as readonly string[]).includes(value);
+}
+
+/** 整棵树里有没有节点带视觉元素。用于"要不要提示旧图没有颜色"这类判断。 */
+export function hasVisuals(root: MindNode): boolean {
+  if (root.color || root.icon) return true;
+  return root.children.some(hasVisuals);
+}
 
 /**
  * AI 生成时标题的软上限（契约 `GENERATED_LABEL_MAX_CHARS`）。
@@ -102,6 +147,32 @@ export function setNodeNote(root: MindNode, id: string, note: string | null): Mi
   return {
     ...root,
     children: root.children.map(child => setNodeNote(child, id, note)),
+  };
+}
+
+/**
+ * 改节点的视觉元素（`color` / `icon`）。返回新的根，原树不动。
+ *
+ * 与 `setNodeNote` 分开而不是合成一个"改任意字段"的通用函数：通用版本会诱使
+ * 调用方把 `label`、`note`、`source_refs` 也顺手塞进来，而那三条各自有更严格的
+ * 前置条件（非空、2000 字、引用必须落在 source_usage 里）。窄函数让"哪条路径
+ * 能改什么"在签名上就看得出来。
+ *
+ * `null` 是**显式清除**（与 `undefined` 不同）：界面上选「默认」就是清掉颜色。
+ */
+export function setNodeVisual(
+  root: MindNode,
+  id: string,
+  color: NodeColor | null,
+  icon: string | null,
+): MindNode {
+  if (root.id === id) {
+    const trimmed = (icon ?? '').trim();
+    return { ...root, color, icon: trimmed ? trimmed : null };
+  }
+  return {
+    ...root,
+    children: root.children.map(child => setNodeVisual(child, id, color, icon)),
   };
 }
 
@@ -193,6 +264,15 @@ export function validateDraft(content: MindMapContent): string | null {
     }
     if (node.detail && charLength(node.detail.trim()) > LIMITS.detail) {
       return `节点「${shortLabel(label)}」的详情超过 ${LIMITS.detail} 个字`;
+    }
+    // 视觉元素：与后端 `Node.color` 的 Literal / `Node.icon` 的 max_length 对齐。
+    // 不在这里拦的话，一个非法颜色要到保存时才 422，而那时用户已经在图上改了
+    // 半天——他看到的是一句"内容不合法"，指不到是哪个节点。
+    if (node.color != null && !isNodeColor(node.color)) {
+      return `节点「${shortLabel(label)}」的颜色不在调色板里（${NODE_COLORS.join('/')}）`;
+    }
+    if (node.icon != null && (!node.icon.trim() || charLength(node.icon) > LIMITS.icon)) {
+      return `节点「${shortLabel(label)}」的图标应为 1–${LIMITS.icon} 个字符`;
     }
     if (node.children.length > LIMITS.children) {
       return `节点「${shortLabel(label)}」最多 ${LIMITS.children} 个子节点`;

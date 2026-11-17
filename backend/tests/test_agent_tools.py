@@ -30,6 +30,7 @@ from app.agent.tools import (
     DEEP_CONCURRENCY,
     MAX_OUTPUT_TOKENS_CAP,
     PLAN_PROMPT,
+    SUBNODE_EXPAND_PROMPT,
     build_registry,
 )
 from app.contracts.mindmap import MindMapContent
@@ -552,7 +553,10 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertIn("8", plan_users[8])
         self.assertNotEqual(plan_users[3], plan_users[8])
         for text in plan_users.values():
-            self.assertIn("20 字", text)
+            # 长度口径与系统提示词、代码截断同源（16，见 `GENERATED_LABEL_MAX_CHARS`）。
+            # 这里曾经钉的是 20，而 `PLAN_PROMPT` 说 16、`_skeleton_titles` 按 16 截
+            # ——三处两个数，模型照 user 写、写出来就被截。
+            self.assertIn("16 字", text)
             self.assertIn("互不重叠", text)
 
 
@@ -1374,14 +1378,79 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("rag_query", names)
 
     def test_edit_without_sources_has_no_rag(self):
-        """没有来源时的检索必然返回"没找到"，注册它只会诱导模型乱查。"""
-        self.assertEqual(build_registry("edit").names(), ["mindmap_edit"])
+        """没有来源时的检索必然返回"没找到"，注册它只会诱导模型乱查。
+
+        `edit` 有五个写工具（四个细粒度 + 批量）。这里断言的是**集合**：顺序由
+        `_TOOL_ORDER` 决定，另有专门的用例钉它，不该让"多一个工具"把这条判断
+        变成一个数字游戏。
+        """
+        self.assertEqual(
+            set(build_registry("edit").names()),
+            {"add_node", "update_node", "remove_node", "move_node", "mindmap_edit"},
+        )
+        self.assertNotIn("rag_query", build_registry("edit").names())
 
     def test_unknown_tool_lists_available(self):
         result = _run(build_registry("create").execute(_call("generate_mindmap", topic="x"), _ctx()))
         self.assertFalse(result.ok)
         self.assertEqual(result.data["code"], "unknown_tool")
         self.assertIn("mindmap_generate", result.content)
+
+
+class BranchVisualsTest(unittest.TestCase):
+    """视觉元素**只挂在一级分支上**。
+
+    一组 80 节点的树如果每个节点都有图标，图标就不再指示任何东西，只是把画布弄花。
+    这条边界有两道防线，用例各钉一条：
+
+      1. 提示词里明说"只给一级分支"（并给了 ❌/✅ 对照）；
+      2. 代码根本不读子节点上的 color/icon（`_slot_from` 没有这两个字段），
+         所以模型写了也落不到树上——这一条才是硬的。
+    """
+
+    def test_only_top_level_branches_get_color_and_icon(self):
+        ctx = _ctx(max_model_calls=10)
+        plan = {"branches": [
+            {"label": "范围", "color": "blue", "icon": "🎯"},
+            {"label": "原理", "color": "teal", "icon": "📊"},
+            {"label": "风险", "color": "#2563eb", "icon": "用放大镜"},
+        ]}
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return plan
+            # 子节点上也写 color/icon：模型的常见越界，必须被忽略而不是落树。
+            return {"children": [
+                {"label": "要点一", "color": "red", "icon": "🔧"},
+                {"label": "要点二"},
+            ]}
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+            result = _run(build_registry("create").execute(_call(
+                "mindmap_generate_deep", topic="机器学习", branches=3,
+                points_per_branch=2), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        branches = ctx.candidate.root.children
+        self.assertEqual([b.color for b in branches], ["blue", "teal", None])
+        # 非法 hex 与"写成文字的图标"都被丢掉，而不是让整次骨架失败
+        self.assertEqual([b.icon for b in branches], ["🎯", "📊", None])
+
+        for branch in branches:
+            for child in branch.children:
+                self.assertIsNone(child.color, "子节点不该带颜色")
+                self.assertIsNone(child.icon, "子节点不该带图标")
+        # 根节点也没有视觉元素：它是中心主题，颜色由主题决定
+        self.assertIsNone(ctx.candidate.root.color)
+
+    def test_prompts_state_the_boundary_with_contrast_examples(self):
+        """提示词要写清边界，并给 ❌/✅ 对照——只写"只给一级"模型会忽略。"""
+        self.assertIn("一级分支", PLAN_PROMPT)
+        self.assertIn("✅ 正确", PLAN_PROMPT)
+        self.assertIn("❌ 错误", PLAN_PROMPT)
+        # 展开那一层明确说"不要写"，否则模型每次都会顺手补一个图标
+        self.assertIn("不要给子项写 color 或 icon", BRANCH_EXPAND_PROMPT)
+        self.assertIn("不要给子项写 color 或 icon", SUBNODE_EXPAND_PROMPT)
 
 
 class LimitAlignmentTest(unittest.TestCase):

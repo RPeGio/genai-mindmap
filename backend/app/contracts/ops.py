@@ -15,10 +15,16 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.contracts.source import SourceRef
-from app.contracts.mindmap import MAX_NODE_DETAIL_CHARS, MAX_NODE_LABEL_CHARS, MAX_TREE_NODES
+from app.contracts.mindmap import (
+    MAX_NODE_DETAIL_CHARS,
+    MAX_NODE_ICON_CHARS,
+    MAX_NODE_LABEL_CHARS,
+    MAX_TREE_NODES,
+    NODE_COLORS,
+)
 
 
 class OpError(Exception):
@@ -45,6 +51,24 @@ class _OpBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _palette_color(value: str | None) -> str | None:
+    """`color` 的校验：`None` 不动、空串清空、其余必须是调色板键。
+
+    大小写与空白归一（模型常写 `"Blue "`）——这不只是宽容，归一是让"同一个键
+    在不同 op 里写成了两种形式"这个隐患消失。不认识的键**报错**（与
+    `normalize_color` 的"丢掉"不同）：这里已经是 op 契约层，能走到这里的只有
+    服务端自己构造的草案与前端解析出来的批次，报错不会误伤模型的一次正常产出。
+    """
+    if value is None:
+        return None
+    key = value.strip().lower()
+    if not key:
+        return ""
+    if key not in NODE_COLORS:
+        raise ValueError(f"color 只能是 {'/'.join(NODE_COLORS)} 之一，收到 {value!r}")
+    return key
+
+
 class AddOp(_OpBase):
     """在当前树里挂一个新节点。
 
@@ -63,27 +87,49 @@ class AddOp(_OpBase):
     # 那正是"节点是完整句子、画布挤成一团"的成因。缺省 `None` 与"空详情"同义
     # （契约层会把空串归一成 None，见 `mindmap.Node.blank_text_as_none`）。
     detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
+    # 视觉元素，语义见 `mindmap.Node.color` / `Node.icon`。`color` 仍然只收
+    # 调色板键（`_palette_color` 校验）：op 这一层是模型写得到的入口，如果这里
+    # 放开成自由字符串，"契约只允许预设色"这条就只剩下半条防线。
+    color: str | None = None
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
+
+    @field_validator("color")
+    @classmethod
+    def color_in_palette(cls, value: str | None) -> str | None:
+        return _palette_color(value)
 
 
 class UpdateChanges(BaseModel):
-    """只允许改这三个字段。
+    """只允许改这几个字段：`label` / `detail` / `color` / `icon`（+ 契约内部的 `source_refs`）。
 
-    `label` / `detail` / `source_refs` 都是 `None` 表示"这一项不动"，与"清空"
-    区分开：`source_refs=[]` 是显式清空，`source_refs=None` 是保持原样。这个区别
-    丢不得，否则模型漏写一个字段就等于把引用全删了。
+    引用（`source_refs`）在**模型这条路**上是关着的：模型给节点加一条引用就必须
+    逐字匹配原文，而这一步在生成路径上已经由 `validate_generated_content` 做过；
+    编辑路径再开一个入口，等于多一条能凭空造引用的路。契约里保留这个字段是因为
+    原生编辑（导入、界面）需要它——`agent.tools.EditChange` 才是模型看到的那一层，
+    那里没有它。
 
-    `detail` 走同一个约定：`None` = 不动，空串 = 清空（执行器归一成 `None`）。
-    用户在界面上手写的 `note` 不在这三个字段里——生成侧永远碰不到它。
+    五个字段统一的约定：`None` 表示"这一项不动"。空串是**显式清空**（`detail=""`
+    清空正文，`color=""` 清除颜色），执行器把空串归一成 `None`。这个区别丢不得：
+    只写 `None` 的话，模型永远摘不掉一个画错的图标——它会反复发同一条 update，
+    每次都"成功"但什么都没变。
     """
 
     model_config = ConfigDict(extra="forbid")
     label: str | None = Field(default=None, min_length=1, max_length=MAX_NODE_LABEL_CHARS)
     detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
     source_refs: list[SourceRef] | None = Field(default=None, max_length=20)
+    color: str | None = None
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
+
+    @field_validator("color")
+    @classmethod
+    def color_in_palette(cls, value: str | None) -> str | None:
+        return _palette_color(value)
 
     @model_validator(mode="after")
     def at_least_one(self) -> UpdateChanges:
-        if self.label is None and self.detail is None and self.source_refs is None:
+        if (self.label is None and self.detail is None and self.source_refs is None
+                and self.color is None and self.icon is None):
             raise ValueError("update 至少要改一个字段")
         return self
 

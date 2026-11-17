@@ -61,7 +61,34 @@ export interface MindNode {
   collapsed?: boolean;
   style?: NodeStyle | null;
   pos?: NodePosition | null;
+  /**
+   * 语义色（调色板键）。**可选、缺省 `null`**，所以旧图不需要迁移。
+   *
+   * 只接受 `NODE_COLORS` 里的键，不是任意 hex：模型自由发挥的 hex 会得到一堆
+   * 脏色，而且换主题（暗色/亮色）时无法自动适配。渲染层把它映射到 CSS 变量
+   * （`--mind-color-<key>`，见 `styles.css`），色值不在数据里。
+   *
+   * 与 `style.color`（`#RRGGBB`，透传保存、界面不渲染）**不是同一个东西**，
+   * 两者同时存在时以这个为准——语义色是渲染意图，hex 是历史值。
+   */
+  color?: NodeColor | null;
+  /**
+   * 图标。目前是 emoji（零依赖、跨平台、`<span>` 直接渲染）。
+   *
+   * 契约上限 16 码点（组合 emoji 也要放得下）。只有一级分支会被生成侧要求带它：
+   * 一棵 80 节点的树如果每个节点都有图标，图标就不再指示任何东西。
+   */
+  icon?: string | null;
 }
+
+/**
+ * 节点语义色。与后端 `mindmap.NODE_COLORS` 一一对应。
+ *
+ * 用联合类型而不是 `string`：拼错一个键在编译期就红，而不是等到画出来是灰的
+ * 才有人发现。运行时那份清单在 `mindmap/edits.ts::NODE_COLORS`（与 `LIMITS`
+ * 同一个位置、同一条理由：数字与枚举值得两侧共读）。
+ */
+export type NodeColor = 'blue' | 'green' | 'amber' | 'red' | 'purple' | 'teal' | 'pink' | 'gray';
 
 /**
  * 节点还能不能再展开。与后端 `Node.expandable` 的取值一一对应。
@@ -99,18 +126,29 @@ export interface AddOp {
   source_refs?: SourceRef[];
   /** 生成产出的说明（上限 2000 字）。与 `note` 分开：后者永远是用户写的。 */
   detail?: string | null;
+  /** 语义色，只收调色板键（`NodeColor`）；不认识的键在执行器里被拒。 */
+  color?: NodeColor | null;
+  /** 图标（一个 emoji，≤16 码点）。 */
+  icon?: string | null;
 }
 
 /**
  * 改节点。
  *
- * `label`、`detail` 与 `source_refs` 缺省（undefined）表示"这一项不动"，与"清空"
- * 区分开：`source_refs: []` 是显式清空。这个区别丢不得。
+ * `label`、`detail`、`color`、`icon` 与 `source_refs` 缺省（undefined）表示
+ * "这一项不动"，与"清空"区分开：`source_refs: []` 是显式清空，`detail: ''` /
+ * `color: ''` 是清空该项。这个区别丢不得。
  */
 export interface UpdateOp {
   op: 'update';
   id: string;
-  changes: { label?: string; source_refs?: SourceRef[]; detail?: string | null };
+  changes: {
+    label?: string;
+    source_refs?: SourceRef[];
+    detail?: string | null;
+    color?: NodeColor | '';
+    icon?: string | null;
+  };
 }
 
 /** 删节点及整棵子树。根节点不可删。 */

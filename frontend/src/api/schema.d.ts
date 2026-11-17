@@ -590,6 +590,10 @@ export interface components {
              * @default false
              */
             collapsed: boolean;
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
@@ -618,12 +622,31 @@ export interface components {
              * @default false
              */
             collapsed: boolean;
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;
         };
-        /** NodeStyle */
+        /**
+         * NodeStyle
+         * @description 节点样式（v2 预留字段，界面对它只做透传保存）。
+         *
+         *     `style.color` 与 `Node.color` **不是同一个东西**，两者的关系必须写清楚，
+         *     否则下一个人会以为它们是"新旧两版"而随手改坏一处：
+         *
+         *       - `NodeStyle.color` 是 `#RRGGBB`，来源是导入/将来的取色器，**界面不渲染**。
+         *         它是"用户画的那个色"，逐像素还原用。
+         *       - `Node.color` 是**调色板键**（`blue`/`green`/…），界面按它渲染，能跟着
+         *         主题（暗色/亮色）自动适配。
+         *
+         *     两个字段同时存在时 **`Node.color` 优先**：语义色是渲染意图，hex 是历史值。
+         *     `Node.color` 为 `None` 时才回落到…也不回落——`style.color` 仍然不渲染，
+         *     它只是被保留下来，免得用户点一次保存就把导入的颜色丢掉。
+         */
         NodeStyle: {
             /** Color */
             color?: string | null;

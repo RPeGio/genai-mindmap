@@ -2,11 +2,21 @@ import type {
   MindMapContent,
   MindMapOp,
   MindNode,
+  NodeColor,
   OpBatch,
   SourceRef,
   SourceUsage,
 } from '../api/types';
-import { charLength, cloneTree, findNode, findParent, LIMITS, removeNode } from './edits';
+import {
+  charLength,
+  cloneTree,
+  findNode,
+  findParent,
+  isNodeColor,
+  LIMITS,
+  NODE_COLORS,
+  removeNode,
+} from './edits';
 
 /**
  * 导图操作执行器（前端侧）。
@@ -141,6 +151,15 @@ function assertTreeValid(root: MindNode, sourceUsage: SourceUsage[]): void {
     if (node.children.length > LIMITS.children) {
       invalid(`节点 ${node.id} 最多 ${LIMITS.children} 个子节点`);
     }
+    // 视觉元素：`color` 只收调色板键（后端是 `Literal`，非法值会 422）。
+    // 与 `add` 那条入口的校验同一口径：走到整树兜底还留着非法值，说明有一条
+    // 写入路径绕过了 op 层的检查——那时报错比把它画成一个灰点好。
+    if (node.color != null && !isNodeColor(node.color)) {
+      invalid(`节点 ${node.id} 的颜色不在调色板里（${NODE_COLORS.join('/')}）`);
+    }
+    if (node.icon != null && (!node.icon.trim() || charLength(node.icon) > LIMITS.icon)) {
+      invalid(`节点 ${node.id} 的图标应为 1–${LIMITS.icon} 个字符`);
+    }
     for (const ref of node.source_refs ?? []) {
       if (!allowedSources.has(ref.source_id)) {
         invalid(`节点 ${node.id} 引用的来源 ${ref.source_id} 不在 source_usage 中`);
@@ -208,6 +227,10 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
           // `detail` 是生成产出的说明，与用户备注 `note` 分开存；`add` 不带
           // note 字段，正是为了这两条写入路径永不交叉。
           detail: op.detail ?? null,
+          // 视觉元素：空串归一成 null（`add` 没有"清空"语义，新节点本来就没有
+          // 颜色）。值是调色板键——校验在 `assertTreeValid` 里统一做。
+          color: op.color ? op.color : null,
+          icon: op.icon ? op.icon : null,
         };
         next.root = insertChildAt(next.root, op.parent_id, op.index, node);
         changed.add(op.id);
@@ -222,14 +245,21 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         if (!node) {
           throw new OpError('node_not_found', path('id'), `节点 ${op.id} 不存在`);
         }
-        const changes: { label?: string; source_refs?: SourceRef[]; detail?: string | null } =
-          op.changes ?? {};
+        const changes: {
+          label?: string;
+          source_refs?: SourceRef[];
+          detail?: string | null;
+          color?: NodeColor | '';
+          icon?: string | null;
+        } = op.changes ?? {};
         // 后端 UpdateChanges.at_least_one 直接拒绝空 changes。前端不拦的话，
         // 同一条 op 在这里成功、在服务端 ValidationError，模型收到的反馈相反。
         if (
           changes.label === undefined &&
           changes.source_refs === undefined &&
-          changes.detail === undefined
+          changes.detail === undefined &&
+          changes.color === undefined &&
+          changes.icon === undefined
         ) {
           throw new OpError('empty_changes', path('changes'), `节点 ${op.id} 的 update 至少要改一个字段`);
         }
@@ -245,6 +275,30 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         if (changes.detail !== undefined) {
           const detail = (changes.detail ?? '').trim();
           node.detail = detail ? detail : null;
+        }
+        // 视觉元素同一条约定：`undefined` 不动，空串是**显式清除**。
+        // 与后端 `_apply_update` 逐条对齐（`color: ''` → `null`），否则同一个
+        // batch 会一边清掉颜色、一边在树里留一个查不到 CSS 变量的空串。
+        if (changes.color !== undefined) {
+          if (changes.color !== '' && !isNodeColor(changes.color)) {
+            throw new OpError(
+              'invalid_color',
+              path('changes.color'),
+              `颜色只能是 ${NODE_COLORS.join('/')} 之一，收到 ${String(changes.color)}`,
+            );
+          }
+          node.color = changes.color === '' ? null : changes.color;
+        }
+        if (changes.icon !== undefined) {
+          const icon = (changes.icon ?? '').trim();
+          if (icon && charLength(icon) > LIMITS.icon) {
+            throw new OpError(
+              'invalid_icon',
+              path('changes.icon'),
+              `图标最多 ${LIMITS.icon} 个字符`,
+            );
+          }
+          node.icon = icon ? icon : null;
         }
         changed.add(op.id);
         break;

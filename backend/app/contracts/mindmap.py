@@ -8,6 +8,7 @@ v1 记录不需要迁移脚本就能读进来（`migrate_content()` 负责这一
 """
 from __future__ import annotations
 
+import unicodedata
 from enum import Enum
 from typing import Literal
 
@@ -65,6 +66,76 @@ MAX_NODE_DETAIL_CHARS = 2000
 # 有更多内容"可选，白花一次调用。
 NODE_EXPANDABLE = ("yes", "no", "unknown")
 
+# 节点颜色的**调色板**。`Node.color` 只能取这八个键之一，不接受任意 hex。
+#
+# 为什么不做 `#RRGGBB`：模型自由发挥的 hex 会得到一堆脏色（同一张图里出现
+# `#3f8ac9`、`#4a90d9`、`#2f7fbf` 三个几乎一样的蓝），而且换主题（暗色/亮色）
+# 时无法自动适配——hex 是**结论**，不是语义。键是语义（`red` 就是"风险/告警"），
+# 具体色值留给渲染层：CSS 变量一处定义，暗色主题只覆盖 `:root`，导图数据不动。
+#
+# 八个键是按"能表达一张图里的分类"选的，不是凑数：主色（blue）、正向/结论
+# （green）、注意/待定（amber）、风险（red）、并列主题（purple）、过程/辅助
+# （teal）、人/组织（pink）、背景/其他（gray）。再多就会开始重复语义，
+# 而两个键意思一样时模型只会随机挑一个。
+NODE_COLORS = ("blue", "green", "amber", "red", "purple", "teal", "pink", "gray")
+
+# 调色板键 → 前端 CSS 变量名的前缀。**只有前缀在契约里**，具体色值在
+# `frontend/src/styles.css` 的 `:root` 里定义。
+#
+# 放在这里是为了让"后端加了一个颜色、前端却没定义"这件事能被用例抓住
+# （`tests/test_node_visuals.py` 读 styles.css 逐个比对）：静默漏一个键的表现是
+# 那个颜色画出来是默认灰，而没有任何地方会报错。
+NODE_COLOR_CSS_PREFIX = "--mind-color-"
+
+# 节点的图标上限（码点）。emoji 常见 1–4 个码点（`🎯` 是 1，带肤色/ZWJ 的
+# `👨‍👩‍👧` 可以到 8），16 给组合 emoji 留够余量，同时挡住"把一句话塞进图标"。
+MAX_NODE_ICON_CHARS = 16
+
+NodeColor = Literal["blue", "green", "amber", "red", "purple", "teal", "pink", "gray"]
+
+
+def normalize_color(value: object) -> str | None:
+    """模型给的 `color` → 调色板里的键，或 `None`。
+
+    三件事：非字符串/空串当没给；大小写与空白归一（模型常写 `"Blue "`）；
+    **不在调色板里的一律丢掉，不报错**。
+
+    为什么是"丢掉"而不是"报错"：这条函数只服务生成侧（骨架里的 color/icon）。
+    一个 `color: "深蓝"` 或 `color: "#1e40af"` 说明模型没照提示词写，但它产出的
+    结构本身是好的——为了一个装饰字段把一次已经花掉的骨架调用整批判失败，
+    代价方向完全错了。契约层（`Node.color` 的 Literal）仍然是硬拒绝，
+    所以脚本与前端构造的数据不会绕过白名单。
+    """
+    if not isinstance(value, str):
+        return None
+    key = value.strip().lower()
+    return key if key in NODE_COLORS else None
+
+
+def normalize_icon(value: object) -> str | None:
+    """模型给的 `icon` → 可落库的 emoji，或 `None`。
+
+    三件事：折掉空白、按 `MAX_NODE_ICON_CHARS` 截断、**把"写成文字的图标"丢掉**。
+
+    第三条不是洁癖。实测模型会写 `"icon": "放大镜"` 或者 `"用眼睛表示观察"`
+    ——它照着自己的话写了一个**词**。这种值落到树上会变成节点标题前面挂着四个
+    汉字，看起来像标题的一部分，而用户没有任何办法知道"那个字本来应该是个图标"。
+    所以按 Unicode 类别判：只要含字母或数字（`L*` / `N*`，中日韩汉字也在 `Lo`
+    里）就不是图标，丢掉。emoji 是 `So`（Symbol, other），可以过。
+
+    不追求"严格的 emoji 白名单"：那要跟着 Unicode 版本更新一张属性表，为一个
+    装饰字段不值得。长度 + 字母/数字这两条挡住的是真实出现的两种坏值。
+    """
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if not text:
+        return None
+    for char in text:
+        if unicodedata.category(char)[0] in ("L", "N"):
+            return None
+    return text[:MAX_NODE_ICON_CHARS]
+
 
 def clip_label(text: str, limit: int = GENERATED_LABEL_MAX_CHARS) -> str:
     """按**码点**截断标题，返回不超过 `limit` 个码点的字符串。
@@ -101,6 +172,21 @@ class Position(BaseModel):
 
 
 class NodeStyle(BaseModel):
+    """节点样式（v2 预留字段，界面对它只做透传保存）。
+
+    `style.color` 与 `Node.color` **不是同一个东西**，两者的关系必须写清楚，
+    否则下一个人会以为它们是"新旧两版"而随手改坏一处：
+
+      - `NodeStyle.color` 是 `#RRGGBB`，来源是导入/将来的取色器，**界面不渲染**。
+        它是"用户画的那个色"，逐像素还原用。
+      - `Node.color` 是**调色板键**（`blue`/`green`/…），界面按它渲染，能跟着
+        主题（暗色/亮色）自动适配。
+
+    两个字段同时存在时 **`Node.color` 优先**：语义色是渲染意图，hex 是历史值。
+    `Node.color` 为 `None` 时才回落到…也不回落——`style.color` 仍然不渲染，
+    它只是被保留下来，免得用户点一次保存就把导入的颜色丢掉。
+    """
+
     model_config = ConfigDict(extra="forbid")
     color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
     icon: str | None = Field(default=None, max_length=40)
@@ -181,6 +267,22 @@ class Node(BaseModel):
     # 把没问过的记成"还能展开"会让界面替旧图许下一个它兑现不了的承诺。
     expandable: Literal["yes", "no", "unknown"] = "unknown"
     collapsed: bool = False
+    # 视觉元素：语义色 + 图标。**两个都可选、缺省 None**，所以库里所有旧图
+    # 不需要迁移脚本就能读进来（与 `note` / `detail` / `expandable` 同一条规矩：
+    # 新字段一律有默认值）。
+    #
+    # `color` 只能是 `NODE_COLORS` 里的键。用 `Literal` 而不是 pattern：非法值
+    # 会在契约层直接被拒，而不是被画成一个脏色。生成侧另有一层归一化
+    # （`normalize_color`），模型写了个不认识的键会被丢掉而不是让整棵树失败。
+    #
+    # 为什么加在 `Node` 上而不是继续用 `style.color`：语义色是**渲染意图**，
+    # 见 `NodeStyle` 的 docstring。
+    color: NodeColor | None = None
+    # 图标。目前是 emoji（零依赖、跨平台、`<span>` 直接渲染），不是图标库的 id：
+    # 前端没有图标库（`package.json` 里没有 `lucide-vue-next` 之类），为一个
+    # 纯装饰字段新增一个依赖不划算。将来真上了图标库，这个字段可以保持
+    # "字符串"不变——那时它承载的就是库里的 id。
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
     style: NodeStyle | None = None
     source_refs: list[SourceRef] = Field(default_factory=list, max_length=20)
     pos: Position | None = None
@@ -192,6 +294,16 @@ class Node(BaseModel):
         if not folded:
             raise ValueError("节点标题不能为空")
         return folded
+
+    @field_validator("icon")
+    @classmethod
+    def blank_icon_as_none(cls, value: str | None) -> str | None:
+        """纯空白的图标等于没有图标。
+
+        与 `note` / `detail` 同一条理由：留一个空串会让前端多一个"有图标但画出来
+        什么都没有"的分支（`<span>` 里塞一个空格），而 `None` 的语义是明确的。
+        """
+        return value if value and value.strip() else None
 
     @field_validator("note", "detail")
     @classmethod

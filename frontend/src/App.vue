@@ -11,6 +11,7 @@ import type { SampleMap } from './dev/samples';
 import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
 import { useSourcesStore } from './stores/sources';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
+import { NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
 
 const store = useMindMapStore();
 const sources = useSourcesStore();
@@ -171,6 +172,55 @@ function expandBranch() {
   // 材料正文只在本次会话内存里；重新打开旧图时它是空的，后端会按节点的
   // `source_refs` 从知识库把来源找回来，所以这里照传、传空也不拦。
   void store.expandSelected(sources.readySources);
+}
+
+/**
+ * 画布上方的「改这张图」输入框。
+ *
+ * 与左侧「输入主题或文本」是两个入口、两件事：那个既是主题输入框又会顺手把文本
+ * 加进来源列表，语义上更接近"新建"；用户想把「把第三支拆细一点」这种**针对现有图
+ * 的指令**说清楚时，在那个框里打字的心理预期是"加材料"。所以这里单独开一个：
+ * 标题写明意图（edit），发出去的 `intent` 也是 edit。
+ *
+ * 后端 `edit` 意图给的是四个细粒度工具 + 批量 `mindmap_edit`，改动只落在候选上，
+ * 用户点「应用」才进画布——与展开、生成完全同一条确认流程。
+ */
+const editPrompt = ref('');
+const editBlocked = computed(() => !store.content || store.busy || store.agentRunning);
+
+const editHint = computed(() => {
+  if (!store.content) return '先生成或打开一张导图，再让它改。';
+  if (store.busy || store.agentRunning) return '正在跑，等这一次结束。';
+  return '改动只落候选，确认后才进画布。';
+});
+
+const editGoalDisabled = computed(() => editBlocked.value || !editPrompt.value.trim());
+
+async function submitEdit() {
+  const goal = editPrompt.value.trim();
+  if (!goal || editBlocked.value) return;
+  editPrompt.value = '';
+  // 材料照传：edit 路径不读来源，但后端会按节点的 `source_refs` 找回原文，
+  // 与展开那条路同一份处理（`tools._expand_sources`）。
+  await store.runGeneration(goal, 'edit', sources.readySources);
+}
+
+/** 详情面板的「样式」两个控件：颜色是下拉（只列调色板），图标是一个输入框。 */
+function changeColor(event: Event) {
+  const id = selected.value?.node.id;
+  if (!id) return;
+  const value = (event.target as HTMLSelectElement).value;
+  store.setNodeVisualById(id, { color: value ? (value as (typeof NODE_COLORS)[number]) : null });
+}
+
+function changeIcon(event: Event) {
+  const id = selected.value?.node.id;
+  if (!id) return;
+  const value = (event.target as HTMLInputElement).value;
+  store.setNodeVisualById(id, { icon: value });
+  // 以 store 归一后的值为准（空串→清空、超长→截断），否则框里留着空格，
+  // 界面上却显示"没有图标"——与备注框同一条处理。
+  (event.target as HTMLInputElement).value = store.selectedNode?.node.icon ?? '';
 }
 
 /** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
@@ -462,6 +512,37 @@ async function copyBody() {
             重做
           </button>
         </div>
+        <!--
+          画布上方的「改这张图」入口。**专门开一个输入框**而不是复用左侧那个：
+          左侧「输入主题或文本」同时会把文字加进来源列表，在那里打「把第三支拆细
+          一点」会被当成材料。这一个只发 `intent=edit`，改动落候选，确认后才进画布。
+        -->
+        <div
+          class="absolute right-4 top-4 z-10 flex w-[380px] max-w-[calc(100%-2rem)] flex-col gap-1 rounded-md border border-slate-200 bg-white p-2 shadow-sm"
+          role="group"
+          aria-label="改这张图"
+        >
+          <div class="flex items-center gap-1">
+            <span class="shrink-0 text-xs font-medium text-slate-600">改这张图</span>
+            <input
+              v-model="editPrompt"
+              aria-label="改这张图"
+              class="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 text-xs outline-none focus:border-slate-500 disabled:opacity-50"
+              :disabled="editBlocked"
+              placeholder="把第三支拆细一点"
+              @keydown.enter.prevent="submitEdit"
+            />
+            <button
+              type="button"
+              class="shrink-0 rounded-md bg-slate-900 px-2 py-1 text-xs text-white disabled:opacity-40"
+              :disabled="editGoalDisabled"
+              @click="submitEdit"
+            >
+              {{ store.agentRunning && store.runIntent === 'edit' ? '改中…' : '让它改' }}
+            </button>
+          </div>
+          <p class="text-[11px] leading-tight text-slate-400">{{ editHint }}</p>
+        </div>
         <MindMapCanvas />
       </section>
 
@@ -529,6 +610,42 @@ async function copyBody() {
               {{ expandState.label }}
             </button>
             <p class="text-xs leading-relaxed text-slate-400">{{ expandState.hint }}</p>
+          </section>
+
+          <!--
+            样式：语义色 + 图标。两个值都可选、缺省为空（"默认"）。
+            颜色只给调色板里的键——不是取色器。理由与契约那边一致：任意 hex 会
+            得到一堆脏色，而且换主题（暗色/亮色）时无法自动适配；键是语义，
+            色值在 CSS 变量里（`styles.css`），换主题只改那一处。
+            图标是**一个 emoji**：前端没有图标库，为一个纯装饰字段新增依赖不划算。
+          -->
+          <section class="flex flex-col gap-1" aria-label="节点样式">
+            <h3 class="text-xs font-medium text-slate-500">样式</h3>
+            <div class="flex items-center gap-2">
+              <select
+                aria-label="节点颜色"
+                class="min-w-0 flex-1 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700"
+                :value="selected.node.color ?? ''"
+                @change="changeColor"
+              >
+                <option value="">默认（无色）</option>
+                <option v-for="key in NODE_COLORS" :key="key" :value="key">
+                  {{ NODE_COLOR_LABELS[key] }}
+                </option>
+              </select>
+              <input
+                aria-label="节点图标"
+                class="w-16 rounded-md border border-slate-300 px-2 py-1.5 text-center text-xs text-slate-700"
+                :value="selected.node.icon ?? ''"
+                :maxlength="16"
+                placeholder="🎯"
+                title="一个 emoji；清空表示去掉图标"
+                @change="changeIcon"
+              />
+            </div>
+            <p class="text-[11px] leading-relaxed text-slate-400">
+              颜色只收预设的 8 个语义色（换主题时自动适配）；图标是一个 emoji。生成时只有一级分支会带这两个值。
+            </p>
           </section>
 
           <label class="flex flex-1 flex-col gap-1">

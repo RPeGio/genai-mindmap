@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunResolved, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
+import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
@@ -20,6 +20,7 @@ import {
   removeNode,
   renameNode,
   setNodeNote,
+  setNodeVisual,
   validateDraft,
 } from '../mindmap/edits';
 
@@ -69,13 +70,109 @@ export function displayBody(node: MindNode): string {
   return note && note.length > 0 ? note : node.label.trim();
 }
 
-/** 正文当前来自哪一段。详情面板据此给出"这一段是什么"的说明。 */
+/** 正文本当前来自哪一段。详情面板据此给出"这一段是什么"的说明。 */
 export type BodySource = 'detail' | 'note' | 'label';
 
 export function bodySource(node: MindNode): BodySource {
   if (node.detail?.trim()) return 'detail';
   if (node.note?.trim()) return 'note';
   return 'label';
+}
+
+/**
+ * 候选相对当前画布的一条改动。
+ *
+ * 存在的理由：`edit` / `expand` 意图的候选是"在当前树上的改动"，而**画布优先渲染
+ * `content`**（用户的作品），候选节点在采纳之前根本不在画布上。没有这份清单，
+ * 用户面对「候选已就绪」只能盲点「应用」——他不知道 agent 动了哪几个节点、动了什么。
+ */
+export interface CandidateChange {
+  kind: 'added' | 'removed' | 'updated' | 'moved';
+  /** 节点 id。新增的节点在画布上还不存在，`locate` 会静默忽略它。 */
+  id: string;
+  /** 显示用标题：更新/移动取**新**标题，删除取原标题。 */
+  label: string;
+  /** 一句话说明改了什么（"标题 → 新标题"、"颜色 blue→red"、"移到「甲」下"）。 */
+  detail: string;
+}
+
+/** 一棵树的索引：id → 节点与父 id。前序遍历，`parentId` 为 null 的是根。 */
+function indexTree(root: MindNode): Map<string, { node: MindNode; parentId: string | null }> {
+  const out = new Map<string, { node: MindNode; parentId: string | null }>();
+  const walk = (node: MindNode, parentId: string | null) => {
+    out.set(node.id, { node, parentId });
+    for (const child of node.children) walk(child, node.id);
+  };
+  walk(root, null);
+  return out;
+}
+
+/** 一个节点上"人看得懂的变化"。没有变化返回空数组。 */
+function nodeFieldChanges(before: MindNode, after: MindNode): string[] {
+  const parts: string[] = [];
+  if (before.label.trim() !== after.label.trim()) {
+    parts.push(`标题「${before.label.trim()}」→「${after.label.trim()}」`);
+  }
+  if ((before.detail ?? '').trim() !== (after.detail ?? '').trim()) {
+    parts.push(after.detail?.trim() ? '改了详情' : '清空了详情');
+  }
+  if ((before.color ?? null) !== (after.color ?? null)) {
+    parts.push(`颜色 ${before.color ?? '无'} → ${after.color ?? '无'}`);
+  }
+  if ((before.icon ?? null) !== (after.icon ?? null)) {
+    parts.push(`图标 ${before.icon ?? '无'} → ${after.icon ?? '无'}`);
+  }
+  // `note` 归用户，生成侧碰不到它；这里仍然比一次，是为了让"某条路径改到了用户
+  // 备注"这种 bug 在界面上直接看得见，而不是等着用户发现自己的字变了。
+  if ((before.note ?? '') !== (after.note ?? '')) {
+    parts.push('改了「我的备注」');
+  }
+  if ((before.source_refs?.length ?? 0) !== (after.source_refs?.length ?? 0)) {
+    parts.push(`引用 ${before.source_refs?.length ?? 0} → ${after.source_refs?.length ?? 0} 条`);
+  }
+  return parts;
+}
+
+/**
+ * 当前画布与候选之间的差异；**没有可比基线时返回 `null`**（`create` 意图）。
+ *
+ * 为什么用"两份树对比"而不是"记录收到的 op 批次"：
+ *
+ *  - op 帧可能丢、可能乱序（`applyOpsToCandidate` 会主动丢弃对不上的批次），
+ *    按 op 记账得到的是"我以为改了什么"，而对比得到的是"树到底哪里不一样"；
+ *  - `resumeRun` 从服务端捡回候选时一条 op 帧都没有，那时只有对比能给出差异；
+ *  - 对比不依赖协议：后端将来加一种下发方式，这里一行都不用改。
+ *
+ * `create` 返回 `null` 而不是"全部节点都是新增"：一张 80 节点的图会得到 80 条
+ * "新增"，那不是 diff，是把整棵树重念一遍。
+ */
+export function diffCandidate(base: MindNode | null, next: MindNode): CandidateChange[] | null {
+  if (!base) return null;
+  const before = indexTree(base);
+  const after = indexTree(next);
+  const changes: CandidateChange[] = [];
+
+  for (const [id, entry] of after) {
+    const old = before.get(id);
+    if (!old) {
+      changes.push({ kind: 'added', id, label: entry.node.label.trim(), detail: '新增节点' });
+      continue;
+    }
+    const fields = nodeFieldChanges(old.node, entry.node);
+    if (fields.length) {
+      changes.push({ kind: 'updated', id, label: entry.node.label.trim(), detail: fields.join('；') });
+    }
+    if (old.parentId !== entry.parentId) {
+      const target = entry.parentId ? after.get(entry.parentId)?.node.label.trim() ?? entry.parentId : '根';
+      changes.push({ kind: 'moved', id, label: entry.node.label.trim(), detail: `移到「${target}」下` });
+    }
+  }
+  for (const [id, entry] of before) {
+    if (!after.has(id)) {
+      changes.push({ kind: 'removed', id, label: entry.node.label.trim(), detail: '删除节点（含子树）' });
+    }
+  }
+  return changes;
 }
 
 /**
@@ -89,6 +186,12 @@ const AGENT_TOOL_LABELS: Record<string, { running: string; done: string }> = {
   node_expand: { running: '正在展开分支', done: '已展开分支' },
   rag_query: { running: '正在查资料', done: '已查好资料' },
   mindmap_edit: { running: '正在改结构', done: '已改好结构' },
+  // 四个细粒度工具。`edit` 意图下模型可能连调几次（一次改一处），所以文案要能
+  // 让人看出"它在逐个改"，而不是以为同一件事被重复执行了。
+  add_node: { running: '正在加节点', done: '已加节点' },
+  update_node: { running: '正在改节点', done: '已改节点' },
+  remove_node: { running: '正在删节点', done: '已删节点' },
+  move_node: { running: '正在移动节点', done: '已移动节点' },
 };
 
 /**
@@ -248,6 +351,21 @@ export interface MindNodeData {
   draft?: 'preview' | 'candidate';
   /** 预览里模型明确标了「不用再展开」的节点，再弱一档；`null` 与 `true` 都不额外标记。 */
   previewLeaf?: boolean;
+  /**
+   * 语义色键（`blue` / `green` / …）。渲染层把它映射到 CSS 变量，色值不在数据里。
+   * 缺省 `undefined` 表示"没有语义色"，节点保持原来的中性样式。
+   */
+  color?: NodeColor;
+  /** 图标（目前是 emoji）。画在 label 前面。 */
+  icon?: string;
+  /**
+   * 这个节点在待确认的候选里被改过（新增除外——新增的节点在画布上还没有位置）。
+   *
+   * 只对 `edit` / `expand` 意图有意义：那两个意图的候选是"在当前树上的改动"，
+   * 而画布优先渲染 `content`（用户的作品），所以必须另给一个视觉标记，否则
+   * 用户点了「应用」才发现哪里变了。
+   */
+  changed?: boolean;
 }
 
 export interface FlatNode {
@@ -912,6 +1030,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
           refs: node.source_refs?.length ?? 0,
           draft: source.kind === 'content' ? undefined : source.kind,
           previewLeaf: source.kind === 'preview' && source.expandable.get(node.id) === false,
+          // 视觉元素原样带过去：只有已应用的那棵树才画（候选/预览用弱化样式，
+          // 它们的颜色会让"这是一份提案"这件事变得模糊）。
+          color: editable ? node.color ?? undefined : undefined,
+          icon: editable ? node.icon ?? undefined : undefined,
+          // 高亮只在"画布上这棵树 + 有候选"时成立，所以它天然只对 content 生效。
+          changed: changedNodeIds.value.has(node.id),
         },
       } satisfies MindFlowNode;
     });
@@ -965,6 +1089,33 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 左侧说"被 5 个节点引用"、而其中 3 个根本不在导图里。
    */
   const refIndex = computed(() => buildRefIndex(content.value?.root ?? null));
+
+  /**
+   * 待确认候选相对画布的改动清单；`create` 意图（没有基线）为 `null`。
+   *
+   * 只在"候选是当前树上的改动"时有意义，而那条判据就是 `candidateIntent`：
+   * `create` 的候选是一份新作品，谈差异无从谈起。`candidateIntent` 是个普通
+   * `let`（不参与响应式），但它只在 `candidate.value` 被赋值的同时变化，
+   * 所以把 `candidate` 读进来就能保证这个 computed 在该重算时重算。
+   */
+  const candidateDiff = computed<CandidateChange[] | null>(() => {
+    const next = candidate.value;
+    if (!next) return null;
+    if (candidateIntent === 'create') return null;
+    return diffCandidate(content.value?.root ?? null, next.root);
+  });
+
+  /**
+   * 画布上要**高亮**的节点 id：候选改动过、且在当前树里还存在的那些。
+   *
+   * 新增的节点没有 id 可高亮（它在 `content` 里根本不存在），删除的节点还在
+   * `content` 里所以能高亮——那正是"这个节点会消失，你看一眼再决定"。
+   */
+  const changedNodeIds = computed<Set<string>>(() => {
+    const diff = candidateDiff.value;
+    if (!diff) return new Set<string>();
+    return new Set(diff.filter(item => item.kind !== 'added').map(item => item.id));
+  });
 
   /**
    * "把某个节点挪到视野中心"的触发计数。
@@ -1149,6 +1300,41 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     if (!applyContent({ ...content.value, root: setNodeNote(content.value.root, id, next) }, true)) return;
     status.value = next ? '已修改正文，记得保存。' : '已清空正文，只保留标题，记得保存。';
+  }
+
+  /**
+   * 改节点的语义色与图标（详情面板上的两个控件）。
+   *
+   * 与改标题、改备注同一套语义：内容没变就什么都不做（不记撤销、不置脏），
+   * 变了才是**一次可撤销的内容修改**——换颜色凭什么不能 Ctrl+Z 退回去。
+   *
+   * 传 `null` 是显式清除（选「默认」就是清掉颜色）；要"不动"就别传这个字段。
+   * 图标按码点截到契约上限（`LIMITS.icon`），空串归一成 `null`：一个只含空格的
+   * 图标在画布上什么都不显示，却会让"有没有图标"这件事变成两个分支。
+   */
+  function setNodeVisualById(
+    id: string,
+    patch: { color?: NodeColor | null; icon?: string | null },
+  ): void {
+    if (!content.value) return;
+    const node = findNode(content.value.root, id);
+    if (!node) return;
+
+    const nextColor = patch.color === undefined ? node.color ?? null : patch.color;
+    const nextIcon = patch.icon === undefined
+      ? node.icon ?? null
+      : (() => {
+        const text = (patch.icon ?? '').trim();
+        return text ? Array.from(text).slice(0, LIMITS.icon).join('') : null;
+      })();
+
+    if ((node.color ?? null) === nextColor && (node.icon ?? null) === nextIcon) return;
+
+    if (!applyContent(
+      { ...content.value, root: setNodeVisual(content.value.root, id, nextColor, nextIcon) },
+      true,
+    )) return;
+    status.value = '已修改样式，记得保存。';
   }
 
   function renameTitle(title: string) {
@@ -1995,6 +2181,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     selectedNode,
     selectedRefs,
     refIndex,
+    // 候选 diff：`edit` / `expand` 意图的确认界面靠它说清"改了哪几个节点"
+    candidateDiff,
+    changedNodeIds,
     focusTick,
     breadcrumb,
     canUndo,
@@ -2015,6 +2204,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     endEdit,
     commitLabel,
     commitNote,
+    setNodeVisualById,
     renameTitle,
     addChildTo,
     addSiblingTo,

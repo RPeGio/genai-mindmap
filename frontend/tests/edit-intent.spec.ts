@@ -1,0 +1,243 @@
+import { mount, type VueWrapper } from '@vue/test-utils';
+import { createPinia, setActivePinia, type Pinia } from 'pinia';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import App from '../src/App.vue';
+import AgentPanel from '../src/components/AgentPanel.vue';
+import type { MindMapContent } from '../src/api/types';
+import { useMindMapStore } from '../src/stores/mindmap';
+
+// jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这一组用例只关心
+// 「改这张图」入口与候选 diff，画布换成占位元素。
+vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
+  default: { name: 'MindMapCanvasStub', template: '<div data-test="canvas" />' },
+}));
+
+const EDIT_INPUT = 'input[aria-label="改这张图"]';
+
+/** 把若干事件包成 SSE 帧，模拟后端 /api/agent/runs/stream。 */
+function agentReply(frames: unknown[]): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const frame of frames) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+  return { ok: true, status: 200, body, json: async () => ({}) } as unknown as Response;
+}
+
+function stubFetch(reply: () => Response) {
+  const calls: Array<{ url: string; body: unknown }> = [];
+  const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    return reply();
+  });
+  vi.stubGlobal('fetch', mock);
+  return calls;
+}
+
+const BASE: MindMapContent = {
+  title: '示例',
+  root: {
+    id: 'root', label: '根', children: [
+      { id: 'a', label: '甲', children: [] },
+      { id: 'b', label: '乙', children: [] },
+      { id: 'c', label: '丙', children: [] },
+    ],
+  },
+};
+
+/** 模型改完的树：甲改了标题与颜色，丙被删掉，另外新增一个节点。 */
+const EDITED: MindMapContent = {
+  title: '示例',
+  root: {
+    id: 'root', label: '根', children: [
+      { id: 'a', label: '甲（拆细）', color: 'purple', children: [] },
+      { id: 'b', label: '乙', children: [] },
+      { id: 'd', label: '新增的要点', children: [] },
+    ],
+  },
+};
+
+function mountApp(): VueWrapper {
+  return mount(App, { global: { plugins: [createPinia()] } });
+}
+
+beforeEach(() => {
+  setActivePinia(createPinia());
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('画布上方的「改这张图」入口', () => {
+  it('没有导图时禁用，并说明原因', async () => {
+    const wrapper = mountApp();
+    const input = wrapper.find(EDIT_INPUT);
+    expect(input.exists()).toBe(true);
+    expect((input.element as HTMLInputElement).disabled).toBe(true);
+    expect(wrapper.text()).toContain('先生成或打开一张导图');
+  });
+
+  it('有导图时打字 + 点按钮，发出 intent=edit 且带上当前树', async () => {
+    const calls = stubFetch(() => agentReply([
+      { type: 'done', seq: 2, content: EDITED },
+    ]));
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(structuredClone(BASE), 'right');
+    await wrapper.vm.$nextTick();
+
+    await wrapper.find(EDIT_INPUT).setValue('把第三支拆细一点');
+    const button = wrapper.findAll('button').find(item => item.text().includes('让它改'));
+    expect(button).toBeTruthy();
+    await button!.trigger('click');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/agent/runs/stream');
+    const body = calls[0].body as Record<string, unknown>;
+    expect(body.intent).toBe('edit');
+    expect(body.goal).toBe('把第三支拆细一点');
+    // edit 必须带 snapshot：后端要在客户端这棵树上改，而它可能有一堆没保存的编辑
+    expect((body.snapshot as MindMapContent).root.id).toBe('root');
+  });
+
+  it('回车也能提交', async () => {
+    const calls = stubFetch(() => agentReply([{ type: 'done', seq: 2, content: EDITED }]));
+    const wrapper = mountApp();
+    useMindMapStore().preview(structuredClone(BASE), 'right');
+    await wrapper.vm.$nextTick();
+
+    const input = wrapper.find(EDIT_INPUT);
+    await input.setValue('把甲改名');
+    await input.trigger('keydown', { key: 'Enter' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(calls).toHaveLength(1);
+    expect((calls[0].body as Record<string, unknown>).intent).toBe('edit');
+  });
+
+  it('空输入不发请求', async () => {
+    const calls = stubFetch(() => agentReply([{ type: 'done', seq: 1 }]));
+    const wrapper = mountApp();
+    useMindMapStore().preview(structuredClone(BASE), 'right');
+    await wrapper.vm.$nextTick();
+
+    const input = wrapper.find(EDIT_INPUT);
+    await input.setValue('   ');
+    await input.trigger('keydown', { key: 'Enter' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('侧栏改样式', () => {
+  it('下拉框里选颜色、输入框里写图标都写回 content，并可撤销', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const store = useMindMapStore();
+    store.preview(structuredClone(BASE), 'right');
+    store.select('a');
+    const wrapper = mount(App, { global: { plugins: [pinia] } });
+    await wrapper.vm.$nextTick();
+
+    const select = wrapper.find('select[aria-label="节点颜色"]');
+    expect(select.exists()).toBe(true);
+    // 选项是调色板的 8 个键 + 一个"默认"
+    expect(select.findAll('option')).toHaveLength(9);
+    await select.setValue('purple');
+    expect(store.content!.root.children[0].color).toBe('purple');
+
+    const icon = wrapper.find('input[aria-label="节点图标"]');
+    await icon.setValue('🎯');
+    await icon.trigger('change');
+    expect(store.content!.root.children[0].icon).toBe('🎯');
+
+    // 选「默认」等于清除颜色（不是"不动"）
+    await select.setValue('');
+    expect(store.content!.root.children[0].color).toBeNull();
+
+    // 两次改动都可撤销：第一次撤销回紫色，第二次回到"没有颜色"
+    store.undo();
+    expect(store.content!.root.children[0].color).toBe('purple');
+  });
+});
+
+describe('候选确认能看到改动', () => {
+  /**
+   * 跑一次 edit 意图，拿到候选（`done` 帧直接给修改后的整棵树）。
+   *
+   * 返回**这一个** pinia：面板必须挂在同一个 store 实例上，否则它看到的是
+   * 另一个空的 store（候选为 null，diff 永远不出现），而用例会以"元素找不到"
+   * 的形式失败——那种失败看起来像组件写错了。
+   */
+  async function runEdit(): Promise<{ store: ReturnType<typeof useMindMapStore>; pinia: Pinia }> {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(EDITED) }]));
+    const store = useMindMapStore();
+    store.preview(structuredClone(BASE), 'right');
+    await store.runGeneration('把第三支拆细一点', 'edit');
+    return { store, pinia };
+  }
+
+  it('面板列出「这次改动」，逐条写清改了什么', async () => {
+    const { pinia } = await runEdit();
+    const wrapper = mount(AgentPanel, { global: { plugins: [pinia] } });
+    await wrapper.vm.$nextTick();
+
+    const section = wrapper.find('[aria-label="这次改动"]');
+    expect(section.exists()).toBe(true);
+    expect(section.text()).toContain('修改');
+    expect(section.text()).toContain('甲（拆细）');
+    expect(section.text()).toContain('新增');
+    expect(section.text()).toContain('删除');
+    // 颜色的变化要能看出来（否则用户只知道"改了"，不知道改成什么色）
+    expect(section.text()).toContain('purple');
+  });
+
+  it('点一条改动会把画布选中到那个节点', async () => {
+    const { store, pinia } = await runEdit();
+    const wrapper = mount(AgentPanel, { global: { plugins: [pinia] } });
+    store.select(null);
+    await wrapper.vm.$nextTick();
+
+    const entry = wrapper.findAll('[aria-label="这次改动"] button')
+      .find(item => item.text().includes('甲（拆细）'));
+    expect(entry).toBeTruthy();
+    await entry!.trigger('click');
+    expect(store.selectedId).toBe('a');
+  });
+
+  it('create 意图没有可比基线：不显示改动清单', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(EDITED) }]));
+    const store = useMindMapStore();
+    await store.runGeneration('做一张新图', 'create');
+    const wrapper = mount(AgentPanel, { global: { plugins: [pinia] } });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[aria-label="这次改动"]').exists()).toBe(false);
+  });
+
+  it('改动作数为 0 时说"一模一样"，而不是空区块', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(BASE) }]));
+    const store = useMindMapStore();
+    store.preview(structuredClone(BASE), 'right');
+    await store.runGeneration('随便改改', 'edit');
+    const wrapper = mount(AgentPanel, { global: { plugins: [pinia] } });
+    await wrapper.vm.$nextTick();
+
+    const section = wrapper.find('[aria-label="这次改动"]');
+    expect(section.exists()).toBe(true);
+    expect(section.text()).toContain('一模一样');
+  });
+});

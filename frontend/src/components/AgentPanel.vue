@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
-import { agentToolLabel, useMindMapStore, type PreviewNode } from '../stores/mindmap';
+import { agentToolLabel, useMindMapStore, type CandidateChange, type PreviewNode } from '../stores/mindmap';
 
 /**
  * agent 运行面板：工具进度、候选骨架、候选确认、丢弃。
@@ -167,6 +167,47 @@ const previewTitle = computed(() => {
 const canAccept = computed(() => store.candidate !== null && !store.agentRunning);
 
 /**
+ * 待确认候选相对画布的改动清单（`edit` / `expand` 意图）。
+ *
+ * `null` 表示"没有可比基线"（`create` 是一整张新图，谈差异无从谈起），
+ * 空数组表示"算出来了，但一处都没改"——两者必须分开：前者要显示"这是新图"，
+ * 后者要显示"这次什么都没改"，否则用户面对一个"候选已就绪"看不出该不该点。
+ */
+const diff = computed<CandidateChange[] | null>(() => store.candidateDiff);
+
+/** 改动清单最多列几条：再往下列就不是"确认一下"，而是让用户读变更日志。 */
+const DIFF_LIMIT = 8;
+const shownDiff = computed(() => (diff.value ?? []).slice(0, DIFF_LIMIT));
+const hiddenDiff = computed(() => Math.max(0, (diff.value?.length ?? 0) - shownDiff.value.length));
+
+/** 四种改动的中文标签。用徽标而不是句子：一屏能扫完"哪几处被动了"。 */
+const DIFF_LABELS: Record<CandidateChange['kind'], string> = {
+  added: '新增',
+  removed: '删除',
+  updated: '修改',
+  moved: '移动',
+};
+
+/** 颜色也在这里区分一次：删除用玫红，新增用翠绿，其余中性。 */
+const DIFF_CLASS: Record<CandidateChange['kind'], string> = {
+  added: 'bg-emerald-100 text-emerald-700',
+  removed: 'bg-rose-100 text-rose-700',
+  updated: 'bg-amber-100 text-amber-800',
+  moved: 'bg-sky-100 text-sky-700',
+};
+
+/**
+ * 点一条改动就跳到那个节点。
+ *
+ * 新增的节点在画布上还不存在（画布画的是已应用的 `content`），`locate` 会静默
+ * 不选中它——这是刻意的：为了跳转方便就往 `content` 里塞一个预览节点，等于让
+ * "画布上有什么"和"用户的作品是什么"分叉。
+ */
+function jumpTo(id: string) {
+  store.locate(id);
+}
+
+/**
  * 结果不完整的证据：partial 标记单独摆在标题行，诊断逐条列 message。
  *
  * 后端在 `ok=true` 的同时给出这些信息，界面只认 ok 的话，「3 个分支失败」
@@ -314,6 +355,40 @@ function cancel() {
       <p v-if="hiddenBranches > 0" class="mt-1 text-[11px] text-slate-400">
         ……还有 {{ hiddenBranches }} 个分支
       </p>
+    </details>
+
+    <!--
+      这次改动：`edit` / `expand` 意图的候选是"在当前树上的改动"，而画布优先渲染
+      已应用的那棵树（用户的作品），所以候选节点根本不在画布上。没有这份清单，
+      用户面对「候选已就绪」只能盲点「应用」——他不知道 agent 动了哪几个节点。
+      清单是**对比两份树算出来的**（`stores/mindmap.diffCandidate`），不是按收到的
+      op 帧记账：op 帧可能丢、也可能被主动丢弃，而"树到底哪里不一样"永远算得出来。
+    -->
+    <details
+      v-if="store.candidate && diff"
+      open
+      class="mt-2 rounded bg-white px-2 py-1"
+      aria-label="这次改动"
+    >
+      <summary class="cursor-pointer font-medium text-slate-700">
+        这次改动（{{ diff.length }} 处）
+      </summary>
+      <p v-if="!diff.length" class="mt-1 text-[11px] text-slate-400">
+        候选和当前画布一模一样，没有改动。
+      </p>
+      <ul v-else class="mt-1 flex flex-col gap-1 text-[11px] leading-relaxed">
+        <li v-for="item in shownDiff" :key="`${item.kind}:${item.id}`" class="break-words">
+          <span class="mr-1 rounded px-1" :class="DIFF_CLASS[item.kind]">{{ DIFF_LABELS[item.kind] }}</span>
+          <button
+            type="button"
+            class="text-left text-slate-700 underline decoration-slate-300 hover:text-slate-900"
+            :title="`在画布上定位「${item.label}」`"
+            @click="jumpTo(item.id)"
+          >{{ item.label }}</button>
+          <span class="ml-1 text-slate-400">{{ item.detail }}</span>
+        </li>
+      </ul>
+      <p v-if="hiddenDiff > 0" class="mt-1 text-[11px] text-slate-400">……还有 {{ hiddenDiff }} 处</p>
     </details>
 
     <div v-if="canAccept" class="mt-2 flex flex-col gap-1">

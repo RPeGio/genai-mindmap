@@ -40,6 +40,8 @@ from app.agent.ops import (
     TEMP_ID_PREFIX,
     apply_ops,
     find_node,
+    find_parent,
+    is_descendant,
     new_node_id,
     normalize_ops,
 )
@@ -49,9 +51,14 @@ from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import (
     GENERATED_LABEL_MAX_CHARS,
     MAX_NODE_DETAIL_CHARS,
+    MAX_NODE_ICON_CHARS,
+    MAX_TREE_NODES,
+    NODE_COLORS,
     MindMapContent,
     Node,
     clip_label,
+    normalize_color,
+    normalize_icon,
 )
 from app.contracts.ops import OpBatch, OpError
 from app.contracts.source import Source, SourceKind, SourceMetadata, SourceUsage
@@ -550,15 +557,20 @@ class RagArgs(BaseModel):
 
 
 class EditChange(BaseModel):
-    """第一版只允许改标题文字。
+    """批量工具（`mindmap_edit`）单条 update 允许改的字段。
 
-    引用（`source_refs`）刻意不开放：模型给节点加一条引用就必须逐字匹配原文，
-    而这一步在生成路径上已经由 `validate_generated_content` 做过了；编辑路径
-    再开一个入口，等于多一条能凭空造引用的路。
+    只到 `label` / `detail` / `color` / `icon` 为止。引用（`source_refs`）刻意
+    不开放：模型给节点加一条引用就必须逐字匹配原文，而这一步在生成路径上已经由
+    `validate_generated_content` 做过了；编辑路径再开一个入口，等于多一条能凭空
+    造引用的路。契约层的 `UpdateChanges` 保留了 `source_refs`（导入与原生编辑要
+    它），**这一层才是模型看到的那一层**——少一个字段，模型连"能不能改"都不用猜。
     """
 
     model_config = ConfigDict(extra="forbid")
-    label: str = Field(min_length=1, max_length=200)
+    label: str | None = Field(default=None, min_length=1, max_length=200)
+    detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
+    color: str | None = Field(default=None, max_length=20)
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
 
 
 class EditOp(BaseModel):
@@ -570,11 +582,104 @@ class EditOp(BaseModel):
     index: int | None = Field(default=None, ge=0)
     label: str | None = Field(default=None, max_length=200)
     changes: EditChange | None = None
+    # `add` 用的三个字段，也接受写在顶层供 `update` 使用（`_edit` 会把它们收进
+    # `changes`）：实测模型更愿意把要改的字段平铺在 op 上而不是塞进 `changes`，
+    # 那种写法被拒之后它下一轮才改得对——但要多花一次调用和几秒。
+    detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
+    color: str | None = Field(default=None, max_length=20)
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
 
 
 class EditArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ops: list[EditOp] = Field(min_length=1, max_length=100)
+
+
+class AddNodeArgs(BaseModel):
+    """`add_node`：在父节点下加**一个**子节点。"""
+
+    model_config = ConfigDict(extra="forbid")
+    parent_id: str = Field(min_length=1, max_length=100, description="父节点 id，取自当前大纲")
+    label: str = Field(
+        min_length=1, max_length=200,
+        description=f"新节点的标题，一句话短语，建议不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号",
+    )
+    detail: str | None = Field(
+        default=None, max_length=MAX_NODE_DETAIL_CHARS,
+        description="可选：这个节点的 2–3 句说明，长内容放这里而不是塞进 label",
+    )
+    index: int | None = Field(
+        default=None, ge=0,
+        description="可选：插到父节点下的第几位（0 起）；省略＝追加到末尾",
+    )
+    color: str | None = Field(
+        default=None, max_length=20,
+        description=f"可选：语义色，只能取 {'/'.join(NODE_COLORS)} 之一",
+    )
+    icon: str | None = Field(
+        default=None, max_length=MAX_NODE_ICON_CHARS,
+        description="可选：一个 emoji 图标（一级分支才需要）",
+    )
+
+    @field_validator("color")
+    @classmethod
+    def color_in_palette(cls, value: str | None) -> str | None:
+        return _check_color_arg(value)
+
+    @field_validator("icon")
+    @classmethod
+    def icon_is_emoji(cls, value: str | None) -> str | None:
+        return _check_icon_arg(value)
+
+
+class UpdateNodeArgs(BaseModel):
+    """`update_node`：改一个节点的字段（至少给一个）。
+
+    没有 `source_refs`：引用只由生成路径写（理由见 `EditChange` 的 docstring）。
+    这个"没有"是刻意的——参数模型是 `extra="forbid"`，模型硬塞一个
+    `source_refs` 会被判参数不合法，而不是被静默忽略。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=100, description="要改的节点 id")
+    label: str | None = Field(default=None, min_length=1, max_length=200, description="新的标题")
+    detail: str | None = Field(
+        default=None, max_length=MAX_NODE_DETAIL_CHARS,
+        description="新的说明；传空串表示清空详情",
+    )
+    color: str | None = Field(
+        default=None, max_length=20,
+        description=f"新的语义色（{'/'.join(NODE_COLORS)} 之一）；传空串表示去掉颜色",
+    )
+    icon: str | None = Field(
+        default=None, max_length=MAX_NODE_ICON_CHARS,
+        description="新的 emoji 图标；传空串表示去掉图标",
+    )
+
+    @field_validator("color")
+    @classmethod
+    def color_in_palette(cls, value: str | None) -> str | None:
+        return _check_color_arg(value)
+
+    @field_validator("icon")
+    @classmethod
+    def icon_is_emoji(cls, value: str | None) -> str | None:
+        return _check_icon_arg(value)
+
+
+class RemoveNodeArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=100, description="要删的节点 id（根节点不可删）")
+
+
+class MoveNodeArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=100, description="要移动的节点 id")
+    new_parent_id: str = Field(min_length=1, max_length=100, description="新的父节点 id")
+    index: int | None = Field(
+        default=None, ge=0,
+        description="可选：在新父节点下的第几位（0 起）；省略＝追加到末尾",
+    )
 
 
 # ---------------------------------------------------------------- 辅助
@@ -744,30 +849,73 @@ def _node_ids(root) -> set[str]:
     return seen
 
 
-def _skeleton_titles(raw: Any) -> list[str]:
-    """从骨架响应里取出分支标题，剔除空项，超长截到 16 字。
+@dataclass(frozen=True)
+class _SkeletonBranch:
+    """骨架里的一条一级分支：标题 + 它的视觉元素。
 
-    只接受字符串：`{"branches":[{"label":"x"}]}` 说明模型没照格式写，硬转字符串
-    会把一整个 dict 的 repr 当成节点标题挂到树上——那种"成功"比失败更难发现。
+    `color` / `icon` 是**只属于一级分支**的标记（见 `PLAN_PROMPT`）：一棵 80 节点
+    的树如果每个节点都有图标，图标就不再指示任何东西，只是把画布弄花。所以这两个
+    字段只由骨架解析产出，展开路径（`_slot_from`）根本不读它们——不读比"读了再
+    丢掉"更彻底：代码里没有那条路，模型写多少都不会漏到树上。
+    """
 
-    截断长度改成 `GENERATED_LABEL_MAX_CHARS`（16）：骨架标题就是画布上的一级
-    分支，它与其余节点受同一条限制。**不做二次校验**——模型偶尔写长一点不该判整
-    次失败（那会浪费一次已经完成的骨架调用），截断后仍是一棵合法的树。
+    label: str
+    color: str | None = None
+    icon: str | None = None
+
+
+def _skeleton_branches(raw: Any) -> list[_SkeletonBranch]:
+    """从骨架响应里取出分支（标题 + 可选 color/icon），剔除空项，标题截到 16 字。
+
+    两种形状都收，因为它们在真实运行里都会出现：
+
+      - `{"branches":[{"label":"甲","color":"blue","icon":"🎯"}]}`：要视觉元素时的格式；
+      - `{"branches":["甲","乙"]}`：纯字符串。老模型、老 mock、以及"模型没照格式写"
+        都会退化成它，硬拒等于把一次已经花掉的骨架调用判死。
+
+    只接受字符串或带 `label` 的 dict：`{"branches":[{"name":"x"}]}` 说明模型没照
+    格式写，硬转字符串会把一整个 dict 的 repr 当成节点标题挂到树上——那种"成功"
+    比失败更难发现。
+
+    截断长度是 `GENERATED_LABEL_MAX_CHARS`（16）：骨架标题就是画布上的一级分支，
+    它与其余节点受同一条限制。**不做二次校验**——模型偶尔写长一点不该判整次失败，
+    截断后仍是一棵合法的树。
+
+    `color` / `icon` 走**归一化而不是拒绝**（`normalize_color` / `normalize_icon`）：
+    一个 `color:"深蓝"` 说明模型没照提示词写，但它产出的结构本身是好的——
+    为一个装饰字段把整次骨架判失败，代价方向完全错了。
     """
     if not isinstance(raw, dict):
         return []
     items = raw.get("branches")
     if not isinstance(items, list):
         return []
-    titles: list[str] = []
+    branches: list[_SkeletonBranch] = []
     for item in items:
-        if not isinstance(item, str):
+        if isinstance(item, str):
+            label = clip_label(item.strip())
+            if label:
+                branches.append(_SkeletonBranch(label))
             continue
-        title = clip_label(item.strip())
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        if not isinstance(label, str):
+            continue
+        title = clip_label(label.strip())
         if not title:
             continue
-        titles.append(title)
-    return titles
+        branches.append(_SkeletonBranch(
+            title,
+            color=normalize_color(item.get("color")),
+            icon=normalize_icon(item.get("icon")),
+        ))
+    return branches
+
+
+def _skeleton_titles(raw: Any) -> list[str]:
+    """只要标题时的便捷入口（诊断、用例与旧调用方读它）。"""
+    return [branch.label for branch in _skeleton_branches(raw)]
 
 
 @dataclass(frozen=True)
@@ -1476,11 +1624,9 @@ def _selection_scope_error(
     if not ctx.request.selected_ids:
         return None
 
-    scope: set[str] = set()
-    for selected in ctx.request.selected_ids:
-        node = find_node(content.root, selected)
-        if node is not None:
-            scope |= _node_ids(node)
+    # 范围的算法只有一份（`_selection_scope`）：四个细粒度工具也问同一个问题，
+    # 两处各写一遍的话，"批量拦得住、细粒度拦不住"只是时间问题。
+    scope = _selection_scope(content, ctx) or set()
     allowed = "、".join(ctx.request.selected_ids)
 
     for index, item in enumerate(args.ops):
@@ -1514,6 +1660,9 @@ EXPAND_PROMPT = (
     f"每个 label 是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
     "detail 是 2–3 句说明，可以带数字与条件。"
     "不要编号，不要解释，不要重复已有子节点，不要编造具体数据、人名或文献。"
+    # 视觉元素只属于一级分支（见 `PLAN_PROMPT`）：这一层写出来也会被忽略，
+    # 明确说一句比让模型自己猜"为什么我写的图标不见了"便宜得多。
+    "这里**不要**给子节点写 color 或 icon：视觉元素只用在骨架的一级分支上。"
     # 旧格式（纯字符串数组）仍然收：老模型、老 mock、以及"模型只写了一半"
     # 这几种情况都会退化成它，硬拒等于把一次可用的响应判死。
     '也接受 {"points":["要点一","要点二"]} 这种旧格式，这时节点没有 detail。'
@@ -1522,15 +1671,35 @@ EXPAND_PROMPT = (
 # 分片生成第一步：只定骨架，不写内容。一次调用同时要求模型「定框架 + 每支展开」，
 # 它会把注意力放在先写出来的那几支上，后面的分支越写越敷衍——这是质量不稳的
 # 直接来源。骨架单独一次调用，模型只需回答「分成哪几块」。
+#
+# `color` / `icon` 只在这一层要，而且**只有这一层**：一级分支是画布上唯一"横向
+# 铺开、需要一眼区分"的行，一根分支一个语义色 + 一个图标，读图的人能靠颜色定位；
+# 二级往下再上色就成了噪音——80 个节点 80 个图标，图标就不再指示任何东西。
+# 这条边界靠代码兜底（`_slot_from` 根本不读这两个字段），提示词只是让模型不要把
+# 力气花在会被丢掉的地方。
 PLAN_PROMPT = (
     "你在为一张思维导图只定一级骨架，不写任何子要点。"
     "只返回一个 JSON 对象，不要代码围栏，格式为 "
-    '{"branches":["分支一","分支二"]}。'
+    '{"branches":[{"label":"分支一","color":"blue","icon":"🎯"},'
+    '{"label":"分支二","color":"amber","icon":"⚠️"}]}。'
     # 16 字与 detail 的那两条是同一批改动：骨架标题**就是**画布上的一级分支，
     # 它比任何节点都更该短。20 字的旧上限画出来已经是两行半。
     f"每条分支是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
     "彼此覆盖的范围不重叠，按逻辑顺序排列；不要编号，不要解释，不要编造具体数据、人名或文献。"
     "材料自带章节时优先采用它们作为一级分支；目录为空或不完整时再自行归纳。"
+    # 视觉元素的规格必须写死，否则模型会给 `#2563eb`、"深蓝"、"🔧⚙️" 这类东西。
+    f"color 与 icon 是给**一级分支**的视觉标记，建议每条分支都给（可选，不必勉强）："
+    f"color 只能取 {' / '.join(NODE_COLORS)} 之一；"
+    f"icon 是**一个** emoji，不超过 {MAX_NODE_ICON_CHARS} 个字符。"
+    "✅ 正确："
+    '{"branches":[{"label":"选题与范围","color":"blue","icon":"🎯"},'
+    '{"label":"数据准备","color":"teal","icon":"📊"}]}'
+    "❌ 错误："
+    '{"branches":[{"label":"选题与范围","color":"#2563eb"},{"label":"数据准备","icon":"放大镜"}]}'
+    "（花括号里那个是十六进制、不在调色板里；icon 写成了文字）"
+    "❌ 错误："
+    '{"branches":[{"label":"选题与范围","color":"blue","icon":"🎯 🔧","children":[{"label":"子项"}]}]}'
+    "（icon 塞了两个 emoji，而且骨架不要写子节点）"
 )
 
 # 骨架提示词里那段"材料自带的章节"的表头。测试用它断言"目录拼进去了没有"，
@@ -1596,7 +1765,12 @@ def _plan_ask(topic: str, branches: int, *, outline: str = "") -> str:
         parts += ["", outline, ""]
     parts.append(f"根据内容实际包含的方面来定一级分支数量，最多 {branches} 条。")
     parts.append("材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。")
-    parts.append("每条不超过 20 字，互不重叠，按逻辑顺序排列。")
+    # 这个数必须与系统提示词和代码截断同源（`GENERATED_LABEL_MAX_CHARS`）。
+    # 这里曾经写死 20：`PLAN_PROMPT` 说 16、`_skeleton_titles` 按 16 截、
+    # 而 user 消息说 20——模型照 user 写，写出来就被截，用户看到的是
+    # 一级分支标题从中间断掉。三条口径现在都读同一个常量。
+    parts.append(
+        f"每条不超过 {GENERATED_LABEL_MAX_CHARS} 字，互不重叠，按逻辑顺序排列。")
     return "\n".join(parts)
 
 
@@ -1623,6 +1797,9 @@ BRANCH_EXPAND_PROMPT = (
     "下级。如果它已经是最小可执行单元、再拆只会重复它自己，就填 false；"
     "如果它还是一句概括、下面明显还有具体内容可写，就填 true。"
     "如实判断，不要为了凑数硬拆，也不要一律填 true。"
+    # 视觉元素只属于一级分支。子节点上写出来会被忽略（`_slot_from` 不读这两个
+    # 字段），所以这里要明确说"别写"——比让它猜"为什么我写的图标不见了"便宜。
+    "不要给子项写 color 或 icon：视觉元素只用在骨架的一级分支上。"
     "不要编号，不要解释，只写这条分支范围内的内容，不要重复同级其他分支，"
     "不要编造具体数据、人名或文献。"
 )
@@ -1643,6 +1820,7 @@ SUBNODE_EXPAND_PROMPT = (
     "每个子项都必须带 expandable 字段，它是布尔值：这个子项还能不能拆出更具体的"
     "下级。已经是最小可执行单元、再拆只会重复它自己的填 false；"
     "明显还有具体内容可写的填 true。如实判断，不要为了凑数硬拆。"
+    "不要给子项写 color 或 icon：视觉元素只用在骨架的一级分支上。"
     "不要编号，不要解释，"
     "只写这个节点范围内的内容，不要重复同一父节点下其他节点的说法，"
     "不要编造具体数据、人名或文献。"
@@ -2377,16 +2555,17 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 
-    titles = _skeleton_titles(raw_plan)
-    if len(titles) < MIN_BRANCHES:
+    branches = _skeleton_branches(raw_plan)
+    if len(branches) < MIN_BRANCHES:
         return _fail(
             "too_few_branches",
-            f"模型只给了 {len(titles)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
-            branches=len(titles),
+            f"模型只给了 {len(branches)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
+            branches=len(branches),
         )
     # 一级分支的条数上限与参数模型同一个常量：模型偶尔会无视"最多 N 条"，
     # 这时最多留 20 条，再多的既不在一级分支的可读区间里，也挤占下层预算。
-    titles = titles[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)]
+    branches = branches[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)]
+    titles = [branch.label for branch in branches]
     # 数量只做宽容校验（允许 ±1）。为了一两条差异整张重来，成本是又一轮全额调用，
     # 而多一条少一条对这张图并不致命；即使超出宽容范围也用实际返回的继续，
     # 只记一条诊断说明"没按要求的条数走"。
@@ -2402,10 +2581,15 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     root_id = new_node_id(taken)
     taken.add(root_id)
     skeleton: list[tuple[str, str]] = []
-    for title in titles:
+    # 分支 id -> 它的视觉元素（color/icon）。单独一张表而不是把 skeleton 扩成四元
+    # 组：`skeleton[index][0]` 是十几处诊断与结果里的"这一支叫什么"，改元数会
+    # 让那些地方全部要跟着改一遍，而它们与视觉元素无关。
+    branch_visual: dict[str, _SkeletonBranch] = {}
+    for branch in branches:
         branch_id = new_node_id(taken)
         taken.add(branch_id)
-        skeleton.append((title, branch_id))
+        skeleton.append((branch.label, branch_id))
+        branch_visual[branch_id] = branch
 
     # 骨架落定的这一刻就把根与一级分支报出去：它们不需要等任何展开调用，而
     # 展开是并发的、动辄十几秒，先让用户看见框架比多等一个字段值不值的问题更值。
@@ -3036,7 +3220,19 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         root=Node(
             id=root_id,
             label=root_label,
-            children=[Node(id=branch_id, label=title, children=[]) for title, branch_id in skeleton],
+            children=[
+                # 一级分支带 `color` / `icon`（骨架那一次要出来的视觉元素，见
+                # `PLAN_PROMPT`）。**只有这一层**：二级往下在建树时一律不带，
+                # 与提示词里那条边界是同一个决定。
+                Node(
+                    id=branch_id,
+                    label=title,
+                    children=[],
+                    color=branch_visual[branch_id].color,
+                    icon=branch_visual[branch_id].icon,
+                )
+                for title, branch_id in skeleton
+            ],
         ),
         source_usage=[
             SourceUsage(source_id=source.id, kind=source.kind,
@@ -4812,6 +5008,472 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     )
 
 
+def _selection_scope(content: MindMapContent, ctx: RunContext) -> set[str] | None:
+    """用户这次允许改的节点集合；没限制时返回 `None`。
+
+    单独抽出来是因为五个工具都要问同一个问题（批量与四个细粒度）。写成
+    「每个工具自己遍历一遍 selected_ids」，两处口径迟早分叉——而分叉的表现是
+    "批量能改、细粒度不能改"这种看起来像 bug 的行为。
+    """
+    if not ctx.request.selected_ids:
+        return None
+    scope: set[str] = set()
+    for selected in ctx.request.selected_ids:
+        node = find_node(content.root, selected)
+        if node is not None:
+            scope |= _node_ids(node)
+    return scope
+
+
+def _scope_guard(content: MindMapContent, ctx: RunContext, target: str) -> ToolResult | None:
+    """细粒度工具的选区内校验：目标不在用户选中的子树里就拒绝。
+
+    与 `_selection_scope_error` 同一套判定（那一个服务于批量的 op 列表），
+    理由也相同：注册表已经按意图裁过工具，但执行层自己再判一次——改错节点是
+    不可逆的（用户手写的分支会被删）。
+    """
+    scope = _selection_scope(content, ctx)
+    if scope is None or target in scope:
+        return None
+    allowed = "、".join(ctx.request.selected_ids)
+    return _fail(
+        "out_of_selection",
+        f"只能改当前选中节点及其子树（{allowed}），{target} 不在范围内。",
+        path=target,
+    )
+
+
+def _commit_drafts(
+    ctx: RunContext, content: MindMapContent, drafts: list[dict[str, Any]],
+) -> tuple[MindMapContent, OpBatch, dict[str, str]] | ToolResult:
+    """把一批草案落成候选树：规范化 id → 建批次 → 原子执行 → 记账。
+
+    **五个写工具共用这一条路**（`mindmap_edit` 与四个细粒度工具）。抽出来不是
+    为了少写几行，而是为了让"原子"这个词只有一个实现：任何一条 op 失败，`apply_ops`
+    丢弃副本、`ctx.candidate` 一个字都不动，调用方拿到的只是一个 `ToolResult` 失败。
+    如果让 `add_node` 自己 `find_node` + `insert`，那"失败时一个 op 都不落"就要靠
+    它自己再实现一遍，而重复实现的那一份迟早与批量那一份不一样。
+
+    返回值三态：成功是 `(树, 批次, id 映射)`，失败是 `ToolResult(ok=False)`。
+    用返回值而不是抛异常，是因为失败信息要**原样回给模型**（`exc.path` 指到具体
+    字段），而它本来就该是一条正常的工具结果。
+    """
+    try:
+        ops, id_map = normalize_ops(drafts, _node_ids(content.root))
+    except ValidationError as exc:
+        detail = "；".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors()[:5]
+        )
+        return _fail("invalid_ops", f"操作列表不合法：{detail}")
+
+    batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
+    try:
+        updated = apply_ops(content, batch)
+    except OpError as exc:
+        # 把执行器的错误原样回给模型：它知道是哪一条、哪个字段错了才能自己改对
+        return _fail(exc.code, f"{exc.path}：{exc.message}", path=exc.path)
+
+    ctx.candidate = updated
+    ctx.batches.append(batch)
+    ctx.revision += 1
+    return updated, batch, id_map
+
+
+def _single_result(
+    ctx: RunContext,
+    updated: MindMapContent,
+    batch: OpBatch,
+    id_map: dict[str, str],
+    content: str,
+    *,
+    changed: Sequence[str] = (),
+    **data: Any,
+) -> ToolResult:
+    """细粒度工具的成功结果：形状与 `_edit` 一致，额外带"这次动了哪些 id"。
+
+    `data` 的键必须与 `_edit` 对齐（`batch` / `batches` / `id_map` / `revision`）：
+    事件流按 `result.data["batches"]` 发 `ops` 帧（`service._run_tool`），少一个键
+    前端就收不到增量——候选树停在原地，而工具回给模型的是一句"已修改"。
+    """
+    return ToolResult(
+        ok=True,
+        content=content,
+        data={
+            "batch": batch,
+            "batches": [batch],
+            "id_map": id_map,
+            "revision": ctx.revision,
+            "node_count": _count_nodes(updated.root),
+            "changed_ids": sorted(set(changed)),
+            **data,
+        },
+    )
+
+
+def _check_color_arg(value: str | None) -> str | None:
+    """工具参数里的 `color`：归一大小写，**非法值直接报错**。
+
+    与生成侧（`normalize_color` 把不认识的键丢掉）方向相反，理由在**上下文**，
+    不在字段本身：
+
+      - 骨架那一次调用已经花掉了，为一个装饰字段把整棵树判失败就是白花钱；
+      - 工具调用可以重来，而"默默不改"是最坏的一种反馈——`ok=true` 但树没变，
+        模型以为换好了颜色，用户看到的是"点了没反应"，两边都不知道发生了什么。
+
+    所以这里给一条能照着做的错误：列出这八个键。空串是**清空**（update 路径），
+    不是错误。
+    """
+    if value is None:
+        return None
+    key = value.strip().lower()
+    if not key:
+        return ""
+    if key not in NODE_COLORS:
+        raise ValueError(
+            f"color 只能是 {'/'.join(NODE_COLORS)} 之一（不是任意十六进制），收到 {value!r}")
+    return key
+
+
+def _check_icon_arg(value: str | None) -> str | None:
+    """工具参数里的 `icon`：必须真的是一个 emoji，否则报错（理由同上）。
+
+    `normalize_icon` 返回 `None` 而输入非空，说明里面含字母或数字——模型把
+    「放大镜」这种**词**写进了 icon。落到树上会变成标题前面挂着四个汉字，
+    看起来像标题的一部分。空串同样是清空。
+    """
+    if value is None:
+        return None
+    text = " ".join(value.split())
+    if not text:
+        return ""
+    if normalize_icon(text) is None:
+        raise ValueError(f"icon 要一个 emoji（例如 🎯 ⚠️ 📊），收到 {value!r}")
+    return text[:MAX_NODE_ICON_CHARS]
+
+
+def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
+    """在父节点下加**一个**子节点。
+
+    与 `mindmap_edit` 的 `add` 是同一条落树路（`_commit_drafts` → `apply_ops`），
+    差别只在参数形态：这里没有 `op` 数组，一次只加一个。这样切的实际收益是**报错
+    更准**——模型写错一个字段时，错误指向的是那次调用本身，而不是"第 3 条 op 的
+    parent_id"。
+
+    限额检查放在这里而不是交给 `apply_ops` 的整树校验：那道兜底会给出
+    `tree_invalid`（"导图最多 1000 个节点"），模型得自己猜到是哪条 op 撞的；
+    这里能直接说"这张图已经有 1000 个节点"。而且 `add_node` 只加一个节点，
+    预检的代价是一次整数比较。
+
+    三种结构上限（节点数 / 层数 / 单节点子数）**都在写树之前**判：越界时
+    `ctx.candidate` 一个字都不动，模型看到的是"这次没加成"，而不是一个半成品。
+    """
+    content = _require_candidate(ctx)
+    if isinstance(content, ToolResult):
+        return content
+
+    scope_error = _scope_guard(content, ctx, args.parent_id)
+    if scope_error is not None:
+        return scope_error
+
+    parent = find_node(content.root, args.parent_id)
+    if parent is None:
+        return _fail("parent_not_found", f"父节点 {args.parent_id} 不存在。")
+    if len(parent.children) >= MAX_CHILDREN:
+        return _fail(
+            "too_many_children",
+            f"节点「{parent.label}」已经有 {len(parent.children)} 个子节点，"
+            f"最多 {MAX_CHILDREN} 个，加不下了。",
+        )
+    node_limit = _node_limit()
+    used = _count_nodes(content.root)
+    if used >= node_limit:
+        return _fail(
+            "too_many_nodes",
+            f"这张图已经有 {used} 个节点，达到上限 {node_limit}，加不了新节点。"
+            "想继续加请先删掉一些节点。",
+            node_count=used, node_limit=node_limit,
+        )
+    depth = _depth_of(content.root,parent.id)
+    if depth is not None and depth + 1 > mindmap_contract.MAX_TREE_DEPTH:
+        return _fail(
+            "too_deep",
+            f"节点「{parent.label}」已经在第 {depth} 层，导图最多 "
+            f"{mindmap_contract.MAX_TREE_DEPTH} 层，它下面加不了子节点。",
+            depth=depth, depth_limit=mindmap_contract.MAX_TREE_DEPTH,
+        )
+
+    index = len(parent.children) if args.index is None else args.index
+    if index > len(parent.children):
+        return _fail(
+            "index_out_of_range",
+            f"父节点「{parent.label}」现有 {len(parent.children)} 个子节点，"
+            f"index 最大为 {len(parent.children)}，收到 {index}。",
+        )
+
+    draft: dict[str, Any] = {
+        "op": "add",
+        # 临时 id 由 `normalize_ops` 换成真实 id：模型手里没有也造不出真实 id，
+        # 写一个像 `n_1` 的名字撞上既有节点的概率远比它想象的高。
+        "id": f"{TEMP_ID_PREFIX}add1",
+        "parent_id": args.parent_id,
+        "index": index,
+        "label": args.label,
+        "detail": args.detail,
+        # 引用一律空：编辑路径不开放引用（`EditChange` 的 docstring 里那条理由）。
+        "source_refs": [],
+        # `color` / `icon` 在参数模型里已经校验并归一（`_check_color_arg` 等）。
+        # 这里只是搬运：再归一一次等于给同一件事留两个实现。
+        "color": args.color,
+        "icon": args.icon,
+    }
+    committed = _commit_drafts(ctx, content, [draft])
+    if isinstance(committed, ToolResult):
+        return committed
+    updated, batch, id_map = committed
+    node_id = id_map.get(f"{TEMP_ID_PREFIX}add1", f"{TEMP_ID_PREFIX}add1")
+
+    summary = (f"已在「{parent.label}」下新增节点「{args.label}」"
+               f"（第 {index + 1} 个，节点 id {node_id}）。")
+    if args.color or args.icon:
+        marks = "、".join(part for part in
+                          (f"颜色 {args.color}" if args.color else "",
+                           f"图标 {args.icon}" if args.icon else "") if part)
+        summary += f"视觉标记：{marks}。"
+    return _single_result(
+        ctx, updated, batch, id_map, summary,
+        changed=[node_id, args.parent_id],
+        node_id=node_id, parent_id=args.parent_id, index=index,
+    )
+
+
+def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
+    """改**一个**节点的字段（至少给一个）。
+
+    `None` = 这一项不动、空串 = 清空该项，两件事必须分开（理由见
+    `contracts.ops.UpdateChanges` 的 docstring）。只给了空白字符串的 `detail`
+    也算"清空"——用户的详情原本就是空白时，归一成 `None` 是一致的。
+
+    这里**不做**节点数/层数检查：改字段不改结构，那些上限与这次操作无关。
+    真正需要拦的只有两件事：节点存在、以及**引用不可改**（`UpdateNodeArgs` 里
+    根本没有 `source_refs`，参数模型的 `extra="forbid"` 会让硬塞进来的那个字段
+    变成一条参数错误，而不是被静默忽略）。
+    """
+    content = _require_candidate(ctx)
+    if isinstance(content, ToolResult):
+        return content
+
+    scope_error = _scope_guard(content, ctx, args.node_id)
+    if scope_error is not None:
+        return scope_error
+
+    node = find_node(content.root, args.node_id)
+    if node is None:
+        return _fail("node_not_found", f"节点 {args.node_id} 不存在。")
+
+    if (args.label is None and args.detail is None
+            and args.color is None and args.icon is None):
+        return _fail(
+            "invalid_ops",
+            "update_node 至少要给一个要改的字段（label / detail / color / icon）。",
+        )
+
+    changes: dict[str, Any] = {}
+    # 变量名不叫 `field`：`dataclasses.field` 在上面被 import 进来了，同名会把它
+    # 遮住（ruff 的 F402 就在守这件事，而它一旦被遮住，下一次有人在本函数里
+    # 写 `field(...)` 会拿到一个字符串）。
+    for name in ("label", "detail", "color", "icon"):
+        value = getattr(args, name)
+        if value is not None:
+            changes[name] = value
+    draft = {"op": "update", "id": args.node_id, "changes": changes}
+
+    committed = _commit_drafts(ctx, content, [draft])
+    if isinstance(committed, ToolResult):
+        return committed
+    updated, batch, id_map = committed
+
+    changed_fields = "、".join(changes)
+    return _single_result(
+        ctx, updated, batch, id_map,
+        f"已更新节点「{node.label}」（{changed_fields}）。",
+        changed=[args.node_id],
+        node_id=args.node_id, changed_fields=sorted(changes),
+    )
+
+
+def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
+    """删一个节点——**连同它的整棵子树**（级联）。
+
+    子树策略为什么是级联，而不是"子节点提升到父节点"或"有子节点就拒绝"：
+
+      1. **与既有语义一致**。`remove` op、前端 Delete 键、`ops.ts` 的
+         `removeNode` 全都是级联。让工具做另一件事，就会看到"模型删 A，前端删 B"
+         这种只有对比两条路才会发现的差异。
+      2. **提升会偷偷改形状**。子节点被挂回父节点时插在哪一位没有正确答案
+         （原来的位置已经不存在了），而层级还可能在提升后超过 8 层直接被契约拒。
+         一次"删一个节点"变成"重排一段树"，是模型没有要求过的事。
+      3. **拒绝不可行**。要先删子节点，模型就得知道子树有多大——它没有"看子树"
+         的工具，只能从上下文里已有的部分猜，猜错就进入"删了一半、报错、再试"
+         的循环，每次都是真实计费。
+      4. **删错了能恢复**。这里有三层：整批原子（失败一个都不落）、候选不落地
+         （用户点「应用」才进画布）、画布撤销栈（前端 50 步）。返回值里还带
+         `removed_nodes`（标题列表），模型可以照着重建。
+
+    根节点不可删：删了就没有导图了。这一条与 `_apply_remove` 一致，只是这里提前
+    给出更好读的理由。
+    """
+    content = _require_candidate(ctx)
+    if isinstance(content, ToolResult):
+        return content
+
+    scope_error = _scope_guard(content, ctx, args.node_id)
+    if scope_error is not None:
+        return scope_error
+
+    if args.node_id == content.root.id:
+        return _fail("cannot_remove_root", "根节点不能删除：删了这张导图就没有中心主题了。")
+    node = find_node(content.root, args.node_id)
+    if node is None:
+        return _fail("node_not_found", f"节点 {args.node_id} 不存在。")
+
+    parent = find_parent(content.root, args.node_id)
+    removed = [item.label for item in _iter_nodes(node)]
+    draft = {"op": "remove", "id": args.node_id}
+
+    committed = _commit_drafts(ctx, content, [draft])
+    if isinstance(committed, ToolResult):
+        return committed
+    updated, batch, id_map = committed
+
+    summary = f"已删除节点「{node.label}」"
+    if len(removed) > 1:
+        # 级联必须说出来：用户看到的是一次"少了一整片"，而模型以为只删了一个。
+        summary += f"及其 {len(removed) - 1} 个子孙节点（共 {len(removed)} 个）"
+    summary += "。画布上可以撤销。"
+    return _single_result(
+        ctx, updated, batch, id_map, summary,
+        changed=[args.node_id] + ([parent.id] if parent is not None else []),
+        removed_nodes=removed,
+        removed_count=len(removed),
+        parent_id=parent.id if parent is not None else None,
+    )
+
+
+def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
+    """把一个节点连同子树挂到另一个父节点下。
+
+    两道结构检查在这里（环由 `apply_ops` 兜底，那一条不需要看深度）：
+
+      - **根节点不能移**：执行器会把它报成 `cycle_detected`（根的每个候选父节点
+        都是它自己或它的子孙），那个码对"我想移动根"这件事毫无指导意义；
+      - **移动后不能超过 8 层**：新父节点的层数 + 这棵子树的高度必须装得下。
+        这一条执行器**不检查**（它只看环），所以不在这里判的话，一棵 6 层的子树
+        挂到第 5 层下面，会在整树校验时才炸成 `tree_invalid`——那时模型已经
+        收到过"已移动"的念头，而代价是一整批白做。
+    """
+    content = _require_candidate(ctx)
+    if isinstance(content, ToolResult):
+        return content
+
+    scope_error = _scope_guard(content, ctx, args.node_id)
+    if scope_error is not None:
+        return scope_error
+    scope_error = _scope_guard(content, ctx, args.new_parent_id)
+    if scope_error is not None:
+        return scope_error
+
+    if args.node_id == content.root.id:
+        return _fail("cannot_move_root", "根节点不能移动：它没有父节点。")
+    node = find_node(content.root, args.node_id)
+    if node is None:
+        return _fail("node_not_found", f"节点 {args.node_id} 不存在。")
+    target = find_node(content.root, args.new_parent_id)
+    if target is None:
+        return _fail("parent_not_found", f"新的父节点 {args.new_parent_id} 不存在。")
+    # 环检测要先做，否则下面那个深度算法会在环上转不出来（子树的高度不再有限）。
+    # `is_descendant` 含自己，"挂到自己"与"挂到自己的子孙"由同一句拦住。
+    if is_descendant(content.root, args.node_id, args.new_parent_id):
+        return _fail(
+            "cycle_detected",
+            f"节点 {args.new_parent_id} 在「{node.label}」的子树里，"
+            "挂过去会形成环，这次没有移动。",
+            path=f"{args.node_id}->{args.new_parent_id}",
+        )
+
+    parent_depth = _depth_of(content.root, args.new_parent_id) or 1
+    height = _subtree_height(node)
+    if parent_depth + height > mindmap_contract.MAX_TREE_DEPTH:
+        return _fail(
+            "too_deep",
+            f"「{node.label}」这一支有 {height} 层，挂到第 {parent_depth} 层的"
+            f"「{target.label}」下面会到第 {parent_depth + height} 层，"
+            f"超过导图上限 {mindmap_contract.MAX_TREE_DEPTH} 层，这次没有移动。",
+            depth=parent_depth + height,
+            depth_limit=mindmap_contract.MAX_TREE_DEPTH,
+        )
+    if len(target.children) >= MAX_CHILDREN and find_parent(content.root, node.id) is not target:
+        return _fail(
+            "too_many_children",
+            f"节点「{target.label}」已经有 {len(target.children)} 个子节点，"
+            f"最多 {MAX_CHILDREN} 个，放不下这一支。",
+        )
+
+    index = len(target.children) if args.index is None else args.index
+    old_parent = find_parent(content.root, args.node_id)
+    if old_parent is not None and old_parent.id == args.new_parent_id:
+        # 同父移动：先摘后插，所以此刻的长度已经少了一个。索引上界按移除后算，
+        # 与 `_apply_move` / 前端 `ops.ts` 是同一条语义。
+        limit = max(0, len(target.children) - 1)
+    else:
+        limit = len(target.children)
+    if index > limit:
+        return _fail(
+            "index_out_of_range",
+            f"新父节点「{target.label}」现有 {len(target.children)} 个子节点，"
+            f"index 最大为 {limit}，收到 {index}。",
+        )
+
+    draft = {"op": "move", "id": args.node_id,
+             "new_parent_id": args.new_parent_id, "index": index}
+    committed = _commit_drafts(ctx, content, [draft])
+    if isinstance(committed, ToolResult):
+        return committed
+    updated, batch, id_map = committed
+
+    summary = f"已把「{node.label}」（含 {_count_nodes(node) - 1} 个子孙节点）移动到「{target.label}」下"
+    summary += f"，位置第 {index + 1} 个。"
+    return _single_result(
+        ctx, updated, batch, id_map, summary,
+        changed=[args.node_id, args.new_parent_id]
+        + ([old_parent.id] if old_parent is not None else []),
+        node_id=args.node_id, parent_id=args.new_parent_id, index=index,
+    )
+
+
+def _subtree_height(node: Node) -> int:
+    """节点自己算一层的子树高度（叶子是 1）。"""
+    return 1 + max((_subtree_height(child) for child in node.children), default=0)
+
+
+def _top_level_changes(item: EditOp) -> dict[str, Any]:
+    """`EditOp` 顶层那四个可改字段里**给了的**那几个。
+
+    单独一个函数是因为它被两处用：`changes` 缺省时（模型把字段平铺在 op 上），
+    以及 `changes` 是空对象但顶层写了字段时（两种写法混用）。两处各写一遍
+    `{k: v for ...}`，加第五个字段时就会漏掉一处，而漏掉的表现是"模型说改了，
+    树没变"。
+    """
+    return {
+        key: value for key, value in (
+            ("label", item.label),
+            ("detail", item.detail),
+            ("color", item.color),
+            ("icon", item.icon),
+        ) if value is not None
+    }
+
+
 async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
     content = _require_candidate(ctx)
     if isinstance(content, ToolResult):
@@ -4837,13 +5499,40 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
         # extra="forbid" 拒掉，那个错误信息对模型毫无指导意义。
         if item.label is not None and item.op != "update":
             draft["label"] = item.label
+        # `detail` / `color` / `icon` 三条同一条规矩：`add` 放在 op 顶层，
+        # `update` 收进 `changes`（模型两种写法都会出现，入口吸收掉比让它下一轮
+        # 改对便宜一次调用）。三条都不在这里校验：契约层（`AddOp` / `UpdateChanges`）
+        # 会把非法值连同字段路径一起报回来，`normalize_ops` 已经把它转成了
+        # `invalid_ops`——在这一层再判一遍就是两处真相。
+        if item.detail is not None and item.op != "update":
+            draft["detail"] = item.detail
+        if item.op != "update":
+            for field in ("color", "icon"):
+                value = getattr(item, field)
+                if value is not None:
+                    draft[field] = value
         if item.changes is not None:
-            draft["changes"] = {"label": item.changes.label}
-        elif item.op == "update" and item.label is not None:
+            draft["changes"] = {
+                key: value for key, value in (
+                    ("label", item.changes.label),
+                    ("detail", item.changes.detail),
+                    ("color", item.changes.color),
+                    ("icon", item.changes.icon),
+                ) if value is not None
+            }
+            # `changes: {}` 但顶层写了字段：模型两种写法混用时的形态。吸收掉，
+            # 否则 `changes` 为空会在契约层报"至少要改一个字段"，而模型明明给了。
+            if not draft["changes"] and item.op == "update":
+                absorbed = _top_level_changes(item)
+                if absorbed:
+                    draft["changes"] = absorbed
+        elif item.op == "update":
             # 实测模型会把 label 直接写在 op 顶层而不是 changes 里。它被拒之后
             # 下一轮能自己改对（错误反馈是有效的），但那要多花一次模型调用和
             # 几秒等待。两种写法都能表达同一件事，就在入口吸收掉。
-            draft["changes"] = {"label": item.label}
+            absorbed = _top_level_changes(item)
+            if absorbed:
+                draft["changes"] = absorbed
 
         # 显式 index 对所有 op 都必须保留。之前只有 add 分支复制了它，
         # move 给了合法 index 反而在契约层报 move.index: Field required。
@@ -4867,28 +5556,15 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
 
         drafts.append(draft)
 
-    try:
-        ops, id_map = normalize_ops(drafts, _node_ids(content.root))
-    except ValidationError as exc:
-        detail = "；".join(
-            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
-            for error in exc.errors()[:5]
-        )
-        return _fail("invalid_ops", f"操作列表不合法：{detail}")
-
-    batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
-    try:
-        updated = apply_ops(content, batch)
-    except OpError as exc:
-        # 把执行器的错误原样回给模型：它知道是第几条、哪个字段错了才能自己改对
-        return _fail(exc.code, f"{exc.path}：{exc.message}", path=exc.path)
+    committed = _commit_drafts(ctx, content, drafts)
+    if isinstance(committed, ToolResult):
+        return committed
+    updated, batch, id_map = committed
+    ops = batch.ops
 
     changed = {op.id for op in ops} | {
         op.new_parent_id for op in ops if op.op == "move" and op.new_parent_id
     }
-    ctx.candidate = updated
-    ctx.batches.append(batch)
-    ctx.revision += 1
     return ToolResult(
         ok=True,
         content=f"已应用 {len(ops)} 条修改，导图现在有 {_count_nodes(updated.root)} 个节点。",
@@ -4915,10 +5591,17 @@ def _batch_id(ctx: RunContext) -> str:
 # `mindmap_generate` 已随 `MINDMAP_SOURCE_MODE=full` 形态一起删除
 # （决策见 `docs/ONE-PATH.md`）。形态不再参与裁剪——有没有来源，模型看到的
 # 生成工具都是同一个。
+#
+# `edit` 给**五个**：四个细粒度（加/改/删/移）外加批量 `mindmap_edit`。
+# 为什么不只留批量：批量的参数是一张 op 表，改一处也要写出 `[{"op":"update",
+# "id":…,"changes":{"label":…}}]` 这一串，而模型的失败模式恰恰在这里——少一个
+# 括号、把 label 写在 op 顶层、把 index 写成字符串。细粒度工具把这些自由度
+# 压成扁平参数，改一处就是一次调用、一处错误。批量留作**五处以上**的兜底：
+# 一次工具调用改十处，在 `max_tool_calls=8` 下这是唯一可行的形状。
 _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
     "create": ("mindmap_generate_deep",),
     "expand": ("node_expand",),
-    "edit": ("mindmap_edit",),
+    "edit": ("add_node", "update_node", "remove_node", "move_node", "mindmap_edit"),
 }
 
 # 会读来源的意图。`create` 不在里面：分片生成在工具内部自己检索（骨架之后每支一次、
@@ -4928,10 +5611,18 @@ _SOURCE_AWARE_INTENTS = ("expand", "edit")
 
 # 注册顺序固定，便于日志与测试对照；用工厂而不是共享实例，避免一个 registry
 # 上的改动影响到另一个（ToolSpec 目前不可变，但这个保证不该靠约定维持）。
+#
+# 细粒度工具排在 `mindmap_edit` **前面**：`specs()` 按注册顺序下发，模型读工具
+# 列表是有先验的，先看到的那几个更容易被选。这一条不是玄学——四个细粒度工具
+# 每个只花一次调用，批量则是"最后手段"，顺序把这条分工又强调了一次。
 _TOOL_ORDER = (
     "mindmap_generate_deep",
     "node_expand",
     "rag_query",
+    "add_node",
+    "update_node",
+    "remove_node",
+    "move_node",
     "mindmap_edit",
 )
 
@@ -4976,9 +5667,69 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
         fn=_rag,
         readonly=True,
     ),
+    # 四个细粒度工具的描述都要写清"一次只改一处"与"什么时候改用批量"：
+    # 分工写在**每个**工具里而不是只写在批量那一个里——模型是逐个读工具决定
+    # 用哪个的，只在批量那边写"改一处请用细粒度"，它在读 add_node 时看不到。
+    "add_node": lambda: ToolSpec(
+        name="add_node",
+        description=(
+            "在指定父节点下加**一个**子节点。原子：成功就落这一个，失败一个都不落。"
+            "要加两个请调用两次，或者改用 mindmap_edit 的批量 add。"
+            f"label 建议不超过 {GENERATED_LABEL_MAX_CHARS} 字（不带句号），长内容放 detail。"
+            f"color 只能取 {'/'.join(NODE_COLORS)} 之一，icon 是一个 emoji；两者都可选。"
+            "取值写错（十六进制、颜色名、把词当图标）会被拒并列出可用的写法。"
+            f"受限：整图 {MAX_TREE_NODES} 节点、{mindmap_contract.MAX_TREE_DEPTH} 层、"
+            f"单节点 {MAX_CHILDREN} 个子节点，越界会被拒并说明原因。"
+        ),
+        args_model=AddNodeArgs,
+        fn=_add_node,
+    ),
+    "update_node": lambda: ToolSpec(
+        name="update_node",
+        description=(
+            "改**一个**节点的字段（label / detail / color / icon，至少给一个）。"
+            '空串表示清空该项：detail="" 清掉详情，color="" / icon="" 摘掉视觉标记。'
+            "颜色只收预设的语义色、图标要一个 emoji，取值写错会被拒（不会「默默不改」）。"
+            "不能改引用（source_refs）：引用只由生成路径写入，编辑路径不开放这个入口。"
+            "不受节点数/层数限制（改字段不改结构）。"
+            "要改多个节点请调用多次，或者改用 mindmap_edit 的批量 update。"
+        ),
+        args_model=UpdateNodeArgs,
+        fn=_update_node,
+    ),
+    "remove_node": lambda: ToolSpec(
+        name="remove_node",
+        description=(
+            "删**一个**节点，**连同它的整棵子树**（级联删除：不把子节点挂到父节点上，"
+            "也不要求先删子节点）。根节点不能删。"
+            "返回里带被删掉的节点标题，删错了可以照着重建；画布上还能撤销。"
+            "想保留子节点，请先用 move_node 把要留的那些挪到别的父节点下。"
+        ),
+        args_model=RemoveNodeArgs,
+        fn=_remove_node,
+    ),
+    "move_node": lambda: ToolSpec(
+        name="move_node",
+        description=(
+            "把**一个**节点连同它的子树挂到另一个父节点下（index 省略＝追加到末尾）。"
+            f"会检查环与层级：挂到自己的子孙下、根节点、或移动后超过 "
+            f"{mindmap_contract.MAX_TREE_DEPTH} 层，都会被拒且一个 op 都不落。"
+        ),
+        args_model=MoveNodeArgs,
+        fn=_move_node,
+    ),
     "mindmap_edit": lambda: ToolSpec(
         name="mindmap_edit",
-        description="按节点 id 精确修改已有导图：增删改节点或移动子树。不要用它整张重建。",
+        description=(
+            "按节点 id 批量修改已有导图：一次提交 1–100 条 op（add / update / remove / move），"
+            "整批原子（任一条失败则整批不生效）。"
+            "**改一两处不要用它**：用 add_node / update_node / remove_node / move_node，"
+            "它们一次只改一处、参数是扁平的、报错指得更准。"
+            "**什么时候用它**：要改五处以上，或者一次改动需要几条有先后关系的 op"
+            "（先建父节点再用它的临时 id 挂子节点）——批量只花一次工具调用，"
+            "而细粒度工具每个节点各花一次。"
+            "不要用它整张重建。"
+        ),
         args_model=EditArgs,
         fn=_edit,
     ),
@@ -4996,7 +5747,10 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     裁剪规则：
       - `create` 只给分片生成（`mindmap_generate_deep`），没有第二个选项
       - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
-      - `edit` 给 `mindmap_edit`，请求带来源时再加 `rag_query`
+      - `edit` 给**五个**写工具（`add_node` / `update_node` / `remove_node` /
+        `move_node` / `mindmap_edit`），请求带来源时再加 `rag_query`。
+        让模型自己选粒度：改一两处用细粒度的（参数扁平、报错更准），改五处以上
+        用批量（一次调用改十处，在 `max_tool_calls=8` 下这是唯一装得下的形状）
       - `expand` / `edit` 在请求带来源时加 `rag_query`：那两条路不读来源，
         模型只能自己查。
       - **不**给 `create`：分片生成在工具内部自己检索（骨架之后每支一次、限额

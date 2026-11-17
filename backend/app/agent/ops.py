@@ -227,6 +227,11 @@ def _apply_add(content: MindMapContent, op: AddOp, base: str) -> None:
         # `detail` 是生成产出的说明，与用户备注 `note` 分开存：这里只带 detail，
         # 永远不碰 note——重新生成一次就把用户敲的字盖掉是最不该发生的那种丢失。
         detail=op.detail,
+        # `color` / `icon` 是可选的视觉元素，缺省 None。空串在这里归一成 None：
+        # `add` 没有"清空"这个语义（新节点本来就没有颜色），把它传成 `""` 会在
+        # 契约层被判非调色板键。
+        color=op.color or None,
+        icon=op.icon,
     ))
 
 
@@ -247,6 +252,14 @@ def _apply_update(content: MindMapContent, op: UpdateOp, base: str) -> None:
     if op.changes.detail is not None:
         detail = op.changes.detail.strip()
         node.detail = detail or None
+    # 视觉元素同一条约定：`None` 不动；空串是**显式清除**。
+    # `color` 在契约层已经归一成调色板键或空串（`ops._palette_color`），这里只把
+    # 空串收成 `None`——不这么做，模型摘掉一个颜色之后树里会留一个 `""`，
+    # 前端读到它就会去查一个不存在的 CSS 变量（画出来是透明/继承色）。
+    if op.changes.color is not None:
+        node.color = op.changes.color or None
+    if op.changes.icon is not None:
+        node.icon = op.changes.icon or None
 
 
 def _apply_remove(content: MindMapContent, op: RemoveOp, base: str) -> None:
