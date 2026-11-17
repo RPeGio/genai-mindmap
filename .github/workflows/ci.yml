@@ -20,7 +20,12 @@ jobs:
       run:
         working-directory: backend
     steps:
+      # 逐字节回归用例要 `git show <基线提交>:path` 把旧模块载进内存比对
+      # （test_edges.py、test_agent_diagram_type.py 等 11 个文件）。浅克隆里
+      # 取不到那些基线提交，用例会直接红；仓库只有几 MiB，拉全量历史最省事。
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v7
         with:
@@ -36,7 +41,6 @@ jobs:
 
       - name: Test
         run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=0
-
       # 前端的契约类型由这份快照生成。忘了重新导出时，本地那条 pytest
       # （tests/test_openapi_snapshot.py）会红；这里再多一层：即便快照更新了，
       # 也要确认提交上去的就是重新生成过的结果，而不是手改的。
