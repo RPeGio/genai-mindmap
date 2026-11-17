@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-16，合入上游 RAG 与知识库入口之后）：后端 1188 个测试（pytest，另有 19 个 subtest）、前端 415 个 vitest 用例（27 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-16，合入上游 RAG 与知识库入口之后）：后端 1192 个测试（pytest，另有 19 个 subtest）、前端 415 个 vitest 用例（27 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -98,7 +98,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml
     mindmaps/          保存 / 读取 / 版本冲突
-  tests/               1188 个测试（另有 19 个 subtest）
+  tests/               1192 个测试（另有 19 个 subtest）
 frontend/
   src/
     App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
