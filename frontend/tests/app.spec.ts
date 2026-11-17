@@ -598,8 +598,63 @@ describe('知识库入口', () => {
     expect(wrapper.text()).toContain('被 2 张导图引用');
     expect(wrapper.text()).toContain('还没有导图引用它');
     expect(wrapper.text()).toContain('旧笔记.md');
-    // 总数来自后端，不是当前列表长度。
-    expect(wrapper.text()).toContain('2');
+    // 总数来自后端，不是当前列表长度：断言整句，免得页面上任何一个 "2" 都能过。
+    expect(wrapper.text()).toMatch(/库里现在有\s*2\s*份/);
+  });
+
+  it('库里超过一页时说明只显示了最近几份', async () => {
+    stubLibrary({
+      total: 137,
+      items: [entry(), entry({ source_id: 'src-2', filename: '旧笔记.md', cited_by: 0 })],
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    // 137 份只显示了 2 条：必须说清楚，否则用户会以为材料丢了。
+    expect(wrapper.text()).toMatch(/库里现在有\s*137\s*份/);
+    expect(wrapper.text()).toMatch(/这里只显示最近\s*2\s*份/);
+  });
+
+  it('Esc 能关掉知识库抽屉，点遮罩也能关', async () => {
+    stubLibrary({ total: 1, items: [entry()] });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    await flushPromises();
+    expect(wrapper.find('[aria-labelledby="library-title"]').exists()).toBe(false);
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    // 声明成模态（aria-modal）就必须有一条"点外面能关"的路。
+    const backdrop = wrapper.findAll('div[aria-hidden="true"]')
+      .find(node => node.classes().includes('inset-0'));
+    expect(backdrop).toBeTruthy();
+    await backdrop!.trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[aria-labelledby="library-title"]').exists()).toBe(false);
+  });
+
+  it('列表标出「最近使用」，创建时间放在 title 里', async () => {
+    stubLibrary({ total: 1, items: [entry()] });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    // 只写一个时间戳会被读成创建时间；这里钉住"最近使用"这几个字与完整 title。
+    expect(wrapper.text()).toContain('最近使用');
+    const stamped = wrapper.find('[title*="最近使用"]');
+    expect(stamped.exists()).toBe(true);
+    expect(stamped.attributes('title')).toContain('收录');
   });
 
   it('点一份材料看正文预览，截断时说明只显示前 4000 字', async () => {

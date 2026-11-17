@@ -256,6 +256,25 @@ describe('agent 运行', () => {
     await running;
   });
 
+  it('心跳不进事件列表：它只驱动等待计时，面板里没人读它', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'stage', seq: 1, stage: '准备' });
+    await vi.waitFor(() => expect(store.agentEvents.map(event => event.type)).toEqual(['stage']));
+
+    stream.push({ type: 'heartbeat', seq: 2, waited_ms: 10200 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(10));
+    // 计时更新了，但心跳不进数组：长静默会累积几十帧，每帧整数组复制没必要。
+    expect(store.agentEvents.map(event => event.type)).toEqual(['stage']);
+
+    stream.push(doneFrame(content()));
+    stream.finish();
+    await running;
+  });
+
   it('取消之后等待计时归零：不能一边说已取消、一边说还在思考', async () => {
     const stream = controllableReply();
     vi.stubGlobal('fetch', vi.fn(async () => stream.response));

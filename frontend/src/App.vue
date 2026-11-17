@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
@@ -270,13 +270,24 @@ const libraryPreviewBusy = ref(false);
 const libraryPreviewError = ref('');
 /** 只让最后点开的那一份落地：连续点两份时，慢的响应不能盖掉后点的。 */
 let libraryPreviewToken = 0;
+/**
+ * 抽屉声明了 `aria-modal`，就得按模态对待：打开时焦点移进去，Tab 圈在里面，
+ * 关闭时还给原来那个按钮——否则键盘用户能 Tab 到背后的画布上。
+ */
+const libraryPanel = ref<HTMLElement | null>(null);
+const libraryCloseButton = ref<HTMLButtonElement | null>(null);
+let libraryOpener: HTMLElement | null = null;
 
 async function openLibrary(): Promise<void> {
+  // 记下是谁打开的：关闭时焦点要还回去。
+  libraryOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   libraryOpen.value = true;
   libraryPreview.value = null;
   libraryOpening.value = null;
   libraryPreviewError.value = '';
   await loadLibrary();
+  await nextTick();
+  libraryCloseButton.value?.focus();
 }
 
 async function loadLibrary(): Promise<void> {
@@ -324,6 +335,35 @@ function backToLibrary(): void {
 function closeLibrary(): void {
   libraryOpen.value = false;
   backToLibrary();
+  // 焦点还给打开它的按钮；节点可能已经不在 DOM 里（列表刷新过），所以判一下。
+  const opener = libraryOpener;
+  libraryOpener = null;
+  if (opener && opener.isConnected) opener.focus();
+}
+
+/** 把 Tab 圈在抽屉里。返回 true 表示这次按键已被接住。 */
+function trapLibraryFocus(event: KeyboardEvent): boolean {
+  const panel = libraryPanel.value;
+  if (!panel) return false;
+  const focusable = Array.from(panel.querySelectorAll<HTMLElement>(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+  )).filter(element => !element.hasAttribute('disabled'));
+  if (focusable.length === 0) return false;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  const inside = active instanceof HTMLElement && panel.contains(active);
+  if (event.shiftKey && (!inside || active === first)) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && (!inside || active === last)) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
 }
 
 /** 材料被几张已保存导图引用过；0 表示存了但从没进过任何一张图。 */
@@ -337,7 +377,7 @@ function librarySize(entry: LibraryEntry): string {
 
 function formatStamp(value: string): string {
   const when = new Date(value);
-  if (Number.isNaN(when.getTime())) return value;
+  if (Number.isNaN(when.getTime())) return '—';
   return when.toLocaleString('zh-CN', { hour12: false });
 }
 
@@ -397,6 +437,15 @@ function formatTime(iso: string): string {
 
 /** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
 function onKeydown(event: KeyboardEvent) {
+  // 知识库抽屉是模态的：Esc 先关它，Tab 也不能跑到背后的画布上。
+  if (libraryOpen.value) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeLibrary();
+      return;
+    }
+    if (event.key === 'Tab' && trapLibraryFocus(event)) return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     saveNow();
@@ -815,8 +864,17 @@ async function copyBody() {
       </div>
     </aside>
 
+    <!-- 遮罩：点空白处也算关闭。抽屉本身 z-40，盖在它上面 -->
+    <div
+      v-if="libraryOpen"
+      class="fixed inset-0 z-30 bg-slate-900/20"
+      aria-hidden="true"
+      @click="closeLibrary()"
+    />
+
     <aside
       v-if="libraryOpen"
+      ref="libraryPanel"
       class="fixed inset-y-0 right-0 z-40 flex w-[480px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl"
       role="dialog"
       aria-modal="true"
@@ -824,7 +882,12 @@ async function copyBody() {
     >
       <div class="flex items-center justify-between border-b border-slate-100 px-4 py-3">
         <h2 id="library-title" class="text-sm font-semibold">知识库</h2>
-        <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="closeLibrary()">
+        <button
+          ref="libraryCloseButton"
+          type="button"
+          class="text-xs text-slate-500 hover:text-slate-900"
+          @click="closeLibrary()"
+        >
           关闭
         </button>
       </div>
@@ -880,6 +943,10 @@ async function copyBody() {
           <p v-if="!libraryBusy && !libraryListError" class="text-xs leading-relaxed text-slate-500">
             生成时用到的材料会被收进这里，供以后复用。库里现在有
             <strong class="text-slate-700">{{ libraryTotal }}</strong> 份。
+            <!-- 库里超过一页时必须说明"只显示了一部分"，否则用户会以为材料丢了 -->
+            <span v-if="libraryTotal > libraryEntries.length">
+              这里只显示最近 <strong class="text-slate-700">{{ libraryEntries.length }}</strong> 份。
+            </span>
           </p>
           <p v-if="libraryBusy" class="mt-3 text-xs text-slate-400">正在读取…</p>
           <p v-else-if="libraryListError" class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
@@ -897,8 +964,11 @@ async function copyBody() {
               >
                 <span class="min-w-0">
                   <span class="block break-words text-sm text-slate-800">{{ entry.filename || '未命名材料' }}</span>
-                  <span class="mt-0.5 block text-xs text-slate-400">
-                    {{ SOURCE_LABELS[entry.kind] }} · {{ librarySize(entry) }} · {{ formatStamp(entry.last_used_at) }}
+                  <span
+                    class="mt-0.5 block text-xs text-slate-400"
+                    :title="`最近使用：${formatStamp(entry.last_used_at)}；收录：${formatStamp(entry.created_at)}`"
+                  >
+                    {{ SOURCE_LABELS[entry.kind] }} · {{ librarySize(entry) }} · 最近使用 {{ formatStamp(entry.last_used_at) }}
                   </span>
                 </span>
                 <span
