@@ -1,6 +1,6 @@
 """知识库只读入口（`knowledge/shelf.py` + `/api/knowledge/library`）的行为约束。
 
-四组，各自钉一类错误：
+五组，各自钉一类错误：
 
 1. **列表的口径**。`total` 必须是库里的总数而不是本次返回的条数——写成
    `len(items)` 时列表页会显示"共 50 份"，而库里可能有 137 份，用户据此判断
@@ -125,6 +125,16 @@ def test_entry_fields_match_the_stored_material(client):
     assert item["chunks"] > 0
     # 没被任何导图引用过：0，而不是缺字段。
     assert item["cited_by"] == 0
+
+
+@pytest.mark.parametrize("limit", ["0", "-5", "201"])
+def test_list_limit_is_bounded(client, limit):
+    """`limit` 有上下界：0/负数不该被悄悄吞成一条，大值也不该一次拉整库。
+
+    `max(int(limit), 1)` 那种写法会把 `limit=0` 变成"最近 1 份"——调用方分不清
+    "我要一份"和"我写错了"。这里要的是 422，让它自己在请求里改。
+    """
+    assert client.get("/api/knowledge/library", params={"limit": limit}).status_code == 422
 
 
 # ---------------------------------------------------------------- 2 被引用次数

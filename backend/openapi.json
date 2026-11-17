@@ -583,7 +583,7 @@
           "知识增强"
         ],
         "summary": "List Library",
-        "description": "库里的材料列表，最近使用的在前。`total` 是库里的总数，不是返回条数。\n\n只读：不改任何状态，也不刷 `last_used_at`（\"看了一下列表\"不等于\"用到了\n这份材料\"——那个字段是 `prune` 保留与否的依据）。",
+        "description": "库里的材料列表，最近使用的在前。`total` 是库里的总数，不是返回条数。\n\n只读：不改任何状态，也不刷 `last_used_at`（\"看了一下列表\"不等于\"用到了\n这份材料\"——那个字段是 `prune` 保留与否的依据）。\n\n`limit` 有上下界：`ge=1` 让 `limit=0/-5` 直接 422 而不是被悄悄吞成一条，\n`le=200` 防止一次请求把整库都拉出来（库上限就是 200 份，再大没有意义）。",
         "operationId": "list_library_api_knowledge_library_get",
         "parameters": [
           {
@@ -592,6 +592,8 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
               "default": 50,
               "title": "Limit"
             }
@@ -650,6 +652,12 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "库里没有这份材料（`code=not_found`）"
+          },
+          "503": {
+            "description": "知识库暂时读不出来（`code=library_unavailable`）"
           },
           "422": {
             "description": "Validation Error",

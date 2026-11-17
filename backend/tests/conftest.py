@@ -79,6 +79,11 @@ BEHAVIOUR = (
     # 不清的话，宿主机上为 qwen 配过 32768 的机器会把"发出去的 max_tokens"整批改小，
     # `tests/test_budget.py` 与 `test_agent_tools.py` 里断言数值的那几条会随机器漂。
     "MINDMAP_LLM_MAX_TOKENS",
+    # 材料要不要在生成时入库（`knowledge/remember.py`）。**清空而不是置 0**：默认开，
+    # 而"默认开 + 临时库是空的"就是这些用例要验的起点。不清会继承宿主机变量：
+    # 谁在本地设过 `MINDMAP_LIBRARY_REMEMBER=0`，"入库后换 id"那批用例就会集体变红
+    # ——一个只在某些机器上出现的绿/红。
+    "MINDMAP_LIBRARY_REMEMBER",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",

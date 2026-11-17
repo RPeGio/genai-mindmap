@@ -13,7 +13,8 @@
    入库是唯一的写入来源，所以淘汰挂在它后面，但要有两个闸门（条数余量 + 每小时
    一次）并跑在后台线程里——首帧之前不能多一次全表删除。
 
-全部离线：`conftest.py` 已清空凭证、开关置 0，数据库落在本次用例的 `tmp_path`。
+全部离线：`conftest.py` 清空了凭证与外部开关、把 `MINDMAP_LIBRARY_REMEMBER` 也
+一起清空（回到默认开），数据库落在本次用例的 `tmp_path`。
 """
 from __future__ import annotations
 

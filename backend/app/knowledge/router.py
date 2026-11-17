@@ -8,7 +8,7 @@
 `MINDMAP_LIBRARY_SEARCH` 影响——那个开关管的是"生成时要不要从库里捞材料参与"，
 关掉它只应该让生成变回不查库，不该让用户看不见自己库里的东西。
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from app.core.errors import AppError
 from app.knowledge import shelf
@@ -30,16 +30,26 @@ def search_knowledge(body: SearchRequest):
 
 
 @router.get("/library", response_model=shelf.LibraryList)
-def list_library(limit: int = shelf.DEFAULT_LIMIT):
+def list_library(limit: int = Query(shelf.DEFAULT_LIMIT, ge=1, le=200)):
     """库里的材料列表，最近使用的在前。`total` 是库里的总数，不是返回条数。
 
     只读：不改任何状态，也不刷 `last_used_at`（"看了一下列表"不等于"用到了
     这份材料"——那个字段是 `prune` 保留与否的依据）。
+
+    `limit` 有上下界：`ge=1` 让 `limit=0/-5` 直接 422 而不是被悄悄吞成一条，
+    `le=200` 防止一次请求把整库都拉出来（库上限就是 200 份，再大没有意义）。
     """
     return shelf.list_entries(limit=limit)
 
 
-@router.get("/library/{source_id}", response_model=shelf.LibrarySource)
+@router.get(
+    "/library/{source_id}",
+    response_model=shelf.LibrarySource,
+    responses={
+        404: {"description": "库里没有这份材料（`code=not_found`）"},
+        503: {"description": "知识库暂时读不出来（`code=library_unavailable`）"},
+    },
+)
 def read_library_source(source_id: str):
     """单份材料的正文预览（前 4000 字，`truncated` 说明是否截断）。"""
     # 这里用 AppError 而不是 HTTPException：后者会被全局处理器兜成"请求处理失败

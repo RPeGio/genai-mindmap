@@ -154,10 +154,6 @@ class LegacyRouteTest(unittest.TestCase):
         self.assertFalse(response.json()["implemented"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SourcesFrameTest(unittest.TestCase):
     """材料入库后先发一帧 `sources`，把临时 id 换成持久 id。
 
@@ -234,3 +230,7 @@ class SourcesFrameTest(unittest.TestCase):
         # 入库抛的是 sqlite3 错误，被包成 error 帧后仍然以尾。
         self.assertEqual(frames[-1]["type"], "error")
         self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))
+
+
+if __name__ == "__main__":
+    unittest.main()

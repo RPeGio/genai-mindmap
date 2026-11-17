@@ -280,6 +280,9 @@ export interface paths {
          *
          *     只读：不改任何状态，也不刷 `last_used_at`（"看了一下列表"不等于"用到了
          *     这份材料"——那个字段是 `prune` 保留与否的依据）。
+         *
+         *     `limit` 有上下界：`ge=1` 让 `limit=0/-5` 直接 422 而不是被悄悄吞成一条，
+         *     `le=200` 防止一次请求把整库都拉出来（库上限就是 200 份，再大没有意义）。
          */
         get: operations["list_library_api_knowledge_library_get"];
         put?: never;
@@ -1460,6 +1463,13 @@ export interface operations {
                     "application/json": components["schemas"]["LibrarySource"];
                 };
             };
+            /** @description 库里没有这份材料（`code=not_found`） */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1468,6 +1478,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+            /** @description 知识库暂时读不出来（`code=library_unavailable`） */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
