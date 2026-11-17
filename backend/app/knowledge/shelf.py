@@ -83,11 +83,20 @@ def _cited_counts() -> dict[str, int]:
     一次扫全表而不是给每份来源各查一次：来源数最多几百，导图数也是几百，
     逐份查是 N×M 次查询，扫一次是 M 次 JSON 解析。
 
-    解析失败的行跳过并记 warning：导图表里若有一行坏 JSON，不能让它把整个
-    知识库列表打成 500——那份导图本来就该单独排查。
+    这条路是**旁路统计**，不能反过来把入口打挂：单张读不出来的导图跳过并记
+    warning（由 `repository.list_maps(tolerant=True)` 逐行兜住），导图表整个读不
+    出来时返回空计数、列表照常展示（`cited_by` 退化成 0）。真正"坏在哪儿"由列表
+    页/单图接口去暴露，不是这里。
     """
     counts: dict[str, int] = {}
-    for record in repository.list_maps():
+    try:
+        maps = repository.list_maps(tolerant=True)
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("读不到导图表（%s），引用计数按 0 处理：%s",
+                       type(exc).__name__, str(exc)[:160])
+        return counts
+
+    for record in maps:
         content: MindMapContent = record.content
         used = {usage.source_id for usage in content.source_usage}
         stack = [content.root]
@@ -126,16 +135,20 @@ def list_entries(*, limit: int = DEFAULT_LIMIT) -> LibraryList:
 
     库读不出来（表被删、文件被锁）时返回空列表 + `total=0` 并记 warning，
     不抛：入口打不开比入口空着更糟，而这条路上"库坏了"的正确表现就是一条空列表。
+    导图表读不出来、或其中个别行坏掉时，只影响 `cited_by`（按 0 计），不影响列表。
     """
     size = max(int(limit), 1)
     try:
         rows = knowledge_library.list_sources(limit=size)
         total = knowledge_library.count()
+        # 引用计数是旁路展示：它自己会兜住坏行/坏表，这里顺带放在 try 内——
+        # 即便将来它抛了 sqlite 错误，也不该连带把列表变成 500。
+        # 空库不必白扫一遍导图表。
+        cited_by = _cited_counts() if rows else {}
     except (sqlite3.Error, OSError) as exc:
         logger.warning("读不到知识库（%s），列表按空处理：%s",
                        type(exc).__name__, str(exc)[:160])
         return LibraryList(items=[], total=0)
-    cited_by = _cited_counts()
     return LibraryList(
         items=[LibraryEntry.model_validate(_summary(row, cited_by)) for row in rows],
         total=total,

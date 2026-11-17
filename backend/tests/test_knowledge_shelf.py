@@ -10,13 +10,15 @@
    一张图用过它。
 3. **预览要能被识破**。正文超过截断长度时 `truncated` 必须为真，
    `total_chars` 要报全文长度；否则用户会拿前 4000 字当全文。
-4. **库坏了不等于入口挂了**。库读不出来时列表返回空 + `total=0`，不抛 500——
+4. **库坏了不等于入口挂了**。库读不出来时列表返回空 + `total=0`，不抛 500；
+   导图表里有一行坏 JSON 时该行跳过、`cited_by` 按 0 计，列表照常返回——
    这条路上"库坏了"的正确表现是一条空列表，而不是整页打不开。
 
 全部离线：`conftest.py` 已清空凭证、开关置 0、数据库落在本次用例的 `tmp_path`。
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -70,6 +72,15 @@ def _save_map(*, usage: list[str], refs: list[str] = (), title: str = "用到了
         }
     )
     return repository.create_map(content).id
+
+
+def _insert_raw_map(map_id: str, content: str) -> None:
+    """绕过契约直接往导图表塞一行原始 `content`：模拟坏 JSON / 旧版本残留。"""
+    with repository.connect() as conn:
+        conn.execute(
+            "INSERT INTO mindmaps VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (map_id, content),
+        )
 
 
 @pytest.fixture
@@ -208,3 +219,48 @@ def test_missing_source_becomes_404_when_library_breaks(client, monkeypatch):
     monkeypatch.setattr(library, "load", boom)
 
     assert client.get("/api/knowledge/library/任意id").status_code == 404
+
+
+def test_listing_survives_a_corrupt_map_row(client):
+    """导图表里有一行坏 JSON：该行跳过，健康的那张照常计数，入口仍是 200。
+
+    这是 `_cited_counts` docstring 里的承诺：坏数据只该让"它自己那张图"消失，
+    不能把整个知识库列表打成 500。
+    """
+    cited = _ingest(_material(1))
+    _save_map(usage=[cited], title="健康的一张")
+    _insert_raw_map("broken-json", "{这不是 JSON")
+
+    response = client.get("/api/knowledge/library")
+
+    assert response.status_code == 200
+    items = {item["source_id"]: item for item in response.json()["items"]}
+    assert items[cited]["cited_by"] == 1
+
+
+def test_corrupt_map_row_still_surfaces_in_strict_mode(client):
+    """`tolerant` 只给旁路统计用：列表页/单图读取走的严格模式仍然要抛。"""
+    _save_map(usage=[])
+    _insert_raw_map("broken-json", "{这不是 JSON")
+
+    with pytest.raises(json.JSONDecodeError):
+        repository.list_maps()
+    # 同一批数据在容错模式下只剩健康的那张。
+    assert len(repository.list_maps(tolerant=True)) == 1
+
+
+def test_listing_survives_a_broken_mindmap_table(client, monkeypatch):
+    """导图表整个读不出来时，列表照常返回，只是 `cited_by` 一律 0。"""
+    _ingest(_material(1))
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("no such table: mindmaps")
+
+    monkeypatch.setattr(repository, "list_maps", boom)
+
+    response = client.get("/api/knowledge/library")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["items"][0]["cited_by"] == 0

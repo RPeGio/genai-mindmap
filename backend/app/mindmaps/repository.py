@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 from app.contracts.mindmap import MapRecord, MindMapContent, migrate_content
+
+logger = logging.getLogger(__name__)
 
 
 def db_path() -> Path:
@@ -47,10 +50,25 @@ def _record(row: sqlite3.Row) -> MapRecord:
                      updated_at=row["updated_at"])
 
 
-def list_maps() -> list[MapRecord]:
+def list_maps(*, tolerant: bool = False) -> list[MapRecord]:
+    """按更新时间倒序加载全部导图。
+
+    `tolerant=True` 只给**旁路统计**用（如知识库的"被几张导图引用"）：单行坏数据
+    （坏 JSON、v1 之后又演进的字段）跳过并记 warning，不让一行脏数据把整个知识库
+    入口打成 500。列表页/导出必须用默认的 `False`——坏数据要暴露给排查的人，
+    而不是被静默跳过。
+    """
     with closing(connect()) as conn, conn:
         rows = conn.execute("SELECT * FROM mindmaps ORDER BY updated_at DESC, id").fetchall()
-    return [_record(row) for row in rows]
+    records: list[MapRecord] = []
+    for row in rows:
+        try:
+            records.append(_record(row))
+        except Exception:  # noqa: BLE001 - tolerant 模式下"任何读不出来的行"都算坏行
+            if not tolerant:
+                raise
+            logger.warning("跳过一张读不出来的导图：id=%s", row["id"], exc_info=True)
+    return records
 
 
 def get_map(map_id: str) -> MapRecord | None:
