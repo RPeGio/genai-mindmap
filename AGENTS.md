@@ -50,6 +50,7 @@ cd frontend && npm run dev
 - **父块坐标只认区间全等去重。** `_near_duplicate` / `_pick_ordered` 是为"同一份证据被切成两块"设计的，只能用于**块坐标**；父块之间的重叠来自切块器的句首吸附，套重叠率判据会把两个不同父块判成重复、静默吞掉一条（父块坐标用 `_dedupe_exact`）。
 - **保底席位的口径必须跨过 rerank。** `_reserve_seats` 按交付口径（`top_k`）算，不是候选池口径（`depth`）。`_rerank_top(reserve=...)` 就是这件事的兑现点，漏了它扩池等于把交付口径偷换成池口径。
 - **改一个开关后，关掉时必须与上一个提交逐字节一致。** 用旧模块对比（`git show <commit>:path` 载入旧模块跑同一批输入），不是"测试还绿"——测试可能只覆盖一半：`test_short_parents_are_not_deduped` 早年只测 `library=False`，库分支的 bug 因此活了很久。
+- **用 `git show` 读历史的测试，CI 必须配 `fetch-depth`，且不能拿 `pytest.skip` 兜"读不到"。** `test_edges` / `test_agent_diagram_type` / `test_external_directions` 都靠 `git show <commit>:path` 载旧模块做逐字节比对，最远的基线距 HEAD 一百多个提交；`actions/checkout` 默认只拉 1 个提交，那些测试在 CI 上从被引入那天起一直红（或被 `skip` 静默跳过），而本地是完整克隆、永远绿。`fetch-depth: 0` 之后才转绿。`skip` 把"环境配错了"伪装成"这条测试不适用"，比红更糟——红会有人去查，跳过不会。
 - **改了带 `content_hash` 的文档要同步 `backend/scripts/eval_cases_manual.py` 的 `MANUAL_SOURCE_HASHES`。** `docs/AGENT_PLAN.md`、`docs/RAG-DECISIONS.md`、`docs/PLAN.md`、`docs/ARCHITECTURE.md` 四份是评估语料，改内容会让 28 条手工标注失效（`load_manual_dataset` 当场报错，不静默跳过）。
 - **引用校验只保证"逐字出自那个来源"，不保证"那个来源支持这个论断"。** 写提示词或诊断文案时不要暗示它有语义校验。
 - **降级要留下"降过级"的痕迹。** 无 key 退纯 BM25、检索空就留空、向量批失败——每一项单看都对，合起来就是"坏了和本来就没有长得一样"。
@@ -69,6 +70,6 @@ AI 模型：claude-sonnet-4-5
 
 ## Agent constraints
 
-- **不要 `grep` / `cat` 整个大文件找东西。** `backend/app/agent/tools.py`（5008 行）、`backend/app/knowledge/service.py`（2762 行）、`frontend/src/stores/mindmap.ts`（1928 行）。先按符号定位（`grep -n` 找 `def` / `export` 行），再按行号精读。
+- **不要 `grep` / `cat` 整个大文件找东西。** `backend/app/agent/tools.py`（6700+ 行）、`backend/app/knowledge/service.py`（2762 行）、`frontend/src/stores/mindmap.ts`（3000+ 行）。先按符号定位（`grep -n` 找 `def` / `export` 行），再按行号精读。
 - **不要用 `python -c` / 内联脚本批量改文件。** 要改就逐处编辑，一次一处。
 - **不要跑 `npm run build` 验证前端改动**（它 = `vue-tsc --noEmit && vite build`，慢，且 build 期报错会盖掉类型错误）。用 `npm run type-check` + `npm test`；build 交给 CI。
