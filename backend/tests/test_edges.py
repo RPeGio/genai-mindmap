@@ -86,8 +86,12 @@ class TestContract:
         dumped = parsed.model_dump()
         assert dumped["edges"] == []
         # 除 `edges` 之外，其余字段与输入一致（没有别的字段被悄悄补上）。
+        # `diagram_type` 是后来加的产物字段，同样靠字段默认值补齐（默认 `tree`），
+        # 不写迁移脚本——旧图本来就是用 `tree` 那条提示词生成的。
         assert set(dumped) - set(raw) == {"edges", "schema_version", "layout",
-                                          "theme", "relations", "source_usage"}
+                                          "theme", "relations", "source_usage",
+                                          "diagram_type"}
+        assert dumped["diagram_type"] == "tree"
 
     def test_kind_is_a_literal(self):
         """`kind` 是 `Literal` 而不是自由字符串：渲染层按它选画法。"""
@@ -332,7 +336,11 @@ class TestDiagramType:
         assert ctx.candidate is not None
         assert ctx.candidate.edges == []
         assert result.data["diagram"] == {
-            "type": "fishbone", "edges": 0,
+            # `source` / `stripped` 是"这次图型是怎么定下来的"的两个诊断字段：
+            # 这一条请求层没带图型（`_ctx()` 的 `diagram_type` 是 None），
+            # 值来自工具参数，所以是 `model`；`goal` 里没有可剥的图型词，`stripped`
+            # 是 None。它们不影响 `type` / `edges` 这两个核心值。
+            "type": "fishbone", "source": "model", "stripped": None, "edges": 0,
             "edge_kinds": {"flow": 0, "branch": 0, "loop": 0},
         }
 
@@ -617,9 +625,17 @@ class TestExport:
         ]
 
     def test_formats_are_unchanged_without_edges(self):
-        """没有边的图，三种格式与加 `edges` 之前逐字节相同。"""
+        """没有边的图：markdown / opml 与加 `edges` 之前逐字节相同。
+
+        **PUML 多了一行图型注释**，那是有意的：`mindmap` 语法分不出流程图与思维
+        导图（形状可以一模一样），拿到文件的人只能从这一行知道它本来是什么。
+        除这一行之外，文件与之前一字不差。
+        """
         plain = MindMapContent.model_validate(content())
-        assert to_puml(plain) == "@startmindmap\n* 报销\n** 提交申请\n** 形式审查\n** 付款\n@endmindmap\n"
+        text = to_puml(plain)
+        assert text.replace("' 图型：思维导图（tree）\n", "") == \
+            "@startmindmap\n* 报销\n** 提交申请\n** 形式审查\n** 付款\n@endmindmap\n"
+        assert text.split("\n")[1] == "' 图型：思维导图（tree）"
         assert to_markdown(plain) == "# 报销流程\n\n- 报销\n  - 提交申请\n  - 形式审查\n  - 付款\n"
         assert "附加关系" not in to_opml(plain)
 

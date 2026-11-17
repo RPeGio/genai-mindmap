@@ -109,7 +109,14 @@ async function generate() {
   // 只写了材料、没写目标时给一句占位，别把正文当目标塞进去。
   const goal = text || (ready.length ? `请基于附带的 ${ready.length} 份材料生成导图` : '');
   // 图型跟着一起发：`auto` 时 store 那边会省略这个字段（后端 None = 让模型判断）。
-  await store.runGeneration(goal, store.content ? 'edit' : 'create', ready, thinkingModel.value, diagramType.value);
+  //
+  // 第六个参数把选区**显式清空**：这个按钮旁边没有「已选 N 个节点」徽标，用户
+  // 看不到"这次带着画布上的选区"。看不见的东西就不该偷偷发出去——他要改选中的
+  // 那几个节点，画布上方那个「改这张图」才是那个入口。
+  await store.runGeneration(
+    goal, store.content ? 'edit' : 'create', ready,
+    thinkingModel.value, diagramType.value, { selection: [] },
+  );
 }
 
 function cancel() {

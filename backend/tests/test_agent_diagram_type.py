@@ -143,6 +143,11 @@ class TestRequestSelectsDiagramType:
         ]
         assert result.data["diagram"] == {
             "type": "flowchart",
+            # 请求层带的就是 flowchart：`source` 是 `request`（不是 `inferred`——
+            # 推断只在请求没给的时候发生）。
+            "source": "request",
+            # 请求已经指定图型时不剥 `goal`，所以没有"被剥掉的那一段"。
+            "stripped": None,
             "edges": 3,
             "edge_kinds": {"flow": 1, "branch": 1, "loop": 1},
         }

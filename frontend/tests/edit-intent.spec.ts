@@ -241,3 +241,197 @@ describe('候选确认能看到改动', () => {
     expect(section.text()).toContain('一模一样');
   });
 });
+
+/**
+ * 「选中节点 + 一句话」。
+ *
+ * 这一组守的是本次改动的**主路径**：用户在画布上圈几个节点，然后说一句
+ * 「这几个合并成一个」。选区必须真的进请求（否则模型只能从整棵树里猜），
+ * 而且必须看得见（否则用户不知道自己圈的东西算不算数）。
+ */
+describe('「改这张图」认选区', () => {
+  /** 选中三个节点：主选区 a，再追加 b 与 c。 */
+  function selectThree(store: ReturnType<typeof useMindMapStore>) {
+    store.preview(structuredClone(BASE), 'right');
+    store.select('a');
+    store.toggleSelect('b');
+    store.toggleSelect('c');
+  }
+
+  it('选中三个节点：请求体里的 selected_ids 正好是这三条', async () => {
+    const calls = stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(BASE) }]));
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    selectThree(store);
+    await wrapper.vm.$nextTick();
+
+    await wrapper.find(EDIT_INPUT).setValue('这三个合并成一个');
+    await wrapper.findAll('button').find(item => item.text().includes('让它改'))!.trigger('click');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const body = calls[0].body as Record<string, unknown>;
+    expect(body.intent).toBe('edit');
+    // 顺序也有意义：第一个是主选区（详情面板对着的那个），后两个是追加的
+    expect(body.selected_ids).toEqual(['a', 'b', 'c']);
+  });
+
+  it('徽标显示「已选 3 个节点」，placeholder 跟着变', async () => {
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    await wrapper.vm.$nextTick();
+    // 没选中时不显示徽标，placeholder 是那句通用的例子
+    expect(wrapper.find('[data-test="edit-selection"]').exists()).toBe(false);
+    expect((wrapper.find(EDIT_INPUT).element as HTMLInputElement).placeholder)
+      .toBe('把第三支拆细一点');
+
+    selectThree(store);
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find('[data-test="edit-selection"]').text()).toBe('已选 3 个节点');
+    expect((wrapper.find(EDIT_INPUT).element as HTMLInputElement).placeholder)
+      .toBe('改选中的这 3 个节点…');
+    // 提示语要说明"选区是提示不是限制"，否则用户会以为自己把模型锁住了
+    expect(wrapper.text()).toContain('优先改这 3 个节点及其子分支');
+  });
+
+  it('没选中时提示语是"先在画布上选中节点，或直接描述要改哪里"', async () => {
+    const wrapper = mountApp();
+    useMindMapStore().preview(structuredClone(BASE), 'right');
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).toContain('先在画布上选中节点，或直接描述要改哪里');
+  });
+
+  it('不回归：选了三个节点时，expand 仍然只发主选区那一个 id', async () => {
+    const calls = stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(BASE) }]));
+    const store = useMindMapStore();
+    selectThree(store);
+    await store.runGeneration('展开节点「甲」，补充 3 个子节点。', 'expand');
+
+    const body = calls[0].body as Record<string, unknown>;
+    expect(body.intent).toBe('expand');
+    // 后端开流前要求 expand 的 selected_ids 长度恰好为 1
+    expect(body.selected_ids).toEqual(['a']);
+  });
+
+  it('再点一次同一个节点就取消选中；主选区被取消时提一个追加选区上来', () => {
+    const store = useMindMapStore();
+    selectThree(store);
+    expect(store.selectedIds).toEqual(['a', 'b', 'c']);
+
+    store.toggleSelect('c');
+    expect(store.selectedIds).toEqual(['a', 'b']);
+
+    // 取消主选区：b 顶上来当主选区，详情面板不会停在"没选中但有选区"
+    store.toggleSelect('a');
+    expect(store.selectedIds).toEqual(['b']);
+    expect(store.selectedId).toBe('b');
+
+    // 普通单击换人：追加选区一起清掉
+    store.select('c');
+    expect(store.selectedIds).toEqual(['c']);
+  });
+
+  it('看不见选区的入口不偷带选区：左侧「生成」显式传空', async () => {
+    const calls = stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(BASE) }]));
+    const store = useMindMapStore();
+    selectThree(store);
+    // 左侧「输入主题或文本」的生成按钮走的就是这一句（`SourceInputs.generate`）：
+    // 它旁边没有「已选 N 个」徽标，所以必须把选区显式清掉。
+    await store.runGeneration('按材料重做一张', 'edit', undefined, 'default', 'auto', { selection: [] });
+
+    const body = calls[0].body as Record<string, unknown>;
+    expect(body.intent).toBe('edit');
+    expect(body.selected_ids).toEqual([]);
+  });
+});
+
+/**
+ * 候选 diff 上的「范围内 / 外」标记。
+ *
+ * 改图带上了选区之后，用户要知道的第一件事不是"改了几处"，而是"它有没有跑到
+ * 我圈的范围外面"。所以每条改动都要能定位。
+ */
+describe('候选 diff 的范围标记', () => {
+  /** 甲的标题改了（范围内），乙的标题也改了（范围外）。 */
+  const SCOPED: MindMapContent = {
+    title: '示例',
+    root: {
+      id: 'root', label: '根', children: [
+        { id: 'a', label: '甲（改）', children: [] },
+        { id: 'b', label: '乙（改）', children: [] },
+        { id: 'c', label: '丙', children: [] },
+      ],
+    },
+  };
+
+  async function runScopedEdit() {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(SCOPED) }]));
+    const store = useMindMapStore();
+    store.preview(structuredClone(BASE), 'right');
+    store.select('a');
+    await store.runGeneration('把甲和乙都改一下', 'edit');
+    return { store, pinia };
+  }
+
+  it('范围内 / 范围外各标一条，并在清单下面给出小结', async () => {
+    const { pinia } = await runScopedEdit();
+    const wrapper = mount(AgentPanel, { global: { plugins: [pinia] } });
+    await wrapper.vm.$nextTick();
+
+    const marks = wrapper.findAll('[data-test="diff-scope-mark"]');
+    expect(marks).toHaveLength(2);
+    // 甲在选中的子树里，乙不在
+    expect(marks.map(mark => mark.text()).sort()).toEqual(['范围内', '范围外']);
+
+    const rows = wrapper.findAll('[aria-label="这次改动"] li');
+    const rowOf = (label: string) => rows.find(row => row.text().includes(label))!.text();
+    expect(rowOf('甲（改）')).toContain('范围内');
+    expect(rowOf('乙（改）')).toContain('范围外');
+
+    expect(wrapper.find('[data-test="diff-scope-summary"]').text())
+      .toContain('1 处改到了范围外');
+  });
+
+  it('没带选区时不显示任何范围标记', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(SCOPED) }]));
+    const store = useMindMapStore();
+    store.preview(structuredClone(BASE), 'right');
+    // 不选中任何节点直接说"改这张图"
+    await store.runGeneration('把甲和乙都改一下', 'edit');
+
+    const wrapper = mount(AgentPanel, { global: { plugins: [pinia] } });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.findAll('[data-test="diff-scope-mark"]')).toHaveLength(0);
+    expect(wrapper.find('[data-test="diff-scope-summary"]').exists()).toBe(false);
+  });
+
+  it('在选中节点下面新增的节点也算范围内（新 id 在基线树里查不到）', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const grown: MindMapContent = {
+      title: '示例',
+      root: {
+        id: 'root', label: '根', children: [
+          { id: 'a', label: '甲', children: [{ id: 'a1', label: '甲一（新）', children: [] }] },
+          { id: 'b', label: '乙', children: [] },
+          { id: 'c', label: '丙', children: [] },
+        ],
+      },
+    };
+    stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(grown) }]));
+    const store = useMindMapStore();
+    store.preview(structuredClone(BASE), 'right');
+    store.select('a');
+    await store.runGeneration('给甲补一个子节点', 'edit');
+
+    const changes = store.candidateDiff!;
+    const added = changes.find(item => item.kind === 'added')!;
+    expect(added.id).toBe('a1');
+    expect(added.inSelection).toBe(true);
+  });
+});

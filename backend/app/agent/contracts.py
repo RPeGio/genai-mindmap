@@ -13,9 +13,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, Protocol, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from app.contracts.mindmap import MindMapContent
+from app.contracts.mindmap import DiagramKind, MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
 from app.optimization.source_refs import EvidenceSpan
@@ -359,6 +359,15 @@ class RunContext:
     # 只装**真的被本次检索命中过**的库来源，不是整库：校验的语义是"你引的东西
     # 这次确实查到过"，而不是"库里恰好有这份材料"。
     library_sources: dict[str, Source] = field(default_factory=dict)
+    # 「这次图型是怎么定的」以及从 `goal` 里剥掉的那一段（见 `diagram_intent`）。
+    #
+    # 默认 `None` = **这一层没跑**（单测与直接构造 `RunContext` 的代码就是这种）。
+    # 这个默认值是有用的：`tests/test_agent_diagram_type.py` / `test_edges.py` 用
+    # 旧模块钉着"请求不带图型时产出逐字节一致"，那些断言里 `data` 没有 `source`
+    # 与 `stripped` 两个键——工具只在**解析过**时才补它们（见 `_generate_deep` 的
+    # 「图型与附加边」那一段）。
+    diagram_source: str | None = None
+    diagram_stripped: str | None = None
 
     def record_library_sources(self, sources: Iterable[Source]) -> None:
         """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。
@@ -474,7 +483,17 @@ class AgentRunRequest(BaseModel):
     #
     # 用 Literal 而不是自由字符串，理由与 `thinking_model` 同：拼错的值在开流
     # 之前就该被拒，而不是静默退化成"自动判断"。
-    diagram_type: Literal["tree", "flowchart", "fishbone"] | None = None
+    diagram_type: DiagramKind | None = None
+    # 「这一次图型是怎么定的」，由 `diagram_intent.apply()` 在开流之前写：
+    # `request`（下拉）/ `inferred`（从 `goal` 的文字里读出来）/ `model`（两边都没说）。
+    # 附带的 `_diagram_stripped` 是那次从 `goal` 里真的剥走的那一段原文。
+    #
+    # **私有属性**（不是 pydantic 字段）：它不序列化、不进 OpenAPI、不进前端镜像，
+    # 也不该进——它是"这次请求内部发生的一件事"，对外面的契约面没有一个字的增加。
+    # 前端要的答案在别的两个地方：产物里的 `MindMapContent.diagram_type`（这张图
+    # 是什么），与工具结果的 `data["diagram"]`（它是怎么定下来的）。
+    _diagram_source: str | None = PrivateAttr(default=None)
+    _diagram_stripped: str | None = PrivateAttr(default=None)
     snapshot: MindMapContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)

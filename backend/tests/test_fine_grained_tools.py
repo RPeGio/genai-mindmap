@@ -475,14 +475,29 @@ def test_batch_tool_rejects_an_invalid_color_atomically():
 # ---------------------------------------------------------------- 选区与事件流
 
 
-def test_selection_scope_applies_to_fine_grained_tools():
-    """用户选中了 `a` 这一支时，动 `b` 会被拒——与批量那一层同一套判定。"""
+def test_selection_is_a_hint_for_fine_grained_tools_too():
+    """选中 `a` 却改 `b`：照样改（选区是提示，不是墙），但结果里点名 `b`。
+
+    与批量（`mindmap_edit`）是同一套口径（`tools._scope_note`）。这里单独钉一次，
+    因为细粒度工具是模型改一两处时的**首选**路径：硬拦在它们身上，等于把
+    「整张图都加上时间维度」这种请求整条堵死。
+    """
     base = _content()
     ctx = _ctx(candidate=base, selected_ids=["a"])
-    result = _run("update_node", ctx, node_id="b", label="不该改到")
-    assert result.ok is False
-    assert result.data["code"] == "out_of_selection"
-    _assert_untouched(ctx, base)
+    result = _run("update_node", ctx, node_id="b", label="乙改")
+    assert result.ok, result.content
+    assert result.data["outside_selection"] == ["b"]
+    assert "不在用户选中的节点范围内" in result.content
+    assert _find(ctx.candidate.root, "b").label == "乙改"
+
+
+def test_out_of_selection_is_empty_when_nothing_selected():
+    """没有选区时 `outside_selection` 是空列表，而不是"什么都没算"。"""
+    ctx = _ctx(candidate=_content())
+    result = _run("update_node", ctx, node_id="b", label="乙改")
+    assert result.ok
+    assert result.data["outside_selection"] == []
+    assert "不在用户选中的节点范围内" not in result.content
 
 
 def test_success_carries_the_batch_for_the_ops_frame():

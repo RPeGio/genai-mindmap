@@ -583,6 +583,12 @@ export interface components {
             source_usage?: components["schemas"]["SourceUsage"][];
             /** Edges */
             edges?: components["schemas"]["Edge"][];
+            /**
+             * Diagram Type
+             * @default tree
+             * @enum {string}
+             */
+            diagram_type: "tree" | "flowchart" | "fishbone";
         };
         /** MindMapContent */
         "MindMapContent-Output": {
@@ -604,6 +610,12 @@ export interface components {
             source_usage?: components["schemas"]["SourceUsage"][];
             /** Edges */
             edges?: components["schemas"]["Edge"][];
+            /**
+             * Diagram Type
+             * @default tree
+             * @enum {string}
+             */
+            diagram_type: "tree" | "flowchart" | "fishbone";
         };
         /** Node */
         "Node-Input": {

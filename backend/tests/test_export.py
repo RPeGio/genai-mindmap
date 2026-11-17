@@ -109,7 +109,9 @@ class NewlineTest(unittest.TestCase):
 
         puml = to_puml(content)
         self.assertIn("* 第一行 第二行", puml)          # 仍在同一行
-        self.assertEqual(len([line for line in puml.split("\n") if line.strip()]), 4)
+        # 五行：`@startmindmap`、图型注释、根、一个子节点、`@endmindmap`。
+        # 注释行也必须是**一行**——它带着图型名，换行会把文件头撑成两行注释。
+        self.assertEqual(len([line for line in puml.split("\n") if line.strip()]), 5)
 
         md = to_markdown(content)
         self.assertEqual(md.count("- 第一行 第二行"), 1)   # 没有拆成两个列表项

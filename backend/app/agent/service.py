@@ -40,8 +40,15 @@ from app.agent.contracts import (
     ToolStartEvent,
     ToolEndEvent,
 )
+from app.agent import diagram_intent
 from app.agent.provider import default_provider
-from app.agent.tools import ToolRegistry, build_registry, library_available
+from app.agent.tools import (
+    ToolRegistry,
+    _node_path,
+    _path_text,
+    build_registry,
+    library_available,
+)
 from app.contracts.mindmap import MindMapContent
 from app.generation.service import (
     GenerationError,
@@ -106,6 +113,64 @@ _RAG_INTENT_RULES = {
 }
 
 
+# 「用户选中了哪些节点」那一段的表头与规矩。两条都是**稳定字符串常量**：
+# 用例按它们断言"选中时这一段出现了、没选中时整段不出现"，散成字面量的话，
+# 某天改一句措辞，用例会绿着而提示词已经不是那个形状。
+#
+# 为什么必须把选中节点写进 system，而不是只靠那句 `goal`：用户圈了三个节点说
+# 「这几个合并成一个」，`goal` 里没有 id、也没有标题，模型只能从整棵树里猜是哪三个。
+# 大纲里虽然有全部 id，但"哪些是用户此刻圈住的"这个信息**根本不在树里**——
+# 树只描述结构，描述不了选区。
+SELECTION_HEADER = "用户这次在画布上选中了这些节点（id｜标题｜层级路径）："
+
+# 这一段的核心分寸：**提示，不是作用域**。
+#
+# 写成硬约束（"只能改选中的节点"）在两种真实场景下会挡住本来正确的改动：
+#
+#   1. 用户说「整张图都加上时间维度」却顺手选着一个节点——他要的是全图；
+#   2. 用户选了三个不相邻的节点说「把这一支整体压缩」——真正要动的是它们的
+#      公共祖先，而那个祖先并不在选区里。
+#
+# 所以这里只要求"优先 + 说明"，不要求"只能"。执行层也不再拦（见
+# `tools._outside_selection`），口径与这句话一一对应。
+SELECTION_RULE = (
+    "先改这些节点及其子树、以及它们周围紧邻的地方。"
+    "但这不是允许改动的范围限制：如果用户的意图明显不限于选中的节点"
+    "（例如「整张图都加上时间维度」，或要动的是这几个节点的公共祖先），"
+    "照样可以改别处——只要在回复的正文（content）里说清为什么必须动到选区之外。"
+)
+
+
+def selection_text(request: AgentRunRequest, content: MindMapContent | None) -> str:
+    """把"用户选中了哪些节点"渲染成 system 里的一段；没有选中时返回**空串**。
+
+    空串而不是"用户选中了：\\n（无）"：一个空的小标题会让模型以为"用户选了 0 个
+    节点"是一种需要它处理的输入，而真实语义是"这一轮没有选区，别按选区想事情"。
+    调用方按空串整段跳过（`_system_text` 里那个 `if part` 过滤）。
+
+    只在 `edit` 意图下拼。`expand` 不用这一段：那条路只展开**一个**节点，`_expand`
+    自己会把从根到它的标题链写进工具调用的提示里（`_expand_ask`），system 再写
+    一遍就是同一件事的两处口径——而两处口径迟早会分叉成"工具里说 A、system 说 B"。
+    `create` 更没有选区可言：那时画布还是空的。
+
+    找不到的 id 静默跳过（用户选完又删了节点、或老前端发来了上一个版本的 id）。
+    全部找不到时同样返回空串：提示词里列不出任何一条，就不该留一个空段落。
+    """
+    if request.intent != "edit" or not request.selected_ids or content is None:
+        return ""
+    lines: list[str] = []
+    for node_id in request.selected_ids:
+        # 路径与展开共用同一份实现（`tools._node_path` / `_path_text`）：
+        # "从根到这里的标题链"只该有一种写法，否则同一次运行里模型会看到两种格式。
+        chain = _node_path(content.root, node_id)
+        if chain is None:
+            continue
+        lines.append(f"- [{chain[-1].id}] {chain[-1].label.strip()}｜路径：{_path_text(chain)}")
+    if not lines:
+        return ""
+    return "\n".join([SELECTION_HEADER, *lines, SELECTION_RULE])
+
+
 def outline_text(content: MindMapContent | None, limit: int = 200) -> str:
     """把树压成带 id 的大纲，让模型能引用具体节点。
 
@@ -152,12 +217,22 @@ def _intent_rule(request: AgentRunRequest) -> str:
 
 
 def _system_text(request: AgentRunRequest, content: MindMapContent | None) -> str:
-    return "\n".join([
+    """这次运行要下发的 system。
+
+    四段的顺序有讲究，不能随手调：**身份 → 这次做什么 → 这次对着哪儿 → 树**。
+    选区排在"当前导图"之前，因为它描述的是"接下来那句话指哪儿"，先读到它，
+    后面那棵大纲才有一个"重点看这几支"的读法。
+
+    空段整段跳过（`if part`）：没有选区时 `selection_text` 返回空串，直接 join
+    会在 system 里留一行空白，看起来像"这里本该有东西但没填上"。
+    """
+    return "\n".join(part for part in (
         _SYSTEM_BASE,
         _intent_rule(request),
+        selection_text(request, content),
         "当前导图：",
         outline_text(content),
-    ]).strip()
+    ) if part).strip()
 
 
 def _initial_messages(request: AgentRunRequest) -> list[dict[str, Any]]:
@@ -517,10 +592,16 @@ async def run(
     `on_close` 不传时行为与加它之前**逐字相同**（连一次库调用都没有），单测与
     直接调 `run()` 的代码不受影响。
     """
+    # 「这次图型是怎么定的」随请求一起进来（`diagram_intent.apply` 在开流前写好）。
+    # 直接构造请求的调用方没经过那一层，两个私有属性都是 `None`——那表示"这一层
+    # 没跑"，不是"模型决定的"。工具按这个区别决定要不要往 `data` 里补 `source`。
+    intent = diagram_intent.of(request)
     ctx = RunContext(
         request=request,
         candidate=request.snapshot,
         sources_by_id={source.id: source for source in request.sources},
+        diagram_source=intent.source,
+        diagram_stripped=intent.stripped,
     )
     try:
         async with contextlib.aclosing(_loop(request, ctx, provider=provider, tools=tools)) as events:

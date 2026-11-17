@@ -14,9 +14,17 @@ const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveE
 
 // 预览与候选节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
 // 画布这边不必自己判断来源，点不中就是点不中。
-onNodeClick(({ node }) => store.select(node.id));
+//
+// 按住 Ctrl / Cmd / Shift 点是**追加选区**：「改这张图」吃的是整个选区（用户圈三个
+// 节点说「这几个合并成一个」，模型得知道是哪三个）。不加修饰键的单击仍然是
+// "只看这一个"，并把追加选区清掉——那才是用户在画布上随手点一下的预期。
+onNodeClick(({ node, event }) => {
+  const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+  if (additive) store.toggleSelect(node.id);
+  else store.select(node.id);
+});
 onNodeDoubleClick(({ node }) => store.beginEdit(node.id));
-onPaneClick(() => store.select(null));
+onPaneClick(() => store.clearSelection());
 // 用户手动平移或缩放后停止自动适配，否则每长一个节点视图就会被拽回全图。
 onMoveEnd(() => {
   store.viewAdjusted = true;

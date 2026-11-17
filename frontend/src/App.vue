@@ -175,6 +175,29 @@ const edgeHint = computed(() => {
   return '关系只画连线，不会改变节点位置。';
 });
 
+/**
+ * 「附加关系」区块的可见性。
+ *
+ * 它此前**一直摆着**：这个区块只对流程图有意义（思维导图与鱼骨图的边为空是正常
+ * 的，不是"这个节点没有关系"），但代码里没有任何判断依据，只能一直显示。加在
+ * `MindMapContent.diagram_type` 上之后，这里才有据可依。
+ *
+ * 两个条件缺一不可：
+ *
+ *   1. 图型是流程图：模型会给边，而用户要能补错的、删画歪的；
+ *   2. **或者手里已经有边**。`diagram_type` 是后加的字段，库里那些旧图缺省是
+ *      `tree`，但用户可能早就手工加过边——只按图型判会让那些边再也删不掉
+ *      （列表与删除按钮都在这个区块里）。
+ *
+ * `?? 'tree'` 不能省：字段缺失（旧图、上一个版本保存的草稿）时读成 `undefined`，
+ * 直接比较会让 `=== 'flowchart'` 之外的一切都落到"没有边就隐藏"这一支，看起来
+ * 恰好也对——但它把"字段缺失"与"明确是 tree"混成了一件事，而将来 `fishbone`
+ * 也要有专属区块时，这个区别就是要害。
+ */
+const showEdgeSection = computed(
+  () => (store.content?.diagram_type ?? 'tree') === 'flowchart' || store.contentEdges.length > 0,
+);
+
 function connectEdge() {
   const source = selected.value?.node.id;
   const target = edgeTarget.value;
@@ -253,10 +276,40 @@ function expandBranch() {
 const editPrompt = ref('');
 const editBlocked = computed(() => !store.content || store.busy || store.agentRunning);
 
+/**
+ * 画布上圈了几个节点。
+ *
+ * 「改这张图」吃的是**整个选区**：请求把它作为 `selected_ids` 发出去，后端拼进
+ * system（"优先改这些节点及其子树"）。所以用户必须能看见自己圈了什么——圈三个
+ * 却只看到一个高亮时，他没法确认另外两个算不算数。
+ */
+const editSelection = computed(() => store.selectedIds.length);
+
+/** 输入框旁边那枚徽标：没选中时**不显示**（空徽标会读成"选了 0 个"）。 */
+const editSelectionLabel = computed(
+  () => (editSelection.value > 0 ? `已选 ${editSelection.value} 个节点` : ''),
+);
+
+/** placeholder 跟着选区变：用户一眼看出这句话是对谁说的。 */
+const editPlaceholder = computed(() => {
+  const count = editSelection.value;
+  if (count === 0) return '把第三支拆细一点';
+  if (count === 1) return '改这个节点…';
+  return `改选中的这 ${count} 个节点…`;
+});
+
 const editHint = computed(() => {
   if (!store.content) return '先生成或打开一张导图，再让它改。';
   if (store.busy || store.agentRunning) return '正在跑，等这一次结束。';
-  return '改动只落候选，确认后才进画布。';
+  if (editSelection.value === 0) {
+    // 「按住 Ctrl 点可以多选」必须写出来：多选没有可见入口，不写没人发现得了。
+    return '先在画布上选中节点，或直接描述要改哪里（按住 Ctrl 点节点可以多选）。';
+  }
+  // 这条必须说清"不是只能改这些"：选区是提示，用户说「整张图都加上时间维度」
+  // 时它照样改全图，而界面不该让用户以为自己在限制它。
+  return editSelection.value === 1
+    ? '优先改这个节点及其子分支；真要动别处也能改，清单里会标出来。'
+    : `优先改这 ${editSelection.value} 个节点及其子分支；真要动别处也能改，清单里会标出来。`;
 });
 
 const editGoalDisabled = computed(() => editBlocked.value || !editPrompt.value.trim());
@@ -589,12 +642,21 @@ async function copyBody() {
         >
           <div class="flex items-center gap-1">
             <span class="shrink-0 text-xs font-medium text-slate-600">改这张图</span>
+            <!--
+              「已选 N 个节点」。没选中时整枚徽标不出现：显示一个「已选 0 个」
+              既占地方又容易被读成"我是不是选错了"。
+            -->
+            <span
+              v-if="editSelectionLabel"
+              data-test="edit-selection"
+              class="shrink-0 rounded bg-sky-50 px-1 py-0.5 text-[11px] text-sky-700"
+            >{{ editSelectionLabel }}</span>
             <input
               v-model="editPrompt"
               aria-label="改这张图"
               class="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 text-xs outline-none focus:border-slate-500 disabled:opacity-50"
               :disabled="editBlocked"
-              placeholder="把第三支拆细一点"
+              :placeholder="editPlaceholder"
               @keydown.enter.prevent="submitEdit"
             />
             <button
@@ -791,8 +853,15 @@ async function copyBody() {
             而它给错的那些（比如画到了错的出口、或者本该是顺序却标成了回退）
             没有别的地方能改。删边同样在这里——画布上点线不做选中，因为节点
             已经有选中态了，两套选中语义混在一起会让「Delete 删什么」变得不可预测。
+
+            `v-if` 的依据是产物自己的 `diagram_type`（见 `showEdgeSection`）：
+            对思维导图与鱼骨图来说，"没有附加关系"不是缺陷而是定义。
           -->
-          <section class="flex flex-col gap-2 border-t border-slate-200 pt-3" aria-label="附加关系">
+          <section
+            v-if="showEdgeSection"
+            class="flex flex-col gap-2 border-t border-slate-200 pt-3"
+            aria-label="附加关系"
+          >
             <h3 class="text-xs font-medium text-slate-500">
               附加关系（{{ selectedEdgeRows.length }}）
             </h3>

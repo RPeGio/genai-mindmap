@@ -130,6 +130,22 @@ MAX_NODE_ICON_CHARS = 16
 
 NodeColor = Literal["blue", "green", "amber", "red", "purple", "teal", "pink", "gray"]
 
+# 图型。三个值同时是 `AgentRunRequest.diagram_type`（请求：用户要画什么）与
+# `MindMapContent.diagram_type`（产物：画成了什么）的取值集合——一处定义，两处
+# 引用。分成两份字面量写的后果是可预期的：某天加第四种图型，请求层收下了、
+# 契约层 422，而报错会指向产物而不是那张没被加进去的表。
+#
+# **它不是 `layout`**：`layout` 描述排布（横向 / 纵向 / 时间线 / 手动坐标），
+# 图型描述"这张图按什么读"——流程图要看条件分支与回退，鱼骨图的一级分支固定是
+# 人 / 机 / 料 / 法 / 环 / 测。
+DIAGRAM_TYPES = ("tree", "flowchart", "fishbone")
+DiagramKind = Literal["tree", "flowchart", "fishbone"]
+
+# 图型的中文名。导出文件头（`export.service.to_puml`）要用它：写成 `fishbone`
+# 读不出意思，写成"因果图"又与界面上那个下拉的名字对不上。**只放中文名，不放
+# 说明**——说明属于界面（`SourceInputs.vue` 里那四个 hint）。
+DIAGRAM_LABELS = {"tree": "思维导图", "flowchart": "流程图", "fishbone": "鱼骨图"}
+
 
 def normalize_color(value: object) -> str | None:
     """模型给的 `color` → 调色板里的键，或 `None`。
@@ -405,6 +421,19 @@ class MindMapContent(BaseModel):
     # `schema_version` 升级（树 + 边的**树**那一半形状没变，读完写回时多出来的
     # `edges: []` 是无害的默认值）。
     edges: list[Edge] = Field(default_factory=list)
+    # 这张图**是什么图型**。加它的理由是产物无法自证：一张鱼骨图与一张思维导图
+    # 在树形状上可以长得一模一样（一级分支六条、下面挂要点），界面上唯一的区别
+    # 只存在于生成它那一次调用用了哪份提示词——那个信息随调用一起消失了。
+    #
+    # 三处读者：
+    #   1. 前端据此决定要不要摆「附加关系」区块（那个区块只对流程图有意义）；
+    #   2. 导出（PUML 文件头注明图型），读的人不必从形状去猜；
+    #   3. 排查"我要的鱼骨图怎么成了导图"时，那张图自己说得出来。
+    #
+    # 默认 `tree`：库里所有旧记录都没有这个键，Pydantic 的字段默认值把缺的补成
+    # `tree`——**零迁移**，与 `edges` 同一条规矩（不改库、不升 `schema_version`）。
+    # 而"旧图本来就是思维导图"这句是真的：它们全部由 `tree` 那条提示词生成。
+    diagram_type: DiagramKind = "tree"
 
     @field_validator("title")
     @classmethod

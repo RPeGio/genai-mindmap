@@ -30,6 +30,7 @@ from app.agent.contracts import (
     ErrorEvent,
     SnapshotEvent,
 )
+from app.agent.diagram_intent import apply as apply_diagram_intent
 from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.core.errors import AppError
@@ -108,6 +109,10 @@ def _request_summary(body: AgentRunRequest) -> dict[str, Any]:
         # 它不参与重放（重放的是候选树本身），但事后排查"我要的流程图怎么成了
         # 导图"时，没有这一行就只能靠猜。`None` 与 `"tree"` 在这里也必须分得开：
         # 前者是"用户让我自己判断"，后者是"用户明确要思维导图"。
+        #
+        # 这里记的是**解析之后**的值（`apply_diagram_intent` 在调用之前跑过），
+        # 所以"用户打字说了鱼骨图"这件事在台账里是 `fishbone`，不是 `None`——
+        # 否则最该被查的那一次恰恰查不出来。
         "diagram_type": body.diagram_type,
         "selected_ids": list(body.selected_ids),
         "source_ids": [source.id for source in body.sources],
@@ -226,6 +231,16 @@ async def stream_run(body: AgentRunRequest) -> StreamingResponse:
             detail={"code": "agent_disabled", "message": "AI 代理功能当前已关闭"},
         )
     _validate(body)
+    # 图型：请求没带就**从 `goal` 的文字里认**，并把那个词从 `goal` 里剥掉
+    # （见 `app/agent/diagram_intent.py`）。位置在这里有三个理由：
+    #
+    #   1. 这是"请求已经合法、还没有任何一个字节发出去"的唯一时刻——认错时
+    #      一切都还来得及；
+    #   2. 必须早于 `_request_summary`：运行台账里那一行是事后排查"我要的鱼骨图
+    #      怎么成了思维导图"的唯一痕迹，记 `None` 等于什么都没记；
+    #   3. 工具层不行：`diagram_type` 在那里的默认值就是模型会走的默认值，推断
+    #      放在它前面才轮得到"用户说的是什么"。
+    apply_diagram_intent(body)
 
     run_id = body.run_id or uuid4().hex[:_GENERATED_RUN_ID_BYTES * 2]
     claim = runs.begin(run_id, _request_summary(body))

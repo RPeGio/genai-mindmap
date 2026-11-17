@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from xml.sax.saxutils import escape, quoteattr
 
-from app.contracts.mindmap import Edge, MindMapContent, Node
+from app.contracts.mindmap import DIAGRAM_LABELS, Edge, MindMapContent, Node
 
 # 文末那一节的标题。markdown 用它做二级标题，opml 用它做最后那棵 outline 的
 # `text`。两处共读一个常量：改一处忘一处时，导出的两种格式会出现两个名字。
@@ -118,8 +118,16 @@ def to_puml(content: MindMapContent) -> str:
     PlantUML 报语法错；加一个注释符之后文件仍然可解析，而那一行文字还能被
     grep 到、也能直接粘进 class/activity 图。这是一个明确的取舍：**保住文件
     可用**比让那行"看起来更像图"更重要。
+
+    图型写在**文件头**的第二行：拿到这个 `.puml` 的人看不到 `diagram_type`
+    字段，而 `mindmap` 语法本身分不出流程图与思维导图——形状可以一模一样。
+    写上之后"这张图本来是按鱼骨图生成的"至少留下过痕迹。
     """
-    lines: list[str] = ["@startmindmap"]
+    lines: list[str] = [
+        "@startmindmap",
+        f"' 图型：{DIAGRAM_LABELS.get(content.diagram_type, content.diagram_type)}"
+        f"（{content.diagram_type}）",
+    ]
     lines.append(f"* {_sanitize(_node_text(content.root))}")
 
     def walk(node: Node, depth: int) -> None:

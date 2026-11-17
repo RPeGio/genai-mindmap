@@ -1242,11 +1242,17 @@ class EditToolTest(unittest.TestCase):
         self.assertEqual(ctx.revision, 0)
 
 
-class SelectionScopeTest(unittest.TestCase):
-    """选中集合划定的可改范围。
+class SelectionHintTest(unittest.TestCase):
+    """选中集合是**上下文提示**，不是作用域。
 
-    两层防线都要测：注册表按意图裁剪，执行层再按选中子树收窄。只测其中一层，
-    另一层配错时就没有任何东西守着"别改用户没选中的分支"。
+    这里守两件事，方向相反但都必须成立：
+
+      1. 注册表按意图裁剪仍然是**硬**的（expand 下连 `mindmap_edit` 都看不到），
+         否则模型会在展开时去删别的分支；
+      2. 选区本身**不硬拦**：动到选区之外的节点照样执行，只在结果里附一句
+         "这几处不在你选中的范围"。写成硬拦截会挡掉「整张图都加上时间维度」
+         与「压缩这一支」（真正的目标是三个不相邻节点的公共祖先，它不在选区里）
+         这两种本来正确的改动。
     """
 
     def test_expand_selection_rejects_edit_of_other_branch(self):
@@ -1254,49 +1260,57 @@ class SelectionScopeTest(unittest.TestCase):
         before = ctx.candidate.model_dump()
         ops = [{"op": "remove", "id": "b"}]
 
-        # 第一层：expand 意图的注册表里压根没有 mindmap_edit
+        # 注册表这一层仍然是硬的：expand 意图里压根没有 mindmap_edit
         registry = build_registry("expand")
         self.assertNotIn("mindmap_edit", registry.names())
         blocked = _run(registry.execute(_call("mindmap_edit", ops=ops), ctx))
         self.assertFalse(blocked.ok)
         self.assertEqual(blocked.data["code"], "unknown_tool")
 
-        # 第二层：就算注册表被误配（这里直接喂一个 edit 的 registry），执行层也拦
-        executed = _run(build_registry("edit").execute(_call("mindmap_edit", ops=ops), ctx))
-        self.assertFalse(executed.ok)
-        self.assertEqual(executed.data["code"], "out_of_selection")
-
         self.assertEqual(ctx.candidate.model_dump(), before)
         self.assertEqual(ctx.revision, 0)
 
-    def test_edit_inside_selection_is_allowed(self):
-        """收窄不等于禁用：选中 A 时改 A 的子树必须照常成功。"""
+    def test_edit_outside_selection_still_applies_and_says_so(self):
+        """选中 a 却改 b：改动生效，结果里点名 b 并提醒模型交代原因。"""
+        ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
+        result = _run(build_registry("edit").execute(_call(
+            "mindmap_edit", ops=[{"op": "update", "id": "b", "changes": {"label": "乙改"}}]), ctx))
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], ["b"])
+        self.assertIn("不在用户选中的节点范围内", result.content)
+        node = next(child for child in ctx.candidate.root.children if child.id == "b")
+        self.assertEqual(node.label, "乙改")
+
+    def test_edit_inside_selection_has_no_hint(self):
+        """收窄不等于禁用：选中 A 时改 A 的子树必须照常成功，且不多一句提示。"""
         ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
         result = _run(build_registry("edit").execute(_call(
             "mindmap_edit", ops=[{"op": "update", "id": "a1", "changes": {"label": "甲一改"}}]), ctx))
         self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], [])
+        self.assertNotIn("不在用户选中的节点范围内", result.content)
         node = next(child for child in ctx.candidate.root.children if child.id == "a")
         self.assertEqual(node.children[0].label, "甲一改")
 
-    def test_move_target_outside_selection_is_rejected(self):
-        """move 的落脚点也在范围里：不能把选中子树挂到未选中的分支下。"""
+    def test_move_target_outside_selection_is_allowed(self):
+        """把选中子树挂到未选中的分支下也是允许的（移出选区同样是"扩权"）。"""
         ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
-        before = ctx.candidate.model_dump()
         result = _run(build_registry("edit").execute(_call(
             "mindmap_edit", ops=[{"op": "move", "id": "a1", "new_parent_id": "b"}]), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "out_of_selection")
-        self.assertEqual(ctx.candidate.model_dump(), before)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], ["b"])
+        b = next(child for child in ctx.candidate.root.children if child.id == "b")
+        self.assertEqual([child.id for child in b.children], ["a1"])
 
-    def test_add_under_unselected_parent_is_rejected(self):
+    def test_add_under_unselected_parent_is_allowed(self):
         """add 看的是 parent_id：新节点的 id 是临时名，比它没有意义。"""
         ctx = _ctx(intent="edit", candidate=_content(), selected_ids=["a"])
         result = _run(build_registry("edit").execute(_call("mindmap_edit", ops=[
             {"op": "add", "id": "$new", "parent_id": "b", "label": "丙"},
         ]), ctx))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "out_of_selection")
-        self.assertEqual(ctx.revision, 0)
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.data["outside_selection"], ["b"])
+        self.assertEqual(ctx.revision, 1)
 
 
 class DeepBudgetFloorTest(unittest.TestCase):

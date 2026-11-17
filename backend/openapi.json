@@ -1302,6 +1302,16 @@
             },
             "type": "array",
             "title": "Edges"
+          },
+          "diagram_type": {
+            "type": "string",
+            "enum": [
+              "tree",
+              "flowchart",
+              "fishbone"
+            ],
+            "title": "Diagram Type",
+            "default": "tree"
           }
         },
         "additionalProperties": false,
@@ -1358,6 +1368,16 @@
             },
             "type": "array",
             "title": "Edges"
+          },
+          "diagram_type": {
+            "type": "string",
+            "enum": [
+              "tree",
+              "flowchart",
+              "fishbone"
+            ],
+            "title": "Diagram Type",
+            "default": "tree"
           }
         },
         "additionalProperties": false,

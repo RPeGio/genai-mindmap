@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
-import { agentToolLabel, useMindMapStore, type CandidateChange, type PreviewNode } from '../stores/mindmap';
+import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
 
 /**
  * agent 运行面板：工具进度、候选骨架、候选确认、丢弃。
@@ -173,15 +173,57 @@ const canAccept = computed(() => store.candidate !== null && !store.agentRunning
  * 空数组表示"算出来了，但一处都没改"——两者必须分开：前者要显示"这是新图"，
  * 后者要显示"这次什么都没改"，否则用户面对一个"候选已就绪"看不出该不该点。
  */
-const diff = computed<CandidateChange[] | null>(() => store.candidateDiff);
+const diff = computed<ScopedChange[] | null>(() => store.candidateDiff);
+
+/**
+ * 这一轮「改这张图」是不是带着选区发出去的。
+ *
+ * 为空表示"没圈任何节点"（或候选是从服务端捡回来的，见 `resumeRun`）——那时
+ * 「范围内/外」不成立，标记整片不显示。没选区却显示一个"范围外"，是纯粹的噪音，
+ * 还会让人以为模型越权了。
+ */
+const showScope = computed(() => store.candidateSelection.length > 0);
 
 /** 改动清单最多列几条：再往下列就不是"确认一下"，而是让用户读变更日志。 */
 const DIFF_LIMIT = 8;
-const shownDiff = computed(() => (diff.value ?? []).slice(0, DIFF_LIMIT));
+
+/**
+ * 范围外的改动排前面。
+ *
+ * 清单只列 8 条，其余进"……还有 N 处"。用户最需要看见的恰恰是那条越界的改动
+ * （"我只圈了三个节点，它怎么动了这一支？"），而它按原始顺序很可能正好被截断
+ * 在那个省略号里。
+ */
+const shownDiff = computed(() => {
+  const all = diff.value ?? [];
+  if (!showScope.value) return all.slice(0, DIFF_LIMIT);
+  return [
+    ...all.filter(item => !item.inSelection),
+    ...all.filter(item => item.inSelection),
+  ].slice(0, DIFF_LIMIT);
+});
+
 const hiddenDiff = computed(() => Math.max(0, (diff.value?.length ?? 0) - shownDiff.value.length));
 
+/** 有多少处落在当时那个选区里。 */
+const inScopeCount = computed(() => (diff.value ?? []).filter(item => item.inSelection).length);
+
+/** 有多少处改到了选区之外——**不是错误**，是模型扩权了，用户要能一眼看见。 */
+const outScopeCount = computed(() => (diff.value?.length ?? 0) - inScopeCount.value);
+
+/** 清单下面那句范围小结。没选区时是空串（整段 `v-if` 一起不渲染）。 */
+const scopeSummary = computed(() => {
+  if (!showScope.value) return '';
+  const total = diff.value?.length ?? 0;
+  const head = `带着「已选 ${store.candidateSelection.length} 个节点」发起：`
+    + `${total} 处改动里 ${inScopeCount.value} 处在选中范围内`;
+  return outScopeCount.value > 0
+    ? `${head}，${outScopeCount.value} 处改到了范围外——那是模型判断必须一起动的地方，看一眼再应用。`
+    : `${head}，没有改到范围外。`;
+});
+
 /** 六种改动的中文标签。用徽标而不是句子：一屏能扫完"哪几处被动了"。 */
-const DIFF_LABELS: Record<CandidateChange['kind'], string> = {
+const DIFF_LABELS: Record<ScopedChange['kind'], string> = {
   added: '新增',
   removed: '删除',
   updated: '修改',
@@ -193,7 +235,7 @@ const DIFF_LABELS: Record<CandidateChange['kind'], string> = {
 };
 
 /** 颜色也在这里区分一次：删除用玫红，新增用翠绿，其余中性。 */
-const DIFF_CLASS: Record<CandidateChange['kind'], string> = {
+const DIFF_CLASS: Record<ScopedChange['kind'], string> = {
   added: 'bg-emerald-100 text-emerald-700',
   removed: 'bg-rose-100 text-rose-700',
   updated: 'bg-amber-100 text-amber-800',
@@ -201,6 +243,16 @@ const DIFF_CLASS: Record<CandidateChange['kind'], string> = {
   edge_added: 'bg-indigo-100 text-indigo-700',
   edge_removed: 'bg-orange-100 text-orange-700',
 };
+
+/**
+ * 「在不在你圈的范围里」两枚标记的样式。
+ *
+ * 刻意不用实心色块（六种改动已经各占一色）：范围是**第二维**信息，与"改了什么"
+ * 叠在同一行。范围外只用淡红描边：那是"看一眼"的语气，不是"出错了"——模型扩权
+ * 很可能是对的（用户说「整张图都加上时间维度」时，它本来就该改全图）。
+ */
+const IN_SCOPE_CLASS = 'bg-slate-100 text-slate-600';
+const OUT_SCOPE_CLASS = 'bg-rose-50 text-rose-600 ring-1 ring-rose-200';
 
 /**
  * 点一条改动就跳到那个节点。
@@ -385,6 +437,19 @@ function cancel() {
       <ul v-else class="mt-1 flex flex-col gap-1 text-[11px] leading-relaxed">
         <li v-for="item in shownDiff" :key="`${item.kind}:${item.id}`" class="break-words">
           <span class="mr-1 rounded px-1" :class="DIFF_CLASS[item.kind]">{{ DIFF_LABELS[item.kind] }}</span>
+          <!--
+            范围标记：这处改动落在「这次带上去的选区」里，还是跑到了范围外。
+            只有真的带过选区才显示（`showScope`）——没圈节点时谈"范围外"没有意义。
+          -->
+          <span
+            v-if="showScope"
+            data-test="diff-scope-mark"
+            class="mr-1 rounded px-1"
+            :class="item.inSelection ? IN_SCOPE_CLASS : OUT_SCOPE_CLASS"
+            :title="item.inSelection
+              ? '这处改动落在你选中的节点及其子树里'
+              : '这处改动落在你选中的范围之外：模型判断必须一起动，或者它判断错了'"
+          >{{ item.inSelection ? '范围内' : '范围外' }}</span>
           <button
             type="button"
             class="text-left text-slate-700 underline decoration-slate-300 hover:text-slate-900"
@@ -395,6 +460,9 @@ function cancel() {
         </li>
       </ul>
       <p v-if="hiddenDiff > 0" class="mt-1 text-[11px] text-slate-400">……还有 {{ hiddenDiff }} 处</p>
+      <p v-if="showScope" data-test="diff-scope-summary" class="mt-1 text-[11px] text-slate-500">
+        {{ scopeSummary }}
+      </p>
     </details>
 
     <div v-if="canAccept" class="mt-2 flex flex-col gap-1">

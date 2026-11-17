@@ -37,6 +37,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.agent.contracts import RunContext, ToolCall, ToolResult, ToolSpec
+from app.agent.diagram_intent import SOURCE_MODEL, SOURCE_REQUEST
 from app.agent.ops import (
     TEMP_ID_PREFIX,
     apply_ops,
@@ -1790,53 +1791,33 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
     return _TreeAudit(depths=depths, total=total, deepest=deepest, blank=blank, missing=missing)
 
 
-def _selection_scope_error(
-    content: MindMapContent, args: EditArgs, ctx: RunContext,
-) -> ToolResult | None:
-    """把可改范围收窄到用户选中节点的子树。
+def _edit_targets(args: EditArgs) -> list[str]:
+    """一批 op 会碰到哪些节点——只用于"有没有越出选区"的**提示**（不是拦截）。
 
-    注册表已经按意图裁掉了 expand 下的 `mindmap_edit`，但那是**一层**防线：
-    注册表被误配、或被调用方直接传进一个全量 registry 时，这一层就没了。
-    所以执行层自己再判一次——改错节点是不可逆的（用户手写的分支会被删）。
+    两条口径：
 
-    两处口径说明：
       - `add` 比的是 `parent_id` 而不是 `id`。新节点的 id 是本批临时名
         （`$tmp1`），它根本不在树里，"落在谁的子树内"对它没有意义；
         真正决定"改到哪去"的是父节点。
-      - 同批新建的父节点（`$` 开头）放行：它自己会被"它挂靠在谁下面"
-        那条检查约束住，放行不会漏出范围。
+      - 同批新建的父节点（`$` 开头）跳过：它自己会被"它挂靠在谁下面"那条覆盖，
+        报一个树里还不存在的 id 只会让提示里出现一串模型自己编的名字。
+
+    为什么要单独抽一个函数：批量与六个细粒度工具都要回答"这次动到哪儿"，
+    各写一遍的话，加第七种 op 时必然只改一处。
     """
-    if not ctx.request.selected_ids:
-        return None
-
-    # 范围的算法只有一份（`_selection_scope`）：四个细粒度工具也问同一个问题，
-    # 两处各写一遍的话，"批量拦得住、细粒度拦不住"只是时间问题。
-    scope = _selection_scope(content, ctx) or set()
-    allowed = "、".join(ctx.request.selected_ids)
-
-    for index, item in enumerate(args.ops):
+    targets: list[str] = []
+    for item in args.ops:
         if item.op == "add":
-            if item.parent_id is None:
-                # 缺 parent_id 由后面的 invalid_ops 给更准确的错误，这里不抢答
-                continue
-            target, field = item.parent_id, "parent_id"
-            if target.startswith(TEMP_ID_PREFIX):
-                continue
+            # 缺 parent_id 由后面的 invalid_ops 给更准确的错误，这里不抢答
+            if item.parent_id:
+                targets.append(item.parent_id)
         else:
-            target, field = item.id, "id"
-        if target not in scope:
-            return _fail(
-                "out_of_selection",
-                f"只能改当前选中节点及其子树（{allowed}），第 {index} 条操作指向 {target}。",
-                path=f"ops.{index}.{field}",
-            )
-        if item.op == "move" and item.new_parent_id not in scope:
-            return _fail(
-                "out_of_selection",
-                f"移动的目标父节点 {item.new_parent_id} 不在选中范围（{allowed}）内。",
-                path=f"ops.{index}.new_parent_id",
-            )
-    return None
+            targets.append(item.id)
+        if item.op == "move" and item.new_parent_id:
+            targets.append(item.new_parent_id)
+    # 本批新建的临时 id（`$tmp1`）一律不提：树里还没有这个名字，提示里列出它
+    # 只会让模型以为自己在改一个真实节点。它挂靠在谁下面已经由上面那条约束住了。
+    return [target for target in targets if not target.startswith(TEMP_ID_PREFIX)]
 
 
 EXPAND_PROMPT = (
@@ -2837,6 +2818,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 补一个（校验收下、这里覆盖、记一条 debug），或者它压根不知道有这个字段。
     # 两种都不会改变产出——覆盖发生在读参数的第一步，后面再没人读 `args` 的那份。
     diagram_type = ctx.request.diagram_type or args.diagram_type
+    # 「这次图型是怎么定下来的」。请求层解析过（`ctx.diagram_source` 非空）就用它
+    # 记的那个值：那里才知道"是下拉选的"还是"从 `goal` 的文字里读出来的"。没有
+    # 解析层时只能按请求有没有带值推——带了就是用户选的，没带就是模型的默认值。
+    # 两种情况下都不是**这里**说了算；这里只是把结论记下来。
+    source_of_diagram = ctx.diagram_source or (
+        SOURCE_REQUEST if ctx.request.diagram_type else SOURCE_MODEL)
     if ctx.request.diagram_type and args.diagram_type != ctx.request.diagram_type:
         logger.debug(
             "图型以请求为准：请求=%s，工具参数=%s（模型的写法不生效）",
@@ -3575,6 +3562,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         ],
         # `tree` / `fishbone` 到这里是空列表：上面那段只在 flowchart 时填它。
         edges=edges,
+        # 产物自己声明"我是什么图型"。不加这一行的后果是这张图**无法自证**：
+        # 一张六支的鱼骨图与一张六支的思维导图在树形状上可以完全一样，而
+        # 「要不要摆附加关系区块」「导出文件头怎么写」两件事都只能靠这个字段。
+        diagram_type=diagram_type,
     )
 
     drafts: list[dict[str, Any]] = []
@@ -4182,19 +4173,27 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             # 是**产出**。两个都报，因为"选了流程图但一条边都没画出来"与"选了
             # 思维导图"在树上长得一样，而前者是要去补的动作。
             #
-            # **只在非 `tree` 时加这个键**，与 `external` / `material` 同一条规矩：
-            # `tree` 是默认值，它的 `data` 键集必须与加 `diagram_type` 之前逐字节
-            # 相同（`tests/test_edges.py` 拿 `e3ba390` 的旧模块整份比对）。
+            # `source` / `stripped` 只在**经过请求层解析**（`ctx.diagram_source`
+            # 非空）时出现：它们回答的是"这次的图型是怎么定下来的"——请求层的下拉、
+            # 从 `goal` 的文字里读出来的，还是模型自己填的；以及为了识别，从 `goal`
+            # 里剥走了哪一段。直接构造 `RunContext` 的代码（单测、未来的其它入口）
+            # 没有这两个值，那里保持**没有这两个键**的旧形状——`tests/test_edges.py`
+            # 与 `test_agent_diagram_type.py` 用旧模块整份比对 `data`，多一个键就红。
+            #
+            # 出现条件因此是"非 tree **或** 解析过"：`tree` 且没解析时没有这个键，
+            # 是加 `diagram_type` 之前就有的形状（同 `external` / `material` 那条规矩）。
             **({"diagram": {
                 # 报**生效的**那一个（请求优先），不是 `args` 里那个：用户选了流程图、
                 # 而模型没写参数时，`data` 里再写 tree 会让诊断面板与产出自相矛盾。
                 "type": diagram_type,
+                "source": source_of_diagram,
+                "stripped": ctx.diagram_stripped,
                 "edges": len(edges),
                 "edge_kinds": {
                     kind: sum(1 for edge in edges if (edge.kind or "flow") == kind)
                     for kind in EDGE_KINDS
                 },
-            }} if diagram_type != "tree" else {}),
+            }} if diagram_type != "tree" or ctx.diagram_source is not None else {}),
             "nli": {
                 "on_generate": nli_attempted,
                 "limit": MAX_NLI_CHECKS,
@@ -5392,22 +5391,60 @@ def _selection_scope(content: MindMapContent, ctx: RunContext) -> set[str] | Non
     return scope
 
 
-def _scope_guard(content: MindMapContent, ctx: RunContext, target: str) -> ToolResult | None:
-    """细粒度工具的选区内校验：目标不在用户选中的子树里就拒绝。
+def _outside_selection(
+    content: MindMapContent, ctx: RunContext, targets: Sequence[str],
+) -> list[str]:
+    """这些目标里有哪几个落在用户选区**之外**。**只用来提醒，一律不拦。**
 
-    与 `_selection_scope_error` 同一套判定（那一个服务于批量的 op 列表），
-    理由也相同：注册表已经按意图裁过工具，但执行层自己再判一次——改错节点是
-    不可逆的（用户手写的分支会被删）。
+    为什么不再是硬拦截（`out_of_selection` 那个失败码连同它的两道判定一起删了）：
+    选区描述的是"用户此刻圈着哪几块"，它是一句上下文，不是一道墙。三种真实场景
+    都会被硬拦截挡死：
+
+      1. 用户说「整张图都加上时间维度」，手上却还留着某个节点的选区——他要的是全图；
+      2. 用户选了三个不相邻节点说「把这一支整体压缩」——真正要动的是它们的
+         **公共祖先**，而那个祖先不在选区里；
+      3. 老前端把上一版的 `selected_ids` 带过来，那些 id 在当前树里查不到，
+         静态算出的范围是空集，于是**每一条**改动都被判成越界。
+
+    代价也不像当初担心的那样大：改动只落**候选**（`ctx.candidate`），用户点
+    「应用」才进画布，画布上还有撤销。这一层真正需要的是"让用户与模型都看见
+    这次动到了选区之外"，而不是"拒绝执行"。
+
+    返回的顺序与去重都保留（同一批里同一个 id 出现两次是常见形态：先 update 再
+    move 它），提示里重复列同一个节点只会让那句话变长而没有新信息。
     """
     scope = _selection_scope(content, ctx)
-    if scope is None or target in scope:
-        return None
+    if scope is None:
+        return []
+    outside: list[str] = []
+    for target in targets:
+        if target in scope or target in outside:
+            continue
+        outside.append(target)
+    return outside
+
+
+def _scope_note(
+    content: MindMapContent, ctx: RunContext, targets: Sequence[str],
+) -> tuple[str, list[str]]:
+    """`(追加到回给模型那句话末尾的提示, 越界的 id 列表)`；没越界时是 `("", [])`。
+
+    抽成一个函数是因为**七个写工具共用同一条口径**（批量 + 六个细粒度）。写成
+    "每个工具自己拼一句"，改一处忘一处时分叉的表现是"批量会提醒、细粒度不会"，
+    那看起来像 bug 而不像设计。
+
+    提示里要求模型"说明原因"，与 system 里 `service.SELECTION_RULE` 那句一一对应：
+    提示词让它优先改选区、越界要交代；工具这里是它真的越界之后的**回声**，
+    两句话说的是同一件事，模型不容易忽略。
+    """
+    outside = _outside_selection(content, ctx, targets)
+    if not outside:
+        return "", []
     allowed = "、".join(ctx.request.selected_ids)
-    return _fail(
-        "out_of_selection",
-        f"只能改当前选中节点及其子树（{allowed}），{target} 不在范围内。",
-        path=target,
-    )
+    note = (f"\n（提示：{'、'.join(outside)} 不在用户选中的节点范围内（{allowed}），"
+            "改动照样生效。若这是有意的扩权，请在回复正文里向用户说明原因；"
+            "若是误伤，请自己改回去。）")
+    return note, outside
 
 
 def _commit_drafts(
@@ -5455,13 +5492,19 @@ def _single_result(
     content: str,
     *,
     changed: Sequence[str] = (),
+    outside_selection: Sequence[str] = (),
     **data: Any,
 ) -> ToolResult:
     """细粒度工具的成功结果：形状与 `_edit` 一致，额外带"这次动了哪些 id"。
 
-    `data` 的键必须与 `_edit` 对齐（`batch` / `batches` / `id_map` / `revision`）：
-    事件流按 `result.data["batches"]` 发 `ops` 帧（`service._run_tool`），少一个键
-    前端就收不到增量——候选树停在原地，而工具回给模型的是一句"已修改"。
+    `data` 的键必须与 `_edit` 对齐（`batch` / `batches` / `id_map` / `revision` /
+    `outside_selection`）：事件流按 `result.data["batches"]` 发 `ops` 帧
+    （`service._run_tool`），少一个键前端就收不到增量——候选树停在原地，而工具
+    回给模型的是一句"已修改"。
+
+    `outside_selection` 是"这次动到了用户选区之外的哪几个节点"，**空列表也是有效
+    信息**（= 没越界）。缺键与"没越界"混在一起时，排查"这次为什么改到我别的分支"
+    就只能靠读提示词，而提示词是会变的那一层。
     """
     return ToolResult(
         ok=True,
@@ -5473,6 +5516,7 @@ def _single_result(
             "revision": ctx.revision,
             "node_count": _count_nodes(updated.root),
             "changed_ids": sorted(set(changed)),
+            "outside_selection": list(outside_selection),
             **data,
         },
     )
@@ -5539,9 +5583,8 @@ def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
 
-    scope_error = _scope_guard(content, ctx, args.parent_id)
-    if scope_error is not None:
-        return scope_error
+    # 选区只是提示：父节点在选区外时照样加，但要在结果里说一声（`_scope_note`）。
+    scope_note, outside = _scope_note(content, ctx, [args.parent_id])
 
     parent = find_node(content.root, args.parent_id)
     if parent is None:
@@ -5608,8 +5651,9 @@ def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
                            f"图标 {args.icon}" if args.icon else "") if part)
         summary += f"视觉标记：{marks}。"
     return _single_result(
-        ctx, updated, batch, id_map, summary,
+        ctx, updated, batch, id_map, summary + scope_note,
         changed=[node_id, args.parent_id],
+        outside_selection=outside,
         node_id=node_id, parent_id=args.parent_id, index=index,
     )
 
@@ -5630,9 +5674,7 @@ def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
 
-    scope_error = _scope_guard(content, ctx, args.node_id)
-    if scope_error is not None:
-        return scope_error
+    scope_note, outside = _scope_note(content, ctx, [args.node_id])
 
     node = find_node(content.root, args.node_id)
     if node is None:
@@ -5663,8 +5705,9 @@ def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
     changed_fields = "、".join(changes)
     return _single_result(
         ctx, updated, batch, id_map,
-        f"已更新节点「{node.label}」（{changed_fields}）。",
+        f"已更新节点「{node.label}」（{changed_fields}）。" + scope_note,
         changed=[args.node_id],
+        outside_selection=outside,
         node_id=args.node_id, changed_fields=sorted(changes),
     )
 
@@ -5694,9 +5737,7 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
 
-    scope_error = _scope_guard(content, ctx, args.node_id)
-    if scope_error is not None:
-        return scope_error
+    scope_note, outside = _scope_note(content, ctx, [args.node_id])
 
     if args.node_id == content.root.id:
         return _fail("cannot_remove_root", "根节点不能删除：删了这张导图就没有中心主题了。")
@@ -5727,8 +5768,9 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
         summary += f"，同时删掉了 {len(removed_edges)} 条与它相关的附加关系"
     summary += "。画布上可以撤销。"
     return _single_result(
-        ctx, updated, batch, id_map, summary,
+        ctx, updated, batch, id_map, summary + scope_note,
         changed=[args.node_id] + ([parent.id] if parent is not None else []),
+        outside_selection=outside,
         removed_nodes=removed,
         removed_count=len(removed),
         removed_edges=[edge.id for edge in removed_edges],
@@ -5753,12 +5795,8 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
 
-    scope_error = _scope_guard(content, ctx, args.node_id)
-    if scope_error is not None:
-        return scope_error
-    scope_error = _scope_guard(content, ctx, args.new_parent_id)
-    if scope_error is not None:
-        return scope_error
+    # 移动涉及两个节点（被移动的与新的父节点），两个都要算进"有没有出选区"。
+    scope_note, outside = _scope_note(content, ctx, [args.node_id, args.new_parent_id])
 
     if args.node_id == content.root.id:
         return _fail("cannot_move_root", "根节点不能移动：它没有父节点。")
@@ -5821,9 +5859,10 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
     summary = f"已把「{node.label}」（含 {_count_nodes(node) - 1} 个子孙节点）移动到「{target.label}」下"
     summary += f"，位置第 {index + 1} 个。"
     return _single_result(
-        ctx, updated, batch, id_map, summary,
+        ctx, updated, batch, id_map, summary + scope_note,
         changed=[args.node_id, args.new_parent_id]
         + ([old_parent.id] if old_parent is not None else []),
+        outside_selection=outside,
         node_id=args.node_id, parent_id=args.new_parent_id, index=index,
     )
 
@@ -5866,12 +5905,7 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
 
-    scope_error = _scope_guard(content, ctx, args.source)
-    if scope_error is not None:
-        return scope_error
-    scope_error = _scope_guard(content, ctx, args.target)
-    if scope_error is not None:
-        return scope_error
+    scope_note, outside = _scope_note(content, ctx, [args.source, args.target])
 
     source = find_node(content.root, args.source)
     if source is None:
@@ -5922,8 +5956,9 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
         f"类型：{kind_text.get(args.kind or 'flow', '顺序跳转')}（边 id {edge_id}）。"
     )
     return _single_result(
-        ctx, updated, batch, id_map, summary,
+        ctx, updated, batch, id_map, summary + scope_note,
         changed=[args.source, args.target],
+        outside_selection=outside,
         edge_id=edge_id, source=args.source, target=args.target,
         edge_count=len(updated.edges),
     )
@@ -5952,9 +5987,13 @@ def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
     if edge.label:
         summary += f"（{edge.label}）"
     summary += f"；现在还剩 {len(updated.edges)} 条。"
+    # 删边不动节点，但两个端点仍然决定"这次动到了哪一片"：删一条跨选区的线，
+    # 与删一条选区内部的线，对用户来说是两件不同的事。
+    scope_note, outside = _scope_note(content, ctx, [edge.source, edge.target])
     return _single_result(
-        ctx, updated, batch, id_map, summary,
+        ctx, updated, batch, id_map, summary + scope_note,
         changed=[edge.source, edge.target],
+        outside_selection=outside,
         edge_id=args.edge_id, edge_count=len(updated.edges),
     )
 
@@ -5982,11 +6021,10 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
 
-    # 纵深防御：注册表已经按意图裁剪过，这里再按"用户选中了哪些节点"收窄一次。
-    # 注册表配错时这条仍然拦得住，被测过（expand 意图下删除选中节点之外的分支）。
-    scope_error = _selection_scope_error(content, args, ctx)
-    if scope_error is not None:
-        return scope_error
+    # 选区只是**提示**：动到选区之外照样执行，结果里附一句"这几处不在你选中的
+    # 范围"（理由见 `_outside_selection` 的 docstring）。注册表按意图裁剪仍是
+    # 第一层防线（expand 下连 `mindmap_edit` 都看不到），这一层不再拦第二刀。
+    scope_note, outside = _scope_note(content, ctx, _edit_targets(args))
 
     drafts: list[dict[str, Any]] = []
     # 同一批里对同一个父节点连续 add 时，缺省 index 必须按“前面几条已经加进去之后”
@@ -6070,13 +6108,15 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
     }
     return ToolResult(
         ok=True,
-        content=f"已应用 {len(ops)} 条修改，导图现在有 {_count_nodes(updated.root)} 个节点。",
+        content=(f"已应用 {len(ops)} 条修改，导图现在有 {_count_nodes(updated.root)} 个节点。"
+                 + scope_note),
         data={
             "batch": batch,
             "batches": [batch],
             "id_map": id_map,
             "revision": ctx.revision,
             "changed_ids": sorted(changed),
+            "outside_selection": outside,
         },
     )
 
