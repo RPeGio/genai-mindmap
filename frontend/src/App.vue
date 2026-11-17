@@ -711,6 +711,14 @@ async function copyBody() {
             <p class="text-[11px] leading-relaxed text-slate-400">
               颜色只收预设的 8 个语义色（换主题时自动适配）；图标是一个 emoji。生成时只有一级分支会带这两个值。
             </p>
+            <!--
+              继承规则必须写出来，否则这里会成为一处"看起来坏了"的地方：给一个二级
+              节点选「默认（无色）」之后它**仍然是带色的**（继承上级），用户会以为
+              选择没生效。说清"下级选默认 = 继承"比让那条下拉自己解释要省事。
+            -->
+            <p class="text-[11px] leading-relaxed text-slate-400">
+              一级分支定了颜色，它的所有下级都跟着用这个色（在这里改一级分支，整支一起变）；下级节点选「默认」表示继承上级。
+            </p>
           </section>
 
           <label class="flex flex-1 flex-col gap-1">

@@ -576,8 +576,13 @@ async def _loop(
     active_provider = provider or default_provider()
     # 意图决定模型看得到哪些工具：expand 下根本没有 mindmap_edit，
     # 它也就不会去试"删掉另一个分支"。
+    #
+    # `diagram_type` 一起传下去：用户在图型下拉里选了什么，生成的工具定义就该
+    # 跟着变（那个参数不再下发给模型）。`expand` / `edit` 的工具集里没有生成
+    # 工具，这个值对它们没有影响。
     registry = tools if tools is not None else build_registry(
         request.intent, has_sources=bool(request.sources),
+        diagram_type=request.diagram_type,
     )
     budget = request.budget
     messages = _initial_messages(request)

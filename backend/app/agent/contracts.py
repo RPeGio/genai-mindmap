@@ -264,15 +264,43 @@ class ToolSpec:
     # 只读工具才允许按参数去重。写操作（改树）即使参数完全相同，第二次执行时
     # 树的状态已经变了，返回上次的结果等于谎报成功。
     readonly: bool = False
+    # 不给模型看的参数名：`schema()` 会把它们从 `properties` 里删掉。
+    #
+    # 用在"这个参数已经由请求层定死"的场合（比如用户在界面上选了图型）。
+    # **只是不给它看，不是不许它写**：`args_model` 里字段还在，模型凭老习惯补一个
+    # 也照样校验通过、随后被请求覆盖。反过来做（字段删掉 + `extra="forbid"`）的
+    # 代价是一次"参数不合法"，模型下一轮才改对——为一个我们本来就要覆盖的值
+    # 白烧一轮调用。
+    hidden_args: tuple[str, ...] = ()
 
     def schema(self) -> dict[str, Any]:
-        """转成 OpenAI tools 格式。"""
+        """转成 OpenAI tools 格式。
+
+        `hidden_args` 里的字段从这里抹掉：模型读的就是这份 JSON Schema，看不见的
+        参数它不会去填。`model_json_schema()` 每次返回新对象，就地删不会污染
+        别的 spec。
+
+        `required` 也一起清：隐藏一个必填字段等于让这个工具**永远**调不通
+        （模型不知道要填，服务端又要求它有），而那种失败在日志里长得像"模型不会
+        用工具"。当前唯一的隐藏字段是有默认值的，这一条是给将来的调用方留的护栏。
+        """
+        parameters = self.args_model.model_json_schema()
+        if self.hidden_args:
+            properties = parameters.get("properties")
+            if isinstance(properties, dict):
+                for key in self.hidden_args:
+                    properties.pop(key, None)
+            required = parameters.get("required")
+            if isinstance(required, list):
+                parameters["required"] = [
+                    key for key in required if key not in self.hidden_args
+                ]
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.args_model.model_json_schema(),
+                "parameters": parameters,
             },
         }
 
@@ -434,6 +462,19 @@ class AgentRunRequest(BaseModel):
     thinking_model: Literal[
         "default", "first-principles", "feynman", "systematic", "critical"
     ] = "default"
+    # 图型：界面上那个下拉里用户选的东西。**None = 让模型自己判断**，也就是
+    # "用户没说"——这一条是向后兼容的全部内容：老前端不带这个字段，走的就是
+    # `args.diagram_type` 那条老路，行为与加这个字段之前逐字节相同。
+    #
+    # 为什么必须有这一层：模型看不见界面。「画个流程图」这句话在 `goal` 里被它
+    # 当成主题描述消化掉之后，它不会再回头把工具参数设成 `flowchart`——实测三次
+    # 里三次都走 `GenerateDeepArgs.diagram_type` 的默认值 `tree`，用户看到的是
+    # 一张思维导图。只要"这个参数模型可以不填"，它就会不填；把它提到请求层，
+    # 「用户说了要流程图」这件事就不再依赖模型的记性。
+    #
+    # 用 Literal 而不是自由字符串，理由与 `thinking_model` 同：拼错的值在开流
+    # 之前就该被拒，而不是静默退化成"自动判断"。
+    diagram_type: Literal["tree", "flowchart", "fishbone"] | None = None
     snapshot: MindMapContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)

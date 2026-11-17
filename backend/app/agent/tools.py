@@ -29,7 +29,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Callable, Literal, Sequence
 from uuid import uuid4
@@ -984,6 +984,40 @@ def _skeleton_branches(raw: Any) -> list[_SkeletonBranch]:
 def _skeleton_titles(raw: Any) -> list[str]:
     """只要标题时的便捷入口（诊断、用例与旧调用方读它）。"""
     return [branch.label for branch in _skeleton_branches(raw)]
+
+
+def _fill_branch_colors(branches: Sequence[_SkeletonBranch]) -> list[_SkeletonBranch]:
+    """给没写 `color` 的一级分支补一个调色板色：**按调色板顺序，跳过已被占用的**。
+
+    提示词一直写着"建议每条分支都给"，而那是建议而不是契约——真实响应里模型
+    经常一条都不给（主题越抽象越明显）。缺色的后果不是"难看"这么轻：一级颜色
+    唯一的用途就是"按分支分组"（一级分支一个色、它的后代继承，见
+    `frontend/src/stores/mindmap.ts` 里沿父链找色那一段），一条都没有时整张图
+    退回中性灰，用户看不出哪几块是同一支。
+
+    **为什么不硬校验、不重来一次**：为一个装饰字段把一次已经花掉的骨架调用连同
+    整棵树判废，代价方向完全错（与 `_skeleton_branches` 对非法 color 的处理是
+    同一条理由：归一化而不是拒绝）。缺了就补，比要求模型一次说对便宜得多。
+
+    分配是确定的，不是随机的：
+      - 池子是**模型没占用**的调色板色，顺序即 `NODE_COLORS` 的顺序；
+      - 需要补的分支按骨架顺序依次取，取完从头循环（分支最多 20 条、调色板 8 色，
+        必然出现重色；但要走到循环说明 8 种全被模型用了，那时撞不撞不由这里决定）。
+      - 跳过已占用色是关键：只按序号取 `NODE_COLORS[i]` 时，模型给第 0 支写了
+        `blue`、第 4 支空着正好也轮到 `blue`——两条一级分支同色，"颜色=分组"
+        这个唯一约定当场失效。
+
+    纯函数：同一条骨架响应永远得到同一组颜色（用例钉着），不做任何跨请求记忆。
+    """
+    missing = [index for index, branch in enumerate(branches) if not branch.color]
+    if not missing:
+        return list(branches)
+    taken = {branch.color for branch in branches if branch.color}
+    pool = [color for color in NODE_COLORS if color not in taken] or list(NODE_COLORS)
+    filled = list(branches)
+    for position, index in enumerate(missing):
+        filled[index] = replace(filled[index], color=pool[position % len(pool)])
+    return filled
 
 
 def _skeleton_edges(
@@ -2787,6 +2821,27 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
     ctx.extra_model_calls += 1
     outline = _skeleton_outline(sources) if slicing else ""
+    # ---- 图型的唯一判定点 -------------------------------------------------------
+    # **请求给了就用请求的，没给才用工具参数。** 这一行是"用户说了画流程图"能被
+    # 兑现的全部原因：模型看不见界面，`diagram_type` 这种"可以填也可以不填"的工具
+    # 参数，只要默认值存在它就会走默认值——用户说"画个流程图"，它把这句话当主题
+    # 描述消化掉，然后规规矩矩用默认的 tree。提到请求层之后，「图型是什么」不再
+    # 由模型的记性决定。
+    #
+    # 为什么仍然保留工具参数这一支：老前端不带 `request.diagram_type`（None），
+    # 那时唯一知道用户想要什么图的地方就是模型自己的判断，行为与加请求层之前
+    # 逐字节相同——`tests/test_agent_diagram_type.py` 用 `2ed92ac` 的旧模块钉着。
+    #
+    # 请求指定时 registry 那边**根本不把这个字段发给模型**（见
+    # `_generate_deep_spec`），所以"模型填了会怎样"只剩两种情况：它凭老习惯凭空
+    # 补一个（校验收下、这里覆盖、记一条 debug），或者它压根不知道有这个字段。
+    # 两种都不会改变产出——覆盖发生在读参数的第一步，后面再没人读 `args` 的那份。
+    diagram_type = ctx.request.diagram_type or args.diagram_type
+    if ctx.request.diagram_type and args.diagram_type != ctx.request.diagram_type:
+        logger.debug(
+            "图型以请求为准：请求=%s，工具参数=%s（模型的写法不生效）",
+            ctx.request.diagram_type, args.diagram_type,
+        )
     # 骨架这一路只在**没有可检索材料**时补那两句（`CONTENT_FREEDOM_CONTRACT` +
     # `DETAIL_NO_SOURCE_RULES`）：它们是纯文本契约、不含输出格式，不会与
     # `PLAN_PROMPT` 的"只返回 branches"打架。有材料时一个字都不加——那时引用的
@@ -2796,8 +2851,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 一行都不用改。`tree` 这一支是逐字节回归的守卫点——它的两个字符串变量与
     # 加 `diagram_type` 之前完全相同。
     base_plan = (
-        PLAN_PROMPT if args.diagram_type == "tree"
-        else FLOW_PLAN_PROMPT if args.diagram_type == "flowchart"
+        PLAN_PROMPT if diagram_type == "tree"
+        else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
         else FISHBONE_PLAN_PROMPT
     )
     plan_system = base_plan if slicing else (
@@ -2807,7 +2862,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             plan_system,
             _plan_ask(
                 args.topic, args.branches, outline=outline,
-                diagram_type=args.diagram_type,
+                diagram_type=diagram_type,
             ) + hint_block)
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
@@ -2822,6 +2877,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 一级分支的条数上限与参数模型同一个常量：模型偶尔会无视"最多 N 条"，
     # 这时最多留 20 条，再多的既不在一级分支的可读区间里，也挤占下层预算。
     branches = branches[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)]
+    # 缺色的分支在这里补齐（调色板顺序、跳过模型已占用的）。放在截断**之后**：
+    # 只给真的要上画布的那几条分配，被丢掉的尾巴不参与配色，否则"第 4 支拿到
+    # 第 4 个颜色"这种事会因为一条被截掉的分支而错位。
+    branches = _fill_branch_colors(branches)
     titles = [branch.label for branch in branches]
     # 数量只做宽容校验（允许 ±1）。为了一两条差异整张重来，成本是又一轮全额调用，
     # 而多一条少一条对这张图并不致命；即使超出宽容范围也用实际返回的继续，
@@ -2857,7 +2916,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 一条 warn。**不在这里硬拒**：边是骨架的附加产物，一条写错的边不该把已经
     # 花掉的那次骨架调用连同整棵树判废。
     edges: list[Edge] = []
-    if args.diagram_type == "flowchart":
+    if diagram_type == "flowchart":
         # 端点只可能是 root 或一级分支——`_skeleton_edges` 的解析表就是这么建的，
         # 所以这里能构造的 id 集合也只需要这两个。
         skeleton_ids = {root_id} | {branch_id for _, branch_id in skeleton}
@@ -4009,7 +4068,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 附加边必须出现在 content 里：用户选的是流程图，而"这张图上有几条条件分支、
     # 几条回退"正是他判断"画出来像不像他想要的流程"的第一个信号。只说节点数时，
     # 一棵有 6 条回退线的流程图与一棵纯思维导图在文字上长得一模一样。
-    if args.diagram_type != "tree":
+    if diagram_type != "tree":
         if edges:
             branches_n = sum(1 for edge in edges if edge.kind == "branch")
             loops_n = sum(1 for edge in edges if edge.kind == "loop")
@@ -4127,13 +4186,15 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             # `tree` 是默认值，它的 `data` 键集必须与加 `diagram_type` 之前逐字节
             # 相同（`tests/test_edges.py` 拿 `e3ba390` 的旧模块整份比对）。
             **({"diagram": {
-                "type": args.diagram_type,
+                # 报**生效的**那一个（请求优先），不是 `args` 里那个：用户选了流程图、
+                # 而模型没写参数时，`data` 里再写 tree 会让诊断面板与产出自相矛盾。
+                "type": diagram_type,
                 "edges": len(edges),
                 "edge_kinds": {
                     kind: sum(1 for edge in edges if (edge.kind or "flow") == kind)
                     for kind in EDGE_KINDS
                 },
-            }} if args.diagram_type != "tree" else {}),
+            }} if diagram_type != "tree" else {}),
             "nli": {
                 "on_generate": nli_attempted,
                 "limit": MAX_NLI_CHECKS,
@@ -6073,8 +6134,43 @@ _TOOL_ORDER = (
     "mindmap_edit",
 )
 
-_TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
-    "mindmap_generate_deep": lambda: ToolSpec(
+# 图型 → 一句中文说明。给**模型**读（拼进生成工具的描述），前端 `SourceInputs.vue`
+# 的界面说明与它措辞一致：用户看到的与模型被告知的是同一件事，两边各写一套说法
+# 迟早会分叉成"用户以为选了流程、模型以为要画导图"。
+_DIAGRAM_HINTS = {
+    "tree": "思维导图（一级分支按话题分解）",
+    "flowchart": "流程图（一级分支是执行阶段，会额外给出条件分支与回退的连线）",
+    "fishbone": "鱼骨图（一级分支固定为人/机/料/法/环/测）",
+}
+
+
+def _generate_deep_spec(diagram_type: str | None = None) -> ToolSpec:
+    """分片生成的工具定义。`diagram_type` 非 None 表示**用户已经选了**。
+
+    两条分支的差别就是"这个参数谁来定"：
+
+      - `None`（老前端、或用户选了"自动判断"）：参数留在 schema 里，由模型判断
+        ——这是 `2ed92ac` 的行为，逐字节不变。
+      - 非 `None`：参数从 schema 里**抹掉**（`hidden_args`），描述改成"本次图型
+        已由用户选定：X"。模型既不会去填它，也不会在"该画流程还是导图"上再猜
+        一次；它唯一要做的就是按这个图型生成。请求层是权威（`_generate_deep`
+        的第一行就覆盖），这里是让它连填的机会都没有。
+
+    描述里那句图型说明必须**跟着分支走**：留着"diagram_type 选图型"而 schema 里
+    没有这个参数，模型会去找一个不存在的参数，或者干脆以为自己该画导图。
+    """
+    if diagram_type is None:
+        diagram_sentence = (
+            "diagram_type 选图型：tree 思维导图（默认，按话题分解）；"
+            "flowchart 流程图（一级分支是阶段，会额外给出条件分支与回退的连线）；"
+            "fishbone 鱼骨图（一级分支固定为人/机/料/法/环/测）。"
+        )
+    else:
+        diagram_sentence = (
+            f"本次图型已由用户在界面上选定：{_DIAGRAM_HINTS[diagram_type]}。"
+            "按这个图型生成，不要再自行判断图型（这个参数不会下发给工具）。"
+        )
+    return ToolSpec(
         name="mindmap_generate_deep",
         description=(
             "分片生成一张完整思维导图：先定一级骨架，再按层并发展开。某一支要不要"
@@ -6090,14 +6186,18 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
             "所以带材料的主题同样可以用它；它不会把全文读进来。"
             # 图型必须说出来：模型看不到"我该画流程还是画导图"的界面，只能靠这句
             # 判断。不说的话它一律按默认的 tree 走，用户选了流程图也拿到思维导图。
-            "diagram_type 选图型：tree 思维导图（默认，按话题分解）；"
-            "flowchart 流程图（一级分支是阶段，会额外给出条件分支与回退的连线）；"
-            "fishbone 鱼骨图（一级分支固定为人/机/料/法/环/测）。"
-            "只有当前还没有导图时可用。"
+            + diagram_sentence
+            + "只有当前还没有导图时可用。"
         ),
         args_model=GenerateDeepArgs,
         fn=_generate_deep,
-    ),
+        # 请求层定死图型时，这个参数对模型**不存在**（理由见本函数的 docstring）。
+        hidden_args=() if diagram_type is None else ("diagram_type",),
+    )
+
+
+_TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
+    "mindmap_generate_deep": lambda: _generate_deep_spec(),
     "node_expand": lambda: ToolSpec(
         name="node_expand",
         description=(
@@ -6221,7 +6321,8 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
 
 
 def build_registry(intent: str = "create", *, has_sources: bool = False,
-                   has_library: bool | None = None) -> ToolRegistry:
+                   has_library: bool | None = None,
+                   diagram_type: str | None = None) -> ToolRegistry:
     """本次可用的工具集，按意图裁剪。
 
     早先是「四个全注册 + 各自内部校验意图」。那样做的问题是模型看得到工具、
@@ -6261,6 +6362,11 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     测试与脚本要固定答案时显式传 `False / True`：否则一条用例的结论会悄悄依赖
     宿主机库里恰好存了什么。未知意图按 `create` 兜底——宁可少给工具，也不要把
     破坏性工具塞进一个没预期到的新意图里。
+
+    `diagram_type` 是**用户在界面上选的那个图型**（`AgentRunRequest.diagram_type`）。
+    非 None 时生成工具的 `diagram_type` 参数从 schema 里消失、描述改成"已选定"
+    ——见 `_generate_deep_spec`。其余九个工具与它无关：`expand` / `edit` 那两侧
+    不生成骨架，图型对它们没有任何意义（用例钉着这一点）。
     """
     if has_library is None:
         has_library = library_available()
@@ -6278,5 +6384,7 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     registry = ToolRegistry()
     for name in _TOOL_ORDER:
         if name in allowed:
-            registry.register(_TOOL_SPECS[name]())
+            registry.register(
+                _generate_deep_spec(diagram_type) if name == "mindmap_generate_deep"
+                else _TOOL_SPECS[name]())
     return registry

@@ -163,8 +163,12 @@ describe('store：样式改动', () => {
     const byId = new Map(store.nodes.map(item => [item.id, item.data]));
     expect(byId.get('a')!.color).toBe('blue');
     expect(byId.get('a')!.icon).toBe('🎯');
-    // 子节点没有视觉元素，旧图也一样
-    expect(byId.get('a1')!.color).toBeUndefined();
+    // 子节点自己没有颜色，但**渲染时沿父链继承**一级分支的色（见
+    // `inheritedColor`）。这条断言原来钉的是 `undefined`——那时颜色只到一级，
+    // 二级往下在画布上是灰的，一支配色看不出来。
+    expect(byId.get('a1')!.color).toBe('blue');
+    // 没有色的一级分支整支都没有色：继承不等于"凭空给一个色"
+    expect(byId.get('c')!.color).toBeUndefined();
   });
 });
 

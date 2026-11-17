@@ -869,6 +869,22 @@
             "title": "Thinking Model",
             "default": "default"
           },
+          "diagram_type": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "tree",
+                  "flowchart",
+                  "fishbone"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagram Type"
+          },
           "snapshot": {
             "anyOf": [
               {

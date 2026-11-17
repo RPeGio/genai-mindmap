@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunResolved, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
+import type { AgentEvent, AgentRunRequest, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
@@ -1119,6 +1119,32 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const parentOf = new Map<string, string | null>();
     for (const { node, parentId } of flatNodes.value) parentOf.set(node.id, parentId);
 
+    /**
+     * 颜色继承：沿父链取**最近的有色祖先**。
+     *
+     * 一级分支一个颜色、它的所有后代用同一个色——这是思维导图"按分支分组"的
+     * 标准做法。每个节点各一色会像调色板测试：颜色不再指示"这属于哪一支"。
+     *
+     * 为什么在**渲染层**继承，而不是生成时给每个节点都填上色：
+     *   1. 旧图立刻有颜色。生成时填只对那一次生成有效，库里已有的树仍然是黑的；
+     *   2. 用户手工改一级分支的颜色时，整支跟着变——他改的是"这一支的分组色"，
+     *      而生成时填下去的是快照，改完只有那一个节点变，视觉上像改坏了；
+     *   3. 落进库里的数据仍然是"一级分支才有 color"（与后端
+     *      `PLAN_PROMPT` / `_slot_from` 的边界一致），导出、保存都不多出噪音。
+     *
+     * 一次前向遍历算完：`flatNodes` 是父在子前的 DFS 序，所以取父节点的结论时
+     * 它一定已经算好了。逐节点沿父链往上走是 O(深度)，这条路是 O(节点数)，而且
+     * 这段代码每次 `flatNodes` 变化都会重跑（画布重排的同一条路）。
+     */
+    const inheritedColor = new Map<string, NodeColor | undefined>();
+    for (const { node, parentId } of flatNodes.value) {
+      const own = node.color ?? undefined;
+      inheritedColor.set(
+        node.id,
+        own ?? (parentId ? inheritedColor.get(parentId) : undefined),
+      );
+    }
+
     return flatNodes.value.map(({ node, depth }) => {
       const point = current.positions.get(node.id) ?? { x: 0, y: 0 };
 
@@ -1176,7 +1202,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
           previewLeaf: source.kind === 'preview' && source.expandable.get(node.id) === false,
           // 视觉元素原样带过去：只有已应用的那棵树才画（候选/预览用弱化样式，
           // 它们的颜色会让"这是一份提案"这件事变得模糊）。
-          color: editable ? node.color ?? undefined : undefined,
+          // 颜色取**继承**的结果：自身没有就沿用最近的有色祖先（见上面那段）。
+          color: editable ? inheritedColor.get(node.id) : undefined,
           icon: editable ? node.icon ?? undefined : undefined,
           // 高亮只在"画布上这棵树 + 有候选"时成立，所以它天然只对 content 生效。
           changed: changedNodeIds.value.has(node.id),
@@ -2084,6 +2111,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     intent: 'create' | 'expand' | 'edit' = 'create',
     sources?: Source[],
     thinkingModel: string = 'default',
+    diagramType: DiagramTypeChoice = 'auto',
   ): Promise<void> {
     if (busy.value || agentRunning.value) return;
     // 来源合法性在这里再判一次。组件里已有同样的闸门，但 `runGeneration` 是唯一
@@ -2174,6 +2202,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 把正文拼进 goal 会同时踩两个坑——被截断的材料丢掉大半，且模型分不清
       // 目标与素材。空数组不发：旧后端对多出来的字段是 extra="forbid"。
       if (sources && sources.length > 0) body.sources = sources;
+      // 图型只在用户真的选了、且这次是新建时发出去。两条边界各有理由：
+      //   - `auto`（= 没选）**省略字段**，不发假值：后端 `None` 的语义就是"让模型
+      //     自己判断"，省略与它同一件事，而 `"auto"` 这种字符串会被 Literal 挡成
+      //     422。省略还多换来一条性质：没选图型的请求与老前端逐字节相同。
+      //   - `expand` / `edit` 不生成骨架，后端的编辑工具集里连生成工具都没有。
+      //     那两个意图带图型只会让"图型只在新建时生效"这条边界变成一句空话。
+      if (intent === 'create' && diagramType !== 'auto') body.diagram_type = diagramType;
 
       await runAgentStream(body, event => {
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，

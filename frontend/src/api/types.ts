@@ -414,6 +414,23 @@ export interface CreateTextSourceResponse {
 // ---- agent 运行 ----
 
 /**
+ * 图型（镜像后端 `AgentRunRequest.diagram_type` 的 Literal）。
+ *
+ * `tree` 思维导图 / `flowchart` 流程图 / `fishbone` 鱼骨图。三者共用同一条生成
+ * 流水线，差别只在骨架那一次要哪份提示词、要不要解析附加边。
+ */
+export type DiagramType = 'tree' | 'flowchart' | 'fishbone';
+
+/**
+ * 界面上下拉里可能出现的那四个值。
+ *
+ * `auto` **不是**发给后端的值：它表示"我不指手画脚"，请求体里干脆不带这个字段
+ * （后端 `None` = 让模型自己判断）。省略字段与老前端逐字节相同，而发一个假值
+ * 会让后端多一种要理解的状态。
+ */
+export type DiagramTypeChoice = 'auto' | DiagramType;
+
+/**
  * 一次 agent 运行。字段与 backend/app/agent/contracts.py 的 `AgentRunRequest` 对应。
  *
  * `create` 不能带 snapshot、`expand`/`edit` 必须带——那条约束在后端开流前校验，
@@ -441,6 +458,16 @@ export interface AgentRunRequest {
    * string，由下拉框保证只在五个值里出现。缺省即 `default`。
    */
   thinking_model?: string;
+  /**
+   * 图型：用户在图型下拉里选的那一个。**省略 = 让模型自己判断**。
+   *
+   * 这个字段是"说了流程图就真的出流程图"的唯一保证：模型看不见界面，而工具参数
+   * `diagram_type` 它有默认值可走——用户说"画个流程图"，它把这句话当主题消化掉，
+   * 然后照默认的 `tree` 生成。提到请求层之后，图型不再依赖模型的记性。
+   *
+   * 只有 `create` 会用它：`expand` / `edit` 不生成骨架，图型对它们没有意义。
+   */
+  diagram_type?: DiagramType | null;
   snapshot?: MindMapContent | null;
   selected_ids?: string[];
   /**

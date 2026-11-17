@@ -411,6 +411,8 @@ export interface components {
              * @enum {string}
              */
             thinking_model: "default" | "first-principles" | "feynman" | "systematic" | "critical";
+            /** Diagram Type */
+            diagram_type?: ("tree" | "flowchart" | "fishbone") | null;
             snapshot?: components["schemas"]["MindMapContent-Input"] | null;
             /** Selected Ids */
             selected_ids?: string[];

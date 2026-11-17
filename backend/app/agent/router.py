@@ -104,6 +104,11 @@ def _request_summary(body: AgentRunRequest) -> dict[str, Any]:
         "goal": body.goal,
         "intent": body.intent,
         "thinking_model": body.thinking_model,
+        # 图型也落进摘要：这是"用户到底要的是流程图还是导图"唯一留下的持久痕迹。
+        # 它不参与重放（重放的是候选树本身），但事后排查"我要的流程图怎么成了
+        # 导图"时，没有这一行就只能靠猜。`None` 与 `"tree"` 在这里也必须分得开：
+        # 前者是"用户让我自己判断"，后者是"用户明确要思维导图"。
+        "diagram_type": body.diagram_type,
         "selected_ids": list(body.selected_ids),
         "source_ids": [source.id for source in body.sources],
     }

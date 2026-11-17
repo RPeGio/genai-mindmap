@@ -246,11 +246,21 @@ def _run(coro):
 
 
 def _stub():
-    """骨架 + 每支两个要点。分支由 user 消息里的主题决定，固定 3 支。"""
+    """骨架 + 每支两个要点。分支由 user 消息里的主题决定，固定 3 支。
+
+    骨架**带 color**：逐字节回归用例要拿 `e3ba390` 的旧模块整份比对，而"缺色由
+    代码按调色板补"是后来加的、有独立用例守着的一条改动（`_fill_branch_colors`）。
+    桩里给全颜色，这条回归就继续只盯"tree 这一支有没有多出别的东西"，不会被那条
+    改动牵连成一片红。
+    """
     def fake(system: str, user: str, **kwargs):
         if "只定一级骨架" in system or "只定主干骨架" in system or "只定骨架" in system:
             return {
-                "branches": [{"label": "提交申请"}, {"label": "形式审查"}, {"label": "付款"}],
+                "branches": [
+                    {"label": "提交申请", "color": "blue", "icon": "📝"},
+                    {"label": "形式审查", "color": "amber", "icon": "🔍"},
+                    {"label": "付款", "color": "teal", "icon": "💳"},
+                ],
                 "edges": [
                     {"source": 1, "target": 2, "label": "是", "kind": "branch"},
                     {"source": 1, "target": 0, "label": "驳回", "kind": "loop"},

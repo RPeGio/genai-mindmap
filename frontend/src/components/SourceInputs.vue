@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import RecordButton from './RecordButton.vue';
+import type { DiagramTypeChoice } from '../api/types';
 import { FILE_ACCEPT, MAX_INPUT_CHARS, MAX_SOURCES, mergedCharCount, SOURCE_LABELS, sourceInputError, sourceWarning, textSource } from '../sources/input';
 import { useMindMapStore } from '../stores/mindmap';
 import { useSourcesStore } from '../stores/sources';
@@ -26,11 +27,35 @@ const THINKING_MODEL_OPTIONS = [
 const thinkingModel = ref('default');
 
 /**
- * 拆解方式只在"会真正生效"的路径上出现：已有导图时走 `edit` 意图，后端的编辑
- * 路径不消费这个字段。摆一个选了不起作用的控件，比不摆更糟——用户会以为自己
- * 换过拆法了。
+ * 图型。`auto` = 不传字段（后端 `None`，让模型自己判断）——它是默认值，也是
+ * "用户没说"这件事在界面上唯一诚实的呈现：不选，就由生成那一次决定。
+ *
+ * 四个值与后端 `AgentRunRequest.diagram_type` 的 Literal 一一对应（`auto` 那一项
+ * 不发出去）。写死在这里而不是拉接口，理由与 `THINKING_MODEL_OPTIONS` 相同：
+ * 拼错的值会被后端 422 挡下，不会静默变形。
+ *
+ * `hint` 是**必须**的：图型不是自解释的选项。用户选「流程图」时，他期待的是
+ * "一级分支按阶段排、判断节点分是/否"，而不是"换个颜色的思维导图"；选「鱼骨图」
+ * 时更得先知道一级分支固定是那六个类别——否则他会以为模型没听懂他的主题。
  */
-const thinkingModelVisible = computed(() => !store.content);
+const DIAGRAM_TYPE_OPTIONS: { value: DiagramTypeChoice; label: string; hint: string }[] = [
+  { value: 'auto', label: '自动判断', hint: '按你的描述判断图型；判断不出时按思维导图生成。' },
+  { value: 'tree', label: '思维导图', hint: '一级分支按话题分解，不画附加连线。' },
+  { value: 'flowchart', label: '流程图', hint: '一级分支会按执行阶段排，判断节点带是/否分支' },
+  { value: 'fishbone', label: '鱼骨图', hint: '一级分支固定为人/机/料/法/环/测' },
+];
+const diagramType = ref<DiagramTypeChoice>('auto');
+const diagramHint = computed(
+  () => DIAGRAM_TYPE_OPTIONS.find(item => item.value === diagramType.value)?.hint ?? '',
+);
+
+/**
+ * 「拆解方式」与「图型」这两个下拉只在**新建**路径上生效：已有导图时点击生成走
+ * `edit` 意图，而后端的编辑路径既不消费 `thinking_model`、也不生成骨架（图型只
+ * 影响骨架那一次调用的提示词）。摆一个选了不起作用的控件比不摆更糟——用户会以为
+ * 自己换过拆法或图型了。
+ */
+const createOptionsVisible = computed(() => !store.content);
 
 const recording = ref(false);
 const generating = computed(() => store.busy);
@@ -83,7 +108,8 @@ async function generate() {
   const ready = sources.readySources;
   // 只写了材料、没写目标时给一句占位，别把正文当目标塞进去。
   const goal = text || (ready.length ? `请基于附带的 ${ready.length} 份材料生成导图` : '');
-  await store.runGeneration(goal, store.content ? 'edit' : 'create', ready, thinkingModel.value);
+  // 图型跟着一起发：`auto` 时 store 那边会省略这个字段（后端 None = 让模型判断）。
+  await store.runGeneration(goal, store.content ? 'edit' : 'create', ready, thinkingModel.value, diagramType.value);
 }
 
 function cancel() {
@@ -107,7 +133,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       <span class="text-xs text-slate-400">文本 · 文档 · 图片 · 语音</span>
     </div>
     <label for="prompt" class="text-xs font-medium text-slate-600">输入主题或文本</label>
-    <template v-if="thinkingModelVisible">
+    <template v-if="createOptionsVisible">
       <label for="thinking-model" class="text-xs font-medium text-slate-600">拆解方式</label>
       <select
         id="thinking-model"
@@ -119,6 +145,21 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
         <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
       </select>
       <p class="text-xs leading-relaxed text-slate-400">按这种方式拆解主题</p>
+    </template>
+    <template v-if="createOptionsVisible">
+      <label for="diagram-type" class="text-xs font-medium text-slate-600">图型</label>
+      <select
+        id="diagram-type"
+        v-model="diagramType"
+        :disabled="generating"
+        title="这张图要画成什么形状"
+        class="rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
+      >
+        <option v-for="item in DIAGRAM_TYPE_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+      </select>
+      <!-- 说明必须跟着选项变：图型不是自解释的。选「鱼骨图」却按话题分六支的人
+           会以为模型没听懂他的话，这一行就是"这个选项到底改了什么"。 -->
+      <p class="text-xs leading-relaxed text-slate-400">{{ diagramHint }}</p>
     </template>
     <textarea
       id="prompt"

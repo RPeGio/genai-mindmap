@@ -1433,7 +1433,11 @@ class BranchVisualsTest(unittest.TestCase):
 
         self.assertTrue(result.ok, result.content)
         branches = ctx.candidate.root.children
-        self.assertEqual([b.color for b in branches], ["blue", "teal", None])
+        # 第 3 支模型写了 `#2563eb`（非法，归一成 None），**由调色板补色**：
+        # 模型已占用 blue / teal，按 `NODE_COLORS` 顺序第一个没人用的就是 green。
+        # 这条断言改过——原来第 3 支是 None，那时缺色就留空，画布上一支没颜色与
+        # "这一支是另一组"没法区分（见 `_fill_branch_colors`）。
+        self.assertEqual([b.color for b in branches], ["blue", "teal", "green"])
         # 非法 hex 与"写成文字的图标"都被丢掉，而不是让整次骨架失败
         self.assertEqual([b.icon for b in branches], ["🎯", "📊", None])
 
