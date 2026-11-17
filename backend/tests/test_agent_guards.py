@@ -500,6 +500,12 @@ def test_edit_intent_keeps_all_seven_tools():
     assert len(names) == 7
 
 
-def test_expand_intent_keeps_its_only_tool():
-    """`expand` 仍然只有 `node_expand`（无来源时）。"""
-    assert build_registry("expand", has_library=False).names() == ["node_expand"]
+def test_expand_intent_keeps_its_tools():
+    """`expand` 只有展开 + 整图体检（无来源时）。
+
+    `audit_tree` 进这一组不是"多给一个工具"：那条路上模型是逐个 `node_expand`
+    展开的，`mindmap_generate_deep` 内部那套验收（`_audit_branches` / `partial`）
+    覆盖不到它，而大纲只列前 200 个节点——"还差哪几支"只能由代码数。
+    """
+    assert build_registry("expand", has_library=False).names() == [
+        "audit_tree", "node_expand"]

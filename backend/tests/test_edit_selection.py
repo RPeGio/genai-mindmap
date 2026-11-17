@@ -237,7 +237,13 @@ def test_create_registry_is_untouched():
 
 
 def test_expand_registry_is_untouched():
-    assert build_registry("expand", has_library=False).names() == ["node_expand"]
+    """`expand` 的两个工具：展开 + 整图体检（`audit_tree`，只读、不产节点）。
+
+    体检工具在这条路上是必需的：模型逐个 `node_expand` 展开时，"还差哪几支"
+    没有任何代码在替它数，而它看到的大纲只列前 200 个节点。
+    """
+    assert build_registry("expand", has_library=False).names() == [
+        "audit_tree", "node_expand"]
 
 
 def test_router_accepts_many_selected_ids_for_edit():

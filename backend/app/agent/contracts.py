@@ -425,6 +425,17 @@ class RunContext:
     # 「图型与附加边」那一段）。
     diagram_source: str | None = None
     diagram_stripped: str | None = None
+    # `audit_tree` 最后一次数出来"还有几条一级分支没有子节点"。0 表示上次体检
+    # 是干净的，`None` 表示这次运行**从没体检过**——两者必须分得开：没体检过时
+    # 循环不该替模型判断"它是不是漏了"，那是凭空多出来的停止条件。
+    #
+    # 谁写谁读：`tools._audit_tree_tool` 写（每次体检覆盖），`service._loop` 在
+    # 模型准备收尾时读。放在 ctx 上而不是 `ToolResult.data` 里，理由与
+    # `loop_diagnostics` 相同——它是**跨调用**的事实，不属于任何一次调用。
+    audit_missing: int | None = None
+    # 「已经提醒过模型一次了」。收尾提醒必须是一次性的：模型听完还是要停，
+    # 那是它的判断（或者它有自己的理由），再催就变成代码替它写这张图。
+    audit_nagged: bool = False
 
     def record_library_sources(self, sources: Iterable[Source]) -> None:
         """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。

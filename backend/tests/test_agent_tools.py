@@ -1376,13 +1376,14 @@ class RegistryTest(unittest.TestCase):
     def test_expand_intent_never_offers_edit(self):
         """expand 下模型看不到 mindmap_edit，就不会去试"删掉另一个分支"。"""
         names = build_registry("expand").names()
-        self.assertEqual(names, ["node_expand"])
+        # 第二个是只读的整图体检（`audit_tree`），它不改任何节点。
+        self.assertEqual(names, ["audit_tree", "node_expand"])
         self.assertNotIn("mindmap_edit", names)
 
     def test_expand_intent_adds_rag_only_when_sources_exist(self):
         self.assertEqual(
             build_registry("expand", has_sources=True).names(),
-            ["node_expand", "rag_query"],
+            ["audit_tree", "node_expand", "rag_query"],
         )
 
     def test_edit_intent_offers_edit_but_not_generate(self):

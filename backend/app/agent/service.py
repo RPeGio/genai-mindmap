@@ -918,6 +918,31 @@ async def _loop(
         usage_total = _merge_usage(usage_total, completion.usage)
 
         if not completion.tool_calls:
+            # 收尾前的一次性提醒：模型**自己**刚查出还有几支没展开，却直接收尾了。
+            #
+            # 判据只依赖它自己调 `audit_tree` 的结果（`ctx.audit_missing`），所以
+            # 这不算代码替它判断"该不该继续"：它已经知道缺什么，这里只是把
+            # "你知道吗"变成"那你补完再收"。**没体检过（None）时一个字都不加**——
+            # 用户的请求可能就只是展开一个节点，那时缺 7 支是正常的，凭空要求
+            # 补全等于代码替用户改需求。
+            #
+            # 只提醒一次（`audit_nagged`）：它听完还是要停，那是它的判断（可能
+            # 它有别的理由，比如用户只是问了一句）；再催就变成代码在写这张图。
+            #
+            # 体检结论**不随后续写入失效**：模型审计完补了一支又收尾时，那句
+            # "还有 2 条没有子节点"已经过时了，但提醒仍然是对的——它上一次的
+            # 判断是"缺 2 支"，而它没有再说"现在不缺了"。多花一轮往返，换的是
+            # "补到一半就收尾"不会静默通过。
+            if (completion.finish_reason == "stop" and ctx.audit_missing
+                    and not ctx.audit_nagged):
+                ctx.audit_nagged = True
+                reminder = (
+                    f"你刚才的体检显示还有 {ctx.audit_missing} 条一级分支没有任何子节点。"
+                    "请继续用 node_expand 展开它们；如果你判断就该停在这里，直接说明原因。"
+                )
+                messages.append({"role": "user", "content": reminder})
+                yield StageEvent(seq=next(seq), stage="audit_pending", detail=reminder)
+                continue
             if completion.finish_reason == "stop":
                 yield DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
                                 mode="model")

@@ -11,6 +11,9 @@
 - `rag_query` 只读，查本次请求带来的来源**与知识库**（`library=True`，默认开；
   库命中的 `source_id` 是持久 id，收尾校验前要用 `library.load()` 取回原文）
 - `mindmap_edit` 才允许改/删/移，且必须按节点 id
+- `audit_tree` 只读：数出"还有哪几支一级分支没展开"，**不做任何判断**。它存在
+  的理由是"模型以为自己写完了"——`expand` 意图下没有代码替它数，而它看到的大纲
+  只列前 200 个节点（口径见该工具的 docstring）
 
 `create` 只剩这一条生成路：整树一次成型的 `mindmap_generate` 已随
 `MINDMAP_SOURCE_MODE=full` 形态一起删除（决策与代价见 `docs/ONE-PATH.md`）。
@@ -554,6 +557,17 @@ class ExpandArgs(BaseModel):
     node_id: str = Field(min_length=1, max_length=100, description="要展开的节点 id，取自当前大纲")
     count: int = Field(default=3, ge=2, le=4, description="要补充几个子要点")
     instruction: str | None = Field(default=None, max_length=300, description="可选的补充要求")
+
+
+class AuditTreeArgs(BaseModel):
+    """`audit_tree` 没有参数：它数的是**当前这棵树**，不是模型描述的那棵树。
+
+    刻意不留任何旋钮。这个工具的存在理由是"模型以为自己写完了"，它的输入必须是
+    客观状态（`ctx.candidate`）而不是模型的复述——一旦允许传 `branches` 之类，
+    模型就会把自己记忆里那份骨架传进来，审的成了它自己的记忆。
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class RagArgs(BaseModel):
@@ -5394,6 +5408,152 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     )
 
 
+# ---------------------------------------------------------------- 整图审计
+
+
+# 三个列表各自最多回几条。超出的只给 `more` 数字：一棵 300 节点的树里空壳可能有
+# 几十条，整份塞进 tool 消息是把上下文吃了去换一堆模型用不上的 id；而一条都不给
+# 又让"还差几处"无法定位。20 与 `outline_text` 的 200 行是同一个口径——够模型
+# 认得出是哪几支，装不满一次响应的预算。
+AUDIT_LIST_LIMIT = 20
+
+
+def _audit_walk(root: Node) -> tuple[int, int]:
+    """整树节点数与实际层数（root 计 1 层）。
+
+    显式栈而不是递归：树是模型给的，不假设深度上限成立（与 `ops.find_node`
+    同一条理由）。
+    """
+    total = 0
+    deepest = 1
+    stack: list[tuple[Node, int]] = [(root, 1)]
+    while stack:
+        node, depth = stack.pop()
+        total += 1
+        deepest = max(deepest, depth)
+        stack.extend((child, depth + 1) for child in node.children)
+    return total, deepest
+
+
+def _audit_branch_lists(root: Node) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                                             list[dict[str, Any]]]:
+    """`missing` / `thin` / `empty` 三个列表（口径见 `_audit_tree` 的 docstring）。
+
+    纯函数、只读：它不碰 `ctx.candidate`，所以用例可以直接拿一棵树钉住判定。
+    """
+    missing = [{"id": branch.id, "label": branch.label}
+               for branch in root.children if not branch.children]
+    thin = [{"id": branch.id, "label": branch.label, "children": len(branch.children)}
+            for branch in root.children if len(branch.children) == 1]
+    empty: list[dict[str, Any]] = []
+    # 深度口径与 `_audit_walk` 一致：root 是第 1 层，一级分支第 2 层，所以一级
+    # 分支的子节点从第 3 层起。
+    stack = [(child, 3) for branch in root.children for child in branch.children]
+    while stack:
+        node, depth = stack.pop()
+        if not node.children:
+            empty.append({"id": node.id, "label": node.label, "depth": depth})
+        stack.extend((child, depth + 1) for child in node.children)
+    # 按深度升序：先补浅的（浅层空壳影响整图可读性，补它的收益最大），
+    # 同深度保持发现顺序——不排序的话，"先补哪一处"由栈的实现细节决定。
+    empty.sort(key=lambda item: item["depth"])
+    return missing, thin, empty
+
+
+def _audit_tree_tool(args: AuditTreeArgs, ctx: RunContext) -> ToolResult:
+    """整图结构体检：**只数事实，不做判断**。
+
+    **函数名带 `_tool` 后缀不是风格，是必须的**：`_audit_tree` 这个名字已经被
+    `_generate_deep` 收尾那道「整树形状审计」（`_audit_tree(root, expected)` →
+    `_TreeAudit`）占着。同名覆盖的后果不是报错而是**静默**——后者被替换成这里的
+    实现，`_generate_deep` 会拿一棵树和一个 `set` 调它，直接 `AttributeError`。
+    这一条是靠 `tests/test_agent_tools.py` 全红才发现的，所以名字不能再合并。
+
+    为什么需要它，而不是让模型看大纲：`service.outline_text` 只列前 200 个节点，
+    8 支 × 3 层就可能超；被截断之后模型看不出"最后两支下面什么都没有"，而它
+    **不知道自己没看到**——这正是"模型以为自己写完了"最典型的形状。这个工具的
+    每一个数都来自 `ctx.candidate`，与模型记得什么无关。
+
+    三个列表都是可数的，没有一条是判断：
+
+      - `missing`：一级分支里 `children` 为空的 —— "这一支从来没展开过"；
+      - `thin`：一级分支只有一个子节点的 —— 展开过但只写了一条，是"这一支其实
+        没写满"最便宜的证据（结构体检里 `SINGLE_CHILD` 数的是同一类事）；
+      - `empty`：**非**一级分支、且没有子节点的节点 —— 树上真实存在的空壳。
+        "非一级分支"这条限制是有意的：一级分支没有子节点已经由 `missing` 说了，
+        两个列表说同一件事会让"还差几处"变成要先相加才读得懂。
+
+    它读 `ctx.candidate` 而**不写**它：`revision` 与树指纹一个字节都不变，所以
+    连续调它不会把 `NO_PROGRESS` 计数清零，也不会被记成一次改动。这也是它必须
+    `readonly=True` 的理由——同参数的重复调用直接命中缓存，不再算一遍。
+
+    返回的 `content` 是写给模型的行动指令（"缺的先补、不空就收尾"），`data` 是给
+    前端与排查的原始计数。两者形状不同是有意的：模型要的是下一步做什么，人要看
+    的是到底缺几处。
+    """
+    content = ctx.candidate
+    if content is None:
+        return _fail("no_candidate", "当前还没有导图，没有可体检的东西。")
+    root = content.root
+    total, deepest = _audit_walk(root)
+    missing, thin, empty = _audit_branch_lists(root)
+    branches = len(root.children)
+    # 还能再展开的节点数（`expandable != "no"`）。**不含根**：根永远是 `unknown`
+    # 或 `yes`，把它算进来会让"8 支都到底了"显示成 1 处待展开。
+    pending = 0
+    stack = list(root.children)
+    while stack:
+        node = stack.pop()
+        if node.expandable != "no":
+            pending += 1
+        stack.extend(node.children)
+
+    expanded = branches - len(missing)
+    parts = [
+        f"整图体检：{total} 个节点、{deepest} 层、一级分支 {branches} 条，"
+        f"其中已展开 {expanded} 条。"
+    ]
+    if missing:
+        names = "、".join(f"「{item['label']}」({item['id']})"
+                         for item in missing[:AUDIT_LIST_LIMIT])
+        # 前面已经说了总条数，这里不再重复一遍"等 N 条"——那句话读起来像
+        # "还另外有 N 条"，而它数的是同一批。只说"列不全"就够了。
+        tail = (f"（这里只列前 {AUDIT_LIST_LIMIT} 条）"
+                if len(missing) > AUDIT_LIST_LIMIT else "")
+        parts.append(f"还有 {len(missing)} 条一级分支没有任何子节点：{names}{tail}；"
+                     "先补这些，再收尾。")
+    if thin:
+        names = "、".join(f"「{item['label']}」({item['id']})"
+                         for item in thin[:AUDIT_LIST_LIMIT])
+        parts.append(f"{len(thin)} 条一级分支只有 1 个子节点：{names}；"
+                     "如果这一支本该更丰满，可以再补。")
+    if empty:
+        sample = "、".join(f"「{item['label']}」" for item in empty[:AUDIT_LIST_LIMIT])
+        parts.append(f"树上有 {len(empty)} 个叶子节点（如 {sample}），"
+                     "它们是终点还是没写完，由你判断。")
+    if not missing and not thin:
+        parts.append("没有发现没展开的一级分支，可以收尾。")
+
+    data = {
+        "branches": branches,
+        "expanded": expanded,
+        "depth": deepest,
+        "nodes": total,
+        "pending": pending,
+        "missing": missing[:AUDIT_LIST_LIMIT],
+        "missing_count": len(missing),
+        "thin": thin[:AUDIT_LIST_LIMIT],
+        "thin_count": len(thin),
+        "empty": empty[:AUDIT_LIST_LIMIT],
+        "empty_count": len(empty),
+    }
+    # 记到 ctx 上：模型读不读得到是它的事，但"它查出来还缺几支"要留在代码手里，
+    # 收尾时（`service._loop`）才有依据提醒它一次。写在返回之前而不是之后——
+    # 这条路径没有 await，顺序不影响正确性，但"先记账再回答"是这一层的一贯顺序。
+    ctx.audit_missing = len(missing)
+    return ToolResult(ok=True, content="".join(parts), data=data)
+
+
 def _selection_scope(content: MindMapContent, ctx: RunContext) -> set[str] | None:
     """用户这次允许改的节点集合；没限制时返回 `None`。
 
@@ -6164,7 +6324,16 @@ def _batch_id(ctx: RunContext) -> str:
 # 模型往返——每次工具调用都要等模型再看一眼结果。
 _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
     "create": ("mindmap_generate_deep",),
-    "expand": ("node_expand",),
+    # `audit_tree` 只给 `expand`：那条路上模型是**逐个** `node_expand` 展开的，
+    # "还有哪几支没展开"没有任何代码在替它数——`mindmap_generate_deep` 内部那套
+    # 验收（`_audit_branches` / `partial`）只覆盖生成那一次，用户在生成之后说
+    # "把这张图补完"时，模型能看到的大纲还可能被 200 行截断。
+    #
+    # 为什么不给 `create`：那条路的循环边界由代码保证（工具内部 gather 全部支、
+    # 自己判 sparse 并报 `partial`），再给一个审计工具只是把同一条事实说两遍，
+    # 而"create 只有一条生成路"是一条被 `tests/test_one_path.py` 钉住的硬约束
+    # ——审计不是第二条路，但它也不该在这条路上多一个可调的旋钮。
+    "expand": ("node_expand", "audit_tree"),
     "edit": (
         "add_node", "update_node", "remove_node", "move_node",
         "add_edge", "remove_edge", "mindmap_edit",
@@ -6188,6 +6357,7 @@ _TOOL_ORDER = (
     "mindmap_generate_deep",
     "node_expand",
     "rag_query",
+    "audit_tree",
     "add_node",
     "update_node",
     "remove_node",
@@ -6268,6 +6438,12 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
             "模型会看到从根到这个节点的标题链与它已有的子节点，所以写出来的内容要落在"
             "这一支的范围里，并且不能与已有子节点重复。"
             "节点已经到底（第 8 层 / 模型说过没有更细内容）时它会被拒，理由会一起返回。"
+            # 循环写在这里，是因为它是模型在 expand 意图下**读到的第一个工具**：
+            # 只在 audit_tree 自己的描述里写"它什么时候该被调"，等于要求模型先想到
+            # 去读一个它还不知道要用的工具。
+            "**用户要求把整张图补全 / 补齐时**：先调 audit_tree 看还有哪几条一级分支"
+            "没有子节点，对每一条调一次 node_expand，补完再调一次 audit_tree 复查，"
+            "missing 为空才收尾——你自己数不准，大纲只列前 200 个节点。"
         ),
         args_model=ExpandArgs,
         fn=_expand,
@@ -6280,6 +6456,27 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
         ),
         args_model=RagArgs,
         fn=_rag,
+        readonly=True,
+    ),
+    # 审计工具的描述就是它的分工声明：**数事实的是它，补不补的是模型**。
+    # 描述里写"missing 非空就继续调 node_expand"，而不是把这条写进 system：
+    # 模型是逐个读工具决定下一步的，写在 system 里它读完就忘，写在这里它每次
+    # 想看"还差什么"时都会重读一遍。
+    "audit_tree": lambda: ToolSpec(
+        name="audit_tree",
+        description=(
+            "体检当前这棵导图，**只数事实不产节点**：返回一级分支总数、已展开几条、"
+            "还有哪几条一级分支没有任何子节点（missing）、哪几条只有一个子节点（thin）、"
+            "以及树上有多少个叶子节点（empty）。"
+            "用户要求「把整张图补完 / 补齐 / 看看还缺什么」时用它：先 audit_tree，"
+            "对 missing 里的每一条调 node_expand，再 audit_tree 复查，"
+            "直到 missing 为空才收尾。"
+            "**你自己数不准**：大纲只列前 200 个节点，大图里后面的分支你看不到；"
+            "这个工具读的是服务端那棵真树，不受截断影响。"
+            "它不改任何东西，可以反复调。"
+        ),
+        args_model=AuditTreeArgs,
+        fn=_audit_tree_tool,
         readonly=True,
     ),
     # 四个细粒度工具的描述都要写清"一次只改一处"与"什么时候改用批量"：
@@ -6394,7 +6591,9 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
 
     裁剪规则：
       - `create` 只给分片生成（`mindmap_generate_deep`），没有第二个选项
-      - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
+      - `expand` 给 `node_expand` + `audit_tree`（整图体检，用户要求"补完"时
+        模型靠它知道还差哪几支；那条路上没有代码替它数），请求带来源时再加
+        `rag_query`
       - `edit` 给**七个**写工具（`add_node` / `update_node` / `remove_node` /
         `move_node` / `add_edge` / `remove_edge` / `mindmap_edit`），请求带来源时
         再加 `rag_query`。让模型自己选粒度：改一两处用细粒度的（参数扁平、报错更准），
