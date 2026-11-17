@@ -72,6 +72,8 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 2C2G 的机器上：不装 LibreOffice 可以跑，装了之后要留意 `.doc/.ppt` 转换时 `soffice` 进程会额外占 350–380 MB。
 
+知识库（`backend/data/mindmaps.db`，可用 `MINDMAP_DB_PATH` 指定位置）随使用增长，但入库之后会按 90 天 / 200 份自动淘汰（触发条件与成本见 `docs/LIBRARY-MEASUREMENTS.md`），稳态在 10 MB 以内。仍然建议把该分区剩余空间纳入监控（例如低于 500 MB 告警）：磁盘写满时 SQLite 报 `database or disk is full`，会连带影响生成。
+
 ## 6. 语音输入（F07）
 
 走阿里云百炼的 **Qwen-Audio-ASR**（`qwen-audio-3.1-asr-flash`），不在部署机上跑本地模型。

@@ -9,6 +9,9 @@
    不进去，这一轮照样要能生成，只是它下次不能从库里复用。
 3. **开关关掉时逐字段不变**。`MINDMAP_LIBRARY_REMEMBER=0` 必须是"完全不碰库"，
    而不是"碰了但结果一样"——线上那一刻没法调库，碰了就是投递失败。
+4. **库不能只增不减**。`prune()` 的保留规则（90 天 / 200 份）早写好了却没人调；
+   入库是唯一的写入来源，所以淘汰挂在它后面，但要有两个闸门（条数余量 + 每小时
+   一次）并跑在后台线程里——首帧之前不能多一次全表删除。
 
 全部离线：`conftest.py` 已清空凭证、开关置 0，数据库落在本次用例的 `tmp_path`。
 """
@@ -16,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -186,3 +191,82 @@ def test_switch_only_recognises_zero(monkeypatch, value, expected):
     monkeypatch.setenv(remember.REMEMBER_ENV, value)
 
     assert remember.remember_enabled() is expected
+
+
+# ---------------------------------------------------------------- 4 自动淘汰
+
+
+def test_big_library_triggers_a_background_prune(tmp_path, monkeypatch):
+    """库明显超过保留上限时，入库顺手触发一次淘汰，但跑在后台线程里。"""
+    monkeypatch.setattr(remember, "_prune_checked_at", 0.0)
+    monkeypatch.setattr(library, "count", lambda: remember.PRUNE_TRIGGER_COUNT + 1)
+    done = threading.Event()
+    calls: list[int] = []
+
+    def fake_prune(**kwargs):
+        calls.append(1)
+        done.set()
+        return 0
+
+    monkeypatch.setattr(library, "prune", fake_prune)
+
+    remember.remember_sources([_source("正文。")])
+
+    assert done.wait(5.0), "淘汰没有在后台跑起来"
+    assert calls == [1]
+
+
+def test_small_library_does_not_prune(tmp_path, monkeypatch):
+    """没到阈值就不碰库：240 的余量就是为了避免"刚好 201 份就开始删"。"""
+    monkeypatch.setattr(remember, "_prune_checked_at", 0.0)
+    monkeypatch.setattr(library, "count", lambda: remember.PRUNE_TRIGGER_COUNT)
+    calls: list[int] = []
+    monkeypatch.setattr(library, "prune", lambda **kwargs: calls.append(1) or 0)
+
+    remember.remember_sources([_source("正文。")])
+
+    time.sleep(0.05)  # 真起了线程的话，这点时间足够它跑到 prune
+    assert calls == []
+
+
+def test_prune_check_is_throttled_per_interval(tmp_path, monkeypatch):
+    """每小时最多查一次条数：否则每次生成都多一次 COUNT、多一次潜在删除。"""
+    monkeypatch.setattr(remember, "_prune_checked_at", time.monotonic())
+    calls: list[int] = []
+    monkeypatch.setattr(library, "count", lambda: calls.append(1) or 1000)
+    monkeypatch.setattr(library, "prune", lambda **kwargs: 0)
+
+    remember.remember_sources([_source("正文。")])
+
+    # 节流在查条数之前就返回了：连 `count` 都不该调。
+    assert calls == []
+
+
+def test_count_failure_does_not_affect_ingest(tmp_path, monkeypatch, caplog):
+    """淘汰前的条数都读不到，入库本身仍必须成功、也不许抛。"""
+    monkeypatch.setattr(remember, "_prune_checked_at", 0.0)
+
+    def boom() -> int:
+        raise sqlite3.OperationalError("no such table: library_sources")
+
+    monkeypatch.setattr(library, "count", boom)
+
+    with caplog.at_level(logging.WARNING, logger=remember.__name__):
+        result = remember.remember_sources([_source("正文。")])
+
+    assert len(result.mapping) == 1
+    assert result.sources[0].id in result.mapping.values()
+    assert any("本次跳过淘汰" in record.getMessage() for record in caplog.records)
+
+
+def test_prune_failure_is_only_a_warning(tmp_path, monkeypatch, caplog):
+    """守护线程里 `prune` 抛错只记 warning：淘汰失败不该冒到任何人面前。"""
+    def boom(**kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(library, "prune", boom)
+
+    with caplog.at_level(logging.WARNING, logger=remember.__name__):
+        remember._prune_once()
+
+    assert any("知识库自动淘汰失败" in record.getMessage() for record in caplog.records)

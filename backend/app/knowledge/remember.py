@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -36,6 +38,16 @@ REMEMBER_ENV = "MINDMAP_LIBRARY_REMEMBER"
 # 到点就放弃剩下的材料、按临时 id 继续生成：记上账是旁路，不能压过生成本身。
 REMEMBER_BUDGET_SECONDS = 5.0
 
+# 自动淘汰（`library.prune()`：90 天 / 200 份）的两个闸门。入库是唯一的写入
+# 来源，把淘汰挂在它后面就不需要额外的定时任务；但"每次生成都淘汰一遍"没必要，
+# 所以：条数要明显超过保留上限（比 200 留 20% 余量，避免刚好 201 份就开始删），
+# 且进程内每小时最多检查一次。真正的删除放到后台线程——prune 要扫全表，
+# 不该出现在首帧之前的关键路径上。
+PRUNE_TRIGGER_COUNT = 240
+PRUNE_INTERVAL_SECONDS = 3600.0
+_prune_checked_at = 0.0
+_prune_lock = threading.Lock()
+
 
 def remember_enabled() -> bool:
     return os.getenv(REMEMBER_ENV, "1").strip() != "0"
@@ -48,6 +60,41 @@ class Remembered:
     sources: list[Source]
     # 旧 id → 持久 id。为空表示没有任何 id 变化（包括整个开关关掉的情形）。
     mapping: dict[str, str] = field(default_factory=dict)
+
+
+def _maybe_prune() -> None:
+    """到点就把淘汰交给后台线程；首帧之前的关键路径上只多一次 `COUNT`。"""
+    global _prune_checked_at
+
+    now = time.monotonic()
+    with _prune_lock:
+        if now - _prune_checked_at < PRUNE_INTERVAL_SECONDS:
+            return
+        # 先记账再判断：读条数失败时也不该每分钟重试一次，一小时后再说。
+        _prune_checked_at = now
+        try:
+            total = knowledge_library.count()
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("读不到知识库条数（%s），本次跳过淘汰：%s",
+                           type(exc).__name__, str(exc)[:160])
+            return
+        if total <= PRUNE_TRIGGER_COUNT:
+            return
+        logger.info("知识库 %d 份，超过阈值 %d，后台淘汰一次", total, PRUNE_TRIGGER_COUNT)
+        threading.Thread(target=_prune_once, name="library-prune", daemon=True).start()
+
+
+def _prune_once() -> None:
+    """执行一次淘汰；这是守护线程里跑的东西，异常只记日志、不许往外抛。"""
+    try:
+        removed = knowledge_library.prune()
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("知识库自动淘汰失败（%s）：%s", type(exc).__name__, str(exc)[:160])
+    except Exception:  # noqa: BLE001 - 守护线程里没人接异常，兜住并留栈
+        logger.exception("知识库自动淘汰出现未预期异常")
+    else:
+        if removed:
+            logger.info("知识库自动淘汰 %d 份来源（保留 90 天 / 200 份）", removed)
 
 
 def remember_sources(sources: list[Source]) -> Remembered:
@@ -66,6 +113,11 @@ def remember_sources(sources: list[Source]) -> Remembered:
     因此这里兜到底：已知异常（空正文、库故障）按 warning 记，其余任何意外按
     exception 记完整栈——这条支路不该有能力中断生成，异常一旦穿出去就会被
     `agent/router.py` 兜成 `agent_failed`，整轮生成不跑。
+
+    **淘汰挂在入库后面**：`prune` 的保留策略（90 天 / 200 份）写死在库里，但
+    没有定时任务去调它；库只增不减，早晚把磁盘和列表接口一起拖慢。这里按
+    `PRUNE_TRIGGER_COUNT` / `PRUNE_INTERVAL_SECONDS` 触发一次，删除动作在后台
+    线程里跑——记账可以慢一点，首帧不能。
     """
     if not sources or not remember_enabled():
         return Remembered(sources=list(sources))
@@ -88,10 +140,13 @@ def remember_sources(sources: list[Source]) -> Remembered:
             continue
         mapping[source.id] = persistent_id
         kept.append(source.model_copy(update={"id": persistent_id}))
+    _maybe_prune()
     return Remembered(sources=kept, mapping=mapping)
 
 
 __all__ = [
+    "PRUNE_INTERVAL_SECONDS",
+    "PRUNE_TRIGGER_COUNT",
     "REMEMBER_BUDGET_SECONDS",
     "REMEMBER_ENV",
     "Remembered",
