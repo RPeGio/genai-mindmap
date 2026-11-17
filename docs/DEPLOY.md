@@ -336,6 +336,11 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 
 加演示账号：`sudo htpasswd /etc/nginx/.htpasswd-mindmap alice`。
 
+**多加账号 = 共用一个知识库**。服务端是单用户单库的设计（见 `docs/PLAN.md` 的 F12），
+Basic Auth 只决定"能不能进来"，不区分是谁：任何账号打开「知识库」抽屉，都能列出
+别人的材料、并读到每份正文的前 4000 字。只想自己用就别加账号；真要多人共用，
+先想清楚这些材料能不能互相看见。
+
 **重启会等正在跑的生成**：单元里 `TimeoutStopSec=660`（生成预算是 600 秒），所以有长请求在跑时 `systemctl restart` 可能等到十来分钟。演示前别在有人用的时候重启；确实要立刻停，用
 `sudo systemctl kill -s SIGKILL genai-mindmap && sudo systemctl start genai-mindmap`（代价是那条请求直接断，前端看到断流）。
 
