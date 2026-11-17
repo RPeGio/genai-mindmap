@@ -1508,6 +1508,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 取消/换图同理：长到一半的预览属于已经结束的那一次运行。
     clearAgentPreview();
     stageText.value = '';
+    // 这一轮已经结束，"等了多久"不再有意义：不清的话，静默超 10s 后点取消，
+    // 界面会一边写"已取消。"、一边挂着"模型正在思考，已等 20 秒"。
+    waitedMs.value = 0;
     status.value = '已取消。';
   }
 
@@ -1745,6 +1748,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
         agentRunning.value = false;
         busy.value = false;
         stageText.value = '';
+        // 断流/异常退出时同理：这一轮已经结束，别再留着"模型正在思考"。
+        waitedMs.value = 0;
       }
     }
   }

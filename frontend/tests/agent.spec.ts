@@ -255,6 +255,41 @@ describe('agent 运行', () => {
     stream.finish();
     await running;
   });
+
+  it('取消之后等待计时归零：不能一边说已取消、一边说还在思考', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'heartbeat', seq: 1, waited_ms: 20400 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(20));
+
+    store.cancel();
+    // fetch mock 的读端不会自己因为 abort 结束，手动收尾让 runGeneration 退出
+    stream.finish();
+    await running;
+
+    expect(store.waitedMs).toBe(0);
+    expect(store.status).toBe('已取消。');
+  });
+
+  it('断流之后等待计时归零：不再挂着「模型正在思考」', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'heartbeat', seq: 1, waited_ms: 31000 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(31));
+
+    // 没有 done / error 就 EOF：连接断了，这一轮已经结束
+    stream.finish();
+    await running;
+
+    expect(store.waitedMs).toBe(0);
+    expect(store.agentError).toContain('中断');
+  });
 });
 
 describe('部分完成与诊断', () => {
@@ -740,6 +775,7 @@ describe('静默提示', () => {
   it('静默到 10 秒时把阶段文案换成「模型正在思考」，两句话不并存', async () => {
     const wrapper = panel();
     const store = useMindMapStore();
+    store.busy = true;
     store.stageText = '正在定框架';
     await wrapper.vm.$nextTick();
     expect(wrapper.text()).toContain('正在定框架');
@@ -752,26 +788,42 @@ describe('静默提示', () => {
     expect(wrapper.text()).not.toContain('正在定框架');
   });
 
-  it('10 秒以内仍显示阶段文案，等待秒数附在后面', async () => {
+  it('10 秒以内仍显示阶段文案，不额外加括号提示', async () => {
     const wrapper = panel();
     const store = useMindMapStore();
+    store.busy = true;
     store.stageText = '正在定框架';
     store.waitedMs = 3;
     await wrapper.vm.$nextTick();
 
     expect(wrapper.text()).toContain('正在定框架');
-    expect(wrapper.text()).toContain('（已等待 3 秒）');
+    // 后端心跳最小间隔就是 10 秒，`waitedMs < 10` 只在测试里造得出来；
+    // 渲染层不为此再留一条永远走不到的分支。
+    expect(wrapper.text()).not.toContain('已等待');
     expect(wrapper.text()).not.toContain('模型正在思考');
   });
 
   it('没有阶段文案时也不因为等待计时凭空多出一行', async () => {
     const wrapper = panel();
     const store = useMindMapStore();
+    store.busy = true;
     store.stageText = '';
     store.waitedMs = 0;
     await wrapper.vm.$nextTick();
     expect(wrapper.text()).not.toContain('正在思考');
-    expect(wrapper.text()).not.toContain('已等待');
+  });
+
+  it('这一轮结束之后，残留的等待计时不再渲染', async () => {
+    // store 会在取消/断流时归零，但渲染不该依赖"没忘"：多一道守卫，
+    // 界面就不可能在"已取消。"底下再挂一句"模型正在思考"。
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.stageText = '正在定框架';
+    store.waitedMs = 20;
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).not.toContain('模型正在思考');
+    expect(wrapper.text()).not.toContain('正在定框架');
   });
 });
 

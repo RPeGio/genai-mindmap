@@ -58,9 +58,14 @@ const showRefState = computed(() => !!store.content);
  * 后端只在静默达到 10 秒才发心跳，所以 `waitedMs > 0` 基本等价于"已经静默 10 秒"。
  * 阈值再写一遍是为了前端自己也站得住：万一别处的实现改成更密的保活帧，
  * 这里不会 1 秒就把阶段文案顶掉。
+ *
+ * 外面必须再判一次"这一轮还在跑"：`waitedMs` 是流式状态，取消/断流/EOF 之后
+ * 它可能还留着上一次心跳的值（归零由 store 负责，但渲染不该依赖"没忘"）。
+ * 少了这个守卫，静默超 10 秒后点取消会看到"已取消。"和"模型正在思考"并列。
  */
 const SILENT_HINT_SECONDS = 10;
 const stageLine = computed(() => {
+  if (!generating.value) return '';
   if (store.waitedMs >= SILENT_HINT_SECONDS) {
     return `模型正在思考，已等 ${store.waitedMs} 秒`;
   }
@@ -267,8 +272,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       <button v-if="generating" type="button" class="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700" @click="cancel">取消</button>
     </div>
     <p role="status" class="text-xs leading-relaxed text-slate-500">{{ store.status }}</p>
-    <p v-if="stageLine" class="text-xs text-slate-400">
-      {{ stageLine }}<span v-if="store.waitedMs > 0 && store.waitedMs < SILENT_HINT_SECONDS">（已等待 {{ store.waitedMs }} 秒）</span>
-    </p>
+    <p v-if="stageLine" class="text-xs text-slate-400">{{ stageLine }}</p>
   </div>
 </template>
