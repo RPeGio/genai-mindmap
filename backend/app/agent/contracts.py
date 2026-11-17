@@ -15,6 +15,7 @@ from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, Proto
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
+from app.contracts.diagnostic import Diagnostic
 from app.contracts.mindmap import DiagramKind, MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
@@ -45,6 +46,15 @@ MAX_EVIDENCE_SPANS = 200
 # 代价可控：一份典型材料 30 KB，50 份 1.5 MB，而一次运行只用一个进程。
 # 超了仍丢**最旧**的：模型先检索、后写引用，最旧那批的引用通常已经写完。
 MAX_LIBRARY_SOURCES = 50
+
+# 记住最近多少次成功调用，供"连续重复调用"判据回溯。
+#
+# 判定窗口（`service.REPEAT_CALL_WINDOW = 3`）比这个数小，是故意的：窗口是
+# **语义**（连续几次算重复），容量是**内存**。留出余量之后，将来把窗口调大
+# 不需要动这份状态，也不会出现"窗口 5 但只记了 3 条"的静默错判。
+# 内存量级：一条 = 一个 call_id + 一串参数 JSON。工具参数只有话题、节点 id、
+# label、问句这类短字段——材料正文在 `request.sources` 里，从不进工具参数。
+MAX_RECENT_CALLS = 8
 
 
 # ---------------------------------------------------------------- 预算
@@ -98,6 +108,14 @@ def _initial_call_plan() -> int:
 # 而失败的那次同样烧调用），之后还会点几次「展开这个节点」（每次 1 次调用）。
 # 3 倍覆盖"初次 + 重做一次 + 十几个扩展"，同时仍是一道能在跑飞的循环上刹住的闸。
 _INITIAL_CALL_PLANS_PER_RUN = 3
+
+
+# 工具调用额度的上界。装配在「一次工具调用 = 一次模型往返」这条算术上，而不是
+# 一个整数能写多大：`max_tool_calls` 每加一，`max_model_calls` 至少要跟得上一次
+# provider 请求，所以它必须留在模型额度之下（见 `max_tool_calls` 的字段注释）。
+# 120 是"够细粒度工具改一百来处"的量级，同时仍小于 `MAX_MODEL_CALLS_LIMIT`
+# 的 400——两者不是同一个量纲，不该共用一个天花板。
+MAX_TOOL_CALLS_LIMIT = 120
 
 
 def _default_max_model_calls() -> int:
@@ -157,7 +175,30 @@ class RunBudget(BaseModel):
     # 想再高就得重新算这条算式，而不是把数字调大。
     max_model_calls: int = Field(
         default=_default_max_model_calls(), ge=1, le=MAX_MODEL_CALLS_LIMIT)
-    max_tool_calls: int = Field(default=8, ge=1, le=50)
+    # 50 不是"容量"，是**给细粒度工具留的空间**。
+    #
+    # 8 在它被写下的那一年是对的：那时 `create` 只有一条路（一次
+    # `mindmap_generate_deep` 就是整张图），8 挡的是"查一下→再查一下"的死循环
+    # ——实测 10 次里 10 次都先检索一遍、把 8 次用光、一次生成都没调。那时的
+    # 8 是一道闸，不是一条容量线：正常路径只用 1–2 次。
+    #
+    # 现在 `edit` 意图有七个写工具（四个细粒度 + 两条边 + 批量），改 9 处以上
+    # 细粒度就**物理装不下**：第 9 次调用会被判 `budget_exhausted`，用户看到
+    # "工具调用次数已用完"而图只改了一半。所以闸门必须放开。
+    #
+    # 放开闸门就得补真防线（`service.REPEAT_CALL_WINDOW` / `NO_PROGRESS_*`）：
+    # 数字变大之后，"模型原地打转"不再会被次数上限自然掐断，只能靠
+    # 「连续重复调用」与「连续无进展」两条判据去认。上限 120 是同样的口径
+    # （够改一百多处），而不是把闸拆掉。
+    #
+    # **与 `max_model_calls` 的关系**：两者量纲不同——工具调用是"模型发来一个
+    # tool_call"，模型调用是"一次 provider 请求"。但每一次工具调用之后，模型都要
+    # 再看一眼结果才能决定下一步，所以 **50 次工具调用 ≈ 50 次模型往返**（一次
+    # completion 里并发发多个 tool_call 时才会少几次）。默认 `max_model_calls`
+    # 是 100，正好是"50 次工具 + 50 次收尾余量"的两倍，不会先撞上它。
+    # 反过来说：把 `max_tool_calls` 调到 100 以上而不动 `max_model_calls`，
+    # 就不再是工具额度先停，而是模型额度先停——两个上限必须一起看。
+    max_tool_calls: int = Field(default=50, ge=1, le=MAX_TOOL_CALLS_LIMIT)
     # 时间上限从 120 提到 600：120 秒是照「一句话主题」的短路径拍的，实测
     # 12106 字材料出 526 个节点要 48.6 秒，慢速档 97 tok/s 时同样的材料光是
     # 输出就要 136 秒，多轮工具循环必然超时。上限放到一小时：这是"卡住不动"
@@ -323,6 +364,22 @@ class RunContext:
     executed: dict[str, tuple[str, "ToolResult"]] = field(default_factory=dict)
     # (工具名, 规范化参数) -> 结果。只对只读工具生效。
     dedupe: dict[str, "ToolResult"] = field(default_factory=dict)
+    # 最近若干次**成功执行**的 (call_id, 参数指纹)，供"连续重复调用"判据使用
+    # （`service._duplicate_anchor`）。
+    #
+    # 为什么记在 ctx 上而不是循环的局部变量里：判定点在 `_execute_once`（那里才
+    # 同时拿得到 call_id 幂等、只读缓存与工具注册表三样东西），而它是独立函数。
+    # 为什么只记成功的：一次失败的检索/写入之后，模型用**完全相同的参数**重试是
+    # 合法恢复动作；把它也算成"重复"等于在模型最需要重试时堵住它。
+    recent_calls: list[tuple[str, str]] = field(default_factory=list)
+    # 循环层自己产出、不来自任何一次工具调用的诊断。目前只有 `NO_PROGRESS`
+    # （连续多次工具调用没有改变候选树）。
+    #
+    # 与 `ToolResult.data["diagnostics"]` 并存而不是并进去：那一条路上诊断是
+    # **某次工具调用**的产物，随 `tool_end` 一帧落到前端；无进展是**跨调用**的
+    # 事实，不属于任何一次调用——硬塞进最后一次 `ToolResult` 会让"这条诊断说的是
+    # 哪一次"变成需要猜的事。
+    loop_diagnostics: list[Diagnostic] = field(default_factory=list)
     # 模型调用的**权威账本**：外层每一轮 provider 调用与工具内部每一次 chat_async
     # 调用共用这一个计数。额度必须在请求发出**之前**通过 `reserve_model_call()`
     # 占掉——事后记账等于先花钱后记账，工具执行期间预算就会被超支使用。
@@ -420,6 +477,21 @@ class RunContext:
             del self.evidence[:overflow]
             logger.debug("证据区间达到 %d 条上限，丢弃最旧的 %d 条",
                          MAX_EVIDENCE_SPANS, overflow)
+
+    def record_call(self, call_id: str, fingerprint: str) -> None:
+        """记一次**成功执行**的调用，供"连续重复调用"判据回溯。
+
+        只由 `service._execute_once` 在工具真的返回 `ok=True` 之后调用。失败的
+        调用不进这里，理由写在 `recent_calls` 的字段注释里：用相同的参数重试一次
+        失败的检索/写入，是模型正常的恢复动作，不该被判成"重复"。
+
+        容量是 `MAX_RECENT_CALLS`（比判定窗口宽），超了丢最旧——判据只看最近几次，
+        更早的条目即使留着也不会被任何一次判定读到。
+        """
+        self.recent_calls.append((call_id, fingerprint))
+        overflow = len(self.recent_calls) - MAX_RECENT_CALLS
+        if overflow > 0:
+            del self.recent_calls[:overflow]
 
     def reserve_model_call(self) -> bool:
         """占掉一次模型调用额度，拿不到返回 False。

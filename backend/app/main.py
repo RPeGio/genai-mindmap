@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agent.router import router as agent_router
 from app.core.errors import register_error_handlers
 from app.export.router import router as export_router
+from app.importing.router import router as import_router
 from app.ingestion.router import router as ingestion_router
 from app.knowledge.router import router as knowledge_router
 from app.mindmaps.router import router as mindmap_router
@@ -21,6 +22,7 @@ app.add_middleware(
 
 # 已实现的完整闭环
 app.include_router(mindmap_router, prefix="/api")      # 保存 / 读取 / 版本
+app.include_router(import_router, prefix="/api")        # 导入已有导图（只解析，不落库）
 app.include_router(optimization_router, prefix="/api")  # 结构诊断与建议
 app.include_router(export_router, prefix="/api")       # 导出 puml
 app.include_router(ingestion_router, prefix="/api")    # 多模态输入

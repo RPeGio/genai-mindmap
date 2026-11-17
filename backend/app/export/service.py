@@ -1,9 +1,19 @@
 """导出（F20 / F10）。
 
-三种格式，都是 MindMapContent → 文本的纯映射，不调模型也不读盘：
+四种格式，都是 MindMapContent → 文本的纯映射，不调模型也不读盘：
     PUML      PlantUML `@startmindmap`，能贴进语雀 / Typora / Confluence
     Markdown  缩进大纲，最通用的中间格式
     OPML      能直接导入 XMind 等导图工具
+    JSON      `MindMapContent` 的序列化——**唯一无损的一种**，也是导入的保底：
+              另外三种都只有一个文字字段（正文优先），往返时 `note` / `detail`
+              的区分、`color` / `icon`、`diagram_type`、附加边都会退化
+
+新增 JSON 的理由是"能导出什么就能导入什么"：`app/importing/` 支持 JSON，若导出
+侧不产出它，用户手里就没有一份"改完还能原样导回来"的文件，而这正是四种格式里
+唯一能保证"结构 + 视觉 + 边 + 图型"一条都不丢的那一个。
+
+**另外三种格式逐字节不变**——JSON 是新增的出口，不碰既有输出。
+`tests/test_export.py::ByteIdenticalTest` 钉着这件事。
 
 关于 PUML 的定位（与 docs/ARCHITECTURE.md 第 5 条一致）：
     puml 只作**导出格式**，不作为渲染主链路。
@@ -11,7 +21,7 @@
           viz.js 是 Graphviz 的 WASM，只认 DOT，解析不了 PlantUML 语法。
     若要在页面内预览，需要额外部署 plantuml-server，并且预览只能是图片。
 
-**附加边（`MindMapContent.edges`）在三种格式里怎么处理**——三种格式都不能凭空
+**附加边（`MindMapContent.edges`）在四种格式里怎么处理**——文本格式不能凭空
 多出"任意连线"这个能力，所以各自的落点不同，但有一条共同底线：**没有边的图，
 输出与加 edges 之前逐字节相同**（有回归用例钉着）。
 
@@ -22,9 +32,11 @@
     - markdown / opml：树形格式表达不了环，所以**文末单列一节「附加关系」**
       （`A → B（是）`）。硬塞进缩进列表会把"这是汇合/回退"读成"这是下一层"，
       而那条层级本来就已经存在了。
+    - json：`edges` 是结构化的数组，原样进出，无损。
 """
 from __future__ import annotations
 
+import json
 from xml.sax.saxutils import escape, quoteattr
 
 from app.contracts.mindmap import DIAGRAM_LABELS, Edge, MindMapContent, Node
@@ -35,7 +47,12 @@ EDGES_SECTION = "附加关系"
 
 # `kind` → 中文说法，只在边**没有 label** 时补上去。有 label 时（"是"/"驳回"）
 # 那两个字已经表达了分支朝向，再补一个"条件分支"只是把行拉长。
-_EDGE_KIND_LABELS = {
+#
+# 它是**两边共读**的：`app/importing/markdown.py` 用它的反表把"顺序/条件分支/
+# 回退"读回 `kind`。所以它必须公开——私有名会让导入侧只能复制一份，而复制出来
+# 的那份在某天改了文案之后不会有人记得同步，"回退线往返之后变成实线"就是这么
+# 发生的。
+EDGE_KIND_LABELS = {
     "flow": "顺序",
     "branch": "条件分支",
     "loop": "回退",
@@ -84,7 +101,7 @@ def _edge_suffix(edge: Edge) -> str:
     if edge.label:
         return f"（{edge.label}）"
     if edge.kind:
-        return f"（{_EDGE_KIND_LABELS.get(edge.kind, edge.kind)}）"
+        return f"（{EDGE_KIND_LABELS.get(edge.kind, edge.kind)}）"
     return ""
 
 
@@ -147,7 +164,7 @@ def to_puml(content: MindMapContent) -> str:
             if edge.label:
                 text += f" : {_sanitize(edge.label)}"
             elif edge.kind:
-                text += f" : {_EDGE_KIND_LABELS.get(edge.kind, edge.kind)}"
+                text += f" : {EDGE_KIND_LABELS.get(edge.kind, edge.kind)}"
             lines.append(f"' {text}")
     lines.append("@endmindmap")
     return "\n".join(lines) + "\n"
@@ -216,3 +233,26 @@ def to_opml(content: MindMapContent) -> str:
         lines.append("    </outline>")
     lines.extend(("  </body>", "</opml>"))
     return "\n".join(lines) + "\n"
+
+
+def to_json(content: MindMapContent) -> str:
+    """导出 `MindMapContent` 的 JSON 序列化——**唯一无损的格式**。
+
+    为什么它比另外三种重要：markdown / opml / puml 都只有一个文字槽位，而我们的
+    节点有两个文字字段（`label` 短标题、`note` 用户备注、`detail` 生成说明）。
+    导出时按"正文优先"合成一句，导入时只能塞回 `label`——文字没丢，但"哪部分是
+    标题"这个区分丢了，`color` / `icon` / `diagram_type` / 附加边也一并退化。
+
+    JSON 把这些全部保住，所以它是"导出 → 改 → 导入"的保底：结构、视觉、边、
+    图型、主题、布局一条不少。唯一**不**保留的是 `source_refs` 与 `source_usage`
+    ——导入侧会清空它们（外部文件的字符偏移指向的是别处的原文），这是刻意的，
+    见 `app/importing/normalize.py` 的第 ⑤ 条。
+
+    `model_dump(mode="json")` 而不是手拼 dict：契约加字段时这里自动跟上，不会
+    出现"导出少一个字段、导入时它悄悄变默认值"。
+
+    `indent=2` + `ensure_ascii=False`：这份文件是给人改的，中文标题不该变成
+    `\\u5b63\\u5ea6`。行尾补一个换行，与另外三种格式一致（`git diff` 少一行噪声）。
+    """
+    return json.dumps(content.model_dump(mode="json"),
+                      ensure_ascii=False, indent=2) + "\n"

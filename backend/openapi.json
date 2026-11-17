@@ -161,6 +161,47 @@
         }
       }
     },
+    "/api/mindmaps/import": {
+      "post": {
+        "tags": [
+          "导入"
+        ],
+        "summary": "Import Mindmap",
+        "operationId": "import_mindmap_api_mindmaps_import_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_import_mindmap_api_mindmaps_import_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/optimization/check": {
       "post": {
         "tags": [
@@ -323,6 +364,41 @@
         "summary": "Export Opml",
         "description": "导出 OPML，便于导入 XMind 等工具。",
         "operationId": "export_opml_api_export_opml_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/export/json": {
+      "post": {
+        "tags": [
+          "导出"
+        ],
+        "summary": "Export Json",
+        "description": "导出 JSON（`MindMapContent` 的序列化）。\n\n这是唯一**无损**的格式，也是「导出 → 手改 → 导入」的保底：另外三种都只有\n一个文字槽位，往返一次 `note` / `detail` / 颜色 / 图型会退化（见\n`app/export/service.py::to_json` 的 docstring）。",
+        "operationId": "export_json_api_export_json_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -982,6 +1058,20 @@
         ],
         "title": "Body_create_file_source_api_ingestion_files_post"
       },
+      "Body_import_mindmap_api_mindmaps_import_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_import_mindmap_api_mindmaps_import_post"
+      },
       "CheckRequest": {
         "properties": {
           "content": {
@@ -1188,6 +1278,50 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "ImportResponse": {
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/MindMapContent-Output"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/ImportWarningPayload"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "source_format": {
+            "type": "string",
+            "title": "Source Format"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content",
+          "warnings",
+          "source_format"
+        ],
+        "title": "ImportResponse"
+      },
+      "ImportWarningPayload": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ImportWarningPayload",
+        "description": "一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。"
       },
       "KnowledgeHit": {
         "properties": {
@@ -1816,10 +1950,10 @@
           },
           "max_tool_calls": {
             "type": "integer",
-            "maximum": 50.0,
+            "maximum": 120.0,
             "minimum": 1.0,
             "title": "Max Tool Calls",
-            "default": 8
+            "default": 50
           },
           "max_seconds": {
             "type": "number",

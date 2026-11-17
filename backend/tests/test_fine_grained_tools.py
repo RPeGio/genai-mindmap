@@ -435,9 +435,10 @@ def test_move_node_failure_on_missing_parent_is_atomic():
 def test_batch_tool_can_change_six_nodes_in_one_call():
     """批量兜底的价值就在这里：六处改动 = **一次**工具调用。
 
-    细粒度工具每个节点各花一次，而 `RunBudget.max_tool_calls` 默认 8——"改六个
-    节点"用细粒度就是 6/8 的额度，再加上读图/检索，很容易在改完之前把额度烧光。
-    所以批量不是"旧的遗留"，它是**唯一装得下多改动的形状**。
+    细粒度工具每个节点各花一次。`RunBudget.max_tool_calls` 提到 50 之后，额度
+    不再是"改六个就吃掉 6/50"那种稀缺——省下的变成了**模型往返**：一次工具调用
+    之后模型要再看一眼结果，六处改动分散着做就是六轮往返（每轮 5–20 秒），
+    批量是一轮。所以批量不是"旧的遗留"，在多改动的场景里它仍是更省的那条路。
     """
     ctx = _ctx(candidate=_content())
     result = _run("mindmap_edit", ctx, ops=[

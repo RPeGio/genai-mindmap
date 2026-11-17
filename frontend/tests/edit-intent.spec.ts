@@ -13,7 +13,12 @@ vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
   default: { name: 'MindMapCanvasStub', template: '<div data-test="canvas" />' },
 }));
 
-const EDIT_INPUT = 'input[aria-label="改这张图"]';
+/**
+ * 画布右上角那个框。合并之后它同时承担 `create` 与 `edit`，所以按 id 取而不是
+ * 按 aria-label 取——label 会随状态变（「主题或要求」/「怎么改」），id 不会。
+ */
+const EDIT_INPUT = 'textarea#intent';
+const SUBMIT = '[data-test="intent-box"] button';
 
 /** 把若干事件包成 SSE 帧，模拟后端 /api/agent/runs/stream。 */
 function agentReply(frames: unknown[]): Response {
@@ -75,13 +80,20 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('画布上方的「改这张图」入口', () => {
-  it('没有导图时禁用，并说明原因', async () => {
+describe('画布右上角的「改这张图」入口', () => {
+  it('没有导图时它先当生成入口用，并说明"写个主题"', async () => {
+    const calls = stubFetch(() => agentReply([{ type: 'done', seq: 2 }]));
     const wrapper = mountApp();
     const input = wrapper.find(EDIT_INPUT);
     expect(input.exists()).toBe(true);
-    expect((input.element as HTMLInputElement).disabled).toBe(true);
-    expect(wrapper.text()).toContain('先生成或打开一张导图');
+    // 合并之后这个框不再对"没图"禁用：没图时它自己就是生成入口
+    expect((input.element as HTMLTextAreaElement).disabled).toBe(false);
+    expect(wrapper.get('[data-test="intent-box"]').text())
+      .toContain('写一个主题，或者先在左侧添加材料');
+    // 空着点不动，也就不该发请求
+    await wrapper.get(SUBMIT).trigger('click');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toHaveLength(0);
   });
 
   it('有导图时打字 + 点按钮，发出 intent=edit 且带上当前树', async () => {
@@ -94,9 +106,9 @@ describe('画布上方的「改这张图」入口', () => {
     await wrapper.vm.$nextTick();
 
     await wrapper.find(EDIT_INPUT).setValue('把第三支拆细一点');
-    const button = wrapper.findAll('button').find(item => item.text().includes('让它改'));
-    expect(button).toBeTruthy();
-    await button!.trigger('click');
+    const button = wrapper.get(SUBMIT);
+    expect(button.text()).toBe('改这张图');
+    await button.trigger('click');
     await new Promise(resolve => setTimeout(resolve, 0));
 
     expect(calls).toHaveLength(1);
@@ -266,7 +278,7 @@ describe('「改这张图」认选区', () => {
     await wrapper.vm.$nextTick();
 
     await wrapper.find(EDIT_INPUT).setValue('这三个合并成一个');
-    await wrapper.findAll('button').find(item => item.text().includes('让它改'))!.trigger('click');
+    await wrapper.get(SUBMIT).trigger('click');
     await new Promise(resolve => setTimeout(resolve, 0));
 
     const body = calls[0].body as Record<string, unknown>;
@@ -275,21 +287,22 @@ describe('「改这张图」认选区', () => {
     expect(body.selected_ids).toEqual(['a', 'b', 'c']);
   });
 
-  it('徽标显示「已选 3 个节点」，placeholder 跟着变', async () => {
+  it('徽标显示「已选 3 个节点」，placeholder 与按钮跟着变', async () => {
     const wrapper = mountApp();
     const store = useMindMapStore();
     await wrapper.vm.$nextTick();
-    // 没选中时不显示徽标，placeholder 是那句通用的例子
+    // 没选中时不显示徽标，placeholder 是那句通用的说法
     expect(wrapper.find('[data-test="edit-selection"]').exists()).toBe(false);
-    expect((wrapper.find(EDIT_INPUT).element as HTMLInputElement).placeholder)
-      .toBe('把第三支拆细一点');
+    expect((wrapper.find(EDIT_INPUT).element as HTMLTextAreaElement).placeholder)
+      .toBe('输入主题，或直接点生成用已上传的材料');
 
     selectThree(store);
     await wrapper.vm.$nextTick();
 
     expect(wrapper.find('[data-test="edit-selection"]').text()).toBe('已选 3 个节点');
-    expect((wrapper.find(EDIT_INPUT).element as HTMLInputElement).placeholder)
+    expect((wrapper.find(EDIT_INPUT).element as HTMLTextAreaElement).placeholder)
       .toBe('改选中的这 3 个节点…');
+    expect(wrapper.get(SUBMIT).text()).toBe('改这 3 个节点');
     // 提示语要说明"选区是提示不是限制"，否则用户会以为自己把模型锁住了
     expect(wrapper.text()).toContain('优先改这 3 个节点及其子分支');
   });
@@ -332,12 +345,12 @@ describe('「改这张图」认选区', () => {
     expect(store.selectedIds).toEqual(['c']);
   });
 
-  it('看不见选区的入口不偷带选区：左侧「生成」显式传空', async () => {
+  it('显式传空选区就真的不发选区（"看得见的才发"这条规矩的兜底）', async () => {
     const calls = stubFetch(() => agentReply([{ type: 'done', seq: 2, content: structuredClone(BASE) }]));
     const store = useMindMapStore();
     selectThree(store);
-    // 左侧「输入主题或文本」的生成按钮走的就是这一句（`SourceInputs.generate`）：
-    // 它旁边没有「已选 N 个」徽标，所以必须把选区显式清掉。
+    // 画布右上角那个框按徽标上的数把选区带上去；反过来，任何一个不显示选区的
+    // 入口都必须显式传 `[]`，否则它会静默带着用户在画布上圈的东西去"重新生成"。
     await store.runGeneration('按材料重做一张', 'edit', undefined, 'default', 'auto', { selection: [] });
 
     const body = calls[0].body as Record<string, unknown>;

@@ -26,6 +26,14 @@ MAX_TREE_NODES = 1000
 # 不是承载能力，所以它保持不变。
 MAX_TREE_DEPTH = 8
 
+# 单个节点的子节点上限。它是**硬边界**（`Node.children` 的 `max_length`），
+# 与另外两个限额不同：超过不是"该告警"，而是契约层直接 422。
+#
+# 50 这个数是横向排布的承载能力：一级分支 50 个已经要滚动三屏，再多就不是"这个
+# 主题有 50 个方面"，而是"这里没被整理过"。导入侧要用它做截断（超了砍掉并告警），
+# 所以它必须有常量名——写死在 `Field(max_length=50)` 里时，导入层只能重复一个 50。
+MAX_NODE_CHILDREN = 50
+
 # 关系条数上限。200 条大约是一张 1000 节点导图里"跨分支解释性关系"的合理密度，
 # 再多的画布也读不清——那时用户要的其实是子节点，不是连线。
 MAX_RELATIONS = 200
@@ -331,7 +339,7 @@ class Node(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=100)
     label: str = Field(min_length=1, max_length=MAX_NODE_LABEL_CHARS)
-    children: list[Node] = Field(default_factory=list, max_length=50)
+    children: list[Node] = Field(default_factory=list, max_length=MAX_NODE_CHILDREN)
     # 正文。`label` 是短标题（画布上只放得下 200 字以内的两行），长的内容放这里。
     # 渲染取值收敛为 `note or label`，两处都空是不可能的（label 非空）。
     #

@@ -451,7 +451,8 @@ def test_branch_retrieval_does_not_consume_tool_calls():
 
     检索发生在工具内部，是服务端自己的并发检索——模型看到的仍然只是一次
     `mindmap_generate_deep` 调用。这条如果退化（比如把检索做成 N 个独立工具），
-    `max_tool_calls` 的默认值 8 会在 20 支的图上直接把整次运行掐断。
+    工具调用数会变成 1+N 并随分支数线性增长，几十支的图上迟早撞上
+    `max_tool_calls`（默认 50），而且撞在"刚生成完骨架"的位置上。
     """
     deep_call = ToolCall(call_id="deep-1", name="mindmap_generate_deep",
                          arguments={"topic": "管理办法", "branches": 3,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import json
 import logging
@@ -44,11 +45,13 @@ from app.agent import diagram_intent
 from app.agent.provider import default_provider
 from app.agent.tools import (
     ToolRegistry,
+    _count_nodes,
     _node_path,
     _path_text,
     build_registry,
     library_available,
 )
+from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import MindMapContent
 from app.generation.service import (
     GenerationError,
@@ -261,6 +264,115 @@ def _dedupe_key(call: ToolCall) -> str:
     return call.name + "\0" + json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)
 
 
+# ---------------------------------------------------------------- 两道行为防线
+#
+# `max_tool_calls` 从 8 提到 50（见 `contracts.RunBudget.max_tool_calls`）之后，
+# 原来那道"次数闸"不再能自然掐断"模型原地打转"：50 次空转 = 50 次模型往返，
+# 用户等几分钟换回一棵没变的树。所以提额度的同时补两条**行为**判据，不再靠数字。
+
+# 防线一：连续重复调用。
+#
+# 判的是"**连续**"：从最近一次往回扫，只要一路上都是同一个参数指纹就算重复；
+# 中途只要插入过任何别的调用就放行——用户可能在两次提问之间往材料里补了东西，
+# 那时再问同一个问题是**对的**，拒掉等于让模型用旧检索结果编。
+#
+# 为什么是"连续"而不是"N 次窗口内出现过"：后者会把 `A, B, A` 也判成重复
+# （A 在最近 3 次里出现过），而 `A, B, A` 正是"先查、再改、回来复核"的正常形状。
+# 窗口 3 只约束扫描长度：连续重复在第二次就被拒了，扫不到更远；留着这个数是为了
+# 将来把判据换成"窗口内出现两次"时只改一处。
+REPEAT_CALL_WINDOW = 3
+
+# 防线二：无进展。
+#
+# 连续这么多次工具调用之后候选树一个字节都没变 → 记一条 `NO_PROGRESS` 警告。
+# 8 的依据是**旧闸的宽度**：8 正是被放开的那道 `max_tool_calls`，也就是"原来一整轮
+# 空转最多能烧掉几次调用"。旧值下这类循环会被次数上限自然掐断，现在同样的浪费量
+# 只值一条警告；到 16（两倍）说明模型没有任何恢复迹象——再给它 34 次也只是把
+# 刚才那 16 次重演一遍，所以中止。
+NO_PROGRESS_WARN = 8
+NO_PROGRESS_ABORT = 16
+
+
+def _duplicate_anchor(ctx: RunContext, key: str) -> str | None:
+    """这次调用是不是"刚做过同一件事"；是的话返回那次的 call_id。
+
+    返回**最早那次**连续相同的调用：模型连着发三次同一个 `rag_query`，第二、
+    第三次都该被告知"这个查询在第一次的 tool_call 里已经做过了"。指回中间那次
+    会让它以为"上一次被判重复，那我再试一次"。
+    """
+    anchor: str | None = None
+    for call_id, fingerprint in reversed(ctx.recent_calls[-REPEAT_CALL_WINDOW:]):
+        if fingerprint != key:
+            break
+        anchor = call_id
+    return anchor
+
+
+def _tree_signature(ctx: RunContext) -> str:
+    """候选树的内容指纹，用来判"这次工具调用有没有改变树"。
+
+    三个候选判据都试过，只有这一个站得住：
+
+      - `ctx.revision`：它只在**写入路径**里 +1，而 `node_expand` 给一个节点加
+        一整层子节点时根本不碰它（那条路径直接改 `ctx.candidate`）。用它当判据，
+        "连续展开 8 次"会被误判成无进展。
+      - 节点数：`update_node` 反复把 label 改来改去时节点数一个都不变，而那正是
+        "50 次空转"里最常见的一半。
+      - 整棵树序列化后的哈希：所有改动路径都绕不过它。
+
+    代价是一次工具调用算一次。一棵 1000 节点的树 dump + 哈希是毫秒级，而工具调用
+    本身是「一次模型往返」，这个开销在噪声里。
+    """
+    if ctx.candidate is None:
+        return ""
+    return hashlib.blake2b(
+        ctx.candidate.model_dump_json().encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _no_progress_message(no_progress: int, tool_calls: int) -> str:
+    return (f"连续 {no_progress} 次工具调用没有改动导图（本次已调用 {tool_calls} 次），"
+            f"模型可能在原地打转；到 {NO_PROGRESS_ABORT} 次会停止这次运行。")
+
+
+def _no_progress_frame(
+    ctx: RunContext, seq: "itertools.count[int]", no_progress: int, tool_calls: int,
+) -> StageEvent:
+    """警告：连续多次调用没有改变树。
+
+    三处都要写，缺一处就有人看不见：`ctx.loop_diagnostics` 是给调用方与用例的
+    结构化记录，日志是给排查的，`StageEvent` 是给用户的（前端那行"现在在干什么"
+    会显示出来——它是唯一能让用户知道"这 30 秒在空转"的通道）。
+    """
+    message = _no_progress_message(no_progress, tool_calls)
+    ctx.loop_diagnostics.append(Diagnostic(
+        level=DiagnosticLevel.warn, code="NO_PROGRESS", message=message,
+        evidence=f"tool_calls={tool_calls},no_progress={no_progress}",
+    ))
+    _log_failure(ctx, tool_calls, code="NO_PROGRESS", message=message)
+    return StageEvent(seq=next(seq), stage="no_progress", detail=message)
+
+
+def _no_progress_stop(
+    ctx: RunContext,
+    seq: "itertools.count[int]",
+    usage_total: dict[str, Any],
+    tool_calls: int,
+    no_progress: int,
+) -> DoneEvent | ErrorEvent:
+    """连续无进展到硬阈值：收尾。
+
+    与 `_budget_stop` 同一条规矩：已经有候选就当作完成（那棵树是能用的，报成失败
+    只会让用户不知道该不该用），一份都没有才报错。
+    """
+    message = (f"连续 {no_progress} 次工具调用没有改动导图，模型在原地打转，已停止。")
+    _log_failure(ctx, tool_calls, code="no_progress", message=message)
+    if ctx.candidate is not None:
+        return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
+                         mode="model")
+    return ErrorEvent(seq=next(seq), code="no_progress", message=message,
+                      limit="no_progress")
+
+
 def _args_summary(call: ToolCall, width: int = 80) -> dict[str, Any]:
     """事件流里只放参数摘要：完整参数可能带整份来源正文。"""
     summary: dict[str, Any] = {}
@@ -353,6 +465,30 @@ class _ToolOutcome:
     timed_out: bool = False
 
 
+def _budget_message(ctx: RunContext, limit: str, tool_calls: int) -> str:
+    """预算停下来的那句话。时间上限这一条要带上"走到哪了"。
+
+    `max_seconds` 从 120 提到 600 之后，它是一条**只在长循环上**才撞到的上限，
+    而撞上它的那一刻恰恰是最需要解释的时候：用户等了十分钟，看到的如果只是
+    「这次运行超过了时间上限」，他无从判断"我的图改完没有""该不该点应用"。
+    预算的作用是限制继续花钱，不是把已经做了一半的事说成一句没有下文的错误。
+
+    次数上限那两条不加进度：`max_model_calls` / `max_tool_calls` 停在**某一轮
+    的开头**，此时候选内容与上一帧 tool_end 完全一致，多写一句只是重复。
+
+    这里**不**谎报"还剩几处没做"：模型这一轮还没发出的调用不在任何地方，编一个
+    数字比不说更糟。能诚实说的是"用掉多少、做到哪、之后的没执行"。
+    """
+    base = _BUDGET_HINT[limit]
+    if limit != "max_seconds":
+        return base
+    nodes = _count_nodes(ctx.candidate.root) if ctx.candidate is not None else 0
+    done = f"，树上是 {nodes} 个节点" if ctx.candidate is not None else "，还没产出候选"
+    return (f"{base}（已执行 {tool_calls} 次工具调用{done}）。"
+            "这之前的改动都在候选里，之后的没有执行——把目标拆小一点再跑一次，"
+            "或者调大 max_seconds。")
+
+
 def _budget_stop(
     ctx: RunContext,
     seq: "itertools.count[int]",
@@ -371,15 +507,16 @@ def _budget_stop(
     真的一份候选都没有（第一轮就没额度、工具失败前没产出）时仍然报错，
     那种情况下用户确实什么都没拿到。
     """
+    message = _budget_message(ctx, limit, tool_calls)
     _log_failure(
-        ctx, tool_calls, call=call, code="budget_exhausted", message=_BUDGET_HINT[limit],
+        ctx, tool_calls, call=call, code="budget_exhausted", message=message,
     )
     if ctx.candidate is not None:
         return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
                          mode="model")
     return ErrorEvent(
         seq=next(seq), code="budget_exhausted",
-        message=_BUDGET_HINT[limit], limit=limit,
+        message=message, limit=limit,
     )
 
 
@@ -524,11 +661,14 @@ async def _run_tool(
 
 
 async def _execute_once(call: ToolCall, ctx: RunContext, registry: ToolRegistry) -> ToolResult:
-    """带两级幂等的执行。
+    """带两级幂等 + 一道重复判据的执行。
 
     call_id 幂等是协议要求的：模型偶尔会把同一个 tool_call 重复发一遍。
     参数级去重是防"同一轮里两个不同 id 但参数完全一样"的调用——实测模型
     并行发起两个 node_expand(n1) 是会发生的事，执行两次就会加两遍子节点。
+
+    最前面那道 `duplicate_call`（防线一）是 `max_tool_calls` 提到 50 之后新增的：
+    次数闸放开以后，"同一个调用连着发 20 次"不再会被额度自然掐断，只能在这里认。
     """
     key = _dedupe_key(call)
 
@@ -544,6 +684,22 @@ async def _execute_once(call: ToolCall, ctx: RunContext, registry: ToolRegistry)
                 data={"code": "call_id_conflict"},
             )
         return cached_result
+
+    # 防线一排在只读缓存**之前**，顺序是有意的：缓存命中会返回 `ok=True` 的旧结果，
+    # 模型读到的就是"又查成功了"，它根本没有机会知道自己在重复。判在这里，它拿到的
+    # 是一句能改行为的话（"结果在上一条 tool 消息里"）。
+    anchor = _duplicate_anchor(ctx, key)
+    if anchor is not None:
+        result = ToolResult(
+            ok=False,
+            content=(f"这次调用与 {anchor} 完全相同（工具 {call.name}、参数一字不差），"
+                     "没有执行：结果就在上一条工具结果里。"
+                     "请直接用它；如果确实要再跑一次（比如材料变了），中间先做一次别的调用，"
+                     "或者换一个不同的参数。"),
+            data={"code": "duplicate_call", "duplicate_of": anchor},
+        )
+        ctx.executed[call.call_id] = (key, result)
+        return result
 
     spec = registry.get(call.name)
     readonly = spec is not None and spec.readonly
@@ -561,6 +717,10 @@ async def _execute_once(call: ToolCall, ctx: RunContext, registry: ToolRegistry)
     ctx.executed[call.call_id] = (key, result)
     if readonly:
         ctx.dedupe[key] = result
+    # 只记成功的：参数一字不差的**重试**是模型对失败（超时、节点已不存在）的
+    # 正常恢复动作，把它判成重复等于在它最需要重试的时候堵住它。
+    if result.ok:
+        ctx.record_call(call.call_id, key)
     return result
 
 
@@ -673,6 +833,12 @@ async def _loop(
     failures = 0
     usage_total: dict[str, Any] = {}
     last_call: ToolCall | None = None
+    # 防线二的状态：树的内容指纹 + 连续多少次调用没让它变。
+    #
+    # 初值在**进入循环之前**取，而不是在第一轮之后：`request.snapshot` 是用户
+    # 现在的树，模型第一次调用若只是检索，那就已经是"没有改变树"的第一次了。
+    tree_signature = _tree_signature(ctx)
+    no_progress = 0
 
     yield StageEvent(
         seq=next(seq),
@@ -772,9 +938,10 @@ async def _loop(
                 async for event in tool_events:
                     yield event
             if outcome.timed_out:
+                timeout_message = _budget_message(ctx, "max_seconds", tool_calls)
                 _log_failure(
                     ctx, tool_calls, call=call, code="tool_timeout",
-                    message=_BUDGET_HINT["max_seconds"],
+                    message=timeout_message,
                 )
                 # 超时也是一次「工具结束了」。少了这一帧，事件序列就是
                 # `stage → tool_start → error`，前端那行工具永远停在「执行中」——
@@ -783,13 +950,13 @@ async def _loop(
                     seq=next(seq), call_id=call.call_id, name=call.name, ok=False,
                     result_summary={
                         "code": "tool_timeout",
-                        "message": _BUDGET_HINT["max_seconds"],
+                        "message": timeout_message,
                     },
                     latency_ms=int((time.monotonic() - begun) * 1000),
                 )
                 yield ErrorEvent(
                     seq=next(seq), code="budget_exhausted",
-                    message=_BUDGET_HINT["max_seconds"], limit="max_seconds",
+                    message=timeout_message, limit="max_seconds",
                 )
                 return
             if outcome.error is not None:
@@ -833,21 +1000,48 @@ async def _loop(
                 # 模型给错参数是常态，它看到错误后下一轮通常能改对；但一直错下去
                 # 就是在烧调用，超过容忍次数直接收尾。计的是累计失败数（不是连续），
                 # 成功的工具调用不会把它清零。
-                failures += 1
-                if failures > budget.max_repairs:
-                    message = (
-                        f"工具执行已累计失败 {failures} 次（上限 {budget.max_repairs} 次），"
-                        "继续重试没有意义，已停止。"
-                    )
-                    _log_failure(
-                        ctx, tool_calls, call=call, code="too_many_failures", message=message,
-                    )
-                    yield ErrorEvent(
-                        seq=next(seq), code="too_many_failures",
-                        message=message,
-                        limit="max_repairs",
-                    )
-                    return
+                #
+                # `duplicate_call` 是**例外，不计入**：`max_repairs` 的语义是
+                # "模型把参数写错了、改不过来"，而重复调用是"模型在原地打转"，
+                # 那条由防线一拒绝、由防线二计数中止。把它计进来的直接后果是：
+                # 默认 `max_repairs=1` 下，模型重复两次就掐死整个 run——一次可
+                # 自我纠正的提示变成了终止条件，比它要修的问题更糟。
+                if summary["code"] != "duplicate_call":
+                    failures += 1
+                    if failures > budget.max_repairs:
+                        message = (
+                            f"工具执行已累计失败 {failures} 次（上限 {budget.max_repairs} 次），"
+                            "继续重试没有意义，已停止。"
+                        )
+                        _log_failure(
+                            ctx, tool_calls, call=call, code="too_many_failures", message=message,
+                        )
+                        yield ErrorEvent(
+                            seq=next(seq), code="too_many_failures",
+                            message=message,
+                            limit="max_repairs",
+                        )
+                        return
+
+            # 防线二：这次调用有没有让树变样。
+            #
+            # 位置选在 ToolEnd 之后：那一帧必须紧跟上一次 tool_start（前端靠配对
+            # 结束"执行中"），中间插一条 stage 会让它多闪一下"在做什么"。
+            #
+            # 判据是整树内容指纹而不是"调用成功与否"：工具可能"成功"却什么都没做
+            # （`update_node` 把 label 改成同一个值、`rag_query` 查到同样的片段），
+            # 那正是 50 次空转里最常见的一半。
+            signature = _tree_signature(ctx)
+            if signature == tree_signature:
+                no_progress += 1
+            else:
+                no_progress = 0
+                tree_signature = signature
+            if no_progress == NO_PROGRESS_WARN:
+                yield _no_progress_frame(ctx, seq, no_progress, tool_calls)
+            if no_progress >= NO_PROGRESS_ABORT:
+                yield _no_progress_stop(ctx, seq, usage_total, tool_calls, no_progress)
+                return
 
             # 候选树从"没有"变成"有"（只可能是 mindmap_generate_deep 成功）时补一帧
             # snapshot：前端立刻就能渲染候选内容，不必等到 done。

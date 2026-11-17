@@ -39,6 +39,14 @@ const MEDIA_CONCURRENCY = 2;
 export const useSourcesStore = defineStore('sources', () => {
   const items = ref<SourceItem[]>([]);
   const error = ref('');
+  /**
+   * 正在录音。
+   *
+   * 放在这里而不是某个组件里，因为**两个组件都要看它**：`RecordButton` 那边决定
+   * 按钮形态，画布右上角的生成按钮要据此禁用——录音停下来的那一刻会新增一份材料，
+   * 此刻发出去的请求里一定缺这一块。
+   */
+  const recording = ref(false);
   const files = new Map<string, File>();
   const active = new Map<string, AbortController>();
   let textNumber = 0;
@@ -52,6 +60,14 @@ export const useSourcesStore = defineStore('sources', () => {
     if (items.value.some(item => item.state === 'failed')) return '有来源解析失败，请重试或移除后生成。';
     return sourceInputError(readySources.value);
   });
+  /**
+   * 材料作为**可选**输入时的闸门：一份都没有不是错误。
+   *
+   * `problem` 对空列表返回「请先添加至少一个来源」，那是"合并生成"时代的判据
+   * （生成必须要来源）。现在材料可以不传，谁把 `problem` 直接摆到生成按钮上，
+   * 用户就会看到一个永远禁用的按钮和一句要求他去加材料的话。
+   */
+  const materialProblem = computed(() => (items.value.length ? problem.value : ''));
 
   function hasRoom(count: number): boolean {
     error.value = '';
@@ -62,7 +78,8 @@ export const useSourcesStore = defineStore('sources', () => {
 
   function addText(text: string): boolean {
     if (!text.trim()) {
-      error.value = '请输入主题或文本。';
+      // 这个入口加的是**材料**：说"请输入主题或文本"会让用户以为主题也该贴在这里。
+      error.value = '粘贴的内容是空的，没有加进来源。';
       return false;
     }
     if (!hasRoom(1)) return false;
@@ -196,8 +213,12 @@ export const useSourcesStore = defineStore('sources', () => {
     files.clear();
     items.value = [];
     error.value = '';
+    recording.value = false;
   }
 
   onScopeDispose(clear);
-  return { items, error, parsing, readySources, problem, addText, addFiles, retry, remove, clear };
+  return {
+    items, error, parsing, recording, readySources, problem, materialProblem,
+    addText, addFiles, retry, remove, clear,
+  };
 });

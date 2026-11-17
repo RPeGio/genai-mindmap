@@ -158,12 +158,13 @@ onBeforeUnmount(() => {
     </VueFlow>
 
     <!-- 空态用「画布上一个节点都没有」判断，而不是「content 为空」：生成中预览
-         会长出节点，这时再压一条占位文字，正好盖住用户想看的生长过程。 -->
+         会长出节点，这时再压一条占位文字，正好盖住用户想看的生长过程。
+         文案要指出**输入框在哪**：合并之后左侧只剩材料区，老用户会先往左看。 -->
     <p
       v-if="store.nodeCount === 0 && !store.busy"
       class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-slate-400"
     >
-      还没有导图，先在左侧输入内容。
+      还没有导图：在右上角写个主题，或先在左侧添加材料。
     </p>
     <p
       v-else-if="store.nodeCount === 0 && store.busy"

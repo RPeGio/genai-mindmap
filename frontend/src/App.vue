@@ -4,11 +4,13 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
+import ImportMindmap from './components/ImportMindmap.vue';
 import SourceInputs from './components/SourceInputs.vue';
-import { SOURCE_LABELS } from './sources/input';
+import { SOURCE_LABELS, materialTitle } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
 import type { SampleMap } from './dev/samples';
-import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
+import { displayBody, bodySource, INITIAL_STATUS, useMindMapStore } from './stores/mindmap';
+import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from './stores/options';
 import { useSourcesStore } from './stores/sources';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
@@ -263,64 +265,174 @@ function expandBranch() {
 }
 
 /**
- * 画布上方的「改这张图」输入框。
+ * 画布右上角那个框：**唯一**说一句话的地方。
  *
- * 与左侧「输入主题或文本」是两个入口、两件事：那个既是主题输入框又会顺手把文本
- * 加进来源列表，语义上更接近"新建"；用户想把「把第三支拆细一点」这种**针对现有图
- * 的指令**说清楚时，在那个框里打字的心理预期是"加材料"。所以这里单独开一个：
- * 标题写明意图（edit），发出去的 `intent` 也是 edit。
+ * 合并之前它是第二个输入框（只发 `edit`），而左侧「输入主题或文本」在有图的时候
+ * 发的也是 `edit`——同一个意图两个入口，选区语义还相反（左边偷偷清空、这里带上），
+ * 用户从文案上看不出区别。现在这一个框承担 `create` 与 `edit` 两个意图，文案随
+ * 状态变，选区该不该带由**看得见的徽标**决定。
  *
- * 后端 `edit` 意图给的是四个细粒度工具 + 批量 `mindmap_edit`，改动只落在候选上，
- * 用户点「应用」才进画布——与展开、生成完全同一条确认流程。
+ * 「展开这一支」不并入这里：那是快捷动作，不是文字输入。
+ *
+ * 后端 `edit` 意图给的是四个细粒度工具 + 批量 `mindmap_edit`，`create` 只有分片
+ * 生成；两条路的改动都只落在候选上，用户点「应用」才进画布。
  */
-const editPrompt = ref('');
-const editBlocked = computed(() => !store.content || store.busy || store.agentRunning);
+const options = useGenerationOptions();
+const intentText = ref('');
 
 /**
- * 画布上圈了几个节点。
+ * 三态：有没有图、有没有选区。
  *
- * 「改这张图」吃的是**整个选区**：请求把它作为 `selected_ids` 发出去，后端拼进
- * system（"优先改这些节点及其子树"）。所以用户必须能看见自己圈了什么——圈三个
- * 却只看到一个高亮时，他没法确认另外两个算不算数。
+ * 有图但没选节点也算 `edit`——用户说「整张图都加上时间维度」时本来就不需要选节点，
+ * 逼他先点一个节点是多余的仪式，而那样还会让模型收到一个他并不想要的"优先改这里"。
  */
-const editSelection = computed(() => store.selectedIds.length);
+type IntentState = 'create' | 'edit-all' | 'edit-selected';
 
-/** 输入框旁边那枚徽标：没选中时**不显示**（空徽标会读成"选了 0 个"）。 */
-const editSelectionLabel = computed(
-  () => (editSelection.value > 0 ? `已选 ${editSelection.value} 个节点` : ''),
-);
-
-/** placeholder 跟着选区变：用户一眼看出这句话是对谁说的。 */
-const editPlaceholder = computed(() => {
-  const count = editSelection.value;
-  if (count === 0) return '把第三支拆细一点';
-  if (count === 1) return '改这个节点…';
-  return `改选中的这 ${count} 个节点…`;
+const intentState = computed<IntentState>(() => {
+  if (!store.content) return 'create';
+  return store.selectedIds.length ? 'edit-selected' : 'edit-all';
 });
 
-const editHint = computed(() => {
-  if (!store.content) return '先生成或打开一张导图，再让它改。';
-  if (store.busy || store.agentRunning) return '正在跑，等这一次结束。';
-  if (editSelection.value === 0) {
+/**
+ * 选区大小。只认 `content` 里真实存在的节点：`selectedIds` 可能残留着上一次的
+ * 选中，而那时树已经换了一张——徽标说"已选 3 个"、请求里却是空，用户没法察觉。
+ */
+const selectionCount = computed(() => (store.content ? store.selectedIds.length : 0));
+
+/** 材料那边的闸门（解析中、有失败项、超长）。没有材料时它是空串——材料是可选的。 */
+const materialProblem = computed(() => sources.materialProblem);
+
+/** 只给材料、不给主题时的备选主题。判据在 `materialTitle` 里，这里只取结果。 */
+const materialTopicChoice = computed(() => materialTitle(sources.readySources));
+
+const runBlocked = computed(() => store.busy || store.agentRunning);
+const typed = computed(() => intentText.value.trim());
+
+/**
+ * 这次点下去会发什么；空串 = 还发不出去（按钮禁用，原因写在下面那行提示里）。
+ *
+ * 「只给材料」的那条路（B）在这里落地：`mindmap_generate_deep` 只需要一个 topic
+ * 字符串，而模型看不见文件名，所以标题必须**写进 goal** 才真的算"用了它当主题"。
+ * 标题不像主题时（`未命名`、`IMG_001`）不给兜底，退回"请写一个主题"。
+ */
+const submitGoal = computed(() => {
+  if (typed.value) return typed.value;
+  if (intentState.value !== 'create') return '';
+  const topic = materialTopicChoice.value.topic;
+  return topic ? `用材料标题「${topic}」当主题，把材料整理成导图` : '';
+});
+
+const canSubmit = computed(() => {
+  if (runBlocked.value || !submitGoal.value) return false;
+  if (intentState.value !== 'create') return true;
+  // 录音停下来的那一刻会多出一份材料：此刻发出去的请求一定缺这一块。
+  return !materialProblem.value && !sources.recording;
+});
+
+/** 这一次点下去会发哪个意图。按钮文案与「正在进行的是不是这一次」都按它判。 */
+const wantedIntent = computed<'create' | 'edit'>(
+  () => (intentState.value === 'create' ? 'create' : 'edit'),
+);
+
+/** 按钮文案：说清"这一次会发生什么"，而不是一个通用的「提交」。 */
+const intentButton = computed(() => {
+  // 只认**这一个入口**发起的那一轮：展开在跑的时候，「改这张图」不该显示「改中…」。
+  const busyHere = store.agentRunning && store.runIntent === wantedIntent.value;
+  if (busyHere) return wantedIntent.value === 'create' ? '生成中…' : '改中…';
+  if (intentState.value === 'create') return '生成导图';
+  if (intentState.value === 'edit-all') return '改这张图';
+  return selectionCount.value === 1 ? '改这个节点' : `改这 ${selectionCount.value} 个节点`;
+});
+
+/** placeholder 跟着状态走：用户一眼看出这句话是对谁说的。 */
+const intentPlaceholder = computed(() => {
+  if (intentState.value === 'create') return '输入主题，或直接点生成用已上传的材料';
+  if (intentState.value === 'edit-all') return '说说你想怎么改';
+  return selectionCount.value === 1 ? '改选中的这个节点…' : `改选中的这 ${selectionCount.value} 个节点…`;
+});
+
+/** 输入框的名字：两种意图各有一个自然的叫法，写死一个会让另一半看起来不对。 */
+const intentLabel = computed(() => (intentState.value === 'create' ? '主题或要求' : '怎么改'));
+
+/** 输入框旁边那枚徽标：没选中时**不显示**（空徽标会读成"选了 0 个"）。 */
+const selectionLabel = computed(
+  () => (selectionCount.value > 0 ? `已选 ${selectionCount.value} 个节点` : ''),
+);
+
+const intentHint = computed(() => {
+  if (runBlocked.value) {
+    return store.agentRunning ? '正在跑，等这一次结束。' : '正在生成，等这一次跑完再改。';
+  }
+  if (intentState.value === 'create') {
+    if (sources.recording) return '正在录音：先「停止并添加」，再生成。';
+    if (materialProblem.value) return materialProblem.value;
+    if (typed.value) {
+      // 有材料 / 没材料是两件事：不说清的话，用户会以为"不传材料"这条路上什么都不会发生。
+      return sources.items.length
+        ? '会带上左侧的材料一起生成。'
+        : '没传材料，会先去外部搜资料。';
+    }
+    if (materialTopicChoice.value.topic) {
+      return `没写主题：用材料标题「${materialTopicChoice.value.topic}」当中心主题。`;
+    }
+    return materialTopicChoice.value.reason
+      ? `${materialTopicChoice.value.reason}——写一个主题，或者换一份标题像样的材料。`
+      : '写一个主题，或者先在左侧添加材料。';
+  }
+  if (intentState.value === 'edit-all') {
     // 「按住 Ctrl 点可以多选」必须写出来：多选没有可见入口，不写没人发现得了。
     return '先在画布上选中节点，或直接描述要改哪里（按住 Ctrl 点节点可以多选）。';
   }
   // 这条必须说清"不是只能改这些"：选区是提示，用户说「整张图都加上时间维度」
   // 时它照样改全图，而界面不该让用户以为自己在限制它。
-  return editSelection.value === 1
+  return selectionCount.value === 1
     ? '优先改这个节点及其子分支；真要动别处也能改，清单里会标出来。'
-    : `优先改这 ${editSelection.value} 个节点及其子分支；真要动别处也能改，清单里会标出来。`;
+    : `优先改这 ${selectionCount.value} 个节点及其子分支；真要动别处也能改，清单里会标出来。`;
 });
 
-const editGoalDisabled = computed(() => editBlocked.value || !editPrompt.value.trim());
+/** 材料那边的毛病用 amber：它是"这一次点不动"的原因，不是一句泛泛的说明。 */
+const intentHintWarn = computed(() => intentState.value === 'create' && !!materialProblem.value);
 
-async function submitEdit() {
-  const goal = editPrompt.value.trim();
-  if (!goal || editBlocked.value) return;
-  editPrompt.value = '';
-  // 材料照传：edit 路径不读来源，但后端会按节点的 `source_refs` 找回原文，
+/**
+ * 状态行只在"有一件事要讲"时出现。
+ *
+ * 初始那一句和下面那行提示说的是同一件事（写个主题然后生成），同一个框里说两遍
+ * 只是噪音。运行中、失败、导出结果、打开记录——这些才是它存在的理由。
+ */
+const showStatus = computed(() => store.status !== INITIAL_STATUS);
+
+async function submitIntent() {
+  if (!canSubmit.value) return;
+  const goal = submitGoal.value;
+  if (!goal) return;
+  // 这里**不问**"要不要丢掉未保存的修改"：`edit` 只产出候选，画布上的东西在用户
+  // 点「应用」之前一个字都不变；`create` 的前提就是当前没有图（有图时这个框走
+  // edit），而 `newMap` 已经把 dirty 清零了。合并前左侧那个按钮每次都问一句，
+  // 问的却是一件不会发生的事。
+  // 选区随状态**显式**带上：徽标说「已选 3 个」时，请求里就正好是这三个。
+  // `create` 传空数组而不是省略——这个入口从不偷带画布上圈的东西。
+  const selection = intentState.value === 'create' ? [] : [...store.selectedIds];
+  const intent = intentState.value === 'create' ? 'create' : 'edit';
+  intentText.value = '';
+  // 材料照传：`edit` 路径不读来源，但后端会按节点的 `source_refs` 找回原文，
   // 与展开那条路同一份处理（`tools._expand_sources`）。
-  await store.runGeneration(goal, 'edit', sources.readySources);
+  await store.runGeneration(
+    goal, intent, sources.readySources,
+    options.thinkingModel, options.diagramType, { selection },
+  );
+}
+
+/**
+ * Enter 提交、Shift+Enter 换行。
+ *
+ * 输入法候选框里的回车**不是**提交：中文主题几乎都要经过那一步，而老写法
+ * （`@keydown.enter.prevent`）会在组词过程中就把半截主题发出去。
+ */
+function onIntentKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return;
+  if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.metaKey) return;
+  event.preventDefault();
+  void submitIntent();
 }
 
 /** 详情面板的「样式」两个控件：颜色是下拉（只列调色板），图标是一个输入框。 */
@@ -372,7 +484,13 @@ const exporting = ref(false);
 // 表现为点了没反应。
 const exportChoice = ref<ExportFormat | ''>('');
 
-/** 浏览器端落盘：三种导出都是纯文本，不需要后端再跑一趟。 */
+/**
+ * 浏览器端落盘：四种导出都是纯文本（JSON 也是），不需要后端再跑一趟。
+ *
+ * 统一用 `text/plain` 而不是给 JSON 单独一个 `application/json`：浏览器只按
+ * 扩展名决定保存的文件名与打开方式，MIME 在这里不影响写盘结果，而多一个分支
+ * 就多一处"两种格式走了不同代码路径"的机会。
+ */
 function saveTextFile(filename: string, text: string): void {
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -545,6 +663,13 @@ async function copyBody() {
         >
           新建
         </button>
+        <!--
+          导入已有导图（JSON / Markdown / OPML / XMind / FreeMind / PlantUML）。
+          与「新建」「打开」同样会整棵换掉画布，所以它拿到同一个 `confirmDiscard`：
+          有未保存修改时先问一句。结果里的告警由它自己在按钮下方列出来——只写进
+          `store.status` 的话，被截断的节点数永远没人看见。
+        -->
+        <ImportMindmap :confirm-discard="confirmDiscard" />
         <select
           v-model="exportChoice"
           class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 disabled:opacity-40"
@@ -556,6 +681,8 @@ async function copyBody() {
           <option value="puml">PlantUML</option>
           <option value="markdown">Markdown</option>
           <option value="opml">OPML（XMind）</option>
+          <!-- JSON 是唯一无损的一种，也是「导出改一改再导入」的保底 -->
+          <option value="json">JSON（可再导入）</option>
         </select>
         <p>
           <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
@@ -566,6 +693,14 @@ async function copyBody() {
           </span>
           <span v-else-if="store.mode === 'saved'" class="rounded bg-slate-100 px-2 py-0.5 text-slate-600">
             已保存导图
+          </span>
+          <!--
+            导入进来的图**没有** mapId，`dirty` 为真——它是"未保存的新作品"，
+            所以不能混进「已保存导图」，也不能混进「模型生成」（那会让人以为什么都
+            不用改）。这一档只说清来历。
+          -->
+          <span v-else-if="store.mode === 'import'" class="rounded bg-sky-100 px-2 py-0.5 text-sky-700">
+            导入
           </span>
           <span v-else>未生成</span>
           <span class="ml-3">{{ store.nodeCount }} 个节点</span>
@@ -591,7 +726,8 @@ async function copyBody() {
           <p v-else class="text-xs text-slate-400">生成或新建之后可以改标题</p>
         </div>
 
-        <SourceInputs :confirm-discard="confirmDiscard" />
+        <!-- 材料区只收材料：主题与「怎么改」在画布右上角那个框里。 -->
+        <SourceInputs />
 
         <p class="mt-auto text-xs leading-relaxed text-slate-400">
           双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销、Ctrl+Shift+Z 重做。
@@ -631,44 +767,89 @@ async function copyBody() {
           </button>
         </div>
         <!--
-          画布上方的「改这张图」入口。**专门开一个输入框**而不是复用左侧那个：
-          左侧「输入主题或文本」同时会把文字加进来源列表，在那里打「把第三支拆细
-          一点」会被当成材料。这一个只发 `intent=edit`，改动落候选，确认后才进画布。
+          画布右上角：**唯一**说一句话的地方（合并后的 #2）。
+          没图时它是「生成导图」，有图时它是「改这张图」，选了节点时徽标和按钮都
+          跟着数变。左侧材料区不再有输入框，也不再有自己的生成按钮。
         -->
         <div
-          class="absolute right-4 top-4 z-10 flex w-[380px] max-w-[calc(100%-2rem)] flex-col gap-1 rounded-md border border-slate-200 bg-white p-2 shadow-sm"
+          class="absolute right-4 top-4 z-10 flex w-[400px] max-w-[calc(100%-2rem)] flex-col gap-1.5 rounded-md border border-slate-200 bg-white p-2 shadow-sm"
           role="group"
-          aria-label="改这张图"
+          aria-label="生成与改图"
+          data-test="intent-box"
         >
-          <div class="flex items-center gap-1">
-            <span class="shrink-0 text-xs font-medium text-slate-600">改这张图</span>
+          <div class="flex items-center justify-between gap-2">
+            <label for="intent" class="text-xs font-medium text-slate-600">{{ intentLabel }}</label>
             <!--
               「已选 N 个节点」。没选中时整枚徽标不出现：显示一个「已选 0 个」
               既占地方又容易被读成"我是不是选错了"。
             -->
             <span
-              v-if="editSelectionLabel"
+              v-if="selectionLabel"
               data-test="edit-selection"
               class="shrink-0 rounded bg-sky-50 px-1 py-0.5 text-[11px] text-sky-700"
-            >{{ editSelectionLabel }}</span>
-            <input
-              v-model="editPrompt"
-              aria-label="改这张图"
-              class="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 text-xs outline-none focus:border-slate-500 disabled:opacity-50"
-              :disabled="editBlocked"
-              :placeholder="editPlaceholder"
-              @keydown.enter.prevent="submitEdit"
-            />
-            <button
-              type="button"
-              class="shrink-0 rounded-md bg-slate-900 px-2 py-1 text-xs text-white disabled:opacity-40"
-              :disabled="editGoalDisabled"
-              @click="submitEdit"
-            >
-              {{ store.agentRunning && store.runIntent === 'edit' ? '改中…' : '让它改' }}
-            </button>
+            >{{ selectionLabel }}</span>
           </div>
-          <p class="text-[11px] leading-tight text-slate-400">{{ editHint }}</p>
+          <textarea
+            id="intent"
+            v-model="intentText"
+            rows="2"
+            aria-label="主题或修改指令"
+            class="resize-none rounded border border-slate-300 px-2 py-1 text-xs outline-none focus:border-slate-500 disabled:opacity-50"
+            :disabled="runBlocked"
+            :placeholder="intentPlaceholder"
+            @keydown="onIntentKeydown"
+          />
+          <!--
+            拆解方式与图型只在**新建**那一次生效：后端的编辑路径既不消费
+            `thinking_model`，也不生成骨架（图型只影响骨架那一次调用）。摆一个
+            选了不起作用的控件比不摆更糟——用户会以为自己换过拆法或图型了。
+            它们挨着按钮放，而不是留在材料区：用户实测 12 次生成里 0 次点过图型下拉，
+            因为它在左栏材料堆里、看不出跟生成有什么关系。
+          -->
+          <template v-if="intentState === 'create'">
+            <div class="flex items-center gap-1.5 text-[11px] text-slate-500">
+              <label for="thinking-model" class="w-14 shrink-0">拆解方式</label>
+              <select
+                id="thinking-model"
+                v-model="options.thinkingModel"
+                :disabled="runBlocked"
+                title="按这种方式拆解主题"
+                class="min-w-0 flex-1 rounded border border-slate-300 px-1 py-1 text-[11px] outline-none focus:border-slate-500 disabled:opacity-50"
+              >
+                <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+              </select>
+            </div>
+            <p class="text-[11px] leading-tight text-slate-400">按这种方式拆解主题</p>
+            <div class="flex items-center gap-1.5 text-[11px] text-slate-500">
+              <label for="diagram-type" class="w-14 shrink-0">图型</label>
+              <select
+                id="diagram-type"
+                v-model="options.diagramType"
+                :disabled="runBlocked"
+                title="这张图要画成什么形状"
+                class="min-w-0 flex-1 rounded border border-slate-300 px-1 py-1 text-[11px] outline-none focus:border-slate-500 disabled:opacity-50"
+              >
+                <option v-for="item in DIAGRAM_TYPE_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+              </select>
+            </div>
+            <!-- 说明必须跟着选项变：图型不是自解释的。选「鱼骨图」却按话题分六支的人
+                 会以为模型没听懂他的话，这一行就是"这个选项到底改了什么"。 -->
+            <p class="text-[11px] leading-tight text-slate-400">{{ options.diagramHint }}</p>
+          </template>
+          <p
+            class="text-[11px] leading-tight"
+            :class="intentHintWarn ? 'text-amber-700' : 'text-slate-400'"
+          >{{ intentHint }}</p>
+          <button
+            type="button"
+            class="rounded-md bg-slate-900 px-2 py-1.5 text-xs text-white disabled:opacity-40"
+            :disabled="!canSubmit"
+            @click="submitIntent"
+          >{{ intentButton }}</button>
+          <p v-if="showStatus" role="status" class="text-[11px] leading-tight text-slate-500">{{ store.status }}</p>
+          <p v-if="store.stageText" class="text-[11px] leading-tight text-slate-400">
+            {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
+          </p>
         </div>
         <MindMapCanvas />
       </section>

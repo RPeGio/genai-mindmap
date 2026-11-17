@@ -56,6 +56,14 @@ function mountApp() {
 const NOTE_TEXTAREA = 'textarea[aria-label="我的备注"]';
 
 /**
+ * 画布右上角那个框（合并后的 #2）：**唯一**说一句话的地方。
+ *
+ * 按 id 定位而不是 `get('textarea')`：左侧材料区还有一个「粘贴材料正文」的
+ * textarea，按标签取会随组件顺序拿到错误的那一个。
+ */
+const INTENT = 'textarea#intent';
+
+/**
  * 按文字找按钮：开发期示例选择器会异步插入一排按钮，
  * 用 `findAll('button')[0]` 会随加载时机拿到不同的东西。
  */
@@ -70,16 +78,19 @@ afterEach(() => {
 });
 
 describe('App', () => {
-  it('空输入时不发请求，并提示用户', async () => {
+  it('空输入时按钮是禁用的，并说明「要写一个主题」', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
-    await buttonByText(wrapper, '生成导图').trigger('click');
+    // 没主题、没材料：按钮点不动，原因写在那行提示里。合并之前这里是"点得下去、
+    // 然后弹一句「请在下方输入主题或文本」"——那个提示指向的框现在已经不存在了。
+    const submit = wrapper.get('[data-test="intent-box"] button');
+    expect(submit.attributes('disabled')).toBeDefined();
+    await submit.trigger('click');
 
     expect(fetchMock).not.toHaveBeenCalled();
-    // 提示必须点明是哪个框：用户把主题写进「导图标题」再点生成，界面毫无动静。
-    expect(wrapper.get('[role="status"]').text()).toContain('「输入主题或文本」');
+    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('写一个主题，或者先在左侧添加材料');
   });
 
   it('点生成把请求打到 agent 路由，候选不自动落画布', async () => {
@@ -90,7 +101,7 @@ describe('App', () => {
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('机器学习');
+    await wrapper.get(INTENT).setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
 
     // 生成只剩这一条通道
@@ -110,7 +121,7 @@ describe('App', () => {
     vi.stubGlobal('fetch', vi.fn(async () => streamReply([doneFrame(mode)])));
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('机器学习');
+    await wrapper.get(INTENT).setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
     await buttonByText(wrapper, '应用到画布').trigger('click');
@@ -136,7 +147,7 @@ describe('App', () => {
     );
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('x');
+    await wrapper.get(INTENT).setValue('x');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() =>
       expect(wrapper.get('[role="status"]').text()).toContain('模型服务暂时不可用'));
@@ -150,7 +161,7 @@ describe('App', () => {
     );
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('x');
+    await wrapper.get(INTENT).setValue('x');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() =>
       expect(wrapper.get('[role="status"]').text()).toContain('模型返回超时'));

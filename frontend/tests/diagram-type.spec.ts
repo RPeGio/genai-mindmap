@@ -1,21 +1,30 @@
-import { mount } from '@vue/test-utils';
+import { mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import SourceInputs from '../src/components/SourceInputs.vue';
+import App from '../src/App.vue';
 import type { DiagramTypeChoice, MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
-import { useSourcesStore } from '../src/stores/sources';
 
 /**
- * 图型从界面到请求体，以及"选了之后到底改了什么"那一行说明。
+ * 「拆解方式」与「图型」从界面到请求体，以及"选了之后到底改了什么"那一行说明。
  *
  * bug 的现场是：用户说"画个流程图"，生成出来的还是树——因为前端根本不发图型，
  * 模型也没回头去设工具参数。这组用例把三条钉住：
  *   1. 选择器存在、四个值、默认「自动判断」；
- *   2. 选了就随 `runGeneration` 发出去，没选就**不带这个字段**；
+ *   2. 选了就随生成发出去，没选就**不带这个字段**；
  *   3. 说明文字跟着选项变（选流程图/鱼骨图时不能还是那句泛泛的话）。
+ *
+ * 这两个下拉在合并之后搬到了画布右上角那个框里（与「生成导图」按钮同一个区块）：
+ * 用户实测 12 次生成里 0 次点过图型下拉——它在左侧材料堆里，看不出跟生成有关。
  */
+
+vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
+  default: { name: 'MindMapCanvasStub', template: '<div data-test="canvas" />' },
+}));
+
+const INTENT = 'textarea#intent';
+const SUBMIT = '[data-test="intent-box"] button';
 
 function agentReply(frames: unknown[]): Response {
   const encoder = new TextEncoder();
@@ -38,26 +47,24 @@ const content = (label = '根'): MindMapContent => ({
 
 function stubFetch(reply: () => Response) {
   const calls: Array<{ url: string; body: unknown }> = [];
-  const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
     return reply();
-  });
-  vi.stubGlobal('fetch', mock);
+  }));
   return calls;
 }
 
 const doneFrame = (payload: MindMapContent) => ({ type: 'done', seq: 4, content: payload });
 
 /** 输入区里那个下拉：按 id 取，按序号取会随控件增减而错位。 */
-function diagramSelect(wrapper: ReturnType<typeof mount>) {
+function diagramSelect(wrapper: VueWrapper) {
   return wrapper.get('#diagram-type');
 }
 
-function mountInputs() {
-  return mount(SourceInputs, {
-    global: { plugins: [createPinia()] },
-    props: { confirmDiscard: () => true },
-  });
+function mountApp(): VueWrapper {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  return mount(App, { global: { plugins: [pinia] } });
 }
 
 beforeEach(() => {
@@ -70,7 +77,7 @@ afterEach(() => {
 
 describe('图型选择器', () => {
   it('四个选项、按顺序、默认自动判断', () => {
-    const wrapper = mountInputs();
+    const wrapper = mountApp();
     const select = diagramSelect(wrapper);
     const options = select.findAll('option');
 
@@ -83,29 +90,62 @@ describe('图型选择器', () => {
     // 「自动判断」是默认：用户没说，就让生成那一次决定（后端 None）
     expect((select.element as HTMLSelectElement).value).toBe('auto');
     expect(select.attributes('disabled')).toBeUndefined();
+    // 它就在生成按钮上面那一块：选择器和消费它的动作必须挨着
+    expect(wrapper.get('[data-test="intent-box"]').find('#diagram-type').exists()).toBe(true);
   });
 
-  it('生成期间禁用，与旁边的输入框一致', async () => {
-    const wrapper = mountInputs();
+  it('生成期间禁用：改了也看不到生效，那就不许改', async () => {
+    const wrapper = mountApp();
     useMindMapStore().busy = true;
     await wrapper.vm.$nextTick();
     expect(diagramSelect(wrapper).attributes('disabled')).toBeDefined();
+    expect(wrapper.get('#thinking-model').attributes('disabled')).toBeDefined();
   });
 
   it('已有导图（edit 场景）时不渲染：那条路不消费图型', async () => {
-    const wrapper = mountInputs();
+    const wrapper = mountApp();
     expect(wrapper.find('#diagram-type').exists()).toBe(true);
 
     useMindMapStore().preview(content('原图'), 'right');
     await wrapper.vm.$nextTick();
 
     expect(wrapper.find('#diagram-type').exists()).toBe(false);
+    expect(wrapper.find('#thinking-model').exists()).toBe(false);
+  });
+});
+
+describe('拆解方式选择器', () => {
+  it('五个选项与后端标识一致，默认选中通用，并说明它改了什么', () => {
+    const wrapper = mountApp();
+    const select = wrapper.get('#thinking-model');
+    const options = select.findAll('option');
+    expect(options.map(option => option.attributes('value'))).toEqual([
+      'default', 'first-principles', 'feynman', 'systematic', 'critical',
+    ]);
+    expect(options.map(option => option.text())).toEqual([
+      '通用', '第一性原理', '费曼', '5W1H', '批判性',
+    ]);
+    expect((select.element as HTMLSelectElement).value).toBe('default');
+    // 旁边那一行短说明：用户得知道选了它会影响什么
+    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('按这种方式拆解主题');
+  });
+
+  it('选了就随 create 请求发出去', async () => {
+    const calls = stubFetch(() => agentReply([doneFrame(content())]));
+    const wrapper = mountApp();
+
+    await wrapper.get('#thinking-model').setValue('first-principles');
+    await wrapper.get(INTENT).setValue('做一张图');
+    await wrapper.get(SUBMIT).trigger('click');
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    expect((calls[0].body as Record<string, unknown>).thinking_model).toBe('first-principles');
   });
 });
 
 describe('图型说明文字', () => {
   it('切换选项时说明跟着变，且指出这个图型具体改了什么', async () => {
-    const wrapper = mountInputs();
+    const wrapper = mountApp();
     const select = diagramSelect(wrapper);
 
     // 默认那一句：说清"不选"会发生什么
@@ -127,12 +167,11 @@ describe('图型说明文字', () => {
 describe('图型进入请求体', () => {
   it('选了流程图就带上 diagram_type=flowchart', async () => {
     const calls = stubFetch(() => agentReply([doneFrame(content())]));
-    const wrapper = mountInputs();
-    useSourcesStore();  // 输入区读它，挂上再点生成
+    const wrapper = mountApp();
 
-    await wrapper.get('textarea#prompt').setValue('画个报销流程图');
+    await wrapper.get(INTENT).setValue('画个报销流程图');
     await diagramSelect(wrapper).setValue('flowchart');
-    await wrapper.findAll('button').find(item => item.text().includes('生成导图'))!.trigger('click');
+    await wrapper.get(SUBMIT).trigger('click');
     await vi.waitFor(() => expect(calls).toHaveLength(1));
 
     const body = calls[0].body as Record<string, unknown>;
@@ -142,10 +181,10 @@ describe('图型进入请求体', () => {
 
   it('「自动判断」不带这个字段（省略 = 让模型自己判断）', async () => {
     const calls = stubFetch(() => agentReply([doneFrame(content())]));
-    const wrapper = mountInputs();
+    const wrapper = mountApp();
 
-    await wrapper.get('textarea#prompt').setValue('画个报销流程图');
-    await wrapper.findAll('button').find(item => item.text().includes('生成导图'))!.trigger('click');
+    await wrapper.get(INTENT).setValue('画个报销流程图');
+    await wrapper.get(SUBMIT).trigger('click');
     await vi.waitFor(() => expect(calls).toHaveLength(1));
 
     // 不发 'auto' 这种假值：后端的 Literal 只认三个图型，省略才是"没说"

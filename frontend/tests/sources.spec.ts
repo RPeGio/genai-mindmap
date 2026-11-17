@@ -2,7 +2,7 @@ import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Source } from '../src/api/types';
-import { MAX_AUDIO_BYTES, MAX_INPUT_CHARS, MAX_SOURCES, MAX_UPLOAD_BYTES, mergedCharCount, sourceInputError, textSource } from '../src/sources/input';
+import { MAX_AUDIO_BYTES, MAX_INPUT_CHARS, MAX_SOURCES, MAX_UPLOAD_BYTES, TOPIC_MAX_CHARS, fileTitle, materialTitle, mergedCharCount, sourceInputError, textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 
@@ -306,8 +306,101 @@ describe('合并生成边界', () => {
     { sources: [parsed('bad', { status: 'failed' })], message: '尚未解析成功' },
     { sources: Array.from({ length: 51 }, (_, i) => parsed(String(i))), message: '最多添加 50' },
   ])('无效来源过不了界面校验：$message', ({ sources, message }) => {
-    // 校验是纯函数，界面拿它决定「合并生成导图」按不按得下去；
-    // 直接测它，就不必再借一条已经不存在的生成通道来断言"没发请求"。
+    // 校验是纯函数：界面拿它决定生成按钮按不按得下去。直接测它，就不必再借
+    // 一条已经删掉的生成通道来断言"没发请求"。
     expect(sourceInputError(sources)).toContain(message);
+  });
+});
+
+/**
+ * 「只上传材料、不写主题」时用材料标题当主题。
+ *
+ * 判据是"这个标题有没有携带信息"：`未命名`、`扫描件`、`IMG_001` 的长度都过得了
+ * "非空"这道关，可它们描述的是文件而不是内容——拿它当中心主题，生成的是一张以
+ * 垃圾词为根的图，比让用户补一句主题更糟。
+ */
+describe('材料标题能不能当主题', () => {
+  it('去掉扩展名，但不按"最后一个点"切', () => {
+    expect(fileTitle('机器学习导论.pdf')).toBe('机器学习导论');
+    expect(fileTitle('  年度总结  .docx')).toBe('年度总结');
+    // `方案 v1.2` 按点切会变成 `方案 v1`，而它本来就该原样当标题
+    expect(fileTitle('方案 v1.2')).toBe('方案 v1.2');
+    expect(fileTitle('没有扩展名')).toBe('没有扩展名');
+  });
+
+  it.each([
+    '未命名.txt', '扫描件.pdf', 'IMG_001.png', 'screenshot_20241117.png',
+    '新建文本文档.txt', '12345.txt', '(2).pdf', 'a.pdf', '录音.wav', 'untitled.md',
+  ])('%s 当不了主题，并给出一句原因', (filename) => {
+    const result = materialTitle([{ ...parsed('s1'), filename }]);
+    expect(result.topic).toBe('');
+    // 原因必须说得出来：灰着不解释，用户只会以为功能坏了
+    expect(result.reason.length).toBeGreaterThan(4);
+  });
+
+  it('原因里带上那个标题，用户才知道说的是哪一份', () => {
+    const result = materialTitle([{ ...parsed('s1'), filename: '未命名.txt' }]);
+    expect(result.reason).toContain('未命名');
+    expect(result.reason).toContain('通用词');
+  });
+
+  it('太长的标题也不当主题（那是文件名，不是主题）', () => {
+    const long = `${'很长的文件名'.repeat(TOPIC_MAX_CHARS)}.pdf`;
+    expect(materialTitle([{ ...parsed('s1'), filename: long }]).topic).toBe('');
+  });
+
+  it('常规标题能用，并说明取自哪一份', () => {
+    const result = materialTitle([{ ...parsed('s1'), filename: '机器学习导论.pdf' }]);
+    expect(result.topic).toBe('机器学习导论');
+    expect(result.from).toBe('机器学习导论.pdf');
+    expect(result.reason).toBe('');
+  });
+
+  it('剪掉「(2)」「- 副本」这类尾巴', () => {
+    expect(materialTitle([{ ...parsed('s1'), filename: '手册 (2).pdf' }]).topic).toBe('手册');
+    expect(materialTitle([{ ...parsed('s1'), filename: '手册 - 副本.pdf' }]).topic).toBe('手册');
+  });
+
+  it('粘贴的文本没有标题：不猜，让用户写主题', () => {
+    const result = materialTitle([textSource('一段正文')]);
+    expect(result.topic).toBe('');
+    expect(result.reason).toContain('粘贴的材料没有标题');
+  });
+
+  it('第一份不可用时往后找，用第二份的标题', () => {
+    const result = materialTitle([
+      { ...parsed('a'), filename: 'IMG_2041.png' },
+      { ...parsed('b'), filename: '碳中和路线图.pdf' },
+    ]);
+    expect(result.topic).toBe('碳中和路线图');
+    expect(result.from).toBe('碳中和路线图.pdf');
+  });
+
+  it('没有材料时不给原因：那不是错误，只是还没加材料', () => {
+    expect(materialTitle([])).toEqual({ topic: '', from: '', reason: '' });
+  });
+});
+
+describe('材料是可选的，不是必需的', () => {
+  it('没有材料时 materialProblem 是空串（problem 却是"请先添加来源"）', () => {
+    const store = useSourcesStore();
+    expect(store.problem).toContain('至少一个来源');
+    // 合并之后生成可以没有任何材料：谁把 problem 直接摆到按钮上，用户就会看到
+    // 一个永远禁用的按钮和一句要求他去加材料的话。
+    expect(store.materialProblem).toBe('');
+  });
+
+  it('有材料时两者一致', () => {
+    const store = useSourcesStore();
+    store.addText('正文');
+    expect(store.materialProblem).toBe(store.problem);
+    expect(store.materialProblem).toBe('');
+  });
+
+  it('解析失败时材料闸门给出可操作的一句话', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({ detail: '解析失败' }, 422)));
+    const store = useSourcesStore();
+    await store.addFiles([file('坏.pdf')]);
+    expect(store.materialProblem).toContain('重试或移除');
   });
 });

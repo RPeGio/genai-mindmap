@@ -533,10 +533,10 @@ export interface RunOptions {
   /**
    * 这次运行**显式**指定的选区，覆盖 store 里当前的选中。
    *
-   * 存在的理由只有一条：**看得见的才发**。画布上方的「改这张图」旁边挂着
-   * 「已选 N 个节点」徽标，那个入口默认把选区带上；而左侧「输入主题或文本」
-   * 的生成按钮不显示选区，它必须显式传 `[]`——否则它会静默带着用户在画布上
-   * 圈的节点去"重新生成"，而用户看不到这件事正在发生。
+   * 存在的理由只有一条：**看得见的才发**。画布右上角那个框旁边挂着「已选 N 个
+   * 节点」徽标，它按徽标上的数把选区带上；而将来任何不显示选区的入口（快捷动作、
+   * 测试直调）必须显式传 `[]`——否则它会静默带着用户在画布上圈的节点去"重新生成"，
+   * 而用户看不到这件事正在发生。
    */
   selection?: string[];
 }
@@ -592,9 +592,26 @@ function flatten(root: MindNode): FlatNode[] {
   return out;
 }
 
+/**
+ * 还没跑过任何一轮时的状态行。
+ *
+ * 导出成常量是为了让界面能判断"这条状态是不是还没有内容"：画布右上角那个框在
+ * 初始状态下已经有一行提示了，再摆一句"写一个主题后生成"就是在同一个框里说两遍
+ * 同一件事。
+ */
+export const INITIAL_STATUS = '写一个主题后生成，节点会边生成边出现。';
+
 export const useMindMapStore = defineStore('mindmap', () => {  const content = ref<MindMapContent | null>(null);
-  const mode = ref<'demo' | 'model' | 'saved' | null>(null);
-  const status = ref('输入主题或文本后生成，节点会边生成边出现。');
+  /**
+   * 这张图是怎么来的。顶栏那一小块徽标按它换文案。
+   *
+   * `import` 是新增的一档：导入进来的图既不是示例（`demo`），也不是模型生成的
+   * （`model`），更不是"已保存导图"（`saved`，那个意味着从库里打开、有 mapId）。
+   * 它**没有 mapId**、`dirty` 为真——第一次保存会创建一条新记录。混进任何一档
+   * 都会在界面上说错话：「已保存导图」会让人以为导入的内容已经在库里了。
+   */
+  const mode = ref<'demo' | 'model' | 'saved' | 'import' | null>(null);
+  const status = ref(INITIAL_STATUS);
   const stageText = ref('');
   const waitedMs = ref(0);
   const busy = ref(false);
@@ -2267,13 +2284,55 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
   }
 
   /**
+   * 装载一份**导入**的导图。
+   *
+   * 与 `preview` 的三处差别，每一处都是刻意的：
+   *
+   *  1. `dirty = true`。导入的是用户的作品，他必须被提醒"还没保存"。示例数据是
+   *     拿来检查布局的，不算作品，所以那边是 false。
+   *  2. `mode = 'import'`。徽标要说清这张图的来历；混进 `saved` 会让人以为它已经
+   *     在库里了，混进 `demo` 会让人以为这是假数据（他会不敢保存）。
+   *  3. `mapId = null`。后端导入**只解析不落库**，所以第一次保存走 `createMindMap`
+   *     建一条新记录，而不是 PUT 到某张既有图上。
+   *
+   * 朝向不经过 `withDirection`：文件自带的 `theme.direction` / `layout` 就是用户
+   * 原来看到的样子，`direction` 是 content 的派生值（`directionOf`），设好 content
+   * 之后画布自然按它排。强行套一个默认朝向会把一份"向左"的图导成向右。
+   *
+   * `resetHistory()`：导入不是一个可以撤销的编辑步骤——撤销回到导入前就意味着
+   * "把画布清空"，而那不是用户点撤销时想要的东西。
+   */
+  function importMap(next: MindMapContent) {
+    cancel();
+    // 换图必须换会话号，否则上一张图在途的保存响应回来时会把它的 id 写进 mapId，
+    // 而画布上是这张新导入的图——下次保存就把导入的内容 PUT 到旧记录上。
+    mapSession += 1;
+    candidate.value = null;
+    resetCandidateOps();
+    titleDraft.value = null;
+    // 与 preview 同一条：上一张图在途的保存作废，saving 必须自己复位，否则新图
+    // 永远卡在"保存中"。
+    saving.value = false;
+    content.value = next;
+    mode.value = 'import';
+    setPrimary(null);
+    editingId.value = null;
+    viewAdjusted.value = false;
+    mapId.value = null;
+    version.value = 0;
+    savedAt.value = null;
+    dirty.value = true;
+    resetHistory();
+    status.value = `已导入「${next.title}」，还没有保存。`;
+  }
+
+  /**
    * 掐掉在途的 agent 运行。
    *
    * 取消只是停止这一轮：画布上的 `content` 从来没被这一轮碰过（候选落地要用户
    * 点「应用」），所以不需要回滚，清掉属于这一轮的中间态就够了。
    * 换图场景（loadMap / newMap / preview）也走它，把旧流掐死。
-   */
-  function cancel() {
+   */  function cancel() {
     const active = controller;
     controller = null;
     active?.abort();
@@ -2350,7 +2409,7 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
       agentError.value = '';
       agentWarnings.value = [];
       clearAgentPreview();
-      status.value = '请在下方「输入主题或文本」里写下要生成的内容；上面的「导图标题」只改名字，不会重新生成。';
+      status.value = '请在画布右上角的输入框里写下主题或要改什么；「导图标题」那个框只改名字，不会重新生成。';
       return;
     }
     if (intent !== 'create' && !content.value) {
@@ -2739,6 +2798,7 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     listBusy,
     cancel,
     preview,
+    importMap,
     select,
     locate,
     setDirection,

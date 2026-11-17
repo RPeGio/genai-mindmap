@@ -311,6 +311,35 @@ export interface MapRecord {
   updated_at: string;
 }
 
+// ---- 导入（`POST /api/mindmaps/import`）----
+
+/**
+ * 一条导入告警。**只有 code 与 message**（后端 `ImportWarningPayload`）。
+ *
+ * 定位信息（第几行、哪个节点）写在 message 正文里，不占单独字段：多一个字段就
+ * 多一次两端契约对齐，而"第 12 行"读在句子里并不更差。
+ *
+ * `code` 是稳定的（`truncated_nodes` / `source_refs_cleared` / `edges_dropped`…），
+ * 界面按它分组或加图标；`message` 是给人看的中文。**不要按 message 做判断**——
+ * 文案会改，码不会。
+ */
+export interface ImportWarning {
+  code: string;
+  message: string;
+}
+
+/**
+ * 导入的响应体。`source_format` 是识别出来的格式（`json` / `markdown` / `opml` /
+ * `xmind` / `freemind` / `puml`），界面用它说"按 XMind 读进来了"。
+ *
+ * **只解析不落库**：`content` 装进画布后是"有未保存修改"的状态，落库仍走保存。
+ */
+export interface ImportResult {
+  content: MindMapContent;
+  warnings: ImportWarning[];
+  source_format: string;
+}
+
 // ---- 来源（文档解析）----
 
 /**

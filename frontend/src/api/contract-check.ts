@@ -32,6 +32,8 @@
  */
 import type { components } from './schema';
 import type {
+  ImportResult,
+  ImportWarning,
   MapRecord,
   MindEdge,
   MindMapContent,
@@ -75,6 +77,10 @@ export const checks = {
   sourceSpanKeys: true satisfies SameKeys<SourceSpan, Schemas['SourceSpan']>,
   sourceUsageKeys: true satisfies SameKeys<SourceUsage, Schemas['SourceUsage']>,
   recordKeys: true satisfies SameKeys<MapRecord, Schemas['MapRecord']>,
+  // 导入：`warnings` 里只有 code/message，多一个字段就要在这里红——那条契约是
+  // "定位信息写进 message"，加字段等于换一种约定。
+  importKeys: true satisfies SameKeys<ImportResult, Schemas['ImportResponse']>,
+  importWarningKeys: true satisfies SameKeys<ImportWarning, Schemas['ImportWarningPayload']>,
 
   // ---- 字段形状 ----
   contentShape: true satisfies SameShape<MindMapContent, Schemas['MindMapContent-Output']>,
@@ -89,4 +95,7 @@ export const checks = {
   sourceSpanShape: true satisfies SameShape<SourceSpan, Schemas['SourceSpan']>,
   sourceUsageShape: true satisfies SameShape<SourceUsage, Schemas['SourceUsage']>,
   recordShape: true satisfies SameShape<MapRecord, Schemas['MapRecord']>,
+  importShape: true satisfies SameShape<ImportResult, Schemas['ImportResponse']>,
+  importWarningShape: true satisfies
+    SameShape<ImportWarning, Schemas['ImportWarningPayload']>,
 };

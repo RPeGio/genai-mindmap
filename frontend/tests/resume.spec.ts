@@ -144,7 +144,10 @@ describe('上次的运行结果', () => {
     await flushPromises();
 
     expect(wrapper.find(NOTICE).exists()).toBe(false);
-    expect(wrapper.get('[role="status"]').text()).not.toContain('服务挂了');
+    // 「一声不响」= 界面上连一条状态行都没有（初始那句让位给了生成框里的提示，
+    // 见 `intent-input.spec.ts`），失败原因更不该出现在任何地方。
+    expect(wrapper.find('[role="status"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('服务挂了');
   });
 
   it('点「查看」把候选载入现有的确认流程：面板出现，画布不动', async () => {

@@ -412,12 +412,18 @@ class IdempotencyTest(unittest.TestCase):
         _collect(_request(), provider, _registry(handler, readonly=True))
         self.assertEqual(executed, ["同样"])
 
-    def test_write_tool_is_never_deduped(self):
-        """写操作绝不能按参数去重。
+    def test_write_tool_is_never_answered_from_a_cache(self):
+        """写操作绝不能按参数去取"上一次的结果"。
 
         模型完全可能先改成 X、再改成 Y、再改回 X，第三次参数与第一次相同，
         但那时树的状态已经不是第一次的样子。走上缓存会直接返回旧结果，
         模型以为改成功了，实际停在 Y——比报错危险得多。
+
+        `max_tool_calls` 提到 50 之后多了一道防线：**紧挨着**的同一个写调用会被
+        判 `duplicate_call`（连续两次给同一个节点写同一个值本来就是空操作）。
+        关键区别是它返回 `ok=False` 的"没有执行"，而不是一份被伪装成成功的结果
+        ——上面那个危险正是被这一点挡掉的。隔一次别的调用之后（X→Y→X 的真实
+        形状）照常执行，见下一条。
         """
         executed: list[str] = []
 
@@ -428,8 +434,32 @@ class IdempotencyTest(unittest.TestCase):
         calls = [ToolCall(call_id=f"c{index}", name="echo", arguments={"text": "同样"})
                  for index in range(2)]
         provider = ScriptedProvider([_completion(calls, finish="tool_calls"), _completion()])
-        _collect(_request(), provider, _registry(handler, readonly=False))
-        self.assertEqual(executed, ["同样", "同样"])
+        events = _collect(_request(), provider, _registry(handler, readonly=False))
+        self.assertEqual(executed, ["同样"])
+        ends = [event for event in events if event.type == "tool_end"]
+        self.assertEqual(ends[1].result_summary["code"], "duplicate_call")
+
+    def test_write_tool_runs_again_after_a_different_call(self):
+        """X → Y → X：第三次必须真的执行。
+
+        这是"写工具不能按参数缓存"的原始场景（用户可能说了"还是改回去"），也是
+        防线一窗口的边界：它判的是**连续**重复，中间插过一次别的调用就放行。
+        """
+        executed: list[str] = []
+
+        def handler(args, ctx):
+            executed.append(args.text)
+            return ToolResult(ok=True, content="ok")
+
+        calls = [
+            ToolCall(call_id="c0", name="echo", arguments={"text": "甲"}),
+            ToolCall(call_id="c1", name="echo", arguments={"text": "乙"}),
+            ToolCall(call_id="c2", name="echo", arguments={"text": "甲"}),
+        ]
+        provider = ScriptedProvider([_completion(calls, finish="tool_calls"), _completion()])
+        events = _collect(_request(), provider, _registry(handler, readonly=False))
+        self.assertEqual(executed, ["甲", "乙", "甲"])
+        self.assertTrue(all(event.ok for event in events if event.type == "tool_end"))
 
     def test_same_call_id_with_different_arguments_is_conflict(self):
         """同一个 call_id 换参数是协议违规，必须报错而不是返回旧结果。"""

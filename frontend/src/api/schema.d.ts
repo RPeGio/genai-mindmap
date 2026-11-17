@@ -40,6 +40,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mindmaps/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import Mindmap */
+        post: operations["import_mindmap_api_mindmaps_import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/optimization/check": {
         parameters: {
             query?: never;
@@ -136,6 +153,30 @@ export interface paths {
          * @description 导出 OPML，便于导入 XMind 等工具。
          */
         post: operations["export_opml_api_export_opml_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/export/json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export Json
+         * @description 导出 JSON（`MindMapContent` 的序列化）。
+         *
+         *     这是唯一**无损**的格式，也是「导出 → 手改 → 导入」的保底：另外三种都只有
+         *     一个文字槽位，往返一次 `note` / `detail` / 颜色 / 图型会退化（见
+         *     `app/export/service.py::to_json` 的 docstring）。
+         */
+        post: operations["export_json_api_export_json_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -449,6 +490,11 @@ export interface components {
             /** File */
             file: string;
         };
+        /** Body_import_mindmap_api_mindmaps_import_post */
+        Body_import_mindmap_api_mindmaps_import_post: {
+            /** File */
+            file: string;
+        };
         /** CheckRequest */
         CheckRequest: {
             content: components["schemas"]["MindMapContent-Input"];
@@ -532,6 +578,24 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** ImportResponse */
+        ImportResponse: {
+            content: components["schemas"]["MindMapContent-Output"];
+            /** Warnings */
+            warnings: components["schemas"]["ImportWarningPayload"][];
+            /** Source Format */
+            source_format: string;
+        };
+        /**
+         * ImportWarningPayload
+         * @description 一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。
+         */
+        ImportWarningPayload: {
+            /** Code */
+            code: string;
+            /** Message */
+            message: string;
         };
         /** KnowledgeHit */
         KnowledgeHit: {
@@ -784,7 +848,7 @@ export interface components {
             max_model_calls: number;
             /**
              * Max Tool Calls
-             * @default 8
+             * @default 50
              */
             max_tool_calls: number;
             /**
@@ -1197,6 +1261,39 @@ export interface operations {
             };
         };
     };
+    import_mindmap_api_mindmaps_import_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_import_mindmap_api_mindmaps_import_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     check_map_api_optimization_check_post: {
         parameters: {
             query?: never;
@@ -1326,6 +1423,37 @@ export interface operations {
         };
     };
     export_opml_api_export_opml_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_json_api_export_json_post: {
         parameters: {
             query?: never;
             header?: never;

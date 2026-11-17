@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   AgentRunRequest,
   CreateTextSourceResponse,
+  ImportResult,
   MapRecord,
   MindMapContent,
   RunDetail,
@@ -250,13 +251,20 @@ export async function uploadDocument(file: File, signal?: AbortSignal): Promise<
 
 // ---- 导出 ----
 
-/** 后端三种格式都是纯文本响应，不能走 request()——它固定按 JSON 解析。 */
-export type ExportFormat = 'puml' | 'markdown' | 'opml';
+/**
+ * 四种导出都是纯文本响应，不能走 request()——它固定按 JSON 解析。
+ *
+ * `json` 是**唯一无损**的一种：另外三种都只有一个文字槽位（正文优先），
+ * `note` / `detail` 的区分、颜色、图标、图型、附加边往返一次就退化了。
+ * 它也是导入的保底——"导出改一改再导入"只有这条路能保证一条都不丢。
+ */
+export type ExportFormat = 'puml' | 'markdown' | 'opml' | 'json';
 
 const EXPORT_META: Record<ExportFormat, { label: string; extension: string }> = {
   puml: { label: 'PlantUML', extension: 'puml' },
   markdown: { label: 'Markdown', extension: 'md' },
   opml: { label: 'OPML', extension: 'opml' },
+  json: { label: 'JSON', extension: 'json' },
 };
 
 export function exportLabel(format: ExportFormat): string {
@@ -278,8 +286,8 @@ export async function exportMindMap(
     response = await fetch(`${BASE}/export/${format}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // 后端三种导出统一取 `note or label`，这里直接发原样内容：
-      // 前端不再自己做"把正文折进标题"的拼接，避免同一份内容在两端拼出两种结果。
+      // 后端四种导出统一取 `note or label`（JSON 除外，它全字段照抄），这里直接发
+      // 原样内容：前端不再自己做"把正文折进标题"的拼接，避免同一份内容两端拼出两种结果。
       body: JSON.stringify({ content }),
     });
   } catch {
@@ -288,4 +296,40 @@ export async function exportMindMap(
 
   if (!response.ok) throw await toApiError(response);
   return response.text();
+}
+
+// ---- 导入 ----
+
+/**
+ * 上传一个已有的思维导图文件，由后端识别格式并解析成 `MindMapContent`。
+ *
+ * 与 `uploadDocument` 同一个形状（multipart 不能走 `request()`：它固定带
+ * `Content-Type: application/json`，而 multipart 的 boundary 必须由浏览器生成）。
+ *
+ * **后端只解析不落库**：拿到 `content` 之后由 store 装进画布，形态是"有未保存
+ * 修改的新导图"，用户点保存才写库。这样导入失败不会污染已有数据。
+ */
+export async function importMindMap(
+  file: File,
+  signal?: AbortSignal,
+): Promise<ImportResult> {
+  const form = new FormData();
+  // 字段名必须是 `file`：后端签名是 `file: UploadFile = File(...)`。
+  form.append('file', file);
+
+  let response: Response;
+  try {
+    response = await fetch(`${BASE}/mindmaps/import`, { method: 'POST', body: form, signal });
+  } catch {
+    throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
+  }
+
+  if (!response.ok) throw await toApiError(response);
+
+  const body = (await response.json().catch(() => null)) as ImportResult | null;
+  if (!body?.content?.root) {
+    // 契约里失败一定走 400；拿到空壳说明后端出了问题，别把 undefined 塞进画布。
+    throw new ApiError(response.status, 'empty_import', '后端没有返回解析结果，请重试。');
+  }
+  return body;
 }

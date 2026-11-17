@@ -1,12 +1,10 @@
-import { mount, type VueWrapper } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import AgentPanel from '../src/components/AgentPanel.vue';
-import SourceInputs from '../src/components/SourceInputs.vue';
 import type { MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
-import { useSourcesStore } from '../src/stores/sources';
 
 /** 把若干事件包成 SSE 帧，模拟后端 /api/agent/runs/stream。 */
 function agentReply(frames: unknown[]): Response {
@@ -40,13 +38,6 @@ function stubFetch(reply: () => Response) {
 }
 
 const doneFrame = (payload: MindMapContent) => ({ type: 'done', seq: 4, content: payload });
-
-/** 按文字找按钮：输入区里「取消」「移除」这类按钮会随状态出现，只按序号取不可靠。 */
-function buttonByText(wrapper: VueWrapper, text: string) {
-  const found = wrapper.findAll('button').find(item => item.text().includes(text));
-  if (!found) throw new Error(`找不到按钮：${text}`);
-  return found;
-}
 
 /** 一次性 JSON 响应：openMap / save 走 request()，只读 json，不读流。 */
 function jsonReply(payload: unknown): Response {
@@ -166,8 +157,9 @@ describe('agent 运行', () => {
 
     expect(calls).toHaveLength(0);
     // 提示必须指出是哪个框：用户把主题写进「导图标题」时，只说"请输入主题"
-    // 会让他以为系统坏了。
-    expect(store.status).toContain('输入主题或文本');
+    // 会让他以为系统坏了。合并之后那个框在画布右上角，提示也得跟着搬家。
+    expect(store.status).toContain('右上角');
+    expect(store.status).toContain('导图标题');
   });
 
   it('没有导图时不允许 edit', async () => {
@@ -612,78 +604,6 @@ describe('思维模型进入请求体', () => {
     // 两种形态（省略字段 / 显式发 default）选后者并保持一致：排查请求体时
     // 一眼能看出用户选了哪套拆解方式，不用去猜"没这个字段是什么意思"。
     expect((calls[0].body as Record<string, unknown>).thinking_model).toBe('default');
-  });
-
-  it('下拉的五个选项与后端标识一致，默认选中通用', async () => {
-    // 新行为：下拉只在「会真正生效」时渲染（画布为空时走 create，后端才消费
-    // thinking_model）。已有导图时走 edit，见下面那条用例。
-    const wrapper = mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
-    });
-
-    const select = wrapper.get('#thinking-model');
-    const options = select.findAll('option');
-    expect(options.map(option => option.attributes('value'))).toEqual([
-      'default', 'first-principles', 'feynman', 'systematic', 'critical',
-    ]);
-    expect(options.map(option => option.text())).toEqual([
-      '通用', '第一性原理', '费曼', '5W1H', '批判性',
-    ]);
-    expect((select.element as HTMLSelectElement).value).toBe('default');
-    expect(select.attributes('disabled')).toBeUndefined();
-    // 旁边那一行短说明：用户得知道选了它会影响什么
-    expect(wrapper.text()).toContain('按这种方式拆解主题');
-
-    // 生成期间与旁边的输入框行为一致：禁用，免得用户改了方式却看不到它生效
-    useMindMapStore().busy = true;
-    await wrapper.vm.$nextTick();
-    expect(select.attributes('disabled')).toBeDefined();
-  });
-
-  it('已有导图（edit 场景）时下拉不渲染', async () => {
-    // 有导图时点击生成走 edit 意图，后端的编辑路径同样不消费 thinking_model。
-    const wrapper = mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
-    });
-    expect(wrapper.find('#thinking-model').exists()).toBe(true);
-
-    useMindMapStore().preview(content('原图'), 'right');
-    await wrapper.vm.$nextTick();
-
-    expect(wrapper.find('#thinking-model').exists()).toBe(false);
-  });
-});
-
-describe('运行中的来源区', () => {
-  it('运行期间冻结来源列表，取消后恢复可编辑', async () => {
-    // 生成中途还能改来源，用户会以为改动对这一轮生效——实际上请求体早就发出去了。
-    // 冻结与"取消后恢复"是同一件事的两半。
-    const gate = controllableReply();
-    stubFetch(() => gate.response);
-    const wrapper = mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
-    });
-    const store = useMindMapStore();
-    const sources = useSourcesStore();
-    sources.addText('正文');
-
-    const running = store.runGeneration('做一张图', 'create', sources.readySources);
-    await vi.waitFor(() => expect(store.busy).toBe(true));
-    expect(wrapper.get('input[type="file"]').attributes('disabled')).toBeDefined();
-    expect(buttonByText(wrapper, '清空来源').attributes('disabled')).toBeDefined();
-    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeDefined();
-
-    await buttonByText(wrapper, '取消').trigger('click');
-    expect(store.busy).toBe(false);
-    // 取消不该顺手把用户收集的材料清掉
-    expect(sources.items).toHaveLength(1);
-    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeUndefined();
-
-    gate.finish();
-    await running;
   });
 });
 

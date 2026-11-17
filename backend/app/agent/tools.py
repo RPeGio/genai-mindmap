@@ -4716,8 +4716,9 @@ def _expand_reference(ctx: RunContext, chain: Sequence[Node], sources: list[Sour
 
     **不占 `max_tool_calls`**：检索发生在工具内部（与 `_generate_deep` 的按支检索
     同一条规矩），模型看到的仍然只有一次 `node_expand` 调用。这不只是计费口径：
-    `max_tool_calls` 默认 8，把它算进去时一次"先查再展开"就吃掉两次，而用户点的
-    是"展开这一支"，他并不知道自己在花工具额度。
+    用户点的是"展开这一支"，他并不知道自己在花工具额度；而额度的每一格都是
+    **一次模型往返**，让服务端自己做的检索去占一格，等于让用户为一次内部操作
+    多等 5–20 秒。
 
     用 `search_parent` 而不是 `search_sources`：它同时给出父块区间与命中的子块区间，
     引用才判得出"落在这段命中的原文里吗"（`_ref_from` 与
@@ -6135,12 +6136,13 @@ def _batch_id(ctx: RunContext) -> str:
 # （决策见 `docs/ONE-PATH.md`）。形态不再参与裁剪——有没有来源，模型看到的
 # 生成工具都是同一个。
 #
-# `edit` 给**五个**：四个细粒度（加/改/删/移）外加批量 `mindmap_edit`。
+# `edit` 给**七个**：六个细粒度（加/改/删/移 + 两条边）外加批量 `mindmap_edit`。
 # 为什么不只留批量：批量的参数是一张 op 表，改一处也要写出 `[{"op":"update",
 # "id":…,"changes":{"label":…}}]` 这一串，而模型的失败模式恰恰在这里——少一个
 # 括号、把 label 写在 op 顶层、把 index 写成字符串。细粒度工具把这些自由度
 # 压成扁平参数，改一处就是一次调用、一处错误。批量留作**五处以上**的兜底：
-# 一次工具调用改十处，在 `max_tool_calls=8` 下这是唯一可行的形状。
+# 一次工具调用改十处，省下的不是"额度"（50 次够细粒度改 49 处），而是四十次
+# 模型往返——每次工具调用都要等模型再看一眼结果。
 _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
     "create": ("mindmap_generate_deep",),
     "expand": ("node_expand",),
@@ -6150,9 +6152,11 @@ _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# 会读来源的意图。`create` 不在里面：分片生成在工具内部自己检索（骨架之后每支一次、
-# 限额补查再各一次），模型再拿到 `rag_query` 只会把"先查一下"当成规定动作——
-# 实测 10 次里 10 次都先查一遍，把 `max_tool_calls` 用光，一次生成都没调。
+# 会读来源的意图。`create` 不在里面，而理由**不是**预算：分片生成在工具内部
+# 自己检索（骨架之后每支一次、限额补查再各一次），模型再查一遍拿到的是同一批
+# 片段的另一截——而 `mindmap_generate_deep` 没有任何参数能接收它。查了只能自己
+# 在文字里复述，白烧一次模型往返。`max_tool_calls` 从 8 提到 50 不改变这条：
+# 它是**重复**，不是容量。
 _SOURCE_AWARE_INTENTS = ("expand", "edit")
 
 # 注册顺序固定，便于日志与测试对照；用工厂而不是共享实例，避免一个 registry
@@ -6372,16 +6376,17 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     裁剪规则：
       - `create` 只给分片生成（`mindmap_generate_deep`），没有第二个选项
       - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
-      - `edit` 给**五个**写工具（`add_node` / `update_node` / `remove_node` /
-        `move_node` / `mindmap_edit`），请求带来源时再加 `rag_query`。
-        让模型自己选粒度：改一两处用细粒度的（参数扁平、报错更准），改五处以上
-        用批量（一次调用改十处，在 `max_tool_calls=8` 下这是唯一装得下的形状）
+      - `edit` 给**七个**写工具（`add_node` / `update_node` / `remove_node` /
+        `move_node` / `add_edge` / `remove_edge` / `mindmap_edit`），请求带来源时
+        再加 `rag_query`。让模型自己选粒度：改一两处用细粒度的（参数扁平、报错更准），
+        改五处以上用批量（一次调用改十处，省下的是**模型往返**——每次调用都要一轮）
       - `expand` / `edit` 在请求带来源时加 `rag_query`：那两条路不读来源，
         模型只能自己查。
       - **不**给 `create`：分片生成在工具内部自己检索（骨架之后每支一次、限额
         补查再各一次）。早先这里是反的——那时整树还不预检索，不给工具模型就只能
-        凭标题编；现在补上预检索之后，再给工具反而让模型连查八次把
-        `max_tool_calls` 用光、一次生成都没调。
+        凭标题编。补上预检索之后，再给工具就只剩**重复**：模型查到的片段进不了
+        `mindmap_generate_deep` 的任何参数，它只能自己在文字里复述，而每一支的
+        检索用的是那支的标题。`max_tool_calls` 从 8 到 50 不改变这一点。
       - **请求不带来源、但知识库非空**时，任何意图都加 `rag_query`（见下）。
 
     **为什么 `create` 只剩一条路**：整树一次成型的 `mindmap_generate` 随
@@ -6413,9 +6418,9 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
     if has_sources:
         # `create` **不**补 `rag_query`：分片生成在工具内部先检索（骨架之后按支
-        # 一次、限额补查再各一次），模型再自行查是纯浪费——实测它连查 8 次把
-        # `max_tool_calls` 用光，一次生成都没调，用户拿到"工具调用次数已用完"和
-        # 0 个节点。`expand` / `edit` 仍需要：那两条路不读来源，模型只能自己查。
+        # 一次、限额补查再各一次），模型再自行查是**重复**——它查到的片段进不了
+        # `mindmap_generate_deep` 的任何参数，只能自己在文字里复述一遍。
+        # `expand` / `edit` 仍需要：那两条路不读来源，模型只能自己查。
         if intent in _SOURCE_AWARE_INTENTS:
             allowed.add("rag_query")
     if has_library and not has_sources:
