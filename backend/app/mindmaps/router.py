@@ -1,16 +1,53 @@
-from fastapi import APIRouter, HTTPException, status
+"""导图的 HTTP 面：保存 / 读取 / 版本，以及**改动日志的两条读路径**。
+
+改动日志的写入口不在这里单开一个端点——它并进 `POST` / `PUT` 的请求体（见
+`contracts.mindmap.SaveRequest` 的注释）。第一次保存之前没有 `map_id`，一个
+`POST /mindmaps/{id}/edits` 要么发不出去，要么必须先 create 再补发，于是多出
+"内容存了、事件没存"这种半截状态，而统计从此只看见部分改动。
+
+读有两条：`summary` 是这一版的交付物（分布），`edits` 是明细（那 42 条具体是什么）。
+没有明细，一个反常的平均值只能连数据库才查得下去。
+"""
+import logging
+
+from fastapi import APIRouter, HTTPException, Query, status
+
+from app.contracts.edits import EditEventRow, EditSummary
 from app.contracts.mindmap import MapRecord, SaveRequest, UpdateRequest
-from app.mindmaps import repository
+from app.mindmaps import edits, repository
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/mindmaps", tags=["导图管理"])
+
+
+def _record_edits(body: SaveRequest, map_id: str) -> None:
+    """内容已经落库之后再写事件。
+
+    顺序不能反：`create_map` 之前没有 `map_id`。而失败方向也是刻意的——事件写不进
+    只记 warning（`edits.record` 内部处理），不让用户的保存失败：为了统计丢掉一次
+    真实保存，代价方向完全错了。
+
+    `truncated` 只进日志，不落表：往行为事件表里插一条"我截断了"的假事件，会让每个
+    统计口径的 `total` 都变脏。它不是丢弃——前端把超出的部分留在队列里等下次保存。
+    """
+    if body.truncated:
+        logger.warning("编辑事件分批：map_id=%s 本次提交 %d 条，另有 %d 条留到下次保存",
+                       map_id, len(body.events), body.truncated)
+    edits.record(map_id, body.events)
+
 
 @router.get("", response_model=list[MapRecord])
 def list_maps():
     return repository.list_maps()
 
+
 @router.post("", response_model=MapRecord, status_code=status.HTTP_201_CREATED)
 def create_map(body: SaveRequest):
-    return repository.create_map(body.content)
+    record = repository.create_map(body.content)
+    _record_edits(body, record.id)
+    return record
+
 
 @router.get("/{map_id}", response_model=MapRecord)
 def get_map(map_id: str):
@@ -19,11 +56,41 @@ def get_map(map_id: str):
         raise HTTPException(status_code=404, detail="导图不存在")
     return result
 
+
 @router.put("/{map_id}", response_model=MapRecord)
 def update_map(map_id: str, body: UpdateRequest):
     result = repository.update_map(map_id, body.version, body.content)
     if result == "missing":
         raise HTTPException(status_code=404, detail="导图不存在")
     if result == "conflict":
+        # 内容没落库，事件也就无处归属：一起拒。重试一次两者都补上，
+        # 不会出现"事件已写、内容被拒"这种统计漂移。
         raise HTTPException(status_code=409, detail="导图已被修改，请重新打开后再保存")
+    _record_edits(body, map_id)
     return repository.get_map(map_id)
+
+
+# `/{map_id}/edits/summary` 必须排在 `/{map_id}/edits` **之前**：两条路径段数不同，
+# 现在的匹配不受顺序影响；把它写对是因为下一个人加 `/{map_id}/edits/xxx` 时不会
+# 记得回头调换，而那时 `summary` 会被当成一个 `limit` 值或另一条子路径。
+@router.get("/{map_id}/edits/summary", response_model=EditSummary)
+def edit_summary(map_id: str):
+    """这张图的改动分布。**这一版真正的交付物。**
+
+    404 而不是"空统计"：给一个不存在的 id 查统计是调用方错了，返回一份全零的
+    报告会让它以为"这张图没人改过"——那是完全不同的一件事。
+    """
+    if repository.get_map(map_id) is None:
+        raise HTTPException(status_code=404, detail="导图不存在")
+    return edits.summary(map_id)
+
+
+@router.get("/{map_id}/edits", response_model=list[EditEventRow])
+def list_edits(
+    map_id: str,
+    limit: int = Query(default=edits.RECENT_DEFAULT, ge=1, le=edits.RECENT_LIMIT),
+):
+    """最近的改动明细，新的在前。`limit` 有上限：这是给人读的一屏，不是导出通道。"""
+    if repository.get_map(map_id) is None:
+        raise HTTPException(status_code=404, detail="导图不存在")
+    return edits.recent(map_id, limit)

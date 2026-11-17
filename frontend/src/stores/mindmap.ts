@@ -5,6 +5,7 @@ import { computed, ref } from 'vue';
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunResolved, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
+import { diffEdits, EDIT_EVENT_LIMIT, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
@@ -668,6 +669,23 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
   const future = ref<string[]>([]);
   /** 撤销栈已占的字节数。维护这个数，免得每次压栈都把整栈重新编码一遍。 */
   const pastBytes = ref(0);
+
+  /**
+   * 还没提交的改动（算法与取舍见 `mindmap/edit-log.ts`）。
+   *
+   * 攒到保存时一起发（`save()`），**保存成功才清**：失败就清掉的话，那批事件永远
+   * 丢了，而用户以为已经记下。不保存就关页面 → 事件丢失，这是可接受的——那次编辑
+   * 本来也没保存，日志不该比内容更"诚实"。
+   */
+  const pendingEdits = ref<EditEvent[]>([]);
+
+  /**
+   * 改动**之前**那棵树，以及这次改动该记到谁头上。
+   *
+   * `pushHistory()` 设置、`collectEdits()` 消费并清空。抄引用而不是抄序列化：
+   * `applyContent` 每次都是整体替换 `content.value`，旧树不会被后续修改带跑。
+   */
+  let editBase: { content: MindMapContent; actor: EditActor; runId?: string } | null = null;
 
   const saving = ref(false);
 
@@ -1591,22 +1609,68 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     }
   }
 
-  /** 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。 */
-  function pushHistory() {
-    const snap = snapshot();
-    if (!snap) return;
-    recordPast(snap);
+  /**
+   * 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。
+   *
+   * `actor` 决定这次改动记到谁头上：默认 `user`（手工编辑，绝大多数调用点），
+   * `agent` 只有 `acceptCandidate()` 传（用户只点了一下「应用」，改动是模型算的）。
+   * 区分只能靠参数——`pushHistory()` 返回之后 `content.value` 已经是新树，那时候
+   * 再想看出"谁改的"是不可能的。
+   */
+  function pushHistory(actor: EditActor = 'user', runId?: string) {
+    const current = content.value;
+    if (!current) return;
+    recordPast(JSON.stringify(current));
     future.value = [];
+    editBase = { content: current, actor, ...(runId ? { runId } : {}) };
   }
 
   /** 还能撤销几步、占了多少字节：界面与测试都靠它确认字节上限真的生效。 */
   const undoDepth = computed(() => past.value.length);
   const undoBytes = computed(() => pastBytes.value);
 
+  /**
+   * 撤销栈与改动账本一起归零。
+   *
+   * 两个都清是因为它们的适用前提是同一个：**这是同一棵树的历史**。换图（打开 /
+   * 新建 / 示例 / 导入）之后，上一张图那些没提交的事件属于另一条记录，留着它们，
+   * 下一次保存会把它们写到当前这张图的 `map_id` 上——统计一旦串图，就再也分不开
+   * "这张图被改得多"和"这个人改得多"。
+   *
+   * `acceptCandidate()` 的 `create` 分支也走它：那是一份新作品，上一张图（如果
+   * 有）的账本同样到此为止。
+   */
   function resetHistory() {
     past.value = [];
     future.value = [];
     pastBytes.value = 0;
+    pendingEdits.value = [];
+    editBase = null;
+  }
+
+  /**
+   * 改动**已经落到 `content` 之后**调用：算出这次改了什么，攒进待提交队列。
+   *
+   * 与 `pushHistory()` 分成两步，是因为顺序不能换：diff 要"改之前"和"改之后"两份树，
+   * 而 `pushHistory()` 执行时 `content.value` 还是旧值。
+   *
+   * 一次提交内所有事件共享同一个 `at`：它是"这次操作产生了几条事件"的唯一分组依据
+   * （一个字段一条事件，见 `edit-log.ts` 文件头）。
+   *
+   * 不在这里截断：截断发生在提交那一刻（`save()`），这样"超了多少条"能如实上报；
+   * 在这里截掉的话，超出的部分连数都不知道。
+   */
+  function collectEdits(after: MindMapContent | null) {
+    const base = editBase;
+    editBase = null;
+    if (!base) return;
+    const events = diffEdits(base.content, after, {
+      actor: base.actor,
+      at: new Date().toISOString(),
+      ...(base.runId ? { runId: base.runId } : {}),
+    });
+    if (!events.length) return;
+    pendingEdits.value = [...pendingEdits.value, ...events];
   }
 
   /**
@@ -1614,11 +1678,15 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
    *
    * 与 `pushHistory()` 只差一处：画布本来是空白时也要留下一步（`'null'` 就是
    * JSON 里的空画布），否则用户点了「应用到画布」就再也退不回接受之前的样子。
+   *
+   * 刻意**不设 `editBase`**：整棵树都是"新增"，那不是 diff，是把整棵树重念一遍
+   * （与 `diffCandidate` 对 `create` 返回 `null` 同一条判断，理由见 `edit-log.ts`）。
    */
   function pushHistoryOrEmpty() {
     recordPast(snapshot() ?? 'null');
     // 树从这里长出新的分支了，重做栈必须失效。
     future.value = [];
+    editBase = null;
   }
 
   /** 选中的节点可能已被删掉：兜底清空，免得详情面板指向不存在的节点。 */
@@ -1646,7 +1714,11 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     }
   }
 
-  function applyContent(next: MindMapContent, history: boolean): boolean {
+  function applyContent(
+    next: MindMapContent,
+    history: boolean,
+    actor: EditActor = 'user',
+  ): boolean {
     // 生成还在进行时禁止用户改动：done 帧会用完整结果整树替换，期间的编辑
     // 必然被覆盖；撤销栈里也会混进生成中间态，撤销起来只剩半成品。
     // 返回 false 让调用方提前退出，免得它接着把 status 改成「已修改」。
@@ -1654,10 +1726,14 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
       status.value = '正在生成导图，完成之后才能编辑。';
       return false;
     }
-    if (history) pushHistory();
+    if (history) pushHistory(actor);
     content.value = next;
     dirty.value = true;
     clientRevision.value += 1;
+    // 改动已经落地，这时候才比得出差：`pushHistory()` 抄下的那棵树 vs `next`。
+    // `history=false` 时 `editBase` 是空的，这里自动什么都不记——"不记历史"与
+    // "不记日志"是同一件事，没有哪条调用路径会只要其中之一。
+    collectEdits(next);
     return true;
   }
 
@@ -2056,10 +2132,20 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     saving.value = true;
     status.value = '正在保存…';
     const session = mapSession;
+    // 事件跟着内容一起提交，不另开端点：**第一次保存前根本没有 `map_id`**，
+    // 一个 `POST /mindmaps/{id}/edits` 要么发不出去，要么必须先 create 再补发——
+    // 那就多出"内容存了、事件没存"这种半截状态，而统计从此只看见部分改动。
+    //
+    // 超限的部分**不是被丢掉**，而是留在 `pendingEdits` 里等下一次保存——截断是
+    // 分批，不是丢弃。`truncated` 只报"这次没带上多少条"，后端记一条 warning；
+    // **不在表里插一条假事件**：`total` 必须是真实改动数，运维事件混进行为事件会
+    // 让每一个统计口径都脏掉。
+    const batch = pendingEdits.value.slice(0, EDIT_EVENT_LIMIT);
+    const truncated = pendingEdits.value.length - batch.length;
     try {
       const record = mapId.value
-        ? await updateMindMap(mapId.value, payload, version.value)
-        : await createMindMap(payload);
+        ? await updateMindMap(mapId.value, payload, version.value, batch, truncated)
+        : await createMindMap(payload, batch, truncated);
 
       // 请求在途时用户可能已经切到别的导图（或点了新建）。这时响应属于
       // 上一张图，不能拿它改当前页面的 mapId —— 改了之后画布显示的是 B、
@@ -2068,6 +2154,12 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
         status.value = `上一张导图已保存（版本 ${record.version}），当前导图未受影响。`;
         return 'saved';
       }
+
+      // 内容与事件在同一次请求里落库，所以"保存成功"就是"这批事件收下了"。
+      // 用 `slice(batch.length)` 而不是清空，两种情形都靠它：
+      //  - 请求在途时用户又改了几处 —— 那几条还没上过网，必须留给下一次；
+      //  - 这批超过 500 条被截 —— 剩下的同样留在队首之后，下一次继续发。
+      if (batch.length) pendingEdits.value = pendingEdits.value.slice(batch.length);
 
       // 请求在途时用户可能还在编辑。applyContent() 是整体替换 content.value，
       // 所以比一次引用就知道内容有没有变过。变了必须把脏标记恢复回来——
@@ -2118,11 +2210,16 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     const current = content.value;
     if (!current) return;
     const session = mapSession;
+    // 另存为同样把事件带上：新记录的内容里就含着这批改动，事件挂在旧 `map_id`
+    // 上就成了"改动在 A，内容在 B"。
+    const batch = pendingEdits.value.slice(0, EDIT_EVENT_LIMIT);
+    const truncated = pendingEdits.value.length - batch.length;
     try {
-      const record = await createMindMap(current);
+      const record = await createMindMap(current, batch, truncated);
       if (session !== mapSession) {
         return;
       }
+      if (batch.length) pendingEdits.value = pendingEdits.value.slice(batch.length);
       const changedDuringSave = content.value !== current;
       markSaved(record);
       conflict.value = null;
@@ -2719,9 +2816,15 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
       pushHistoryOrEmpty();
     } else {
       // 改的是现有这张图：身份、版本、历史都沿用，撤销回到改动前的那棵树。
-      pushHistory();
+      //
+      // `actor` 必须是 `agent`：这条路上用户只点了一下「应用」，改动是模型算出来的。
+      // `runId` 顺手带上——统计里"agent 改了多少、其中几次是同一个 run 反复改"
+      // 只能靠它回答，而它过了 `reportRunResolution()` 就没了。
+      pushHistory('agent', activeRunId ?? undefined);
     }
     content.value = candidate.value;
+    // 候选落地当下的 diff：`pushHistory` 已抄下改动前那棵树。
+    collectEdits(content.value);
     candidate.value = null;
     // 候选落地之后账本归零：这份内容已经进了 content，下一轮从第 0 版重来。
     resetCandidateOps();
@@ -2803,6 +2906,8 @@ export const useMindMapStore = defineStore('mindmap', () => {  const content = r
     canRedo,
     undoDepth,
     undoBytes,
+    // 还没提交的改动：保存时随内容一起落库，保存成功才清（见 `mindmap/edit-log.ts`）
+    pendingEdits,
     saving,
     conflict,
     maps,

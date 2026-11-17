@@ -2,6 +2,9 @@ import type {
   AgentEvent,
   AgentRunRequest,
   CreateTextSourceResponse,
+  EditEventPayload,
+  EditEventRow,
+  EditSummary,
   ImportResult,
   MapRecord,
   MindMapContent,
@@ -12,6 +15,7 @@ import type {
   SavedPref,
   Source,
 } from './types';
+import type { EditEvent } from '../mindmap/edit-log';
 
 /** 后端错误体现在只返回 detail；契约 v2 会带 code/request_id，这里先兼容两种。 */
 interface ErrorBody {
@@ -82,27 +86,98 @@ export function getMindMap(id: string): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`);
 }
 
+/** 编辑日志的事件 → 请求体里的形状（前端的 camelCase 只活在内存里）。 */
+function toEventPayload(event: EditEvent): EditEventPayload {
+  return {
+    actor: event.actor,
+    kind: event.kind,
+    at: event.at,
+    ...(event.nodeId !== undefined ? { node_id: event.nodeId } : {}),
+    ...(event.field !== undefined ? { field: event.field } : {}),
+    ...(event.before !== undefined ? { before: event.before } : {}),
+    ...(event.after !== undefined ? { after: event.after } : {}),
+    ...(event.depth !== undefined ? { depth: event.depth } : {}),
+    ...(event.runId !== undefined ? { run_id: event.runId } : {}),
+  };
+}
+
+/**
+ * 保存请求体。
+ *
+ * 空事件数组**不发字段**：与 `sources` / `prefs_applied` 同一条约定——"这次一条
+ * 都没记"与"这个字段不存在"对读的人来说是同一件事，而少发一个字段让一次没有改动的
+ * 保存与上一版逐字节相同。
+ *
+ * `truncated` 是"这一次没带上多少条"（超出 `EDIT_EVENT_LIMIT` 的部分留在前端队列里
+ * 等下次），只在真的发生时才发：后端据此记一条 warning，不落表。
+ */
+function saveBody(
+  content: MindMapContent,
+  events: readonly EditEvent[],
+  truncated: number,
+): { content: MindMapContent; events?: EditEventPayload[]; truncated?: number } {
+  const body: { content: MindMapContent; events?: EditEventPayload[]; truncated?: number } = {
+    content,
+  };
+  if (events.length) body.events = events.map(toEventPayload);
+  if (truncated > 0) body.truncated = truncated;
+  return body;
+}
+
 /** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
-export function createMindMap(content: MindMapContent): Promise<MapRecord> {
+export function createMindMap(
+  content: MindMapContent,
+  events: readonly EditEvent[] = [],
+  truncated = 0,
+): Promise<MapRecord> {
   return request<MapRecord>('/mindmaps', {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(saveBody(content, events, truncated)),
   });
 }
 
 /**
  * 覆盖保存已有导图。`version` 是"我打开时看到的版本"：
  * 服务端发现不是最新就返回 409，不会用旧内容盖掉别人的修改。
+ *
+ * `events` 与内容同一次请求提交，理由见 `stores/mindmap.ts::save()`：
+ * 第一次保存前没有 `map_id`，独立端点根本发不出去。
  */
 export function updateMindMap(
   id: string,
   content: MindMapContent,
   version: number,
+  events: readonly EditEvent[] = [],
+  truncated = 0,
 ): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`, {
     method: 'PUT',
-    body: JSON.stringify({ content, version }),
+    body: JSON.stringify({ ...saveBody(content, events, truncated), version }),
   });
+}
+
+// ---- 编辑日志（"用户最常改什么"）----
+
+/**
+ * 这张图的改动统计。
+ *
+ * 这是这一版真正的交付物：`label_shrunk` 回答"标题是不是被普遍改短"，
+ * `removed_depth` 回答"删掉的集中在第几层"——两个都直接指向生成侧该改什么。
+ */
+export function getEditSummary(id: string): Promise<EditSummary> {
+  return request<EditSummary>(`/mindmaps/${encodeURIComponent(id)}/edits/summary`);
+}
+
+/**
+ * 最近的改动明细，新的在前。
+ *
+ * 统计给的是分布，明细回答"那 42 条具体是什么"——没有它，一个反常的平均值
+ * 只能靠连数据库才查得下去。
+ */
+export function listEditEvents(id: string, limit = 50): Promise<EditEventRow[]> {
+  return request<EditEventRow[]>(
+    `/mindmaps/${encodeURIComponent(id)}/edits?limit=${encodeURIComponent(limit)}`,
+  );
 }
 
 // ---- agent 流式运行 ----

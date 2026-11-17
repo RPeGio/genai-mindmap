@@ -161,6 +161,108 @@
         }
       }
     },
+    "/api/mindmaps/{map_id}/edits/summary": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Edit Summary",
+        "description": "这张图的改动分布。**这一版真正的交付物。**\n\n404 而不是\"空统计\"：给一个不存在的 id 查统计是调用方错了，返回一份全零的\n报告会让它以为\"这张图没人改过\"——那是完全不同的一件事。",
+        "operationId": "edit_summary_api_mindmaps__map_id__edits_summary_get",
+        "parameters": [
+          {
+            "name": "map_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Map Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditSummary"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mindmaps/{map_id}/edits": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "List Edits",
+        "description": "最近的改动明细，新的在前。`limit` 有上限：这是给人读的一屏，不是导出通道。",
+        "operationId": "list_edits_api_mindmaps__map_id__edits_get",
+        "parameters": [
+          {
+            "name": "map_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Map Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EditEventRow"
+                  },
+                  "title": "Response List Edits Api Mindmaps  Map Id  Edits Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/mindmaps/import": {
       "post": {
         "tags": [
@@ -1224,6 +1326,20 @@
           "content": {
             "$ref": "#/components/schemas/MindMapContent-Input"
           },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EditEventIn"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Events"
+          },
+          "truncated": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Truncated",
+            "default": 0
+          },
           "sources": {
             "anyOf": [
               {
@@ -1413,6 +1529,311 @@
         "title": "Edge",
         "description": "跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。\n\n**为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处\n依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`\n的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、\n前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力\n并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。\n\n三件事刻意不做，每一条都有具体后果：\n\n  - **不要求同父**。连到另一条 subtree 上正是\"汇合\"的定义；加一条\"必须\n    同父\"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。\n  - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有\n    \"最长环 ≤ `MAX_EDGE_CYCLE_NODES`\"，而且是 warn。\n  - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），\n    边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的\n    位置就没了——这是\"树 + 边\"能成立的前提之一。"
       },
+      "EditEventIn": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "enum": [
+              "user",
+              "agent"
+            ],
+            "title": "Actor"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "add",
+              "remove",
+              "update",
+              "move",
+              "edge",
+              "style"
+            ],
+            "title": "Kind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "label",
+                  "title",
+                  "detail",
+                  "note",
+                  "color",
+                  "icon"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "before": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Before"
+          },
+          "after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 64.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depth"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "actor",
+          "kind"
+        ],
+        "title": "EditEventIn",
+        "description": "一条改动（`POST/PUT /mindmaps` 请求体里的一项）。\n\n`extra=\"forbid\"`：字段名漂移（比如前端写成 `nodeId`）必须当场 422。静默丢掉\n一条事件比拒收整次保存更糟——统计会少一块，而没人知道少的是哪一块。"
+      },
+      "EditEventRow": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "enum": [
+              "user",
+              "agent"
+            ],
+            "title": "Actor"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "add",
+              "remove",
+              "update",
+              "move",
+              "edge",
+              "style"
+            ],
+            "title": "Kind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "label",
+                  "title",
+                  "detail",
+                  "note",
+                  "color",
+                  "icon"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "before": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Before"
+          },
+          "after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 64.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depth"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "at": {
+            "type": "string",
+            "title": "At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "map_id": {
+            "type": "string",
+            "title": "Map Id"
+          },
+          "recorded_at": {
+            "type": "string",
+            "title": "Recorded At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "actor",
+          "kind",
+          "at",
+          "id",
+          "map_id",
+          "recorded_at"
+        ],
+        "title": "EditEventRow",
+        "description": "落库后的一行：载荷 + 自增 id + 服务端写入时刻。"
+      },
+      "EditSummary": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "by_actor": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Actor"
+          },
+          "by_kind": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Kind"
+          },
+          "by_field": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Field"
+          },
+          "label_shrunk": {
+            "$ref": "#/components/schemas/LabelShrunk"
+          },
+          "removed_depth": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Removed Depth"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "by_actor",
+          "by_kind",
+          "by_field",
+          "label_shrunk",
+          "removed_depth"
+        ],
+        "title": "EditSummary",
+        "description": "`GET /mindmaps/{id}/edits/summary` 的响应。\n\n两条恒等式让数字可以先自校验再读结论：\n\n  - `sum(by_actor) == total`；\n  - `sum(by_field) == by_kind[\"update\"] + by_kind[\"style\"]`。\n\n对不上就说明有写入路径绕过了契约，而不是\"统计有点怪\"。"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1497,6 +1918,40 @@
         "additionalProperties": false,
         "type": "object",
         "title": "KnowledgeHit"
+      },
+      "LabelShrunk": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "avg_before": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Before"
+          },
+          "avg_after": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg After"
+          }
+        },
+        "type": "object",
+        "title": "LabelShrunk",
+        "description": "标题被改短的统计。\n\n`avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。\n两个平均值的差（18.3 → 9.1）就是\"缩短了多少\"，比只看 count 有信息量得多：\n从 18 缩到 9 是\"太长了\"，从 18 缩到 17 只是\"改了个字\"。"
       },
       "LayoutKind": {
         "type": "string",
@@ -2355,13 +2810,28 @@
         "properties": {
           "content": {
             "$ref": "#/components/schemas/MindMapContent-Input"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EditEventIn"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Events"
+          },
+          "truncated": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Truncated",
+            "default": 0
           }
         },
         "type": "object",
         "required": [
           "content"
         ],
-        "title": "SaveRequest"
+        "title": "SaveRequest",
+        "description": "保存一份导图，**顺带提交这一次保存里攒下的改动日志**。\n\n事件为什么不走独立端点（`POST /mindmaps/{id}/edits`）：第一次保存之前根本\n没有 `map_id`。要么发不出去，要么必须先 create 再补发，于是多出一种半截状态\n——内容存了、事件没存——而统计从此只看见部分改动，且没有任何地方能察觉。\n放进同一个请求体，两者天然同成败：409 冲突时一起失败、重试就都补上。\n\n`events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是\n重新点了一下保存）与上一版请求体逐字节相同。"
       },
       "Saved": {
         "properties": {
@@ -2921,6 +3391,20 @@
         "properties": {
           "content": {
             "$ref": "#/components/schemas/MindMapContent-Input"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EditEventIn"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Events"
+          },
+          "truncated": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Truncated",
+            "default": 0
           },
           "version": {
             "type": "integer",

@@ -70,6 +70,37 @@ def connect() -> sqlite3.Connection:
         created_at    TEXT NOT NULL,
         updated_at    TEXT NOT NULL
     )""")
+    # 编辑事件（`app/mindmaps/edits.py`）。与上面三张表建在同一时刻、同一个连接上，
+    # 理由同 `runs` / `user_prefs`：读它的路径（统计接口）不该再有"发现表不存在 →
+    # 建表"的分支。
+    #
+    # 这张表只回答一个问题：**用户最常改什么**。所以每一列都为统计服务，而
+    # `before` / `after` 是**摘要**不是内容（`detail` 只存 `"1800字"`）：一份 2000 字
+    # 的正文进这张表，它就变成了第二个 `mindmaps.content`。
+    #
+    # `depth` 是节点层数（根=1）。`removed_depth` 直接对它 `GROUP BY`——"删掉的
+    # 集中在第 3 层"就是"初次生成挖得太深"的证据，这是这一版最想要的两个数之一。
+    #
+    # `at` 由前端给（事件发生的时刻），`recorded_at` 是入库时刻。分开是为了能诊断
+    # "事件说它 09:31 发生、实际 09:35 才入库"——前端的时钟不可信。
+    #
+    # 不做外键到 `mindmaps`：`map_id` 是调用方给的字面量，加外键只会在"导图被删"
+    # （现在还没有删除接口）时多一个级联分支；而统计按 `map_id` 过滤本来就不依赖它。
+    conn.execute("""CREATE TABLE IF NOT EXISTS edit_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        map_id      TEXT NOT NULL,
+        run_id      TEXT,
+        actor       TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        node_id     TEXT,
+        field       TEXT,
+        before      TEXT,
+        after       TEXT,
+        depth       INTEGER,
+        at          TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edit_events_map ON edit_events(map_id, at)")
     # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
     # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"
     # 的窗口（与 `_record` 读时补齐 schema_version 是同一条理由）。

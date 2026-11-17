@@ -672,3 +672,54 @@ export interface PrefSuggestion {
   count: number;
   message: string;
 }
+
+// ---- 编辑日志（统计"用户最常改什么"）----
+//
+// 这几个类型是**日志载荷**，不是导图契约：它们的形状由 `POST/PUT /mindmaps` 的
+// 请求体决定，后端 `EditEventIn` 带 `extra="forbid"`。所以字段名漂移的表现是
+// **保存直接 422**，不是字段被静默丢掉——那正是 `api/contract-check.ts` 存在的
+// 理由（它防的是静默丢字段），所以这里刻意不把它加进那份检查：多一道编译期镜像
+// 换不来安全，只会让加一个统计字段要改三个文件。
+
+/** 一条改动。`at` 与 `depth` 的语义见 `src/mindmap/edit-log.ts`。 */
+export interface EditEventPayload {
+  actor: 'user' | 'agent';
+  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style';
+  node_id?: string;
+  field?: 'label' | 'title' | 'detail' | 'note' | 'color' | 'icon';
+  /** 摘要，不是内容（`detail`/`note` 只存 `"1800字"` 这种长度）。 */
+  before?: string;
+  after?: string;
+  depth?: number;
+  run_id?: string;
+  at: string;
+}
+
+/** 落库后的一行：载荷 + 自增 id + 入库时刻（`GET /mindmaps/{id}/edits`）。 */
+export interface EditEventRow extends EditEventPayload {
+  id: number;
+  /**
+   * 服务端写入时刻。与 `at` 分开是为了能诊断"事件说它 09:31 发生、
+   * 实际 09:35 才入库"——前端的时钟不可信，两者相等才是常态。
+   */
+  recorded_at: string;
+  map_id: string;
+}
+
+/**
+ * 统计结果（`GET /mindmaps/{id}/edits/summary`）。
+ *
+ * 两条恒等式让这份数字可以先自校验再读结论：
+ *  - `sum(by_actor) === total`；
+ *  - `sum(by_field) === by_kind.update + by_kind.style`（只有这两种事件带 field）。
+ */
+export interface EditSummary {
+  total: number;
+  by_actor: Record<string, number>;
+  by_kind: Record<string, number>;
+  by_field: Record<string, number>;
+  /** 变短的标题改动。`count` 为 0 时两个平均值为 `null`（不是 0）。 */
+  label_shrunk: { count: number; avg_before: number | null; avg_after: number | null };
+  /** 删掉的节点按层分布，键是层数（根=1）的字符串形式。 */
+  removed_depth: Record<string, number>;
+}

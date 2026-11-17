@@ -40,6 +40,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mindmaps/{map_id}/edits/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Edit Summary
+         * @description 这张图的改动分布。**这一版真正的交付物。**
+         *
+         *     404 而不是"空统计"：给一个不存在的 id 查统计是调用方错了，返回一份全零的
+         *     报告会让它以为"这张图没人改过"——那是完全不同的一件事。
+         */
+        get: operations["edit_summary_api_mindmaps__map_id__edits_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mindmaps/{map_id}/edits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Edits
+         * @description 最近的改动明细，新的在前。`limit` 有上限：这是给人读的一屏，不是导出通道。
+         */
+        get: operations["list_edits_api_mindmaps__map_id__edits_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/mindmaps/import": {
         parameters: {
             query?: never;
@@ -579,6 +622,13 @@ export interface components {
         /** CheckRequest */
         CheckRequest: {
             content: components["schemas"]["MindMapContent-Input"];
+            /** Events */
+            events?: components["schemas"]["EditEventIn"][];
+            /**
+             * Truncated
+             * @default 0
+             */
+            truncated: number;
             /** Sources */
             sources?: components["schemas"]["Source"][] | null;
         };
@@ -655,6 +705,107 @@ export interface components {
             /** Kind */
             kind?: ("flow" | "branch" | "loop") | null;
         };
+        /**
+         * EditEventIn
+         * @description 一条改动（`POST/PUT /mindmaps` 请求体里的一项）。
+         *
+         *     `extra="forbid"`：字段名漂移（比如前端写成 `nodeId`）必须当场 422。静默丢掉
+         *     一条事件比拒收整次保存更糟——统计会少一块，而没人知道少的是哪一块。
+         */
+        EditEventIn: {
+            /**
+             * Actor
+             * @enum {string}
+             */
+            actor: "user" | "agent";
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style";
+            /** Node Id */
+            node_id?: string | null;
+            /** Field */
+            field?: ("label" | "title" | "detail" | "note" | "color" | "icon") | null;
+            /** Before */
+            before?: string | null;
+            /** After */
+            after?: string | null;
+            /** Depth */
+            depth?: number | null;
+            /** Run Id */
+            run_id?: string | null;
+            /** At */
+            at?: string | null;
+        };
+        /**
+         * EditEventRow
+         * @description 落库后的一行：载荷 + 自增 id + 服务端写入时刻。
+         */
+        EditEventRow: {
+            /**
+             * Actor
+             * @enum {string}
+             */
+            actor: "user" | "agent";
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style";
+            /** Node Id */
+            node_id?: string | null;
+            /** Field */
+            field?: ("label" | "title" | "detail" | "note" | "color" | "icon") | null;
+            /** Before */
+            before?: string | null;
+            /** After */
+            after?: string | null;
+            /** Depth */
+            depth?: number | null;
+            /** Run Id */
+            run_id?: string | null;
+            /** At */
+            at: string;
+            /** Id */
+            id: number;
+            /** Map Id */
+            map_id: string;
+            /** Recorded At */
+            recorded_at: string;
+        };
+        /**
+         * EditSummary
+         * @description `GET /mindmaps/{id}/edits/summary` 的响应。
+         *
+         *     两条恒等式让数字可以先自校验再读结论：
+         *
+         *       - `sum(by_actor) == total`；
+         *       - `sum(by_field) == by_kind["update"] + by_kind["style"]`。
+         *
+         *     对不上就说明有写入路径绕过了契约，而不是"统计有点怪"。
+         */
+        EditSummary: {
+            /** Total */
+            total: number;
+            /** By Actor */
+            by_actor: {
+                [key: string]: number;
+            };
+            /** By Kind */
+            by_kind: {
+                [key: string]: number;
+            };
+            /** By Field */
+            by_field: {
+                [key: string]: number;
+            };
+            label_shrunk: components["schemas"]["LabelShrunk"];
+            /** Removed Depth */
+            removed_depth: {
+                [key: string]: number;
+            };
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -692,6 +843,25 @@ export interface components {
              * @default 0
              */
             score: number;
+        };
+        /**
+         * LabelShrunk
+         * @description 标题被改短的统计。
+         *
+         *     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
+         *     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：
+         *     从 18 缩到 9 是"太长了"，从 18 缩到 17 只是"改了个字"。
+         */
+        LabelShrunk: {
+            /**
+             * Count
+             * @default 0
+             */
+            count: number;
+            /** Avg Before */
+            avg_before?: number | null;
+            /** Avg After */
+            avg_after?: number | null;
         };
         /**
          * LayoutKind
@@ -1046,9 +1216,27 @@ export interface components {
             /** Dismissed At */
             dismissed_at?: string | null;
         };
-        /** SaveRequest */
+        /**
+         * SaveRequest
+         * @description 保存一份导图，**顺带提交这一次保存里攒下的改动日志**。
+         *
+         *     事件为什么不走独立端点（`POST /mindmaps/{id}/edits`）：第一次保存之前根本
+         *     没有 `map_id`。要么发不出去，要么必须先 create 再补发，于是多出一种半截状态
+         *     ——内容存了、事件没存——而统计从此只看见部分改动，且没有任何地方能察觉。
+         *     放进同一个请求体，两者天然同成败：409 冲突时一起失败、重试就都补上。
+         *
+         *     `events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是
+         *     重新点了一下保存）与上一版请求体逐字节相同。
+         */
         SaveRequest: {
             content: components["schemas"]["MindMapContent-Input"];
+            /** Events */
+            events?: components["schemas"]["EditEventIn"][];
+            /**
+             * Truncated
+             * @default 0
+             */
+            truncated: number;
         };
         /**
          * Saved
@@ -1259,6 +1447,13 @@ export interface components {
         /** UpdateRequest */
         UpdateRequest: {
             content: components["schemas"]["MindMapContent-Input"];
+            /** Events */
+            events?: components["schemas"]["EditEventIn"][];
+            /**
+             * Truncated
+             * @default 0
+             */
+            truncated: number;
             /** Version */
             version: number;
         };
@@ -1420,6 +1615,70 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MapRecord"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    edit_summary_api_mindmaps__map_id__edits_summary_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                map_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_edits_api_mindmaps__map_id__edits_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                map_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditEventRow"][];
                 };
             };
             /** @description Validation Error */

@@ -1,0 +1,282 @@
+"""编辑日志：一张表、两条读路径，以及这一版真正要回答的那个问题。
+
+用例分成四组，各验一件不同的事：
+
+  1. **落库**：保存时带上去的事件真的进了 `edit_events`，`GET /edits` 读得回来；
+  2. **统计**：`by_actor` / `by_kind` / `by_field` 的数字，以及两条恒等式
+     （`sum(by_actor) == total`、`sum(by_field) == update + style`）；
+  3. **两个关键指标**：`label_shrunk` 与 `removed_depth`——它们直接对应"生成侧
+     该改什么"，数字错一位，结论就指向错误的地方；
+  4. **边界**：超量 422、字段名漂移 422、非法时间戳退化、409 时不落事件、
+     以及"事件写失败不能让保存失败"。
+
+最后一条单独说：它是刻意的取舍，不是容错偷懒。保存的语义是"用户的内容没丢"，
+为了统计丢掉一次真实保存，代价方向完全错了。
+"""
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.contracts.edits import MAX_EVENTS_PER_SAVE, EditEventIn
+from app.core.errors import register_error_handlers
+from app.mindmaps import edits
+from app.mindmaps import repository
+from app.mindmaps.router import router as mindmap_router
+
+api = FastAPI()
+register_error_handlers(api)
+api.include_router(mindmap_router, prefix="/api")
+client = TestClient(api)
+
+CONTENT = {
+    "title": "示例",
+    "root": {
+        "id": "root",
+        "label": "主题",
+        "children": [
+            {"id": "a", "label": "子节点", "children": [
+                {"id": "b", "label": "孙节点", "children": []},
+            ]},
+        ],
+    },
+}
+
+
+def _create(events: list[dict] | None = None, truncated: int = 0) -> str:
+    body: dict = {"content": CONTENT}
+    if events is not None:
+        body["events"] = events
+    if truncated:
+        body["truncated"] = truncated
+    response = client.post("/api/mindmaps", json=body)
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def _event(**overrides) -> dict:
+    """一条"用户把长标题改短"的事件。各用例只覆盖自己关心的字段。"""
+    base = {
+        "actor": "user",
+        "kind": "update",
+        "field": "label",
+        "node_id": "a",
+        "before": "长" * 18,
+        "after": "短" * 9,
+        "depth": 2,
+        "at": "2026-11-17T09:31:02.123Z",
+    }
+    base.update(overrides)
+    return base
+
+
+# ---------------------------------------------------------------- 落库
+
+
+def test_events_are_stored_and_read_back():
+    map_id = _create([
+        _event(),
+        _event(kind="style", field="color", before="无", after="red"),
+    ])
+
+    rows = client.get(f"/api/mindmaps/{map_id}/edits").json()
+
+    assert len(rows) == 2
+    assert {row["kind"] for row in rows} == {"update", "style"}
+    assert all(row["map_id"] == map_id for row in rows)
+    # `at` 是前端给的时刻，`recorded_at` 是入库时刻——两者分开才诊断得出时钟漂移。
+    assert rows[0]["at"] == "2026-11-17T09:31:02.123Z"
+    assert rows[0]["recorded_at"].endswith("Z")
+    assert rows[1]["id"] == 2
+
+
+def test_saving_without_events_writes_nothing():
+    map_id = _create()
+    assert client.get(f"/api/mindmaps/{map_id}/edits").json() == []
+    assert client.get(f"/api/mindmaps/{map_id}/edits/summary").json()["total"] == 0
+
+
+def test_update_appends_events_to_the_same_map():
+    map_id = _create([_event()])
+    response = client.put(
+        f"/api/mindmaps/{map_id}",
+        json={"content": {**CONTENT, "title": "改过的标题"}, "version": 1,
+              "events": [_event(field="title", node_id=None, before="示例", after="改过的标题")]},
+    )
+    assert response.status_code == 200, response.text
+
+    rows = client.get(f"/api/mindmaps/{map_id}/edits").json()
+    assert [row["field"] for row in rows] == ["label", "title"]
+
+
+def test_recent_returns_newest_first_and_respects_limit():
+    map_id = _create([
+        _event(at="2026-11-17T09:00:00.000Z", before="一", after="二"),
+        _event(at="2026-11-17T10:00:00.000Z", before="三", after="四"),
+        _event(at="2026-11-17T11:00:00.000Z", before="五", after="六"),
+    ])
+    rows = client.get(f"/api/mindmaps/{map_id}/edits?limit=2").json()
+    assert [row["at"][11:13] for row in rows] == ["11", "10"]
+
+
+# ---------------------------------------------------------------- 统计
+
+
+def test_summary_counts_by_actor_kind_and_field():
+    map_id = _create([
+        _event(),
+        _event(node_id="b"),
+        _event(node_id="root"),
+        _event(kind="style", field="color", before="无", after="blue"),
+        _event(kind="add", field=None, node_id="c", before=None, after="新节点", depth=2),
+        _event(actor="agent", kind="remove", field=None, node_id="b", before="孙节点",
+               after=None, depth=3),
+    ])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["total"] == 6
+    assert summary["by_actor"] == {"user": 5, "agent": 1}
+    assert summary["by_kind"] == {"update": 3, "style": 1, "add": 1, "remove": 1}
+    # `field` 只在 update / style 上有值：add / remove 不进 by_field。
+    assert summary["by_field"] == {"label": 3, "color": 1}
+    # 两条恒等式：对不上就说明有写入路径绕过了契约。
+    assert sum(summary["by_actor"].values()) == summary["total"]
+    assert sum(summary["by_field"].values()) == (
+        summary["by_kind"].get("update", 0) + summary["by_kind"].get("style", 0))
+
+
+def test_label_shrunk_counts_only_shorter_labels():
+    map_id = _create([
+        _event(before="长" * 18, after="短" * 9),
+        _event(node_id="b", before="长" * 20, after="短" * 10),
+        # 变长的不算"缩短"：用户把标题写细了，是另一件事。
+        _event(node_id="root", before="短" * 5, after="长" * 9),
+        # 导图标题的改动混进来会稀释"节点标题被改短"这个信号。
+        _event(field="title", node_id=None, before="长" * 30, after="短" * 3),
+    ])
+
+    shrunk = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()["label_shrunk"]
+
+    assert shrunk["count"] == 2
+    assert shrunk["avg_before"] == 19.0
+    assert shrunk["avg_after"] == 9.5
+
+
+def test_label_shrunk_averages_are_null_not_zero_when_empty():
+    map_id = _create([_event(before="短标题", after="更长的标题啊")])
+    shrunk = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()["label_shrunk"]
+    # 0 会被读成"平均改成 0 字"，那是一次完全不同的改动。
+    assert shrunk == {"count": 0, "avg_before": None, "avg_after": None}
+
+
+def test_removed_depth_groups_by_level():
+    map_id = _create([
+        _event(kind="remove", field=None, node_id="x", before="甲", after=None, depth=2),
+        _event(kind="remove", field=None, node_id="y", before="乙", after=None, depth=2),
+        _event(kind="remove", field=None, node_id="z", before="丙", after=None, depth=3),
+        # 别的 kind 的 depth 不算进"删在第几层"。
+        _event(kind="update", depth=4),
+    ])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["removed_depth"] == {"2": 2, "3": 1}
+
+
+def test_summary_is_scoped_to_one_map():
+    first = _create([_event()])
+    second = _create([_event(), _event(node_id="b")])
+    assert client.get(f"/api/mindmaps/{first}/edits/summary").json()["total"] == 1
+    assert client.get(f"/api/mindmaps/{second}/edits/summary").json()["total"] == 2
+
+
+# ---------------------------------------------------------------- 边界
+
+
+def test_summary_404_for_unknown_map():
+    assert client.get("/api/mindmaps/nope/edits/summary").status_code == 404
+    assert client.get("/api/mindmaps/nope/edits").status_code == 404
+
+
+def test_too_many_events_is_rejected():
+    response = client.post(
+        "/api/mindmaps",
+        json={"content": CONTENT, "events": [_event()] * (MAX_EVENTS_PER_SAVE + 1)},
+    )
+    assert response.status_code == 422
+
+
+def test_unknown_field_name_is_rejected():
+    # `extra="forbid"`：字段名漂移必须当场 422，不能静默丢掉一条事件。
+    bad = _event()
+    bad["nodeId"] = bad.pop("node_id")
+    response = client.post("/api/mindmaps", json={"content": CONTENT, "events": [bad]})
+    assert response.status_code == 422
+
+
+def test_invalid_timestamp_falls_back_to_server_clock():
+    map_id = _create([_event(at="昨天下午")])
+    row = client.get(f"/api/mindmaps/{map_id}/edits").json()[0]
+    # 少一个准确时间戳比少一条改动可接受：`at` 退回入库时刻，而不是整批拒收。
+    assert row["at"].endswith("Z")
+    assert row["at"] == row["recorded_at"]
+
+
+def test_conflict_does_not_write_events():
+    map_id = _create([_event()])
+    response = client.put(
+        f"/api/mindmaps/{map_id}",
+        json={"content": CONTENT, "version": 99, "events": [_event(node_id="b")]},
+    )
+    assert response.status_code == 409
+    # 内容没落库，事件也就无处归属：一起拒，重试一次两者都补上。
+    assert client.get(f"/api/mindmaps/{map_id}/edits/summary").json()["total"] == 1
+
+
+def test_record_failure_does_not_fail_the_save(monkeypatch, caplog):
+    """统计写失败 → 保存照常成功 + 一条 warning。
+
+    这条用例锁的是取舍，不是容错：为了统计丢掉一次真实保存，方向是错的。
+    """
+
+    class BrokenRepository:
+        @staticmethod
+        def connect():
+            raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(edits, "repository", BrokenRepository)
+    with caplog.at_level("WARNING"):
+        written = edits.record("map-1", [EditEventIn(**_event())])
+
+    assert written == 0
+    assert "编辑事件写入失败" in caplog.text
+
+
+def test_truncated_count_is_accepted_and_not_stored():
+    map_id = _create([_event()], truncated=7)
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+    # 截断只进服务端日志：插一条假事件会让每一个统计口径的 `total` 都变脏。
+    assert summary["total"] == 1
+
+
+def test_repository_creates_the_table_on_connect():
+    """表在 `repository.connect()` 里建好，与 `mindmaps` / `runs` 同一时刻。
+
+    不这样做，读统计那条路就要多一个"发现表不存在 → 建表"的分支——而它会在
+    第一次有人打开面板时表现为一次 500。
+    """
+    with repository.connect() as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(edit_events)")]
+    assert {"map_id", "run_id", "actor", "kind", "node_id", "field",
+            "before", "after", "depth", "at", "recorded_at"} <= set(columns)
+
+
+@pytest.mark.parametrize("kind", ["add", "remove", "update", "move", "edge", "style"])
+def test_all_kinds_round_trip(kind: str):
+    map_id = _create([_event(kind=kind)])
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+    assert summary["by_kind"] == {kind: 1}

@@ -4,7 +4,7 @@
 
 **错误体已统一**：所有错误响应都是 `{code, message, detail, request_id}`（实现见 `backend/app/core/errors.py`）。`message` 是中文可读文案，`detail` 保留原始细节（校验错误为数组），`request_id` 优先沿用请求头 `X-Request-ID`、没有则生成，并同时通过响应头回传。前端 `src/api/client.ts` 的 `ApiError` 读 `message`，缺失时回退到 `detail`。
 
-**前端消费情况**（截至 2026-11-10）：`POST /api/agent/runs/stream`（`runAgentStream`，生成与编辑的**唯一**入口）、`POST /api/ingestion/files`（`uploadDocument`）、`POST /api/export/{puml,markdown,opml}`、四个 `/api/mindmaps*` 端点。画布与编辑全部在 `src/canvas/`、`src/mindmap/{edits,ops}.ts` 里完成，只把整棵树发给后端。节点引用（`node.source_refs`）已能展示：角标显示条数，详情面板列来源与位置，抽屉里看原文并高亮命中句，实现见 `src/mindmap/refs.ts`。
+**前端消费情况**（截至 2026-11-17）：`POST /api/agent/runs/stream`（`runAgentStream`，生成与编辑的**唯一**入口）、`POST /api/ingestion/files`（`uploadDocument`）、`POST /api/export/{puml,markdown,opml}`、四个 `/api/mindmaps*` 端点（另有两条改动日志读路径 `GET .../edits/summary` 与 `GET .../edits`，界面暂无入口，供统计与排查）。画布与编辑全部在 `src/canvas/`、`src/mindmap/{edits,ops}.ts` 里完成，只把整棵树发给后端。节点引用（`node.source_refs`）已能展示：角标显示条数，详情面板列来源与位置，抽屉里看原文并高亮命中句，实现见 `src/mindmap/refs.ts`。
 
 **尚未封装**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check`、`POST /api/optimization/suggest`、`POST /api/knowledge/search`、`POST /api/agent/tasks`。其中前两个是小事，中间两个是"结构诊断还没进界面"，后两个仍是桩。
 
@@ -62,9 +62,27 @@
 | `POST /api/ingestion/files` | multipart，字段名 `file` | `{"source": 来源}`，`source.text` 是解析出的正文 | 扩展名不在白名单 422；文档/图片超 10MB 或音频超 20MB 413；扫描件无文本层、音频无人声、图片视觉不可用、缺语音凭证 422 |
 | `GET /api/ingestion/formats` | 无 | `{"document":[…],"audio":[".wav"],"image":[".png",…],"maxUploadBytes":…,"maxAudioBytes":…,"maxImageBytes":…}` | — |
 | `GET /api/mindmaps` | 无 | 导图记录数组 | — |
-| `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
+| `POST /api/mindmaps` | `{"content":导图,"events":[改动事件…],"truncated":0}`（后两个可省略） | 201，导图记录 | 结构无效 422；事件形状不对（字段名漂移、未知 kind/field、时间戳以外的多余键）422 |
 | `GET /api/mindmaps/{map_id}` | 无 | 导图记录 | 不存在 404 |
-| `PUT /api/mindmaps/{map_id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
+| `PUT /api/mindmaps/{map_id}` | `{"version":1,"content":导图,"events":[…]}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409（此时**事件一条都不写**）；结构无效 422 |
+| `GET /api/mindmaps/{map_id}/edits/summary` | 无 | 改动分布：`total` / `by_actor` / `by_kind` / `by_field` / `label_shrunk` / `removed_depth`（见下） | 不存在 404（不返回全零报告——"这张图没人改过"是另一件事） |
+| `GET /api/mindmaps/{map_id}/edits` | 查询参数 `limit`（1–500，默认 50） | 改动明细，新的在前：`id` / `map_id` / `run_id` / `actor` / `kind` / `node_id` / `field` / `before` / `after` / `depth` / `at` / `recorded_at` | 不存在 404 |
+
+**改动日志（"用户最常改什么"）只记录、不总结。** 表是 `edit_events`（在 `repository.connect()` 里与其余表同一时刻建好）。写入口只有一个：`POST`/`PUT /api/mindmaps` 的 `events` 字段——**并进保存，不另开端点**，因为第一次保存前没有 `map_id`，一个 `POST /mindmaps/{id}/edits` 要么发不出去，要么必须 create 之后补发，那就会多出"内容存了、事件没存"的半截状态，而统计从此只看见部分改动。所以：内容与事件同一次请求、同一次成败；409 冲突时两者一起拒。
+
+一条事件的形状（`before` / `after` 是**摘要**，`detail` 只存 `"1800字"` 这种长度）：
+
+```json
+{"actor":"user","kind":"update","field":"label","node_id":"d1a",
+ "before":"缺失值、异常值与重复样本的清理顺序","after":"缺失值清洗","depth":3,
+ "run_id":null,"at":"2026-11-17T09:30:01.250Z"}
+```
+
+`kind` ∈ `add` / `remove` / `update` / `move` / `edge` / `style`；`field` **只在 `update` / `style` 上有值**（`label` / `title` / `detail` / `note` / `color` / `icon`）。这条规则让统计能自校验：`sum(by_field) == by_kind.update + by_kind.style`，`sum(by_actor) == total`。对不上就说明有写入路径绕过了契约。
+
+`depth` 是节点层数（**根是 1**），`remove` 事件填删除前所在层。`at` 由前端给（事件发生的时刻，非法时退回入库时刻），`recorded_at` 是服务端写入时刻——分开才诊断得出时钟漂移。单次保存最多 500 条，超出的部分留在前端队列里**等下一次**（分批，不是丢弃），只把条数上报成一条服务端 warning。
+
+`label_shrunk` 是 `field='label'` 且 `length(after) < length(before)` 的条数与两个平均值（码点口径，`count=0` 时平均值为 `null` 而不是 0——0 会被读成"平均改成 0 字"）。`removed_depth` 是删掉的节点按层分布。两个数直接对应生成侧该改什么：标题普遍被缩短 → 16 字上限可能还不够短；删掉的集中在第 4 层 → 初次深度太深。**它们只说发生了什么，不说为什么**（见 `docs/EDIT-LOG.md` 的局限一节）。
 | `POST /api/agent/runs/stream` | `{"run_id":"…","goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"prefs_applied":["diagram_type.default=fishbone"],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `done` / `error`；`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`，所以 demo / model 帧必带，缺字段只说明对面"没说"），产物是**候选** | 目标为空 422；来源合计超出模型上下文 422；同一个 `run_id` 正在跑 409（`run_in_progress`）；预算用尽或模型失败以 `error` 事件下发 |
 | `GET /api/agent/runs` | 查询参数 `status`（`done` / `cancelled` / `failed` / `running`，可省略）、`unapplied`（默认 `true`）、`limit`（1–100，默认 20） | 运行台账数组（`run_id` / `status` / `intent` / `goal` / 时间戳），**不含候选正文**。`status` 省略时取 `done` + `cancelled` 中"有草稿且既没应用也没丢弃"的 | — |
 | `GET /api/agent/runs/{run_id}` | 无 | 同上再加 `candidate`（整棵树）、`failure`、`mode` | 不存在 404 |

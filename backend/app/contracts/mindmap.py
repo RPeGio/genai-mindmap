@@ -14,6 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.contracts.edits import EditEventIn, MAX_EVENTS_PER_SAVE
 from app.contracts.source import SourceRef, SourceUsage
 
 # 整树节点上限。1000 是**承载能力**：前端渲染、保存、导出都还扛得住，所以它是
@@ -575,7 +576,23 @@ def migrate_content(data: dict) -> dict:
 
 
 class SaveRequest(BaseModel):
+    """保存一份导图，**顺带提交这一次保存里攒下的改动日志**。
+
+    事件为什么不走独立端点（`POST /mindmaps/{id}/edits`）：第一次保存之前根本
+    没有 `map_id`。要么发不出去，要么必须先 create 再补发，于是多出一种半截状态
+    ——内容存了、事件没存——而统计从此只看见部分改动，且没有任何地方能察觉。
+    放进同一个请求体，两者天然同成败：409 冲突时一起失败、重试就都补上。
+
+    `events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是
+    重新点了一下保存）与上一版请求体逐字节相同。
+    """
+
     content: MindMapContent
+    events: list[EditEventIn] = Field(default_factory=list, max_length=MAX_EVENTS_PER_SAVE)
+    #: 前端这一次**没带上**多少条（超出 `MAX_EVENTS_PER_SAVE` 的部分留在前端队列里
+    #: 等下次保存）。只用来记一条服务端 warning，不落表：往行为事件表里插一条假事件，
+    #: 会让每一个统计口径的 `total` 都变脏。
+    truncated: int = Field(default=0, ge=0)
 
 
 class UpdateRequest(SaveRequest):
