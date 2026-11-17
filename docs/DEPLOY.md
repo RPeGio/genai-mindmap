@@ -45,6 +45,8 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_NLI_ENABLED` | 空（关） | 引用核验的第三层（语义蕴含打分）。需同时配 `MINDMAP_NLI_MODEL_DIR` |
 | `MINDMAP_NLI_MODEL_DIR` | — | 含 `model.onnx` / `tokenizer.json` / `config.json` 的目录 |
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
+| `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
+| `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
 
 ## 4. 各格式的依赖与耗时
 
@@ -69,6 +71,8 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | 单次 PDF 解析峰值内存 | 约 70 MB（渲染与模型调用都在外部） |
 
 2C2G 的机器上：不装 LibreOffice 可以跑，装了之后要留意 `.doc/.ppt` 转换时 `soffice` 进程会额外占 350–380 MB。
+
+知识库（`backend/data/mindmaps.db`，可用 `MINDMAP_DB_PATH` 指定位置）随使用增长，但入库之后会按 90 天 / 200 份自动淘汰（触发条件与成本见 `docs/LIBRARY-MEASUREMENTS.md`），稳态在 10 MB 以内。仍然建议把该分区剩余空间纳入监控（例如低于 500 MB 告警）：磁盘写满时 SQLite 报 `database or disk is full`，会连带影响生成。
 
 ## 6. 语音输入（F07）
 
@@ -331,6 +335,11 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 恢复备份：`gunzip -c /var/backups/genai-mindmap/mindmaps-<时间>.db.gz > /var/lib/genai-mindmap/mindmaps.db`，然后 `chown genai:genai` 并重启服务。
 
 加演示账号：`sudo htpasswd /etc/nginx/.htpasswd-mindmap alice`。
+
+**多加账号 = 共用一个知识库**。服务端是单用户单库的设计（见 `docs/PLAN.md` 的 F12），
+Basic Auth 只决定"能不能进来"，不区分是谁：任何账号打开「知识库」抽屉，都能列出
+别人的材料、并读到每份正文的前 4000 字。只想自己用就别加账号；真要多人共用，
+先想清楚这些材料能不能互相看见。
 
 **重启会等正在跑的生成**：单元里 `TimeoutStopSec=660`（生成预算是 600 秒），所以有长请求在跑时 `systemctl restart` 可能等到十来分钟。演示前别在有人用的时候重启；确实要立刻停，用
 `sudo systemctl kill -s SIGKILL genai-mindmap && sudo systemctl start genai-mindmap`（代价是那条请求直接断，前端看到断流）。

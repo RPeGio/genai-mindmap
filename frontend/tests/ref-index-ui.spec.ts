@@ -55,7 +55,7 @@ function content(): MindMapContent {
 
 function ready(id: string, label: string) {
   const sources = useSourcesStore();
-  sources.items.push({ id, label, kind: 'document', state: 'ready', source: source(id), error: '', seconds: 0 });
+  sources.items.push({ key: id, id, label, kind: 'document', state: 'ready', source: source(id), error: '', seconds: 0 });
 }
 
 function mountPanel() {

@@ -246,7 +246,11 @@ def test_retrieve_branches_degraded_is_byte_identical(monkeypatch):
 
     hits = run(_retrieve_branches(_sources(), list(TITLES), expansions={}))
 
-    assert seen == [(title, DEEP_BRANCH_TOP_K) for title in TITLES]
+    # 第一支是串行预热的（向量缓存成本闸），它必须先发；其余各支走
+    # `asyncio.gather` 并发检索，谁先调到 `search_parent` 由线程池调度决定，
+    # 拿完成顺序当断言会在满负载时随机翻车（实测全量跑隔几次挂一次）。
+    assert seen[0] == (TITLES[0], DEEP_BRANCH_TOP_K)
+    assert sorted(seen) == sorted((title, DEEP_BRANCH_TOP_K) for title in TITLES)
     assert hits == [[], [], []]
 
 

@@ -8,6 +8,7 @@ import { directionOf, withDirection } from '../mindmap/direction';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
+import { useSourcesStore } from './sources';
 import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
 import {
   addChild,
@@ -292,6 +293,9 @@ function flatten(root: MindNode): FlatNode[] {
 }
 
 export const useMindMapStore = defineStore('mindmap', () => {
+  // 只为了在收到 `sources` 帧时把来源 id 换成持久 id（见 runGeneration）。
+  // 依赖方向是单向的：sources 不认识 mindmap，反过来才会。
+  const sourcesStore = useSourcesStore();
   const content = ref<MindMapContent | null>(null);
   const mode = ref<'demo' | 'model' | 'saved' | null>(null);
   const status = ref('输入主题或文本后生成，节点会边生成边出现。');
@@ -1504,6 +1508,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 取消/换图同理：长到一半的预览属于已经结束的那一次运行。
     clearAgentPreview();
     stageText.value = '';
+    // 这一轮已经结束，"等了多久"不再有意义：不清的话，静默超 10s 后点取消，
+    // 界面会一边写"已取消。"、一边挂着"模型正在思考，已等 20 秒"。
+    waitedMs.value = 0;
     status.value = '已取消。';
   }
 
@@ -1634,10 +1641,26 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，
         // 否则旧回调会把新请求刚设好的 stageText / status / candidate 覆盖掉。
         if (controller !== ctrl) return;
+        // 心跳不进 `agentEvents`：它只驱动状态行的"已等 N 秒"，面板里没有任何地方
+        // 读它。而每帧都整数组复制是 O(n²)——长静默会累积几十帧，没必要为纯保活
+        // 的帧付这个成本。
+        if (event.type === 'heartbeat') {
+          waitedMs.value = Math.round(event.waited_ms / 1000);
+          return;
+        }
         agentEvents.value = [...agentEvents.value, event];
+        // 真进度帧到了，静默就结束了：等待计时必须跟着归零，否则「已等 25 秒」
+        // 会一直挂在状态行上，看起来像卡住了——而那会儿节点已经在长。
+        waitedMs.value = 0;
         switch (event.type) {
           case 'stage':
             stageText.value = event.detail || event.stage;
+            break;
+          case 'sources':
+            // 后端刚把材料写进知识库，临时 id 已被换成持久 id。不换的话这张图里
+            // 的 `source_refs.source_id` 重新打开后指不到原文——引用计数、点开看
+            // 原文、会话内反向索引全部失效，而且是静默失效。
+            sourcesStore.remap(event.mapping);
             break;
           case 'tool_start':
             // 状态行显示的也是人话：用户读不到 `mindmap_generate` 这种函数名。
@@ -1726,6 +1749,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
         agentRunning.value = false;
         busy.value = false;
         stageText.value = '';
+        // 断流/异常退出时同理：这一轮已经结束，别再留着"模型正在思考"。
+        waitedMs.value = 0;
       }
     }
   }

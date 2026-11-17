@@ -572,6 +572,46 @@ class NodeGrowEvent(_EventBase):
     expandable: bool | None = None
 
 
+class SourcesEvent(_EventBase):
+    """材料入库后，临时 id 被换成持久 id 的通知。
+
+    解析接口给每份材料发的是本次请求内有效的 uuid，而库里给的是另一个持久 id：
+    入库时 `uuid4()` 生成，正文 sha256 只做去重判断、不充当 id（见
+    `app/knowledge/library.py::ingest`）。两套 id 并存时导图里记的
+    `source_refs.source_id` 在重新打开后就谁也找不到。所以入库之后要把"旧 id →
+    持久 id"告诉前端，让它就地替换手上的来源条目。
+
+    只在真有 id 变化时发：没有材料、或用不到库（开关关掉）时这一帧根本不出现，
+    既有帧序列逐字节不变。
+    """
+
+    type: Literal["sources"] = "sources"
+    # 旧 id → 持久 id。空字典不该发这一帧，前端也不必处理空表。
+    mapping: dict[str, str] = Field(default_factory=dict)
+
+
+class HeartbeatEvent(_EventBase):
+    """等模型/等工具期间的"我还活着"帧。
+
+    线上实测单轮静默能到 25 秒（3 路并发下模型思考）。这期间事件流里一个字节
+    都没有，中间链路只要有 30–60 秒的空闲超时（企业代理、Cloudflare、部分移动
+    网络）就会把连接掐断，用户看到"连接中断"，而模型其实还在跑、还在计费。
+    nginx 那边是 900 秒，救不了更靠前的链路。
+
+    心跳只做两件事：让连接上一直有字节流动；把"已经等了多少秒"送到页面。
+    它不携带任何业务信息，前端也不该把它当进度——真实进度由 `stage` /
+    `tool_start` / `node_grow` 负责。
+
+    `waited_ms` 是**本次等待**已经持续了多久，不是总耗时：页面上"已等 N 秒"要说
+    的是"卡了多久"，不是"跑了多久"。实现上它以"开始等这一步"为起点；工具段里
+    每次收到工具事件都会重置（即使那个事件最终没产帧），所以这个值可能比"距上
+    一帧"略小——它是"本轮等待时长"的近似，不是精确的帧间隔。
+    """
+
+    type: Literal["heartbeat"] = "heartbeat"
+    waited_ms: int = Field(ge=0)
+
+
 class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
     content: MindMapContent | None = None
@@ -601,7 +641,7 @@ class ErrorEvent(_EventBase):
 AgentEvent = Annotated[
     Union[
         StageEvent, ToolStartEvent, ToolEndEvent, OpsEvent, SnapshotEvent,
-        NodeGrowEvent, DoneEvent, ErrorEvent,
+        NodeGrowEvent, SourcesEvent, HeartbeatEvent, DoneEvent, ErrorEvent,
     ],
     Field(discriminator="type"),
 ]

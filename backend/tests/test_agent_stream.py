@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ from app.agent.contracts import (
 )
 from app.agent.router import router
 from app.agent.stream import encode_event
+from app.contracts.source import Source, SourceKind
 from app.core.errors import register_error_handlers
 from app.generation.service import GenerationError
 
@@ -100,16 +102,23 @@ class StreamRouteTest(unittest.TestCase):
         self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))
 
     def test_unexpected_exception_is_also_a_frame(self):
+        """未预期异常要变成可读的一帧，而且不把内部细节（类型/路径）漏给浏览器。"""
         async def boom():
-            raise RuntimeError("内部错误")
+            raise RuntimeError("内部错误：/srv/genai-mindmap/data/mindmaps.db")
             yield  # pragma: no cover
 
         with patch("app.agent.router.run", return_value=boom()):
-            response = client.post(URL, json={"goal": "x", "intent": "create"})
+            with self.assertLogs("app.agent.router", level="ERROR") as captured:
+                response = client.post(URL, json={"goal": "x", "intent": "create"})
         frames = _frames(response.text)
         self.assertEqual(frames[-1]["type"], "error")
         self.assertEqual(frames[-1]["code"], "agent_failed")
-        self.assertIn("RuntimeError", frames[-1]["message"])
+        # 出站帧只给一句能看懂的话；异常类型、原文（可能带绝对路径/库结构）只进日志。
+        self.assertEqual(frames[-1]["message"], "生成过程中出错了，请稍后重试。")
+        self.assertNotIn("RuntimeError", response.text)
+        self.assertNotIn("mindmaps.db", response.text)
+        # 但日志里必须有它，否则线上就查不到是哪一层炸的。
+        self.assertTrue(any("RuntimeError" in line for line in captured.output))
 
     def test_agent_disabled_returns_503_before_stream(self):
         with patch.dict("os.environ", {"MINDMAP_AGENT_ENABLED": "0"}):
@@ -143,6 +152,84 @@ class LegacyRouteTest(unittest.TestCase):
         response = client.post("/api/agent/tasks", json={"goal": "做一个产品"})
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["implemented"])
+
+
+class SourcesFrameTest(unittest.TestCase):
+    """材料入库后先发一帧 `sources`，把临时 id 换成持久 id。
+
+    这一帧必须排在 `run()` 的产物之前：前端要在收到任何 `node_grow` / `snapshot`
+    之前就知道"手上的来源 id 变了"，否则第一张图里的引用就已经指错。
+    """
+
+    def test_sources_frame_comes_first_and_carries_the_mapping(self):
+        source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文若干。")
+        seen: list = []
+        kwargs_seen: dict = {}
+
+        async def fake_run(body, **kwargs):
+            # _frames 用 first_seq 让编号接着 sources 那帧往下走。
+            kwargs_seen.update(kwargs)
+            seen.append(body)
+            yield DoneEvent(seq=kwargs.get("first_seq", 1))
+
+        with patch("app.agent.router.run", side_effect=fake_run):
+            response = client.post(URL, json={
+                "goal": "整理材料", "intent": "create",
+                "sources": [source.model_dump(mode="json")],
+            })
+
+        frames = _frames(response.text)
+        self.assertEqual(frames[0]["type"], "sources")
+        self.assertEqual(list(frames[0]["mapping"]), [source.id])
+        # 换过 id 的 request 才交给循环：库里记的是新 id，导图引用要对得上。
+        self.assertEqual([item.id for item in seen[0].sources], [frames[0]["mapping"][source.id]])
+        # 编号必须接着 sources 往下走：两帧都叫 seq=1 时，按 seq 排序的客户端会乱序。
+        self.assertEqual([frame["seq"] for frame in frames], [1, kwargs_seen["first_seq"]])
+
+    def test_no_sources_frame_when_there_is_nothing_to_remap(self):
+        with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):
+            response = client.post(URL, json={"goal": "做一张导图", "intent": "create"})
+
+        self.assertNotIn("sources", [frame["type"] for frame in _frames(response.text)])
+
+    def test_first_bytes_are_a_comment_frame(self):
+        """入库在首帧之前，客户端要先看到"连接已建立"：首块是一行 SSE 注释。
+
+        注释帧不占 `seq`、`postSse` 解析时也不认它，所以真正的第一帧仍是 `sources`；
+        但它在响应体最前面，代理与浏览器能立刻知道这条流开始了。
+        """
+        source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文。")
+
+        with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):
+            response = client.post(URL, json={
+                "goal": "整理", "intent": "create",
+                "sources": [source.model_dump(mode="json")],
+            })
+
+        self.assertTrue(response.text.startswith(": 正在把材料收进知识库\n\n"))
+        frames = _frames(response.text)
+        self.assertEqual(frames[0]["type"], "sources")
+        self.assertEqual(frames[0]["seq"], 1)
+
+    def test_stream_still_ends_with_done_when_ingest_fails(self):
+        """入库失败不能把流打断：材料照样用，只是没进库。"""
+        source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文。")
+
+        def boom(sources):
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch("app.agent.router.remember_sources", boom):
+            with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):
+                response = client.post(URL, json={
+                    "goal": "整理", "intent": "create",
+                    "sources": [source.model_dump(mode="json")],
+                })
+
+        self.assertEqual(response.status_code, 200)
+        frames = _frames(response.text)
+        # 入库抛的是 sqlite3 错误，被包成 error 帧后仍然以尾。
+        self.assertEqual(frames[-1]["type"], "error")
+        self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))
 
 
 if __name__ == "__main__":

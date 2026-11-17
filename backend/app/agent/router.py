@@ -9,16 +9,21 @@ HTTP 状态码已经发出去了，后续只能以流内的 `error` 帧表达。
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import AsyncIterator
 
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from app.agent.contracts import AgentEvent, AgentRunRequest, ErrorEvent
+from app.agent.contracts import AgentEvent, AgentRunRequest, ErrorEvent, SourcesEvent
 from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.generation.service import GenerationError
+from app.knowledge.remember import remember_sources
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["AI 代理"])
 
@@ -73,7 +78,23 @@ async def _frames(body: AgentRunRequest) -> AsyncIterator[str]:
     # "async generator ignored GeneratorExit"，底层生成器的清理也被跳过。
     finished = False
     try:
-        async for event in run(body):
+        # 材料入库排在事件流之前：入库会把临时 id 换成库里的持久 id，换完的
+        # id 必须同时送到前端（`sources` 帧）和生成上下文（重排后的 request）。
+        # 两边不一致时，导图里记的 `source_refs.source_id` 从这一轮起就指不到原文。
+        #
+        # 放线程池里跑：入库是同步 sqlite 写。但入库是"第一帧之前"的工作，几十份
+        # 材料串起来可能安静好几秒——客户端这时连"连接已建立"都还看不到。所以先
+        # 刷一行 SSE 注释帧把首字节送出去：`postSse` 只认 `data: ` 行，注释会被
+        # 安全忽略，也不需要占 `seq`（`sources` 帧仍是 seq 1）。
+        yield ": 正在把材料收进知识库\n\n"
+        remembered = await run_in_threadpool(remember_sources, body.sources)
+        if remembered.mapping:
+            seq += 1
+            yield encode_event(SourcesEvent(seq=seq, mapping=remembered.mapping))
+            body = body.model_copy(update={"sources": remembered.sources})
+        # `first_seq=seq + 1`：这一帧已经占掉 `seq`，循环里的编号接着往下发，
+        # 否则 `sources` 和首个 `stage` 会同时叫 `seq=1`（客户端按 seq 排序时会困惑）。
+        async for event in run(body, first_seq=seq + 1):
             seq = max(seq, getattr(event, "seq", 0))
             yield encode_event(event)
         finished = True
@@ -81,10 +102,14 @@ async def _frames(body: AgentRunRequest) -> AsyncIterator[str]:
         yield encode_event(ErrorEvent(seq=seq + 1, code="generation_failed", message=str(exc)))
         finished = True
     except Exception as exc:  # noqa: BLE001 — 兜底：任何未预期异常都要变成可读的一帧
+        # 只给用户一句能看懂的话。异常类型与原文（可能带绝对路径、库结构、上游
+        # 地址）只进日志：出站帧是要给浏览器看的，不是排障现场。
+        logger.exception("生成过程中出现未预期异常（%s），已收成 agent_failed 帧",
+                         type(exc).__name__)
         yield encode_event(ErrorEvent(
             seq=seq + 1,
             code="agent_failed",
-            message=f"生成过程中出错：{type(exc).__name__}: {exc}",
+            message="生成过程中出错了，请稍后重试。",
         ))
         finished = True
     if finished:

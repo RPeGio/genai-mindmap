@@ -3,7 +3,7 @@ import { createPinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
-import type { MindMapContent } from '../src/api/types';
+import type { LibraryEntry, LibraryList, LibrarySource, MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 
@@ -549,5 +549,253 @@ describe('版本徽章', () => {
     await flushPromises();
 
     expect(wrapper.find('header').text()).not.toContain('dev');
+  });
+});
+
+describe('知识库入口', () => {
+  const entry = (overrides: Partial<LibraryEntry> = {}): LibraryEntry => ({
+    source_id: 'src-1',
+    filename: '管理办法.pdf',
+    kind: 'document',
+    chars: 1200,
+    chunks: 8,
+    created_at: '2026-11-16T10:00:00.000Z',
+    last_used_at: '2026-11-16T11:00:00.000Z',
+    cited_by: 2,
+    ...overrides,
+  });
+
+  /** 按路径路由：列表与正文预览是两个不同的 GET。 */
+  function stubLibrary(list: LibraryList, source?: LibrarySource) {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
+      }
+      if (url.includes('/knowledge/library/') && source) {
+        return { ok: true, status: 200, json: async () => source } as unknown as Response;
+      }
+      if (url.includes('/knowledge/library')) {
+        return { ok: true, status: 200, json: async () => list } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('点「知识库」列出材料，被引用次数与未被引用都写清楚', async () => {
+    stubLibrary({
+      total: 2,
+      items: [entry(), entry({ source_id: 'src-2', filename: '旧笔记.md', kind: 'markdown', cited_by: 0 })],
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    expect(wrapper.text()).toContain('被 2 张导图引用');
+    expect(wrapper.text()).toContain('还没有导图引用它');
+    expect(wrapper.text()).toContain('旧笔记.md');
+    // 总数来自后端，不是当前列表长度：断言整句，免得页面上任何一个 "2" 都能过。
+    expect(wrapper.text()).toMatch(/库里现在有\s*2\s*份/);
+  });
+
+  it('库里超过一页时说明只显示了最近几份', async () => {
+    stubLibrary({
+      total: 137,
+      items: [entry(), entry({ source_id: 'src-2', filename: '旧笔记.md', cited_by: 0 })],
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    // 137 份只显示了 2 条：必须说清楚，否则用户会以为材料丢了。
+    expect(wrapper.text()).toMatch(/库里现在有\s*137\s*份/);
+    expect(wrapper.text()).toMatch(/这里只显示最近\s*2\s*份/);
+  });
+
+  it('Esc 能关掉知识库抽屉，点遮罩也能关', async () => {
+    stubLibrary({ total: 1, items: [entry()] });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    await flushPromises();
+    expect(wrapper.find('[aria-labelledby="library-title"]').exists()).toBe(false);
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    // 声明成模态（aria-modal）就必须有一条"点外面能关"的路。
+    const backdrop = wrapper.findAll('div[aria-hidden="true"]')
+      .find(node => node.classes().includes('inset-0'));
+    expect(backdrop).toBeTruthy();
+    await backdrop!.trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[aria-labelledby="library-title"]').exists()).toBe(false);
+  });
+
+  it('列表标出「最近使用」，创建时间放在 title 里', async () => {
+    stubLibrary({ total: 1, items: [entry()] });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    // 只写一个时间戳会被读成创建时间；这里钉住"最近使用"这几个字与完整 title。
+    expect(wrapper.text()).toContain('最近使用');
+    const stamped = wrapper.find('[title*="最近使用"]');
+    expect(stamped.exists()).toBe(true);
+    expect(stamped.attributes('title')).toContain('收录');
+  });
+
+  it('点一份材料看正文预览，截断时说明只显示前 4000 字', async () => {
+    stubLibrary(
+      { total: 1, items: [entry()] },
+      {
+        source_id: 'src-1',
+        filename: '管理办法.pdf',
+        kind: 'document',
+        text: '第一章 总则',
+        truncated: true,
+        total_chars: 12000,
+      },
+    );
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+    await buttonByText(wrapper, '管理办法.pdf').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('第一章 总则'));
+
+    expect(wrapper.text()).toContain('只显示前 4000 字');
+    expect(wrapper.text()).toContain('12000');
+
+    await buttonByText(wrapper, '回到列表').trigger('click');
+    await flushPromises();
+    expect(wrapper.text()).not.toContain('第一章 总则');
+  });
+
+  it('正文读不出来时只影响这一份：列表还在，能重试也能退回', async () => {
+    let previewCalls = 0;
+    const list: LibraryList = { total: 1, items: [entry()] };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
+      }
+      if (url.includes('/knowledge/library/')) {
+        previewCalls += 1;
+        if (previewCalls === 1) {
+          return { ok: false, status: 503, json: async () => ({ code: 'library_unavailable', message: '知识库暂时读不出来' }) } as unknown as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            source_id: 'src-1',
+            filename: '管理办法.pdf',
+            kind: 'document',
+            text: '第一章 总则',
+            truncated: false,
+            total_chars: 6,
+          }),
+        } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => list } as unknown as Response;
+    }));
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+    await buttonByText(wrapper, '管理办法.pdf').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('正文没能读取'));
+
+    // 抽屉停在预览壳里：能退回列表，也能原地重试，不必关掉重开
+    expect(wrapper.text()).toContain('回到列表');
+    expect(wrapper.text()).toContain('再试一次');
+
+    await buttonByText(wrapper, '再试一次').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('第一章 总则'));
+    expect(previewCalls).toBe(2);
+
+    await buttonByText(wrapper, '回到列表').trigger('click');
+    await flushPromises();
+    expect(wrapper.text()).toContain('被 2 张导图引用');
+  });
+
+  it('退回列表再点另一份：迟到的正文不能盖掉后点的那一份', async () => {
+    const pending: Array<(response: Response) => void> = [];
+    const list: LibraryList = {
+      total: 2,
+      items: [entry(), entry({ source_id: 'src-2', filename: '旧笔记.md', kind: 'markdown' })],
+    };
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/health')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response);
+      }
+      if (url.includes('/knowledge/library/')) {
+        return new Promise<Response>((resolve) => { pending.push(resolve); });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => list } as unknown as Response);
+    }));
+    const wrapper = mountApp();
+    await flushPromises();
+
+    const preview = (text: string): LibrarySource => ({
+      source_id: 'src-x', filename: '材料', kind: 'document', text, truncated: false, total_chars: text.length,
+    });
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('旧笔记.md'));
+
+    // 第一份还在路上，用户退回列表点了第二份
+    await buttonByText(wrapper, '管理办法.pdf').trigger('click');
+    await buttonByText(wrapper, '回到列表').trigger('click');
+    await buttonByText(wrapper, '旧笔记.md').trigger('click');
+
+    pending[1]({ ok: true, status: 200, json: async () => preview('第二份正文') } as unknown as Response);
+    await flushPromises();
+    expect(wrapper.text()).toContain('第二份正文');
+
+    // 第一份的响应现在才到：它已经过期了，不能把正文换掉
+    pending[0]({ ok: true, status: 200, json: async () => preview('第一份正文') } as unknown as Response);
+    await flushPromises();
+    expect(wrapper.text()).not.toContain('第一份正文');
+  });
+  it('知识库读不出来时给出错误文案，而不是空白面板', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
+      }
+      return { ok: false, status: 500, json: async () => ({ code: 'internal_error', message: '服务器出错了' }) } as unknown as Response;
+    }));
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('知识库没能读取'));
+  });
+
+  it('空库时说明为什么是空的', async () => {
+    stubLibrary({ total: 0, items: [] });
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('还是空的'));
+    expect(wrapper.text()).toContain('带着材料生成一次导图');
   });
 });

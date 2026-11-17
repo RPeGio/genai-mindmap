@@ -52,6 +52,27 @@ const problem = computed(() => {
  */
 const showRefState = computed(() => !!store.content);
 
+/**
+ * 状态行第二行：正常时是阶段文案，长静默时换成"模型正在思考"。
+ *
+ * 后端只在静默达到 10 秒才发心跳，所以 `waitedMs > 0` 基本等价于"已经静默 10 秒"。
+ * 阈值再写一遍是为了前端自己也站得住：万一别处的实现改成更密的保活帧，
+ * 这里不会 1 秒就把阶段文案顶掉。
+ *
+ * 外面必须再判一次"这一轮还在跑"：`waitedMs` 是流式状态，取消/断流/EOF 之后
+ * 它可能还留着上一次心跳的值（归零由 store 负责，但渲染不该依赖"没忘"）。
+ * 少了这个守卫，静默超 10 秒后点取消会看到"已取消。"和"模型正在思考"并列。
+ */
+const SILENT_HINT_SECONDS = 10;
+const stageLine = computed(() => {
+  if (!generating.value) return '';
+  if (store.waitedMs >= SILENT_HINT_SECONDS) {
+    return `模型正在思考，已等 ${store.waitedMs} 秒`;
+  }
+  if (!store.stageText) return '';
+  return store.stageText;
+});
+
 function refCount(sourceId: string): number {
   return store.refIndex.counts[sourceId] ?? 0;
 }
@@ -172,7 +193,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       添加多个来源后一起生成；也可以只输入文本，直接生成导图。
     </p>
     <ul v-else aria-label="待生成来源" class="flex flex-col gap-2">
-      <li v-for="item in sources.items" :key="item.id" class="rounded-md border border-slate-200 p-2">
+      <li v-for="item in sources.items" :key="item.key" class="rounded-md border border-slate-200 p-2">
         <div class="flex items-start gap-2 text-xs">
           <span class="shrink-0 rounded bg-slate-100 px-1 py-0.5 text-slate-500">{{ SOURCE_LABELS[item.kind] }}</span>
           <span class="min-w-0 flex-1 break-words font-medium text-slate-700">{{ item.label }}</span>
@@ -181,7 +202,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
             class="shrink-0 text-slate-400 hover:text-rose-600 disabled:opacity-50"
             :aria-label="`移除 ${item.label}`"
             :disabled="generating"
-            @click="sources.remove(item.id)"
+            @click="sources.remove(item.key)"
           >移除</button>
         </div>
         <p v-if="item.state === 'queued'" class="mt-1 text-xs text-slate-500">等待解析…</p>
@@ -223,7 +244,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
         </template>
         <template v-else-if="item.state === 'failed'">
           <p role="alert" class="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-rose-700">{{ item.error }}</p>
-          <button type="button" class="mt-1 text-xs text-slate-700 underline disabled:opacity-50" :disabled="generating" @click="sources.retry(item.id)">
+          <button type="button" class="mt-1 text-xs text-slate-700 underline disabled:opacity-50" :disabled="generating" @click="sources.retry(item.key)">
             重试解析
           </button>
         </template>
@@ -251,8 +272,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       <button v-if="generating" type="button" class="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700" @click="cancel">取消</button>
     </div>
     <p role="status" class="text-xs leading-relaxed text-slate-500">{{ store.status }}</p>
-    <p v-if="store.stageText" class="text-xs text-slate-400">
-      {{ store.stageText }}<span v-if="store.waitedMs > 0">（已等待 {{ store.waitedMs }} 秒）</span>
-    </p>
+    <p v-if="stageLine" class="text-xs text-slate-400">{{ stageLine }}</p>
   </div>
 </template>

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AgentPanel from '../src/components/AgentPanel.vue';
 import SourceInputs from '../src/components/SourceInputs.vue';
 import type { MindMapContent, Source } from '../src/api/types';
+import { textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 
@@ -212,6 +213,101 @@ describe('agent 运行', () => {
     stream.push(doneFrame(content()));
     stream.finish();
     await running;
+  });
+
+  it('心跳帧累积等待时长，真进度帧一到就归零', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'heartbeat', seq: 1, waited_ms: 10200 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(10));
+
+    // 心跳连着来是"还在等"，数字要跟着涨
+    stream.push({ type: 'heartbeat', seq: 2, waited_ms: 20400 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(20));
+
+    // 真进度到了，静默结束：计时必须归零，否则「已等 20 秒」会一直挂着
+    stream.push({ type: 'node_grow', seq: 3, path: [], label: '根' });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(0));
+
+    stream.push(doneFrame(content()));
+    stream.finish();
+    await running;
+  });
+
+  it('心跳不改阶段文案：它不带业务进度', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'tool_start', seq: 1, call_id: 'c1', name: 'mindmap_generate' });
+    await vi.waitFor(() => expect(store.stageText).toBe('正在定框架'));
+
+    stream.push({ type: 'heartbeat', seq: 2, waited_ms: 11000 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(11));
+    // 让心跳把阶段文案顶掉，会让用户以为进度回退了
+    expect(store.stageText).toBe('正在定框架');
+
+    stream.push(doneFrame(content()));
+    stream.finish();
+    await running;
+  });
+
+  it('心跳不进事件列表：它只驱动等待计时，面板里没人读它', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'stage', seq: 1, stage: '准备' });
+    await vi.waitFor(() => expect(store.agentEvents.map(event => event.type)).toEqual(['stage']));
+
+    stream.push({ type: 'heartbeat', seq: 2, waited_ms: 10200 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(10));
+    // 计时更新了，但心跳不进数组：长静默会累积几十帧，每帧整数组复制没必要。
+    expect(store.agentEvents.map(event => event.type)).toEqual(['stage']);
+
+    stream.push(doneFrame(content()));
+    stream.finish();
+    await running;
+  });
+
+  it('取消之后等待计时归零：不能一边说已取消、一边说还在思考', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'heartbeat', seq: 1, waited_ms: 20400 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(20));
+
+    store.cancel();
+    // fetch mock 的读端不会自己因为 abort 结束，手动收尾让 runGeneration 退出
+    stream.finish();
+    await running;
+
+    expect(store.waitedMs).toBe(0);
+    expect(store.status).toBe('已取消。');
+  });
+
+  it('断流之后等待计时归零：不再挂着「模型正在思考」', async () => {
+    const stream = controllableReply();
+    vi.stubGlobal('fetch', vi.fn(async () => stream.response));
+    const store = useMindMapStore();
+    const running = store.runGeneration('做一张导图', 'create');
+
+    stream.push({ type: 'heartbeat', seq: 1, waited_ms: 31000 });
+    await vi.waitFor(() => expect(store.waitedMs).toBe(31));
+
+    // 没有 done / error 就 EOF：连接断了，这一轮已经结束
+    stream.finish();
+    await running;
+
+    expect(store.waitedMs).toBe(0);
+    expect(store.agentError).toContain('中断');
   });
 });
 
@@ -687,6 +783,69 @@ describe('运行中的来源区', () => {
   });
 });
 
+describe('静默提示', () => {
+  function panel() {
+    return mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+  }
+
+  it('静默到 10 秒时把阶段文案换成「模型正在思考」，两句话不并存', async () => {
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.busy = true;
+    store.stageText = '正在定框架';
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('正在定框架');
+    expect(wrapper.text()).not.toContain('模型正在思考');
+
+    store.waitedMs = 12;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('模型正在思考，已等 12 秒');
+    // 阶段文案被顶掉，不是两句叠在一起
+    expect(wrapper.text()).not.toContain('正在定框架');
+  });
+
+  it('10 秒以内仍显示阶段文案，不额外加括号提示', async () => {
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.busy = true;
+    store.stageText = '正在定框架';
+    store.waitedMs = 3;
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).toContain('正在定框架');
+    // 后端心跳最小间隔就是 10 秒，`waitedMs < 10` 只在测试里造得出来；
+    // 渲染层不为此再留一条永远走不到的分支。
+    expect(wrapper.text()).not.toContain('已等待');
+    expect(wrapper.text()).not.toContain('模型正在思考');
+  });
+
+  it('没有阶段文案时也不因为等待计时凭空多出一行', async () => {
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.busy = true;
+    store.stageText = '';
+    store.waitedMs = 0;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).not.toContain('正在思考');
+  });
+
+  it('这一轮结束之后，残留的等待计时不再渲染', async () => {
+    // store 会在取消/断流时归零，但渲染不该依赖"没忘"：多一道守卫，
+    // 界面就不可能在"已取消。"底下再挂一句"模型正在思考"。
+    const wrapper = panel();
+    const store = useMindMapStore();
+    store.stageText = '正在定框架';
+    store.waitedMs = 20;
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text()).not.toContain('模型正在思考');
+    expect(wrapper.text()).not.toContain('正在定框架');
+  });
+});
+
 describe('面板文案与候选骨架', () => {
   /** 把状态铺好再挂载，首帧渲染就带着内容，不用等 nextTick 再断言。 */
   function panel(seed: (store: ReturnType<typeof useMindMapStore>) => void) {
@@ -799,5 +958,65 @@ describe('面板文案与候选骨架', () => {
     const rows = wrapper.findAll('ol > li');
     expect(rows[0].find('p').text()).toContain('模型服务返回 HTTP 429');
     expect(rows[1].find('p').exists()).toBe(false);
+  });
+});
+
+describe('材料入库后的 id 重映射', () => {
+  const readyItem = (id: string) => ({
+    key: id,
+    id,
+    label: '资料.pdf',
+    kind: 'document' as const,
+    state: 'ready' as const,
+    source: { ...textSource('正文'), id, kind: 'document' as const, filename: '资料.pdf' },
+    error: '',
+    seconds: 0,
+  });
+
+  it('收到 sources 帧就把来源条目的 id 换成持久 id', async () => {
+    const sourcesStore = useSourcesStore();
+    sourcesStore.items = [readyItem('tmp-1')];
+    stubFetch(() => agentReply([
+      { type: 'sources', seq: 1, mapping: { 'tmp-1': '持久-1' } },
+      doneFrame(content()),
+    ]));
+
+    await useMindMapStore().runGeneration('整理材料', 'create', sourcesStore.readySources);
+
+    expect(sourcesStore.items[0].id).toBe('持久-1');
+    expect(sourcesStore.items[0].source?.id).toBe('持久-1');
+    expect(sourcesStore.readySources[0].id).toBe('持久-1');
+  });
+
+  it('两份材料认领成同一个持久 id：列表仍是两行，删一行只删一行', async () => {
+    const wrapper = mount(SourceInputs, {
+      global: { plugins: [createPinia()] },
+      props: { confirmDiscard: () => true },
+    });
+    const sourcesStore = useSourcesStore();
+    sourcesStore.items = [readyItem('tmp-a'), readyItem('tmp-b')];
+    sourcesStore.remap({ 'tmp-a': '持久-同', 'tmp-b': '持久-同' });
+    await wrapper.vm.$nextTick();
+
+    const rows = wrapper.findAll('ul[aria-label="待生成来源"] > li');
+    expect(rows).toHaveLength(2);
+    // 两行的 id 相同不能当成"重复 key"：行身份挂在 key 上
+    expect(sourcesStore.items.map(item => item.key)).toEqual(['tmp-a', 'tmp-b']);
+
+    const removes = rows[0].findAll('button').filter(button => button.text() === '移除');
+    await removes[0].trigger('click');
+
+    expect(wrapper.findAll('ul[aria-label="待生成来源"] > li')).toHaveLength(1);
+    expect(sourcesStore.items.map(item => item.key)).toEqual(['tmp-b']);
+  });
+
+  it('没有这一帧时来源原样不动', async () => {
+    const sourcesStore = useSourcesStore();
+    sourcesStore.items = [readyItem('tmp-2')];
+    stubFetch(() => agentReply([doneFrame(content())]));
+
+    await useMindMapStore().runGeneration('整理材料', 'create', sourcesStore.readySources);
+
+    expect(sourcesStore.items[0].id).toBe('tmp-2');
   });
 });
