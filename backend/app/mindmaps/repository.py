@@ -71,6 +71,22 @@ def list_maps(*, tolerant: bool = False) -> list[MapRecord]:
     return records
 
 
+def maps_fingerprint() -> tuple[str, int, str | None]:
+    """导图表当前状态的廉价指纹：库位置 + 条数 + 最后更新时间。
+
+    "被几张导图引用"每次开抽屉都要算，而算它得把每张图的正文全量解析一遍。这个
+    查询只走聚合，不读正文——任何新建或保存都会改动指纹（`update_map` 一定刷新
+    `updated_at`），所以拿它当缓存键比"纯按时间过期"更准。
+
+    库文件位置也进指纹：测试与本地调试会切 `MINDMAP_DB_PATH`，换了库当然不能沿用
+    上一个库的计数（否则两个测试库恰好"条数相同、最后一毫秒相同"时会互相串）。
+    """
+    with closing(connect()) as conn, conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total, MAX(updated_at) AS latest FROM mindmaps").fetchone()
+    return str(db_path()), int(row["total"]), row["latest"]
+
+
 def get_map(map_id: str) -> MapRecord | None:
     with closing(connect()) as conn, conn:
         row = conn.execute("SELECT * FROM mindmaps WHERE id = ?", (map_id,)).fetchone()

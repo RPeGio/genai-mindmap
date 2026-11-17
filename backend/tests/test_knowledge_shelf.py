@@ -15,6 +15,9 @@
    这条路上"库坏了"的正确表现是一条空列表，而不是整页打不开。预览这条路上
    库故障也不能冒充 404：材料不存在与库读不出来是两件事（503 `library_unavailable`
    vs 404 `not_found`），混在一起会让用户以为材料被删了。
+5. **引用计数要缓存，且缓存要立刻失效**。算一次 `cited_by` 得把全库导图正文解析
+   一遍，开抽屉不该每次都扫；缓存键取导图表指纹（条数 + 最后更新时间），所以存完
+   或改完一张图再开抽屉，计数必须当场变；指纹不变的旧数据最多旧 30 秒（TTL）。
 
 全部离线：`conftest.py` 已清空凭证、开关置 0、数据库落在本次用例的 `tmp_path`。
 """
@@ -146,6 +149,119 @@ def test_citation_in_both_usage_and_refs_counts_as_one_map(client):
     item = client.get("/api/knowledge/library").json()["items"][0]
 
     assert item["cited_by"] == 1
+
+# ------------------------------------------------- 2b 引用计数的缓存
+
+
+@pytest.fixture(autouse=True)
+def _fresh_citation_cache():
+    """引用计数的缓存挂在模块级：每个用例都从干净状态开始。
+
+    不清的话，"刚存进去的图应该立刻算进计数"这类断言会读到上一个用例留下的
+    数字；而"缓存命中没有"本身就是本组要钉的行为。
+    """
+    shelf._cited_cache = None
+    yield
+    shelf._cited_cache = None
+
+
+def _count_scans(monkeypatch) -> list[int]:
+    """统计真正扫了一遍导图表的次数（缓存命中时不该增加）。"""
+    calls = [0]
+    original = repository.list_maps
+
+    def counting(*, tolerant: bool = False):
+        calls[0] += 1
+        return original(tolerant=tolerant)
+
+    monkeypatch.setattr(repository, "list_maps", counting)
+    return calls
+
+
+def test_listing_twice_scans_the_maps_once(client, monkeypatch):
+    """连开两次抽屉：第二次走缓存，不重复解析全库导图。"""
+    _ingest(_material(1))
+    scans = _count_scans(monkeypatch)
+
+    client.get("/api/knowledge/library")
+    client.get("/api/knowledge/library")
+
+    assert scans[0] == 1
+
+
+def test_saving_a_map_makes_the_count_visible_without_waiting(client, monkeypatch):
+    """缓存键是导图表指纹，不是纯时间：存完图再开抽屉，计数必须立刻变。"""
+    source_id = _ingest(_material(1))
+    scans = _count_scans(monkeypatch)
+    before = client.get("/api/knowledge/library").json()["items"][0]
+    assert before["cited_by"] == 0
+
+    _save_map(usage=[source_id])
+    after = client.get("/api/knowledge/library").json()["items"][0]
+
+    assert after["cited_by"] == 1
+    assert scans[0] == 2
+
+
+def test_updating_a_map_makes_the_count_visible_without_waiting(client):
+    """条数没变、只有 `updated_at` 变了（改图保存），指纹也必须失效。
+
+    `update_map` 会刷新 `updated_at`；这里再显式改一次时间戳，避免"创建与更新
+    落在同一毫秒"导致指纹恰好相同——那属于 TTL 兜底的边角，不该让主路径的用例
+    偶发。
+    """
+    source_id = _ingest(_material(1))
+    map_id = _save_map(usage=[])
+    client.get("/api/knowledge/library")  # 先把 cited_by=0 缓存下来
+    record = repository.get_map(map_id)
+    assert record is not None
+
+    content = MindMapContent.model_validate(
+        {
+            "title": "改过的一张",
+            "root": {"id": "root", "label": "根", "children": []},
+            "source_usage": [
+                {"source_id": source_id, "kind": "text", "char_count": 10}
+            ],
+        }
+    )
+    assert repository.update_map(map_id, record.version, content) == "updated"
+    _stamp_map_updated_at(map_id, "2030-01-01T00:00:00.000Z")
+
+    item = client.get("/api/knowledge/library").json()["items"][0]
+
+    assert item["cited_by"] == 1
+
+
+def test_citation_cache_expires_after_ttl(client, monkeypatch):
+    """指纹不变也要有有效期：坏数据在不重扫的情况下最多旧 30 秒。"""
+    _ingest(_material(1))
+    scans = _count_scans(monkeypatch)
+    client.get("/api/knowledge/library")
+
+    monkeypatch.setattr(shelf, "_CITED_CACHE_TTL_SECONDS", -1.0)  # 已过期
+    client.get("/api/knowledge/library")
+
+    assert scans[0] == 2
+
+
+def test_refresh_bypasses_the_cache(client, monkeypatch):
+    """`refresh=True` 是给调用方主动重算用的口子（后台统计、调试）。"""
+    _ingest(_material(1))
+    scans = _count_scans(monkeypatch)
+
+    shelf._cited_counts()
+    shelf._cited_counts()
+    assert scans[0] == 1
+
+    shelf._cited_counts(refresh=True)
+    assert scans[0] == 2
+
+
+def _stamp_map_updated_at(map_id: str, stamp: str) -> None:
+    with repository.connect() as conn:
+        conn.execute("UPDATE mindmaps SET updated_at = ? WHERE id = ?", (stamp, map_id))
+
 
 # ---------------------------------------------------------------- 3 预览与截断
 

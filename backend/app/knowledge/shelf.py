@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -85,8 +86,43 @@ class LibraryUnavailable(RuntimeError):
     """
 
 
-def _cited_counts() -> dict[str, int]:
-    """每个持久 source_id 被几张**已保存导图**引用。
+# "被几张导图引用"是展示值，精度要求很低；算它却要把每一张已保存导图的正文全量
+# 解析一遍。缓存的键取导图表的状态指纹（条数 + 最后更新时间）而不是纯时间：存完
+# 一张图再开抽屉，计数要立刻变。同一毫秒内连存两张这类边角由 TTL 兜住——过期后
+# 重算一次，代价只是一次旁路扫描。
+_CITED_CACHE_TTL_SECONDS = 30.0
+_cited_cache: tuple[tuple[str, int, str | None], float, dict[str, int]] | None = None
+
+
+def _cited_counts(*, refresh: bool = False) -> dict[str, int]:
+    """每个持久 source_id 被几张**已保存导图**引用（带缓存）。
+
+    缓存命中与否只看导图表指纹：`repository.maps_fingerprint()` 是条数 + 最后更新
+    时间，新建/保存导图必然改动其中之一，所以不会出现"刚存的图没算进去"。导图表
+    整个读不出来时返回空计数（`cited_by` 退化成 0），不抛——入口空着也比打不开好。
+    """
+    global _cited_cache
+
+    try:
+        fingerprint = repository.maps_fingerprint()
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("读不到导图表（%s），引用计数按 0 处理：%s",
+                       type(exc).__name__, str(exc)[:160])
+        return {}
+
+    now = time.monotonic()
+    cached = _cited_cache
+    if (not refresh and cached is not None and cached[0] == fingerprint
+            and now - cached[1] < _CITED_CACHE_TTL_SECONDS):
+        return dict(cached[2])
+
+    counts = _scan_cited_counts()
+    _cited_cache = (fingerprint, now, dict(counts))
+    return counts
+
+
+def _scan_cited_counts() -> dict[str, int]:
+    """全量扫一遍导图表，算出每个来源被几张图引用。
 
     一次扫全表而不是给每份来源各查一次：来源数最多几百，导图数也是几百，
     逐份查是 N×M 次查询，扫一次是 M 次 JSON 解析。
