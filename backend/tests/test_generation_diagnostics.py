@@ -95,7 +95,7 @@ def _ref_of(user: str) -> list[dict]:
 
 
 def _chat(*, per_branch: int = 2, third_level: int = 1, refs: bool = True,
-          seen: list[str] | None = None):
+          seen: list[str] | None = None, detail: bool = False):
     """脚本模型：骨架给 `BRANCHES`，每支 `per_branch` 个要点（每个都照抄一条引用），
     每个要点再给 `third_level` 个子节点。
 
@@ -103,6 +103,8 @@ def _chat(*, per_branch: int = 2, third_level: int = 1, refs: bool = True,
     即 `SINGLE_CHILD` 的形状——分片按支展开时，这就是"那一支模型没展开"的现场。
     `refs=True` 时每个要点各带一条引用（`per_branch=2` × 3 支 = 6 条），
     与真实形态一致：模型会为每个要点写引用，而不是每支只写一条。
+    `detail=True` 时每个要点再带一句 `detail`——真实生成会写它，而 NLI 的
+    hypothesis 正是"label + detail"而不是 label 本身。
     """
     async def chat(system: str, user: str, *, max_tokens=None, on_delta=None) -> dict:
         if seen is not None:
@@ -111,11 +113,14 @@ def _chat(*, per_branch: int = 2, third_level: int = 1, refs: bool = True,
             return {"branches": list(BRANCHES)}
         if "本条一级分支：" in user:
             sourced = _ref_of(user) if refs else []
-            return {"children": [
-                {"label": f"{_branch_of(user)}·{index}",
-                 "source_refs": list(sourced)}
-                for index in range(1, per_branch + 1)
-            ]}
+            children = []
+            for index in range(1, per_branch + 1):
+                item = {"label": f"{_branch_of(user)}·{index}",
+                        "source_refs": list(sourced)}
+                if detail:
+                    item["detail"] = f"{_branch_of(user)}的第{index}条论断，五万元以内由财务经理核准。"
+                children.append(item)
+            return {"children": children}
         # 第三层：不再写引用（引用只挂在二级要点上，与真实提示词的粒度一致）
         return {"children": [
             {"label": f"细节{index}", "expandable": False}
@@ -259,6 +264,7 @@ def test_disabled_nli_is_never_called():
 def test_enabled_model_runs_the_semantic_layer(monkeypatch):
     """模型开了、生成这道闸没被关 → 每条留存引用各判一次。"""
     monkeypatch.setenv("MINDMAP_NLI_ENABLED", "1")
+    monkeypatch.setenv("MINDMAP_NLI_ON_GENERATE", "1")
     calls: list[str] = []
 
     def fake_judge(claim: str, evidence: str) -> dict | None:
@@ -281,6 +287,7 @@ def test_enabled_model_runs_the_semantic_layer(monkeypatch):
 def test_contradiction_is_reported_one_by_one(monkeypatch):
     """判成「相反」的逐条留 warn：那是要人核的东西，不能压成计数。"""
     monkeypatch.setenv("MINDMAP_NLI_ENABLED", "1")
+    monkeypatch.setenv("MINDMAP_NLI_ON_GENERATE", "1")
 
     ctx = _ctx()
     with patch("app.optimization.nli.available", return_value=True), \
@@ -302,6 +309,70 @@ def test_contradiction_is_reported_one_by_one(monkeypatch):
     assert refs == 6
 
 
+def test_claim_carries_the_node_detail_through_the_whole_path(monkeypatch):
+    """端到端：`judge` 收到的 hypothesis 是「label + detail」，不是 label。
+
+    这条钉的是接线本身。上一版传的是 `node.label`（"预算审批·1"这种短标题），
+    模型能判的只有"这段引文提到这些字了吗"，而 `detail` 里的论断——真正可能
+    与原文相反的东西——根本没进过模型。
+    """
+    monkeypatch.setenv("MINDMAP_NLI_ENABLED", "1")
+    monkeypatch.setenv("MINDMAP_NLI_ON_GENERATE", "1")
+    claims: list[str] = []
+
+    def fake_judge(claim: str, evidence: str) -> dict | None:
+        claims.append(claim)
+        return {"score": 0.9, "label": "entailment", "probs": {}}
+
+    ctx = _ctx()
+    with patch("app.optimization.nli.available", return_value=True), \
+            patch("app.optimization.nli.judge", new=fake_judge):
+        result = _run(ctx, _chat(per_branch=2, third_level=2, detail=True))
+
+    assert result.ok, result.content
+    assert len(claims) == 6
+    for claim in claims:
+        assert "。" in claim, claim
+        assert "五万元以内由财务经理核准" in claim, claim
+        assert claim.index("。") < claim.index("五万元"), "label 必须排在 detail 前面"
+    assert result.data["nli"]["judged"] == 6
+    assert result.data["nli"]["contradicted"] == 0
+
+
+def test_three_verdicts_are_counted_apart(monkeypatch):
+    """三档混着来：相反逐条 warn，其余合成一条 info，两个计数各自对得上。
+
+    `judged` 是实判条数、`contradicted` 是其中 warn 的条数——混淆这两个数（比如
+    把 judged 记成"开关开着"）会让 `on_generate=True + judged=0` 被读成"跑了但
+    一条都没判"，而真相是"没有引用可判"。
+    """
+    monkeypatch.setenv("MINDMAP_NLI_ENABLED", "1")
+    monkeypatch.setenv("MINDMAP_NLI_ON_GENERATE", "1")
+    verdicts = ["contradiction", "entailment", "neutral",
+                "contradiction", "entailment", "neutral"]
+    offset = {"index": 0}
+
+    def fake_judge(claim: str, evidence: str) -> dict | None:
+        label = verdicts[offset["index"] % len(verdicts)]
+        offset["index"] += 1
+        return {"score": 0.75, "label": label, "probs": {}}
+
+    ctx = _ctx()
+    with patch("app.optimization.nli.available", return_value=True), \
+            patch("app.optimization.nli.judge", new=fake_judge):
+        result = _run(ctx, _chat(per_branch=2, third_level=2, detail=True))
+
+    assert result.ok, result.content
+    codes = _codes(result)
+    assert result.data["nli"]["judged"] == 6
+    assert result.data["nli"]["contradicted"] == 2
+    assert codes.count("SOURCE_REF_CONTRADICTED") == 2
+    # 其余 4 条（entailment/neutral）合成一条 info，不逐条列出
+    assert codes.count("SOURCE_REF_NLI") == 1
+    assert "语义复核：6 条引用的论断与引文做过蕴含判定" in result.content
+    assert "其中 2 条与原文语义相反，已逐条列出" in result.content
+
+
 def _walk(root):
     stack = [root]
     while stack:
@@ -321,6 +392,7 @@ def test_nli_does_not_block_the_event_loop(monkeypatch):
     同一个窗口里能跳二十来次、最大间隔只剩心跳周期。
     """
     monkeypatch.setenv("MINDMAP_NLI_ENABLED", "1")
+    monkeypatch.setenv("MINDMAP_NLI_ON_GENERATE", "1")
     ctx = _ctx()
     marks: dict[str, float] = {}
     ticks: list[tuple[float, float]] = []
@@ -438,6 +510,7 @@ def test_generation_reports_the_nli_limit():
 def test_nli_failure_does_not_break_generation(monkeypatch):
     """NLI 抛错 → 生成照常完成，诊断里没有 NLI 条目。"""
     monkeypatch.setenv("MINDMAP_NLI_ENABLED", "1")
+    monkeypatch.setenv("MINDMAP_NLI_ON_GENERATE", "1")
     ctx = _ctx()
     with patch("app.agent.tools.annotate_nli",
                new=lambda content, sources: (_ for _ in ()).throw(

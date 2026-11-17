@@ -60,6 +60,7 @@ from app.agent.tools import (  # noqa: E402
     build_registry,
 )
 from app.contracts.source import Source, SourceKind  # noqa: E402
+from app.optimization import nli as nli_module  # noqa: E402
 from app.optimization.service import check  # noqa: E402
 from app.optimization.source_refs import annotate_nli  # noqa: E402
 
@@ -202,27 +203,32 @@ def quote_stats(refs) -> dict:
 def claim_stats(content) -> dict:
     """`nli.judge(claim, evidence)` 的两个参数分别有多长。
 
-    `annotate_nli` 传的 `claim` 是**节点标签**，不是节点的 `detail`：这是它
-    contradiction 难触发的机制来源——"短标题 vs 几百字引文"在 MNLI 上几乎必然
-    判中性。这里把两边的长度量出来，好让那句话有数字可依。
+    claim 现在是**论断**（`label` + `detail`，见 `source_refs._claim_of`），不再是
+    节点标题。这里把两边长度量出来，好判断 `MAX_CLAIM_CHARS` 的 340 字符预算有没有
+    被撞到——撞到就意味着 `detail` 被截，卡在 512 token 上限上的那一对就快挤到
+    premise 了。分片生成里 `detail` 为空时 claim 等于 label，与旧口径相同。
     """
     labels: list[int] = []
+    claims: list[int] = []
     evidences: list[int] = []
     stack = [content.root]
     while stack:
         node = stack.pop()
         for ref in node.source_refs:
             labels.append(len(node.label))
+            claims.append(len(node.label) + len(node.detail or ""))
             evidences.append(len((ref.quote or "").strip()))
         stack.extend(node.children)
     if not labels:
-        return {"labels": 0, "median_label": 0, "max_label": 0,
-                "median_evidence": 0, "min_evidence": 0}
+        return {"claims": 0, "median_label": 0, "max_label": 0,
+                "median_claim": 0, "median_evidence": 0, "min_evidence": 0}
     labels.sort()
+    claims.sort()
     evidences.sort()
-    return {"labels": len(labels),
+    return {"claims": len(labels),
             "median_label": labels[len(labels) // 2],
             "max_label": labels[-1],
+            "median_claim": claims[len(claims) // 2],
             "median_evidence": evidences[len(evidences) // 2],
             "min_evidence": evidences[0]}
 
@@ -391,8 +397,9 @@ def main() -> int:
           f"有字符区间 {quotes['with_range']}/{quotes['total']}，"
           f"两者都无 {quotes['skipped_would_be']}/{quotes['total']}")
     claims = claim_stats(content)
-    print(f"  判定的两边：claim = 节点标签（中位 {claims['median_label']} 字、"
-          f"最长 {claims['max_label']} 字），premise = 引文（中位 "
+    print(f"  判定的两边：claim = 论断（中位 {claims['median_claim']} 字，其中 label "
+          f"中位 {claims['median_label']} 字、最长 {claims['max_label']} 字；上限 "
+          f"{nli_module.MAX_CLAIM_CHARS} 字），premise = 引文（中位 "
           f"{claims['median_evidence']} 字、最短 {claims['min_evidence']} 字）")
     for latency in ([args.nli_latency] if args.nli_latency is not None
                     else [NLI_FAST, NLI_SLOW]):
@@ -436,7 +443,6 @@ def main() -> int:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        from app.optimization import nli as nli_module
         print(f"  {label:28s} → on_generate() = {nli_module.on_generate()}，"
               f"DEFAULT_ON_GENERATE = {nli_module.DEFAULT_ON_GENERATE}")
     os.environ.pop("MINDMAP_NLI_ENABLED", None)

@@ -77,17 +77,28 @@
 前三层都是机械判据，它们管不住一种情况：引文逐字对得上，但节点论断与原文
 **语义相反**（原文「只在小数据集上验证」，节点写成「已在大规模数据上验证」）。
 
-`app/optimization/nli.py` 用一个小型 ONNX cross-encoder 对「节点标签 ↔ 引文」
-再判一次语义蕴含，**只产出诊断，不改变任何引用**：
+`app/optimization/nli.py` 用一个小型 ONNX cross-encoder 对「节点论断 ↔ 引文」
+判一次语义蕴含，**只产出诊断，不改变任何引用**：
 
 | 判定 | 诊断 |
 | --- | --- |
 | contradiction | `SOURCE_REF_CONTRADICTED`（warn），引用保留 |
 | entailment / neutral | `SOURCE_REF_NLI`（info），附置信度 |
 
+hypothesis 是 **`label` + `detail`**（`source_refs._claim_of`），不是 `label`：
+
+```
+预算审批流程。五万元以内由财务经理核准，超过五十万元报总经理审批。
+```
+
+拿"预算审批流程"这种名词短语当 hypothesis，模型能回答的只有"这段引文提到这个
+短语了吗"——一段话几乎不可能**否定**一个名词短语的存在，它顶多不提它。真模型
+实测（Erlangshen int8，20 条真实引文）：只给 `label` 时模式相反的论断一条都抓
+不到，全被盖成 entailment；换成 `label + detail` 之后才出现三档分布。
+
 设计约束：概率模型不得推翻确定性判据。冲突时引用留着、同时给出警告，
-由人判断。没有 `quote` 也没有字符区间的引用直接跳过——拿整篇原文去比一个
-节点标签，NLI 只会给 neutral。
+由人判断。没有 `quote` 也没有字符区间的引用直接跳过——拿整篇原文去比一句
+论断，NLI 只会给 neutral。
 
 **默认关闭**（`MINDMAP_NLI_ENABLED` 未设即关）。关闭时连 `onnxruntime`
 都不会 import，`annotate_nli` 立刻返回空列表。启用需要
@@ -111,10 +122,43 @@
 分片路留存的引用**必带 `quote`**（实测 24/24、40/40，且同时带字符区间）：
 `_check_reference` 把"只有区间没引文"和"两者都无"都判 `UNVERIFIED_SOURCE_REF`
 并剔除，而收尾那一步是 `remove_invalid=True`。所以"没有 quote 就跳过"这条规则
-在生成路上不触发——`judge()` 的入参是**节点标签**（中位 16 字）与引文（中位
-205–238 字），两边长度差一个量级，`contradiction` 因此难触发，产出以 neutral 为主
-（那些 info 在 `_generate_deep` 里被聚合成一条 `SOURCE_REF_NLI`，只有
-`SOURCE_REF_CONTRADICTED` 逐条留）。
+在生成路上不触发。
+
+### 实测：这一层到底抓不抓得到「语义相反」
+
+模型是真模型（Erlangshen-Roberta-110M-NLI int8 98.3 MB / mDeBERTa-v3-base-xnli
+int8 302.6 MB，onnxruntime CPU），材料是本仓库 `docs/RAG-DECISIONS.md`，引文逐字
+来自原文。三组：**A** 忠实论断 20 条（论断与引文同向）、**B** 反向论断 10 条
+（论断与引文相反，即这一层唯一声称能抓的故障）、**C** 真分片生成出来的 24 条
+引用（`detail` 为空，走回退）。
+
+| 组 | claim | entailment | neutral | contradiction |
+|---|---|---|---|---|
+| A 忠实 20 | 旧：`label` | 20 (100%) | 0 | 0 |
+| A 忠实 20 | 新：`label + detail` | 19 (95%) | 1 (5%) | 0 |
+| B 反向 10 | 旧：`label` | **10 (100%)** | 0 | **0** |
+| B 反向 10 | 新：`label + detail` | 6 (60%) | 3 (30%) | **1 (10%)** |
+| C 真实 24 | 旧 = 新（`detail` 空） | 20 (83%) | 0 | 4 (17%) |
+
+同一批数据换 mDeBERTa：A 组 旧 50%/50%/0 → 新 80%/20%/0；B 组 旧 10%/90%/0 →
+新 10%/90%/0（**一条也没抓到**）；C 组 38%/62%/0。
+
+三条结论都有数字支撑：
+
+1. **旧 claim 不是"灌一堆 neutral"，是把错的方向盖成"有原文支持"**。B 组 10 条
+   写反的论断，Erlangshen 给 100% entailment（置信 0.49–0.91），mDeBERTa 给 90%
+   neutral。前者比中性更糟——它让错误看起来被引文支持。
+2. **新 claim 能把反例的 contradiction 概率从 5–7% 抬到 16–39%，但 top-1 只抓到
+   1/10**。信号真的进来了，可还不够压过 entailment。两个模型、同一批样本，召回
+   上限都是 10%。
+3. **旧 claim 在真实数据上产出的 warn 是噪声**。C 组那 4 条 contradiction 里 3 条
+   claim 是 markdown 表格行（`| 扫描件 PDF | 0 |`、`| 4 | 单换行 \n |`），被判
+   "与原文相反"——`annotate_nli` 会把它们逐条报成 `SOURCE_REF_CONTRADICTED`。
+
+合起来：这一层在真反向样本上召回 10%，在真引用上精确率 25%（1 真 / 3 假），
+成本 36–55 ms/条（238 字引文，int8，本机 i5-13500H）。`DEFAULT_ON_GENERATE=True`
+的依据是"低于每次生成多等三秒"，而按真实引文长度算 24 条是 0.9–1.3 s、100 条是
+3.6–5.5 s——量级仍成立，但 0.37–1.07 s 那组数字是等价延迟注入的，不是真模型。
 
 实测参考：
 
@@ -122,6 +166,13 @@
 |---|---|---|---|---|---|
 | `typeform/mobilebert-uncased-mnli` int8 | 25.7 MB | +83.5 MB | 9.9 s | 11–23 ms | 0/4 |
 | `IDEA-CCNL/Erlangshen-Roberta-110M-NLI` int8 | 98.3 MB | +140.3 MB | 1.4 s | 15–44 ms | 6/6 |
+
+"单次推理"那一列是在**短样本**上量的。同一台机器、同一个 int8 模型，耗时随 premise
+长度变化很大：引文 50 字 11.8 ms、238 字 36.4 ms、300 字 54.7 ms、400 字 721 ms、
+1200 字 1159 ms（Erlangshen，本机 i5-13500H）。300→400 字之间有一个台阶，同样的
+台阶在 fp32 权重上也有、只是位置不同（150→200 字），所以它更像本机 CPU 线程调度的
+产物而不是模型固有的；但父块级引文（450–700 字）一旦进了 `judge()`，成本就得按
+台阶之上算。
 
 **英文模型对中文完全失效**，不是「偏弱」：它对「完全不能识别图像」vs「本系统可以识别图像」给 `entailment 0.52`，对「数据库采用主从架构」这种无关内容给 `entailment 0.65`——四条中文用例全判成蕴含，说明它只在数词汇重叠，没有识别否定结构。中文场景必须用中文模型。
 
