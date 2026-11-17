@@ -81,12 +81,31 @@ from app.knowledge.service import (
     search_multi,
     search_parent,
 )
-from app.optimization.source_refs import EvidenceSpan, verify_source_refs
+from app.optimization import nli
+from app.optimization.service import check
+from app.optimization.source_refs import (
+    MAX_NLI_CHECKS,
+    EvidenceSpan,
+    annotate_nli,
+    verify_source_refs,
+)
 
 logger = logging.getLogger(__name__)
 
 # 与 backend/app/contracts/mindmap.py 的 Node.children max_length 同口径
 MAX_CHILDREN = 50
+
+# 逐节点、数量随树规模线性膨胀的引用提示，**不进** `diagnostics`。
+#
+# 分片出来的树动辄几百节点，「这个节点没有可核验的引用」几乎对每个叶子都成立，
+# 几百条同质提示会把真正有用的诊断（`SPARSE_BRANCH` / `BRANCH_FAILED`）淹掉，也不
+# 给用户任何可操作的信息。所以它们只在 `data.source_refs` 里按 code 计数、在
+# `content` 里聚合成一句话。
+#
+# 收尾的剔除（`verify_source_refs` 的回报）与结构体检（`check()` 的第三层）共用
+# 这一份清单：同一个判定在两处各自维护就会分叉，而分叉的表现是"体检报了一堆、
+# 聚合那句一个字没提"。
+_PER_NODE_REF_CODES = ("UNSOURCED_NODE", "SOURCE_PAGE_UNVERIFIED")
 
 # 分片生成的并发上限。原值 3 的依据是「一次打 8 个容易被限流」，但那是推测。
 # 实测（2026-11-07，纯文本小请求）：并发 3/5/8/10 全部成功，总耗时从 0.99s
@@ -3143,7 +3162,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         refs_kept = _count_refs(content.root)
         refs_dropped = before - refs_kept
         for item in raw_reports:
-            if item.code in ("UNSOURCED_NODE", "SOURCE_PAGE_UNVERIFIED"):
+            if item.code in _PER_NODE_REF_CODES:
                 continue
             refs_by_code[item.code] = refs_by_code.get(item.code, 0) + 1
         if refs_dropped:
@@ -3154,6 +3173,70 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                     f"或落在本次检索命中之外），已剔除；保留 {refs_kept} 条"
                 ),
             ))
+
+    # ---- 结构体检（`check`）：整树路删掉之后，这里是新建导图唯一的形态诊断 ------
+    #
+    # 这两处（本段与下面那段 `annotate_nli`）原本接在 `_generate` 的收尾，随整树生成
+    # 一起被删掉，于是新建一张图既没有结构体检、也没有语义层的引用检查。
+    #
+    # **分片比整树更需要 `check()`**：某一支模型没展开时，树上留下的正是「一个父节点
+    # 只有一个子节点」——`SINGLE_CHILD` 就是为这个准备的；而整树一次成型时模型总把
+    # 每支要点数给满，它几乎不触发。深度诊断同一套道理：`max_depth` 是本次预算，
+    # `check()` 用的是契约的 8 层上限，它只在"树真的长很深"时才响。
+    #
+    # 来源传 `_verify_sources(ctx)`（口径见它的 docstring）：上面那次剔除用的是同一份，
+    # 两处必须一致，否则"校验认得的来源"与"体检认得的来源"会在库来源上分叉。没有
+    # `slicing` 时传 `None`——那种树没有过一次检索，也就不该有引用，跑第三层只会给
+    # 每个节点报一条 `UNSOURCED_NODE`（正是 `_PER_NODE_REF_CODES` 里那类噪声）。
+    #
+    # 第三层在分片路上**是冗余的**（上面已有同一函数、更宽的来源、`remove_invalid=True`
+    # 跑过一遍），留着它只为两件事：来源口径不分叉；以及"多处出现的引文"这类**没有被
+    # 剔除、只被标待核**的判定还能在诊断里露头一次。
+    health = [item for item in check(content, verify_sources or None)
+              if item.code not in _PER_NODE_REF_CODES]
+    diagnostics.extend(health)
+    single_child = sum(1 for item in health if item.code == "SINGLE_CHILD")
+
+    # ---- 语义层（`annotate_nli`）：每条已通过逐字校验的引用各打一次分 -----------
+    #
+    # **必须走 `to_thread`**：`nli.judge` 是 onnxruntime 的同步 CPU 推理（单条实测
+    # 15–44 ms，`MAX_NLI_CHECKS=100` → 上限 4.4 秒），首次调用还会把权重加载进来。
+    # 直接在事件循环里跑会把这几秒里的**所有**并发堵死——与 `search_parent` 被
+    # `to_thread` 包住是同一种性质，只是阻塞源从网络换成了 CPU。
+    #
+    # 两道闸（`nli.on_generate()` 内含 `_enabled()`）：模型没启用、或生成路径这道
+    # 开关被显式关掉，这里一次调用都不发生，`annotate_nli` 的重依赖也一个都不 import。
+    # 默认值按实测定（`scripts/measure_generation_diagnostics.py`）：8 支树 24 条
+    # 引用 0.37–1.07 s、20 支（工具上限）40 条 0.62–1.79 s，低于"每次生成多等
+    # 三秒"的界，所以**模型启用时它默认就跑**；撞满 `MAX_NLI_CHECKS=100` 才是
+    # 1.5–4.4 s，那种图设 `MINDMAP_NLI_ON_GENERATE=0` 关掉即可。
+    #
+    # 失败一律降级：语义复核是附加评分，它自己出错不该让一次生成失败。
+    nli_diagnostics: list[Diagnostic] = []
+    # 记成"这次**真的**尝试过"而不是"开关开着"：没有 `slicing` 的树上没有引用可
+    # 判，`data.nli.on_generate=True` + `judged=0` 会被读成"跑了但一条都没判"。
+    nli_attempted = slicing and nli.on_generate()
+    if nli_attempted:
+        try:
+            nli_diagnostics = await asyncio.to_thread(
+                annotate_nli, content, verify_sources)
+        except Exception as exc:  # noqa: BLE001 - 语义层失败只是没有评分
+            logger.warning("NLI 语义复核失败（%s）：%s",
+                           type(exc).__name__, str(exc)[:160])
+            nli_diagnostics = []
+    # 相反的那几条逐条留（要人核，必须能点回节点）；其余（entailment / neutral）
+    # 只留一个计数——「每条引用一条 info」在一棵几百引用的树上就是噪声，与上面
+    # `_PER_NODE_REF_CODES` 是同一条理由。
+    contradicted = [item for item in nli_diagnostics
+                    if item.code == "SOURCE_REF_CONTRADICTED"]
+    diagnostics.extend(contradicted)
+    nli_agree = len(nli_diagnostics) - len(contradicted)
+    if nli_agree:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="SOURCE_REF_NLI",
+            message=(f"{nli_agree} 条引用的语义判定不是「相反」（中性或蕴含），"
+                     "无冲突，未逐条列出"),
+        ))
 
     retried_set = set(retried)
     # 收尾仍不足的分支：(下标, 标题, 差几个)。这是 `partial` 的第三个来源——
@@ -3455,6 +3538,21 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         f"按 {max_depth} 层预算展开，实际 {audit.deepest + 1} 层（含中心主题），各层节点数："
         f"{' / '.join(str(audit.depths.get(depth, 0)) for depth in range(audit.deepest + 1))}。"
     )
+    # 结构体检与语义复核的结论要出现在 content 里：`diagnostics` 只有前端诊断面板
+    # 会展开（且只列前三条），而"某一支其实只长了一个子节点"直接影响用户对这棵树
+    # 完整度的判断——那是要他去补展开的地方，不是一条可以折叠的告警。
+    if single_child:
+        content_parts.append(
+            f"结构体检：{single_child} 个节点只有一个子节点，可能有一支没展开；"
+            "可以对这些节点用 node_expand 继续展开，或与相邻节点合并。"
+        )
+    if nli_diagnostics:
+        tail = (f"其中 {len(contradicted)} 条与原文语义相反，已逐条列出"
+                if contradicted else "没有一条与原文语义相反")
+        content_parts.append(
+            f"语义复核：{len(nli_diagnostics)} 条引用的论断与引文做过蕴含判定，{tail}；"
+            "该判定是概率评分，不改变任何引用的存在与否。"
+        )
 
     return ToolResult(
         ok=True,
@@ -3523,6 +3621,22 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "kept": refs_kept,
                 "dropped": refs_dropped,
                 "dropped_by_code": refs_by_code,
+            },
+            # 结构体检的结论与语义复核的成本。前者是"哪些节点该再展开"的机器读那
+            # 一半；后者是**成本账**：`limit` + `judged` 一起才说得清"NLI 到底跑了几
+            # 条、有没有被上限截断"，而那正是决定这道开关该不该默认开的唯一依据。
+            "structure": {
+                "single_child": single_child,
+                "deepest": audit.deepest + 1,
+                # 从 `check()` 里**留下来进了 diagnostics** 的条数（逐节点引用噪声
+                # 已被 `_PER_NODE_REF_CODES` 挡掉），不是 `check()` 的原始产出量。
+                "reported": len(health),
+            },
+            "nli": {
+                "on_generate": nli_attempted,
+                "limit": MAX_NLI_CHECKS,
+                "judged": len(nli_diagnostics),
+                "contradicted": len(contradicted),
             },
             "diagnostics": [item.model_dump() for item in diagnostics],
             **({"external": {

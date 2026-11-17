@@ -20,8 +20,17 @@
 
 关闭时**零开销**：连 onnxruntime 都不 import，`available()` 只读一个环境变量。
 
+**两道开关，问的不是同一件事**（`MINDMAP_NLI_ENABLED` 与
+`MINDMAP_NLI_ON_GENERATE`）：前者是"这台机器能不能跑 NLI"，后者是"每次生成
+都跑一遍值不值"。生成路径是这一层唯一的消费方（`optimization` 路由那条只读
+体检只跑机械判据），所以模型启用之后它默认就在生成收尾跑一次；实测成本
+（24 条引用 0.37–1.07 s、40 条 0.62–1.79 s）低于"每次生成多等三秒"的界，
+撞满 100 条上限时才需要 `MINDMAP_NLI_ON_GENERATE=0` 关掉。`available()` 为假
+时它一次都不发生。
+
 稳定接口：
     available() -> bool
+    on_generate() -> bool                      # 这次生成要不要跑语义复核
     judge(claim, evidence) -> dict | None      # {"score": float, "label": str, "probs": {...}}
     reset() -> None                            # 测试用：丢弃已加载的模型
 
@@ -39,6 +48,15 @@ import threading
 ENABLED_ENV = "MINDMAP_NLI_ENABLED"
 MODEL_DIR_ENV = "MINDMAP_NLI_MODEL_DIR"
 MIN_FREE_MB_ENV = "MINDMAP_NLI_MIN_FREE_MB"
+# 生成路径上的第二道闸：`ENABLED_ENV` 只回答"这台机器能不能跑 NLI"，回答不了
+# "每次生成都跑一遍值不值"。
+ON_GENERATE_ENV = "MINDMAP_NLI_ON_GENERATE"
+# 缺省值按实测（`scripts/measure_generation_diagnostics.py`，脚本化分片生成 +
+# 等价延迟）：8 支树 24 条引用 → 0.37–1.07 s；20 支（工具上限）40 条 → 0.62–1.79 s。
+# 都低于 3 s，所以模型已启用时**默认就跑**——否则这个开关形同虚设，"接了"与
+# "没接"在部署上无法区分。撞满 `MAX_NLI_CHECKS=100` 时是 1.5–4.4 s，那种图
+# （层数更深、每节点都带引用）要省时间就把 `ON_GENERATE_ENV` 设成 0。
+DEFAULT_ON_GENERATE = True
 
 # 实测占用：英文 mobilebert-uncased-mnli（25.7 MB int8）加载后 +83.5 MB；
 # 中文 Erlangshen-Roberta-110M-NLI（98.3 MB int8）加载后 +140.3 MB。
@@ -201,6 +219,28 @@ def available() -> bool:
     return _load() is not None
 
 
+def on_generate() -> bool:
+    """这次生成要不要跑语义复核。
+
+    与 `available()` 是两道独立的闸，缺一不可：
+
+      - `available()` 为假（没开 `ENABLED_ENV` 或模型加载失败）→ 恒为假。生成
+        路径连 `annotate_nli` 都不会调进去，重依赖也一个都不 import。
+      - 模型可用但 `ON_GENERATE_ENV` 显式设成 0 → 假。这条留在人手里的理由只有
+        成本：一次生成的引用条数 × 单条推理时间，实测见 `DEFAULT_ON_GENERATE`。
+
+    **不探测模型**：这里只读环境变量，与 `available()` 分开正是为了"开关关着时
+    连一次加载尝试都不发生"——把两者合并成一个函数就会在判定阶段把 100 MB 权重
+    拉进内存，只为了回答一个"要不要用它"的问题。
+    """
+    if not _enabled():
+        return False
+    raw = str(os.getenv(ON_GENERATE_ENV, "")).strip().lower()
+    if not raw:
+        return DEFAULT_ON_GENERATE
+    return raw in _TRUTHY
+
+
 def judge(claim: str, evidence: str) -> dict | None:
     """语义蕴含打分。不可用时返回 None，绝不抛异常。"""
     backend = _load()
@@ -226,6 +266,7 @@ def info() -> dict:
     return {
         "enabled": _enabled(),
         "available": available(),
+        "on_generate": on_generate(),
         "model_dir": _model_dir(),
         "reason": _cache["reason"],
         "min_free_mb": _min_free_mb(),

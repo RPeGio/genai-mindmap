@@ -94,6 +94,28 @@
 `MINDMAP_NLI_MODEL_DIR` 指向含 `model.onnx` / `tokenizer.json` / `config.json`
 的目录。加载前有内存闸门（默认 700 MB，Linux 可检测）。
 
+**生成路径的第二道闸**（`MINDMAP_NLI_ON_GENERATE`，默认**开**）：模型启用之后，
+`_generate_deep` 的收尾就默认跑一次语义复核——这条路径是这一层唯一的消费方，
+默认关会让"接了"与"没接"在部署上无法区分。成本实测（
+`scripts/measure_generation_diagnostics.py`，脚本化分片生成 + 等价延迟）：
+
+| 骨架 | 树 / 引用 | 15 ms/条 | 44 ms/条 |
+|---|---|---|---|
+| 8 支（默认量级） | 33 节点 / 24 条 | 0.37 s | 1.07 s |
+| 20 支（工具上限） | 61 节点 / 40 条 | 0.62 s | 1.78 s |
+
+撞满 `MAX_NLI_CHECKS=100` 才是 1.5–4.4 s，那种图设 `MINDMAP_NLI_ON_GENERATE=0`。
+**必须在线程池里跑**：同步调一次 374 ms 的 NLI，事件循环心跳 0 次（整段被独占）；
+`to_thread` 之后同一段心跳 25 次、最大停顿 16 ms。
+
+分片路留存的引用**必带 `quote`**（实测 24/24、40/40，且同时带字符区间）：
+`_check_reference` 把"只有区间没引文"和"两者都无"都判 `UNVERIFIED_SOURCE_REF`
+并剔除，而收尾那一步是 `remove_invalid=True`。所以"没有 quote 就跳过"这条规则
+在生成路上不触发——`judge()` 的入参是**节点标签**（中位 16 字）与引文（中位
+205–238 字），两边长度差一个量级，`contradiction` 因此难触发，产出以 neutral 为主
+（那些 info 在 `_generate_deep` 里被聚合成一条 `SOURCE_REF_NLI`，只有
+`SOURCE_REF_CONTRADICTED` 逐条留）。
+
 实测参考：
 
 | 模型 | 文件 | 内存增量 | 加载 | 单次推理 | 中文准确率 |
