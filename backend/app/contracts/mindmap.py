@@ -157,6 +157,29 @@ DiagramKind = Literal["tree", "flowchart", "fishbone"]
 # 说明**——说明属于界面（`SourceInputs.vue` 里那四个 hint）。
 DIAGRAM_LABELS = {"tree": "思维导图", "flowchart": "流程图", "fishbone": "鱼骨图"}
 
+# 鱼骨图一级分支（"骨"）的典型六类：5M1E 的人 / 机 / 料 / 法 / 环 / 测。
+#
+# **它是一份推荐词表，不是契约白名单**。契约层拿它做的事只有一件：把"类别"这个
+# 字段的长度与去重判掉（见 `FishboneContent.validate_fishbone`）。为什么不硬绑：
+# 5M1E 之外还有 8P、4M1E、服务业的"人 / 流程 / 系统 / 外部"，而模型写"人员"而不是
+# "人"时，硬绑的表现是整张图 422——用户宁可要一张"类别名字不太标准但内容对"的
+# 鱼骨图。词表留给生成侧做提示词与诊断（阶段 2），那里报 warn 是恰当的粒度。
+FISHBONE_CATEGORIES = ("人", "机", "料", "法", "环", "测")
+
+# 骨的根数上限。六类就是六根，`Field(max_length=...)` 是硬边界而不是 warn：
+# 骨是**顶层数组**，多出来的第七根在画布上没有位置（主骨上下各三根是 5M1E 的
+# 固定摆法），静默画到框外比 422 更难排查。少于此数完全合法——很多问题的成因
+# 只有三类，凑到六根等于让模型编。
+MAX_FISHBONE_BONES = len(FISHBONE_CATEGORIES)
+
+# 骨的类别上限（码点）。类别是一个词（"人"、"流程"、"外部环境"），40 字够写
+# "供应商来料与库存周转"，再长的内容属于 `problem` 或节点详情。
+MAX_FISHBONE_CATEGORY_CHARS = 40
+
+# 主骨上那句话的上限。与 `MAX_NODE_LABEL_CHARS` 同口径：它最终会被画成一行的字，
+# 200 是"一句话主题"的既有容量。写成 `"为什么 X 会 Y"` 的句式通常 30–60 字。
+MAX_FISHBONE_PROBLEM_CHARS = 200
+
 
 def normalize_color(value: object) -> str | None:
     """模型给的 `color` → 调色板里的键，或 `None`。
@@ -583,26 +606,8 @@ class MindMapContent(ContentBase):
     @field_validator("edges")
     @classmethod
     def dedupe_edges(cls, value: list[Edge]) -> list[Edge]:
-        """按 `(source, target, label)` 去重，**保留第一条**。
-
-        为什么去重键里有 `label`：判断节点的两个出口指向同一个目标是完全正常的
-        流程（"是"和"否"都回到主流程），把它们当成重复边删掉，图上就少了一条
-        分支说明。反过来，两个端点与文字都一样的边没有任何表达差异，留着只会让
-        画布上叠一条看不出来的重线。
-
-        为什么是"去重"而不是"报错"：重复边是**幂等**输入——模型重试一次、用户
-        点两次"连线"都会产生它，而它不改变图的意思。为一条信息量为零的边让整张
-        图 422，代价方向错了。真正需要硬拒的是 dangling 与自环（见 `validate_tree`）。
-        """
-        unique: list[Edge] = []
-        seen: set[tuple[str, str, str | None]] = set()
-        for edge in value:
-            key = (edge.source, edge.target, edge.label)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(edge)
-        return unique
+        """去重的判据见模块级 `_dedupe_edges`；流程图那边共用同一份。"""
+        return _dedupe_edges(value)
 
     @model_validator(mode="after")
     def validate_tree(self) -> MindMapContent:
@@ -620,6 +625,111 @@ class MindMapContent(ContentBase):
 
         _validate_relations(self.relations, node_ids)
         _validate_edges(self.edges, node_ids)
+        return self
+
+
+def _dedupe_edges(value: list[Edge]) -> list[Edge]:
+    """按 `(source, target, label)` 去重，**保留第一条**。
+
+    为什么去重键里有 `label`：判断节点的两个出口指向同一个目标是完全正常的
+    流程（"是"和"否"都回到主流程），把它们当成重复边删掉，图上就少了一条
+    分支说明。反过来，两个端点与文字都一样的边没有任何表达差异，留着只会让
+    画布上叠一条看不出来的重线。
+
+    为什么是"去重"而不是"报错"：重复边是**幂等**输入——模型重试一次、用户
+    点两次"连线"都会产生它，而它不改变图的意思。为一条信息量为零的边让整张
+    图 422，代价方向错了。真正需要硬拒的是 dangling 与自环（见 `_validate_edges`）。
+
+    两种图型（树的 `edges` 与流程的阶段间跳转）共用这一份：它们的去重语义没有
+    任何差别，分开写只会在某一天让两边对"什么算重复"给出不同答案。
+    """
+    unique: list[Edge] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for edge in value:
+        key = (edge.source, edge.target, edge.label)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(edge)
+    return unique
+
+
+class FishboneBone(BaseModel):
+    """鱼骨图上的一根骨：一个类别 + 一棵子树。
+
+    **`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /
+    `detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层
+    `Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。
+    `causes` 就是 `root.children`，多一层数组只会让"这条原因下面还能不能再展开"
+    这件事换个地方回答。
+
+    骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**
+    （人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    category: str = Field(min_length=1, max_length=MAX_FISHBONE_CATEGORY_CHARS)
+    root: Node
+    color: NodeColor | None = None
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
+
+    @field_validator("category")
+    @classmethod
+    def fold_category(cls, value: str) -> str:
+        folded = _fold(value)
+        if not folded:
+            raise ValueError("骨的类别不能为空")
+        return folded
+
+    @field_validator("icon")
+    @classmethod
+    def blank_icon_as_none(cls, value: str | None) -> str | None:
+        """纯空白的图标等于没有图标（与 `Node.icon` 同一条归一）。"""
+        return value if value and value.strip() else None
+
+
+class FishboneContent(ContentBase):
+    """鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。
+
+    与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：
+
+      - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），
+        让用户选"横向还是纵向"只会得到一张画歪的鱼。前端按 `diagram_type` 分派
+        （`canvas/layout/index.ts`），不读 `layout`。
+      - `problem` 独立于 `title`。`title` 是文件名（"报销慢的原因分析"），
+        `problem` 是主骨上那一句（"为什么报销要 11 天"）——后半句才是这张图的论点，
+        而它会被画在鱼头里，长度与字号都受位置限制。
+      - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是
+        **类别**，不是"原因 1 / 原因 2"。
+    """
+
+    diagram_type: Literal["fishbone"] = "fishbone"
+    problem: str = Field(min_length=1, max_length=MAX_FISHBONE_PROBLEM_CHARS)
+    # 根数硬上限、类别不重复。**空的 `bones` 合法**：一张只有主骨的草稿是"还没想
+    # 清楚"，那是诊断层该说的事（阶段 2 报 warn），不该让用户存不下当前进度。
+    bones: list[FishboneBone] = Field(default_factory=list, max_length=MAX_FISHBONE_BONES)
+
+    @field_validator("problem")
+    @classmethod
+    def fold_problem(cls, value: str) -> str:
+        folded = _fold(value)
+        if not folded:
+            raise ValueError("鱼骨图的主骨上必须有一句话")
+        return folded
+
+    @model_validator(mode="after")
+    def validate_fishbone(self) -> FishboneContent:
+        source_ids = _unique_source_ids(self.source_usage)
+        # 六根骨是并列的子树，但节点 id 必须全局唯一（前端按 id 建索引）。所以
+        # 一份 `seen` 穿到底，节点总数也按六棵子树合计算。
+        node_ids: set[str] = set()
+        categories: set[str] = set()
+        for bone in self.bones:
+            if bone.category in categories:
+                raise ValueError(f"骨的类别不能重复：{bone.category}")
+            categories.add(bone.category)
+            _scan_tree(bone.root, source_ids, node_ids)
+        _validate_relations(self.relations, node_ids)
         return self
 
 
