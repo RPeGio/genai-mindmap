@@ -1387,6 +1387,8 @@ export interface components {
             /** Icon */
             icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
+            /** Role */
+            role?: ("step" | "decision" | "start" | "end") | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;
@@ -1419,6 +1421,8 @@ export interface components {
             /** Icon */
             icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
+            /** Role */
+            role?: ("step" | "decision" | "start" | "end") | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;

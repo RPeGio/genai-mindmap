@@ -3018,6 +3018,23 @@
               }
             ]
           },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "step",
+                  "decision",
+                  "start",
+                  "end"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
           "source_refs": {
             "items": {
               "$ref": "#/components/schemas/SourceRef"
@@ -3148,6 +3165,23 @@
                 "type": "null"
               }
             ]
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "step",
+                  "decision",
+                  "start",
+                  "end"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
           },
           "source_refs": {
             "items": {

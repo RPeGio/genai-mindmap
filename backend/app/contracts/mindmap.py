@@ -414,6 +414,24 @@ class Node(BaseModel):
     # "字符串"不变——那时它承载的就是库里的 id。
     icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
     style: NodeStyle | None = None
+    # 这个节点在**图里扮演什么**：普通步骤 / 判定 / 起点 / 终点。
+    #
+    # 为什么需要它：`Edge.kind` 已经有 `flow` / `branch` / `loop`——**边**有语义
+    # 类型，节点侧却没有对偶。流程图里判定节点必须画菱形，否则「是/否」两个出口
+    # 是从哪儿分出来的读不出来，而 `branch` 那条边已经默认它的起点是个判定。
+    #
+    # 三条不能走的替代路，每条都有一个具体后果：
+    #
+    #   - **不能复用 `NodeStyle.shape`**。那是导入侧的"用户画的那个形状"，逐像素
+    #     还原用；`Node.color` 与 `NodeStyle.color` 的分工已经把这条线划过一次了
+    #     ——语义不能塞进样式，否则换主题时形状语义会跟着漂。
+    #   - **不能靠出边数让前端猜**。用户编辑到一半（只连了一条 `branch` 出边）
+    #     会闪变，而"这个节点长什么样"是用户记住这张图的一部分。
+    #   - **不能放进 `metadata`**（那是给来源的），也不能塞 `style`。
+    #
+    # 默认 `None` 是旧图零迁移的老规矩：库里那些从没被问过"你是什么角色"的节点
+    # 一律当作普通步骤，行为与加这个字段之前逐字节相同。
+    role: Literal["step", "decision", "start", "end"] | None = None
     source_refs: list[SourceRef] = Field(default_factory=list, max_length=20)
     pos: Position | None = None
 

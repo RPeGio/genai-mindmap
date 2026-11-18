@@ -59,6 +59,20 @@ export interface MindNode {
    * 后端下发的这些字段就被序列化丢掉了（`note` 在 v1 阶段已经踩过同一个坑）。
    */
   collapsed?: boolean;
+  /**
+   * 这个节点在图里扮演什么：普通步骤 / 判定 / 起点 / 终点。
+   *
+   * 与 `MindEdge.kind` 是同一条分工的两半——**边**有语义类型（`flow`/`branch`/`loop`），
+   * 节点侧的对偶就是这个字段。流程图里判定节点要画菱形，否则「是/否」两个出口
+   * 从哪儿分出来读不出来。
+   *
+   * 刻意**不复用** `NodeStyle.shape`：那是导入侧的"用户画的那个形状"，逐像素还原
+   * 用；`color` 与 `style.color` 的分工已经把这条线划过一次（语义不能塞进样式）。
+   * 也刻意**不靠出边数推断**：用户编辑到一半会闪变。
+   *
+   * 缺省 `null` = 普通步骤，与加这个字段之前的渲染逐像素相同。
+   */
+  role?: 'step' | 'decision' | 'start' | 'end' | null;
   style?: NodeStyle | null;
   pos?: NodePosition | null;
   /**
