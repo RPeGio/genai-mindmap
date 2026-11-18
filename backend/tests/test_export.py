@@ -274,6 +274,95 @@ class TwoLayerExportTest(unittest.TestCase):
                          ["审批的人不在"])
 
 
+class DetailExportTest(unittest.TestCase):
+    """`detail`（生成说明）在三种文本格式里各有一个落点。
+
+    这一路以前是"三种文本格式全丢 detail，只有 JSON 保得住"。丢的不是装饰字段：
+    `detail` 是生成的核心产物（实测平均 142 字），而 `note` 可能根本是空的——读者
+    拿到的文件里，一个节点只剩一行标题。
+
+    三种格式各用自己那条不破坏结构的通道，**都不进大纲层级**：引用块（markdown）、
+    注释行（puml）、`_note` 属性（opml）。
+    """
+
+    def content(self):
+        return MindMapContent.model_validate({
+            "title": "报销",
+            "root": {"id": "r", "label": "提交申请", "detail": "把报销单和发票拍照上传。",
+                     "children": [{"id": "a", "label": "填单",
+                                   "detail": "写清事由与金额。"}]},
+        })
+
+    def test_markdown_puts_detail_in_a_quote_under_the_node(self):
+        lines = to_markdown(self.content()).splitlines()
+        self.assertIn("- 提交申请", lines)
+        self.assertEqual(lines[lines.index("- 提交申请") + 1],
+                         "  > 把报销单和发票拍照上传。")
+        self.assertIn("  - 填单", lines)
+        self.assertIn("    > 写清事由与金额。", lines)
+
+    def test_puml_puts_detail_in_a_comment(self):
+        text = to_puml(self.content())
+        self.assertIn("* 提交申请", text)
+        self.assertIn("' 说明：把报销单和发票拍照上传。", text)
+        self.assertIn("** 填单", text)
+        # 注释行不破坏语法：文件仍然以 @endmindmap 收尾
+        self.assertTrue(text.rstrip().endswith("@endmindmap"))
+
+    def test_puml_detail_never_looks_like_an_edge(self):
+        """导入侧把任何含 `-->` 的注释行当边读（`importing/puml.py` 的 `_EDGE`）。
+
+        一句说明里写着箭头时，那句注释会凭空长出一条关系——画出来是一条指不到
+        任何节点的线。所以导出就把箭头压成 `→`，与 `*` → `·` 同一条取舍。
+        """
+        content = MindMapContent.model_validate({
+            "title": "t",
+            "root": {"id": "r", "label": "根", "detail": "先 A --> B 再回 C",
+                     "children": []},
+        })
+        comments = [line for line in to_puml(content).splitlines()
+                    if line.startswith("' 说明：")]
+        self.assertEqual(comments, ["' 说明：先 A → B 再回 C"])
+
+    def test_opml_puts_detail_in_the_note_attribute(self):
+        root = ET.fromstring(to_opml(self.content()))
+        node = root.find("./body/outline")
+        self.assertEqual(node.get("text"), "提交申请")
+        self.assertEqual(node.get("_note"), "把报销单和发票拍照上传。")
+        self.assertEqual(node.find("./outline").get("_note"), "写清事由与金额。")
+
+    def test_formats_without_detail_do_not_grow_the_attribute(self):
+        """没有 `detail` 的节点不写空 `_note`：一个空属性会让"没有备注"与
+        "备注是空串"在文件里长得一样。"""
+        root = ET.fromstring(to_opml(SAMPLE))
+        self.assertIsNone(root.find("./body/outline").get("_note"))
+
+    def test_flow_and_fishbone_nodes_carry_detail_too(self):
+        from app.contracts.mindmap import FishboneContent, FlowContent
+        flow = FlowContent.model_validate({
+            "title": "流程", "diagram_type": "flowchart",
+            "stages": [{"id": "s_1", "root": {
+                "id": "n1", "label": "提交", "detail": "阶段自己的说明",
+                "children": [{"id": "n11", "label": "填单", "detail": "步骤说明"}]}}],
+        })
+        text = to_markdown(flow)
+        self.assertIn("> 阶段自己的说明", text)
+        self.assertIn("  > 步骤说明", text)
+        self.assertIn("' 说明：步骤说明", to_puml(flow))
+
+        fishbone = FishboneContent.model_validate({
+            "title": "鱼骨", "problem": "为什么慢",
+            "bones": [{"category": "人", "root": {
+                "id": "b1", "label": "人",
+                "children": [{"id": "c1", "label": "关键人休假",
+                              "detail": "两位主程同时不在"}]}}],
+        })
+        bones = to_markdown(fishbone)
+        self.assertIn("    > 两位主程同时不在", bones)
+        self.assertIn("' 说明：两位主程同时不在", to_puml(fishbone))
+        self.assertIn('_note="两位主程同时不在"', to_opml(fishbone))
+
+
 class ByteIdenticalTest(unittest.TestCase):
     """三种既有格式的输出**逐字节**钉死。
 

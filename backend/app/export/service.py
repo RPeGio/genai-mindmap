@@ -5,8 +5,9 @@
     Markdown  缩进大纲，最通用的中间格式
     OPML      能直接导入 XMind 等导图工具
     JSON      `MindMapContent` 的序列化——**唯一无损的一种**，也是导入的保底：
-              另外三种都只有一个文字字段（正文优先），往返时 `note` / `detail`
-              的区分、`color` / `icon`、`diagram_type`、附加边都会退化
+              另外三种只有两个文字槽位（`note or label` 合成一行，`detail` 单列
+              一个通道，见下面"节点的 detail 怎么放"），往返时 `note` 与 `label`
+              的区分、`color` / `icon`、附加边都会退化
 
 新增 JSON 的理由是"能导出什么就能导入什么"：`app/importing/` 支持 JSON，若导出
 侧不产出它，用户手里就没有一份"改完还能原样导回来"的文件，而这正是四种格式里
@@ -43,6 +44,21 @@
 `MindMapContent` 却真的去读 `content.root`——一份 `FlowContent` 走到这里就是
 `AttributeError`（500）。形状分派放在这三个公开函数的第一行，树的实现原封不动
 搬到 `_puml_tree` / `_markdown_tree` / `_opml_tree`（逐字节不变的前提就是这个"不动"）。
+
+**节点的 `detail` 怎么放**——`detail` 是生成的核心产物（"这一步到底做什么"），
+`note` 是用户备注，两者都可能为空，而三种文本格式各自只有**一个标题槽**。所以
+`note or label` 继续占那个槽（`_node_text`，一行），`detail` 走各格式的**第二个
+通道**，一条都不进大纲层级：
+
+  - markdown：节点行下面一行引用块（`  > …`）。引用块不占列表缩进，读起来是
+    "这一项的说明"，也不可能被当成下一层节点。
+  - puml：节点行下面一行注释（`' 说明：…`）。文件仍能解析、能出图，那句话还能
+    grep 到；正文里的 `-->` 会被压成 `→`（理由见 `_puml_note`）。
+  - opml：`_note` 属性（OmniOutliner 的备注约定，见 `_opml_note`）。
+
+`note` 与 `label` 仍然合成一行：它们争的是同一个位置——画布上的那一行字——而
+`detail` 是另一层信息，本来就不该挤进标题。**没有 `detail` 的图输出逐字节不变**
+（`tests/test_export.py::ByteIdenticalTest` 钉着这件事）。
 """
 from __future__ import annotations
 
@@ -68,6 +84,7 @@ EDGES_SECTION = "附加关系"
 STAGE_EDGES_SECTION = f"{EDGES_SECTION}（阶段之间）"
 INNER_EDGES_SECTION = f"{EDGES_SECTION}（阶段内部）"
 
+
 # `kind` → 中文说法，只在边**没有 label** 时补上去。有 label 时（"是"/"驳回"）
 # 那两个字已经表达了分支朝向，再补一个"条件分支"只是把行拉长。
 #
@@ -92,6 +109,10 @@ def _node_text(node: Node) -> str:
 
     `label` 是画布上的短标题（≤200 字），`note` 才是生成的完整表述。只导出
     `label` 的话，别人拿到的是一份只有骨架、没有解释的大纲。
+
+    `detail` **不在这里**：它是第二个通道，见模块 docstring 的
+    "节点的 detail 怎么放"。混进同一行会让每个节点变成"标题 + 一段 142 字的话"，
+    而大纲的全部价值在于能一眼扫过。
     """
     return node.note if node.note else node.label
 
@@ -113,6 +134,60 @@ def _escape_markdown(text: str) -> str:
     节点文字就残了。节点总在 `- ` 之后，不占行首，所以 `#` 和 `>` 不用管。
     """
     return _one_line(text).replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _markdown_quote(detail: str | None, pad: str) -> list[str]:
+    """`detail` 在 Markdown 里的落点：紧跟节点行的一句引用块。
+
+    为什么不拼进节点行：那一行已经有 `note or label`（见 `_node_text`），再塞一段
+    生成说明，得到的是"标题 + 一段话"糊成一行的长文本，而 `detail` 实测平均 142 字
+    ——一份 100 个节点的图会变成一串读不下去的段落。
+
+    为什么是引用块：它是 Markdown 里唯一"明显属于上一项、又可以不进列表缩进层级"
+    的写法。它由 `>` 起头，所以导入侧一个正则就认得回来（`importing/markdown.py`
+    的 `_DETAIL`），而 `- ` 行无论怎么写都不会被误认成它。
+
+    `pad` 是**节点自己那一行的缩进 + 2 格**：渲染器据此把它归进那个列表项内部；
+    不缩进的话它会掉到列表外面，看起来像全图共有的注释。
+    """
+    if not detail:
+        return []
+    return [f"{pad}> {_escape_markdown(detail)}"]
+
+
+def _sanitize_comment(text: str) -> str:
+    """PUML 注释行的清洗，理由见 `_puml_note`。"""
+    return _one_line(text).replace("*", "·").replace("-->", "→")
+
+
+def _puml_note(detail: str | None) -> list[str]:
+    """`detail` 在 PlantUML 里的落点：节点行下面一行注释。
+
+    `'` 是 PlantUML 的注释符，所以文件仍然能解析、能出图，而那句话还能被 grep 到。
+
+    正文里的两种字符要压掉，每一种都有具体后果：
+      - `*` 在 mindmap 语法里是层级标记（与 `_sanitize` 同一条理由）；
+      - `-->` 会被 `importing/puml.py` 当成一条边（它把任何含 `-->` 的注释行读成
+        `A --> B : label`），一句说明凭空长出一条关系，比丢一个箭头糟得多。
+        所以它换成 `→`——与 `*` → `·` 同样是一个**单向**替换，puml 的往返用例
+        本来就已经承认这条路有损。
+    """
+    if not detail:
+        return []
+    return [f"' 说明：{_sanitize_comment(detail)}"]
+
+
+def _opml_note(detail: str | None) -> str:
+    """`detail` 在 OPML 里的落点：`_note` 属性（含前导空格，直接拼在标签里）。
+
+    `_note` 是 OmniOutliner 用了几十年的备注约定，XMind / 幕布 / 其它 OPML 阅读器
+    见到不认识也不会报错——它就是一个普通属性，不是非法结构。
+
+    **没有 `detail` 时返回空串**，所以树的既有输出一个字节都不变。
+    """
+    if not detail:
+        return ""
+    return f" _note={quoteattr(_one_line(detail))}"
 
 
 def _edge_suffix(edge: Edge) -> str:
@@ -183,10 +258,12 @@ def _puml_tree(content: MindMapContent) -> str:
         f"（{content.diagram_type}）",
     ]
     lines.append(f"* {_sanitize(_node_text(content.root))}")
+    lines += _puml_note(content.root.detail)
 
     def walk(node: Node, depth: int) -> None:
         for child in node.children:
             lines.append(f"{_depth_marks(depth)} {_sanitize(_node_text(child))}")
+            lines.extend(_puml_note(child.detail))
             walk(child, depth + 1)
 
     # 根节点已输出，子节点从第 2 层开始
@@ -224,13 +301,18 @@ def _markdown_tree(content: MindMapContent) -> str:
 
     附加边**不缩进进树**，而是文末单列一节：树里的一条缩进表示"这是下一层"，
     把"从第 5 步退回第 2 步"画成缩进，读者会把它当成第 6 步的子节点。
+
+    节点的 `detail` 以引用块跟在它自己那一行下面（见 `_markdown_quote`）。
     """
     lines: list[str] = [f"# {_escape_markdown(content.title)}", ""]
     lines.append(f"- {_escape_markdown(_node_text(content.root))}")
+    lines += _markdown_quote(content.root.detail, "  ")
 
     def walk(node: Node, depth: int) -> None:
+        pad = "  " * depth
         for child in node.children:
-            lines.append(f"{'  ' * depth}- {_escape_markdown(_node_text(child))}")
+            lines.append(f"{pad}- {_escape_markdown(_node_text(child))}")
+            lines.extend(_markdown_quote(child.detail, pad + "  "))
             walk(child, depth + 1)
 
     walk(content.root, 1)
@@ -264,7 +346,7 @@ def _opml_tree(content: MindMapContent) -> str:
 
     def outline(node: Node, depth: int) -> list[str]:
         pad = "  " * depth
-        parts = [f"{pad}<outline text={quoteattr(_one_line(_node_text(node)))}>"]
+        parts = [f"{pad}<outline text={quoteattr(_one_line(_node_text(node)))}{_opml_note(node.detail)}>"]
         for child in node.children:
             parts.extend(outline(child, depth + 1))
         parts.append(f"{pad}</outline>")
@@ -296,21 +378,26 @@ def _opml_tree(content: MindMapContent) -> str:
 # 所以这三种格式对它来说只有"骨架"一件事：`problem` 是鱼头，六根骨是类别，骨下面挂
 # 原因。形状与树不同（没有 `root`），所以不能走树那三个实现。
 
-def _fishbone_lines(content: FishboneContent) -> list[tuple[int, str]]:
-    """鱼骨图 → `(层号, 文字)`：0 是鱼头，1 是骨，2 起是骨下面的原因。
+def _fishbone_lines(content: FishboneContent) -> list[tuple[int, str, str | None]]:
+    """鱼骨图 → `(层号, 文字, 详情)`：0 是鱼头，1 是骨，2 起是骨下面的原因。
 
     鱼头用 `problem ?? title`：`title` 是文件名（"报销慢的原因分析"），`problem` 才是
     这张图的论点（"为什么报销要 11 天"）。导出给别人看时，后者才是那句话。
+
+    第三项是节点的 `detail`。鱼头那一行永远是 `None`：主骨上那句话是 `problem`
+    ——一个字符串字段，它下面没有节点，也就没有详情可带。骨带的是**骨根节点**的
+    `detail`（`bone.root.detail`），而 `bone.category` 不进这一份行表：画在骨上的
+    那行字是 `root.label`，类别是数据的分类（两者通常相同，见 `_markdown_fishbone`）。
     """
     head = content.problem.strip() or content.title
-    out: list[tuple[int, str]] = [(0, head)]
+    out: list[tuple[int, str, str | None]] = [(0, head, None)]
     for bone in content.bones:
         label = bone.root.label.strip() or bone.category
-        out.append((1, label))
+        out.append((1, label, bone.root.detail))
         stack = [(child, 2) for child in reversed(bone.root.children)]
         while stack:
             node, depth = stack.pop()
-            out.append((depth, _node_text(node)))
+            out.append((depth, _node_text(node), node.detail))
             stack.extend((child, depth + 1) for child in reversed(node.children))
     return out
 
@@ -322,21 +409,24 @@ def _puml_fishbone(content: FishboneContent) -> str:
         f"' 图型：{DIAGRAM_LABELS.get(content.diagram_type, content.diagram_type)}"
         f"（{content.diagram_type}）",
     ]
-    for depth, text in _fishbone_lines(content):
+    for depth, text, detail in _fishbone_lines(content):
         lines.append(f"{_depth_marks(depth + 1)} {_sanitize(text)}")
+        lines += _puml_note(detail)
     lines.append("@endmindmap")
     return "\n".join(lines) + "\n"
 
 
 def _markdown_fishbone(content: FishboneContent) -> str:
     """鱼骨图 → Markdown 大纲。骨用一级列表，原因按缩进分层。"""
-    rows = _fishbone_lines(content)
     lines: list[str] = [f"# {_escape_markdown(content.title)}", ""]
-    for depth, text in rows:
+    for depth, text, detail in _fishbone_lines(content):
         if depth == 0:
             lines.append(f"- {_escape_markdown(text)}")
+            lines += _markdown_quote(detail, "  ")
         else:
-            lines.append(f"{'  ' * (depth - 1)}- {_escape_markdown(text)}")
+            pad = "  " * (depth - 1)
+            lines.append(f"{pad}- {_escape_markdown(text)}")
+            lines += _markdown_quote(detail, pad + "  ")
     return "\n".join(lines) + "\n"
 
 
@@ -348,21 +438,22 @@ def _opml_fishbone(content: FishboneContent) -> str:
     "文件格式错误"，很难追到根因。
     """
     rows = _fishbone_lines(content)
-    head: dict = {"text": rows[0][1], "children": []}
+    head: dict = {"text": rows[0][1], "note": rows[0][2], "children": []}
     stack: list[tuple[dict, int]] = [(head, 0)]
-    for depth, text in rows[1:]:
+    for depth, text, detail in rows[1:]:
         while len(stack) > 1 and stack[-1][1] >= depth:
             stack.pop()
-        item: dict = {"text": text, "children": []}
+        item: dict = {"text": text, "note": detail, "children": []}
         stack[-1][0]["children"].append(item)
         stack.append((item, depth))
 
     def emit(item: dict, depth: int) -> list[str]:
         pad = "  " * depth
         text = quoteattr(_one_line(item["text"]))
+        note = _opml_note(item["note"])
         if not item["children"]:
-            return [f"{pad}<outline text={text} />"]
-        parts = [f"{pad}<outline text={text}>"]
+            return [f"{pad}<outline text={text}{note} />"]
+        parts = [f"{pad}<outline text={text}{note}>"]
         for child in item["children"]:
             parts.extend(emit(child, depth + 1))
         parts.append(f"{pad}</outline>")
@@ -483,10 +574,12 @@ def _puml_flow(content: FlowContent) -> str:
     lines.append(f"* {_sanitize(content.title)}")
     for index, stage in enumerate(content.stages):
         lines.append(f"** {_sanitize(_flow_stage_heading(stage, index))}")
+        lines += _puml_note(stage.root.detail)
         stack = [(child, 3) for child in reversed(stage.root.children)]
         while stack:
             node, depth = stack.pop()
             lines.append(f"{_depth_marks(depth)} {_sanitize(_node_text(node))}")
+            lines += _puml_note(node.detail)
             stack.extend((child, depth + 1) for child in reversed(node.children))
 
     if content.edges:
@@ -517,15 +610,27 @@ def _markdown_flow(content: FlowContent) -> str:
     阶段用 `###` 而不是列表项：阶段是**图的骨架**（数组顺序就是执行顺序），把它
     降成一列缩进之后，"这里是第二个阶段"只能从缩进层级去数。树（`-` 列表）的
     逐字节输出不受影响——这条分派在 `to_markdown` 的第一行。
+
+    阶段根自己的 `detail` 以引用块挂在标题下面（见 `_markdown_quote`）。
     """
     lines: list[str] = [f"# {_escape_markdown(content.title)}"]
     for index, stage in enumerate(content.stages):
         lines += ["", f"### {_escape_markdown(_flow_stage_heading(stage, index))}", ""]
+        quotes = _markdown_quote(stage.root.detail, "")
+        if quotes:
+            lines += quotes + [""]
         stack = [(child, 0) for child in reversed(stage.root.children)]
         while stack:
             node, depth = stack.pop()
-            lines.append(f"{'  ' * depth}- {_escape_markdown(_node_text(node))}")
+            pad = "  " * depth
+            lines.append(f"{pad}- {_escape_markdown(_node_text(node))}")
+            lines.extend(_markdown_quote(node.detail, pad + "  "))
             stack.extend((child, depth + 1) for child in reversed(node.children))
+
+    # 每个阶段块尾部都留了一个空行（阶段之间的分隔），最后一节要多删一个，
+    # 否则边清单前面会出现两个连续空行。
+    while lines and not lines[-1]:
+        lines.pop()
 
     stage_lines = _flow_stage_edge_lines(content)
     if stage_lines:
@@ -552,7 +657,7 @@ def _opml_flow(content: FlowContent) -> str:
 
     def outline(node: Node, depth: int) -> list[str]:
         pad = "  " * depth
-        parts = [f"{pad}<outline text={quoteattr(_one_line(_node_text(node)))}>"]
+        parts = [f"{pad}<outline text={quoteattr(_one_line(_node_text(node)))}{_opml_note(node.detail)}>"]
         for child in node.children:
             parts.extend(outline(child, depth + 1))
         parts.append(f"{pad}</outline>")
@@ -560,7 +665,8 @@ def _opml_flow(content: FlowContent) -> str:
 
     for index, stage in enumerate(content.stages):
         lines.append(
-            f"      <outline text={quoteattr(_one_line(_flow_stage_heading(stage, index)))}>")
+            f"      <outline text={quoteattr(_one_line(_flow_stage_heading(stage, index)))}"
+            f"{_opml_note(stage.root.detail)}>")
         for child in stage.root.children:
             lines.extend(outline(child, 4))
         lines.append("      </outline>")
@@ -583,10 +689,12 @@ def _opml_flow(content: FlowContent) -> str:
 def to_json(content: MindMapContent) -> str:
     """导出 `MindMapContent` 的 JSON 序列化——**唯一无损的格式**。
 
-    为什么它比另外三种重要：markdown / opml / puml 都只有一个文字槽位，而我们的
-    节点有两个文字字段（`label` 短标题、`note` 用户备注、`detail` 生成说明）。
-    导出时按"正文优先"合成一句，导入时只能塞回 `label`——文字没丢，但"哪部分是
-    标题"这个区分丢了，`color` / `icon` / `diagram_type` / 附加边也一并退化。
+    为什么它比另外三种重要：markdown / opml / puml 的**标题槽**只有一个，而节点有
+    三个文字字段——`label`（短标题）、`note`（用户备注）、`detail`（生成说明）。
+    导出时 `note or label` 合占那个标题槽（正文优先），`detail` 另走一个通道
+    （引用块 / 注释行 / `_note` 属性，见模块 docstring）。所以文字不会丢，丢的是
+    **`note` 与 `label` 的区分**（合成一句之后回来只能落在 `label` 里），
+    `color` / `icon` / `diagram_type` / 附加边也一并退化。
 
     JSON 把这些全部保住，所以它是"导出 → 改 → 导入"的保底：结构、视觉、边、
     图型、主题、布局一条不少。唯一**不**保留的是 `source_refs` 与 `source_usage`

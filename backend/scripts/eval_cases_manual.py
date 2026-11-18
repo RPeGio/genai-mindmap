@@ -105,7 +105,7 @@ MANUAL_SOURCE_HASHES: dict[str, str] = {
     "docs/AGENT_PLAN.md": "bd5cecdff33fb17382d1ba0ba8e5d877f1cbd05dc3d07c402398f9f4e4fdd9ec",
     "docs/RAG-DECISIONS.md": "0a61ef1684479991fae70e9bba07d1ece3e0f0f0997feab9d5bbbda2b59bcfb8",
     "docs/PLAN.md": "34c6cbd6ea7ad495400b97cb9594e9dcd52285ffd7cdcd2ceaa01ada4b76c3ce",
-    "docs/ARCHITECTURE.md": "28bb4145697f694102eaab0c31977914a37abf686b33383fba95be7a3f649ca5",
+    "docs/ARCHITECTURE.md": "d5022f5907fec818f6bf91c3876fc45ae5a1b19d86fdb3b09a42c9beb6e07de8",
 }
 """这四份材料的 `sha256(正文)`；对不上就是材料变了，整套标注要复核。
 
