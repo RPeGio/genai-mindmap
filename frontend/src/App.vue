@@ -18,7 +18,8 @@ import { DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY, usePrefs
 import PrefsPanel from './components/PrefsPanel.vue';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
-import type { DiagramTypeChoice, EdgeKind } from './api/types';
+import type { DiagramContent, DiagramTypeChoice, EdgeKind } from './api/types';
+import { containerNoun, kindOf, topBranchesOf } from './mindmap/shape';
 
 const store = useMindMapStore();
 
@@ -180,19 +181,26 @@ const edgeTarget = ref('');
 const edgeLabel = ref('');
 const edgeKind = ref<EdgeKind>('branch');
 
-/** 候选目标：当前树里除选中节点之外的所有节点。自环在契约层就是硬拒的，列出来也没用。 */
+/**
+ * 候选目标：当前内容里除选中节点之外的所有节点。自环在契约层就是硬拒的，列出来也没用。
+ *
+ * 读 `selectableNodes` 而不是 `flatNodes`：鱼骨与流程的画布上多一个**不在 content 里**
+ * 的合成根（鱼头 / 流程起点），它是一个纯渲染产物，既不能当端点也不该出现在下拉框里。
+ */
 const edgeTargets = computed(() => {
   const current = selected.value?.node.id;
-  return store.flatNodes
+  return store.selectableNodes
     .filter(entry => entry.node.id !== current)
     .map(entry => ({ id: entry.node.id, label: entry.node.label.trim(), depth: entry.depth }));
 });
 
-/** 边端点的显示名：`id → 标题`。删边/列边都要它，用户认标题不认 id。 */
-const edgeNodeName = computed(() => {
-  const names = new Map(store.flatNodes.map(entry => [entry.node.id, entry.node.label.trim()]));
-  return (id: string) => names.get(id) ?? id;
-});
+/**
+ * 边端点的显示名：`id → 标题`。删边/列边都要它，用户认标题不认 id。
+ *
+ * 走 store 的 `edgeNameOf` 而不是在这里自己建表：流程图的边端点存的是**阶段 id**
+ * （另一个命名空间），自己按节点建的表会把它显示成一串 `s_xxx`。
+ */
+const edgeNodeName = computed(() => store.edgeNameOf);
 
 /** 选中节点相关的边，拼成"谁 → 谁（标签）"给列表用。 */
 const selectedEdgeRows = computed(() => store.selectedEdges.map(edge => ({
@@ -233,6 +241,19 @@ const edgeHint = computed(() => {
 const showEdgeSection = computed(
   () => (store.content?.diagram_type ?? 'tree') === 'flowchart' || store.contentEdges.length > 0,
 );
+
+/**
+ * 保存列表里那一行的规模描述：「6 个一级分支」/「6 根骨」/「4 个阶段」。
+ *
+ * 三种形状的顶层容器是同一个概念（画布上的一块区域），但中文里各有各的量词。
+ * 在这之前这里写的是 `content.root.children.length`——一张鱼骨图打开列表就会炸。
+ */
+function mapShapeLine(content: DiagramContent): string {
+  // 树的"一级分支"是 `root.children`（中心主题是标题，不算一块内容），鱼骨/流程是
+  // 容器本身——两边的口径收在 `shape.topBranchesOf` 一处。
+  const count = topBranchesOf(content).length;
+  return `${count} 个${containerNoun(kindOf(content))}`;
+}
 
 function connectEdge() {
   const source = selected.value?.node.id;
@@ -1574,7 +1595,7 @@ async function copyBody() {
             <button
               type="button"
               class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
-              :disabled="selected.node.id === store.content?.root.id"
+              :disabled="store.isContainerRootId(selected.node.id)"
               @click="store.deleteNode(selected.node.id)"
             >
               删除（Delete）
@@ -1856,7 +1877,7 @@ async function copyBody() {
             <div class="min-w-0">
               <p class="truncate text-sm text-slate-800">{{ item.content.title }}</p>
               <p class="text-xs text-slate-400">
-                版本 {{ item.version }} · {{ item.content.root.children.length }} 个一级分支 ·
+                版本 {{ item.version }} · {{ mapShapeLine(item.content) }} ·
                 {{ formatTime(item.updated_at) }}
               </p>
             </div>

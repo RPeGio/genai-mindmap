@@ -258,6 +258,85 @@ export interface MindMapContent {
   diagram_type?: DiagramType;
 }
 
+// ---- 另外两种图型的顶层结构（阶段 2 起后端真的会产出它们）----
+//
+// 三种内容的判别**靠形状，不靠 `diagram_type`**（镜像后端 `DiagramContent` 的注释）：
+// 树必有 `root`、鱼骨必有 `bones` + `problem`、流程必有 `stages`，三者天然互斥；
+// 而 `diagram_type` 在库里有一批"标着 fishbone、形状仍是树"的历史记录，拿它分派会
+// 让那些图走进不存在的分支。判别与分派都在 `mindmap/shape.ts` 里，别处不要自己写。
+
+/**
+ * 鱼骨图上的一根骨：一个类别 + 一棵子树。与后端 `FishboneBone` 逐字段对应。
+ *
+ * `root.children` 就是"这根骨下挂的原因"——套一层 `causes: list[Node]` 只会让
+ * "这条原因下面还能不能再展开"换个地方回答。
+ */
+export interface FishboneBone {
+  /** 主骨上那一行类别（人 / 机 / 料 / 法 / 环 / 测）。 */
+  category: string;
+  /** 骨自己的子树根。**原因挂在它的 `children` 上**，不挂在别处。 */
+  root: MindNode;
+  /** 骨的配色，独立于第一个原因（那是图的骨架，不是内容节点）。 */
+  color?: NodeColor | null;
+  icon?: string | null;
+}
+
+/**
+ * 鱼骨图。与后端 `FishboneContent` 逐字段对应。
+ *
+ * **没有 `layout`**：鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），
+ * 让用户选"横向还是纵向"只会得到一张画歪的鱼。所以这个类型上也不能有 `layout`
+ * ——`extra="forbid"` 会让多出来的那个键变成保存时的 422。
+ */
+export interface FishboneContent {
+  schema_version?: 2;
+  title: string;
+  diagram_type: 'fishbone';
+  /** 主骨上那一句（"为什么报销要 11 天"）。与 `title`（文件名）是两件事。 */
+  problem: string;
+  bones: FishboneBone[];
+  theme?: MindMapTheme;
+  relations?: MindRelation[];
+  source_usage?: SourceUsage[];
+}
+
+/**
+ * 流程里的一个阶段：一个 id + 一棵步骤树。与后端 `FlowStage` 逐字段对应。
+ *
+ * `id` 与节点 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 引用，节点 id
+ * 只被 `relations` 与阶段内部的树引用。合并之后"这条边连的是阶段还是步骤"只能靠
+ * 形状猜，而两者在画布上画出来的东西完全不同。
+ */
+export interface FlowStage {
+  /** 阶段 id（后端规范化成 `s_` 前缀）。 */
+  id: string;
+  /** 阶段内部的步骤树根。`root.children` 就是这个阶段的第一步、第二步…… */
+  root: MindNode;
+}
+
+/** 流程图。与后端 `FlowContent` 逐字段对应。 */
+export interface FlowContent {
+  schema_version?: 2;
+  title: string;
+  diagram_type: 'flowchart';
+  /** 顺序就是执行先后：流程图的"先后"是数组下标，不需要另一个 `order` 字段。 */
+  stages: FlowStage[];
+  /** **端点是阶段 id**，不是节点 id（与 `MindMapContent.edges` 刚好相反）。 */
+  edges?: MindEdge[];
+  theme?: MindMapTheme;
+  relations?: MindRelation[];
+  source_usage?: SourceUsage[];
+}
+
+/**
+ * 一份内容可能是三种形状之一。保存 / 读取 / 生成产物共用它。
+ *
+ * 写成联合而不是"一个宽松接口 + 一堆可选字段"：可选字段的版本里，`bones` 与
+ * `stages` 同时存在是**合法**的，而那样的图在契约层是 422——类型层面就不该允许
+ * 造出来。
+ */
+export type DiagramContent = MindMapContent | FishboneContent | FlowContent;
+
 /**
  * 边的语义类型。与后端 `mindmap.EDGE_KINDS` 一一对应。
  *
@@ -321,7 +400,14 @@ export interface MindRelation {
 export interface MapRecord {
   id: string;
   version: number;
-  content: MindMapContent;
+  /**
+   * 三种形状之一（树 / 鱼骨 / 流程）。
+   *
+   * 此前这里是 `MindMapContent`：阶段 2 之后库里真的会有另外两种，读回来直接
+   * `content.root` 会让"打开一张鱼骨图"炸在渲染层。判别与分派统一走
+   * `mindmap/shape.ts`，不要在这里自己判。
+   */
+  content: DiagramContent;
   updated_at: string;
 }
 
@@ -349,7 +435,7 @@ export interface ImportWarning {
  * **只解析不落库**：`content` 装进画布后是"有未保存修改"的状态，落库仍走保存。
  */
 export interface ImportResult {
-  content: MindMapContent;
+  content: DiagramContent;
   warnings: ImportWarning[];
   source_format: string;
 }
@@ -605,7 +691,7 @@ export interface RunSummary {
 
 /** 单条运行的详情（镜像后端 `RunDetail`）：多出结果正文、失败原因与来历。 */
 export interface RunDetail extends RunSummary {
-  candidate?: MindMapContent | null;
+  candidate?: DiagramContent | null;
   failure?: { code?: string; message?: string } | null;
   /** `demo` 是占位树、`model` 是模型产出。重放时按它标来源，不能一律写成模型。 */
   mode?: 'demo' | 'model' | null;
@@ -665,7 +751,7 @@ export type AgentEvent =
       /** 模型写出来的可展开性；`null` 表示还没写到，与 `false` 不是一回事。 */
       expandable: boolean | null;
     }
-  | { type: 'snapshot'; seq: number; content: MindMapContent }
+  | { type: 'snapshot'; seq: number; content: DiagramContent }
   /**
    * 长静默期间的保活帧。
    *
@@ -676,7 +762,7 @@ export type AgentEvent =
   | {
       type: 'done';
       seq: number;
-      content?: MindMapContent | null;
+      content?: DiagramContent | null;
       usage?: Record<string, unknown>;
       /**
        * 这棵树是演示规则拼出来的还是模型产出的。

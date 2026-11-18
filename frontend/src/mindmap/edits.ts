@@ -1,4 +1,5 @@
-import type { EdgeKind, MindEdge, MindMapContent, MindNode, NodeColor } from '../api/types';
+import type { DiagramContent, EdgeKind, MindEdge, MindNode, NodeColor } from '../api/types';
+import { containersOf, edgesOfContent, isFishbone, isFlow, rootsOf, stageOfNode } from './shape';
 
 /**
  * 与服务端 Pydantic 约束逐条对应（`backend/app/contracts/mindmap.py`）：
@@ -93,9 +94,15 @@ export function hasVisuals(root: MindNode): boolean {
 // `stores/mindmap.ts`（用户手点「连一条边」）与 `ops.ts`（模型发来的 op 批次）
 // 都要用同一套语义；两处各写一遍，"用户点的时候能连、模型连的时候被拒"只是时间问题。
 
-/** 边集合里所有边（缺省空数组）。旧图没有这个字段，所有读取点都走它。 */
-export function edgesOf(content: MindMapContent | null | undefined): MindEdge[] {
-  return content?.edges ?? [];
+/**
+ * 边集合里所有边（缺省空数组）。旧图没有这个字段，所有读取点都走它。
+ *
+ * 三种内容里**只有鱼骨没有 `edges`**（它的顶层结构里只有 `relations`），判定收在
+ * `shape.edgesOfContent` 一处：传进来是鱼骨就是没有边，返回空数组——画布少画一条
+ * 线好过让每个调用点各判一次形状。
+ */
+export function edgesOf(content: DiagramContent | null | undefined): MindEdge[] {
+  return content ? edgesOfContent(content) : [];
 }
 
 /** 按 id 找边；找不到返回 `null`。 */
@@ -118,30 +125,56 @@ export function newEdgeId(): string {
  *    免得用户点两次"添加"后看到一条线却没发现自己点了两下）。
  *
  * `label` 不同则允许：判断节点的"是"与"否"经常指向同一个目标。
+ *
+ * ## 三种形状各连的是什么（这里唯一需要判形状的地方）
+ *
+ *  - 树：端点是**节点 id**，与入参一致；
+ *  - 流程：`FlowContent.edges` 的端点是**阶段 id**，而入参（界面上的下拉框、
+ *    模型给的 op）是节点 id。所以这里把两个节点各自映到它所在的阶段再落库——
+ *    映射不到的（节点不在流程里）与同一阶段内部的（后端契约明确说"暂不支持
+ *    阶段内部步骤之间的边"）都当场拒掉，别让它到保存时才 422；
+ *  - 鱼骨：顶层结构里根本没有 `edges`，加不了。说清楚比静默丢弃好。
  */
 export function addEdge(
-  content: MindMapContent,
+  content: DiagramContent,
   source: string,
   target: string,
   label?: string | null,
   kind?: EdgeKind | null,
-): { content: MindMapContent; edge: MindEdge } {
+): { content: DiagramContent; edge: MindEdge } {
   if (source === target) throw new Error('起点与终点不能是同一个节点');
-  if (!findNode(content.root, source)) throw new Error('起点节点不存在');
-  if (!findNode(content.root, target)) throw new Error('终点节点不存在');
+  if (isFishbone(content)) {
+    throw new Error('鱼骨图暂不支持附加关系：它的一级结构是类别，跨骨的关系还没有语义');
+  }
+
+  let from = source;
+  let to = target;
+  if (isFlow(content)) {
+    const sourceStage = stageOfNode(content, source);
+    const targetStage = stageOfNode(content, target);
+    if (!sourceStage || !targetStage) throw new Error('端点节点不存在');
+    if (sourceStage === targetStage) {
+      throw new Error('同一个阶段里的步骤之间暂不支持连关系，请连到别的阶段');
+    }
+    from = sourceStage;
+    to = targetStage;
+  } else {
+    if (!findNode(content.root, source)) throw new Error('起点节点不存在');
+    if (!findNode(content.root, target)) throw new Error('终点节点不存在');
+  }
 
   const text = (label ?? '').trim();
   const normalized = text ? text.slice(0, LIMITS.edgeLabel) : null;
   const edges = edgesOf(content);
-  if (edges.some(edge => edge.source === source && edge.target === target
+  if (edges.some(edge => edge.source === from && edge.target === to
     && (edge.label ?? null) === normalized)) {
     throw new Error('这条关系已经存在');
   }
 
   const edge: MindEdge = {
     id: newEdgeId(),
-    source,
-    target,
+    source: from,
+    target: to,
     label: normalized,
     kind: kind ?? null,
   };
@@ -149,7 +182,7 @@ export function addEdge(
 }
 
 /** 删一条边。只动 `edges`，树一个字节都不变。 */
-export function removeEdge(content: MindMapContent, edgeId: string): MindMapContent {
+export function removeEdge(content: DiagramContent, edgeId: string): DiagramContent {
   return { ...content, edges: edgesOf(content).filter(edge => edge.id !== edgeId) };
 }
 
@@ -346,67 +379,99 @@ function shortLabel(label: string): string {
 }
 
 /**
- * 提交前校验整棵树，返回第一条错误文案；没问题返回 null。
+ * 提交前校验整份内容，返回第一条错误文案；没问题返回 null。
  * 文案尽量与服务端一致，避免同一条规则出现两种说法。
+ *
+ * **三种形状共用这一份**，判据逐条对齐后端：`_scan_tree` 的 `seen` 集合在多棵并列
+ * 子树之间**共用**（节点 id 必须全局唯一、节点总数按各容器合计算），而层号按每棵
+ * 子树**各自**从 1 数；边的端点命名空间随形状走——树是节点 id，流程是**阶段 id**，
+ * 鱼骨没有边。分开写三份的话，某一天"树拦了、鱼骨没拦"的分叉只会表现为一次 422。
  */
-export function validateDraft(content: MindMapContent): string | null {
+export function validateDraft(content: DiagramContent): string | null {
   const title = content.title.trim();
   if (!title) return '标题不能为空';
   if (charLength(title) > LIMITS.title) return `标题最多 ${LIMITS.title} 个字`;
 
+  if (isFishbone(content)) {
+    const categories = new Set<string>();
+    for (const bone of content.bones) {
+      if (!bone.category.trim()) return '骨的类别不能为空';
+      if (categories.has(bone.category)) return `骨的类别不能重复（${bone.category}）`;
+      categories.add(bone.category);
+    }
+  }
+  if (isFlow(content)) {
+    if (content.stages.length === 0) return '流程图至少要有一个阶段';
+    const stageIds = new Set<string>();
+    for (const stage of content.stages) {
+      if (!stage.id) return '阶段 ID 不能为空';
+      if (stageIds.has(stage.id)) return `阶段 ID 必须唯一（重复的是 ${stage.id}）`;
+      stageIds.add(stage.id);
+    }
+  }
+
   const seen = new Set<string>();
-  const stack: Array<{ node: MindNode; depth: number }> = [{ node: content.root, depth: 1 }];
+  for (const root of rootsOf(content)) {
+    const stack: Array<{ node: MindNode; depth: number }> = [{ node: root, depth: 1 }];
 
-  while (stack.length > 0) {
-    const { node, depth } = stack.pop()!;
+    while (stack.length > 0) {
+      const { node, depth } = stack.pop()!;
 
-    if (seen.has(node.id)) return '节点 ID 必须唯一';
-    seen.add(node.id);
-    if (seen.size > LIMITS.nodes) return `导图最多 ${LIMITS.nodes} 个节点`;
-    if (depth > LIMITS.depth) return `导图最多 ${LIMITS.depth} 层`;
+      if (seen.has(node.id)) return '节点 ID 必须唯一';
+      seen.add(node.id);
+      if (seen.size > LIMITS.nodes) return `导图最多 ${LIMITS.nodes} 个节点`;
+      if (depth > LIMITS.depth) return `导图最多 ${LIMITS.depth} 层`;
 
-    const label = node.label.trim();
-    if (!label) return '节点标题不能为空';
-    if (charLength(label) > LIMITS.label) {
-      return `节点「${shortLabel(label)}」超过 ${LIMITS.label} 个字`;
-    }
-    if (node.note && charLength(node.note.trim()) > LIMITS.note) {
-      return `节点「${shortLabel(label)}」的正文超过 ${LIMITS.note} 个字`;
-    }
-    if (node.detail && charLength(node.detail.trim()) > LIMITS.detail) {
-      return `节点「${shortLabel(label)}」的详情超过 ${LIMITS.detail} 个字`;
-    }
-    // 视觉元素：与后端 `Node.color` 的 Literal / `Node.icon` 的 max_length 对齐。
-    // 不在这里拦的话，一个非法颜色要到保存时才 422，而那时用户已经在图上改了
-    // 半天——他看到的是一句"内容不合法"，指不到是哪个节点。
-    if (node.color != null && !isNodeColor(node.color)) {
-      return `节点「${shortLabel(label)}」的颜色不在调色板里（${NODE_COLORS.join('/')}）`;
-    }
-    if (node.icon != null && (!node.icon.trim() || charLength(node.icon) > LIMITS.icon)) {
-      return `节点「${shortLabel(label)}」的图标应为 1–${LIMITS.icon} 个字符`;
-    }
-    if (node.children.length > LIMITS.children) {
-      return `节点「${shortLabel(label)}」最多 ${LIMITS.children} 个子节点`;
-    }
+      const label = node.label.trim();
+      if (!label) return '节点标题不能为空';
+      if (charLength(label) > LIMITS.label) {
+        return `节点「${shortLabel(label)}」超过 ${LIMITS.label} 个字`;
+      }
+      if (node.note && charLength(node.note.trim()) > LIMITS.note) {
+        return `节点「${shortLabel(label)}」的正文超过 ${LIMITS.note} 个字`;
+      }
+      if (node.detail && charLength(node.detail.trim()) > LIMITS.detail) {
+        return `节点「${shortLabel(label)}」的详情超过 ${LIMITS.detail} 个字`;
+      }
+      // 视觉元素：与后端 `Node.color` 的 Literal / `Node.icon` 的 max_length 对齐。
+      // 不在这里拦的话，一个非法颜色要到保存时才 422，而那时用户已经在图上改了
+      // 半天——他看到的是一句"内容不合法"，指不到是哪个节点。
+      if (node.color != null && !isNodeColor(node.color)) {
+        return `节点「${shortLabel(label)}」的颜色不在调色板里（${NODE_COLORS.join('/')}）`;
+      }
+      if (node.icon != null && (!node.icon.trim() || charLength(node.icon) > LIMITS.icon)) {
+        return `节点「${shortLabel(label)}」的图标应为 1–${LIMITS.icon} 个字符`;
+      }
+      if (node.children.length > LIMITS.children) {
+        return `节点「${shortLabel(label)}」最多 ${LIMITS.children} 个子节点`;
+      }
 
-    for (const child of node.children) stack.push({ node: child, depth: depth + 1 });
+      for (const child of node.children) stack.push({ node: child, depth: depth + 1 });
+    }
   }
 
   // 附加边：只拦**后端会硬拒**的那两种（dangling 与自环），与契约
-  // `MindMapContent.validate_tree` 逐条对齐。
+  // `MindMapContent.validate_tree` / `FlowContent.validate_flow` 逐条对齐。
   //
   // 条数（>200）与环长（>12 节点）**不在这里拦**：后端把它们报成 warn 而不是
   // 拒绝，前端拦下来的话，一张从库里读出来的、有 250 条边的图就再也存不回去了
   // ——用户什么都没改，图却存不上。校验只该拦"服务端一定会拒"的东西。
+  //
+  // 端点按**形状自己的命名空间**查：树的边连节点，流程的边连阶段。用节点 id 去查
+  // 一张流程图的边，每一条都会变成"指向不存在的节点"，而那份图其实好得很。
+  const edgeSpace = isFlow(content)
+    ? new Set(containersOf(content).map(container => container.id))
+    : seen;
+  const edgeNoun = isFlow(content) ? '阶段' : '节点';
   const edgeIds = new Set<string>();
   for (const edge of edgesOf(content)) {
     if (edgeIds.has(edge.id)) return `边 ID 必须唯一（重复的是 ${edge.id}）`;
     edgeIds.add(edge.id);
-    if (!seen.has(edge.source) || !seen.has(edge.target)) {
-      const missing = !seen.has(edge.source) ? edge.source : edge.target;
-      return `附加关系 ${edge.id} 指向不存在的节点 ${missing}`;
+    if (!edgeSpace.has(edge.source) || !edgeSpace.has(edge.target)) {
+      const missing = !edgeSpace.has(edge.source) ? edge.source : edge.target;
+      return `附加关系 ${edge.id} 指向不存在的${edgeNoun} ${missing}`;
     }
-    if (edge.source === edge.target) return `附加关系 ${edge.id} 的起点与终点不能是同一个节点`;
+    if (edge.source === edge.target) return `附加关系 ${edge.id} 的起点与终点不能是同一个${edgeNoun}`;
     if (charLength(edge.label ?? '') > LIMITS.edgeLabel) {
       return `附加关系 ${edge.id} 的文字超过 ${LIMITS.edgeLabel} 个字`;
     }

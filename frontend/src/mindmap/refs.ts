@@ -222,10 +222,16 @@ export interface RefIndex {
  *
  * 正向链路（节点 → 引用）已经在详情面板里了；这里补反向，是因为用户读材料时
  * 更关心"这段话被用到哪去了"。按先序遍历建，列表顺序与大纲顺序一致。
+ *
+ * 第一参数吃**一个根或一组根**：鱼骨与流程是多棵并列子树（`shape.rootsOf` 给的就是
+ * 数组），而每条路径的起点是**它自己那棵子树的根**——一根骨里的引用不该在路径上
+ * 出现另一根骨的内容（与后端 `path_to` 同一条口径）。树那边传一个根，行为与以前
+ * 逐字节相同。
  */
-export function buildRefIndex(root: MindNode | null): RefIndex {
+export function buildRefIndex(root: MindNode | readonly MindNode[] | null): RefIndex {
   const index: RefIndex = { counts: {}, hits: {} };
   if (!root) return index;
+  const roots: readonly MindNode[] = Array.isArray(root) ? root : [root as MindNode];
 
   const walk = (node: MindNode, path: string[]) => {
     const trail = [...path, node.label];
@@ -239,6 +245,6 @@ export function buildRefIndex(root: MindNode | null): RefIndex {
     for (const child of node.children) walk(child, trail);
   };
 
-  walk(root, []);
+  for (const item of roots) walk(item, []);
   return index;
 }

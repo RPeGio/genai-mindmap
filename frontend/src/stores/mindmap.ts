@@ -3,11 +3,30 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
+import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
+import {
+  canvasEdgesOf,
+  canvasTreeOf,
+  containerNoun,
+  containerOfNode,
+  countNodesIn,
+  depthIn,
+  edgeEndpointLabel,
+  findIn,
+  findParentIn,
+  iterNodesIn,
+  isContainerRoot,
+  isTree,
+  kindOf,
+  pathToIn,
+  replaceContainer,
+  rootsOf,
+  stageOfNode,
+} from '../mindmap/shape';
 import { sourceInputError } from '../sources/input';
 import { useSourcesStore } from './sources';
 import { childSide, NODE_SIZE, type ChildSide, type Direction } from '../canvas/layout/tidy';
@@ -17,10 +36,8 @@ import {
   addEdge as addEdgeToContent,
   addSibling,
   charLength,
-  countNodes,
   edgesOf,
   findNode,
-  findParent,
   LIMITS,
   removeEdge as removeEdgeFromContent,
   removeNode,
@@ -140,14 +157,32 @@ export interface ScopedChange extends CandidateChange {
   inSelection: boolean;
 }
 
-/** 一棵树的索引：id → 节点与父 id。前序遍历，`parentId` 为 null 的是根。 */
-function indexTree(root: MindNode): Map<string, { node: MindNode; parentId: string | null }> {
+/**
+ * `MindNode` 还是 `MindNode[]`：这两种都表示"一批并列的子树"。
+ *
+ * 单独抽出来是因为 `diffCandidate` / `selectionScope` 要对**两份**输入各做一次归一，
+ * 写在两个函数里就是两行一样的 `Array.isArray`——而它们迟早会在"传进来是不是数组"
+ * 这件事上分叉（一个允许 `null`、另一个忘了）。
+ */
+function asRoots(value: MindNode | readonly MindNode[]): readonly MindNode[] {
+  return Array.isArray(value) ? value : [value as MindNode];
+}
+
+/**
+ * 多棵**并列**子树的索引（鱼骨的六根骨、流程的各阶段）。
+ *
+ * 树只有一棵，`indexForest([root])` 与原来的 `indexTree(root)` 逐格相同（每棵子树
+ * 的根都是 `parentId: null`），所以树的 diff 结果一条都不该变。
+ */
+function indexForest(
+  roots: readonly MindNode[],
+): Map<string, { node: MindNode; parentId: string | null }> {
   const out = new Map<string, { node: MindNode; parentId: string | null }>();
   const walk = (node: MindNode, parentId: string | null) => {
     out.set(node.id, { node, parentId });
     for (const child of node.children) walk(child, node.id);
   };
-  walk(root, null);
+  for (const root of roots) walk(root, null);
   return out;
 }
 
@@ -190,10 +225,13 @@ function nodeFieldChanges(before: MindNode, after: MindNode): string[] {
  * 没有基线返回 `null` 而不是"全部节点都是新增"：一张 80 节点的图会得到 80 条
  * "新增"，那不是 diff，是把整棵树重念一遍。
  */
-export function diffCandidate(base: MindNode | null, next: MindNode): CandidateChange[] | null {
+export function diffCandidate(
+  base: MindNode | readonly MindNode[] | null,
+  next: MindNode | readonly MindNode[],
+): CandidateChange[] | null {
   if (!base) return null;
-  const before = indexTree(base);
-  const after = indexTree(next);
+  const before = indexForest(asRoots(base));
+  const after = indexForest(asRoots(next));
   const changes: CandidateChange[] = [];
 
   for (const [id, entry] of after) {
@@ -297,16 +335,20 @@ export function diffEdges(
  * 空选区返回空集（`withinScope` 据此一律判 false，界面也不显示这个标记）。
  */
 function selectionScope(
-  before: MindNode | null, next: MindNode, ids: readonly string[],
+  before: MindNode | readonly MindNode[] | null,
+  next: MindNode | readonly MindNode[],
+  ids: readonly string[],
 ): Set<string> {
   const scope = new Set<string>();
   if (ids.length === 0) return scope;
-  for (const root of [before, next]) {
-    if (!root) continue;
-    for (const id of ids) {
-      const hit = findNode(root, id);
-      if (!hit) continue;
-      for (const owned of subtreeIds(hit)) scope.add(owned);
+  for (const group of [before, next]) {
+    if (!group) continue;
+    for (const root of asRoots(group)) {
+      for (const id of ids) {
+        const hit = findNode(root, id);
+        if (!hit) continue;
+        for (const owned of subtreeIds(hit)) scope.add(owned);
+      }
     }
   }
   return scope;
@@ -584,6 +626,14 @@ export type RenderKind = 'content' | 'preview';
 
 interface RenderSource {
   root: MindNode;
+  /**
+   * 布局用的合成根 id（见 `shape.canvasTreeOf`）。树型恒为 `null`。
+   *
+   * 这个节点**不在 content 里**：它只在画布上代表"鱼头 / 流程起点"。所以它不可选中
+   * （选中会让详情面板对着一个 `findIn()` 找不到的 id 说话），也不参与层号、
+   * 节点计数与编辑。
+   */
+  syntheticId: string | null;
   kind: RenderKind;
   /** 预览节点的可展开性（派生 id → expandable）；非预览时是空表。 */
   expandable: Map<string, boolean | null>;
@@ -622,7 +672,31 @@ export const useMindMapStore = defineStore('mindmap', () => {
   // 只为了在收到 `sources` 帧时把来源 id 换成持久 id（见 runGeneration）。
   // 依赖方向是单向的：sources 不认识 mindmap，反过来才会。
   const sourcesStore = useSourcesStore();
+  /**
+   * 画布上那份内容。
+   *
+   * **声明类型是 `MindMapContent`，运行时可能装着鱼骨图或流程图。** 这不是笔误：
+   * 全仓几十处既有读点（以及 700 多条用例）全都按树读 `content.root`，把声明换成
+   * 联合类型会让"树的这条路径"在一夜之间多出上百处 narrowing 噪音，而真正需要按
+   * 形状分派的地方（渲染、遍历、定位、写回、校验）已经全部收进 `mindmap/shape.ts`
+   * 了。两件事因此定死：
+   *
+   *  1. 装内容一律走 `slot()`（唯一一处有意的类型断言，见它的注释）；
+   *  2. **新代码不要再直接摸 `content.root`**——判形状用 `kindOf()`，取值用
+   *     `findIn()` / `rootsOf()` / `containerOfNode()`，布局用 `canvasTreeOf()`。
+   */
   const content = ref<MindMapContent | null>(null);
+
+  /**
+   * 把任意一种形状装进 `content`。
+   *
+   * 这是全仓**唯一**一处"类型说树、实际可能是别的形状"的断言，收在一个函数里是为了
+   * 让它可数、可查：任何一次新的内容赋值出现在别处，都该被当成"绕过了形状分派"来
+   * 审。运行时不做任何转换——三种形状原样装进去，`shape.ts` 按形状自己认得出来。
+   */
+  function slot(next: DiagramContent | null): MindMapContent | null {
+    return next as MindMapContent | null;
+  }
   /**
    * 这张图是怎么来的。顶栏那一小块徽标按它换文案。
    *
@@ -700,7 +774,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 本身会返回空数组（整棵树都是新的，不是 diff）——那条判断在 `diffEdits` 里。
    */
   let editBase: {
-    content: MindMapContent | null;
+    content: DiagramContent | null;
     actor: EditActor;
     runId?: string;
   } | null = null;
@@ -728,7 +802,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 所以它的对错只影响"这一轮生成有没有拼对"，不影响"用户的作品是什么"——那件事
    * 到 `commitGenerated` 那一刻才发生，且可撤销。
    */
-  const draft = ref<MindMapContent | null>(null);
+  const draft = ref<DiagramContent | null>(null);
 
   /**
    * 生成开始那一刻的画布引用。**只在一轮运行里有意义**，用于两件事：
@@ -741,7 +815,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 抄引用而不是深拷贝：`applyContent` 每次整体替换 `content.value`，旧树不会被
    * 后续修改带跑（与 `editBase` 同一条理由）。
    */
-  let generationBase: MindMapContent | null = null;
+  let generationBase: DiagramContent | null = null;
   /** 生成开始时的 `clientRevision`，完成时用来判"期间画布被改过"。 */
   let generationBaseRevision = 0;
 
@@ -1178,8 +1252,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 这一次展开就没有预览——那比画一条错的链好。
    */
   function seedExpandPreview(nodeId: string): boolean {
-    const root = content.value?.root;
-    if (!root) return false;
+    const current = content.value;
+    if (!current) return false;
+    // 索引链是"根 → 第 i 个子节点"的坐标语言，只有树有。鱼骨与流程的顶层容器
+    // 不是节点，那条链落不到任何位置上——宁可没有预览，也不给一个错位置
+    // （与后端 `shapes.index_path` 对非树返回 `None` 同一条口径）。
+    if (!isTree(current)) return false;
+    const root = current.root;
     const path = indexPathOf(root, nodeId);
     if (!path) return false;
 
@@ -1254,15 +1333,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const renderSource = computed<RenderSource | null>(() => {
     if (content.value) {
+      // 树型拿到的是 `content.value.root` **这一个对象**（`canvasTreeOf` 里原样透传），
+      // 所以树布局的入参与返回值一个字节都没变；鱼骨/流程拿到的是一棵合成树
+      // （虚拟根 + 每个容器作为一级子节点），布局函数那边一行都不用改。
+      const tree = canvasTreeOf(content.value);
       return {
-        root: content.value.root, kind: 'content', expandable: NO_EXPANDABLE,
-        edges: edgesOf(content.value),
+        root: tree.root,
+        syntheticId: tree.synthetic ? tree.root.id : null,
+        kind: 'content',
+        expandable: NO_EXPANDABLE,
+        // 画布用的边：流程图的阶段跳转在这里换成阶段入口节点的 id（见 `canvasEdgesOf`）。
+        // 侧栏与删除仍然读 `contentEdges`，那是内容真相。
+        edges: canvasEdgesOf(content.value),
       };
     }
     if (agentPreview.value) {
       const expandable = new Map<string, boolean | null>();
       const root = previewSubtree(agentPreview.value, [], expandable);
-      return { root, kind: 'preview', expandable, edges: [] };
+      return { root, syntheticId: null, kind: 'preview', expandable, edges: [] };
     }
     return null;
   });
@@ -1396,6 +1484,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     return flatNodes.value.map(({ node, depth }) => {
       const point = current.positions.get(node.id) ?? { x: 0, y: 0 };
+      // 合成根（鱼头 / 流程起点）只画不选：它不在 content 里，选中它会让详情面板、
+      // 面包屑、`expand` 请求一起对着一个 `findIn()` 找不到的 id 说话。
+      const inContent = node.id !== source.syntheticId;
 
       // 子节点在哪几侧，就在哪几侧留出口（双向布局里根的两边都有）。
       const outSides: ChildSide[] = [];
@@ -1432,14 +1523,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
         connectable: false,
         // 预览不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
         // 空内容说话，expand 请求也会把后端不认识的 id 发回去。
-        selectable: editable,
+        selectable: editable && inContent,
         // 选中态由 store 说了算。只在点击时靠 Vue Flow 自己切换的话，代码里改选中
         // （加节点、删节点后跳到父节点）画布上看不出来，用户会以为还停在原来那个节点上。
         // 不可编辑时一律不显示选中：残留的 selectedId 可能正好撞上预览里的同名 id。
         //
         // 多个节点一起高亮而不是只高亮主选区：「改这张图」吃的是整个选区，
         // 只亮一个的话，用户圈完三个节点看不出另外两个算不算数。
-        selected: editable && selectedIds.value.includes(node.id),
+        selected: editable && inContent && selectedIds.value.includes(node.id),
         position: {
           x: point.x - NODE_SIZE.width / 2,
           y: point.y - NODE_SIZE.height / 2,
@@ -1539,7 +1630,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
     return out;
   });
 
-  const nodeCount = computed(() => flatNodes.value.length);
+  /**
+   * 画布上有几个节点（界面上那个「N 个节点」）。
+   *
+   * 用 content 自己的口径（`countNodesIn`）而不是 `flatNodes.length`：鱼骨与流程的
+   * 布局树上多一个**不在 content 里**的合成根，拿扁平表计数会让顶栏说"23 个节点"
+   * 而实际内容是 22 个。树型两者相等，一个数都不会变。
+   *
+   * 画布本来为空时 `content` 是 null，这时退回扁平表——生成中的预览树还是照旧数
+   * 它自己（那正是"节点一个一个长出来"的反馈）。
+   */
+  const nodeCount = computed(() => (
+    content.value ? countNodesIn(content.value) : flatNodes.value.length
+  ));
 
   /**
    * 详情面板要显示的节点。
@@ -1563,7 +1666,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (!all) return [];
     const primary = selectedId.value;
     const extra = extraSelectedIds.value.filter(
-      id => id !== primary && findNode(all.root, id) !== null,
+      id => id !== primary && findIn(all, id) !== null,
     );
     return primary ? [primary, ...extra] : extra;
   });
@@ -1591,11 +1694,30 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 侧栏只用这一份而不是全量：一张流程图可能有几十条线，全列出来用户得自己在
    * 里面找"这条跟选中的节点有关系吗"。而"改这条线 / 删这条线"的操作入口，本来看
    * 的就是选中节点周围那几条。
+   *
+   * 流程图里两个命名空间都要认：`FlowContent.edges` 的端点是**阶段 id**，而画布上
+   * 选中的是阶段里的某个**步骤**。只按节点 id 比的话，一张流程图的每条边都不在
+   * 列表里——用户加完线之后再也删不掉它。
    */
   const selectedEdges = computed<MindEdge[]>(() => {
     const id = selectedId.value;
-    if (!id) return [];
-    return contentEdges.value.filter(edge => edge.source === id || edge.target === id);
+    if (!id || !content.value) return [];
+    const stage = stageOfNode(content.value, id);
+    return contentEdges.value.filter(edge => (
+      edge.source === id || edge.target === id
+      || (stage !== null && (edge.source === stage || edge.target === stage))
+    ));
+  });
+
+  /**
+   * 边端点 id → 显示名（节点标题；流程的边给阶段根节点的标题）。
+   *
+   * 两个命名空间混在同一份列表里显示，所以查找要按形状回退——只查节点的话，
+   * 流程图每一条边都会显示成 `s_xxx → s_yyy`。
+   */
+  const edgeNameOf = computed(() => {
+    const current = content.value;
+    return (id: string) => (current ? edgeEndpointLabel(current, id) : id);
   });
 
   /**
@@ -1604,7 +1726,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 只从 `content` 算：画布上可能正画着预览节点，把它们算进引用统计会让
    * 左侧说"被 5 个节点引用"、而其中 3 个根本不在导图里。
    */
-  const refIndex = computed(() => buildRefIndex(content.value?.root ?? null));
+  const refIndex = computed(() => buildRefIndex(content.value ? rootsOf(content.value) : null));
 
   /**
    * **这次生成改了什么**：生成落地那一刻算好的一份静态快照；没有基线时为 `null`。
@@ -1639,7 +1761,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 这是"删掉候选层"之后唯一保留的裁决界面，而它的性质与候选不同：候选挡在每一次
    * 生成前面，它只在数据要丢的时候出现。
    */
-  const conflictDraft = ref<{ next: MindMapContent; meta: GenerateMeta } | null>(null);
+  const conflictDraft = ref<{ next: DiagramContent; meta: GenerateMeta } | null>(null);
 
   /**
    * 最近一次落到画布的那棵树的**引用**（不是副本）。
@@ -1648,7 +1770,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 便宜，而且正好是那个语义——画布上还是生成的结果本身，说明撤销栈顶就是生成前
    * 那棵树；用户改过之后引用变了，那时"撤销一步"只是退掉他自己的一次编辑。
    */
-  let generatedContent: MindMapContent | null = null;
+  let generatedContent: DiagramContent | null = null;
 
   /**
    * `generatedChanges` 里落在「这次生成带上去的选区」中的那些。
@@ -1671,21 +1793,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const focusTick = ref(0);
 
-  /** 从根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
+  /** 从容器根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
   const breadcrumb = computed<MindNode[]>(() => {
     const target = selectedId.value;
     if (!content.value || !target) return [];
-    const path: MindNode[] = [];
-    const walk = (node: MindNode): boolean => {
-      path.push(node);
-      if (node.id === target) return true;
-      for (const child of node.children) {
-        if (walk(child)) return true;
-      }
-      path.pop();
-      return false;
-    };
-    return walk(content.value.root) ? path : [];
+    // 链首是**它所在那棵子树的根**：鱼骨图里一个原因的祖先链里不该出现另一根骨
+    // 的内容（与后端 `shapes.path_to` 同一条口径）。
+    return pathToIn(content.value, target) ?? [];
   });
 
   const canUndo = computed(() => past.value.length > 0);
@@ -1769,7 +1883,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 不在这里截断：截断发生在提交那一刻（`save()`），这样"超了多少条"能如实上报；
    * 在这里截掉的话，超出的部分连数都不知道。
    */
-  function collectEdits(after: MindMapContent | null, at = new Date().toISOString()) {
+  function collectEdits(after: DiagramContent | null, at = new Date().toISOString()) {
     const base = editBase;
     editBase = null;
     if (!base) return;
@@ -1801,7 +1915,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 选中的节点可能已被删掉：兜底清空，免得详情面板指向不存在的节点。 */
   function ensureSelection() {
     const target = selectedId.value;
-    if (target && content.value && !findNode(content.value.root, target)) {
+    if (target && content.value && !findIn(content.value, target)) {
       setPrimary(null);
     }
   }
@@ -1815,7 +1929,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 否则详情面板和编辑框会继续对着空白画布说话。
    */
   function restoreSnapshot(snap: string) {
-    const parsed = JSON.parse(snap) as MindMapContent | null;
+    const parsed = slot(JSON.parse(snap) as DiagramContent | null);
     content.value = parsed;
     if (!parsed) {
       setPrimary(null);
@@ -1824,7 +1938,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   function applyContent(
-    next: MindMapContent,
+    next: DiagramContent,
     history: boolean,
     actor: EditActor = 'user',
   ): boolean {
@@ -1835,7 +1949,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 代价由 `commitGenerated` 的冲突判定兜住：期间改过（`clientRevision` 变了）
     // 就**不覆盖**，两棵树都留着让用户选。这里一个字都不用判。
     if (history) pushHistory(actor);
-    content.value = next;
+    content.value = slot(next);
     dirty.value = true;
     clientRevision.value += 1;
     // 改动已经落地，这时候才比得出差：`pushHistory()` 抄下的那棵树 vs `next`。
@@ -1845,14 +1959,21 @@ export const useMindMapStore = defineStore('mindmap', () => {
     return true;
   }
 
-  /** 节点深度，1 起算（与契约的"最多 8 层"同一口径）。 */
+  /**
+   * 节点深度，1 起算（与契约的"最多 8 层"同一口径）。
+   *
+   * 直接读 `shape.depthIn` 而不是扁平表：鱼骨与流程的布局树上多一层合成根，拿
+   * `flatNodes` 的 depth 数出来的层号会整体偏 1（一根骨会被算成第 2 层），于是
+   * "最多 8 层"在鱼骨图上前 7 层就开始拦。
+   */
   function depthOfId(id: string): number | null {
+    if (content.value) return depthIn(content.value, id);
     const hit = flatNodes.value.find(entry => entry.node.id === id);
     return hit ? hit.depth + 1 : null;
   }
 
   function beginEdit(id: string) {
-    if (!content.value || !findNode(content.value.root, id)) return;
+    if (!content.value || !findIn(content.value, id)) return;
     setPrimary(id);
     editingId.value = id;
   }
@@ -1863,7 +1984,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function commitLabel(id: string, label: string) {
     if (!content.value) return;
-    const node = findNode(content.value.root, id);
+    const node = findIn(content.value, id);
     if (!node) return;
 
     const next = label.trim();
@@ -1882,7 +2003,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    if (!applyContent({ ...content.value, root: renameNode(content.value.root, id, next) }, true)) return;
+    // 写回按"定位到它所在的那棵子树、把子树当根改、再放回原位"（镜像后端
+    // `shapes.replace_node`）：`edits.ts` 那套纯函数因此一行都不用重写，鱼骨与流程
+    // 走的还是同一份实现。
+    const patched = replaceContainer(content.value, id, root => renameNode(root, id, next));
+    if (!applyContent(patched, true)) return;
     if (editingId.value === id) editingId.value = null;
     status.value = '已修改，记得保存。';
   }
@@ -1895,7 +2020,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   function commitNote(id: string, note: string | null) {
     if (!content.value) return;
-    const node = findNode(content.value.root, id);
+    const node = findIn(content.value, id);
     if (!node) return;
 
     const next = note?.trim() ?? '';
@@ -1906,7 +2031,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    if (!applyContent({ ...content.value, root: setNodeNote(content.value.root, id, next) }, true)) return;
+    const patched = replaceContainer(content.value, id, root => setNodeNote(root, id, next));
+    if (!applyContent(patched, true)) return;
     status.value = next ? '已修改正文，记得保存。' : '已清空正文，只保留标题，记得保存。';
   }
 
@@ -1925,7 +2051,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     patch: { color?: NodeColor | null; icon?: string | null },
   ): void {
     if (!content.value) return;
-    const node = findNode(content.value.root, id);
+    const node = findIn(content.value, id);
     if (!node) return;
 
     const nextColor = patch.color === undefined ? node.color ?? null : patch.color;
@@ -1938,10 +2064,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     if ((node.color ?? null) === nextColor && (node.icon ?? null) === nextIcon) return;
 
-    if (!applyContent(
-      { ...content.value, root: setNodeVisual(content.value.root, id, nextColor, nextIcon) },
-      true,
-    )) return;
+    const patched = replaceContainer(
+      content.value, id, root => setNodeVisual(root, id, nextColor, nextIcon),
+    );
+    if (!applyContent(patched, true)) return;
     status.value = '已修改样式，记得保存。';
   }
 
@@ -1970,11 +2096,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function addChildTo(parentId: string) {
     if (!content.value) return;
-    if (countNodes(content.value.root) >= LIMITS.nodes) {
+    if (countNodesIn(content.value) >= LIMITS.nodes) {
       status.value = `导图最多 ${LIMITS.nodes} 个节点`;
       return;
     }
-    const parent = findNode(content.value.root, parentId);
+    const parent = findIn(content.value, parentId);
     if (!parent) return;
     if (parent.children.length >= LIMITS.children) {
       status.value = `一个节点最多 ${LIMITS.children} 个子节点`;
@@ -1985,8 +2111,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    const { root, node } = addChild(content.value.root, parentId);
-    if (!applyContent({ ...content.value, root }, true)) return;
+    // 加到"某根骨 / 某个阶段"下与加到树节点下是同一件事：容器内的子树形状不变。
+    // 所以这里只换一个入口——拿容器自己的子树根去 `addChild`，再原位写回。
+    const container = containerOfNode(content.value, parentId);
+    if (!container) return;
+    const { root, node } = addChild(container.root, parentId);
+    const patched = replaceContainer(content.value, parentId, () => root);
+    if (!applyContent(patched, true)) return;
     setPrimary(node.id);
     editingId.value = node.id;
     status.value = '已加子节点，输入文字后按回车确认。';
@@ -2000,7 +2131,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function commitAndAddChild(label: string) {
     const id = editingId.value;
     if (!id) return;
-    const parent = content.value ? findParent(content.value.root, id) : null;
+    const parent = content.value ? findParentIn(content.value, id) : null;
     commitLabel(id, label);
     // 提交被拦下（空标题、超长）时编辑态还在，别在错误的基础上接着加节点。
     if (editingId.value === id) return;
@@ -2009,12 +2140,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function addSiblingTo(id: string) {
     if (!content.value) return;
-    if (countNodes(content.value.root) >= LIMITS.nodes) {
+    if (countNodesIn(content.value) >= LIMITS.nodes) {
       status.value = `导图最多 ${LIMITS.nodes} 个节点`;
       return;
     }
-    const parent = findParent(content.value.root, id);
-    // 根节点没有兄弟，退化成一个子节点；这时要按"加子节点"的规则校验层数与个数。
+    const parent = findParentIn(content.value, id);
+    // 容器根（骨 / 阶段 / 中心主题）没有兄弟，退化成一个子节点；这时要按"加子节点"
+    // 的规则校验层数与个数。
     if (!parent) {
       addChildTo(id);
       return;
@@ -2028,8 +2160,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    const { root, node } = addSibling(content.value.root, id);
-    if (!applyContent({ ...content.value, root }, true)) return;
+    const container = containerOfNode(content.value, id);
+    if (!container) return;
+    const { root, node } = addSibling(container.root, id);
+    const patched = replaceContainer(content.value, id, () => root);
+    if (!applyContent(patched, true)) return;
     setPrimary(node.id);
     editingId.value = node.id;
     status.value = '已加兄弟节点，输入文字后按回车确认。';
@@ -2037,29 +2172,38 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function deleteNode(id: string) {
     if (!content.value) return;
-    if (content.value.root.id === id) {
-      status.value = '根节点不能删除';
+    // 容器根删不得：树的中心主题删了就没这张图了，一根骨/一个阶段删了就不是鱼骨图/
+    // 流程图了。判据走形状（`isContainerRoot`），不看 `diagram_type` 字段。
+    if (isContainerRoot(content.value, id)) {
+      status.value = isTree(content.value)
+        ? '根节点不能删除'
+        : `${containerNoun(kindOf(content.value))}本身不能删除；它下面挂的内容可以删。`;
       return;
     }
 
-    // id 不在树上（预览的派生 id 会走到这里）就直接退出。
+    // id 不在内容里（预览的派生 id 会走到这里）就直接退出。
     // 交给 removeNode 的话它只会原样返回整棵树，而 applyContent 照样记一步历史、
     // 递增 clientRevision——用户什么都没删，撤销栈与生成冲突判定的账本却被改脏了。
-    if (!findNode(content.value.root, id)) return;
+    const doomedNode = findIn(content.value, id);
+    if (!doomedNode) return;
 
-    const parent = findParent(content.value.root, id);
+    const parent = findParentIn(content.value, id);
     // 连带删边：命中**这棵子树**任意节点的边全部消失，与后端 `_apply_remove` 同一
     // 语义。只清被点名的那一个节点的话，子孙身上的边会悬空，而 dangling 是契约层
     // 的硬拒——下一次保存就 422，用户却只是"删了一个节点"。
-    const doomed = subtreeIds(findNode(content.value.root, id)!);
-    const keptEdges = edgesOf(content.value).filter(
-      edge => !doomed.has(edge.source) && !doomed.has(edge.target),
-    );
-    const nextContent: MindMapContent = {
-      ...content.value,
-      root: removeNode(content.value.root, id),
-      edges: keptEdges,
-    };
+    //
+    // 只有树的边端点是**节点 id**。流程的边连的是阶段（`s_…`，另一个命名空间），
+    // 删阶段内一个节点碰不到任何一条边——这里的过滤对流程恒为空操作，正合契约。
+    const doomed = subtreeIds(doomedNode);
+    const removed = replaceContainer(content.value, id, root => removeNode(root, id));
+    const nextContent: DiagramContent = isTree(removed)
+      ? {
+        ...removed,
+        edges: edgesOf(removed).filter(
+          edge => !doomed.has(edge.source) && !doomed.has(edge.target),
+        ),
+      }
+      : removed;
     if (!applyContent(nextContent, true)) return;
     setPrimary(parent?.id ?? null);
     editingId.value = null;
@@ -2080,7 +2224,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     source: string, target: string, label?: string | null, kind?: EdgeKind | null,
   ): boolean {
     if (!content.value) return false;
-    if (!findNode(content.value.root, source) || !findNode(content.value.root, target)) {
+    if (!findIn(content.value, source) || !findIn(content.value, target)) {
       status.value = '端点节点不存在';
       return false;
     }
@@ -2088,7 +2232,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = `最多 ${LIMITS.edges} 条附加关系，请先删掉一些`;
       return false;
     }
-    let next: MindMapContent;
+    let next: DiagramContent;
     try {
       next = addEdgeToContent(content.value, source, target, label, kind).content;
     } catch (error) {
@@ -2152,7 +2296,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   let mapSession = 0;
 
-  function loadMap(next: MindMapContent, record: { id: string; version: number; updated_at: string }) {
+  function loadMap(next: DiagramContent, record: { id: string; version: number; updated_at: string }) {
     cancel();
     mapSession += 1;
     // 换了一张图，上一轮生成的工作副本与"改了什么"没有任何意义：留着它，一次
@@ -2164,7 +2308,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     conflictDraft.value = null;
     saving.value = false;
     titleDraft.value = null;
-    content.value = next;
+    content.value = slot(next);
     mapId.value = record.id;
     version.value = record.version;
     savedAt.value = record.updated_at;
@@ -2407,7 +2551,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 这里是不依赖渲染层的最后一道。
    */
   function select(id: string | null) {
-    if (id !== null && !(content.value && findNode(content.value.root, id))) return;
+    if (id !== null && !(content.value && findIn(content.value, id))) return;
     setPrimary(id);
   }
 
@@ -2421,7 +2565,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 用例与 `select` 同一条判据：只有 `content` 里真实存在的节点才进得来。
    */
   function toggleSelect(id: string): void {
-    if (!content.value || !findNode(content.value.root, id)) return;
+    if (!content.value || !findIn(content.value, id)) return;
     const rest = extraSelectedIds.value.filter(item => item !== id);
     if (selectedId.value === id) {
       const [promoted, ...remaining] = rest;
@@ -2472,7 +2616,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 不经过网络直接装载一份导图，开发期的示例选择器用它预览布局。
    * 走 cancel() 先掐掉在途请求，避免旧流回来后把示例顶掉。
    */
-  function preview(next: MindMapContent, dir: Direction) {
+  function preview(next: DiagramContent, dir: Direction) {
     cancel();
     // 换了一张图，会话必须跟着换：否则上一张图在途的保存响应回来时，
     // 会因为会话号没变而把它的 id 写进 mapId——画布上是新图、身份却是旧图，
@@ -2489,7 +2633,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 清理 saving，这里必须自己复位，否则新图永远卡在"保存中"，点保存
     // 只会返回 busy。loadMap / newMap / generate 都是同一套处理。
     saving.value = false;
-    content.value = withDirection(next, dir);
+    content.value = slot(withDirection(next, dir));
     mode.value = 'demo';
     setPrimary(null);
     editingId.value = null;
@@ -2522,7 +2666,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * `resetHistory()`：导入不是一个可以撤销的编辑步骤——撤销回到导入前就意味着
    * "把画布清空"，而那不是用户点撤销时想要的东西。
    */
-  function importMap(next: MindMapContent) {
+  function importMap(next: DiagramContent) {
     cancel();
     // 换图必须换会话号，否则上一张图在途的保存响应回来时会把它的 id 写进 mapId，
     // 而画布上是这张新导入的图——下次保存就把导入的内容 PUT 到旧记录上。
@@ -2536,7 +2680,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 与 preview 同一条：上一张图在途的保存作废，saving 必须自己复位，否则新图
     // 永远卡在"保存中"。
     saving.value = false;
-    content.value = next;
+    content.value = slot(next);
     mode.value = 'import';
     setPrimary(null);
     editingId.value = null;
@@ -2560,7 +2704,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   function loadPreset(preset: {
     label: string;
-    content: MindMapContent;
+    content: DiagramContent;
     direction: Direction;
   }) {
     preview(preset.content, preset.direction);
@@ -2667,6 +2811,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = '当前还没有导图，无法在此基础上修改。';
       return;
     }
+    // 鱼骨与流程还不能交给模型改：后端 `AgentRunRequest.snapshot` 只收树形状
+    // （`MindMapContent`，`extra="forbid"` 会把 `bones` / `stages` 拒成 422）。
+    // 拦在这里给一句能读懂的话，好过让用户等一轮之后收到一条后端校验错误。
+    if (intent !== 'create' && content.value && !isTree(content.value)) {
+      status.value = kindOf(content.value) === 'fishbone'
+        ? '鱼骨图还不能让模型改：后端目前只接受树形状的快照，这一步等它放宽之后才能用。'
+        : '流程图还不能让模型改：后端目前只接受树形状的快照，这一步等它放宽之后才能用。';
+      return;
+    }
 
     agentError.value = '';
     agentEvents.value = [];
@@ -2742,7 +2895,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 用户到底选了哪套拆解方式；值本身与后端默认一致，传了不影响结果。
         thinking_model: thinkingModel || 'default',
         // create 不能带 snapshot（后端开流前会 422）；另外两种必须带
-        snapshot: intent === 'create' ? null : content.value,
+        // 后端的 `AgentRunRequest.snapshot` 目前仍声明为 `MindMapContent | None`
+        // （`extra="forbid"`），鱼骨/流程原样发过去会被 422。这里只发树的形状：
+        // 非树内容在 `runGeneration` 开头就被拦下并给出一句人话，不会走到这里。
+        snapshot: intent === 'create' ? null : (content.value && isTree(content.value) ? content.value : null),
         // 选中节点是**上下文提示**，不是作用域限制：后端会把它拼进 system
         // （`service.selection_text`），说清"优先改这些节点及其子树，意图明显
         // 不限于它们时也允许改别处，但要在回复里说明"。所以这里是"我圈了谁"，
@@ -2946,7 +3102,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     /** `done` 帧的来历；`null` = 对面没填，落地时退回 `model`。 */
     mode: 'demo' | 'model' | null;
     /** 生成开始那一刻的画布，用来算"这次改了什么"、并进改动事件。 */
-    base: MindMapContent | null;
+    base: DiagramContent | null;
   }
 
   /**
@@ -2964,7 +3120,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *
    * 返回分类而不是布尔：调用方（面板/测试）要能区分"落地了""等用户裁决""数据不合法"。
    */
-  function commitGenerated(next: MindMapContent, meta: GenerateMeta, force = false): 'applied' | 'conflict' | 'invalid' | 'stale' {
+  function commitGenerated(next: DiagramContent, meta: GenerateMeta, force = false): 'applied' | 'conflict' | 'invalid' | 'stale' {
     // 换了图：`clientRevision` 判不出这件事（切图不递增），只有会话号能。
     // 装上去等于把上一张图的内容写进当前记录，还顶着它的 mapId。
     if (generationSession !== mapSession) {
@@ -3019,7 +3175,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // `generate` 那条对上，而它过了 `reportRunSaved()` 就没了。
       pushHistory('agent', meta.runId);
     }
-    content.value = next;
+    content.value = slot(next);
     // 改动与"这次生成"共享同一个 `at`：它是"一次操作产生了几条事件"的唯一分组
     // 依据（`GROUP BY at`），两次取时刻会让同一次生成被读成两次操作。
     const at = new Date().toISOString();
@@ -3031,21 +3187,29 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 「这次改了什么」——**落地瞬间冻结**。基线是生成开始那一刻的画布，不是此刻的
     // （此刻就是 next，比出来永远是空）。
     if (meta.base) {
-      const nodeChanges = diffCandidate(meta.base.root, next.root) ?? [];
+      // 两批并列子树（鱼骨的骨、流程的阶段）都要走同一套差：把 `rootsOf` 交进去，
+      // 树的 `[content.root]` 与它逐格等价，所以树的这份清单一个字都不会变。
+      const baseRoots = rootsOf(meta.base);
+      const nextRoots = rootsOf(next);
+      const nodeChanges = diffCandidate(baseRoots, nextRoots) ?? [];
       const names = new Map<string, string>();
-      for (const entry of flatten(next.root)) names.set(entry.node.id, displayTitle(entry.node));
+      for (const root of nextRoots) {
+        for (const entry of flatten(root)) {
+          names.set(entry.node.id, displayTitle(entry.node));
+        }
+      }
       const nameOf = (id: string) => names.get(id) ?? id;
       const changes: CandidateChange[] = [
         ...nodeChanges,
         ...diffEdges(edgesOf(meta.base), edgesOf(next), nameOf),
       ];
-      const scope = selectionScope(meta.base.root, next.root, generationSelection.value);
+      const scope = selectionScope(baseRoots, nextRoots, generationSelection.value);
       generatedChanges.value = changes.map(item => ({ ...item, inSelection: withinScope(item, scope) }));
-      generatedSummary.value = { nodes: countNodes(next.root), changes: changes.length };
+      generatedSummary.value = { nodes: countNodesIn(next), changes: changes.length };
     } else {
       // 画布本来是空的：整棵树都是新的，那不是 diff，是把整棵树重念一遍。
       generatedChanges.value = null;
-      generatedSummary.value = { nodes: countNodes(next.root), changes: null };
+      generatedSummary.value = { nodes: countNodesIn(next), changes: null };
     }
     generatedContent = next;
 
@@ -3081,10 +3245,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 哪几条事件"的唯一分组依据，两次 `new Date()` 会在慢机器上差出几毫秒，把一次
    * 生成拆成两次操作。
    */
-  function recordGeneration(after: MindMapContent, runId: string, at: string) {
+  function recordGeneration(after: DiagramContent, runId: string, at: string) {
     pendingEdits.value = [
       ...pendingEdits.value,
-      generateEvent(countNodes(after.root), { at, runId }),
+      generateEvent(countNodesIn(after), { at, runId }),
     ];
   }
 
@@ -3142,6 +3306,36 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const canUndoGenerate = computed(() => content.value !== null && content.value === generatedContent);
 
+  /**
+   * 画布上**能选中**的那些节点：扁平表去掉合成根（鱼头 / 流程起点）。
+   *
+   * 界面上有两处按节点列表工作（附加关系的下拉框、边端点的显示名），它们要的是
+   * "content 里真实存在的节点"。合成根不在 content 里，选中它 / 给它连线都会得到
+   * 一个 `findIn()` 找不到的 id，所以这里先摘掉；树型没有合成根，这张表与
+   * `flatNodes` 逐项相同。
+   */
+  const selectableNodes = computed<FlatNode[]>(() => {
+    const current = content.value;
+    // 没有 content 时画布上是预览：那棵树本来就全是节点（画布那边已设 `selectable: false`），
+    // 这里原样返回，界面不必再分一次叉。
+    if (!current) return flatNodes.value;
+    // 先建 id 集合再过滤（O(n)）：逐个 `findIn` 是 O(n²)，1000 节点的图每次重排
+    // 都要走一遍百万级的遍历。
+    const known = new Set<string>();
+    for (const node of iterNodesIn(current)) known.add(node.id);
+    return flatNodes.value.filter(entry => known.has(entry.node.id));
+  });
+
+  /**
+   * 这个节点是不是**某块区域的根**（中心主题 / 一根骨 / 一个阶段）。
+   *
+   * 界面上唯一需要它的地方是"删除"按钮的禁用态：删一根骨就不是鱼骨图了，而那件事
+   * 会在点的瞬间被 `deleteNode` 拒掉——按钮灰着比点一次再看一句提示便宜。
+   */
+  function isContainerRootId(id: string): boolean {
+    return content.value ? isContainerRoot(content.value, id) : false;
+  }
+
   return {
     content,
     mode,
@@ -3166,12 +3360,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
     dirty,
     layout,
     flatNodes,
+    // 可选中/可连线的节点（去掉合成根）：界面按节点列表工作的地方读它
+    selectableNodes,
+    isContainerRootId,
     nodes,
     edges,
     nodeCount,
     // 附加关系：当前树上的全部边 + 与"选中节点"相关的那几条（侧栏用）。
     contentEdges,
     selectedEdges,
+    // 边端点 id → 显示名：流程的边连的是阶段 id，只查节点会显示成一串 `s_xxx`
+    edgeNameOf,
     connectNodes,
     deleteEdge,
     selectedNode,

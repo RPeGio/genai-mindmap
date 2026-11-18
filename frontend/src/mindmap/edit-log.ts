@@ -63,8 +63,9 @@
  * 分母 `SUM(node_count) WHERE kind='generate'`，分子是该图上的节点改动条数，
  * 零改动次数是"那个 `run_id` 下一条改动事件都没有"的 generate 行数。
  */
-import type { MindEdge, MindMapContent, MindNode } from '../api/types';
-import { charLength } from './edits';
+import type { DiagramContent, MindEdge, MindNode } from '../api/types';
+import { charLength, edgesOf } from './edits';
+import { rootsOf } from './shape';
 
 /** 谁改的。`user` 是手工编辑（改文字、加节点、删节点、连线），`agent` 是生成落地。 */
 export type EditActor = 'user' | 'agent';
@@ -196,10 +197,19 @@ function fingerprint(children: readonly MindNode[]): string {
   return children.map(child => child.id).sort().join('\u0000');
 }
 
-function indexTree(root: MindNode): TreeIndex {
+/**
+ * 多棵**并列**子树的索引（鱼骨的六根骨、流程的各阶段）。
+ *
+ * 一份 `entries` 穿到底，所以"节点 id 全局唯一"这件事在索引里自动成立（后写的覆盖
+ * 先写的，与契约层"六棵骨里 id 必须唯一"同一条前提）。每棵子树各自从第 1 层数，
+ * 与 `_scan_tree` 的口径一致——一根骨挂在主骨上，但画布上它是从自己的根展开的一列。
+ *
+ * 树只有一棵，`indexForest([root])` 与原来的 `indexTree(root)` 完全等价（每一格都
+ * 一样，`index` 都是 0），所以树的日志一条都不该变。
+ */
+function indexForest(roots: readonly MindNode[]): TreeIndex {
   const entries = new Map<string, Indexed>();
   const siblingKeys = new Map<string, string>();
-  entries.set(root.id, { node: root, parentId: null, depth: 1, index: 0 });
 
   const walk = (node: MindNode, depth: number) => {
     siblingKeys.set(node.id, fingerprint(node.children));
@@ -208,7 +218,11 @@ function indexTree(root: MindNode): TreeIndex {
       walk(child, depth + 1);
     });
   };
-  walk(root, 1);
+
+  roots.forEach((root, index) => {
+    entries.set(root.id, { node: root, parentId: null, depth: 1, index });
+    walk(root, 1);
+  });
   return { entries, siblingKeys };
 }
 
@@ -268,10 +282,14 @@ export interface DiffOptions {
  *
  * `before` 或 `after` 为空（create 意图、空画布）时返回空数组：整棵树都是新的，
  * 不是 diff。见文件头那段"刻意不记"。
+ *
+ * 参数是 `DiagramContent`：鱼骨与流程是**多棵并列子树**，走 `indexForest(rootsOf())`。
+ * 树的节点、结构、边三条判据在两种非树形状下依然是同一套算法——"改了什么"与"这张图
+ * 按什么读"无关，日志里只需要节点 id、层号与父 id 这些两种形状都有的东西。
  */
 export function diffEdits(
-  before: MindMapContent | null,
-  after: MindMapContent | null,
+  before: DiagramContent | null,
+  after: DiagramContent | null,
   options: DiffOptions,
 ): EditEvent[] {
   if (!before || !after) return [];
@@ -292,8 +310,8 @@ export function diffEdits(
     emit({ kind: 'update', field: 'title', before: oldTitle, after: newTitle });
   }
 
-  const oldIndex = indexTree(before.root);
-  const newIndex = indexTree(after.root);
+  const oldIndex = indexForest(rootsOf(before));
+  const newIndex = indexForest(rootsOf(after));
 
   for (const [id, entry] of newIndex.entries) {
     const old = oldIndex.entries.get(id);
@@ -369,8 +387,8 @@ export function diffEdits(
     });
   }
 
-  const oldEdges = new Map((before.edges ?? []).map(edge => [edge.id, edge]));
-  const newEdges = new Map((after.edges ?? []).map(edge => [edge.id, edge]));
+  const oldEdges = new Map(edgesOf(before).map(edge => [edge.id, edge]));
+  const newEdges = new Map(edgesOf(after).map(edge => [edge.id, edge]));
 
   for (const [id, edge] of newEdges) {
     const previous = oldEdges.get(id);

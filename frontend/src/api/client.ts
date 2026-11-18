@@ -10,7 +10,7 @@ import type {
   LibraryList,
   LibrarySource,
   MapRecord,
-  MindMapContent,
+  DiagramContent,
   Pref,
   PrefSuggestion,
   RunDetail,
@@ -132,11 +132,11 @@ function toEventPayload(event: EditEvent): EditEventPayload {
  * 等下次），只在真的发生时才发：后端据此记一条 warning，不落表。
  */
 function saveBody(
-  content: MindMapContent,
+  content: DiagramContent,
   events: readonly EditEvent[],
   truncated: number,
-): { content: MindMapContent; events?: EditEventPayload[]; truncated?: number } {
-  const body: { content: MindMapContent; events?: EditEventPayload[]; truncated?: number } = {
+): { content: DiagramContent; events?: EditEventPayload[]; truncated?: number } {
+  const body: { content: DiagramContent; events?: EditEventPayload[]; truncated?: number } = {
     content,
   };
   if (events.length) body.events = events.map(toEventPayload);
@@ -146,7 +146,7 @@ function saveBody(
 
 /** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
 export function createMindMap(
-  content: MindMapContent,
+  content: DiagramContent,
   events: readonly EditEvent[] = [],
   truncated = 0,
 ): Promise<MapRecord> {
@@ -165,7 +165,7 @@ export function createMindMap(
  */
 export function updateMindMap(
   id: string,
-  content: MindMapContent,
+  content: DiagramContent,
   version: number,
   events: readonly EditEvent[] = [],
   truncated = 0,
@@ -447,7 +447,7 @@ export function exportFilename(format: ExportFormat, title: string): string {
 
 export async function exportMindMap(
   format: ExportFormat,
-  content: MindMapContent,
+  content: DiagramContent,
 ): Promise<string> {
   let response: Response;
   try {
@@ -469,7 +469,7 @@ export async function exportMindMap(
 // ---- 导入 ----
 
 /**
- * 上传一个已有的思维导图文件，由后端识别格式并解析成 `MindMapContent`。
+ * 上传一个已有的思维导图文件，由后端识别格式并解析成一份 `DiagramContent`。
  *
  * 与 `uploadDocument` 同一个形状（multipart 不能走 `request()`：它固定带
  * `Content-Type: application/json`，而 multipart 的 boundary 必须由浏览器生成）。
@@ -495,8 +495,10 @@ export async function importMindMap(
   if (!response.ok) throw await toApiError(response);
 
   const body = (await response.json().catch(() => null)) as ImportResult | null;
-  if (!body?.content?.root) {
+  if (!body?.content) {
     // 契约里失败一定走 400；拿到空壳说明后端出了问题，别把 undefined 塞进画布。
+    // 这里判的是"有没有 content"，不是"有没有 content.root"：导入的产物可能是
+    // 鱼骨图或流程图，那两个顶层结构上没有 `root`。
     throw new ApiError(response.status, 'empty_import', '后端没有返回解析结果，请重试。');
   }
   return body;
