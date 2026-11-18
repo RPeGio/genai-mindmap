@@ -32,6 +32,7 @@ import pytest
 from app.agent import tools as tools_module
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
+    DETAIL_ONLY_PROMPT,
     EXTERNAL_KNOWLEDGE_ENV,
     EXTERNAL_SEARCH_STAGE,
     PLAN_PROMPT,
@@ -47,6 +48,13 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 
 TOPIC = "碳中和"
 BRANCHES = ("政策", "技术路径", "企业案例")
+
+# 第三段（只写说明）的返回正文。长度按提示词的目标区间（80–150 字）写：这一段在
+# 用例里要验的是"说明按 id 对号落回树上"，写一句短语会把断言变成在测兜底。
+_DETAIL_TEXT = (
+    "这里是一段写到八十个字以上的具体说明：它说清这个要点是什么、怎么做、"
+    "在什么条件下成立，并给出可以核对的数字或判断标准，而不是把标题换一种说法。"
+)
 
 # 外部命中的正文：三节分别对上三条一级分支的标题，BM25 才可能按支召回。
 # 标题行是刻意的——真实抓回来的维基正文就长这样，而切块器按标题行切。
@@ -183,9 +191,11 @@ def _codes(result) -> list[str]:
 
 def _tree_chat(seen: list[tuple[str, str]] | None = None,
                branches: tuple[str, ...] = BRANCHES):
-    """模型替身：骨架给 `branches`，生成那一次写出整棵树（每支两个要点）。
+    """模型替身：骨架给 `branches`，结构那一次写出整棵树（每支两个要点），
+    第三段（只写说明）按 id 回一份说明。
 
-    生成调用**只发一次**——这正是这条路与分片的全部差别，用例据此断言。
+    结构与说明是**两次**调用（见 `tools._fill_details`）：结构那次只写 id / label /
+    引用，说明由第三次调用按节点 id 逐个写回。用例据此断言调用次数。
     引用照抄**本支**分组的第一个命中：收尾的逐字校验会剔掉编造的引用，而这条
     用例要验的正是"证据的引用活到了候选树上"。
     """
@@ -194,6 +204,11 @@ def _tree_chat(seen: list[tuple[str, str]] | None = None,
             seen.append((system, user))
         if system.startswith(PLAN_PROMPT):
             return {"branches": list(branches)}
+        if system.startswith(DETAIL_ONLY_PROMPT):
+            # 只回 id → 说明；结构、引用一个都不碰（真实模型这一轮也只该回这个形状）
+            ids = [line.split("id=", 1)[1].split("｜", 1)[0]
+                   for line in user.splitlines() if "id=" in line]
+            return {node_id: _DETAIL_TEXT for node_id in ids}
         groups = _evidence_groups(user)
         children = []
         for index, title in enumerate(branches):
@@ -213,8 +228,15 @@ def _tree_chat(seen: list[tuple[str, str]] | None = None,
 
 
 def _generate_users(seen: list[tuple[str, str]]) -> list[str]:
-    """所有非骨架的 user 消息（这条路只该有一条）。"""
-    return [user for system, user in seen if not system.startswith(PLAN_PROMPT)]
+    """结构那一次的 user 消息（这条路只该有一条）。
+
+    **不含第三段**（只写说明）：那一次的 system 是 `DETAIL_ONLY_PROMPT`，它拿到的
+    是 id / label / 层级的清单，不是"这次要写整棵树"的请求。混在一起数，会把
+    "结构只写一次"这条断言变成"两份 user 里有一份像"，而两者要验的是不同的事。
+    """
+    return [user for system, user in seen
+            if not system.startswith(PLAN_PROMPT)
+            and not system.startswith(DETAIL_ONLY_PROMPT)]
 
 
 # ---------------------------------------------------------------- 1. 注册表只有一次生成

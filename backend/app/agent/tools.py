@@ -3,9 +3,9 @@
 注册表只负责分派与参数校验，业务逻辑在各个 `_xxx` 函数里。
 
 四个工具的划分照「用户意图 + 作用域」而不是 CRUD 动词：
-- `mindmap_generate` 只在没有导图时可用：**骨架一次 → 每支检索一次 → 内容一次
-  写完**（理由与该改动的三条实测依据见该函数的 docstring）。它是 `create` 唯一
-  注册的生成路
+- `mindmap_generate` 只在没有导图时可用：**骨架一次 → 每支检索一次 → 结构一次
+  写完 → 只写说明一次**（理由与该改动的三条实测依据见该函数的 docstring）。它是
+  `create` 唯一注册的生成路
 - `mindmap_generate_deep` 是分片生成（骨架 → 并发展开 → 验收 → 局部重试）。
   **代码与规格都在，但不注册到 `create`**：它服务的是"一次响应写不下 200+ 节点"
   的大图，70 余个既有用例钉着它的行为，需要时把名字加回 `_ALLOWED_BY_INTENT`
@@ -383,6 +383,12 @@ EXTERNAL_HIT_LIMIT = external_knowledge.DEFAULT_LIMIT
 # 取 `"external_search"` 而不是中文：它是**标识**不是文案，要出现在 SSE 帧、日志与
 # 用例断言里；给人看的那句话在 `detail`（"正在检索外部资料…"），改文案不该动它。
 EXTERNAL_SEARCH_STAGE = "external_search"
+
+# 第三段（只写 detail）的 `stage` 帧标识。它存在的理由与外部检索那一对同源：这一段
+# 实测要 24–46 秒，而**界面上一个节点都不长**（`node_grow` 属于结构那一次）——用户
+# 看到的是"树长完了，然后卡住半分钟"。帧形状与外部检索完全一样（开始一帧没有
+# `count`、结束一帧带条数），所以前端不用为它分叉。
+DETAIL_STAGE = "detail"
 
 # 材料总字数低于这个值时不走材料路径，改成"把短材料当主题提示 + 走外部检索/纯主题"
 # （`_generate_deep` 的退化规则，话术见 `MATERIAL_TOO_SHORT`）。
@@ -2280,16 +2286,26 @@ SKELETON_TREE_RULES = (
     "根节点下必须恰好是这几条，顺序、名称都不改，不增不减。"
     "每条分支只写它标题说的范围，同一件事不要挂在两条分支下——"
     "重复的内容会被画成两块，用户还要自己删一个。"
-    # 下面这两句是这条路**唯一的质量风险**的补丁：一次写几十个节点时，模型会在
-    # 后面几支上开始节约。**实测它没有效果**（deepseek-chat：加之前 detail 平均
-    # 45/28 字，加之后 28.5/26.2 字，同一水平）——瓶颈不是提示词，是一次输出里要塞
-    # 几十段说明（数字与两条路的对比见 `docs/ONE-CALL.md`）。留着是因为它把要求写成
-    # 了可数的数字，换模型或换输出预算时可能有用；真要把 detail 拿回来，得加一段
-    # 只写说明的调用，那是另一件事。
-    "\n每个节点的 detail 写满 2–3 句、**不少于 60 字**的具体说明（是什么、怎么做、"
-    "有什么条件或数字）；不要只写一句短语，也不要用「简要说明」「详见教材」这类"
-    "占位话。这一次要在一份响应里写完所有分支，写到后面容易越写越短——"
-    "输出之前回头看一眼前面几支的详细程度，保持一样。\n"
+    # 泛化标题也会被判成重复（`_cross_branch_duplicates` 只做空白折叠，不做语义归一，
+    # 这是"宁可漏、不误报"的那一半）：实测 6 次采样里有 4 次出现同一个「典型应用」
+    # 挂在三条分支下，那 3 个节点全部计入跨支重复。所以这里点名要求换一个更具体的
+    # 标题——它同时也让说明更好写（"典型应用"这四个字本身没有可写的内容）。
+    "不要在多条分支下挂同一个泛化标题（「典型应用」「常见问题」「训练与评估」这类）："
+    "需要交叉指认时换成更具体的写法，或者直接指向已有节点。\n"
+    # **这一轮不写说明**：说明由紧接着的第三段统一写（`DETAIL_ONLY_PROMPT`）。
+    #
+    # 上一版在这里写的是"每个节点的 detail 不少于 60 字"，实测无效（deepseek-chat：
+    # 加之前 detail 平均 45/28 字，加之后 28.5/26.2 字，反而更短）——瓶颈不是提示词，
+    # 是一次输出里要塞几十段说明，注意力被摊薄，而且越写到后面越短（第 1 支 27.5 字
+    # → 第 5 支 23.6 字）。所以这里改成**明确不写**：结构那一轮只花 token 写 id 与
+    # label，说明交给一次只写说明的调用（数字见 `docs/ONE-CALL.md` 的三段式一节）。
+    #
+    # 必须写成"空字符串"而不是"写短一点"：后者模型会写一句短语，而那些短语既不会
+    # 被第三段覆盖（`_needs_detail` 的判据是长度，一句短语通常仍在阈值下，但口径
+    # 就模糊了），也解释不了"为什么这一段这么短"。
+    "\n**这一轮不要写 detail**：每个节点的 detail 一律给空字符串 \"\"，"
+    "说明由紧接着的一次调用统一补写。省下来的输出额度用在结构上："
+    "该拆的层要拆够、每条分支的要点要写全。\n"
 )
 
 # 有证据时拼在 `DETAIL_PROMPT` 之后的那一段。与 `BRANCH_EVIDENCE_RULES` 是同一份
@@ -2317,6 +2333,577 @@ BRANCHED_EVIDENCE_RULES = (
 # 八组、每组形状一样，不带归属的话模型无法知道哪一条命中对应哪一支（这正是分片
 # 那条路不需要、而整树这条路必须解决的问题）。
 EVIDENCE_SECTION_HEADER = "第 {index} 支「{title}」的检索结果（evidence 数组）："
+
+
+# ---------------------------------------------------------------- 第三段：只写 detail
+#
+# 为什么要有这一段：把"骨架 + 每支的结构 + 每段说明"塞进一次输出时，模型的注意力
+# 被几十段说明摊薄——五采样 detail 平均 45.3/28.0/28.5/26.2/27.4 字，越往后越短，
+# 而在 system 里加"不少于 60 字"反而更短（28.5 → 26.2）。瓶颈不是提示词，是同一次
+# 输出里的并发任务太多。第三段把"想结构"整个拿走：user 里给的就是一张定好的
+# id / label / 层级路径清单，它只需要逐个写说明。
+#
+# 原型实测（60 个短 detail 节点，一次调用全部返回）：平均 114.4 字、最短 96、
+# 0 条不足 40。
+#
+# 两个数字各管一件事，**不能合并**：
+#   - `DETAIL_MIN_CHARS` / `DETAIL_MAX_CHARS` 是**这一轮要写多长**（写进提示词的
+#     目标区间）；
+#   - `DETAIL_FILL_FLOOR` 是**哪些节点需要补**（代码侧判据）。取 40 是因为它就是
+#     验收红线：结构那一轮若自己写出了 60 字的说明，不该再花一次输出覆盖它。
+DETAIL_MIN_CHARS = 80
+DETAIL_MAX_CHARS = 150
+DETAIL_FILL_FLOOR = 40
+
+# 第三段从"一次写全部"改成"两次并发各写一半"的**下限**：少于这个数就不拆。
+#
+# 拆半买到的是"墙钟跟着输出量走"：56 个节点 × 105 字 ≈ 5900 字，输出侧要 30 秒
+# 上下，而两半并发之后最慢的那一半只有 2950 字的输出（实测 44.5s → 26s，见
+# `docs/ONE-CALL.md`）。代价是两次首 token 延迟（实测 1–2 秒）与两份 system 提示词
+# ——固定成本，与节点数无关。小树上这笔固定成本比省下来的还多：10 个节点的一半是
+# 5 段说明，模型预热的时间比写 5 段还长。
+#
+# 取 12 的依据不是"配平"而是实测的树规模分布：`INITIAL_MAX_NODES` 是上限，真实
+# 产出在 20–60 个节点之间浮动，12 让常见的树都拆；而"三条分支、每支两个要点"这种
+# 演示级小树（10 个节点）不拆。这个数也是回归面：`tests/test_detail_round.py` 里
+# 那棵树正好 10 个节点，走的是**不拆**那条路，所以那一整批用例的断言与拆分之前
+# 逐字相同。
+DETAIL_SPLIT_MIN = 12
+
+# 第三段的 system。**不复用 `DETAIL_PROMPT`**：那一份是"整棵树"的契约（树规则、
+# 深度、分支数），拿它来写说明会让模型又开始想着要不要再多拆一层。这里只留三件事：
+# 输出形状（id → 说明）、长度、以及"不许动结构、不许动引用"。
+#
+# **长度要求放在最后一段**：前两轮采样里它写在中间，实测仍有 1–3 个节点只写一句
+# （21–46 字）。这是提示词位置问题，不是措辞问题——同一批采样里平均长度 104–138，
+# 说明它读懂了要求，只是对"简单的节点"自行通融。所以把最要紧的两条挪到末尾（模型
+# 对 system 末尾与 user 末尾更敏感），并在 user 末尾再加一句自查。
+DETAIL_ONLY_PROMPT = (
+    "这一次只写思维导图节点的「说明」，不写结构。"
+    "节点已经定好了：id、label、它在一级分支下的位置都在 user 消息里，"
+    "一个都不许增删改名，也不许改动父子关系。\n"
+    "只返回一个 JSON 对象，不要代码围栏：键是节点 id（原样照抄），值是说明正文，"
+    '例如 {"d1a":"…","d1b":"…"}。'
+    "每一个 id 都必须出现，一个都不能漏。\n"
+    "不要写「简要说明」「详见教材」「同上」「可参考」这类占位话；"
+    "也不要把 label 换个说法重复一遍——画布上已经有 label 了，"
+    "detail 是点开之后才能看到的正文。\n"
+    "**这一轮不要写 source_refs**：引用已经在结构那一轮按证据定好了，"
+    "这里再写会与那些引用对不上。\n"
+    # 下面是**最后**一段，两条都是拿真实采样改出来的：
+    #   - 偏短的都是**并列型 label**（「常见变体」「循环与序列网络」「K-means 与层次
+    #     聚类」）：模型只把名字列一遍就收（21–46 字，低于 60 的下限）。所以点名要求
+    #     逐个说清，并给出"至少 3 句"这个比字数更难自我通融的下限；
+    #   - 不压上限会写出 165/170 字（超过 150 的目标），多出来的字既读不完，也拖慢
+    #     这一次调用（说明那一次是总耗时的大头）。
+    f"\n每一段说明写 {DETAIL_MIN_CHARS}–{DETAIL_MAX_CHARS} 字、**至少 3 句完整的话**"
+    "（不是 3 个短语），少于 3 句就是没写完。"
+    "如果这个节点的标题是一串并列的东西（几个算法、几种变体、几类方法、几个阶段），"
+    "要逐个说清它们各自做什么、差别在哪，不要只把名字列一遍就收。"
+    f"超过 {DETAIL_MAX_CHARS} 字就挑最关键的两三点，长文留给节点下面的子节点。\n"
+)
+
+# 有证据时拼在 `DETAIL_ONLY_PROMPT` 之后。与 `BRANCHED_EVIDENCE_RULES` 的区别是
+# 它只要"读"，不要"抄"：引用是上一轮的事，这一轮读原文是为了让**说明**与那些引用
+# 讲同一件事（引用说的是 A、说明讲的是 B，是这条路最容易出现的错位）。
+DETAIL_ONLY_EVIDENCE_RULES = (
+    "\nuser 消息末尾附的是结构那一轮用过的原文（按一级分支分组，与上一轮同一份）。"
+    "写某一支的说明时以**那一组**为准，不要写成另一支的内容；"
+    "原文与你的知识冲突时按原文写。不要新增或改动引用。\n"
+)
+
+
+def _iter_paths(root: Node, path: tuple[str, ...] = ()):
+    """前序遍历，带上"根 → 父"的标题链（不含自己）。"""
+    yield root, path
+    for child in root.children:
+        yield from _iter_paths(child, (*path, root.label))
+
+
+def _needs_detail(node: Node) -> bool:
+    """这个节点的说明要不要第三段补。
+
+    判据是**长度**而不是"空不空"：结构那一轮偶尔会自己写出几句，26–28 字那种
+    恰恰是要消灭的形态，按"空才补"会把它整批放过。
+    """
+    return len((node.detail or "").strip()) < DETAIL_FILL_FLOOR
+
+
+def _detail_targets(root: Node) -> list[tuple[Node, tuple[str, ...]]]:
+    """要补说明的节点（前序，父在子前）与它的层级路径。"""
+    return [(node, path) for node, path in _iter_paths(root) if _needs_detail(node)]
+
+
+def _split_nodes(
+    targets: Sequence[tuple[Node, tuple[str, ...]]],
+) -> list[list[tuple[Node, tuple[str, ...]]]]:
+    """把要补说明的节点切成两半：**按节点数均分，切点吸附到父边界**。
+
+    为什么按节点数而不是按一级分支：墙钟由**输出量**决定，不由调用次数决定。
+    "3 支 33 个 / 2 支 23 个"这种分法里，慢的那半要比均分多写 43% 的字，而两半并发
+    的总耗时看的就是最慢的那一次——按支分等于把 26 秒退回 33 秒。按支分的唯一好处
+    是"同一支一起写、说明更连贯"，可它挡不住模型写到第 20 段时把第 3 段忘掉，而
+    那正是三段式本身要解决的注意力摊薄：用切分去救它，等于用一个更弱的手段去补
+    一个已经被更强的手段（只写说明、不写结构）解决过的问题。
+
+    **但"劈开一支"有一个代价是真的**：同一个父节点下的几个孩子要互相区分。三支
+    各三个要点都挤在一起了还写成三段互不相干的话，读者看到的是"同一件事说了三
+    遍"——这一条与跨支重复不同，代码测不出来，只能靠切点避开。所以切点吸附到最近
+    的**父边界**（前序里同一父的孩子必然连续，因此"与上一项的 path 不同"就是换了
+    一个父节点），两侧最多移动 `slack` 位；`slack` 内找不到边界（例如整棵树是
+    "根 + 56 个并列一级子节点"）就直接按中点切——那种形状里本来就没有"兄弟要互相
+    区分"的单元。56 个里最多挪 7 位，对墙钟的影响在 3% 以内。
+
+    返回 **1 或 2** 个子序列，长度之和恒等于 `len(targets)`、各自保持前序。调用方
+    按返回顺序合并，不需要再对号。
+    """
+    count = len(targets)
+    if count < max(2, DETAIL_SPLIT_MIN):
+        return [list(targets)]
+    cut = (count + 1) // 2      # 前半拿 ceil：两半差一个节点，输出量差 3.5%
+    slack = max(1, count // 8)
+
+    def is_boundary(index: int) -> bool:
+        # 前序里同一父节点的孩子 path 必然相同；跨支重名会让这个判据把边界认到
+        # 更早一位——那是均分误差，不是错误。
+        return targets[index][1] != targets[index - 1][1]
+
+    low, high = max(1, cut - slack), min(count - 1, cut + slack)
+    boundaries = [index for index in range(low, high + 1) if is_boundary(index)]
+    if boundaries:
+        # 距离相同取靠后的：前半多拿一点比后半多拿一点好——额度只够一次时
+        # `_fill_details` 优先跑前半，让被保留的那一次覆盖更多节点。
+        cut = min(boundaries, key=lambda index: (abs(index - cut), -index))
+    return [list(targets[:cut]), list(targets[cut:])]
+
+
+def _detail_ask(
+    topic: str, targets: Sequence[tuple[Node, tuple[str, ...]]],
+    sections: Sequence[str],
+) -> str:
+    """第三段的 user 消息：主题 + 节点清单（id / label / 位置）+ 可选的原文。
+
+    清单必须带**层级路径**：一个 16 字的 label（"实施要点""风险"）几乎在任何主题下
+    都成立，模型不知道它在哪一层、上面那层讲的是什么，写出来的说明会飘到别的主题上
+    （与 `_node_path` 对 `node_expand` 的理由同源）。
+
+    带 id 是这一段唯一能对上号的东西：**不靠顺序**——顺序错一位，整棵树的说明就会
+    整体串行错位，而且从产出上看不出来（每段话本身都通顺）。
+    """
+    lines = [
+        f"{index}. id={node.id}｜{node.label}｜位置：{' / '.join(path) or '中心主题'}"
+        for index, (node, path) in enumerate(targets, start=1)
+    ]
+    user = (
+        f"主题：{topic}\n\n"
+        f"这张图的结构已经定好了，共 {len(targets)} 个节点需要写说明。"
+        "返回一个 JSON 对象，键是下面每个 id（原样照抄），值是它的说明：\n\n"
+        + "\n".join(lines)
+    )
+    if sections:
+        user += ("\n\n结构那一轮用过的原文（按一级分支分组；写说明时以本组为准）：\n\n"
+                 + "\n\n".join(sections))
+    # 自查句放在**最末尾**：它紧挨着模型开始输出的位置。上面每一条规则都在 system 里，
+    # 而实测"每段至少 3 句"这一条只有写在最后才会被逐条执行（见 `DETAIL_ONLY_PROMPT`
+    # 的注释——前两轮有 1–3 个节点只写了一句）。
+    user += (f"\n\n写完后自查一遍：上面 {len(targets)} 个 id 是不是都写了？"
+             f"每一段是不是都有 3 句以上、{DETAIL_MIN_CHARS}–{DETAIL_MAX_CHARS} 字？"
+             "不够的补写，然后再返回。")
+    return user
+
+
+_DETAIL_WRAPPERS = ("details", "detail", "nodes", "data", "map")
+
+
+def _detail_map(
+    raw: Any, known: Sequence[str],
+) -> tuple[dict[str, str], list[str], list[str]]:
+    """模型返回 → `(id → 说明, 缺的 id, 不存在的 id)`。
+
+    三种形状都认，因为它们都出现过：`{"d1":"…"}`（提示词要的那种）、
+    `{"details":{…}}`（多包一层）、`[{"id":"d1","detail":"…"}]`（模型忘了"用 id
+    做键"这条，改成列表）。识别只做在**形状**上，不做在内容上：值不是字符串就当
+    没给，空串当没给——**不替模型编一段**。
+
+    `known` 之外的键进第三个返回值（`unknown`）。它不是致命错（模型偶尔把
+    `root` 写成 `"root "`），但必须能看见：一个都不匹配时，这张图的说明会整批
+    空着，而"模型写了 60 段话"和"模型什么都没写"在产出上长得一样。
+    """
+    if isinstance(raw, dict) and len(raw) == 1:
+        key = next(iter(raw))
+        inner = raw[key]
+        if key in _DETAIL_WRAPPERS and isinstance(inner, (dict, list)):
+            raw = inner
+    pairs: list[tuple[str, Any]] = []
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                value = value.get("detail")
+            pairs.append((str(key), value))
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            node_id = item.get("id") or item.get("node_id")
+            pairs.append((str(node_id or ""), item.get("detail")))
+    allowed = set(known)
+    applied: dict[str, str] = {}
+    unknown: list[str] = []
+    for node_id, value in pairs:
+        key = node_id.strip()
+        if not key:
+            continue
+        if key not in allowed:
+            unknown.append(key)
+            continue
+        text = _detail_text(value)
+        if text:
+            applied[key] = text
+    missing = [node_id for node_id in known if node_id not in applied]
+    return applied, missing, unknown
+
+
+def _with_details(node: Node, mapping: dict[str, str]) -> Node:
+    """把 `id → 说明` 套回树上（重建节点，不动任何其他字段）。"""
+    children = [_with_details(child, mapping) for child in node.children]
+    update: dict[str, Any] = {"children": children}
+    text = mapping.get(node.id)
+    if text:
+        update["detail"] = text
+    return node.model_copy(update=update)
+
+
+@dataclass
+class _DetailHalf:
+    """半次「只写说明」调用的产物与账。
+
+    为什么是一个类型而不是继续用 dict：两半并发跑，**谁先回来不确定**，而每半的
+    账必须跟着它自己的 id 清单走（"第 2 半缺了 3 个、分别是哪几个"里的 label 只能
+    从这一半的 `missing` 推）。拼成一个 dict 再拆，就得在合并处重新猜"这半原本
+    要写哪几个"。
+    """
+
+    requested: int = 0
+    # 这一半**要写**的节点 id，按切分时的前序。与 `applied` 的键不同：那个只装
+    # 写回来的，这个是清单本身。留着它是因为补完说明之后树上再也还原不出切分
+    # （补过的节点不再满足 `_needs_detail`），而"两半各写了哪些节点"正是要量的东西。
+    target_ids: list[str] = field(default_factory=list)
+    applied: dict[str, str] = field(default_factory=dict)
+    missing: list[str] = field(default_factory=list)
+    unknown: list[str] = field(default_factory=list)
+    seconds: float = 0.0
+    # "error"（这一次调用抛错）/ None。`"budget"` 不在这里：那半**根本没发请求**，
+    # 由 `_fill_details` 直接决定，进不到这个类型里。
+    skipped: str | None = None
+    failure: str = ""
+
+    def account(self) -> dict[str, Any]:
+        """进 `data["detail"]["halves"]` 的那份账。键与整体那份同名前缀，方便对比。
+
+        `ids` 也在这里：没有任何别的地方能还原"哪一半写了哪些节点"——切分是按当时
+        的待补清单算的，而这个函数返回时那棵树已经被改过（补过的节点不再满足
+        `_needs_detail`），事后从树上重建切分必然错位。两半的风格是否分叉、两半的
+        输出量是否均衡，这两件要量的事都靠它；`calls` 那样的纯测量字段早就在
+        `data` 里，它不是新引入的负担。
+        """
+        return {
+            "requested": self.requested,
+            "filled": len(self.applied),
+            "missing": len(self.missing),
+            "unknown_keys": len(self.unknown),
+            "seconds": self.seconds,
+            "skipped": self.skipped,
+            "ids": list(self.target_ids),
+        }
+
+
+async def _fill_details_half(
+    targets: Sequence[tuple[Node, tuple[str, ...]]],
+    *,
+    ctx: RunContext,
+    topic: str,
+    sections: Sequence[str],
+    external_rules: str,
+) -> _DetailHalf:
+    """发这一次「只写说明」的请求并解析。**预算是调用方的事**（见 `_fill_details`）。
+
+    这里只兜一种失败：调用抛 `GenerationError`。两件事它**不**做，各有理由：
+
+      - **不占额度**：额度在 `_fill_details` 里按半**串行**预占完再并发发请求。
+        各自占的话，"只剩一份额度该写哪一半"就由 asyncio 的调度顺序决定，那是
+        不确定行为，测试也钉不住。
+      - **不往共享的 `diagnostics` 里写**：两半并发，谁先 append 不确定，而诊断是
+        给人按顺序读的（"第 1 半缺了 2 个"应该排在"第 2 半缺了 3 个"前面）。诊断
+        因此由 `_fill_details` 在合并时按半序生成。
+    """
+    half = _DetailHalf(requested=len(targets),
+                       target_ids=[node.id for node, _ in targets])
+    system = DETAIL_ONLY_PROMPT
+    if sections:
+        system += DETAIL_ONLY_EVIDENCE_RULES + external_rules
+    else:
+        system += DETAIL_NO_SOURCE_RULES
+    started = time.perf_counter()
+    try:
+        raw = await chat_async(
+            system, _detail_ask(topic, targets, sections), max_tokens=_max_tokens(ctx))
+    except GenerationError as exc:
+        half.skipped = "error"
+        half.failure = str(exc)
+        half.seconds = round(time.perf_counter() - started, 3)
+        return half
+    half.seconds = round(time.perf_counter() - started, 3)
+    applied, missing, unknown = _detail_map(raw, [node.id for node, _ in targets])
+    half.applied, half.missing, half.unknown = applied, missing, unknown
+    return half
+
+
+def _settle_halves(
+    results: Sequence[Any],
+    pending: Sequence[Sequence[tuple[Node, tuple[str, ...]]]],
+) -> list[_DetailHalf]:
+    """`gather(return_exceptions=True)` 的结果 → 每半一份账。**先重抛取消**。
+
+    `return_exceptions=True` 会把 `CancelledError` 一并收进返回值。吞掉它等于让
+    `max_seconds` 超时与用户中途取消失效：工具还在跑、模型请求还在计费，而
+    `_run_tool` 那边以为已经停了（它靠 `task.cancel()` + `await` 收尾）。所以这里
+    第一件事就是把它原样抛回去，一个都不能漏。
+
+    非预期异常（`GenerationError` 之外的）只影响它自己那一半：另一半的结果必须
+    保住——这正是 `return_exceptions=True` 在这里的全部意义。记成
+    `skipped="error"`，`failure` 里带上异常类型：`GenerationError` 之外的错多半是
+    代码问题，只看"调用失败"四个字分不出是哪一类。
+    """
+    settled: list[_DetailHalf] = []
+    for index, item in enumerate(results):
+        if isinstance(item, asyncio.CancelledError):
+            raise item
+        if isinstance(item, BaseException):
+            settled.append(_DetailHalf(
+                requested=len(pending[index]), skipped="error",
+                failure=f"{type(item).__name__}: {item}",
+            ))
+            continue
+        settled.append(item)
+    return settled
+
+
+def _incomplete_message(
+    settled: Sequence[_DetailHalf],
+    targets: Sequence[tuple[Node, tuple[str, ...]]],
+    applied: dict[str, str],
+    missing: Sequence[str],
+) -> str:
+    """`DETAIL_ROUND_INCOMPLETE` 的那句话。**拆过的话要说清是哪一半缺的**。
+
+    单半（节点数不到 `DETAIL_SPLIT_MIN`）时的措辞与拆分之前**逐字相同**：那一批
+    量本来就小，"哪一半"这个维度不存在，多一句只是噪声；而且回归用例钉着它。
+
+    拆过时按半报，三件事都要能读出来：这一半缺了几个、是哪些、以及"没额度"与
+    "调用失败"这两种**根本没发出请求**的情形与"模型少写了"分开——三者的处置
+    完全不同（前两种换一次重试就有救，第三种重试也未必）。
+    """
+    labels = {node.id: node.label for node, _ in targets}
+    total = len(targets)
+    if len(settled) == 1:
+        head = "、".join(f"「{labels[node_id]}」" for node_id in missing[:5])
+        return (
+            f"补写说明的那一次调用只写回了 {len(applied)}/{total} 个节点，"
+            f"其余 {len(missing)} 个保持原样（{head}"
+            + ("…" if len(missing) > 5 else "")
+            + "）；缺的说明没有被补写——不替模型编一段"
+        )
+    parts: list[str] = []
+    for index, half in enumerate(settled, start=1):
+        if half.skipped == "budget":
+            parts.append(f"第 {index} 半（{half.requested} 个）没有额度、请求没发出去")
+            continue
+        if half.skipped == "error":
+            parts.append(f"第 {index} 半（{half.requested} 个）调用失败")
+            continue
+        # 另一半越界返回、把这个 id 填上了的话，这里就不该再说它"缺"。
+        gap = [node_id for node_id in half.missing if node_id not in applied]
+        if not gap:
+            parts.append(f"第 {index} 半（{half.requested} 个）齐全")
+            continue
+        head = "、".join(f"「{labels.get(node_id, node_id)}」" for node_id in gap[:3])
+        parts.append(
+            f"第 {index} 半只写回 {len(half.applied)}/{half.requested}"
+            f"（缺 {len(gap)} 个：{head}"
+            + ("…" if len(gap) > 3 else "")
+            + "）"
+        )
+    return (
+        f"补写说明的两次调用一共写回了 {len(applied)}/{total} 个节点："
+        + "；".join(parts)
+        + "。缺的说明没有被补写——不替模型编一段"
+    )
+
+
+async def _fill_details(
+    content: MindMapContent, *, ctx: RunContext, topic: str,
+    sections: Sequence[str], external_rules: str,
+    diagnostics: list[Diagnostic],
+) -> tuple[MindMapContent, dict[str, Any]]:
+    """第三段：给缺说明的节点补 detail。**只读结构、只写 detail**。
+
+    **拆成两次并发调用**（节点数够的话，见 `DETAIL_SPLIT_MIN`）：慢的原因是输出量
+    而不是调用次数——56 个节点 × 105 字 ≈ 5900 字，输出侧就要 30 秒。两半各写一半
+    的输出，墙钟由最慢的那一半决定。总调用从 3 变 4，墙钟从 44.5 秒降到 26 秒上下
+    （数字见 `docs/ONE-CALL.md`）。
+
+    五条兜底各对应一种真实失败，缺任何一条都会让它比不加这一段更糟：
+
+      - **少返回几个**：缺的节点保持原样（多半是空），记一条 warn 把 id 列出来。
+        **不替它编一段**——编出来的说明与引用、与 label 都没有关系，而且看不出来。
+      - **返回不存在的 id**：忽略，但把个数记进 `data` 与诊断（对不上号时这是唯一
+        的线索）。
+      - **返回空串 / 非字符串**：按"没给"处理（`_detail_map`）。
+      - **一半失败 / 一半成功**：成功那半的结果必须落地（`return_exceptions=True`
+        + 各自的兜底），失败的只记它自己那一半。
+      - **两半都失败**：整棵树照样交付（`detail` 是可选字段），只记 warn。为了
+        "说明写短了"把已经生成好的结构丢掉，是拿确定的好换不确定的好。
+
+    引用在这条路上**不可能被改动**：函数只从返回值里读 `id → 字符串`，写回的字段
+    只有 `detail`。`source_refs` 仍然是结构那一轮的产物（`EVIDENCE_UNUSED` 的分母
+    也因此不受影响）。
+    """
+    targets = _detail_targets(content.root)
+    report: dict[str, Any] = {
+        "requested": len(targets), "filled": 0, "missing": 0,
+        "unknown_keys": 0, "seconds": 0.0,
+    }
+    if not targets:
+        # 结构那一轮自己就写够了说明（或被裁到只剩几个节点）：不花这次调用。
+        report["skipped"] = "nothing_to_fill"
+        return content, report
+
+    halves = _split_nodes(targets)
+    # ---- 额度：一次占完，两半只负责花 -------------------------------------
+    #
+    # `reserve_model_call()` 读-判-写之间**没有 await**，在 asyncio 的单线程里不会
+    # 被切走，所以两半并发各占一次也不会算错（多占、少占都不会发生）。但"不会算错"
+    # 之外还有一件更要紧的事：**只剩一份额度时该写哪一半**。交给调度器决定（谁先跑
+    # 到谁拿）就成了不确定行为，测试也钉不住。所以在这里串行占完，够几份就写几半。
+    granted = 0
+    for _ in halves:
+        if not ctx.reserve_model_call():
+            break
+        ctx.extra_model_calls += 1
+        granted += 1
+    if not granted:
+        report["skipped"] = "budget"
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="DETAIL_SKIPPED_NO_BUDGET",
+            message=(
+                f"模型调用额度已用完，{len(targets)} 个节点的说明没有补写；"
+                "结构与引用都已完成，只是说明会偏短"
+            ),
+        ))
+        return content, report
+
+    pending = halves[:granted]
+    # 帧由这里统一推，**两半自己不推**：前端 `stageText` 是覆盖式单值，两半各推一帧
+    # "正在给 28 个节点写说明"只会互相顶掉（同一句话闪两遍）；而各推一帧"已写完
+    # 28"更糟——总共 56 个，那句话在另一半还没回来时就是谎报。所以计数一律用切半
+    # **前**的总数，帧数与文案与拆分之前逐字相同（开始一帧、结束一帧）。
+    await _emit_stage(ctx, DETAIL_STAGE, f"正在给 {len(targets)} 个节点写说明…")
+    results = await asyncio.gather(*(
+        _fill_details_half(half, ctx=ctx, topic=topic, sections=sections,
+                           external_rules=external_rules)
+        for half in pending
+    ), return_exceptions=True)
+    settled = _settle_halves(results, pending)
+    if granted < len(halves):
+        # 只占到最后一份额度：后半**根本没发请求**。补一条账，让 `halves` 的条数与
+        # 节点数对得上——少了它，`halves` 看起来像"这棵树本来就只切了一半"。
+        skipped = [node for node, _ in halves[granted]]
+        settled.append(_DetailHalf(
+            requested=len(skipped), skipped="budget",
+            target_ids=[node.id for node in skipped],
+            missing=[node.id for node in skipped]))
+
+    # ---- 合并 ------------------------------------------------------------
+    #
+    # 两半的 id **天然不相交**，不需要运行时去重：`_detail_map` 按各半自己的 id
+    # 清单过滤，不在清单里的键一律进 `unknown`、不进 `applied`。而越界的那批 id
+    # 也**不能**采用——那一半的 user 里没有这些节点的 label 与位置（`_detail_ask`
+    # 只列本半的清单），模型为它们写的话是凭空编的，却长得完全像一段正常说明。
+    # 所以这里只管累加，落空的那点由 `unknown_keys` 报出来。
+    applied: dict[str, str] = {}
+    for half in settled:
+        applied.update(half.applied)
+    missing: list[str] = []
+    for half in settled:
+        missing.extend(item for item in half.missing
+                       if item not in applied and item not in missing)
+    unknown = {key for half in settled for key in half.unknown}
+
+    report["filled"] = len(applied)
+    report["missing"] = len(missing)
+    report["unknown_keys"] = len(unknown)
+    # `seconds` 是**这一步的墙钟**，不是两次之和：两半并发，`calls["detail"]` 要与
+    # 总耗时对得上，把两个 17 秒加成 34 秒只会让对比表整列失真。每半各自的秒数在
+    # `halves` 里——那正是"两半的输出量是否均衡"的证据。
+    report["seconds"] = round(max((half.seconds for half in settled), default=0.0), 3)
+    if len(settled) > 1:
+        # 只在**真的拆过**时才有这个键，理由与 `data["external"]` 同源：没拆时
+        # `data["detail"]` 的键集与加这套并发之前逐字节相同，回归用例比的是键集。
+        report["halves"] = [half.account() for half in settled]
+
+    if applied:
+        content = content.model_copy(
+            update={"root": _with_details(content.root, applied)})
+    await _emit_stage(ctx, DETAIL_STAGE,
+                      f"已写完 {len(applied)} 个节点的说明", count=len(applied))
+
+    if not applied and not [half for half in settled if half.skipped != "error"]:
+        # 有额度的半**全部**调用失败。这时候再说"没有返回任何可用的说明"是拿一个
+        # 更笼统的原因盖住真原因（模型 500 / 超时），下面那条 `DETAIL_CALL_FAILED`
+        # 才是要读的东西。原单次实现也是这个分工：失败就 return，不报 EMPTY。
+        pass
+    elif not applied:
+        # 只报"整体一段都没写回来"。有半失败、另半写回来了，走下面的 INCOMPLETE
+        # ——那一条里会说清楚是哪一半。
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="DETAIL_ROUND_EMPTY",
+            message=(
+                f"补写说明的这次调用没有返回任何可用的说明"
+                f"（{len(targets)} 个节点一个都没对上"
+                + (f"，其中 {len(unknown)} 个键不是节点 id" if unknown else "")
+                + "），这些节点的说明保持为空；内容会明显短于预期"
+            ),
+        ))
+    elif missing or granted < len(halves):
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="DETAIL_ROUND_INCOMPLETE",
+            message=_incomplete_message(settled, targets, applied, missing),
+        ))
+    if len(settled) > 1:
+        for index, half in enumerate(settled, start=1):
+            if half.skipped == "error":
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.warn, code="DETAIL_CALL_FAILED",
+                    message=(
+                        f"补写说明的第 {index} 半调用失败：{half.failure}；"
+                        f"这一半的 {half.requested} 个节点说明保持原样（多半是空），"
+                        "另一半的结果已落地，结构与引用不受影响"
+                    ),
+                ))
+        if all(half.skipped == "error" for half in settled):
+            # 两半都失败 = 整件事"一次也没做成"，与不拆时的那条出路同名同义，
+            # 读 `data.detail.skipped` 的代码不需要为拆分多分一个分支。
+            report["skipped"] = "error"
+    elif settled and settled[0].skipped == "error":
+        report["skipped"] = "error"
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="DETAIL_CALL_FAILED",
+            message=(
+                f"补写说明的那一次调用失败：{settled[0].failure}；"
+                f"{len(targets)} 个节点的说明保持原样（多半是空），结构与引用不受影响"
+            ),
+        ))
+    return content, report
 
 
 @dataclass(frozen=True)
@@ -2881,9 +3468,9 @@ def _raw_ref_count(raw: Any) -> int:
 
 
 async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
-    """整树一次生成：**骨架一次、每支检索一次、内容一次写完**。
+    """整树生成：**骨架一次、每支检索一次、结构一次、只写说明一到两次**。
 
-    接线（三段，前两段与 `_generate_deep` 完全共用）：
+    接线（前两段与 `_generate_deep` 完全共用，后两段是这条路独有的）：
 
       1. 骨架：`_intake` 定材料 → `_skeleton_outline` 给目录（覆盖率 ≥60% 才给）
          → `_plan_ask` 让模型定一级分支。有材料却没目录时也是这一步定骨架，所以
@@ -2892,7 +3479,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
          并行）。命中按分支分组渲染进 user 消息，**带分支归属**——这是与旧版
          整树生成最大的差别：旧版只做一次主题级 top_k=5 预检索，实测对 14,120 字
          材料的覆盖率 5.1%，而按支检索是 30.5%（`docs/RAG-DECISIONS.md` 第 5 节）。
-      3. 生成：一次 `chat_async`，骨架 + 全部命中一起给。
+      3. 结构：一次 `chat_async`，骨架 + 全部命中一起给，**只写 id / label / 层级**
+         ——`SKELETON_TREE_RULES` 明确要求 detail 留空，引用在这一轮按证据写。
+      4. 说明：`_fill_details` 发**两次并发的 `chat_async`**（节点够多时，见
+         `DETAIL_SPLIT_MIN`），每半的输入是"这半节点（id / label / 层级路径）+
+         同一份原文"，输出是 `{"id":"说明"}`，**按 id 对号**（不靠顺序）。这一轮
+         不碰结构、不碰引用。
 
     **为什么回到一次生成**（三条实测依据，缺一条这个改动就站不住）：
 
@@ -2905,10 +3497,22 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         分支下一字不差出现了两次）。一次生成时全部骨架在同一份响应里，模型至少
         有可能看住全局。
 
-    **最大风险是 detail 质量**：一次写几十个节点，模型可能开始糊弄（"简要说明"
-    "详见教材"）。所以这条路的规格与分片对齐而不是放宽：`DETAIL_PROMPT` 里的
-    "detail 是 2–3 句"与 `MAX_NODE_DETAIL_CHARS` 都没动，节点数与层数仍由
-    `INITIAL_MAX_NODES` / `INITIAL_MAX_DEPTH` 守着（初次 80 节点 / 4 层含根）。
+    **为什么要有第四步（第三段）**：把"结构 + 每支说明"压在同一次输出里时，detail
+    五采样只有 45.3/28.0/28.5/26.2/27.4 字（红线 40），而且越写越短；在 system 里加
+    "不少于 60 字"反而更短（28.5 → 26.2）。瓶颈不是提示词，是一次输出里要塞几十段
+    说明。拆出"只写说明"的一次调用后，说明拿到 80–150 字的预算与全部注意力，节点数
+    与层数仍由 `INITIAL_MAX_NODES` / `INITIAL_MAX_DEPTH` 守着（初次 80 节点 / 4 层
+    含根），`MAX_NODE_DETAIL_CHARS` 也没动。数字见 `docs/ONE-CALL.md`。
+
+    **为什么还要把第三步再拆两半**：这一步的墙钟由**输出量**决定（56 个节点 × 105 字
+    ≈ 5900 字，输出侧就要 30 秒），与调用次数无关——加一次调用不会变慢，但要让它
+    真的省时间，只能让每次写得更少。两半各写一半输出，墙钟由最慢的那半决定：
+    44.5 秒 → 26 秒上下，而 detail 平均与跨支重复都没有退化（同上文档）。
+
+
+    **总调用 3 次**（骨架 + 结构 + 说明）；带材料时检索是本地/向量运算，不占模型额度。
+    第 4 步的失败一律**降级不失败**（见 `_fill_details`）：`detail` 是可选字段，
+    为了"说明写短了"把已经成型的结构与引用丢掉是拿确定的好换不确定的好。
 
     **"全部支都没命中"不兜底整树检索**（与 `_generate_deep` 不同）。那条路的兜底
     是必要的：空支在它那里就是一块空白。这里所有证据本来就在同一次响应里，
@@ -2919,6 +3523,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     `partial` 在这条路上有两个来源：输出被长度上限截断（`SalvagedOutput`），以及
     节点数超过 `INITIAL_MAX_NODES` 被裁剪。两者都不是失败（树仍然可用），但用户
     必须能看见——`ok=true` 与"完整成功"长得一模一样，差别只有这两个字段。
+    说明没补全**不**进 `partial`（它不是"树少了一块"，树是完整的），走
+    `data["detail"]` 那笔账与 `DETAIL_ROUND_*` 诊断。
     """
     if ctx.request.intent != "create":
         return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
@@ -2968,6 +3574,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 判定）：它们不含输出格式，不会与 `PLAN_PROMPT` 的"只返回 branches"打架。
     plan_system = base_plan if sources else (
         base_plan + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
+    plan_started = time.perf_counter()
     try:
         raw_plan = await chat_async(
             plan_system,
@@ -2979,6 +3586,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         )
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
+    skeleton_seconds = time.perf_counter() - plan_started
     _note_truncation(diagnostics, raw_plan)
 
     branches = _skeleton_branches(raw_plan)
@@ -3073,10 +3681,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     stream_kwargs = {}
     if ctx.emit is not None:
         stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
+    structure_started = time.perf_counter()
     try:
         raw = await chat_async(system, user, max_tokens=_max_tokens(ctx), **stream_kwargs)
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
+    structure_seconds = time.perf_counter() - structure_started
 
     # ---- 收尾：校验、裁剪、体检（与旧的整树出口同一套）--------------------------
     declared_refs = _raw_ref_count(raw)
@@ -3120,6 +3730,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 导出文件头怎么写"两件事都只能靠这个字段（与 `_generate_deep` 的建树段
         # 同一个决定）。
         content = content.model_copy(update={"diagram_type": diagram_type})
+
+    # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------
+    #
+    # 放在这里而不是更早：裁剪已经做完（被裁掉的节点不必为它付说明的 token），
+    # 骨架的颜色/边已经套上（它们与本段无关，但重建节点要带上），而 `check()` 与
+    # `annotate_nli()` 都还没跑——那两个函数读的是**最终**的 detail，说明必须在它们
+    # 之前落地。
+    content, detail_report = await _fill_details(
+        content, ctx=ctx, topic=args.topic, sections=sections,
+        external_rules=external_rules, diagnostics=diagnostics)
 
     # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"
     # ——这个区别在这里最实，用户下一步就是点开某个节点继续展开，而把被裁的那几个
@@ -3288,6 +3908,14 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             f"节点数超过初次生成的 {INITIAL_MAX_NODES} 个上限，已保留前 "
             f"{INITIAL_MAX_NODES} 个；想要更大的树，用 node_expand 逐支展开。"
         )
+    if detail_report["requested"] and detail_report["filled"] < detail_report["requested"]:
+        # 只在**没补全**的时候说一句：补全是常态（结构那一轮按提示词留空、第三段
+        # 一次写回），把它写进 every-run 的话术只是在噪声里加一行。
+        summary += (
+            f"有 {detail_report['requested'] - detail_report['filled']} 个节点的说明没写回来"
+            f"（共 {detail_report['requested']} 个需要补写），这几个节点的说明保持为空；"
+            "结构、层级与引用都不受影响。"
+        )
 
     data: dict[str, Any] = {
         "root_id": content.root.id,
@@ -3324,6 +3952,27 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "seconds": round(retrieval_seconds, 3),
         },
         "source_refs": {"declared": declared_refs, "kept": kept_refs},
+        # 四步各自的耗时：总耗时只能回答"慢不慢"，这一笔回答"慢在哪"。骨架与
+        # 结构在这里、检索在 `retrieval.seconds`、说明那一步（两次并发）在自己的
+        # `seconds` 里 ——`scripts/measure_single_call.py` 的对比表就是按这几列拼的。
+        #
+        # 说明那一步记的是**墙钟**（两半取大的那个），不是两次之和：并发跑的时候
+        # 两者差一倍，而"这一步让用户等了多久"只有前者答得对。两半各自的秒数在
+        # `detail.halves` 里。
+        "calls": {
+            "skeleton": round(skeleton_seconds, 3),
+            "structure": round(structure_seconds, 3),
+            "detail": detail_report["seconds"],
+        },
+        # 三段式的第三段（只写 detail）**本身**的账：要补几个、写回几个、花了多久、
+        # 有没有对不上号的键。`detail_avg` 那种质量指标不在这里算（它属于产出，
+        # 直接量树即可，`scripts/measure_single_call.py` 就是这么做的）。
+        "detail": {
+            **detail_report,
+            "floor": DETAIL_FILL_FLOOR,
+            "short_nodes": sum(1 for node in _iter_nodes(content.root)
+                               if _needs_detail(node)),
+        },
         "diagnostics": [item.model_dump() for item in diagnostics],
     }
     if external is not None:
@@ -7228,11 +7877,15 @@ _DIAGRAM_HINTS = {
 
 
 def _generate_spec(diagram_type: str | None = None) -> ToolSpec:
-    """整树一次生成的工具定义。`diagram_type` 非 None 表示**用户已经选了**。
+    """整树生成的工具定义。`diagram_type` 非 None 表示**用户已经选了**。
 
     两条分支的差别与 `_generate_deep_spec` 完全同构（参数谁来定），所以这里只写
     差异：描述里的第一句必须说清"一次调用出整棵树"，因为模型对"生成"的默认
     预期是分步的；不说的话它会在一次调用之后还想再展开一轮。
+
+    它**不**承诺"一次调用写完全部内容"：工具内部是骨架 → 检索 → 结构 → 说明四步，
+    最后一步只写 detail（理由见 `_generate` 与 `_fill_details`）。对调用方（模型）
+    来说仍然是"一次调用拿到整张图"，所以描述里说的还是这一件事。
     """
     if diagram_type is None:
         diagram_sentence = (
@@ -7248,9 +7901,10 @@ def _generate_spec(diagram_type: str | None = None) -> ToolSpec:
     return ToolSpec(
         name="mindmap_generate",
         description=(
-            "生成一张完整思维导图：一次调用出整棵树（定骨架 → 按支检索 → 一次写完）。"
+            "生成一张完整思维导图：一次调用出整棵树（定骨架 → 按支检索 → 写结构 → 逐个补说明）。"
             "带材料时它会先看一眼材料自带的章节标题来定一级骨架，再为每条一级分支"
-            "各自检索一次，最后把骨架与全部检索结果一起交给模型写完；"
+            "各自检索一次，最后把骨架与全部检索结果一起交给模型写完结构与引用，"
+            "再用一次调用专门给每个节点写说明；"
             "它不会把全文读进来。没有材料时直接按主题生成。"
             "初次上限是 80 个节点、4 层（含中心主题），更细的内容留给生成之后的"
             "node_expand 逐支展开。"

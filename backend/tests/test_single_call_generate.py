@@ -1,13 +1,14 @@
-"""整树一次生成的契约：骨架从哪来、证据怎么给、一次写完、旧契约不回归。
+"""整树生成的契约：骨架从哪来、证据怎么给、三段式怎么接、旧契约不回归。
 
 这条路（`mindmap_generate`）与分片（`mindmap_generate_deep`）共用骨架与检索，
-差别只有生成调用几次。所以这个文件盯四件事：
+差别只有生成调几次。所以这个文件盯四件事：
 
   1. **骨架的两个来源**：有材料时用材料自带的章节（`_skeleton_outline`，覆盖率
      ≥60% 才拼进去），没有材料时由模型从主题定。两条路走的是同一次调用。
   2. **证据按支给、每支各检索一次**：退化成"一次主题检索 top_k=5"的表现是
      `queries` 只有一条，而那正是当年整树路径覆盖 5.1% 的原因。
-  3. **一次写完**：骨架一次 + 生成一次，就这么多。
+  3. **三段式**：结构一次（只写 id/label/引用、detail 留空）+ 只写说明一次
+     （按节点 id 对号返回说明）。第三次调用存在的理由见 `tools._fill_details`。
   4. **三条旧契约不回归**：`EVIDENCE_UNUSED`、`partial`、`node_grow` 预览，以及
      初次限额（80 节点 / 4 层）一个都没动。
 
@@ -24,6 +25,8 @@ import pytest
 from app.agent import tools as tools_module
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
+    DETAIL_ONLY_PROMPT,
+    DETAIL_SPLIT_MIN,
     INITIAL_MAX_DEPTH,
     INITIAL_MAX_NODES,
     OUTLINE_HEADER,
@@ -112,9 +115,30 @@ def _two_points(label: str) -> list[tuple[str, str]]:
     return [(f"{label}·一", "一句具体的说明。"), (f"{label}·二", "另一句具体的说明。")]
 
 
+def _walk_payload(node: dict):
+    yield node
+    for child in node.get("children") or []:
+        if isinstance(child, dict):
+            yield from _walk_payload(child)
+
+
+def _detail_answer(tree: dict, *, text: str = "这句说明写到八十个字以上，讲清它是什么、"
+                                                 "怎么做、有什么条件与数字，"
+                                                 "这样第三段的产出才符合长度目标。") -> dict:
+    """第三段的模型替身：按 `tree` 里的 id 造一份 `{id: 说明}`。
+
+    长度按提示词的目标区间（80–150 字）写：拿它测出来的 detail 才是"第三段成功"
+    的样子，写一句短语会把断言变成在测兜底。
+    """
+    return {node["id"]: text for node in _walk_payload(tree["root"]) if node.get("id")}
+
+
 def _chat(tree: dict, *, seen: list[tuple[str, str]] | None = None,
-          on_delta_chunks: int = 0):
-    """模型替身：骨架回 `BRANCHES`，生成回 `tree`。
+          on_delta_chunks: int = 0, details: dict | None = None):
+    """模型替身：骨架回 `BRANCHES`，结构回 `tree`，第三段回 `details`。
+
+    `details` 传 `{}` 表示"模型一个说明也没写回来"——兜底（保留原 detail、
+    记 `DETAIL_ROUND_EMPTY`）就是靠它测的；不传时按 `tree` 的 id 造一份合格的说明。
 
     `on_delta_chunks > 0` 时把整棵树的 JSON 按这个段数喂给 `on_delta`——预览那条
     路只有真收到增量才会往外推帧，假流式是测不出 `node_grow` 的。
@@ -124,6 +148,8 @@ def _chat(tree: dict, *, seen: list[tuple[str, str]] | None = None,
             seen.append((system, user))
         if system.startswith(PLAN_PROMPT):
             return {"branches": list(BRANCHES)}
+        if system.startswith(DETAIL_ONLY_PROMPT):
+            return _detail_answer(tree) if details is None else details
         if on_delta is not None and on_delta_chunks:
             text = json.dumps(tree, ensure_ascii=False)
             size = max(1, len(text) // on_delta_chunks)
@@ -131,6 +157,18 @@ def _chat(tree: dict, *, seen: list[tuple[str, str]] | None = None,
                 await on_delta(text[start:start + size])
         return tree
     return chat
+
+
+def _structure_users(seen: list[tuple[str, str]]) -> list[str]:
+    """结构那一次的 user（不含骨架与第三段）。"""
+    return [user for system, user in seen
+            if not system.startswith(PLAN_PROMPT)
+            and not system.startswith(DETAIL_ONLY_PROMPT)]
+
+
+def _detail_users(seen: list[tuple[str, str]]) -> list[str]:
+    """第三段（只写说明）那一次的 user。"""
+    return [user for system, user in seen if system.startswith(DETAIL_ONLY_PROMPT)]
 
 
 def _three_branches(tree: dict | None = None) -> dict:
@@ -199,7 +237,7 @@ def test_each_branch_is_retrieved_once_and_grouped_for_the_model():
 
     assert result.ok, result.content
     assert calls == list(BRANCHES)
-    generate_user = seen[-1][1]
+    generate_user = _structure_users(seen)[0]
     for index, title in enumerate(BRANCHES, start=1):
         assert f"第 {index} 支「{title}」的检索结果" in generate_user
     # 每条 query 都是分支标题本身（不拼主题，那是实测选出来的）
@@ -207,18 +245,29 @@ def test_each_branch_is_retrieved_once_and_grouped_for_the_model():
     assert result.data["retrieval"]["top_k"] == 3
 
 
-def test_generation_is_a_single_call_after_the_skeleton():
-    """骨架一次 + 生成一次：这条路的总调用数是 2，与分支数无关。"""
+def test_generation_is_three_calls_after_the_skeleton():
+    """骨架一次 + 结构一次 + 只写说明一次：总调用 3，与分支数无关。
+
+    第三段的存在理由是"一次输出里塞几十段说明"这件事本身（数字见
+    `docs/ONE-CALL.md`）：结构与说明拆开之后，说明那一次只面对一份
+    id / label / 层级清单。
+    """
     seen: list[tuple[str, str]] = []
     result = _run(_ctx(), _chat(_three_branches(), seen=seen))
 
     assert result.ok, result.content
-    assert len(seen) == 2, [system[:20] for system, _ in seen]
-    # 生成那一次的 user 里必须带着骨架清单：模型据此写出一级分支，而不是自己再定
-    generate_user = seen[-1][1]
+    assert len(seen) == 3, [system[:20] for system, _ in seen]
+    # 结构那一次的 user 里必须带着骨架清单：模型据此写出一级分支，而不是自己再定
+    structure_user = _structure_users(seen)[0]
     for index, title in enumerate(BRANCHES, start=1):
-        assert f"{index}. {title}" in generate_user
-    assert "不要增删改名" in generate_user
+        assert f"{index}. {title}" in structure_user
+    assert "不要增删改名" in structure_user
+    # 第三段只看到 id / label / 位置，看不到整棵树的结构（它不需要，也不该动）
+    detail_user = _detail_users(seen)[0]
+    for title in BRANCHES:
+        assert title in detail_user
+    assert result.data["detail"]["requested"] == result.data["node_count"]
+    assert result.data["detail"]["filled"] == result.data["detail"]["requested"]
 
 
 # ---------------------------------------------------------------- 3. 跨支重复
@@ -389,22 +438,33 @@ def test_over_the_node_limit_is_clipped_and_marked_partial():
 
 @pytest.mark.parametrize("branches", [3, 6])
 def test_branch_count_only_changes_the_skeleton_size(branches):
-    """分支数变化只影响骨架规模，不改变"两次调用"这条结构。"""
+    """分支数变化只影响骨架规模，不改变"骨架 + 结构 + 说明"这条结构。
+
+    "说明"那一段在节点够多时拆成**两次并发**（`DETAIL_SPLIT_MIN`）：3 支的树 10 个
+    节点不拆、3 次调用；6 支的树 19 个节点拆、4 次。所以这里不能硬编码 3——要钉的
+    性质是"分支数本身不是调用次数的决定因素，节点数才是"。
+    """
     titles = tuple(f"分支{index}" for index in range(branches))
     tree = _tree([
         _branch(index, title, _two_points(title))
         for index, title in enumerate(titles)
     ])
     seen: list[tuple[str, str]] = []
+    answers = {"branches": list(titles)}
 
     async def chat(system: str, user: str, *, max_tokens=None, on_delta=None) -> dict:
         if seen is not None:
             seen.append((system, user))
         if system.startswith(PLAN_PROMPT):
-            return {"branches": list(titles)}
+            return answers
+        if system.startswith(DETAIL_ONLY_PROMPT):
+            return _detail_answer(tree)
         return tree
 
     result = _run(_ctx(), chat, arguments={"branches": branches})
     assert result.ok, result.content
-    assert len(seen) == 2
+    detail_calls = len([user for system, user in seen
+                        if system.startswith(DETAIL_ONLY_PROMPT)])
+    assert detail_calls == (1 if result.data["node_count"] < DETAIL_SPLIT_MIN else 2)
+    assert len(seen) == 2 + detail_calls
     assert result.data["planned_branches"] == branches
