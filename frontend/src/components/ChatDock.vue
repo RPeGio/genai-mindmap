@@ -348,9 +348,20 @@ const statusKind = computed<StatusKind | null>(() => {
 /**
  * 上次那次运行的结果还等着处理：**独立一条**，与状态行并存。
  *
- * 运行中不显示：那会儿进度才是他要看的，而这条提示不会因为这一轮结束而消失。
+ * 两个"不显示"各有理由：
+ *   - 运行中：那会儿进度才是他要看的，而这条提示不会因为这一轮结束而消失；
+ *   - **就是刚刚这一次**（`run_id === store.pendingRunId`）：那棵树已经落到画布上、
+ *     用户正看着它。此时再说一句"上次生成完的导图还没保存"，说的是他自己刚做的事，
+ *     既没有信息量，也会跟着把淡出永远顶住（这是一条刹车，见 `shouldKeep`）。
+ *     服务端确实会把这一次也列进 `pending()`，所以过滤只能放在这一层。
  */
-const resumable = computed(() => (statusKind.value === 'running' ? null : store.resumableRun));
+const resumable = computed(() => {
+  if (statusKind.value === 'running') return null;
+  const run = store.resumableRun;
+  if (!run) return null;
+  if (run.run_id === store.pendingRunId) return null;
+  return run;
+});
 
 /** 这条提示的那句话。文案与"被中断"分开——"完成了没保存"与"中途断了"不是一回事。 */
 const resumableText = computed(() => {
@@ -527,7 +538,8 @@ const shouldKeep = computed(() => {
   if (typed.value) return true;
   if (composing.value || focused.value) return true;
   if (sources.draftText.trim()) return true;
-  if (store.resumableRun) return true;
+  // 只有"别人留下的、还没处理的结果"才当刹车；刚刚这一次不算（见 `resumable`）。
+  if (resumable.value) return true;
   const kind = statusKind.value;
   if (kind && kind !== 'ok' && kind !== 'running') return true;
   if (kind === 'running') return true;
@@ -547,7 +559,7 @@ const canFade = computed(() => statusKind.value === 'ok'
   && !composing.value
   && !focused.value
   && !sources.draftText.trim()
-  && !store.resumableRun);
+  && !resumable.value);
 
 watch(
   () => [canFade.value, store.nodeCount] as const,

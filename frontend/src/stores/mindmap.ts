@@ -994,8 +994,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 从前它是"候选属于哪一次运行，应用/丢弃时上报"。现在只有一半留着：保存成功
    * 才写时间戳，因为 `applied_at` 的语义已经变成"这份结果被存下来了"——它正是
    * "下次进页面还要不要提醒"的判据。
+   *
+   * 用 ref 而不是普通变量：界面要读它（`ChatDock` 据此判断"上次没保存的那次"
+   * 是不是**刚刚**这一次）。普通变量没有响应性，那个判断会停在上一次的值上。
    */
-  let pendingSaveRunId: string | null = null;
+  const pendingSaveRunId = ref<string | null>(null);
 
   /** 每次点击生成一个新的 run 身份。服务端只在这个 id 相同时才做幂等。 */
   function newRunId(): string {
@@ -1093,8 +1096,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * ——那是两件事。
    */
   function reportRunSaved(): void {
-    const id = pendingSaveRunId;
-    pendingSaveRunId = null;
+    const id = pendingSaveRunId.value;
+    pendingSaveRunId.value = null;
     if (!id) return;
     void markRunSaved(id).catch(() => {});
   }
@@ -3436,7 +3439,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       : '模型的结果已落到画布');
     // 等保存成功再上报 `applied_at`：它的语义是"这份结果被存下来了"，正是
     // "下次进页面还要不要提醒"的判据（见 `runs.pending`）。
-    pendingSaveRunId = meta.runId;
+    pendingSaveRunId.value = meta.runId;
     return 'applied';
   }
 
@@ -3662,5 +3665,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     probeResumableRun,
     resumeRun,
     ignoreResumable,
+    // 刚落进画布、还没保存的那个 run：界面据此把"上次没保存"与"刚刚这一次"分开
+    pendingRunId: pendingSaveRunId,
   };
 });
