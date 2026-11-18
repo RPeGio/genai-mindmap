@@ -8642,6 +8642,32 @@ def _prune_stage_edges(content: FlowContent) -> FlowContent:
     return content.model_copy(update={"stages": stages}) if changed else content
 
 
+def _prune_dangling_relations(content: DiagramContent) -> DiagramContent:
+    """把端点已经不存在的 `relations` 丢掉。没有可丢的时候返回**同一个对象**。
+
+    `relations` 落在契约的 `ContentBase` 上——**三种形状都有**，而它的端点永远是
+    节点 id。所以"删节点连带删"的范围不止 `edges`：
+
+      - 树的 `edges` 由 `ops._apply_remove` 一起清（执行器里那一处，见它的注释）；
+      - 流程的阶段内边由 `_prune_stage_edges` 清；
+      - 鱼骨没有边，但**它同样有 `relations`**。
+
+    这一步放在"整图校验之前"（`_apply_ops_in_container` 的 revalidate），因为
+    子树被抽出来当临时 `MindMapContent` 跑 op 时，`relations` 根本不在那个临时
+    对象里（它属于整图），执行器内的清理看不见它。漏了这一处的表现是：删掉一个
+    被关系引用的骨下节点，整批 op 以 `tree_invalid` 被拒，而模型只收到"改动之后
+    整张图不合法"。
+    """
+    if not content.relations:
+        return content
+    alive = shapes.node_ids(content)
+    kept = [relation for relation in content.relations
+            if relation.source in alive and relation.target in alive]
+    if len(kept) == len(content.relations):
+        return content
+    return content.model_copy(update={"relations": kept})
+
+
 def _apply_ops_in_container(
     content: DiagramContent, batch: OpBatch, *, validate: bool = True,
 ) -> DiagramContent:
@@ -8679,6 +8705,9 @@ def _apply_ops_in_container(
     )
     updated_root = apply_ops(temp, batch).root
     moved = shapes.replace_node(content, root_id, lambda _node: updated_root)
+    # 删节点连带删关系：`relations` 属于整图，临时 `MindMapContent` 里没有它，
+    # 所以清理只能落在这里（理由见 `_prune_dangling_relations`）。
+    moved = _prune_dangling_relations(moved)
     if not validate:
         return moved
     try:

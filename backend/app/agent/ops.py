@@ -302,10 +302,15 @@ def _apply_update(content: MindMapContent, op: UpdateOp, base: str) -> None:
 def _apply_remove(content: MindMapContent, op: RemoveOp, base: str) -> None:
     """删节点连整棵子树。根节点不可删——删了就没有导图了。
 
-    **连带删掉与这棵子树相关的附加边**（源或目标命中被删的任意一个节点）。
-    不删的话，库里会留下指向已消失节点的边：契约层下一次校验会报
+    **连带删掉与这棵子树相关的附加边与跨节点关系**（源或目标命中被删的任意一个
+    节点）。不删的话，库里会留下指向已消失节点的边/关系：契约层下一次校验会报
     `边 X 的起点节点 Y 不在导图中`，于是"删一个节点"变成"整张图存不回去"，
     而报错指的位置（某条边）与用户做的事（删节点）之间隔了很远。
+
+    `relations` 与 `edges` 是**两套字段、同一条判据**：契约 `_validate_relations` 与
+    `_validate_edges` 对 dangling 一样是硬拒。只清 `edges` 时，删一个被 `relations`
+    引用的节点会让整批 op 在最后那次整树校验里被拒，工具层报成 `tree_invalid`
+    ——模型只收到"改动之后整张图不合法"，指不回"我刚才删的那个节点"。
 
     命中范围是**整棵子树**而不是只有 `op.id` 一个节点：级联删除会把子孙一起
     摘掉，只清理被点名那一个，子孙身上的边同样会悬空。
@@ -320,6 +325,8 @@ def _apply_remove(content: MindMapContent, op: RemoveOp, base: str) -> None:
     parent.children = [child for child in parent.children if child.id != op.id]
     content.edges = [edge for edge in content.edges
                      if edge.source not in doomed and edge.target not in doomed]
+    content.relations = [relation for relation in content.relations
+                         if relation.source not in doomed and relation.target not in doomed]
 
 
 def _subtree_ids(node: Node | None) -> set[str]:
