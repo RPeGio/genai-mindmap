@@ -411,7 +411,11 @@ def test_branch_query_is_the_title_alone():
         result = _run_deep(_ctx(), _plain_chat)
 
     assert result.ok, result.content
-    assert seen == list(BRANCHES)            # 只有标题，顺序与骨架一致
+    # 顺序不保证：`_search_branch` 走 `asyncio.to_thread(search_parent, ...)`，
+    # append 发生在工作线程里，线程池先跑完哪条由调度决定。
+    # 钉顺序会在全量跑（其他用例占着线程池）时偶发红，而钉集合才是这条用例要说的事。
+    assert sorted(seen) == sorted(BRANCHES)   # 只有标题；集合一致，顺序不作要求
+    assert len(seen) == len(BRANCHES)
     assert all("管理办法" not in query for query in seen)
 
 
