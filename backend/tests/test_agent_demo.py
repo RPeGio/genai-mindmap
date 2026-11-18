@@ -107,6 +107,58 @@ class DemoModeTest(unittest.TestCase):
         self.assertEqual(events[-1].mode, "demo")
 
 
+class DemoContentShapesTest(unittest.TestCase):
+    """占位内容按**图型**产出：没有密钥的机器上也要能演示鱼骨与流程。
+
+    恒为树时，界面上选了"流程图"出来一棵导图——那不是演示，是让人以为功能坏了。
+    所以这里钉两件事：形状对得上请求的 `diagram_type`，且占位内容自己是**合法**的
+    契约实例（它会走和真产物同一条落库/渲染路径，形状不合法的话演示模式自己就 422）。
+    """
+
+    def test_demo_follows_the_requested_diagram_type(self):
+        from app.contracts.mindmap import FishboneContent, FlowContent, MindMapContent
+
+        self.assertIsInstance(_demo_content(TOPIC), MindMapContent)
+        bone = _demo_content(TOPIC, "fishbone")
+        flow = _demo_content(TOPIC, "flowchart")
+
+        self.assertIsInstance(bone, FishboneContent)
+        self.assertTrue(bone.problem)
+        self.assertEqual(len(bone.bones), 3)
+        self.assertIsInstance(flow, FlowContent)
+        self.assertEqual(len(flow.stages), 3)
+        # 三个阶段、两条阶段间跳转：占位也要看得出"这是一条流程"，否则画布上
+        # 只有三个并排的盒子，主轴是断的。
+        self.assertEqual(len(flow.edges), 2)
+
+    def test_demo_content_passes_the_contract_of_its_own_shape(self):
+        from pydantic import TypeAdapter
+
+        from app.contracts.mindmap import DiagramContent
+
+        adapter: TypeAdapter = TypeAdapter(DiagramContent)
+        for kind in ("tree", "fishbone", "flowchart"):
+            content = _demo_content(TOPIC, kind)
+            again = adapter.validate_python(content.model_dump())
+            self.assertIs(type(again), type(content))
+
+    def test_demo_run_emits_the_shape_asked_for_in_the_request(self):
+        """端到端：请求里选了流程图，demo 出来的就是流程（不是一棵树）。"""
+        from app.contracts.mindmap import FlowContent
+
+        provider = _ScriptedProvider()
+        request = AgentRunRequest(
+            goal=TOPIC, intent="create", diagram_type="flowchart",
+            budget=RunBudget(max_model_calls=1),
+        )
+        with patch.dict(os.environ, {"MINDMAP_LLM_MODE": "demo"}):
+            events = _drain(request, provider)
+
+        self.assertIsInstance(events[1].content, FlowContent)
+        self.assertEqual(len(events[1].content.stages), 3)
+        self.assertEqual(provider.calls, 0)
+
+
 class NotDemoModeTest(unittest.TestCase):
     def test_unset_mode_still_runs_the_model_loop(self):
         """缺省值不是 demo：没配这个变量时必须照常进模型循环。

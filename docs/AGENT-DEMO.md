@@ -5,16 +5,25 @@
 
 ## 先说一件容易踩空的事
 
-**agent 没有 demo 模式。**
+**agent 有 demo 模式，但要显式打开。**
 
-`MINDMAP_LLM_MODE` 这个变量只在两个地方被读：`backend/app/generation/service.py`（普通生成）和 `backend/app/ingestion/vision_pdf.py`（PDF 视觉识别）。agent 侧完全没有分支——`agent/provider.py::default_provider()` 直接返回 `OpenAICompatibleProvider()`，每一次工具调用都是真实的模型请求。
+`MINDMAP_LLM_MODE=demo` 时，agent 的 `run()` 在进入模型循环**之前**就返回：一帧
+`stage`（"演示模式，不调用模型"）、一帧 `snapshot`、一帧 `done`（`mode="demo"`），
+一次模型调用都不发（`agent/service.py::_loop` 开头那段）。占位内容与普通生成共用
+同一份 `generation.service._demo_content`。
 
-也就是说：
+三件事要一起记住：
 
-- 设 `MINDMAP_LLM_MODE=demo` 时，普通生成返回固定占位内容，**agent 仍然调真实模型**。
-- 没配 key 时，agent 会失败（`请在后端环境变量中配置模型地址、密钥和模型名称`），而普通生成照常出 demo 内容。
+- **按图型产出**：`_demo_content(goal, diagram_type)` 会按这次请求的图型给占位形状
+  ——树是一棵两层导图，鱼骨是"problem + 三根骨"，流程是"三个阶段 + 两条阶段间
+  跳转"。界面上选了流程图却出来一棵导图，那是让人以为功能坏了。
+- **缺省值不是 demo**：不设这个变量时仍然真跑模型。旧路径那套"没配置就走 demo"
+  照搬到 agent 上，等于把默认路径静默降级成占位图。
+- **demo 不代表工具循环能用**：这条路不发任何工具调用，所以它演示的是"渲染一张图"，
+  不是"模型怎么一步步改图"。要演示编辑/展开仍然是真实调用。
 
-所以"演示 agent"= 配真实 key 演示。不想要这个依赖的话，见最后一节「没有网络或不想花钱时怎么办」。
+所以：**演示 agent 的交互** = 配真实 key；**演示三种图型长什么样**（没有 key 的
+机器）= `MINDMAP_LLM_MODE=demo` + 在界面上切图型下拉。
 
 ## 两个开关
 
@@ -119,10 +128,12 @@ Invoke-WebRequest http://localhost:5173/ -UseBasicParsing | Select-Object Status
 
 ## 没有网络或不想花钱时怎么办
 
-agent 这条路必须有模型。可行的替代：
+**先试 demo 模式**（`MINDMAP_LLM_MODE=demo`）：它给出三种图型各自的占位图，一次
+模型调用都不发，也不需要任何 key。适合"看看鱼骨/流程长什么样、画布怎么排"。
+
+它不能替代的部分是**工具循环**：demo 只有三帧（stage → snapshot → done），没有
+工具调用、没有流式生长。要讲"模型一步步改图"仍然需要真实调用。可选的替代：
 
 1. **提前录屏**。最稳，也不受现场网络影响。
 2. **演示已保存的图**。导图可以存到 SQLite 再从列表打开（不需要生成），讲结构、讲编辑、讲布局都成立，只是没有"流式生长"这一段。
 3. **接受真实调用**。DeepSeek 按量计费，演示一次的量级很小；但要提前跑一遍确认额度够。
-
-如果哪天真需要"agent 也能 demo"，那是一个功能改动（给 `default_provider()` 加一个可回放的假 provider），不是改一个环境变量就能做到的——别指望 `MINDMAP_LLM_MODE=demo` 会有效果。

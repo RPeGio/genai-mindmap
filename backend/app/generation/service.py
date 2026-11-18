@@ -20,6 +20,12 @@ from app.contracts.mindmap import (
     GENERATED_LABEL_MAX_CHARS,
     MAX_TREE_DEPTH,
     MAX_TREE_NODES,
+    DiagramContent,
+    Edge,
+    FishboneBone,
+    FishboneContent,
+    FlowContent,
+    FlowStage,
     MindMapContent,
     Node,
     clip_label,
@@ -1089,11 +1095,85 @@ async def chat_async(
     return await _chat_once(base, request_body, headers)
 
 
-def _demo_content(text: str) -> MindMapContent:
-    """显式的占位内容，不伪装为模型生成。"""
+# 占位内容里那句"请你改我"。三种图型共用同一个文案：演示模式下这三个字就是界面
+# 上唯一一处告诉用户"这不是模型写的"的提示（`mode="demo"` 在 done 帧上，界面上
+# 还有一块来源标记）。
+DEMO_EDIT_LABEL = "请编辑此演示节点"
+
+# 演示模式三个阶段/三根骨的固定 id 前缀。用固定值而不是 uuid4：演示内容每次
+# 打开都该长一样（截图、录屏、新人对照文档时，一个会变的 id 只会让人误以为
+# "这次生成了别的东西"）。节点 id 与阶段 id 依然分属两个命名空间（`stage-1` 与
+# `stage-1-root` 不同名），与契约要求一致。
+_DEMO_ID = "demo"
+
+
+def _demo_content(text: str, diagram_type: str = "tree") -> DiagramContent:
+    """显式的占位内容，不伪装为模型生成。
+
+    **按 `diagram_type` 产出对应形状**：演示模式的用途是"这台机器没有模型密钥，
+    也要能看到一张图长什么样"。恒为树时，用户在界面上选了流程图/鱼骨图，拿到的
+    仍是一棵导图——那不是演示，是让他以为这个功能坏了。
+
+    三种形状各自遵守自己的契约（鱼骨要有 `problem`、流程要有阶段与阶段间跳转），
+    因为占位内容会走**和真产物同一条**落库/渲染路径：形状不合法的话，演示模式
+    自己就会 422。
+
+    树那一档**逐字节不变**（`test_agent_demo.py` 的断言钉着它）：它是三种图型里
+    唯一一个"原来就有"的分支，改它没有任何收益。
+    """
     label = text[:60]
+    if diagram_type == "fishbone":
+        # 主骨上那句必须是"为什么 X 会 Y"的疑问句（`FISHBONE_PLAN_PROMPT` 的硬规矩），
+        # 长度按 `MAX_FISHBONE_PROBLEM_CHARS` 留足余量：主题截到 24 字。
+        return FishboneContent(
+            title=label,
+            problem=f"为什么「{text[:24]}」推进得不顺",
+            bones=[
+                FishboneBone(
+                    category="人", color="blue", icon="👤",
+                    root=Node(id=f"{_DEMO_ID}-bone-people", label="人", children=[
+                        Node(id=f"{_DEMO_ID}-bone-people-1", label=DEMO_EDIT_LABEL)])),
+                FishboneBone(
+                    category="机", color="teal", icon="⚙️",
+                    root=Node(id=f"{_DEMO_ID}-bone-machine", label="机", children=[
+                        Node(id=f"{_DEMO_ID}-bone-machine-1", label=DEMO_EDIT_LABEL)])),
+                FishboneBone(
+                    category="法", color="amber", icon="📐",
+                    root=Node(id=f"{_DEMO_ID}-bone-method", label="法", children=[
+                        Node(id=f"{_DEMO_ID}-bone-method-1", label=DEMO_EDIT_LABEL)])),
+            ],
+        )
+    if diagram_type == "flowchart":
+        # 三个阶段 + 两条阶段间跳转：一条「通过」（条件分支）、一条顺序推进。
+        # 只有阶段、没有边的话，画布上会是一条断开的主轴——那看不出"这是一张流程图"。
+        #
+        # 阶段的**第一步**标 start、**最后一步**标 end：`_stamp_flow_roles` 会做的
+        # 兜底在这里直接写出来，省得演示内容也带两条"已替你补上"的诊断。
+        return FlowContent(
+            title=label,
+            stages=[
+                FlowStage(id=f"{_DEMO_ID}-stage-1", root=Node(
+                    id=f"{_DEMO_ID}-stage-1-root", label="提交", role="start",
+                    children=[Node(id=f"{_DEMO_ID}-stage-1-step", label=DEMO_EDIT_LABEL)])),
+                FlowStage(id=f"{_DEMO_ID}-stage-2", root=Node(
+                    id=f"{_DEMO_ID}-stage-2-root", label="审核",
+                    children=[Node(id=f"{_DEMO_ID}-stage-2-step", label=DEMO_EDIT_LABEL)])),
+                FlowStage(id=f"{_DEMO_ID}-stage-3", root=Node(
+                    id=f"{_DEMO_ID}-stage-3-root", label="完成", role="end",
+                    children=[Node(id=f"{_DEMO_ID}-stage-3-step", label=DEMO_EDIT_LABEL)])),
+            ],
+            edges=[
+                Edge(id=f"{_DEMO_ID}-edge-1", source=f"{_DEMO_ID}-stage-1",
+                     target=f"{_DEMO_ID}-stage-2", label="通过", kind="branch"),
+                # 相邻阶段的先后本来由数组顺序表达，但演示内容必须让用户**看见**
+                # 那条主轴，所以这里显式画一条（生成侧不会这么写，见
+                # `FLOW_PLAN_PROMPT` 的"相邻阶段不要重复画"）。
+                Edge(id=f"{_DEMO_ID}-edge-2", source=f"{_DEMO_ID}-stage-2",
+                     target=f"{_DEMO_ID}-stage-3", label="通过", kind="branch"),
+            ],
+        )
     return MindMapContent(title=label, root=Node(id=str(uuid4()), label=label,
-        children=[Node(id=str(uuid4()), label="请编辑此演示节点")]))
+        children=[Node(id=str(uuid4()), label=DEMO_EDIT_LABEL)]))
 
 
 def _branch_shortfall(count: int) -> GenerationError:

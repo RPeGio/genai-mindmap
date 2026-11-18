@@ -930,9 +930,15 @@ async def _loop(
     # 那套「没配置就走 demo」的默认照搬到 agent 上，等于把默认路径静默降级成占位图，
     # 而 agent 正是要成为默认的那条路。
     if os.getenv("MINDMAP_LLM_MODE", "").strip().lower() == "demo":
-        # 占位树复用旧路径的 `_demo_content`：同一份占位结构只该有一个定义，
+        # 占位内容复用旧路径的 `_demo_content`：同一份占位结构只该有一个定义，
         # 两处各写一份，改文案时必然只改一处。
-        demo = _demo_content(request.goal)
+        #
+        # **按请求的图型产出**（`request.diagram_type`，`None` 就是树）：演示模式的
+        # 用途是没有密钥的机器上也能看到一张图，而恒为树的占位图演示不了鱼骨与
+        # 流程——界面上选了"流程图"却出来一棵导图，用户会以为这个功能坏了。
+        # 图型已经由 `apply_diagram_intent` 在开流前解析过（下拉 / goal 里的话 /
+        # 模型默认），所以这里读到的是**这次真正要的图型**。
+        demo = _demo_content(request.goal, request.diagram_type or "tree")
         # 也记到 ctx 上：草稿要按"这次运行产出的那棵树"落库，占位树同样是产出。
         # 不写这里的话，演示模式的 run 会以"没产出"收尾，回放时前端只看到
         # 一句"模型这次没有产出导图"。
