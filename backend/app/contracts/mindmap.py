@@ -180,6 +180,12 @@ MAX_FISHBONE_CATEGORY_CHARS = 40
 # 200 是"一句话主题"的既有容量。写成 `"为什么 X 会 Y"` 的句式通常 30–60 字。
 MAX_FISHBONE_PROBLEM_CHARS = 200
 
+# 流程图的阶段数上限。阶段是读者一眼扫过的大段（"提交 / 审查 / 付款"），20 段在
+# 1080p 画布上已经要横向滚两屏。与 `bones` 同为**顶层数组**，所以它是
+# `Field(max_length=...)` 的硬边界而不是 warn：多出来的阶段在主轴上没有位置，
+# 静默挤到画布外比 422 更难排查。
+MAX_FLOW_STAGES = 20
+
 
 def normalize_color(value: object) -> str | None:
     """模型给的 `color` → 调色板里的键，或 `None`。
@@ -511,11 +517,17 @@ def _validate_relations(relations: Sequence[Relation], node_ids: set[str]) -> No
         relation_keys.add(key)
 
 
-def _validate_edges(edges: Sequence[Edge], node_ids: set[str]) -> None:
+def _validate_edges(
+    edges: Sequence[Edge], node_ids: set[str], *, what: str = "节点",
+) -> None:
     """附加边的三条硬约束：条数上限、id 唯一、端点存在且不是自环。
 
     与 `relations` 的差别在**硬拒的边界**：条数用的是 `MAX_EDGES_LIMIT`（承载能力）
     而不是 `MAX_EDGES`（产品口径）——后者只报 warn，理由见 `MAX_EDGES` 的注释。
+
+    `what` 只影响错误文案里的名词：树里端点是**节点**，流程里端点是**阶段**
+    （`FlowContent.edges` 是阶段之间的跳转）。判据一模一样，所以只有一份实现；
+    但把"阶段 s1 不在导图中"说成"节点 s1"，排查时会去树里找一个根本不在树里的 id。
     """
     if len(edges) > MAX_EDGES_LIMIT:
         raise ValueError(f"附加边最多 {MAX_EDGES_LIMIT} 条")
@@ -531,13 +543,13 @@ def _validate_edges(edges: Sequence[Edge], node_ids: set[str]) -> None:
         # 生成路径会在构造之前先把这种边滤掉并报 `EDGE_DANGLING`（见
         # `app/mindmaps/edges.py::clean_edges`），两条路都不让脏边活下来。
         if edge.source not in node_ids:
-            raise ValueError(f"边 {edge.id} 的起点节点 {edge.source} 不在导图中")
+            raise ValueError(f"边 {edge.id} 的起点{what} {edge.source} 不在导图中")
         if edge.target not in node_ids:
-            raise ValueError(f"边 {edge.id} 的终点节点 {edge.target} 不在导图中")
+            raise ValueError(f"边 {edge.id} 的终点{what} {edge.target} 不在导图中")
         # 自环画不出来——它只会渲染成一个点，用户看不出那里有一条线，
         # 却会因为"边数 +1"而困惑。而"节点到自己"这件事在图上没有语义。
         if edge.source == edge.target:
-            raise ValueError(f"边 {edge.id} 的起点与终点不能是同一个节点（自环无法绘制）")
+            raise ValueError(f"边 {edge.id} 的起点与终点不能是同一个{what}（自环无法绘制）")
 
 
 class ContentBase(BaseModel):
@@ -729,6 +741,72 @@ class FishboneContent(ContentBase):
                 raise ValueError(f"骨的类别不能重复：{bone.category}")
             categories.add(bone.category)
             _scan_tree(bone.root, source_ids, node_ids)
+        _validate_relations(self.relations, node_ids)
+        return self
+
+
+class FlowStage(BaseModel):
+    """流程里的一个阶段：一个 id + 一棵步骤树。
+
+    `root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——
+    `Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，
+    而第一层"步骤"与第 N 层"步骤"在数据里本来就该是同一个东西。`steps` 就是
+    `root.children`。
+
+    `id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点
+    引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并
+    是因为合并之后"这条边连的是阶段还是步骤"要靠形状猜，而两者在画布上画出来的
+    东西完全不同（一条主轴 vs 一条细线）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=100)
+    root: Node
+
+
+class FlowContent(ContentBase):
+    """流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。
+
+    与 `MindMapContent` 的三个差别：
+
+      - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步
+        还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让"这是阶段"与
+        "这是阶段里的第一步"在数据里长得一样。
+      - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`
+        刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的
+        `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`
+        表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个
+        "第三种命名空间"。
+      - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。
+        `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。
+    """
+
+    diagram_type: Literal["flowchart"] = "flowchart"
+    # 顺序就是 `stages` 的顺序：流程图的"先后"是数组下标，不需要另一个 `order` 字段
+    # ——两个来源说同一件事时，它们迟早会互相矛盾。
+    stages: list[FlowStage] = Field(default_factory=list, max_length=MAX_FLOW_STAGES)
+    edges: list[Edge] = Field(default_factory=list)
+
+    @field_validator("edges")
+    @classmethod
+    def dedupe_edges(cls, value: list[Edge]) -> list[Edge]:
+        """去重的判据见模块级 `_dedupe_edges`；树那边共用同一份。"""
+        return _dedupe_edges(value)
+
+    @model_validator(mode="after")
+    def validate_flow(self) -> FlowContent:
+        source_ids = _unique_source_ids(self.source_usage)
+        stage_ids: set[str] = set()
+        # 阶段内部的节点 id 仍然必须全局唯一（前端按 id 建索引，两个阶段各有一个
+        # `step1` 时点一下会跳到另一个阶段里），节点总数也按全部阶段合计算。
+        node_ids: set[str] = set()
+        for stage in self.stages:
+            if stage.id in stage_ids:
+                raise ValueError(f"阶段 ID 必须唯一，重复的是 {stage.id}")
+            stage_ids.add(stage.id)
+            _scan_tree(stage.root, source_ids, node_ids)
+        # 边端点查的是**阶段** id（见类注释），所以把它自己的命名空间传进去。
+        _validate_edges(self.edges, stage_ids, what="阶段")
         _validate_relations(self.relations, node_ids)
         return self
 
