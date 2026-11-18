@@ -13,9 +13,11 @@
     - `InterfaceTest`       ASGI 打一次 multipart，确认响应形状与"只解析不落库"
 
 闭环用例里有一条刻意留下的**不**等价，写在这里以免下一个人以为是 bug：
-markdown / opml / puml 只有一个文字槽位，导出取 `note or label`，所以带 `note`
+markdown / opml / puml 的**标题槽**只有一个，导出取 `note or label`，所以带 `note`
 的节点往返之后 `note` 变成 `label`（文字不丢、字段位置变）。`note` 转成 `label`
-这件事由 `test_note_text_survives_as_label` 明确钉住。
+这件事由 `test_note_text_survives_as_label` 明确钉住。`detail` 不在那个槽里——它
+有各格式自己的第二个通道（`>` 引用块 / `'` 注释 / `_note` 属性），所以它能原样
+回去；markdown 这条路有用例逐字断言（`MarkdownDetailTest`）。
 """
 from __future__ import annotations
 
@@ -290,6 +292,55 @@ class MarkdownRoundTripTest(unittest.TestCase):
     def test_no_list_items_is_a_parse_failure(self):
         with self.assertRaises(ParseFailure):
             parse_text("empty.md", "# 只有标题\n\n一段话。\n")
+
+
+class MarkdownDetailTest(unittest.TestCase):
+    """`detail`（生成出来的说明）在 markdown 里的往返。
+
+    这一路以前是"三种文本格式全丢 detail，只有 JSON 保得住"。丢的不是装饰字段：
+    `detail` 是生成的核心产物（实测平均 142 字），而 `note` 可能根本是空的——
+    读者拿到的文件里，一个节点只剩一行标题。
+
+    落点是节点行下面一句引用块（`  > …`）：不进列表缩进层级，所以不会被读成
+    下一层节点，也不可能与标题挤在同一行。
+    """
+
+    def tree_with_detail(self) -> MindMapContent:
+        return MindMapContent.model_validate({
+            "title": "报销",
+            "root": {"id": "r", "label": "提交申请",
+                     "detail": "把报销单和发票拍照上传，缺一张都要退回。",
+                     "children": [
+                         {"id": "a", "label": "填单", "detail": "写清事由与金额。"},
+                         {"id": "b", "label": "上传发票"},
+                     ]},
+        })
+
+    def test_detail_round_trips_in_markdown(self):
+        restored = parse_text("d.md", to_markdown(self.tree_with_detail())).content
+        self.assertEqual(restored.root.label, "提交申请")
+        self.assertEqual(restored.root.detail, "把报销单和发票拍照上传，缺一张都要退回。")
+        self.assertEqual(restored.root.children[0].detail, "写清事由与金额。")
+        self.assertIsNone(restored.root.children[1].detail)
+
+    def test_detail_does_not_get_into_the_title(self):
+        """`detail` 一旦并进标题行，大纲就没法扫读了——那是这场修复的底线。"""
+        restored = parse_text("d.md", to_markdown(self.tree_with_detail())).content
+        self.assertNotIn("把报销单和发票拍照上传", restored.root.label)
+        self.assertEqual(len(restored.root.children), 2)
+
+    def test_multiline_quote_is_joined_into_one_detail(self):
+        """用户把一句说明手动折成两行引用块：拼回一句，不留下换行。"""
+        text = "# 标题\n\n- 甲\n  > 第一句。\n  > 第二句。\n"
+        restored = parse_text("m.md", text).content
+        self.assertEqual(restored.root.detail, "第一句。 第二句。")
+
+    def test_quote_attaches_to_the_node_above_it(self):
+        """归属看**位置**不看缩进：用户重排缩进之后说明仍然挂在同一个节点上。"""
+        text = "# 标题\n\n- 甲\n  - 乙\n> 乙的说明（顶格写也不跑）\n"
+        restored = parse_text("q.md", text).content
+        self.assertEqual(restored.root.children[0].detail, "乙的说明（顶格写也不跑）")
+        self.assertIsNone(restored.root.detail)
 
 
 class OpmlRoundTripTest(unittest.TestCase):
@@ -1097,41 +1148,92 @@ def _all_nodes(content):
 
 
 class ShapeJudgeTest(unittest.TestCase):
-    """判据：**只有本仓库的 JSON 认完整结构**，其余五种格式一律只产树。"""
+    """判据：**形状只看文件自述**——JSON 看顶层键，markdown 看文件头的标记；
+    其余格式（opml / puml / xmind / freemind）只产树。
 
-    def test_markdown_fishbone_comes_back_as_a_tree(self):
-        """鱼骨图导成 markdown 再导回来**是树**——这是有损的，且必须如实钉住。
+    早先这里是"只有 JSON 认完整结构，markdown 一律退化成树"，而那正是 P1-③ 那个
+    缺陷的**成因**：`markdown.py::parse` 只把第一个 `#` 当标题，后面的 heading 一律
+    `continue`，于是流程图的 `### 1. 提交` 没有落点——阶段名整段消失、边清单那几行
+    反倒成了节点。现在多级 heading 是容器、形状由标记声明，两条路都能如实还原。
+    """
 
-        这条用例的存在意义不是"验证一个 bug"，而是把"闭环只在 JSON 上成立"这句话
-        变成红灯：哪天有人改了 markdown 的导出/导入让鱼骨能保住形状，这条用例会
-        先红，然后他得去 `docs/IMPORT.md` 把"有损"那段改掉，而不是让文档与代码
-        各说各话。
-        """
-        original = sample_fishbone()
-        restored = parse_text("fishbone.md", to_markdown(original)).content
-        self.assertIsInstance(restored, MindMapContent)
-        # 文字没丢：六类骨与原因都在树里
-        self.assertEqual(restored.root.label, "为什么三次交付都延期")
-        self.assertEqual([child.label for child in restored.root.children], ["人", "机", "料"])
+    def test_flow_markdown_keeps_shape_and_stages(self):
+        """流程图 → markdown → 导入：**还是流程图**，阶段名与两层边都在。
 
-    def test_flow_markdown_comes_back_as_a_tree(self):
-        """流程图的 markdown 往返：变成树，**而且阶段名整段丢掉**。
-
-        丢的原因不是流程特有的是：markdown 解析器只把**第一个** `#` 标题当导图标题，
-        后面任何级别的 heading 都被跳过（`markdown.py::parse` 里那一句 `continue`）。
-        树的导出只用一个 `# 标题`，所以树这条路不受影响；鱼骨与流程的导出用
-        `## 人` / `### 1. 提交` 当容器，那些行在导入侧就没有落点。
-
-        这条用例把"有损在哪"钉成事实，`docs/IMPORT.md` 的格式矩阵照它写。
+        这条用例以前钉的是"变回树、阶段名丢失"。它红了是好事——那说明修复生效了。
+        现在钉的是修复之后的具体数字：三个阶段、两条阶段间边（含一条回退）、
+        两条阶段内的判定出边。少一个就说明某一层又掉回 infer-nothing 的老路。
         """
         restored = parse_text("flow.md", to_markdown(sample_flow())).content
-        self.assertIsInstance(restored, MindMapContent)
+        self.assertIsInstance(restored, FlowContent)
         self.assertEqual(restored.title, "报销流程")
-        # 阶段名（`### 1. 提交`）没有落点，第一个列表项成了根
+        self.assertEqual([stage.root.label for stage in restored.stages],
+                         ["提交", "审查", "付款"])
+        # 阶段之间：三条。端点与文字都回来了，**`kind` 只在那条没有文字的边上
+        # 回来**（导出写 `（顺序）`，导入把它读成 kind=flow）；另外两条的槽被
+        # `通过` / `驳回` 占着，kind 就落不下来。这是 markdown 只有一个边后缀槽的
+        # 既有取舍（见 `export.service._edge_suffix` 与 `EDGE_KIND_LABELS` 的注释），
+        # 不是这次修复引入的——树的边清单一直是同一个行为
+        # （`MarkdownRoundTripTest.test_edges_are_read_back` 钉着）。
+        self.assertEqual(len(restored.edges), 3)
+        self.assertEqual({(edge.label, edge.kind) for edge in restored.edges},
+                         {("顺序", "flow"), ("通过", None), ("驳回", None)})
+        # 阶段内部：两条判定出边，落在**审查**这个阶段自己的节点上
+        review = restored.stages[1]
+        self.assertEqual(len(review.edges), 2)
+        self.assertEqual({edge.label for edge in review.edges}, {"是", "否"})
+        own_ids = {node.id for node in walk(review.root)}
+        for edge in review.edges:
+            self.assertIn(edge.source, own_ids)
+            self.assertIn(edge.target, own_ids)
+        self.assertEqual({node.label for node in walk(review.root)},
+                         {"审查", "形式审查", "实质审查"})
+
+    def test_fishbone_markdown_keeps_bones_and_problem(self):
+        """鱼骨图 → markdown → 导入：骨头（类别）与主骨上那句话都回来。
+
+        骨与骨下面的原因在 markdown 里只差一级缩进，所以导出必须把"谁挂在谁下面"
+        写对（`  - 人` / `    - 关键人休假`）。写错时读起来是"七个并列要点"，
+        导回来则是"主骨下面挂着原因、没有骨"——两张图都叫鱼骨，形状全错。
+        """
+        restored = parse_text("fishbone.md", to_markdown(sample_fishbone())).content
+        self.assertIsInstance(restored, FishboneContent)
+        self.assertEqual(restored.problem, "为什么三次交付都延期")
+        self.assertEqual([bone.category for bone in restored.bones], ["人", "机", "料"])
+        self.assertEqual([cause.label for cause in restored.bones[0].root.children],
+                         ["九月两周", "交接不完整"])
+
+    def test_markdown_without_marker_is_still_a_tree(self):
+        """没标记 = 树。**这是兼容性那一半**：手写大纲、老文件、被人删掉标记的文件
+        都走这一条，行为与加标记之前逐字段相同。"""
+        restored = parse_text("plain.md", to_markdown(
+            MindMapContent.model_validate(build()))).content
+        self.assertIsInstance(restored, MindMapContent)
+
+    def test_container_headings_keep_their_names_without_the_marker(self):
+        """没有标记时多级 heading 也是容器——**容器名不再整段丢失**。
+
+        这是 codex 报的 P1-③ 的最小形态：删掉标记之后，`### 1. 提交` 仍然要落成
+        一个节点（名字带序号，因为这时没有"这是阶段"的依据，序号就是文字的一部分）。
+        形状退化成树是**这条路的已知损失**，名字丢掉不是。
+        """
+        text = to_markdown(sample_flow()).replace(
+            "<!-- genai-mindmap: shape=flowchart -->\n", "")
+        restored = parse_text("flow.md", text).content
+        self.assertIsInstance(restored, MindMapContent)
         labels = {node.label for node in _all_nodes(restored)}
-        self.assertNotIn("提交", labels)
-        self.assertNotIn("审查", labels)
+        self.assertIn("1. 提交", labels)
+        self.assertIn("2. 审查", labels)
         self.assertIn("填单", labels)
+
+    def test_flow_markdown_without_stage_headings_degrades_with_a_notice(self):
+        """标着流程图却一个阶段标题都没有：按树读，并**说出降级**。
+
+        静默换一种形状比降级本身更难排查——用户会把"我的流程变成了导图"当成丢数据。
+        """
+        result = parse_text("odd.md", "# 标题\n<!-- genai-mindmap: shape=flowchart -->\n\n- 甲\n- 乙\n")
+        self.assertIsInstance(result.content, MindMapContent)
+        self.assertIn("format_notice", codes(result.warnings))
 
     def test_empty_bones_is_a_legal_fishbone(self):
         """只有主骨的草稿是合法的：`bones: []` 不该被当成"不是鱼骨图"。"""
@@ -1187,6 +1289,48 @@ class ShapeJudgeTest(unittest.TestCase):
         result = parse_text("cross.json", json.dumps(body, ensure_ascii=False))
         self.assertEqual(result.content.stages[1].edges, [])
         self.assertIn("edges_dropped", codes(result.warnings))
+
+
+class FlowMarkdownTest(unittest.TestCase):
+    """流程图 markdown 的两个细节：阶段根的**正文**、阶段内边的端点归属。"""
+
+    def flow(self):
+        return FlowContent.model_validate({
+            "title": "报销流程",
+            "stages": [
+                {"id": "s_1", "root": {
+                    "id": "n1", "label": "审查", "note": "查单据与金额",
+                    "children": [{"id": "n11", "label": "形式审查"}]},
+                 "edges": [{"id": "i1", "source": "n1", "target": "n11",
+                            "label": "是", "kind": "branch"}]},
+            ],
+        })
+
+    def test_stage_root_note_is_restored_from_the_heading(self):
+        """`### 2. 审查｜查单据与金额`：竖线左边是标题，右边是正文。
+
+        不留这一手的话，阶段根只剩「审查」，而生成出来的那句"查单据与金额"——画布上
+        真正显示的那一行——在文件里和最外层标题里都还是它，导入却没了。
+        """
+        restored = parse_text("f.md", to_markdown(self.flow())).content
+        self.assertEqual(restored.stages[0].root.label, "审查")
+        self.assertEqual(restored.stages[0].root.note, "查单据与金额")
+
+    def test_inner_edge_endpoint_on_the_stage_root_still_resolves(self):
+        """阶段内边的端点写的是**正文优先**的那个名字（`查单据与金额`），而导入之后
+        阶段根的标题是 `审查`。这一层不换回来，那条边会以"端点找不到"的名义丢掉——
+        图能打开、看着正常，只是"是/否"其中一个出口没了。"""
+        result = parse_text("f.md", to_markdown(self.flow()))
+        self.assertEqual(len(result.content.stages[0].edges), 1)
+        self.assertNotIn("edges_dropped", codes(result.warnings))
+
+    def test_unmatched_inner_edge_is_reported_not_silently_dropped(self):
+        """行首的 `[阶段名]` 对不上任何阶段：丢掉，但说出来。"""
+        text = ("# t\n<!-- genai-mindmap: shape=flowchart -->\n\n"
+                "### 1. 甲\n\n- 乙\n\n"
+                "## 附加关系（阶段内部）\n\n- [9. 不存在] 丙 → 丁（是）\n")
+        result = parse_text("x.md", text)
+        self.assertIn("format_notice", codes(result.warnings))
 
 
 class ContainerBfsTest(unittest.TestCase):

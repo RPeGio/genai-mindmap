@@ -59,6 +59,12 @@
 `note` 与 `label` 仍然合成一行：它们争的是同一个位置——画布上的那一行字——而
 `detail` 是另一层信息，本来就不该挤进标题。**没有 `detail` 的图输出逐字节不变**
 （`tests/test_export.py::ByteIdenticalTest` 钉着这件事）。
+
+**形状标记**。markdown 的树输出只有一个 `# 标题`，鱼骨与流程却在用多级 heading /
+缩进分节——导入侧只看得到文字，看不出"这几条是一根骨"。所以非树形状的 markdown
+第二行写一行 HTML 注释 `<!-- genai-mindmap: shape=fishbone -->`：渲染时不可见，
+`grep` 得到，导入侧读它就能精确还原形状（见 `shape_marker`）。树不写——"没有标记"
+就是树，所以树的输出一个字节都没动。
 """
 from __future__ import annotations
 
@@ -83,6 +89,24 @@ EDGES_SECTION = "附加关系"
 # opml 的 outline text、puml 的注释行三处都读它，拼出来的一致性是靠常量保证的。
 STAGE_EDGES_SECTION = f"{EDGES_SECTION}（阶段之间）"
 INNER_EDGES_SECTION = f"{EDGES_SECTION}（阶段内部）"
+
+
+def shape_marker(diagram_type: str) -> str:
+    """Markdown 文件里的形状标记行（不带换行）。
+
+    为什么需要它：鱼骨与流程的 markdown 里，"这几条是六根骨"只体现为缩进，而缩进
+    在导入侧同时可能是"这个节点的子节点"。**从形状硬推断形状是编造**——一份普通的
+    三级缩进大纲与一张只有两条原因的鱼骨图，在文本上可以一模一样。写上这一行之后，
+    导入侧不必猜：`importing/markdown.py` 读它，读不到就按树处理（老文件与手写
+    大纲的行为一个字节没变）。
+
+    为什么是 HTML 注释：渲染时不可见（不影响任何 Markdown 阅读器），是标准语法
+    （不是自造的行内约定），`grep 'shape='` 能直接找到，删掉它只是退回"按树导入"。
+    位置在**第二行**：第一行留给 `# 标题`，那是所有读者（与人）第一眼看的东西。
+
+    只写给非树形状——树不写，所以树的 markdown 输出逐字节不变。
+    """
+    return f"<!-- genai-mindmap: shape={diagram_type} -->"
 
 
 # `kind` → 中文说法，只在边**没有 label** 时补上去。有 label 时（"是"/"驳回"）
@@ -417,8 +441,16 @@ def _puml_fishbone(content: FishboneContent) -> str:
 
 
 def _markdown_fishbone(content: FishboneContent) -> str:
-    """鱼骨图 → Markdown 大纲。骨用一级列表，原因按缩进分层。"""
-    lines: list[str] = [f"# {_escape_markdown(content.title)}", ""]
+    """鱼骨图 → Markdown 大纲。骨用一级列表，原因按缩进分层。
+
+    第二行是形状标记（见 `shape_marker`）：缩进能表达"谁挂在谁下面"，表达不了
+    "这几条是骨"。标记让导入侧不必猜。
+    """
+    lines: list[str] = [
+        f"# {_escape_markdown(content.title)}",
+        shape_marker(content.diagram_type),
+        "",
+    ]
     for depth, text, detail in _fishbone_lines(content):
         if depth == 0:
             lines.append(f"- {_escape_markdown(text)}")
@@ -611,9 +643,13 @@ def _markdown_flow(content: FlowContent) -> str:
     降成一列缩进之后，"这里是第二个阶段"只能从缩进层级去数。树（`-` 列表）的
     逐字节输出不受影响——这条分派在 `to_markdown` 的第一行。
 
-    阶段根自己的 `detail` 以引用块挂在标题下面（见 `_markdown_quote`）。
+    第二行的形状标记让导入侧知道"这些 `###` 是阶段，不是普通小标题"（见
+    `shape_marker`）；阶段根自己的 `detail` 以引用块挂在标题下面。
     """
-    lines: list[str] = [f"# {_escape_markdown(content.title)}"]
+    lines: list[str] = [
+        f"# {_escape_markdown(content.title)}",
+        shape_marker(content.diagram_type),
+    ]
     for index, stage in enumerate(content.stages):
         lines += ["", f"### {_escape_markdown(_flow_stage_heading(stage, index))}", ""]
         quotes = _markdown_quote(stage.root.detail, "")

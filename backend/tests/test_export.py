@@ -274,6 +274,49 @@ class TwoLayerExportTest(unittest.TestCase):
                          ["审批的人不在"])
 
 
+class ShapeMarkerTest(unittest.TestCase):
+    """非树形状的 markdown 第二行有一行机器可读的形状标记。
+
+    为什么它必须有：鱼骨/流程的 markdown 里，"这几条是骨"只体现为缩进，而缩进在
+    导入侧同时可能是"这个节点的子节点"。从形状硬推断形状是编造——一份三级缩进
+    大纲与一张两条原因的鱼骨图在文本上一模一样。标记让导入侧不必猜。
+
+    为什么树没有：`# 标题` + 列表项就是树，没有第二种读法；不写标记，树的输出才能
+    逐字节不变（`ByteIdenticalTest`）。
+    """
+
+    def fishbone(self):
+        from app.contracts.mindmap import FishboneContent
+        return FishboneContent.model_validate({
+            "title": "报销慢的原因分析", "problem": "为什么报销要 11 天",
+            "bones": [{"category": "人", "root": {"id": "b1", "label": "人"}}],
+        })
+
+    def flow(self):
+        from app.contracts.mindmap import FlowContent
+        return FlowContent.model_validate({
+            "title": "报销流程", "diagram_type": "flowchart",
+            "stages": [{"id": "s_1", "root": {"id": "n1", "label": "提交申请"}}],
+        })
+
+    def lines_of(self, content):
+        return [line for line in to_markdown(content).splitlines() if line.strip()]
+
+    def test_fishbone_marker_is_the_second_line(self):
+        lines = self.lines_of(self.fishbone())
+        self.assertEqual(lines[0], "# 报销慢的原因分析")
+        self.assertEqual(lines[1], "<!-- genai-mindmap: shape=fishbone -->")
+
+    def test_flow_marker_is_the_second_line(self):
+        lines = self.lines_of(self.flow())
+        self.assertEqual(lines[0], "# 报销流程")
+        self.assertEqual(lines[1], "<!-- genai-mindmap: shape=flowchart -->")
+
+    def test_tree_has_no_marker(self):
+        """树不写标记——"没有标记"就是树，所以树的输出一个字节都没动。"""
+        self.assertNotIn("genai-mindmap", to_markdown(SAMPLE))
+
+
 class DetailExportTest(unittest.TestCase):
     """`detail`（生成说明）在三种文本格式里各有一个落点。
 
