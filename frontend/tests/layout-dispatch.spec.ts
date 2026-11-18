@@ -184,6 +184,20 @@ describe('store：画布按 content.diagram_type 选布局', () => {
     expect((renNode.data as { in: string[] }).in).toContain('right');
   });
 
+  it('主骨末端的箭头只挂在布局指定的那一条骨线上', () => {
+    const store = mount({ title: 't', diagram_type: 'fishbone', root: fishboneTree() });
+    const carriers = store.edges.filter(edge => (edge.data as { arrow?: unknown }).arrow !== undefined);
+    // 主骨那一小段被六条骨线各画了一遍；箭头只登记一条，画布上就只有一份
+    expect(carriers).toHaveLength(1);
+    expect(carriers[0]!.id).toBe('root->人');
+    expect((carriers[0]!.data as { arrow?: Array<{ x: number; y: number }> }).arrow![0])
+      .toEqual({ x: -NODE_SIZE.width / 2, y: 0 });
+    // 树图型一根都没有
+    const treeStore = mount({ title: '树', root: tree() });
+    expect(treeStore.edges.some(edge => (edge.data as { arrow?: unknown } | undefined)?.arrow !== undefined))
+      .toBe(false);
+  });
+
   it('流程图里回退边绕左侧走、并打上 back 标记', () => {
     const store = mount(flowContent());
     const back = store.edges.find(edge => edge.id === 'attach:e2')!;

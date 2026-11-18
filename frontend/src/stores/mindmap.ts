@@ -1674,6 +1674,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 找不到句柄，线会从头节点中心乱连。
       const bone = current.fishbone?.links.get(id);
       if (bone) {
+        // 主骨末端的箭头只挂给**布局指定的那一条**骨线（锚点最靠右的那根，它的水平段
+        // 就是主骨最右边那一截）。主骨那一小段被六条骨线各画了一遍，六份箭头在
+        // DOM 里是六份、在画面上是一份——布局那边只登记一条，这里就照着给。
+        const arrow = current.fishbone?.spineArrow;
         out.push({
           id,
           source: parentId,
@@ -1681,7 +1685,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
           target: node.id,
           targetHandle: 'in-right',
           type: 'fishbone',
-          data: { points: bone },
+          data: arrow && arrow.link === id ? { points: bone, arrow: arrow.points } : { points: bone },
         });
         continue;
       }

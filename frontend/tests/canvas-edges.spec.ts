@@ -1,4 +1,4 @@
-﻿import { mount, type VueWrapper } from '@vue/test-utils';
+import { mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -108,6 +108,27 @@ describe('画布上的三种连线', () => {
 
     expect(wrapper.findAll('g.vue-flow__edge-fishbone')).toHaveLength(0);
     expect(wrapper.findAll('g.vue-flow__edge-smoothstep').length).toBeGreaterThan(0);
+    // 树上一个箭头都没有：主骨末端那个三角形是鱼骨独有的
+    expect(wrapper.findAll('polygon.fishbone-spine-arrow')).toHaveLength(0);
+  });
+
+  it('鱼骨：主骨末端的箭头只画一份，且落在它自己那条骨线的组里', async () => {
+    const wrapper = mountCanvas();
+    useMindMapStore().preview(fishboneContent, 'right');
+    await settle(wrapper);
+
+    const arrows = wrapper.findAll('polygon.fishbone-spine-arrow');
+    // 主骨那一小段被两条骨线各画了一遍；箭头只有一份（布局指定锚点最靠右的那条）
+    expect(arrows).toHaveLength(1);
+    expect(arrows[0]!.attributes('points')).toBe('-90.00,0.00 -102.00,-5.00 -102.00,5.00');
+    // 它确实画在 `r->人` 那条边的 `<g>` 里，而不是飘在画布上
+    const group = arrows[0]!.element.closest('g.vue-flow__edge-fishbone');
+    expect(group).not.toBeNull();
+    const ownerPath = layoutFishbone(fishboneContent.root).fishbone.links.get('r->人')!;
+    const d = ownerPath
+      .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+      .join(' ');
+    expect(group!.querySelector('path.vue-flow__edge-path')?.getAttribute('d')).toBe(d);
   });
 
   it('流程图：附加边画成 mindEdge（带 kind，能换色/换线型）', async () => {

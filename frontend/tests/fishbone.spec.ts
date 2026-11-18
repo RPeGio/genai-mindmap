@@ -654,4 +654,22 @@ describe('鱼骨连线的渲染', () => {
     expect(d.match(/L/g)).toHaveLength(2);
     expect(d.startsWith(`M ${points[0]!.x.toFixed(2)} ${points[0]!.y.toFixed(2)}`)).toBe(true);
   });
+
+  it('主骨末端的箭头是一个显式三角形，不是 marker', () => {
+    const result = layoutFishbone(sixBoneTree());
+    const arrow = result.fishbone.spineArrow!;
+    const wrapper = mountBone(result.fishbone.links.get(arrow.link)!, arrow.points);
+
+    const polygon = wrapper.find('polygon.fishbone-spine-arrow');
+    expect(polygon.exists()).toBe(true);
+    expect(polygon.attributes('points')).toBe('-90.00,0.00 -102.00,-5.00 -102.00,5.00');
+    // 显式三角形：没有 marker，也就没有 markerUnits 那套"跟着描边宽度变"的耦合
+    expect(wrapper.find('path.vue-flow__edge-path').attributes('marker-end')).toBeUndefined();
+    expect(wrapper.find('defs').exists()).toBe(false);
+  });
+
+  it('没拿到箭头的骨线一条多边形都不画（六条骨线只画一份）', () => {
+    const wrapper = mountBone([{ x: -90, y: 0 }, { x: -138, y: 0 }, { x: -209.6, y: -124 }]);
+    expect(wrapper.find('polygon').exists()).toBe(false);
+  });
 });
