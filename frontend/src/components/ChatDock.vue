@@ -880,7 +880,7 @@ defineExpose({
                 : 'border-slate-200 text-slate-500 hover:bg-slate-50'"
               :aria-pressed="deepThinking"
               :disabled="runBlocked"
-              title="这一次走推理模型：会先想一遍再动手，慢一些，拆解更稳（模型由后端配置决定）"
+              title="这一次的生成链走推理模型（骨架 / 结构 / 说明 / 展开都会先想一遍再动手），慢一些，拆解更稳。检索规划与联网检索仍走普通模型；具体模型名由后端配置决定。"
               @click="deepThinking = !deepThinking"
             >深度思考</button>
             <!-- 「智能搜索」：原来那个联网检索开关。它写的是偏好，所以勾一下就落库。 -->
