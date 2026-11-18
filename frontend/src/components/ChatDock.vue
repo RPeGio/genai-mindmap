@@ -352,8 +352,8 @@ const statusKind = computed<StatusKind | null>(() => {
  *   - 运行中：那会儿进度才是他要看的，而这条提示不会因为这一轮结束而消失；
  *   - **就是刚刚这一次**（`run_id === store.pendingRunId`）：那棵树已经落到画布上、
  *     用户正看着它。此时再说一句"上次生成完的导图还没保存"，说的是他自己刚做的事，
- *     既没有信息量，也会跟着把淡出永远顶住（这是一条刹车，见 `shouldKeep`）。
- *     服务端确实会把这一次也列进 `pending()`，所以过滤只能放在这一层。
+ *     既没有信息量，也会在成功态下多出一条永不消失的提示。服务端确实会把这一次也
+ *     列进 `pending()`（它只看到"有一条没保存的结果"），所以过滤只能放在这一层。
  */
 const resumable = computed(() => {
   if (statusKind.value === 'running') return null;
@@ -530,7 +530,13 @@ function clearDismiss(): void {
  *      或者焦点还在框里——都是"他正在写"，收走就丢了；
  *   3. 材料粘贴框里还有没点「添加」的正文——同上，而且它住在一个会因为淡出而
  *      看不到的面板里（草稿本身在 store 里，不丢；但看不见 = 以为丢了）；
- *   4. 这一次失败了 / 部分完成 / 有冲突 / 有上次没保存的结果——这几种都在等他做决定。
+ *   4. 这一次失败了 / 部分完成 / 有冲突——这几种都在等他做决定。
+ *
+ * **「上次没保存的结果」不在这张表里**，理由与它独立成行是同一条：它只在
+ * `statusKind === 'ok'` 时才可能多挡住一次淡出，而那恰好是"刚生成成功"——用户
+ * 正要看的是新结果，"上次"这件事此刻并不需要他做决定。实测把它当刹车之后，
+ * 只要历史里有一条没保存的结果，**每一次生成完的对话框都再也不淡出**，产品那条
+ * "生成完只剩画布"直接失效。它靠独立那一行 + 悬浮球的回程入口保持可达。
  */
 const shouldKeep = computed(() => {
   if (pinned.value) return true;
@@ -538,8 +544,6 @@ const shouldKeep = computed(() => {
   if (typed.value) return true;
   if (composing.value || focused.value) return true;
   if (sources.draftText.trim()) return true;
-  // 只有"别人留下的、还没处理的结果"才当刹车；刚刚这一次不算（见 `resumable`）。
-  if (resumable.value) return true;
   const kind = statusKind.value;
   if (kind && kind !== 'ok' && kind !== 'running') return true;
   if (kind === 'running') return true;
@@ -558,8 +562,7 @@ const canFade = computed(() => statusKind.value === 'ok'
   && !typed.value
   && !composing.value
   && !focused.value
-  && !sources.draftText.trim()
-  && !resumable.value);
+  && !sources.draftText.trim());
 
 watch(
   () => [canFade.value, store.nodeCount] as const,
@@ -967,7 +970,8 @@ defineExpose({
             上一次的结果还没保存"这种最普通的情形下，它被状态行遮住，随后跟着对话框
             一起淡出——`runs` 表里那份结果从"该被捡回来"变成"没人知道它在"。
             它是一件**等用户做决定**的待办（载入 / 不用了），不是"此刻的状态"，
-            所以既不能被抢位，也要当淡出刹车（见 `shouldKeep`）。
+            所以不能被抢位。但它**不**参与淡出判定：那是实测之后放弃的（见
+            `shouldKeep` 的注释）——它在唯一会生效的场景下正好挡错了人。
           -->
           <div
             v-if="resumable"

@@ -214,7 +214,7 @@ describe('底部对话框的状态机', () => {
     expect(dockFaded(wrapper)).toBe(true);
   });
 
-  it('上次没保存的结果独立成一条：成功时不被"已落到画布"挤掉，也不淡出', async () => {
+  it('上次没保存的结果独立成一条：成功时不被"已落到画布"挤掉', async () => {
     stubFetch();
     const wrapper = mountApp();
     const store = useMindMapStore();
@@ -232,15 +232,31 @@ describe('底部对话框的状态机', () => {
     expect(notice.text()).toContain('还没保存');
     expect(notice.text()).toContain('上一张图');
 
-    vi.advanceTimersByTime(5000);
-    await wrapper.vm.$nextTick();
-    expect(dockFaded(wrapper)).toBe(false);
-
-    // 处理掉它（不用了）之后才允许淡出。
-    await notice.findAll('button')[1].trigger('click');
+    // 但它**不**是淡出刹车：实测当刹车之后，只要历史里有一条没保存的结果，
+    // 每次生成完的对话框都不再淡出（见 ChatDock 里 `shouldKeep` 的注释）。
     vi.advanceTimersByTime(2100);
     await wrapper.vm.$nextTick();
     expect(dockFaded(wrapper)).toBe(true);
+
+    // 处理掉它（不用了）之后提示消失。
+    await notice.findAll('button')[1].trigger('click');
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="resumable-notice"]').exists()).toBe(false);
+  });
+
+  it('刚跑完的那一次不以"上次"自称（那是当前画布上的东西）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.generatedSummary = { nodes: 2, changes: null };
+    store.resumableRun = {
+      run_id: 'run-current', status: 'done', intent: 'create', goal: '刚生成的这张',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+    };
+    store.pendingRunId = 'run-current';
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="resumable-notice"]').exists()).toBe(false);
   });
 });
 
