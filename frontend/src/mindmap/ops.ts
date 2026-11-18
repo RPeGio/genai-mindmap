@@ -281,12 +281,13 @@ export function applyOps(content: DiagramContent, batch: OpBatch): ApplyResult {
     source_usage: content.source_usage ?? [],
   };
   const applied = applyOpsOnTree(temp, batch);
-  // 删节点连带删掉悬空的跨节点引用。**只能落在写回之后**：临时 `MindMapContent`
-  // 只有一棵子树，`relations`（属于整图）与 `stages[i].edges`（属于阶段，不在这棵
-  // 临时树里）在那里都看不见。与后端 `tools._prune_stage_edges` /
-  // `_prune_dangling_relations` 同一个位置、同一条判据（按存活节点判）——漏了这一处，
-  // 模型在鱼骨/流程上删一个被关系或阶段内边引用的节点时，前端预演会以"指向不存在
-  // 的节点"整批失败，而后端执行器已经能成功。
+  // 删节点连带删掉悬空的跨节点引用（`relations` + 阶段内边）。**只能落在写回之后**：
+  // 临时 `MindMapContent` 只有一棵子树，`relations`（属于整图）与 `stages[i].edges`
+  // （属于阶段，不在这棵临时树里）在那里都看不见。与后端 `tools._prune_stage_edges` /
+  // `_prune_dangling_relations` 同一个位置、同一条判据（按存活节点判）。
+  //
+  // 这条路当前不可达（见上面的缺口说明），所以这一段是**为放开闸门预埋的干净起点**：
+  // 删节点这一半（悬空引用）已经对齐后端，仍未跟的是 `add_edge` 的层级落笔。
   const moved = pruneDanglingRefs(replaceContainer(content, rootId, () => applied.content.root));
   // 写回之后再校验一次整份内容：临时树只能看到自己那一棵，跨容器的 id 唯一性与
   // 边/阶段的关系要在这里兜住（后端那一步是 `shapes.revalidate`）。
