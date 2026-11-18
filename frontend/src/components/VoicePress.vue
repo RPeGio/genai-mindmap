@@ -15,6 +15,11 @@ import { RecordingError, startRecording, type ActiveRecording } from '../audio/r
  *   2. **键盘也能按住**：Space/Enter 的 keydown 开始、keyup 结束（读屏用户没有指针）；
  *   3. **组件卸载时取消录音**：否则麦克风指示灯一直亮着。
  *
+ * 还有第四点，是实测出来的：**权限还没回来就松手**。`startRecording()` 会等
+ * `getUserMedia` 的授权框，那一步可能几百毫秒到几秒。这段时间里用户松手，旧写法
+ * 的 `finish()` 看到 `recording === null` 直接 return，等授权回来之后组件照常进入
+ * `recording` 态——**用户明明松手了，麦克风还在录**，而且只有再按一次才能停。
+ *
  * 硬上限 600 秒并非自创：`RecordButton` 与后端 `MAX_AUDIO_BYTES`（20MB）同一条口径，
  * 到这个长度自动停止，免得录完才发现传不上去。
  */
@@ -36,6 +41,24 @@ const error = ref('');
 let recording: ActiveRecording | null = null;
 let ticker: number | undefined;
 let disposed = false;
+/**
+ * 用户此刻是否还按着（指针或键盘）。
+ *
+ * 它解决的正是"授权期间松手"：`begin()` 拿到麦克风之后要再看一眼这个值，
+ * 为假就取消，而不是进入录音态。
+ */
+let pressed = false;
+/**
+ * 上一次通过 `active` 报给外面的值。去重之后，卸载时无条件调一次 `setActive(false)`
+ * 就不会多出一串无意义的帧（`sources.recording` 是生成按钮的闸门）。
+ */
+let announced = false;
+
+function setActive(value: boolean): void {
+  if (announced === value) return;
+  announced = value;
+  emit('active', value);
+}
 
 function format(total: number): string {
   const minutes = Math.floor(total / 60);
@@ -57,8 +80,11 @@ function detach(): void {
 }
 
 async function finish(): Promise<void> {
-  if (!recording) return;
+  // 先摘监听器：这一次"松手"已经发生，后面不该再有第二次回调。
   detach();
+  // 授权还没回来（`recording` 仍是 null）：不做任何事，交给 `begin()` 的
+  // `pressed` 判断收尾。以前这里直接 return，于是松手被静默丢弃。
+  if (!recording) return;
   stopTicker();
   state.value = 'finishing';
   const current = recording;
@@ -73,7 +99,7 @@ async function finish(): Promise<void> {
     error.value = err instanceof RecordingError ? err.message : '录音处理失败';
     emit('failed', error.value);
   } finally {
-    emit('active', false);
+    setActive(false);
   }
 }
 
@@ -81,14 +107,19 @@ async function begin(): Promise<void> {
   if (props.disabled || state.value !== 'idle') return;
   error.value = '';
   state.value = 'starting';
-  emit('active', true);
+  setActive(true);
   try {
-    recording = await startRecording();
-    if (disposed) {
-      recording.cancel();
-      recording = null;
+    const started = await startRecording();
+    // 授权期间松手了（或者组件已经被卸载）：**不进入录音态**，直接丢弃这一段。
+    // 这是"按住说话"最容易错的一处：松手那一刻麦克风还没开，等到它开的时候
+    // 用户的手早就不在按钮上了。
+    if (disposed || !pressed) {
+      started.cancel();
+      setActive(false);
+      state.value = 'idle';
       return;
     }
+    recording = started;
     state.value = 'recording';
     seconds.value = 0;
     // 500ms 轮询而不是每秒 +1：标签页切后台时 setInterval 会被节流，
@@ -101,19 +132,23 @@ async function begin(): Promise<void> {
     state.value = 'idle';
     error.value = err instanceof RecordingError ? err.message : '录音启动失败';
     emit('failed', error.value);
-    emit('active', false);
+    setActive(false);
   }
 }
 
 function onPointerDown(event: PointerEvent): void {
   if (props.disabled) return;
   event.preventDefault();
-  void begin();
+  pressed = true;
+  // 先把监听器挂上再启动麦克风：授权那一步是异步的，中间任何一个同步异常都不该
+  // 留下"按下了但没人听松手"的状态。
   window.addEventListener('pointerup', onPointerUp);
   window.addEventListener('pointercancel', onPointerUp);
+  void begin();
 }
 
 function onPointerUp(): void {
+  pressed = false;
   void finish();
 }
 
@@ -121,21 +156,29 @@ function onKeyDown(event: KeyboardEvent): void {
   if (event.key !== ' ' && event.key !== 'Enter') return;
   if (event.repeat) return;
   event.preventDefault();
-  void begin();
+  pressed = true;
   window.addEventListener('keyup', onKeyUp);
+  void begin();
 }
 
 function onKeyUp(event: KeyboardEvent): void {
   if (event.key !== ' ' && event.key !== 'Enter') return;
+  pressed = false;
   void finish();
 }
 
 onBeforeUnmount(() => {
   disposed = true;
+  pressed = false;
   detach();
   stopTicker();
   recording?.cancel();
   recording = null;
+  state.value = 'idle';
+  // **必须复位全局录音标记**：切回键盘输入（`v-if="voiceMode"`）会把本组件整个
+  // 卸载，而 `sources.recording` 是生成按钮的闸门之一。漏掉这一句，用户切一次
+  // 键盘就再也生成不了，界面上只说"正在录音"。
+  setActive(false);
 });
 </script>
 
@@ -148,7 +191,8 @@ onBeforeUnmount(() => {
       :class="state === 'recording'
         ? 'border-rose-300 bg-rose-50 text-rose-700'
         : 'border-slate-300 text-slate-600 hover:border-slate-400 hover:bg-slate-50'"
-      :disabled="props.disabled || state === 'starting' || state === 'finishing'"
+      :disabled="props.disabled"
+      :aria-busy="state === 'starting' || state === 'finishing'"
       :aria-pressed="state === 'recording'"
       @pointerdown="onPointerDown"
       @keydown="onKeyDown"
