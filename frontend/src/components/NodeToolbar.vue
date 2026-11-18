@@ -1,0 +1,169 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+
+import { NODE_COLORS, NODE_COLOR_LABELS } from '../mindmap/edits';
+import { useMindMapStore } from '../stores/mindmap';
+
+/**
+ * 选中节点旁边浮出的小工具条：`[改][展开][删][色]`。
+ *
+ * **为什么是浮层而不是第二块面板**：这一版把常驻区域全撤了（左栏撤掉、右栏改覆盖式
+ * 抽屉、对话框生成完就淡出），"选中一个节点"于是需要一个**就地**的入口——用户此刻
+ * 的眼睛在节点上，不在屏幕边缘。
+ *
+ * **定位靠读 DOM**，不靠布局：节点坐标在 `stores/mindmap` 里算好、由 Vue Flow 画到
+ * `.vue-flow__node[data-id]` 上。这里只 `getBoundingClientRect()`，一个像素都不改渲染。
+ * 平移/缩放/长出新节点之后位置会变，所以 resize、节点数、方向、选中变化都要重算。
+ */
+const store = useMindMapStore();
+
+const emit = defineEmits<{ edit: [label: string] }>();
+
+const anchor = ref<{ x: number; y: number } | null>(null);
+const paletteOpen = ref(false);
+
+const selected = computed(() => store.selectedNode);
+const visible = computed(() => !!selected.value && !!anchor.value);
+
+/** 这个节点是不是某块区域的根（中心主题 / 一根骨 / 一个阶段）——那种不能删。 */
+const deleteDisabled = computed(
+  () => (selected.value ? store.isContainerRootId(selected.value.node.id) : true),
+);
+
+function measure(): void {
+  const id = selected.value?.node.id;
+  if (!id) {
+    anchor.value = null;
+    return;
+  }
+  const el = document.querySelector(`.vue-flow__node[data-id="${CSS.escape(id)}"]`);
+  if (!(el instanceof HTMLElement)) {
+    // 画布还没画出这个节点（刚落地、还没测量）：保持原位，别把它甩到左上角。
+    anchor.value = null;
+    return;
+  }
+  const rect = el.getBoundingClientRect();
+  anchor.value = { x: rect.left + rect.width / 2, y: rect.top };
+}
+
+let frame = 0;
+function schedule(): void {
+  if (frame) return;
+  frame = requestAnimationFrame(() => {
+    frame = 0;
+    measure();
+  });
+}
+
+watch(
+  () => [selected.value?.node.id, store.nodeCount, store.direction, store.focusTick] as const,
+  async () => {
+    paletteOpen.value = false;
+    await nextTick();
+    schedule();
+  },
+  { immediate: true },
+);
+
+onMounted(() => {
+  window.addEventListener('resize', schedule);
+  window.addEventListener('scroll', schedule, true);
+});
+
+onBeforeUnmount(() => {
+  if (frame) cancelAnimationFrame(frame);
+  window.removeEventListener('resize', schedule);
+  window.removeEventListener('scroll', schedule, true);
+});
+
+function edit(): void {
+  const label = selected.value?.node.label.trim();
+  if (!label) return;
+  emit('edit', label);
+}
+
+function expand(): void {
+  void store.expandSelected();
+}
+
+function remove(): void {
+  const id = selected.value?.node.id;
+  if (!id) return;
+  store.deleteNode(id);
+}
+
+function setColor(value: string): void {
+  const id = selected.value?.node.id;
+  if (!id) return;
+  store.setNodeVisualById(id, { color: value ? (value as (typeof NODE_COLORS)[number]) : null });
+  paletteOpen.value = false;
+}
+</script>
+
+<template>
+  <div
+    v-if="visible && anchor"
+    data-test="node-toolbar"
+    class="fixed z-40 flex -translate-x-1/2 -translate-y-full flex-col items-center gap-1 pb-2"
+    :style="{ left: `${anchor.x}px`, top: `${anchor.y}px` }"
+    role="toolbar"
+    aria-label="节点操作"
+  >
+    <div class="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white p-0.5 shadow-lg">
+      <button
+        type="button"
+        data-test="node-action-edit"
+        class="rounded px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-100"
+        title="让 AI 改这个节点（对话框会重新出现并预填这一句）"
+        @click="edit"
+      >改</button>
+      <button
+        type="button"
+        data-test="node-action-expand"
+        class="rounded px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+        :disabled="store.agentRunning || selected?.node.expandable === 'no'"
+        title="展开这一支（补 3 个子节点）"
+        @click="expand"
+      >展开</button>
+      <button
+        type="button"
+        data-test="node-action-delete"
+        class="rounded px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+        :disabled="deleteDisabled"
+        title="删除这个节点"
+        @click="remove"
+      >删</button>
+      <button
+        type="button"
+        data-test="node-action-color"
+        class="rounded px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-100"
+        title="换颜色"
+        :aria-expanded="paletteOpen"
+        @click="paletteOpen = !paletteOpen"
+      >色</button>
+    </div>
+
+    <div
+      v-if="paletteOpen"
+      data-test="node-palette"
+      class="flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-lg"
+    >
+      <button
+        type="button"
+        class="h-4 w-4 rounded-full border border-slate-300 bg-white text-[9px] leading-none text-slate-500"
+        title="默认（继承上级）"
+        @click="setColor('')"
+      >–</button>
+      <button
+        v-for="key in NODE_COLORS"
+        :key="key"
+        type="button"
+        class="h-4 w-4 rounded-full border border-slate-300"
+        :style="{ background: `var(--mind-color-${key}, #cbd5e1)` }"
+        :title="NODE_COLOR_LABELS[key]"
+        :aria-label="NODE_COLOR_LABELS[key]"
+        @click="setColor(key)"
+      />
+    </div>
+  </div>
+</template>

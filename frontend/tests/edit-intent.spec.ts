@@ -1,4 +1,4 @@
-import { mount, type VueWrapper } from '@vue/test-utils';
+﻿import { mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia, type Pinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -100,7 +100,7 @@ describe('画布右上角的「改这张图」入口', () => {
     // 合并之后这个框不再对"没图"禁用：没图时它自己就是生成入口
     expect((input.element as HTMLTextAreaElement).disabled).toBe(false);
     expect(wrapper.get('[data-test="intent-box"]').text())
-      .toContain('写一个主题，或者先在左侧添加材料');
+      .toContain('写一个主题，或者点「+」添加材料');
     // 空着点不动，也就不该发请求
     await wrapper.get(SUBMIT).trigger('click');
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -305,7 +305,7 @@ describe('「改这张图」认选区', () => {
     // 没选中时不显示徽标，placeholder 是那句通用的说法
     expect(wrapper.find('[data-test="edit-selection"]').exists()).toBe(false);
     expect((wrapper.find(EDIT_INPUT).element as HTMLTextAreaElement).placeholder)
-      .toBe('输入主题，或直接点生成用已上传的材料');
+      .toBe('发消息或写一个主题…');
 
     selectThree(store);
     await wrapper.vm.$nextTick();

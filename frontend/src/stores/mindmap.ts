@@ -626,6 +626,14 @@ export interface RunOptions {
    * 落进 `runs.request.prefs_applied`，是偏好面板上"上次生效"的唯一数据源。
    */
   prefsApplied?: string[];
+  /**
+   * 「这一次」走不走推理模型（镜像后端 `AgentRunRequest.deep_thinking`）。
+   *
+   * 与 `prefsApplied` 一样只由界面那层填：它是**这一次的开关**，不是设置——用户
+   * 会在"随便出一张"和"这段逻辑要拆准"之间来回切，写死进 store 就变成了一个没有
+   * 出口的全局状态。缺省 `false`，发出去的请求与加它之前逐字节相同。
+   */
+  deepThinking?: boolean;
 }
 
 /**
@@ -957,6 +965,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 结果，不是"一份还没被采纳的提案"——生成落地那一刻它就是用户的了。
    */
   const resumableRun = ref<RunSummary | null>(null);
+
+  /**
+   * 这次运行**真正发出去的模型名**与模型的思考过程（`done` 帧带来的两个字段）。
+   *
+   * 为什么留在 store 而不是只写进消息流：它们要能解释"这次为什么不一样"。
+   * `runModel` 是勾了「深度思考」之后**唯一**能证明它真的换了模型的证据（配置里
+   * 没给 `MINDMAP_LLM_MODEL_DEEP` 时后端会退回原模型，界面上必须看得见）；
+   * `lastReasoning` 是折叠面板的数据源，成功时也有内容。
+   *
+   * 两者都随每次运行清空：上一轮的思考过程挂在这一次的结果上是纯粹的误读。
+   */
+  const runModel = ref<string | null>(null);
+  const lastReasoning = ref('');
 
   /**
    * 这一次会话里已经明确表示"不要再问"了。
@@ -2648,6 +2669,25 @@ export const useMindMapStore = defineStore('mindmap', () => {
     status.value = '已取消保存，本地修改还在，可以再试一次。';
   }
 
+  /**
+   * 只把"已保存的导图"列表拉回来，**不打开**那个模态。
+   *
+   * `☰` 抽屉里要直接列出历史，而 `openList()` 会同时把选择模态弹出来（它盖住整个
+   * 界面，抽屉就被压在下面点不到了）。两件事拆开：抽屉用这个，`打开…` 与老入口用
+   * `openList()`。
+   */
+  async function loadMaps(): Promise<void> {
+    listBusy.value = true;
+    try {
+      maps.value = await listMindMaps();
+    } catch (error) {
+      maps.value = [];
+      status.value = error instanceof ApiError ? error.message : '读取导图列表失败。';
+    } finally {
+      listBusy.value = false;
+    }
+  }
+
   async function openList() {
     listOpen.value = true;
     listBusy.value = true;
@@ -3025,6 +3065,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     stageText.value = '正在连接';
     status.value = '正在与模型协作…';
     waitedMs.value = 0;
+    // 上一轮的模型名与思考过程在**这一次开始的那一刻**就作废：它们描述的是另一个
+    // 运行。留到这一次的 done 帧才清，中间那段时间面板会挂着一个已经不对的模型名。
+    runModel.value = null;
+    lastReasoning.value = '';
 
     // 流只在 done / error 帧上才算有了明确结局；两者都没到就 EOF，说明连接被掐断了，
     // 不能当成正常结束——否则面板会停在「正在与模型协作…」，工具行永远显示「执行中…」。
@@ -3072,6 +3116,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 空数组不发：老后端对多出来的字段是 `extra="forbid"`，而"这次一条偏好都没用上"
       // 与"这个字段不存在"对读的人来说是同一件事。
       if (options.prefsApplied?.length) body.prefs_applied = [...options.prefsApplied];
+      // 「深度思考」只在**勾上**时才发字段：`false` 与"没有这个字段"对后端是同一件
+      // 事，而省略让一次普通生成与加这个开关之前的请求逐字节相同。
+      if (options.deepThinking) body.deep_thinking = true;
 
       await runAgentStream(body, event => {
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，
@@ -3147,6 +3194,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
             // 后端 `exclude_none=True`，所以正常帧一定带值；缺字段只说明对面是
             // 没填 mode 的旧版本，记作"没说"，不能替它认成模型产出。
             doneMode = event.mode ?? null;
+            // 模型名与思考过程：成功时也留（`done` 帧现在两条都给）。
+            // `model` 缺字段 = 对面没说（演示模式 / 旧后端 / 测试里的假 provider），
+            // 不替它认成 `deepseek-chat`——界面据此只说"模型没说"，不说谎。
+            runModel.value = event.model ?? null;
+            lastReasoning.value = event.reasoning ?? '';
             // 终态已到，预览再留着只会让人以为还有节点在路上。
             clearAgentPreview();
             if (event.content) draft.value = event.content;
@@ -3584,6 +3636,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     saveAsNew,
     dismissConflict,
     openList,
+    // 只拉列表不弹模态（`☰` 抽屉的历史区用它）
+    loadMaps,
     closeList,
     openMap,
     // agent 路径
@@ -3596,6 +3650,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentRunning,
     agentError,
     runIntent,
+    // 这一次真正发出去的模型名 + 模型的思考过程（`done` 帧的两条）
+    runModel,
+    lastReasoning,
     expanding,
     generating,
     runGeneration,

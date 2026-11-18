@@ -111,7 +111,7 @@ describe('三态文案与按钮', () => {
   it('没图：输入主题 + 「生成导图」，不显示选区徽标', () => {
     const wrapper = mountApp();
 
-    expect(intentField(wrapper).placeholder).toBe('输入主题，或直接点生成用已上传的材料');
+    expect(intentField(wrapper).placeholder).toBe('发消息或写一个主题…');
     expect(submitButton(wrapper).text()).toBe('生成导图');
     expect(wrapper.find('[data-test="edit-selection"]').exists()).toBe(false);
     // 这个框在这一态的名字是「主题或要求」：合并之后它是唯一的主题入口
@@ -413,12 +413,13 @@ describe('材料区只剩材料', () => {
 
   it('材料区的说明写清它是干什么的，并交代"不传材料会去外部搜资料"', () => {
     const wrapper = mountApp();
-    const panel = wrapper.get('main section').text();
+    // 材料区不再常驻左栏，它收进对话框的「+」面板里（`data-test="material-panel"`）。
+    const panel = wrapper.get('[data-test="material-panel"]').text();
     expect(panel).toContain('材料（可选）');
     expect(panel).toContain('上传文档、粘贴文字或录音');
     expect(panel).toContain('不传材料就按主题生成（会去外部搜资料）');
     // 老用户习惯"在左侧框里打字然后点生成"：这一句是防误用的关键
-    expect(panel).toContain('写主题、说「怎么改」在画布右上角那个框');
+    expect(panel).toContain('写主题、说「怎么改」在画布底部那个对话框里');
   });
 
   it('粘贴的材料只有在点「添加文本到来源」之后才算来源', async () => {

@@ -374,14 +374,16 @@ describe('多来源输入界面', () => {
 
     await submitButton(wrapper).trigger('click');
     await vi.waitFor(() => expect(store.busy).toBe(true));
-    expect(wrapper.get('input[type="file"]').attributes('disabled')).toBeDefined();
-    expect(buttonByText(wrapper, '清空来源').attributes('disabled')).toBeDefined();
-    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeDefined();
+    // 生成中整块对话框收成一条细进度（新状态机）：材料此刻根本点不到，
+    // 比"灰着但还在"更彻底。取消按钮就在那一行里。
+    expect(wrapper.find('input[type="file"]').exists()).toBe(false);
+    expect(wrapper.find('#material-text').exists()).toBe(false);
+    expect(wrapper.find('[data-test="run-status"]').text()).toContain('正在生成');
 
-    // 取消在右侧「模型协作」面板里（合并后左侧材料区不再自带取消按钮）
     await buttonByText(wrapper, '取消').trigger('click');
     expect(store.busy).toBe(false);
-    // 取消不该顺手把用户收集的材料清掉
+    // 取消之后对话框回来，材料还在、能继续改：取消不该顺手把用户收集的材料清掉。
+    await wrapper.vm.$nextTick();
     expect(sources.items).toHaveLength(1);
     expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeUndefined();
     release(jsonResponse({}));

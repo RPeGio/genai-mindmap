@@ -7,15 +7,11 @@ import { useMindMapStore } from '../stores/mindmap';
 import { useSourcesStore } from '../stores/sources';
 
 /**
- * 左侧栏的**材料区**。
+ * **材料区**：它现在住在底部对话框的「+」面板里（`ChatDock.vue`），不再是一个常驻
+ * 左栏——那 320px 让画布永远窄一截，而材料只在"准备"那一步要看。
  *
  * 这里只放材料：粘贴的正文、上传的文档/图片、录音，以及它们的来源列表与清空。
- * 主题和「怎么改」不在这里——那是画布右上角那个框（`App.vue` 里的 #2）。
- *
- * 合并前这里是「输入主题或文本」+「合并生成导图」：有图时它走 `edit` 并把选区
- * **显式清空**（旁边没有「已选 N 个」徽标，传了也看不见），而文案完全看不出它
- * 在改图；同一个 `edit` 意图在画布上方还有第二个入口，两处语义相反。现在说一句
- * 话的地方只剩一个，这个组件退回它本来的职责。
+ * 主题和「怎么改」不在这里——那是画布底部那条对话框（`ChatDock.vue` 的 `#intent`）。
  */
 const store = useMindMapStore();
 const sources = useSourcesStore();
@@ -103,7 +99,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       @click="addText"
     >添加文本到来源</button>
     <p class="text-xs leading-relaxed text-slate-400">
-      这里加的东西都算材料；写主题、说「怎么改」在画布右上角那个框。
+      这里加的东西都算材料；写主题、说「怎么改」在画布底部那个对话框里。
     </p>
 
     <label
@@ -140,7 +136,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       >清空来源</button>
     </div>
     <p v-if="!sources.items.length" class="text-xs leading-relaxed text-slate-400">
-      添加多个来源后一起生成；不加材料也行，直接在画布右上角写一个主题。
+      添加多个来源后一起生成；不加材料也行，直接在画布底部的对话框里写一个主题。
     </p>
     <ul v-else aria-label="待生成来源" class="flex flex-col gap-2">
       <li v-for="item in sources.items" :key="item.key" class="rounded-md border border-slate-200 p-2">

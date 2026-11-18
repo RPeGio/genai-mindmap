@@ -105,11 +105,14 @@ afterEach(() => {
 });
 
 describe('右栏改成覆盖式抽屉', () => {
-  it('主区只剩左栏与画布两个 flex 兄弟：右栏不再参与分宽度', () => {
+  it('主区只剩一个 flex 兄弟（画布）：左栏撤掉之后它拿到全宽', () => {
     stubFetch();
     const wrapper = mountApp();
+    // 左栏那个 320px 常驻区块没了，材料改走对话框里的缩略图 + `+` 面板；
+    // `main` 里因此只剩画布一个 section（右抽屉与左抽屉都是覆盖层）。
     const sections = wrapper.get('main').element.querySelectorAll(':scope > section');
-    expect(sections).toHaveLength(2);
+    expect(sections).toHaveLength(1);
+    expect(sections[0].querySelector('.vue-flow, [data-test="canvas"]')).toBeTruthy();
   });
 
   it('抽屉默认关着，而且是绝对定位的覆盖层（不是流里的第三块）', () => {
@@ -162,10 +165,11 @@ describe('右栏改成覆盖式抽屉', () => {
     await wrapper.vm.$nextTick();
 
     expect(drawerOpen(wrapper)).toBe(false);
+    // `side-toggle` 现在在 `☰` 抽屉里（顶栏瘦成三件东西），`aria-expanded` 仍然是
+    // "抽屉开着没有"，而"有东西可看"由 `☰` 抽屉打开后那枚按钮的实心样式表达。
     const toggle = wrapper.get('[data-test="side-toggle"]');
-    // 天蓝高亮 = "这里现在有东西可看"
-    expect(toggle.classes().join(' ')).toContain('bg-sky-50');
-    expect(toggle.attributes('title')).toContain('申请与复核');
+    expect(toggle.attributes('aria-expanded')).toBe('false');
+    expect(toggle.text()).toContain('节点详情');
   });
 
   it('节点详情、附加关系、本图来源都在抽屉里，一块没少', async () => {

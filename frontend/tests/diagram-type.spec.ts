@@ -109,8 +109,11 @@ describe('图型选择器', () => {
     const wrapper = mountApp();
     useMindMapStore().busy = true;
     await wrapper.vm.$nextTick();
-    expect(diagramSelect(wrapper).attributes('disabled')).toBeDefined();
-    expect(wrapper.get('#thinking-model').attributes('disabled')).toBeDefined();
+    // 生成中整个对话框收成一条细进度（那一版是这一轮的核心交互），参数连渲染都不渲染——
+    // 比"灰着但还能看见"更彻底：此刻改了也确实不会生效。
+    expect(wrapper.find('#diagram-type').exists()).toBe(false);
+    expect(wrapper.find('#thinking-model').exists()).toBe(false);
+    expect(wrapper.find('[data-test="run-status"]').exists()).toBe(true);
   });
 
   it('已有导图（edit 场景）时不渲染：那条路不消费图型', async () => {

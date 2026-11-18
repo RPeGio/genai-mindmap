@@ -684,6 +684,13 @@ export interface AgentRunRequest {
    * 而模型需要的是带 source_id 的结构化数据——否则它写不出合法的引用。
    */
   sources?: Source[];
+  /**
+   * 「这一次」走不走推理模型（镜像后端 `AgentRunRequest.deep_thinking`）。
+   *
+   * 它是这**一次**的开关，不是设置：界面上那枚「深度思考」按钮点一下就变一次，
+   * 不写偏好、不进 `prefs_applied`。缺省不发这个字段，与加它之前逐字节相同。
+   */
+  deep_thinking?: boolean;
 }
 
 /**
@@ -796,7 +803,22 @@ export type AgentEvent =
        * 直接显示，排障不用登服务器翻日志。
        */
       text?: string;
+      /**
+       * 模型这一轮的思考过程（`reasoning_content`）。
+       *
+       * 与 `text` 不同，**成功时也填**：走推理模型时它正是用户勾「深度思考」要看
+       * 的东西，界面用 `<details>` 折叠展示全文。上限见后端 `REASONING_TEXT_LIMIT`
+       * （20000 字，远大于实测的 3000–8000 字，等于不截）。
+       */
       reasoning?: string;
+      /**
+       * 这一轮真正发出去的模型名（`deepseek-chat` / `deepseek-reasoner` / 配置值）。
+       *
+       * 缺字段＝没说（演示模式、按脚本回放的假 provider），不是"用了 chat"。
+       * 界面据此在消息流里写清"这次走了哪个模型"——勾了「深度思考」而配置没给对
+       * 名字时，这是唯一看得见的地方。
+       */
+      model?: string | null;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
 

@@ -1,4 +1,4 @@
-import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -123,7 +123,7 @@ describe('App', () => {
     // 挂载时会拉一次偏好（生成面板的两个下拉要带着它），所以断言的粒度是
     // "没有发出生成请求"，而不是"一次 fetch 都没有"。
     expect(agentUrls(fetchMock)).toEqual([]);
-    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('写一个主题，或者先在左侧添加材料');  });
+    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('写一个主题，或者点「+」添加材料');  });
 
   it('点生成把请求打到 agent 路由，结果直接落画布', async () => {
     const fetchMock = vi.fn(async () => streamReply([

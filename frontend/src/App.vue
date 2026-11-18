@@ -4,38 +4,27 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
-import ImportMindmap from './components/ImportMindmap.vue';
-import SourceInputs from './components/SourceInputs.vue';
-import { SOURCE_LABELS, SHORT_MATERIAL_CHARS, materialTitle, mergedCharCount } from './sources/input';
+import ChatDock from './components/ChatDock.vue';
+import HistoryDrawer from './components/HistoryDrawer.vue';
+import MessageFab from './components/MessageFab.vue';
+import NodeToolbar from './components/NodeToolbar.vue';
+import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
 import type { LibraryEntry, LibrarySource } from './api/types';
 import type { SampleMap } from './dev/samples';
 import type { DemoPreset } from './demo/presets';
-import { displayBody, bodySource, INITIAL_STATUS, useMindMapStore } from './stores/mindmap';
+import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
+import { useChatStore } from './stores/chat';
 import { useSourcesStore } from './stores/sources';
-import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from './stores/options';
-import { DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY, usePrefsStore } from './stores/prefs';
-import PrefsPanel from './components/PrefsPanel.vue';
+import { usePrefsStore } from './stores/prefs';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
-import { agentDetailVisible, runResultLine } from './mindmap/run-status';
+import { agentDetailVisible } from './mindmap/run-status';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
-import type { DiagramContent, DiagramTypeChoice, EdgeKind } from './api/types';
+import type { DiagramContent, EdgeKind } from './api/types';
 import { containerNoun, kindOf, topBranchesOf } from './mindmap/shape';
 
 const store = useMindMapStore();
-
-/**
- * 静默多久之后把阶段文案换成「模型正在思考」。
- *
- * 后端只在静默达到 10 秒才发心跳，所以 `waitedMs >= 10` 基本等价于"已经静默 10 秒"。
- * 阈值再写一遍是为了前端自己也站得住：万一别处的实现改成更密的保活帧，这里不会
- * 1 秒就把阶段文案顶掉。
- *
- * 这两句话的渲染点在画布底部那条状态行（`statusText`）——原来它在生成框里另起一行，
- * 而生成框本来就够挤了。规则不变：静默超阈值时阶段文案被**替换**，不是叠在一起，
- * 那会让人以为两件事同时在发生。
- */
-const SILENT_HINT_SECONDS = 10;
+const chat = useChatStore();
 const sources = useSourcesStore();
 
 /**
@@ -340,290 +329,17 @@ function expandBranch() {
 }
 
 /**
- * 画布右上角那个框：**唯一**说一句话的地方。
+ * 说一句话的地方只有一处，但它已经不在画布右上角了——`ChatDock.vue`（画布底部那条
+ * 对话框）承担 `create` 与 `edit` 两个意图，文案随状态变，选区该不该带由**看得见的
+ * 徽标**决定。这个组件只负责外壳：顶栏、抽屉、悬浮球、模态与文件。
  *
- * 合并之前它是第二个输入框（只发 `edit`），而左侧「输入主题或文本」在有图的时候
- * 发的也是 `edit`——同一个意图两个入口，选区语义还相反（左边偷偷清空、这里带上），
- * 用户从文案上看不出区别。现在这一个框承担 `create` 与 `edit` 两个意图，文案随
- * 状态变，选区该不该带由**看得见的徽标**决定。
- *
- * 「展开这一支」不并入这里：那是快捷动作，不是文字输入。
+ * 「展开这一支」不并入对话框：那是快捷动作（节点工具条上一枚按钮），不是文字输入。
  *
  * 后端 `edit` 意图给的是四个细粒度工具 + 批量 `mindmap_edit`，`create` 只有分片
  * 生成；两条路的改动都在 `done` 那一刻直接落画布（`commitGenerated`），没有确认步骤。
  */
-const options = useGenerationOptions();
 const prefs = usePrefsStore();
-const intentText = ref('');
 
-/**
- * 「以后都这样」的两个勾选。
- *
- * 这是这个功能的**主要写入源**：用户生成时顺手说一句"以后都这样"，比让他专门去
- * 打开一个偏好面板设置一次可靠得多——面板是"回来以后才记得"的东西，而这句勾选
- * 与动作在同一个位置、同一刻。
- *
- * 勾上之后在**提交时**才写：勾了又改主意的人不该在库里留下一行。
- */
-const stickyDiagram = ref(false);
-const stickyThinking = ref(false);
-
-/**
- * 偏好 → 预填。`prefs.defaults` 一变就重新填（面板里改一条，下拉跟着变）。
- *
- * `applyDefaults` 内部只填"用户没手动改过"的那两个——用户刚选过的值是他的意图，
- * 不能被一条偏好顶回去。
- */
-watch(() => prefs.defaults, defaults => options.applyDefaults(defaults),
-  { immediate: true, deep: true });
-
-/**
- * 提交前把「以后都这样」落库，并让选项重新跟随偏好。
- *
- * `forget()` + `applyDefaults()` 这两步不能省：不调的话，用户手动选了流程图、勾了
- * "以后都这样"，而 `prefilled` 还是 false——这次生成的 `prefs_applied` 就是空的，
- * 面板上那条偏好显示"尚未生效"，明明它刚刚生效过。顺序是"先写、再让选项回到
- * 跟随偏好、最后算 appliedKeys"。
- */
-async function syncStickyPrefs(): Promise<void> {
-  if (intentState.value !== 'create') return;
-  const writes: Promise<boolean>[] = [];
-  if (stickyDiagram.value && options.diagramType !== 'auto') {
-    writes.push(prefs.save(DIAGRAM_PREF_KEY, options.diagramType));
-  }
-  if (stickyThinking.value) {
-    writes.push(prefs.save(THINKING_PREF_KEY, options.thinkingModel));
-  }
-  if (!writes.length) return;
-  await Promise.all(writes);
-  options.forget();
-  options.applyDefaults(prefs.defaults);
-}
-
-/**
- * 三态：有没有图、有没有选区。
- *
- * 有图但没选节点也算 `edit`——用户说「整张图都加上时间维度」时本来就不需要选节点，
- * 逼他先点一个节点是多余的仪式，而那样还会让模型收到一个他并不想要的"优先改这里"。
- */
-type IntentState = 'create' | 'edit-all' | 'edit-selected';
-
-const intentState = computed<IntentState>(() => {
-  if (!store.content) return 'create';
-  return store.selectedIds.length ? 'edit-selected' : 'edit-all';
-});
-
-/**
- * 选区大小。只认 `content` 里真实存在的节点：`selectedIds` 可能残留着上一次的
- * 选中，而那时树已经换了一张——徽标说"已选 3 个"、请求里却是空，用户没法察觉。
- */
-const selectionCount = computed(() => (store.content ? store.selectedIds.length : 0));
-
-/** 材料那边的闸门（解析中、有失败项、超长）。没有材料时它是空串——材料是可选的。 */
-const materialProblem = computed(() => sources.materialProblem);
-
-/** 只给材料、不给主题时的备选主题。判据在 `materialTitle` 里，这里只取结果。 */
-const materialTopicChoice = computed(() => materialTitle(sources.readySources));
-
-const runBlocked = computed(() => store.busy || store.agentRunning);
-const typed = computed(() => intentText.value.trim());
-
-/**
- * 这次点下去会发什么；空串 = 还发不出去（按钮禁用，原因写在下面那行提示里）。
- *
- * 「只给材料」的那条路（B）在这里落地：`mindmap_generate_deep` 只需要一个 topic
- * 字符串，而模型看不见文件名，所以标题必须**写进 goal** 才真的算"用了它当主题"。
- * 标题不像主题时（`未命名`、`IMG_001`）不给兜底，退回"请写一个主题"。
- */
-const submitGoal = computed(() => {
-  if (typed.value) return typed.value;
-  if (intentState.value !== 'create') return '';
-  const topic = materialTopicChoice.value.topic;
-  return topic ? `用材料标题「${topic}」当主题，把材料整理成导图` : '';
-});
-
-const canSubmit = computed(() => {
-  if (runBlocked.value || !submitGoal.value) return false;
-  if (intentState.value !== 'create') return true;
-  // 录音停下来的那一刻会多出一份材料：此刻发出去的请求一定缺这一块。
-  return !materialProblem.value && !sources.recording;
-});
-
-// ---------------------------------------------------------------- 联网检索开关
-//
-// 这是**第一个真正在界面上可控的生成行为开关**（图型与拆解方式只是给模型的参数，
-// 关不掉任何一步）。三件事必须同时说清，否则它会变成一个"看起来能关、其实不知道
-// 关了什么"的控件：
-//
-//   1. 它只在**没有材料**时有意义：有材料时后端根本不走外部检索（`_intake` 里
-//      "有材料"与"闸门关着"是同一条短路的两个原因），所以要置灰并说明原因，
-//      而不是让用户勾来勾去发现没反应；
-//   2. 材料**太短**时它仍然有意义——那种材料会被降级成"主题提示"，后端照样会
-//      联网补依据（`SHORT_MATERIAL_CHARS`）。所以判据是字数，不是"有没有材料"；
-//   3. 它写的是**偏好**，勾一下就落库：下一次生成、下一次打开页面都跟着变。这是
-//      "设置"，不是"这一次的选项"——后者会逼用户每次重新点一遍。
-
-/** 材料够长到"这次一定不走外部检索"没有。够长时那个勾置灰。 */
-const materialLongEnough = computed(
-  () => mergedCharCount(sources.readySources) >= SHORT_MATERIAL_CHARS,
-);
-
-/** 这个开关这次真的会起作用：新建、且材料不够长。 */
-const externalSearchApplies = computed(
-  () => intentState.value === 'create' && !materialLongEnough.value,
-);
-
-const externalSearchHint = computed(() => {
-  if (materialLongEnough.value) {
-    // 置灰的原因必须写出来。灰着不解释，用户只会以为功能坏了。
-    return '这次带材料，不走联网检索';
-  }
-  return prefs.externalSearchEnabled
-    ? '没材料时先联网搜一轮资料，命中会变成能点回原文的引用（约 4 秒）'
-    : '已关闭：没材料时直接按主题生成，节点上不会有引用';
-});
-
-/**
- * 勾选即落库。写失败时把勾**拨回去**：`:checked` 绑的是 store，而 store 没变就等于
- * 绑定的值没变、Vue 不会重渲染这个 prop——不手动复原的话，界面上显示"已关闭"、
- * 后端还是"开"，下一次生成照样联网。这类"界面说了不算"的开关比没有更危险。
- */
-async function toggleExternalSearch(next: boolean, event: Event): Promise<void> {
-  if (await prefs.save(EXTERNAL_SEARCH_PREF_KEY, next ? 'true' : 'false')) return;
-  (event.target as HTMLInputElement).checked = prefs.externalSearchEnabled;
-}
-
-/**
- * 这一次运行**实际带着哪些偏好**。
- *
- * 两个下拉那条路（`options.appliedKeys`）记的是"界面上的值来自偏好预填"；联网检索
- * 这一条不同——界面上那个勾**就是**偏好本身，不存在"这次与偏好不一样"的可能。
- * 所以只要库里真有这条、且这一次真会用到它，就如实记一笔，让「我的偏好」里的
- * "上次生效"能亮起来（那条正是这张表是不是死表的探测器）。
- *
- * 两种不记：库里没有这条（默认开，没有条目可报）、这次带够长的材料（外部检索这条
- * 路根本没走，说它"生效"了是假话）。
- */
-function appliedKeys(): string[] {
-  const keys = options.appliedKeys();
-  if (externalSearchApplies.value && prefs.value(EXTERNAL_SEARCH_PREF_KEY) !== null) {
-    keys.push(`${EXTERNAL_SEARCH_PREF_KEY}=${prefs.externalSearchEnabled ? 'true' : 'false'}`);
-  }
-  return keys;
-}
-
-/** 这一次点下去会发哪个意图。按钮文案与「正在进行的是不是这一次」都按它判。 */
-const wantedIntent = computed<'create' | 'edit'>(
-  () => (intentState.value === 'create' ? 'create' : 'edit'),
-);
-
-/** 按钮文案：说清"这一次会发生什么"，而不是一个通用的「提交」。 */
-const intentButton = computed(() => {
-  // 只认**这一个入口**发起的那一轮：展开在跑的时候，「改这张图」不该显示「改中…」。
-  const busyHere = store.agentRunning && store.runIntent === wantedIntent.value;
-  if (busyHere) return wantedIntent.value === 'create' ? '生成中…' : '改中…';
-  if (intentState.value === 'create') return '生成导图';
-  if (intentState.value === 'edit-all') return '改这张图';
-  return selectionCount.value === 1 ? '改这个节点' : `改这 ${selectionCount.value} 个节点`;
-});
-
-/** placeholder 跟着状态走：用户一眼看出这句话是对谁说的。 */
-const intentPlaceholder = computed(() => {
-  if (intentState.value === 'create') return '输入主题，或直接点生成用已上传的材料';
-  if (intentState.value === 'edit-all') return '说说你想怎么改';
-  return selectionCount.value === 1 ? '改选中的这个节点…' : `改选中的这 ${selectionCount.value} 个节点…`;
-});
-
-/** 输入框的名字：两种意图各有一个自然的叫法，写死一个会让另一半看起来不对。 */
-const intentLabel = computed(() => (intentState.value === 'create' ? '主题或要求' : '怎么改'));
-
-/** 输入框旁边那枚徽标：没选中时**不显示**（空徽标会读成"选了 0 个"）。 */
-const selectionLabel = computed(
-  () => (selectionCount.value > 0 ? `已选 ${selectionCount.value} 个节点` : ''),
-);
-
-const intentHint = computed(() => {
-  if (runBlocked.value) {
-    return store.agentRunning ? '正在跑，等这一次结束。' : '正在生成，等这一次跑完再改。';
-  }
-  if (intentState.value === 'create') {
-    if (sources.recording) return '正在录音：先「停止并添加」，再生成。';
-    if (materialProblem.value) return materialProblem.value;
-    if (typed.value) {
-      // 有材料 / 没材料是两件事：不说清的话，用户会以为"不传材料"这条路上什么都不会发生。
-      return sources.items.length
-        ? '会带上左侧的材料一起生成。'
-        : '没传材料，会先去外部搜资料。';
-    }
-    if (materialTopicChoice.value.topic) {
-      return `没写主题：用材料标题「${materialTopicChoice.value.topic}」当中心主题。`;
-    }
-    return materialTopicChoice.value.reason
-      ? `${materialTopicChoice.value.reason}——写一个主题，或者换一份标题像样的材料。`
-      : '写一个主题，或者先在左侧添加材料。';
-  }
-  if (intentState.value === 'edit-all') {
-    // 「按住 Ctrl 点可以多选」必须写出来：多选没有可见入口，不写没人发现得了。
-    return '先在画布上选中节点，或直接描述要改哪里（按住 Ctrl 点节点可以多选）。';
-  }
-  // 这条必须说清"不是只能改这些"：选区是提示，用户说「整张图都加上时间维度」
-  // 时它照样改全图，而界面不该让用户以为自己在限制它。
-  return selectionCount.value === 1
-    ? '优先改这个节点及其子分支；真要动别处也能改，清单里会标出来。'
-    : `优先改这 ${selectionCount.value} 个节点及其子分支；真要动别处也能改，清单里会标出来。`;
-});
-
-/** 材料那边的毛病用 amber：它是"这一次点不动"的原因，不是一句泛泛的说明。 */
-const intentHintWarn = computed(() => intentState.value === 'create' && !!materialProblem.value);
-
-/**
- * 状态行只在"有一件事要讲"时出现。
- *
- * 初始那一句和下面那行提示说的是同一件事（写个主题然后生成），同一个框里说两遍
- * 只是噪音。运行中、失败、导出结果、打开记录——这些才是它存在的理由。
- */
-const showStatus = computed(() => store.status !== INITIAL_STATUS);
-
-async function submitIntent() {
-  if (!canSubmit.value) return;
-  const goal = submitGoal.value;
-  if (!goal) return;
-  // 这里**不问**"要不要丢掉未保存的修改"：`create` 的前提就是当前没有图（有图时
-  // 这个框走 edit），而 `newMap` 已经把 dirty 清零了；`edit` 的结果在 `done` 那一刻
-  // 才整树落画布（`commitGenerated`），落之前画布一个字都不变。合并前左侧那个按钮
-  // 每次都问一句，问的却是一件不会发生的事。
-  // 选区随状态**显式**带上：徽标说「已选 3 个」时，请求里就正好是这三个。
-  // `create` 传空数组而不是省略——这个入口从不偷带画布上圈的东西。
-  const selection = intentState.value === 'create' ? [] : [...store.selectedIds];
-  const intent = intentState.value === 'create' ? 'create' : 'edit';
-  intentText.value = '';
-  // 「以后都这样」落库要**先于**生成：这一次请求的 `prefs_applied` 得能记上它，
-  // 否则用户刚勾完就看到面板上写着"尚未生效"。
-  await syncStickyPrefs();
-  // 材料照传：`edit` 路径不读来源，但后端会按节点的 `source_refs` 找回原文，
-  // 与展开那条路同一份处理（`tools._expand_sources`）。
-  await store.runGeneration(
-    goal, intent, sources.readySources,
-    options.thinkingModel, options.diagramType,
-    // `prefs_applied` 由这里标：只有前端知道"下拉里这个值是偏好预填的、用户没动过"。
-    // 后端开流前不会把偏好塞进 `diagram_type`——那会让"用户没说"与"用户选了"再也
-    // 分不开，而事后排查"这次为什么不一样"全靠这两个值分得清。
-    { selection, prefsApplied: appliedKeys() },
-  );
-}
-
-/**
- * Enter 提交、Shift+Enter 换行。
- *
- * 输入法候选框里的回车**不是**提交：中文主题几乎都要经过那一步，而老写法
- * （`@keydown.enter.prevent`）会在组词过程中就把半截主题发出去。
- */
-function onIntentKeydown(event: KeyboardEvent) {
-  if (event.isComposing || event.keyCode === 229) return;
-  if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.metaKey) return;
-  event.preventDefault();
-  void submitIntent();
-}
 
 /** 详情面板的「样式」两个控件：颜色是下拉（只列调色板），图标是一个输入框。 */
 function changeColor(event: Event) {
@@ -898,30 +614,6 @@ function formatTime(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false });
 }
 
-/**
- * 「上次的运行结果」这条提示的文案。
- *
- * 只给时间与目标，不给整棵树：这是一句通知，用户要不要捡回来是他的决定。两种状态
- * 分开说——"完成了但没保存"和"被中断了但已经产出了一部分"对他的意义完全不同，
- * 用同一句话糊过去，他会以为后者是一次完整的结果。
- *
- * 注意措辞里没有"应用"这个动作：生成结果当时**已经进了画布**，关掉页面丢掉的是
- * 那份没保存的改动，不是"一份还没被采纳的提案"。点「载入」= 把上次那棵树装回画布
- * （可撤销），点「不用了」只是这次会话不再提。
- */
-const resumableText = computed(() => {
-  const run = store.resumableRun;
-  if (!run) return '';
-  const date = new Date(run.updated_at);
-  const clock = Number.isNaN(date.getTime())
-    ? ''
-    : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
-  const when = clock ? `（${clock}）` : '';
-  const what = run.status === 'cancelled'
-    ? `上次${when}那次生成被中断了，已经生成的部分还留着`
-    : `上次${when}生成完的导图还没保存`;
-  return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
-});
 
 /** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
 function onKeydown(event: KeyboardEvent) {
@@ -934,10 +626,16 @@ function onKeydown(event: KeyboardEvent) {
     }
     if (event.key === 'Tab' && trapLibraryFocus(event)) return;
   }
-  // 偏好浮层盖在右上角，Esc 关它是这类浮层的默认预期（它不带遮罩，也没有确定按钮）。
+  // 偏好浮层盖在抽屉左上角，Esc 关它是这类浮层的默认预期（它不带遮罩，也没有确定按钮）。
   if (prefsOpen.value && event.key === 'Escape') {
     event.preventDefault();
     prefsOpen.value = false;
+    return;
+  }
+  // 左抽屉（`☰`）是覆盖层，不是模态：Esc 收起它。
+  if (historyOpen.value && event.key === 'Escape') {
+    event.preventDefault();
+    historyOpen.value = false;
     return;
   }
   // 右抽屉是覆盖层，不是模态：画布仍然可点，所以只见 Esc 这一条"退出"手势要接住。
@@ -965,9 +663,6 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onMounted(() => {
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('beforeunload', onBeforeUnload);
-  // 顶栏的偏好浮层点外面要关。必须挂捕获阶段：Vue Flow 的 pane 在 mousedown 里
-  // 吞掉了冒泡（d3-zoom 的常规做法），不捕获的话点画布关不掉它。
-  document.addEventListener('pointerdown', onDocumentPointerDown, true);
   // 启动即拉偏好：生成面板的两个下拉要在用户动手之前就填好，否则第一次生成总是
   // "没带偏好"的那一次——而那正是最该被记住偏好的那一次。
   void prefs.load();
@@ -993,9 +688,7 @@ async function loadVersion() {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('beforeunload', onBeforeUnload);
-  document.removeEventListener('pointerdown', onDocumentPointerDown, true);
   // 计时器必须跟着组件走：它是**展示**用的，没有组件可展示时继续跑只是泄漏。
-  stopElapsed();
   if (noticeTimer) clearTimeout(noticeTimer);
 });
 
@@ -1052,21 +745,17 @@ const sideOpen = ref(false);
  */
 const agentDetailOpen = ref(false);
 
-/** 顶栏齿轮浮层。 */
+/** `☰` 打开的左抽屉（历史导图 + 原来的顶栏操作）。 */
+const historyOpen = ref(false);
+
+/**
+ * 偏好浮层的开合。
+ *
+ * 浮层本身搬进了 `HistoryDrawer`（齿轮在那儿），这里只留一位状态：Esc 与"点外面关掉"
+ * 由 `App` 统一管——键盘监听与 pointerdown 捕获都挂在 window/document 上，写在抽屉里
+ * 会让它自己也有两份。
+ */
 const prefsOpen = ref(false);
-/** 齿轮 + 浮层的外壳：点外面要关，所以得知道边界在哪。 */
-const prefsWrap = ref<HTMLElement | null>(null);
-
-/** 待确认的建议条数：齿轮右上角那个数字，也是"收起来了但没静默"的证据。 */
-const prefsSuggestCount = computed(() => prefs.suggestions.length);
-
-/** 齿轮的 title：把"为什么这里有个角标"写出来，而不是让用户去猜。 */
-const prefsTitle = computed(() => {
-  const bits = ['偏好：默认图型、拆解方式、内容风格备注'];
-  if (prefsSuggestCount.value) bits.push(`${prefsSuggestCount.value} 条建议待确认`);
-  if (prefs.error) bits.push(`上次操作失败：${prefs.error}`);
-  return bits.join('；');
-});
 
 function toggleSide(): void {
   sideOpen.value = !sideOpen.value;
@@ -1082,455 +771,200 @@ function openAgentDetail(): void {
   sideOpen.value = true;
 }
 
-function togglePrefs(): void {
-  prefsOpen.value = !prefsOpen.value;
+function toggleHistory(): void {
+  historyOpen.value = !historyOpen.value;
+  if (!historyOpen.value) prefsOpen.value = false;
+  // 打开就顺手拉一次列表：抽屉里的"历史导图"不该要求用户先点一次「打开」才出现。
+  // 注意用 `loadMaps()` 而不是 `openList()`——后者会同时把选择模态弹出来，正好盖住抽屉。
+  else void store.loadMaps();
 }
 
-/**
- * 点浮层外面关掉它。
- *
- * 两个细节都是踩出来的：
- *   · 用 `pointerdown` 而不是 `click`：抽屉里的按钮若在 pointerdown 之后就改变了 DOM，
- *     click 可能落在别的元素上，那样"点一下别处"会变成一次没头没尾的重开；
- *   · 挂在**捕获阶段**：Vue Flow 的 pane 在 `mousedown` 里做了 `stopImmediatePropagation`
- *     （d3-zoom 的常规做法），冒泡阶段根本收不到——不捕获的话，点画布关不掉浮层。
- */
-function onDocumentPointerDown(event: PointerEvent): void {
-  if (!prefsOpen.value) return;
-  const box = prefsWrap.value;
-  if (box && event.target instanceof Node && box.contains(event.target)) return;
-  prefsOpen.value = false;
+/** 抽屉里那个「打开已保存的导图…」：打开原来的列表模态（选择更清楚，带版本与图型）。 */
+function openHistoryList(): void {
+  void store.openList();
 }
 
 /**
  * 偏好写失败要主动说一句。
  *
- * 面板收进顶栏之后，"保存失败"那一行不再常驻——不主动提示的话，用户点了个勾、
+ * 面板收进抽屉之后，"保存失败"那一行不再常驻——不主动提示的话，用户点了个勾、
  * 勾自己弹回原样、然后什么都没有发生。「偏好建议与保存错误要有提醒」就是这条。
  */
 watch(() => prefs.error, message => {
   if (message) flash('error', message);
 });
 
-// ---- 画布底部那一条：进度 / 结果 / 异常 -------------------------------------
-//
-// 评审的结论：这一块**只需要一行**。四块内容里只有它每次生成都该被看见——进行中它
-// 是进度，落地后它是结果，出事时它是异常。明细（改动清单、诊断逐条、预览）点开才看。
+// ---- 新外壳的三件事：历史 / 新对话 / 消息流 ----------------------------------
 
-/** 状态行的一枚按钮。`run` 直接是函数，模板里 `@click="action.run"`，不必再套一层。 */
-interface StatusAction {
-  key: string;
-  label: string;
-  test: string;
-  run: () => void;
+/** 当前图的来历（原来顶栏那枚徽章，现在在抽屉的状态区里）。 */
+const modeLabel = computed(() => {
+  switch (store.mode) {
+    case 'demo': return '演示模式（非 AI 生成）';
+    case 'model': return '模型生成';
+    case 'saved': return '已保存导图';
+    case 'import': return '导入';
+    default: return '未生成';
+  }
+});
+
+const modeTone = computed(() => {
+  switch (store.mode) {
+    case 'demo': return 'bg-amber-100 text-amber-700';
+    case 'model': return 'bg-emerald-100 text-emerald-700';
+    case 'saved': return 'bg-slate-100 text-slate-600';
+    case 'import': return 'bg-sky-100 text-sky-700';
+    default: return 'bg-slate-100 text-slate-500';
+  }
+});
+
+/** 底部对话框：叫回它、预填一句话（选中节点点「改」走这条）。 */
+const dock = ref<{ openComposer: (prefill?: string) => void; openMaterial: () => void } | null>(null);
+
+function onNodeEdit(label: string): void {
+  dock.value?.openComposer(`关于「${label}」…`);
 }
 
-type StatusKind = 'running' | 'error' | 'warn' | 'ok' | 'conflict' | 'info';
-
-/** 部分完成：后端在 ok 的同时给出来的，界面只认 ok 就永远看不见它。 */
-const agentPartial = computed(
-  () => store.agentWarnings.find(item => item.kind === 'partial') ?? null,
-);
-
 /**
- * 这一行现在在说什么。**优先级从上到下**，同一时刻只说一件。
+ * 悬浮球里的「继续说一句」：把对话框叫回来并关掉消息面板。
  *
- * 冲突排第一：它要用户在两个都会丢东西的选择里做决定，压住它就是丢数据。
- * 运行中排第二：进度要压过上一次的结果。异常排第三：失败不能因为"上次成功过"就不显示。
+ * 这是"生成完对话框淡出"之后的主要回程入口。没有它，用户想接着改一句就得先去画布
+ * 上选个节点（那是"改这一支"），或者点 `+`（那会新开一轮、丢掉当前这张图）。
  */
-const statusKind = computed<StatusKind | null>(() => {
-  if (store.conflictDraft) return 'conflict';
-  if (store.busy || store.agentRunning) return 'running';
-  if (store.agentError) return 'error';
-  if (agentPartial.value) return 'warn';
-  if (store.generatedSummary) return 'ok';
-  if (store.resumableRun) return 'info';
-  return null;
-});
-
-/** 这一轮在做什么。三个意图各有一个动词，混用会把"我在改图"看成"它在重生成"。 */
-const runningVerb = computed(() => {
-  if (store.runIntent === 'expand') return '正在展开这一支';
-  if (store.runIntent === 'edit') return '正在改这张图';
-  return '正在生成';
-});
-
-/**
- * 已经跑了多少秒。**只用于状态行**，不写进 store：它是纯展示计时器，放进 store
- * 会让每一下心跳都触发一轮与数据无关的重算。
- */
-const elapsedSec = ref(0);
-let elapsedTimer: ReturnType<typeof setInterval> | null = null;
-
-function stopElapsed(): void {
-  if (elapsedTimer) clearInterval(elapsedTimer);
-  elapsedTimer = null;
-  elapsedSec.value = 0;
+function onComposeFromFab(): void {
+  chat.closePanel();
+  dock.value?.openComposer();
 }
 
+/**
+ * 悬浮球里某条用户消息的「改这句」：把原句填回对话框。
+ *
+ * 这是自评里那条顾虑的落地：对话框淡出之后，用户想"改一个词重发"的成本变成
+ * 一次点击——不用先翻历史再重打一遍。
+ */
+function onReuseFromFab(text: string): void {
+  chat.closePanel();
+  dock.value?.openComposer(text);
+}
+
+/**
+ * 用户发出去一句话：立刻记进时间线。
+ *
+ * 记的是**发出去的那句**（`goal`），不是输入框里此刻的内容——对话框随后会收成进度条
+ * 并清空，用户回头要看的正是他刚说的话。
+ */
+function onIntentSubmitted(goal: string): void {
+  chat.said(goal);
+}
+
+/**
+ * 一轮跑完：把模型的答复写进消息流。
+ *
+ * 它承担的正是"生成完对话框就淡出"之后的信息出口：结果好不好、改了几处、走的哪个
+ * 模型、想了什么——全在这里，不用去翻抽屉。
+ */
 watch(
-  () => store.busy || store.agentRunning,
-  running => {
-    if (!running) {
-      stopElapsed();
+  () => store.agentRunning,
+  (running, was) => {
+    if (!was || running) return;
+    const summary = store.generatedSummary;
+    if (store.agentError) {
+      chat.replied({
+        text: `这次没成：${store.agentError}`,
+        kind: 'error',
+        model: store.runModel,
+        reasoning: store.lastReasoning || undefined,
+      });
       return;
     }
-    if (elapsedTimer) return;
-    // 从**现在**开始算：`waitedMs` 是"多久没收到帧"，与总耗时不是一回事，
-    // 拿它当时长会让一个每秒都有帧的正常生成永远显示 0 秒。
-    elapsedSec.value = 0;
-    elapsedTimer = setInterval(() => { elapsedSec.value += 1; }, 1000);
+    if (!summary) return;
+    const partial = store.agentWarnings.find(item => item.kind === 'partial');
+    const bits = [`已落到画布：${summary.nodes} 个节点`];
+    if (summary.changes != null) bits.push(`改了 ${summary.changes} 处`);
+    if (partial) bits.push(`（部分完成：${partial.message}）`);
+    chat.replied({
+      text: bits.join(' · '),
+      kind: partial ? 'partial' : 'done',
+      model: store.runModel,
+      reasoning: store.lastReasoning || undefined,
+      nodes: summary.nodes,
+      changes: summary.changes,
+    });
   },
-  { immediate: true },
 );
 
 /**
- * 状态行正文。
+ * `+`：新的一轮。
  *
- * 静默超过 10 秒就换成「模型正在思考」并**替换**阶段文案，不叠在一起——两句话并排
- * 会让人以为两件事同时在发生。这条规则与原来生成框里那行完全一致，只是搬到了这里。
+ * 三件事同时发生，缺一件都会让"新对话"看起来没生效：清空画布（`newMap`）、清空时间线、
+ * 把对话框叫回来放在输入位置。
  */
-const statusText = computed(() => {
-  switch (statusKind.value) {
-    case 'conflict':
-      return '生成期间你改过这张图：两棵树都还在，选一个';
-    case 'running': {
-      const parts = [runningVerb.value];
-      if (store.waitedMs >= SILENT_HINT_SECONDS) {
-        parts.push(`模型正在思考，已等 ${store.waitedMs} 秒`);
-      } else {
-        if (store.stageText) parts.push(store.stageText);
-        if (elapsedSec.value > 0) parts.push(`${elapsedSec.value} 秒`);
-      }
-      return parts.join(' · ');
-    }
-    case 'error':
-      return `生成失败：${store.agentError}`;
-    case 'warn':
-      // 部分完成**不是失败**：树已经落画布了，只是某几支是空的。措辞必须分开。
-      return `部分完成：${agentPartial.value?.message ?? '有几支没能生成'}`;
-    case 'ok': {
-      const summary = store.generatedSummary;
-      if (!summary) return '';
-      return `${runResultLine(summary)} · 还没保存`;
-    }
-    case 'info':
-      return resumableText.value;
-    default:
-      return '';
-  }
-});
+function newConversation(): void {
+  if (!confirmDiscard('开一个新对话')) return;
+  store.newMap();
+  chat.clear();
+  historyOpen.value = false;
+  dock.value?.openComposer();
+}
 
-/**
- * 状态行上的按钮。
- *
- * 规则：**能当场处理完的放在这一行**，其余交给「明细」。冲突的两个裁决（原来在右栏
- * 面板里）必须留在这里——它是要用户立刻做决定的事，藏进抽屉等于把一次数据丢失的
- * 裁决变成一次遗忘。
- */
-const statusActions = computed<StatusAction[]>(() => {
-  switch (statusKind.value) {
-    case 'conflict':
-      return [
-        { key: 'use', label: '用模型的结果', test: 'run-status-use',
-          run: () => store.resolveConflict('generated') },
-        { key: 'keep', label: '保留我的', test: 'run-status-keep',
-          run: () => store.resolveConflict('mine') },
-      ];
-    case 'running':
-      return [
-        { key: 'cancel', label: '取消', test: 'run-status-cancel', run: () => store.cancel() },
-      ];
-    case 'ok':
-      // 只在"画布还是生成结果"时给：否则那个按钮点下去没有任何可退的东西。
-      return store.canUndoGenerate
-        ? [{ key: 'undo', label: '回到生成之前', test: 'run-status-undo',
-            run: () => store.undoGenerate() }]
-        : [];
-    case 'info':
-      return [
-        { key: 'load', label: '载入', test: 'run-status-load', run: () => store.resumeRun() },
-        { key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() },
-      ];
-    default:
-      return [];
-  }
-});
+/** 抽屉里选一个导出格式：先把值写回，再走原来那条导出。 */
+function onExportFromDrawer(format: ExportFormat): void {
+  exportChoice.value = format;
+  void onExport();
+}
 
-/** 异常那三种要给足视觉重量：一行小字读不出"出事了"。 */
-const statusTone = computed(() => {
-  switch (statusKind.value) {
-    case 'error':
-      return 'border-rose-300 bg-rose-50 text-rose-900 ring-1 ring-rose-200';
-    case 'warn':
-    case 'conflict':
-      return 'border-amber-300 bg-amber-50 text-amber-900 ring-1 ring-amber-200';
-    case 'ok':
-      return 'border-emerald-200 bg-white text-slate-700';
-    case 'info':
-      return 'border-sky-200 bg-sky-50 text-sky-900';
-    default:
-      return 'border-slate-200 bg-white text-slate-700';
-  }
-});
-
-const statusDot = computed(() => {
-  switch (statusKind.value) {
-    case 'running': return 'bg-sky-500';
-    case 'error': return 'bg-rose-500';
-    case 'warn':
-    case 'conflict': return 'bg-amber-500';
-    case 'ok': return 'bg-emerald-500';
-    default: return 'bg-sky-400';
-  }
-});
-
-/** 「明细」只在真有明细可看时出现；「上次的运行结果」那两个按钮本身就是全部内容。 */
-const showDetailAction = computed(
-  () => statusKind.value !== null && statusKind.value !== 'info',
-);
-
-/** 抽屉里有没有东西可展开（判据与 `AgentPanel` 共用，见 `mindmap/run-status.ts`）。 */
 const agentHasDetail = computed(() => agentDetailVisible(store));
 </script>
 
 <template>
   <div class="flex h-full w-full flex-col bg-slate-50 text-slate-900">
-    <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-2">
-      <div class="flex items-center gap-3">
-        <h1 class="text-sm font-semibold">生成式 AI 思维导图</h1>
-        <span
-          v-if="versionLabel"
-          class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-500"
-          :title="`后端版本 ${appVersion}`"
-        >{{ versionLabel }}</span>
-        <div v-if="samples.length" class="flex items-center gap-1 text-xs text-slate-500">
-          <span class="mr-1">布局示例</span>
-          <button
-            v-for="item in samples"
-            :key="item.id"
-            type="button"
-            class="rounded border border-slate-200 px-2 py-0.5 hover:bg-slate-100"
-            @click="loadSample(item.id)"
-          >
-            {{ item.label }}
-          </button>
-        </div>
-      </div>
-      <div class="flex items-center gap-3 text-xs text-slate-500">
-        <span v-if="saveHint" :class="store.dirty ? 'text-amber-600' : 'text-slate-400'">
-          {{ saveHint }}
-        </span>
-        <button
-          type="button"
-          class="rounded-md bg-slate-900 px-3 py-1.5 text-xs text-white disabled:opacity-40"
-          :disabled="!store.content || store.saving"
-          title="保存（Ctrl+S）"
-          @click="saveNow"
-        >
-          保存
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
-          @click="openDemoPresets"
-        >
-          演示示例
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
-          @click="openLibrary"
-        >
-          知识库
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 disabled:opacity-40"
-          :disabled="store.listBusy"
-          @click="store.openList()"
-        >
-          打开
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700"
-          @click="newMap"
-        >
-          新建
-        </button>
-        <!--
-          导入已有导图（JSON / Markdown / OPML / XMind / FreeMind / PlantUML）。
-          与「新建」「打开」同样会整棵换掉画布，所以它拿到同一个 `confirmDiscard`：
-          有未保存修改时先问一句。结果里的告警由它自己在按钮下方列出来——只写进
-          `store.status` 的话，被截断的节点数永远没人看见。
-        -->
-        <ImportMindmap :confirm-discard="confirmDiscard" />
-        <select
-          v-model="exportChoice"
-          class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 disabled:opacity-40"
-          :disabled="!store.content || exporting"
-          title="导出为文本格式"
-          @change="onExport"
-        >
-          <option value="" hidden>{{ exporting ? '导出中…' : '导出' }}</option>
-          <option value="puml">PlantUML</option>
-          <option value="markdown">Markdown</option>
-          <option value="opml">OPML（XMind）</option>
-          <!-- JSON 是唯一无损的一种，也是「导出改一改再导入」的保底 -->
-          <option value="json">JSON（可再导入）</option>
-        </select>
-        <p>
-          <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
-            演示模式（非 AI 生成）
-          </span>
-          <span v-else-if="store.mode === 'model'" class="rounded bg-emerald-100 px-2 py-0.5 text-emerald-700">
-            模型生成
-          </span>
-          <span v-else-if="store.mode === 'saved'" class="rounded bg-slate-100 px-2 py-0.5 text-slate-600">
-            已保存导图
-          </span>
-          <!--
-            导入进来的图**没有** mapId，`dirty` 为真——它是"未保存的新作品"，
-            所以不能混进「已保存导图」，也不能混进「模型生成」（那会让人以为什么都
-            不用改）。这一档只说清来历。
-          -->
-          <span v-else-if="store.mode === 'import'" class="rounded bg-sky-100 px-2 py-0.5 text-sky-700">
-            导入
-          </span>
-          <span v-else>未生成</span>
-          <span class="ml-3">{{ store.nodeCount }} 个节点</span>
-        </p>
+    <!--
+      瘦顶栏：**只有三件东西**。左边 `☰` 开历史与全部操作，中间是当前图名（就地改名），
+      右边 `+` 开新的一轮。
 
-        <!--
-          右侧两块内容原来常驻在 320px 的右栏里，现在收进顶栏：
-            · 齿轮 → 偏好浮层（一次设置的东西不该天天占着画布宽度）；
-            · 面板 → 覆盖式详情抽屉（节点详情 + 本次生成的明细）。
-
-          齿轮上的角标是"收起来了但没静默"的证据：有待确认的建议就显示数字，刚失败过
-          一次就变成红点，`title` 里写着原因。这是「偏好建议与保存错误要有提醒」那一条
-          在"偏好已经不在屏幕上"之后的落地方式。
-        -->
-        <div ref="prefsWrap" class="relative">
-          <button
-            type="button"
-            data-test="prefs-toggle"
-            class="relative rounded-md border p-1.5"
-            :class="prefsOpen ? 'border-slate-900 bg-slate-100 text-slate-900' : 'border-slate-300 text-slate-600 hover:bg-slate-50'"
-            :aria-expanded="prefsOpen"
-            aria-controls="prefs-popover"
-            aria-label="偏好"
-            :title="prefsTitle"
-            @click="togglePrefs"
-          >
-            <!-- 齿轮：外圈虚线 + 内圈实线。不引图标库——为一个图标加依赖不划算，
-                 而这条虚线环在 16px 下能读出"齿"。 -->
-            <svg
-              class="h-4 w-4"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.8"
-              aria-hidden="true"
-            >
-              <circle cx="12" cy="12" r="8" stroke-dasharray="2.2 3.1" />
-              <circle cx="12" cy="12" r="3.2" />
-            </svg>
-            <span
-              v-if="prefsSuggestCount"
-              data-test="prefs-badge"
-              class="absolute -right-1.5 -top-1.5 min-w-[15px] rounded-full bg-sky-600 px-1 text-center text-[10px] leading-[15px] text-white"
-            >{{ prefsSuggestCount }}</span>
-            <span
-              v-else-if="prefs.error"
-              data-test="prefs-badge-error"
-              class="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-rose-500"
-              aria-hidden="true"
-            />
-          </button>
-
-          <!-- 浮层：绝对定位挂在齿轮下面。它不参与任何布局，关掉时 `v-show` 只改
-               display——所以面板里的内容与测试里的定位都还在，只是看不见。
-
-               `max-h` 不能省：偏好条目攒起来之后（8 条备注 + 若干键），不限高的浮层
-               会顶出视口底部，最下面那条「加一条备注」就再也点不到。 -->
-          <div
-            v-show="prefsOpen"
-            id="prefs-popover"
-            data-test="prefs-popover"
-            class="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-5rem)] w-[380px] max-w-[calc(100vw-2rem)] overflow-y-auto rounded-lg border border-slate-200 bg-white p-2 shadow-2xl"
-          >
-            <div class="flex items-center justify-between px-1 pb-1">
-              <p class="text-xs font-semibold text-slate-700">偏好</p>
-              <button
-                type="button"
-                data-test="prefs-popover-close"
-                class="text-[11px] text-slate-500 hover:text-slate-900"
-                title="关闭（Esc）"
-                @click="prefsOpen = false"
-              >关闭</button>
-            </div>
-            <PrefsPanel />
-          </div>
-        </div>
-
+      原来那一排（保存 / 演示 / 知识库 / 打开 / 新建 / 导入 / 导出 / 偏好 / 节点详情 /
+      版本号 / 来历徽章）一件没少，全搬进了 `HistoryDrawer`——每一件都还能找到，只是
+      不再天天占着一条横边。顶栏的高度因此从 ~44px 降到 48px 以内，画布多出一整条宽。
+    -->
+    <header class="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-3">
+      <div class="flex min-w-0 flex-1 items-center gap-2">
         <button
           type="button"
-          data-test="side-toggle"
-          class="rounded-md border p-1.5"
-          :class="sideOpen
-            ? 'border-slate-900 bg-slate-900 text-white'
-            : selected
-              ? 'border-sky-300 bg-sky-50 text-sky-700'
-              : 'border-slate-300 text-slate-600 hover:bg-slate-50'"
-          :aria-expanded="sideOpen"
-          aria-controls="side-panel"
-          :aria-label="selected ? `节点详情：${selected.node.label.trim()}` : '节点详情与本次改动'"
-          :title="selected ? `节点详情：${selected.node.label.trim()}（有选中节点时高亮）` : '节点详情与本次改动'"
-          @click="toggleSide"
+          data-test="history-toggle"
+          class="shrink-0 rounded-md border border-slate-200 px-2 py-1 text-slate-600 hover:bg-slate-50"
+          :aria-expanded="historyOpen"
+          aria-controls="history-drawer"
+          aria-label="历史导图与更多操作"
+          title="历史导图与更多操作"
+          @click="toggleHistory"
         >
-          <!-- 面板轮廓：一个矩形加一条竖分隔线，读作"右侧栏"。
-               选中节点时按钮变天蓝——不自动弹抽屉（那会更挡），但入口自己会亮。 -->
-          <svg
-            class="h-4 w-4"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            aria-hidden="true"
-          >
-            <rect x="3" y="4" width="18" height="16" rx="2" />
-            <path d="M15 4v16" />
+          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" stroke-linecap="round" />
           </svg>
         </button>
+        <!-- 标题就是那个"当前图名"，点进去直接改名（#title 一直是同一个输入框）。 -->
+        <input
+          id="title"
+          :value="store.content?.title ?? ''"
+          :placeholder="store.content ? '' : '新对话'"
+          :disabled="!store.content"
+          class="min-w-0 flex-1 truncate rounded border border-transparent bg-transparent px-1 py-0.5 text-sm font-medium text-slate-800 outline-none hover:border-slate-200 focus:border-slate-400 disabled:text-slate-400"
+          aria-label="导图标题"
+          @input="onTitleInput"
+          @change="commitTitle"
+          @blur="store.setTitleDraft(null)"
+        />
       </div>
+      <button
+        type="button"
+        data-test="new-run"
+        class="shrink-0 rounded-md bg-slate-900 px-2.5 py-1 text-xs text-white hover:bg-slate-800"
+        aria-label="新对话"
+        title="新对话（清空画布，开新的一轮）"
+        @click="newConversation"
+      >+</button>
     </header>
 
     <main class="relative flex min-h-0 flex-1">
-      <section class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-white p-4">
-        <div class="flex flex-col gap-1">
-          <label for="title" class="text-xs font-medium text-slate-600">
-            导图标题 <span class="font-normal text-slate-400">· 只改名，不重新生成</span>
-          </label>
-          <input
-            v-if="store.content"
-            id="title"
-            :value="store.content.title"
-            class="rounded-md border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-slate-500"
-            @input="onTitleInput"
-            @change="commitTitle"
-            @blur="store.setTitleDraft(null)"
-          />
-          <p v-else class="text-xs text-slate-400">生成或新建之后可以改标题</p>
-        </div>
-
-        <!-- 材料区只收材料：主题与「怎么改」在画布右上角那个框里。 -->
-        <SourceInputs />
-
-        <p class="mt-auto text-xs leading-relaxed text-slate-400">
-          双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销、Ctrl+Shift+Z 重做。
-        </p>
-      </section>
 
       <section class="relative min-w-0 flex-1">
         <div class="absolute left-4 top-4 z-10 flex gap-1 rounded-md border border-slate-200 bg-white p-1 shadow-sm">
@@ -1564,214 +998,54 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
             重做
           </button>
         </div>
-        <!--
-          画布右上角：**唯一**说一句话的地方（合并后的 #2）。
-          没图时它是「生成导图」，有图时它是「改这张图」，选了节点时徽标和按钮都
-          跟着数变。左侧材料区不再有输入框，也不再有自己的生成按钮。
-        -->
-        <div
-          class="absolute right-4 top-4 z-10 flex w-[400px] max-w-[calc(100%-2rem)] flex-col gap-1.5 rounded-md border border-slate-200 bg-white p-2 shadow-sm"
-          role="group"
-          aria-label="生成与改图"
-          data-test="intent-box"
-        >
-          <div class="flex items-center justify-between gap-2">
-            <label for="intent" class="text-xs font-medium text-slate-600">{{ intentLabel }}</label>
-            <!--
-              「已选 N 个节点」。没选中时整枚徽标不出现：显示一个「已选 0 个」
-              既占地方又容易被读成"我是不是选错了"。
-            -->
-            <span
-              v-if="selectionLabel"
-              data-test="edit-selection"
-              class="shrink-0 rounded bg-sky-50 px-1 py-0.5 text-[11px] text-sky-700"
-            >{{ selectionLabel }}</span>
-          </div>
-          <textarea
-            id="intent"
-            v-model="intentText"
-            rows="2"
-            aria-label="主题或修改指令"
-            class="resize-none rounded border border-slate-300 px-2 py-1 text-xs outline-none focus:border-slate-500 disabled:opacity-50"
-            :disabled="runBlocked"
-            :placeholder="intentPlaceholder"
-            @keydown="onIntentKeydown"
-          />
-          <!--
-            拆解方式与图型只在**新建**那一次生效：后端的编辑路径既不消费
-            `thinking_model`，也不生成骨架（图型只影响骨架那一次调用）。摆一个
-            选了不起作用的控件比不摆更糟——用户会以为自己换过拆法或图型了。
-            它们挨着按钮放，而不是留在材料区：用户实测 12 次生成里 0 次点过图型下拉，
-            因为它在左栏材料堆里、看不出跟生成有什么关系。
-          -->
-          <template v-if="intentState === 'create'">
-            <div class="flex items-center gap-1.5 text-[11px] text-slate-500">
-              <label for="thinking-model" class="w-14 shrink-0">拆解方式</label>
-              <select
-                id="thinking-model"
-                :value="options.thinkingModel"
-                :disabled="runBlocked"
-                title="按这种方式拆解主题"
-                class="min-w-0 flex-1 rounded border border-slate-300 px-1 py-1 text-[11px] outline-none focus:border-slate-500 disabled:opacity-50"
-                @change="options.chooseThinking(($event.target as HTMLSelectElement).value)"
-              >
-                <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
-              </select>
-            </div>
-            <div class="flex items-center justify-between gap-2 text-[11px]">
-              <!--
-                来源标注：`（来自你的偏好）`。这句是「预填」与「偷偷填」的分界——
-                用户必须看得见这个值不是他此刻选的，而是从偏好带过来的，否则
-                `runs.request.diagram_type` 里那个值会被读成"他选了流程图"。
-              -->
-              <p class="leading-tight text-slate-400">
-                按这种方式拆解主题
-                <span v-if="options.prefilled.thinking" class="text-sky-700">（来自你的偏好：{{ options.thinkingLabel }}）</span>
-              </p>
-              <label class="flex shrink-0 items-center gap-1 text-slate-500">
-                <input
-                  v-model="stickyThinking"
-                  type="checkbox"
-                  :disabled="runBlocked"
-                  data-test="sticky-thinking"
-                />
-                以后都这样
-              </label>
-            </div>
-            <div class="flex items-center gap-1.5 text-[11px] text-slate-500">
-              <label for="diagram-type" class="w-14 shrink-0">图型</label>
-              <select
-                id="diagram-type"
-                :value="options.diagramType"
-                :disabled="runBlocked"
-                title="这张图要画成什么形状"
-                class="min-w-0 flex-1 rounded border border-slate-300 px-1 py-1 text-[11px] outline-none focus:border-slate-500 disabled:opacity-50"
-                @change="options.chooseDiagram(($event.target as HTMLSelectElement).value as DiagramTypeChoice)"
-              >
-                <option v-for="item in DIAGRAM_TYPE_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
-              </select>
-            </div>
-            <div class="flex items-center justify-between gap-2 text-[11px]">
-              <!-- 说明必须跟着选项变：图型不是自解释的。选「鱼骨图」却按话题分六支的人
-                   会以为模型没听懂他的话，这一行就是"这个选项到底改了什么"。 -->
-              <p class="leading-tight text-slate-400">
-                {{ options.diagramHint }}
-                <span v-if="options.prefilled.diagram" class="text-sky-700">（来自你的偏好：{{ options.diagramLabel }}）</span>
-              </p>
-              <label class="flex shrink-0 items-center gap-1 text-slate-500">
-                <input
-                  v-model="stickyDiagram"
-                  type="checkbox"
-                  :disabled="runBlocked"
-                  data-test="sticky-diagram"
-                />
-                以后都这样
-              </label>
-            </div>
-            <!--
-              联网检索：与上面两个下拉不同，它不是一个"这次怎么拆"的参数，而是一个
-              真的会改变那条链路的开关（关着时一次外网往返都不发）。所以它没有
-              「以后都这样」——勾它本身就是"以后都这样"，直接写进偏好。
-
-              有材料且够长时置灰并写明原因：那时候后端根本不走外部检索，勾来勾去
-              不会有任何变化，而灰着不解释比摆着不解释更糟。
-            -->
-            <div class="flex items-center justify-between gap-2 text-[11px]">
-              <label
-                class="flex shrink-0 items-center gap-1"
-                :class="externalSearchApplies ? 'text-slate-500' : 'text-slate-400'"
-              >
-                <input
-                  type="checkbox"
-                  :checked="prefs.externalSearchEnabled"
-                  :disabled="runBlocked || !externalSearchApplies || prefs.saving === EXTERNAL_SEARCH_PREF_KEY"
-                  data-test="external-search"
-                  @change="toggleExternalSearch(($event.target as HTMLInputElement).checked, $event)"
-                />
-                联网检索
-              </label>
-              <p
-                class="text-right leading-tight text-slate-400"
-                data-test="external-search-hint"
-              >{{ externalSearchHint }}</p>
-            </div>
-          </template>
-          <p
-            class="text-[11px] leading-tight"
-            :class="intentHintWarn ? 'text-amber-700' : 'text-slate-400'"
-          >{{ intentHint }}</p>
-          <button
-            type="button"
-            class="rounded-md bg-slate-900 px-2 py-1.5 text-xs text-white disabled:opacity-40"
-            :disabled="!canSubmit"
-            @click="submitIntent"
-          >{{ intentButton }}</button>
-          <!-- 阶段文案（"正在定框架"之类）搬到了画布底部那条状态行。这里那行反而要
-               在**生成中藏起来**：`store.status` 在此期间写的是"正在与模型协作…"，
-               和状态行说的是同一件事，两行并排只会互相削弱。
-               其它状态（已保存、已打开、失败原因）都留着——那是状态行不覆盖的信息，
-               而且 `role="status"` 的读屏播报只该有这一个来源。 -->
-          <p
-            v-if="showStatus && statusKind !== 'running'"
-            role="status"
-            class="text-[11px] leading-tight text-slate-500"
-          >{{ store.status }}</p>
-        </div>
         <MindMapCanvas />
 
         <!--
-          画布底部那一条：**常驻，但只有一行**。
-
-          这是评审里唯一"每次生成都该被看见"的东西：进行中它是进度，落地后它是结果，
-          出事时它是异常（失败 / 部分完成 / 冲突）。明细（改动清单、诊断逐条、预览）
-          在抽屉里，点「明细」直接展开到那一块。
-
-          三点是刻意的：
-            · **绝对定位、覆盖在画布上**——出现和消失都不会让画布容器重算尺寸，
-              也就不会在生成过程中把视图拽一下；
-            · **没有 `role="status"`**——生成框里那行 `store.status` 已经占了那个
-              role（`getByRole('status')` 只能有一个），这里用 `aria-live` 表达
-              "这是会变的文字"就够了；
-            · 外面再包一层 `justify-center`：抽屉打开时右边留出 360px，于是这一行
-              仍然居中在**看得见的那块画布**上，而不是被抽屉切掉半截。
+          选中节点旁浮出的工具条（`[改][展开][删][色]`）。它读画布 DOM 定位，
+          不改动一个像素的渲染——"点节点要求 AI 修改"这条需求的落点就在这里。
         -->
-        <div
-          class="pointer-events-none absolute inset-x-4 bottom-3 z-20 flex justify-center"
-          :class="sideOpen ? 'md:pr-[360px]' : ''"
-        >
-          <div
-            v-if="statusKind"
-            data-test="run-status"
-            aria-live="polite"
-            :aria-label="statusKind === 'info' ? '上次的运行结果' : undefined"
-            class="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border bg-white px-3 py-1.5 text-xs shadow-lg"
-            :class="statusTone"
-          >
-            <span class="h-2 w-2 shrink-0 rounded-full" :class="statusDot" aria-hidden="true" />
-            <span
-              class="min-w-0 flex-1 truncate font-medium"
-              :title="statusText"
-              data-test="run-status-text"
-            >{{ statusText }}</span>
-            <button
-              v-for="action in statusActions"
-              :key="action.key"
-              type="button"
-              :data-test="action.test"
-              class="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-0.5 text-xs hover:bg-slate-50"
-              @click="action.run()"
-            >{{ action.label }}</button>
-            <button
-              v-if="showDetailAction"
-              type="button"
-              data-test="run-status-detail"
-              class="shrink-0 rounded-md px-2 py-0.5 text-xs underline decoration-dotted underline-offset-2 hover:bg-white/60"
-              title="打开右侧抽屉：改动清单、诊断逐条、生成中的预览"
-              @click="openAgentDetail"
-            >明细</button>
-          </div>
-        </div>
+        <NodeToolbar @edit="onNodeEdit" />
+
+        <!--
+          底部对话框。**生成中**收成一条细进度、**生成完**淡出，只剩画布 + 悬浮球；
+          失败 / 有草稿 / 画布还空着时留着（判据在 `ChatDock.shouldKeep`）。
+        -->
+        <ChatDock ref="dock" @detail="openAgentDetail" @submit="onIntentSubmitted" />
+
+        <!-- 右下角悬浮球：未读角标 + 消息时间线（生成完对话框消失之后的信息出口）。
+             `@compose` 把对话框叫回来——那是淡出之后"再说一句"的入口。 -->
+        <MessageFab @compose="onComposeFromFab" @reuse="onReuseFromFab" />
       </section>
+
+      <!--
+        `☰` 打开的左抽屉：历史导图 + 原来顶栏那一排按钮。
+        与右抽屉同一个套路——`absolute` 相对 `<main>`，不盖住顶栏（那个开关必须一直点得到）。
+      -->
+      <HistoryDrawer
+        :open="historyOpen"
+        :confirm-discard="confirmDiscard"
+        :exporting="exporting"
+        :export-choice="exportChoice"
+        :save-hint="saveHint"
+        :version-label="versionLabel"
+        :mode-label="modeLabel"
+        :mode-tone="modeTone"
+        :node-count="store.nodeCount"
+        :side-open="sideOpen"
+        :samples="samples"
+        @close="historyOpen = false"
+        @save="saveNow"
+        @new-map="newMap"
+        @open-list="openHistoryList"
+        @open-map="openSaved"
+        @demo="openDemoPresets"
+        @library="openLibrary"
+        @export="onExportFromDrawer"
+        @update-export="value => exportChoice = value"
+        @load-sample="loadSample"
+        @toggle-side="toggleSide"
+        @prefs-open="value => prefsOpen = value"
+      />
 
       <!--
         右抽屉：**覆盖式**，不参与主区的 flex 布局。

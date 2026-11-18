@@ -219,13 +219,17 @@ describe('有材料时它不生效', () => {
     expect('prefs_applied' in backend.runs[0].body).toBe(false);
   });
 
-  it('有图（edit）时整块不渲染：那条路不生成，也没有外部检索', async () => {
+  it('有图（edit）时置灰不生效：那条路不生成，也没有外部检索', async () => {
     stubBackend();
     const wrapper = mountApp();
     useMindMapStore().preview(content('原图'), 'right');
     await wrapper.vm.$nextTick();
 
-    expect(wrapper.find(TOGGLE).exists()).toBe(false);
+    // 「智能搜索」这一格留在按钮行里（截图里那一行是三件东西，抽掉一格会让布局跳），
+    // 但 edit 这条路根本不生成、也不发检索请求，所以它必须是灰的。
+    const toggle = wrapper.get(TOGGLE);
+    expect(toggle.attributes('disabled')).toBeDefined();
+    expect(wrapper.get(HINT).text()).toContain('不走联网检索');
   });
 });
 

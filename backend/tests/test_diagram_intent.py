@@ -253,6 +253,10 @@ class TestApplyOnTheRequest:
             "prefs_applied": [],
             "selected_ids": [], "sources": [],
             "budget": _request("x").budget.model_dump(),
+            # 「这一次走不走推理模型」是公开字段（前端要发它），缺省 False。
+            # 它不进 `prefs_applied`：那一位记的是"长期偏好"，而这个开关只活在
+            # 一次请求里（见 `tests/test_deep_thinking.py`）。
+            "deep_thinking": False,
         }
 
 
