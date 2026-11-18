@@ -38,7 +38,7 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Collection, Literal, Protocol, Sequence, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -174,6 +174,30 @@ DEEP_FANOUT = 5
 # 一级分支的硬上限。参数模型用 `le=DEEP_MAX_BRANCHES` 引用它，骨架那里也用它截断，
 # 两处同源——否则模型无视"最多 N 条"时，一级节点会一直长到契约的单节点上限（50）。
 DEEP_MAX_BRANCHES = 20
+
+# ---------------------------------------------------------------- 两级骨架
+#
+# 一级分支多到二十条时，图宽得没法看：`branches` 只把上限从 8 提到 20，把"塞进一支"
+# 换成了"图很宽"，问题没解决。所以骨架阶段先归成几组：**一级是组，二级才是那二十节**。
+#
+# `SKELETON_GROUP_THRESHOLD`（N）：**超过它才分两级**。它必须是一个"再看就数不清"的位置，
+# 不是"比默认值大就分"——`branches` 默认 5，若在 6 就分组，普通主题会被硬拆出 2-3 个
+# 分组，而那种主题本来就没有可归纳的上一层。
+#   10 的依据：调色板是 8 色（`NODE_COLORS`），一级色靠"一色一组"分组，8 色刚好一屏；
+#   而画布横向能扫完的一行也在 10 条上下。<=10 条时扁平已经能读，分组只是多一层点击。
+SKELETON_GROUP_THRESHOLD = 10
+# 每组的目标支数：20 节 / 4 = 5 组（正好落在 `SKELETON_GROUP_MIN..MAX` 的中间）。
+# 4 的依据是"组内还能一眼看完"：一组的子节点 3–5 个正好一屏，再多就该在组内再分类了。
+SKELETON_GROUP_TARGET = 4
+# 组数的可读区间：少于 3 组时"分组"等于把一级分支从 20 条砍到 2 条，那是另一种难看；
+# 多于 6 组时一层横向又回到 6 条以上，分级的收益开始消失（`DETAIL_PROMPT` 对一级分支
+# 的既有要求也是 3–6 条）。
+SKELETON_GROUP_MIN = 3
+SKELETON_GROUP_MAX = 6
+# 组数的硬上限（模型没照 3–6 写时的安全阀）：与 `DEEP_MAX_BRANCHES` 同一性质——
+# 只兜住病态输出，不参与正常分配。超过它的组整组丢掉（连同它的分支），
+# 与既有"分支尾巴截到 20 条"是同一种处理。
+SKELETON_GROUP_HARD_MAX = 8
 
 # 一次展开至少要能挂下 2 个子节点才值得发一次调用。额度只剩 1 个节点时直接按
 # "被节点预算截断"处理——花一次调用只为了挂一个节点，是把额度换成噪音。
@@ -1041,6 +1065,193 @@ def _skeleton_titles(raw: Any) -> list[str]:
     return [branch.label for branch in _skeleton_branches(raw)]
 
 
+@dataclass(frozen=True)
+class _SkeletonGroup:
+    """两级骨架里的一个分组：组名 + 它的视觉元素 + 它下面的分支。
+
+    `color` / `icon` 在两级的形状里**只属于分组**（它就是画布上的一级节点）：
+    二级分支不写这两个字段，它们的颜色由前端沿父链继承（`frontend/src/stores/
+    mindmap.ts` 里 `inheritedColor` 那一段）。这不是省事，是"颜色 = 分组"这条
+    唯一约定的前提——二级各带一个色，一眼就分不出哪几支是同一组。
+    """
+
+    label: str
+    color: str | None = None
+    icon: str | None = None
+    branches: tuple[_SkeletonBranch, ...] = ()
+
+
+@dataclass(frozen=True)
+class _SkeletonPlan:
+    """骨架的**最终形态**：分两级时 `groups` 非空，否则 `flat` 就是一级分支。
+
+    `flat` 恒等于"要展开的东西"：两级时是二十节（二级），扁平时是五条（一级）。
+    检索、证据分组、detail 全按它走——**组只出现在树的形状里，不出现在任何一次
+    调用里**（见 `_generate` 里那段"组节点不吃调用"的注释）。
+    """
+
+    flat: tuple[_SkeletonBranch, ...] = ()
+    groups: tuple[_SkeletonGroup, ...] = ()
+
+    @property
+    def grouped(self) -> bool:
+        return bool(self.groups)
+
+
+def _skeleton_key(text: str) -> str:
+    """比对用的归一：只折空白，与小写无关（中文没有大小写）。
+
+    与 `_cross_branch_duplicates` 的判据同源——同一个说法在两处的归一必须一致，
+    否则"骨架说有这一支、树里认不出它"会变成一次静默的结构错位。
+    """
+    return re.sub(r"\s+", "", text or "")
+
+
+def _skeleton_groups(raw: Any) -> list[_SkeletonGroup]:
+    """从骨架响应里取出**两级**形状：`{"groups":[{"label":…,"children":[…]}]}`。
+
+    只认这一种嵌套形状（`children` 里放二级分支），因为语义最直接：一次就能看清
+    哪几支属于哪一组。三种情况都退化成"没给分组"，而不是失败：
+
+      - 没有 `groups` 键（模型照老格式写了 `branches`）——老形状见 `_skeleton_branches`；
+      - `groups` 不是数组 / 全是空组；
+      - 某组的 `children` 不是数组或全是空项——那一组没有内容可承载，整组丢掉。
+
+    与 `_skeleton_branches` 同一条规矩：只接受字符串或带 `label` 的 dict，`color` /
+    `icon` 走归一化而不是拒绝（一个 `color:"深蓝"` 说明模型没照提示词写，但结构是好的，
+    为一个装饰字段把整次骨架判失败，代价方向完全错了）。
+    """
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("groups")
+    if not isinstance(items, list):
+        return []
+    groups: list[_SkeletonGroup] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        if not isinstance(label, str):
+            continue
+        title = clip_label(label.strip())
+        if not title:
+            continue
+        children = item.get("children")
+        branches: list[_SkeletonBranch] = []
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, str):
+                    child_label = clip_label(child.strip())
+                    if child_label:
+                        branches.append(_SkeletonBranch(child_label))
+                    continue
+                if not isinstance(child, dict):
+                    continue
+                child_label = child.get("label")
+                if not isinstance(child_label, str):
+                    continue
+                child_title = clip_label(child_label.strip())
+                if not child_title:
+                    continue
+                # 二级的 color/icon 照收但**不用**（见 `_SkeletonGroup`）：收下来只是
+                # 为了让"模型写了什么"有地方落，不在树上落。
+                branches.append(_SkeletonBranch(
+                    child_title,
+                    color=normalize_color(child.get("color")),
+                    icon=normalize_icon(child.get("icon")),
+                ))
+        if not branches:
+            continue
+        groups.append(_SkeletonGroup(
+            title,
+            color=normalize_color(item.get("color")),
+            icon=normalize_icon(item.get("icon")),
+            branches=tuple(branches),
+        ))
+    return groups
+
+
+def _skeleton_group_count(branches: int) -> int:
+    """这次该归成几组（M）：按每组 `SKELETON_GROUP_TARGET` 支倒推，夹在 3–6 之间。
+
+    11 支 → 3 组（4/4/3）、13 → 4、17 → 5、20 → 5（4×5）。上界 20（`DEEP_MAX_BRANCHES`）
+    时 M 恰好落在 5，与 `SKELETON_GROUP_MAX` 还有一格余量，所以这个夹取只在模型
+    自作主张给到 21 支以上时才起作用。
+    """
+    if branches <= 0:
+        return SKELETON_GROUP_MIN
+    return max(SKELETON_GROUP_MIN, min(
+        SKELETON_GROUP_MAX, -(-branches // SKELETON_GROUP_TARGET)))
+
+
+def _skeleton_plan(raw: Any) -> _SkeletonPlan:
+    """骨架响应 → 最终形态（扁平 / 两级），**并在这里决定要不要分两级**。
+
+    判据只有一条：**要展开的东西超过 `SKELETON_GROUP_THRESHOLD` 条**。所以
+    "模型给了分组但只有 6 支"会被压平（6 条本来就是可读的一行，多一层反而多一次点击），
+    而"没给分组但有 20 支"保持扁平——那是老形状的兼容路径：**退化成不分两级，而不是
+    失败**（骨架已经花掉了，硬拒等于把一次调用判死，与 `_skeleton_branches` 收两种
+    形状是同一条理由）。
+    """
+    groups = _skeleton_groups(raw)
+    if groups:
+        # 组数安全阀：超过 `SKELETON_GROUP_HARD_MAX` 的整组丢掉（含它的分支）。
+        groups = groups[:SKELETON_GROUP_HARD_MAX]
+        flat = [branch for group in groups for branch in group.branches]
+        # 只有一组时不分级：根 → 组 → 二十支 与 根 → 二十支 读起来没有区别，
+        # 而前者多一层、多一个没有内容的节点。
+        if len(flat) > SKELETON_GROUP_THRESHOLD and len(groups) > 1:
+            return _SkeletonPlan(flat=tuple(flat), groups=tuple(groups))
+        # 分支太少（或只有一组）：分组没有收益，压平（组名只是分类名，压平时丢掉即可）。
+        return _SkeletonPlan(flat=tuple(flat))
+    return _SkeletonPlan(flat=tuple(_skeleton_branches(raw)))
+
+
+def _cap_plan(plan: _SkeletonPlan) -> _SkeletonPlan:
+    """把总量截到契约允许的规模：二级分支合计不超过 `DEEP_MAX_BRANCHES`。
+
+    截断按**组的顺序**走（第一组先占），与 `branches[:DEEP_MAX_BRANCHES]` 的语义相同：
+    模型无视上限时保留前 N 条，把尾巴丢掉。两级形状下截断之后可能出现只有 0-1 支的
+    组——1 支的组留着（它仍是这一支的归类），0 支的组丢掉（挂上去就是一个空节点）。
+
+    顺带做**同名分支的去重**（只认第一次出现的那一组）：同一支若同时列在两个组下，
+    骨架这一层就已经自相矛盾了——落到树上要么出现两次（跨支重复），要么按我们挑的
+    那一组归位（模型的另一半意思被静默丢掉）。两种都比"只保留一处、并让它归第一个
+    提到它的组"差，而后者正是这里做的。判据与 `_cross_branch_duplicates` 同源
+    （只折空白），所以"骨架去掉了哪一条"与"树上判定重复"不会各说一套。
+    """
+    if not plan.grouped:
+        return _SkeletonPlan(
+            flat=tuple(plan.flat[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)]))
+    remaining = DEEP_MAX_BRANCHES
+    seen: set[str] = set()
+    groups: list[_SkeletonGroup] = []
+    for group in plan.groups:
+        if remaining <= 0:
+            break
+        kept: list[_SkeletonBranch] = []
+        for branch in group.branches:
+            if len(kept) >= remaining:
+                break
+            key = _skeleton_key(branch.label)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            kept.append(branch)
+        if not kept:
+            continue
+        remaining -= len(kept)
+        groups.append(replace(group, branches=tuple(kept)))
+    if len(groups) < 2:
+        # 截到只剩一组（或一组都没剩）：退回扁平，别为一个分类名多插一层。
+        return _SkeletonPlan(
+            flat=tuple(branch for group in groups for branch in group.branches))
+    return _SkeletonPlan(
+        flat=tuple(branch for group in groups for branch in group.branches),
+        groups=tuple(groups),
+    )
+
+
 def _fill_branch_colors(branches: Sequence[_SkeletonBranch]) -> list[_SkeletonBranch]:
     """给没写 `color` 的一级分支补一个调色板色：**按调色板顺序，跳过已被占用的**。
 
@@ -1064,15 +1275,81 @@ def _fill_branch_colors(branches: Sequence[_SkeletonBranch]) -> list[_SkeletonBr
 
     纯函数：同一条骨架响应永远得到同一组颜色（用例钉着），不做任何跨请求记忆。
     """
-    missing = [index for index, branch in enumerate(branches) if not branch.color]
+    return _palette_fill(branches)
+
+
+class _Visual(Protocol):
+    """带一级视觉元素的形状：`_SkeletonBranch` 与 `_SkeletonGroup` 都满足它。
+
+    只声明 `_palette_fill` 真正读写的三个字段，不描述两者其余的差别
+    （分组还有 `branches`）——协议窄一点，将来第四个视觉形状加进来时才不会被
+    一个过宽的接口绑住。
+    """
+
+    label: str
+    color: str | None
+    icon: str | None
+
+
+_VT = TypeVar("_VT", bound=_Visual)
+
+
+def _palette_fill(items: Sequence[_VT]) -> list[_VT]:
+    """给缺 `color` 的项补调色板色（按顺序取、跳过已被占用的）。
+
+    两级骨架之后有两个调用方（一级分支 / 一级分组），算法只有一份：两边各写一遍时，
+    "跳过已占用色"这条一改一处就会漏一处，而漏掉的那一边表现为**两条同级同色**——
+    "颜色 = 分组"这个唯一约定当场失效，且从产出上看不出来。
+
+    泛化而不是两次复制：`replace()` 要求同一个 dataclass，而 `_SkeletonBranch` 与
+    `_SkeletonGroup` 的视觉三字段一模一样（`label` / `color` / `icon`），差别只在
+    后者多一个 `branches`。
+    """
+    missing = [index for index, item in enumerate(items) if not item.color]
     if not missing:
-        return list(branches)
-    taken = {branch.color for branch in branches if branch.color}
+        return list(items)
+    taken = {item.color for item in items if item.color}
     pool = [color for color in NODE_COLORS if color not in taken] or list(NODE_COLORS)
-    filled = list(branches)
+    filled = list(items)
     for position, index in enumerate(missing):
         filled[index] = replace(filled[index], color=pool[position % len(pool)])
     return filled
+
+
+def _fill_group_colors(groups: Sequence[_SkeletonGroup]) -> list[_SkeletonGroup]:
+    """给没写 `color` 的分组补色。与 `_fill_branch_colors` 同一条算法、同一份池子。
+
+    分组是**真正的一级节点**，所以"缺色就补"的理由与那条路完全一样（一级颜色唯一的
+    用途就是分组，一条都没有时整张图退回中性灰）。位置也一致：在截断**之后**补，
+    被丢掉的尾巴不参与配色。
+    """
+    return _palette_fill(groups)
+
+
+def _fill_plan_colors(plan: _SkeletonPlan) -> _SkeletonPlan:
+    """按形态补色：两级补**分组**，扁平补一级分支。
+
+    为什么不分两次调用、也不在调用方判分支：配色只有一条规则（"一级才有色"），
+    而"一级"在两种形态里是不同的东西。把这个判断收在一处，调用方就只需要
+    `plan = _fill_plan_colors(_cap_plan(_skeleton_plan(raw)))` 一行。
+    """
+    if plan.grouped:
+        return replace(plan, groups=tuple(_fill_group_colors(plan.groups)))
+    return replace(plan, flat=tuple(_fill_branch_colors(plan.flat)))
+
+
+def _strip_plan_icons(plan: _SkeletonPlan) -> _SkeletonPlan:
+    """`icon.enabled=false` 时剥掉一级（分组或分支）的 emoji。
+
+    挂在"骨架产物"这一层而不是树上：`branch_visual` 的旧位置就是这个意思——视觉元素
+    唯一落进树的地方只有一处，剥在这里等于覆盖全部产出（三级骨架将来也一样）。
+    二级分支本来就没有 icon（`_SkeletonGroup` 的注释），所以不用管。
+    """
+    if plan.grouped:
+        return replace(plan, groups=tuple(
+            replace(group, icon=None) for group in plan.groups))
+    return replace(plan, flat=tuple(
+        replace(branch, icon=None) for branch in plan.flat))
 
 
 def _skeleton_edges(
@@ -2090,6 +2367,21 @@ OUTLINE_HEADER = "这份材料自带的章节（请优先按它划分一级分�
 OUTLINE_MIN_COVERAGE = 0.6
 
 
+def _outline_entries(sources: list[Source]) -> list:
+    """这份材料的目录行——**只在"该拼给骨架"时**返回，否则空列表。
+
+    门槛（覆盖率 ≥ `OUTLINE_MIN_COVERAGE`）放在这里而不是只放在渲染处，是因为
+    两级骨架也要读它：那一次要先知道"这份材料大概有多少个方面"才能决定要不要分组、
+    分几组。用**裁剪后**的目录判覆盖率，理由见 `_skeleton_outline`。
+    """
+    entries = heading_outline(sources)
+    if not entries:
+        return []
+    if outline_coverage(sources, entries) < OUTLINE_MIN_COVERAGE:
+        return []
+    return list(entries)
+
+
 def _skeleton_outline(sources: list[Source]) -> str:
     """拼给骨架的目录块；不该拼时返回空串。
 
@@ -2098,19 +2390,26 @@ def _skeleton_outline(sources: list[Source]) -> str:
     （措辞见 `_material_inputs` 的 docstring 与 `generation.service` 里那段
     "材料怎么进 prompt"的注释）。这里进 prompt 的只有标题行，一条最多 40 字。
 
-    三件事一起做：取目录、判覆盖率、渲染。判覆盖率必须用**裁剪后**的那份目录
-    （`outline_coverage(sources, entries)` 而不是不带参数的调用），否则"覆盖率
-    95%"可能配着一份只剩 8 条、恰好漏掉大章的目录。
+    两件事一起做：取目录（含覆盖率门槛，见 `_outline_entries`）、渲染。判覆盖率必须用
+    **裁剪后**的那份目录（`outline_coverage(sources, entries)` 而不是不带参数的调用），
+    否则"覆盖率 95%"可能配着一份只剩 8 条、恰好漏掉大章的目录。
 
     百分比的分母是原文总字数，所以"约占 X%"读起来是"这一章大约占全文多少"，
     与模型的直觉一致；小于 1% 的按 1% 显示，写"约占 0%"是在告诉模型这一段不重要，
     而它可能正好是唯一提到某件事的地方。
     """
-    entries = heading_outline(sources)
+    entries = _outline_entries(sources)
+    return _render_outline(entries, sources)
+
+
+def _render_outline(entries: Sequence[Any], sources: list[Source]) -> str:
+    """把目录行渲染成骨架提示词里那一段；`entries` 为空时返回空串。
+
+    与 `_outline_entries` 分开，是为了让调用方**只解析一次**：两级骨架要用"有多少行"
+    决定分组，也要那一段文字，两件事读同一份 `entries`（`heading_outline` 是对整份
+    材料跑正则，跑两遍在大材料上不是零成本）。
+    """
     if not entries:
-        return ""
-    coverage = outline_coverage(sources, entries)
-    if coverage < OUTLINE_MIN_COVERAGE:
         return ""
     total = sum(len(source.text or "") for source in sources)
     lines = [OUTLINE_HEADER]
@@ -2281,9 +2580,11 @@ BRANCH_NO_EVIDENCE_RULES = (
 # 这也正是整树一次生成相对分片的结构优势：分片展开时每一支只看得到自己那条
 # 标题链，兄弟支写了什么它不知道（`PLAN_PROMPT` 里那句"彼此覆盖的范围不重叠"
 # 模型并不听）；这里全部骨架与全部证据在同一次响应里，它至少有可能看住。
-SKELETON_TREE_RULES = (
+_SKELETON_ROOT_RULE = (
     "\n这次的一级分支已经定好了，就是 user 消息里列出的那几条："
     "根节点下必须恰好是这几条，顺序、名称都不改，不增不减。"
+)
+_SKELETON_BODY = (
     "每条分支只写它标题说的范围，同一件事不要挂在两条分支下——"
     "重复的内容会被画成两块，用户还要自己删一个。"
     # 泛化标题也会被判成重复（`_cross_branch_duplicates` 只做空白折叠，不做语义归一，
@@ -2307,6 +2608,98 @@ SKELETON_TREE_RULES = (
     "说明由紧接着的一次调用统一补写。省下来的输出额度用在结构上："
     "该拆的层要拆够、每条分支的要点要写全。\n"
 )
+
+# 扁平的完整规则 = 根规则 + 共用的那两段。拆开的理由是两级骨架**只换根规则**
+# （根下挂的是分组、不是分支），而"不要跨支重复"与"这一轮不写 detail"必须逐字共用：
+# 同一个约束在一处改了、另一处没改，两条路的产出就会在某个细节上分叉，而这种分叉
+# 从产出上看不出来。
+SKELETON_TREE_RULES = _SKELETON_ROOT_RULE + _SKELETON_BODY
+
+# 两级骨架的**根规则**：根下挂的是分组，分组下挂的是分支。
+#
+# 三条都得说，各对应一种会真出错的行为：
+#   - 模型把分组与分支摆成同一层（等于没分组，图还是二十条宽）；
+#   - 给分组再挂"自己的要点"（分组是分类名，它一旦有内容，二十节里就会有一节被它挤掉）；
+#   - 分组算掉一层，于是分支下面还想再拆（第一次生成的上限是 4 层含根，
+#     `INITIAL_MAX_DEPTH=3` 到这里正好用完）。
+_GROUPED_ROOT_RULE = (
+    "\n这次的一级分支已经定好了，**分成两级**（见 user 消息里那份缩进清单）："
+    "根节点下必须恰好是那几个**分组**，每个分组下面必须恰好是它自己列出的那几支**分支**，"
+    "顺序、名称都不改，不增不减。"
+    "分组下面直接挂分支，不要在分组与分支之间再插一层，也不要给分组挂它自己的内容节点"
+    "——分组是分类名，它的内容就是它下面那几支。"
+    "层数是：中心主题 → 分组 → 分支 → 要点，正好 4 层（这已经是第一次生成的层数上限）；"
+    "分支下面只写一层要点，不要再往下拆。"
+)
+GROUPED_TREE_RULES = _GROUPED_ROOT_RULE + _SKELETON_BODY
+
+
+def _group_plan_rules(sections: int) -> str:
+    """两级骨架的提示词尾巴：拼在 `PLAN_PROMPT` **之后**，覆盖它的输出格式。
+
+    为什么是"拼在 PLAN_PROMPT 之后"而不是另写一份两级骨架提示词：
+
+      - `PLAN_PROMPT` 与 `_plan_ask` 有逐字节回归用例钉着（`test_edges.py` 的
+        `TestTreeIsByteIdentical`），改一个字那条用例就红——而它守的是"扁平这条路
+        一个字都没变"，把两级塞进去会同时毁掉这个保证和它对老行为的证明力；
+      - `PLAN_PROMPT` 的后半段（16 字、互不重叠、逻辑顺序、color 只能取调色板、
+        icon 一个 emoji、✅/❌ 对照）在两级的**二级分支**上完全适用，复制一份就是
+        给自己留一处会漂的重复文字。
+
+    代价是 system 里同时存在"一层格式"与"两级格式"两种要求，所以这一段必须以
+    "覆盖"开头、给出完整的 JSON 形状与一个 ✅ 例子——只在末尾轻描淡写加一句
+    "也可以分组"，模型会照前面那个更详细的格式写（实测里它执行的是格式的**最后**
+    一份定义）。
+
+    `sections` 是"这次大概有多少个方面"（目录行数 / 用户要的条数），用来把组数写成
+    具体的数与每组支数区间——不给数字时模型会自己挑一个组数，20 支挤成 2 组或拆成
+    12 组都出现过。
+    """
+    groups = _skeleton_group_count(sections)
+    return (
+        "\n\n**这一次请输出两级骨架**（下面这一种格式覆盖上面那一种）："
+        '只返回一个 JSON 对象，形如 {"groups":[{"label":"基础与定义","color":"blue",'
+        '"icon":"🧩","children":[{"label":"概念界定"},{"label":"发展脉络"}]},'
+        '{"label":"工程实践","color":"teal","icon":"🛠","children":[{"label":"数据处理"},'
+        '{"label":"部署"}]}]}。'
+        f"分组是**一级**：这次大约 {sections} 个方面，请归成 {groups} 组"
+        f"（{SKELETON_GROUP_MIN}–{SKELETON_GROUP_MAX} 组之间，每组 2–6 支，"
+        f"合计不超过 {DEEP_MAX_BRANCHES} 支）。"
+        "用户消息里那个条数说的是**二级分支**的总数，不是分组数。"
+        "分组的依据是这些方面的共同点，组名要能一句话说清这一组在讲什么"
+        "（「基础与定义」「方法与模型」「工程实践」这种），"
+        "不要用「其他」「综合」「杂项」这类什么都没说的名字；"
+        "只有一支能归进去时不值得单独成组，把它并进最接近的那一组。"
+        "color 与 icon 只给**分组**：二级分支不要写这两个字段（它们的颜色随分组继承）。"
+        f"二级分支仍然是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号，"
+        "组内按逻辑顺序排列、组与组之间也按逻辑顺序排列。"
+        "材料自带章节时，章节就是这里的二级分支，不要改成别的话题。"
+        "✅ 正确："
+        '{"groups":[{"label":"基础与定义","color":"blue","icon":"🧩",'
+        '"children":[{"label":"概念界定"},{"label":"发展脉络"}]}]}'
+        "❌ 错误："
+        '{"branches":[{"label":"概念界定","color":"blue"},{"label":"发展脉络"}]}'
+        "（还是写成了一层；这一次要的是 groups 套 children）"
+    )
+
+
+def _skeleton_block(plan: _SkeletonPlan) -> str:
+    """结构那一次 user 消息里的骨架清单：扁平时编号一行一条，两级时缩进。
+
+    两级用**缩进**而不是"分组：甲、乙、丙"这种行内写法：缩进在文本上就是层级，
+    模型照抄形状的准确率比它读一句话再自己摆层级高得多（`_detail_ask` 用
+    `位置：A / B` 的路径写说明，也是同一个理由）。
+    """
+    if not plan.grouped:
+        return "\n".join(
+            f"{index}. {branch.label}"
+            for index, branch in enumerate(plan.flat, start=1))
+    lines: list[str] = []
+    for group_index, group in enumerate(plan.groups, start=1):
+        lines.append(f"{group_index}. {group.label}")
+        for branch_index, branch in enumerate(group.branches, start=1):
+            lines.append(f"   {group_index}.{branch_index} {branch.label}")
+    return "\n".join(lines)
 
 # 有证据时拼在 `DETAIL_PROMPT` 之后的那一段。与 `BRANCH_EVIDENCE_RULES` 是同一份
 # 引用契约的两种投递方式：那边每支一个数组（只给一支看），这边按分支分组一次给
@@ -2429,9 +2822,18 @@ def _needs_detail(node: Node) -> bool:
     return len((node.detail or "").strip()) < DETAIL_FILL_FLOOR
 
 
-def _detail_targets(root: Node) -> list[tuple[Node, tuple[str, ...]]]:
-    """要补说明的节点（前序，父在子前）与它的层级路径。"""
-    return [(node, path) for node, path in _iter_paths(root) if _needs_detail(node)]
+def _detail_targets(
+    root: Node, *, skip: Collection[str] = (),
+) -> list[tuple[Node, tuple[str, ...]]]:
+    """要补说明的节点（前序，父在子前）与它的层级路径。
+
+    `skip` 是两级骨架里的**分组节点**：它是分类名，没有内容可写。为它写一段 105 字
+    的说明只会得到一段解释"这一组在讲什么"的空话，而它占掉的正是那二十节里某一节
+    该有的注意力（第三段的输出预算是按节点数摊的）。
+    """
+    skipped = set(skip)
+    return [(node, path) for node, path in _iter_paths(root)
+            if node.id not in skipped and _needs_detail(node)]
 
 
 def _split_nodes(
@@ -2743,7 +3145,7 @@ def _incomplete_message(
 async def _fill_details(
     content: MindMapContent, *, ctx: RunContext, topic: str,
     sections: Sequence[str], external_rules: str,
-    diagnostics: list[Diagnostic],
+    diagnostics: list[Diagnostic], skip_ids: Collection[str] = (),
 ) -> tuple[MindMapContent, dict[str, Any]]:
     """第三段：给缺说明的节点补 detail。**只读结构、只写 detail**。
 
@@ -2768,7 +3170,7 @@ async def _fill_details(
     只有 `detail`。`source_refs` 仍然是结构那一轮的产物（`EVIDENCE_UNUSED` 的分母
     也因此不受影响）。
     """
-    targets = _detail_targets(content.root)
+    targets = _detail_targets(content.root, skip=skip_ids)
     report: dict[str, Any] = {
         "requested": len(targets), "filled": 0, "missing": 0,
         "unknown_keys": 0, "seconds": 0.0,
@@ -3399,7 +3801,7 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
 
 
 def _apply_skeleton(
-    content: MindMapContent, branches: Sequence[_SkeletonBranch], raw_plan: Any,
+    content: MindMapContent, plan: _SkeletonPlan, raw_plan: Any,
     *, diagram_type: str,
 ) -> tuple[MindMapContent, list[Diagnostic]]:
     """把**骨架那一次**的产物（颜色 / 图标 / flowchart 的附加边）套到生成出来的树上。
@@ -3413,10 +3815,16 @@ def _apply_skeleton(
     后代继承"这个唯一的分组信号整张图都没有——用户看到一片中性灰，看不出哪几块
     是同一支。边同理：流程图的条件分支与回退线全在骨架响应里。
 
+    **两级时套的是分组**（`plan.groups`），不是那二十节：分组才是画布上的一级节点，
+    二级分支不写 color/icon，它们的颜色由前端沿父链继承（`frontend/src/stores/
+    mindmap.ts` 里 `inheritedColor`）。这也是"一级颜色 = 分组"这条约定在两级下
+    仍然成立的全部原因——给二级也套色，一组四支会画出四种颜色。
+
     端点用**裁剪后**的真实 id 建表：`_skeleton_edges` 认得序号 / "root" / 标题，
     而 `clean_edges` 要把指向已裁剪节点的边整条丢掉——拿裁剪前的表建就丢不掉。
     """
     children = list(content.root.children)
+    branches = plan.groups if plan.grouped else plan.flat
     by_label = {branch.label: branch for branch in branches}
     applied: list[Node] = []
     for index, child in enumerate(children):
@@ -3434,7 +3842,10 @@ def _apply_skeleton(
     if applied != children:
         content = content.model_copy(
             update={"root": content.root.model_copy(update={"children": applied})})
-    if diagram_type != "flowchart" or not applied:
+    # 两级只出现在思维导图上（`_generate` 的 `grouped` 判定里排除了 flowchart /
+    # fishbone）：边连的是阶段，分组与阶段顺序无关。这里再判一次，是因为"哪天
+    # 有人给流程图开了分组"不该变成一堆指向分组节点的边。
+    if diagram_type != "flowchart" or not applied or plan.grouped:
         return content, []
     skeleton = [(child.label, child.id) for child in applied]
     skeleton_ids = {content.root.id} | {child.id for child in applied}
@@ -3443,6 +3854,102 @@ def _apply_skeleton(
     if edges:
         content = content.model_copy(update={"edges": edges})
     return content, edge_diagnostics
+
+
+def _apply_groups(
+    content: MindMapContent, plan: _SkeletonPlan,
+) -> tuple[MindMapContent, int, list[str]]:
+    """按骨架定好的两级把树摆好：模型写对时它什么都不改，写歪时它只搬位置。
+
+    为什么要有这一步（以及为什么它**不是**"生成后归并"）：分成哪几组是**骨架那一次**
+    调用定的——模型在那里看到了全部二十节，它比任何事后聚类都更会判断哪些该归一起。
+    这里只执行那个决定：把分支摆到对应分组下面、缺的分组节点补出来。它不发任何
+    调用，也不改任何节点的 label / detail / 引用（搬的是整棵子树）。
+
+    为什么不能只靠提示词：`GROUPED_TREE_RULES` 说了"根下必须是那几个分组"，但模型
+    偶尔仍按老习惯写成二十条并列（老响应、长输出尾部走样、或者它压根没读那段）。
+    照原样落树，用户看到的正是这次改动要消灭的东西——一条二十支宽的一级。所以形状
+    在这里兜底：**提示词负责让它写对，这一步负责让"没写对"不致命**。
+
+    三条排布规则：
+      - 认得出的分支按骨架顺序排进它的分组（同一支在两个组下出现时只认第一次）；
+      - 分组里认不出的节点留在**那个分组**末尾，不下沉也不上提——把模型写的内容
+        放到别处比留在原处更糟（它可能只是改了一个字）；
+      - 根上认不出的节点原样留在根的最后：它们是模型自己加的东西，删掉是丢内容。
+
+    返回 `(树, 被搬动/新建的节点数, 分组节点 id)`。第三个数给第三段用：分组是分类名，
+    不该为它写一段说明（见 `_generate` 传 `skip_ids` 那一行）。
+    """
+    if not plan.grouped:
+        return content, 0, []
+    taken = _node_ids(content.root)
+    group_index = {_skeleton_key(g.label): i for i, g in enumerate(plan.groups)}
+    branch_index: dict[str, int] = {}
+    for index, group in enumerate(plan.groups):
+        for branch in group.branches:
+            branch_index.setdefault(_skeleton_key(branch.label), index)
+
+    wrappers: dict[int, Node] = {}
+    found: dict[str, Node] = {}
+    kept_inside: dict[int, list[Node]] = {index: [] for index in range(len(plan.groups))}
+    loose: list[Node] = []
+    moved = 0
+    for child in content.root.children:
+        index = group_index.get(_skeleton_key(child.label))
+        if index is not None and index not in wrappers:
+            # 模型自己写对了这一层：留下它的 id 与它可能写的 detail，孩子重新排。
+            wrappers[index] = child
+            continue
+        if index is not None:
+            # 同名的第二个分组：整枝留在根上（不合并孩子的顺序，那会悄悄改结构）。
+            loose.append(child)
+            continue
+        index = branch_index.get(_skeleton_key(child.label))
+        if index is None:
+            loose.append(child)
+            continue
+        found.setdefault(_skeleton_key(child.label), child)
+        moved += 1          # 它从根上搬到分组下，位置变了
+    for index, wrapper in wrappers.items():
+        for grandchild in wrapper.children:
+            key = _skeleton_key(grandchild.label)
+            target = branch_index.get(key)
+            if target == index and key not in found:
+                found[key] = grandchild
+                continue
+            # 认不出的、或属于别的组却挂在这个组下的：留在本组末尾。
+            kept_inside[index].append(grandchild)
+            if target is not None and target != index:
+                moved += 1
+
+    children: list[Node] = []
+    group_ids: list[str] = []
+    for index, group in enumerate(plan.groups):
+        kids = [found[_skeleton_key(branch.label)] for branch in group.branches
+                if _skeleton_key(branch.label) in found]
+        kids.extend(kept_inside[index])
+        if not kids:
+            # 一支都没认出来：不挂一个空分组（那是个纯占位的节点）。
+            continue
+        wrapper = wrappers.get(index)
+        if wrapper is None:
+            node = Node(id=new_node_id(taken), label=group.label, children=kids)
+            taken.add(node.id)
+            moved += 1      # 新建的分组节点
+        else:
+            node = wrapper.model_copy(update={"children": kids})
+        children.append(node)
+        group_ids.append(node.id)
+    if len(children) < 2:
+        # 一组都没凑齐（或只剩一组）：两级不成立，原样交回模型写的树。
+        return content, 0, []
+    children.extend(loose)
+    if children == list(content.root.children):
+        # 已经是对的：一个节点都不用重建，返回原对象（调用方按 id 判等）。
+        return content, 0, group_ids
+    return content.model_copy(
+        update={"root": content.root.model_copy(update={"children": children})},
+    ), moved, group_ids
 
 
 def _raw_ref_count(raw: Any) -> int:
@@ -3485,6 +3992,22 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
          `DETAIL_SPLIT_MIN`），每半的输入是"这半节点（id / label / 层级路径）+
          同一份原文"，输出是 `{"id":"说明"}`，**按 id 对号**（不靠顺序）。这一轮
          不碰结构、不碰引用。
+
+    **一级分支太多时先归成两级**（两级骨架，`SKELETON_GROUP_THRESHOLD` 以上）：
+    材料有二十节时，扁平骨架就是二十条一级分支——图宽得没法看。所以**第一步**多问
+    一句"这些方面该归成哪几组"，那一次调用的产出就变成"分组 → 分支"两层：
+
+      - 触发：`max(args.branches, 目录行数) > SKELETON_GROUP_THRESHOLD`（10）。
+        低于它保持扁平——十支以内一行能扫完，多一层只是多一次点击；
+      - 组数：`_skeleton_group_count`，每组 4 支倒推、夹在 3–6 之间（二十节就请它
+        归成 5 组；实测模型有时给 4 组，也算它照做）；
+      - **不多花一次调用**：那句要求拼在同一次骨架请求的 system 里（`_group_plan_rules`），
+        模型这时已经看到了全部二十节——它比任何事后聚类都更会判断哪些该归一起；
+      - **组节点一次调用都不吃**：检索仍按二级分支各一次（二十次本地/向量运算，
+        不占模型额度）、结构仍是那一次、第三段仍按节点数切两半。组只是树的形状，
+        它既不在 `titles` 里，也不进 detail 清单（`skip_ids`）；
+      - 形状有兜底：模型仍写成二十条并列时，`_apply_groups` 按骨架的分组把它摆正
+        （只搬位置、不改内容），并记一条 `SKELETON_GROUPS_APPLIED`。
 
     **为什么回到一次生成**（三条实测依据，缺一条这个改动就站不住）：
 
@@ -3564,16 +4087,37 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，出不了骨架，无法生成导图。")
     ctx.extra_model_calls += 1
-    outline = _skeleton_outline(sources)
+    outline_entries = _outline_entries(sources)
+    outline = _render_outline(outline_entries, sources)
     base_plan = (
         PLAN_PROMPT if diagram_type == "tree"
         else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
         else FISHBONE_PLAN_PROMPT
     )
+    # **两级骨架的判定点**：这一次大概会有多少个方面。两个来源取大的那个——
+    # 材料目录的行数（`_skeleton_outline` 拼进去的那一份，覆盖率不够时是 0 行）
+    # 与用户在界面上要的条数（`args.branches`，上限 20）。
+    #
+    # 为什么要**预判**而不是等骨架回来再决定：骨架只调用一次，要让它一次就吐两级，
+    # 这句要求必须在请求里。等回来再判就只能再发一次"请把刚才那 20 条归成 5 组"，
+    # 那正是这次要避免的第二次调用。
+    #
+    # 预判错了不致命，两个方向都有出路：判多（要了两级，回来只有 8 支）→
+    # `_skeleton_plan` 压平成扁平；判少（要了扁平，回来 20 支）→ 也走扁平，
+    # 与改动之前逐字节相同。所以这条判据只影响"什么时候给它更宽的画布"，
+    # 不影响成不成功。
+    #
+    # 只有 `tree` 分组：流程图的一级是**阶段**（分组会打断顺序），鱼骨图的一级是
+    # 固定的六类（换一套分类就不再是鱼骨图）。
+    sections_expected = max(args.branches, len(outline_entries))
+    grouped_request = (
+        diagram_type == "tree" and sections_expected > SKELETON_GROUP_THRESHOLD)
+    plan_system = base_plan + (
+        _group_plan_rules(sections_expected) if grouped_request else "")
     # 没有可检索材料时补那两句纯文本契约（与 `_generate_deep` 的骨架段同一条
     # 判定）：它们不含输出格式，不会与 `PLAN_PROMPT` 的"只返回 branches"打架。
-    plan_system = base_plan if sources else (
-        base_plan + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
+    if not sources:
+        plan_system += "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES
     plan_started = time.perf_counter()
     try:
         raw_plan = await chat_async(
@@ -3589,19 +4133,23 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     skeleton_seconds = time.perf_counter() - plan_started
     _note_truncation(diagnostics, raw_plan)
 
-    branches = _skeleton_branches(raw_plan)
-    if len(branches) < MIN_BRANCHES:
+    # 骨架 → 最终形态（扁平 / 两级）。`_skeleton_plan` 自己也判一次"要不要两级"，
+    # 判据与上面的 `grouped_request` 同源（分支数 > `SKELETON_GROUP_THRESHOLD`）：
+    # 这里判"要不要问"，那里判"回来的东西够不够两级"。
+    plan = _cap_plan(_skeleton_plan(raw_plan))
+    if len(plan.flat) < MIN_BRANCHES:
         return _fail(
             "too_few_branches",
-            f"模型只给了 {len(branches)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
-            branches=len(branches),
+            f"模型只给了 {len(plan.flat)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
+            branches=len(plan.flat),
         )
-    # 截断在配色之前：只给真的要上画布的那几条分配颜色，否则"第 4 支拿到第 4 个
-    # 颜色"这种事会因为一条被截掉的尾巴而错位。
-    branches = _fill_branch_colors(branches[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)])
+    # 配色在截断（`_cap_plan`）之后：只给真的要上画布的那几条分配颜色，否则
+    # "第 4 支拿到第 4 个颜色"这种事会因为一条被截掉的尾巴而错位。两级时补的是
+    # **分组**的色（一级颜色只属于分组）。
+    plan = _fill_plan_colors(plan)
     if not prefs.icons_enabled():
-        branches = [replace(branch, icon=None) for branch in branches]
-    titles = [branch.label for branch in branches]
+        plan = _strip_plan_icons(plan)
+    titles = [branch.label for branch in plan.flat]
     if not args.branches - 1 <= len(titles) <= args.branches + 1:
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="SKELETON_SIZE_OFF",
@@ -3647,12 +4195,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         for index, (title, evidence) in enumerate(zip(titles, evidences), start=1)
         if evidence is not None
     ]
-    skeleton_block = "\n".join(
-        f"{index}. {title}" for index, title in enumerate(titles, start=1))
-    user = (
-        f"主题：{args.topic}" + hint_block
-        + "\n\n这次的一级分支（已定好，按此顺序，不要增删改名）：\n" + skeleton_block
+    skeleton_block = _skeleton_block(plan)
+    # 两级的开头那句必须跟着变：它说的是"这是一层还是两层"，与清单的形状必须一致，
+    # 否则模型看到缩进却读到"一级分支"，会按扁平的根规则摆（那就白分组了）。
+    skeleton_intro = (
+        "\n\n这次的两级骨架（已定好；缩进的是分组下面的二级分支，按此顺序，不要增删改名）：\n"
+        if plan.grouped else
+        "\n\n这次的一级分支（已定好，按此顺序，不要增删改名）：\n"
     )
+    user = f"主题：{args.topic}" + hint_block + skeleton_intro + skeleton_block
     if sections:
         user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"
                  "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
@@ -3662,14 +4213,18 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                             for source in sources)
         else ""
     )
+    # 形状规则按**实际形态**选（不是按"问没问过分组"）：问了但回来只有 8 支时
+    # `_skeleton_plan` 已经压平，这里也必须用扁平那份规则，否则 system 要求根下挂
+    # 分组、user 里列的却是八条分支，模型只能二选一地写错。
+    shape_rules = GROUPED_TREE_RULES if plan.grouped else SKELETON_TREE_RULES
     if sources and sections:
-        system = (DETAIL_PROMPT + thinking + SKELETON_TREE_RULES
+        system = (DETAIL_PROMPT + thinking + shape_rules
                   + BRANCHED_EVIDENCE_RULES + external_rules)
     elif sources:
         # 有材料但这一轮一条都没命中：与旧的整树路径同一条降级——按无来源写满，
         # 引用留空。**不把 `sources` 判成 None**：模型在本次运行前几轮可能已经
         # `rag_query` 到过真片段，逐字校验照跑，留下的只可能是真依据。
-        system = DETAIL_PROMPT + thinking + SKELETON_TREE_RULES + DETAIL_NO_SOURCE_RULES
+        system = DETAIL_PROMPT + thinking + shape_rules + DETAIL_NO_SOURCE_RULES
     else:
         system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
 
@@ -3702,6 +4257,27 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     diagnostics.extend(validated)
     truncated = _note_truncation(diagnostics, raw)
 
+    # 两级骨架的形状在这里落地（**裁剪之前**：裁剪按节点数砍尾巴，而分组节点必须
+    # 已经在那棵树上，否则八十个节点的预算会被晚到的五个分组挤出去）。
+    # 模型照规则写时这一步什么都不做（返回原对象、`moved == 0`），写歪了它会搬位置
+    # ——判据与理由见 `_apply_groups`。
+    content, groups_moved, group_ids = _apply_groups(content, plan)
+    if plan.grouped and not group_ids:
+        # 一组都没落地（模型把这一层写成了别的东西，连标签都对不上）：退回扁平。
+        # 不这么退的话，下游（`_apply_skeleton` 的配色、`data["skeleton"]` 的形状说明、
+        # 第三段的 `skip_ids`）都会按"这是两级"走，而树上是一层——那种半开状态比
+        # 退化本身更难查。
+        plan = _SkeletonPlan(flat=plan.flat)
+    if groups_moved and plan.grouped:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="SKELETON_GROUPS_APPLIED",
+            message=(
+                f"模型没有完全按两级骨架落树，已按骨架的分组摆正"
+                f"（搬动/补出 {groups_moved} 个一级节点）：分组与分支的归属来自骨架"
+                f"那一次调用，内容一个字都没有改"
+            ),
+        ))
+
     before_clip = _count_nodes(content.root)
     clipped = 0
     cut_ids: set[str] = set()
@@ -3721,7 +4297,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 骨架的产物（颜色 / 图标 / flowgraph 的边）套上去。放在裁剪之后：端点表必须
     # 用裁剪后还活着的 id 建，否则 `clean_edges` 会把边留在指向已消失节点的状态。
     content, edge_diagnostics = _apply_skeleton(
-        content, branches, raw_plan, diagram_type=diagram_type)
+        content, plan, raw_plan, diagram_type=diagram_type)
     diagnostics.extend(edge_diagnostics)
     if diagram_type != "tree":
         # 产物自己声明"我是什么图型"。`validate_generated_content` 只会按模型输出的
@@ -3737,9 +4313,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 骨架的颜色/边已经套上（它们与本段无关，但重建节点要带上），而 `check()` 与
     # `annotate_nli()` 都还没跑——那两个函数读的是**最终**的 detail，说明必须在它们
     # 之前落地。
+    # 第三段：**分组节点不进清单**（`skip_ids`）。分组是分类名、没有内容，给它写一段
+    # 说明只会得到一句"这一组讲的是…"的空话，而它占掉的正是那二十节里某一节的输出
+    # 预算。这一步因此**不因为分组多花一次调用**——它本来就是按节点数切两半的。
     content, detail_report = await _fill_details(
         content, ctx=ctx, topic=args.topic, sections=sections,
-        external_rules=external_rules, diagnostics=diagnostics)
+        external_rules=external_rules, diagnostics=diagnostics,
+        skip_ids=group_ids)
 
     # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"
     # ——这个区别在这里最实，用户下一步就是点开某个节点继续展开，而把被裁的那几个
@@ -3921,7 +4501,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         "root_id": content.root.id,
         "node_count": count,
         "revision": ctx.revision,
-        "planned_branches": len(branches),
+        # 要展开的方面数：两级时是二十节（二级），扁平时就是一级分支。用户看到的
+        # "我要了 20 条"在这里必须还是 20，不能因为多了五个分组变成 5。
+        "planned_branches": len(plan.flat),
         # 初次规模的两个上限：报出来才能解释"为什么这棵树只有这么深/这么大"。
         # 两者都是既有常量，这次改动没有动它们。
         "node_limit": INITIAL_MAX_NODES,
@@ -3934,6 +4516,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 56 节点的分片图量出来是 6（3 个说法各写 2 遍），这个数就是这次改动最想
         # 改善的指标。只在诊断里说一句"有重复"的话，事后比较两条路还得人肉数。
         "cross_branch_duplicates": sum(len(places) for _, places in duplicates),
+        # 根下挂的东西：**不分两级时就是一级分支**，两级时是分组（`points` 因此是
+        # "这一组下有几支"）。键名不变是刻意的——读这个字段的前端与脚本不该为了
+        # 多一层而改一遍读法。
         "branches": [
             {"id": child.id, "label": child.label, "points": len(child.children)}
             for child in content.root.children
@@ -3970,11 +4555,31 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         "detail": {
             **detail_report,
             "floor": DETAIL_FILL_FLOOR,
+            # 分组节点不算"说明偏短"：它们**本来就不该有说明**（`skip_ids`），
+            # 把它们数进来会让两级这一版的 `short_nodes` 恒比扁平多 5，读起来像退化。
             "short_nodes": sum(1 for node in _iter_nodes(content.root)
-                               if _needs_detail(node)),
+                               if node.id not in set(group_ids)
+                               and _needs_detail(node)),
         },
         "diagnostics": [item.model_dump() for item in diagnostics],
     }
+    if plan.grouped:
+        # 只有真的分成两级时才有这个键：扁平时 `data` 的键集与这次改动之前逐字节
+        # 相同（`test_edges.py` 的 `TestTreeIsByteIdentical` 比的就是键与值）。
+        #
+        # 报的是**骨架的决定**（分组与它下面的分支），不是落树后的样子：裁剪会砍掉
+        # 尾部，而"骨架本来要了二十节"这件事必须留在可观测面上——它是"图会有多宽"
+        # 的因，树被裁到 80 个节点是果。落树后的形状看 `data["branches"]`。
+        data["skeleton"] = {
+            "two_tier": True,
+            "threshold": SKELETON_GROUP_THRESHOLD,
+            "groups": [
+                {"label": group.label,
+                 "branches": [branch.label for branch in group.branches]}
+                for group in plan.groups
+            ],
+            "shuffled_nodes": groups_moved,
+        }
     if external is not None:
         # 只在外部队列真的走过时才有这个键：开关关着时 `data` 的键集与加这个
         # 能力之前逐字节相同（回归用例比的是键集，不只是值）。
@@ -4291,7 +4896,16 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 
-    branches = _skeleton_branches(raw_plan)
+    branches = _skeleton_branches(raw_plan) or list(_skeleton_plan(raw_plan).flat)
+    # 为什么这里也要收 `groups` 形状：这条路（分片）**不发两级骨架的提示词**
+    # （`_group_plan_rules` 只在 `_generate` 里拼），所以正常情况下它只会看到扁平的
+    # `branches`。但"模型自己给了一个 groups 响应"并不该让整次生成失败——把它压成
+    # 一层二十支继续跑，代价只是图宽，而不是一次已经花掉的骨架调用被判死。
+    #
+    # **这条路不实现两级**：它的每一步都是"一支一次调用"，分组节点在那套流水线里
+    # 会变成一个没有内容却要展开的节点（正好是这次改动要避免的浪费）。真要把两级
+    # 搬到这里，正确做法是"分组只是树的形状、完全不进 `skeleton` 那张表"，
+    # 而那需要另一轮实测，不在这条路上顺手做。
     if len(branches) < MIN_BRANCHES:
         return _fail(
             "too_few_branches",
