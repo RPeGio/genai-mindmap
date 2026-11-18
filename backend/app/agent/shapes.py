@@ -86,6 +86,20 @@ def roots(content: DiagramContent) -> list[Node]:
     return [content.root]
 
 
+def top_branches(content: DiagramContent) -> list[Node]:
+    """画布最外那一层**内容节点**：树是一级分支，鱼骨是六根骨，流程是各阶段。
+
+    与 `roots()` 的差别只在树：树的最外层内容节点是 `root.children`（中心主题是
+    标题，不是一块内容），而鱼骨/流程的 `roots()` 本身就是最外层内容。
+
+    诊断口径（`audit_tree` 的 missing / thin、`_sparse_branch` 的判据）全部按这一
+    层数——"这一支从来没用过展开"的对象是骨与阶段，不是主骨或流程本身。
+    """
+    if isinstance(content, MindMapContent):
+        return list(content.root.children)
+    return roots(content)
+
+
 def walk_nodes(root: Node) -> Iterator[Node]:
     """前序（父在子前）遍历一棵子树。"""
     stack = [root]

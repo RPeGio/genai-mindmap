@@ -49,8 +49,6 @@ from app.agent.ops import (
     TEMP_ID_PREFIX,
     apply_ops,
     find_node,
-    find_parent,
-    is_descendant,
     new_node_id,
     normalize_ops,
 )
@@ -1088,10 +1086,20 @@ def _nodes_per_call(ctx: RunContext, *, system: str = "") -> int:
     return budget.max_nodes_for_tokens(available)
 
 
-def _require_candidate(ctx: RunContext) -> MindMapContent | ToolResult:
+def _require_candidate(ctx: RunContext) -> DiagramContent | ToolResult:
     if ctx.candidate is None:
         return _fail("no_candidate", "当前还没有导图，请先调用 mindmap_generate 生成。")
     return ctx.candidate
+
+
+def _has_content_nodes(content: DiagramContent) -> bool:
+    """这份产物里有没有实质内容（"要不要报 `map_exists`"的判据）。
+
+    写成"有没有内容节点"而不是"root 有没有孩子"：鱼骨与流程的产物里**没有
+    root**，而它们当然也是"已经有一张图了"。空产物（只有标题、一根骨都没有）
+    仍然算没有内容——那时重新生成一次是用户想要的事。
+    """
+    return any(True for _node in shapes.iter_nodes(content))
 
 
 def _node_ids(root) -> set[str]:
@@ -4462,7 +4470,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     """
     if ctx.request.intent != "create":
         return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
-    if ctx.candidate is not None and ctx.candidate.root.children:
+    if ctx.candidate is not None and _has_content_nodes(ctx.candidate):
         return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
 
     # ---- 材料入口（与 `_generate_deep` 同一份实现）------------------------------
@@ -4616,12 +4624,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     )
     user = f"主题：{args.topic}" + hint_block + skeleton_intro + skeleton_block
     # 流程图的 `role` 必须**在 user 末尾**再说一遍（system 里已有 `FLOW_TREE_RULES`，
-    # 但实测第一版只写在 system 里时，两次采样一个 `decision` 都没标出来，而那份
-    # 流程里明明有「校验信息完整性」「验证账号唯一性」这种判定步骤）。
+    # 但实测第一版把它只写在 system 里时，两次采样一个 `decision` 都没标出来，
+    # 而那份流程里明明有「校验信息完整性」「验证账号唯一性」这种判定步骤）。
     #
-    # 位置的理由与 `_detail_ask` 结尾那句自查同源：模型对**紧挨着输出位置**的那句
-    # 话最敏感，而 system 里的 role 说明夹在 `DETAIL_PROMPT` 的格式定义与「这一轮
-    # 不要写 detail」之间，被读成了一段泛泛的附加要求。
+    # 位置的理由与 `_detail_ask` 结尾那句自查同源：模型对**紧挨着输出位置**的
+    # 那句话最敏感，而 system 里的 role 说明夹在 `DETAIL_PROMPT` 的格式定义与
+    # 「这一轮不要写 detail」之间，被读成了一段泛泛的附加要求。
     if diagram_type == "flowchart":
         user += (
             "\n\n**每个阶段里凡是需要判断走哪一条路的那一步**（校验 / 审核 / 检查 / "
@@ -5232,7 +5240,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     """
     if ctx.request.intent != "create":
         return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
-    if ctx.candidate is not None and ctx.candidate.root.children:
+    if ctx.candidate is not None and _has_content_nodes(ctx.candidate):
         return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
 
     # ---- 材料准备：只喂有正文的来源、短材料退化、没有材料时先做外部检索 --------
@@ -6168,7 +6176,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             slot_states[branch_id] = "unknown"
 
     if drafts:
-        ops, id_map = normalize_ops(drafts, _node_ids(content.root))
+        ops, id_map = normalize_ops(drafts, shapes.node_ids(content))
         batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
         try:
             content = apply_ops(content, batch)
@@ -6978,7 +6986,7 @@ def _expandable_for_slot(slot: "_Slot") -> str:
 
 
 def _stamp_expandable(
-    content: MindMapContent, stamps: dict[str, str], *, max_depth: int,
+    content: DiagramContent, stamps: dict[str, str], *, max_depth: int,
 ) -> None:
     """把三态写进树里：`stamps` 里查得到就用它，查不到按 `yes`。
 
@@ -6994,7 +7002,7 @@ def _stamp_expandable(
     `apply_ops` 里也是就地插的），而这里改的是刚校验过的树、马上要赋值给
     `ctx.candidate`，多复制一次只会多一处"哪份是真的"。
     """
-    for node, depth in _walk_depths(content.root):
+    for node, depth in shapes.walk_depths(content):
         node.expandable = "no" if depth >= max_depth else stamps.get(node.id, "yes")
 
 
@@ -7256,7 +7264,7 @@ def _expand_sources(ctx: RunContext, node: Node) -> tuple[list[Source], dict[str
         if ref.source_id not in wanted_ids:
             wanted_ids.append(ref.source_id)
     if not wanted_ids and ctx.candidate is not None:
-        for other in _iter_nodes(ctx.candidate.root):
+        for other in shapes.iter_nodes(ctx.candidate):
             for ref in other.source_refs:
                 if ref.source_id not in wanted_ids:
                     wanted_ids.append(ref.source_id)
@@ -7391,7 +7399,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
 
-    node = find_node(content.root, args.node_id)
+    node = shapes.find(content, args.node_id)
     if node is None:
         return _fail("node_not_found", f"节点 {args.node_id} 不存在。", path=f"node_id={args.node_id}")
     # 展开只能作用于用户选中的那个节点。参数里虽然有 node_id，但它是模型填的——
@@ -7409,7 +7417,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     # 初次紧、后续松：用户明确点了这个节点要更深，那就按承载能力给。两道判断都放在
     # 调用模型**之前**——额度一旦花掉就收不回来，而这两种情况模型再听话也改不了。
     node_limit = _node_limit()
-    used = _count_nodes(content.root)
+    used = shapes.count_nodes(content)
     room = node_limit - used
     wanted = min(args.count, room)
     if wanted < 2:
@@ -7419,7 +7427,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
             f"（剩余 {max(0, room)} 个）。请先删掉一些节点再展开。",
             node_count=used, node_limit=node_limit,
         )
-    depth = _depth_of(content.root, node.id)
+    depth = shapes.depth_of(content, node.id)
     if depth is not None and depth >= mindmap_contract.MAX_TREE_DEPTH:
         return _fail(
             "too_deep",
@@ -7433,7 +7441,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     # 路径从树里取（不花任何调用），材料可能要从库里找回来（理由见
     # `_expand_sources`）。两者都在调模型之前准备好：提示词里少一样，模型就得
     # 凭一个 16 字的孤立标题写 2–4 个节点。
-    chain = _node_path(content.root, node.id) or [node]
+    chain = shapes.path_to(content, node.id) or [node]
     path_text = _path_text(chain)
     sources, material = _expand_sources(ctx, node)
     evidence: _BranchEvidence | None = None
@@ -7548,10 +7556,10 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
               for source in missing_usage],
         ]
 
-    ops, id_map = normalize_ops(drafts, _node_ids(content.root))
+    ops, id_map = normalize_ops(drafts, shapes.node_ids(content))
     batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
     try:
-        updated = apply_ops(base, batch)
+        updated = _apply_ops_any(base, batch)
     except OpError as exc:
         return _fail(exc.code, exc.message, path=exc.path)
 
@@ -7564,7 +7572,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     for offset, item in enumerate(kept):
         raw_id = drafts[offset]["id"]
         stamps[id_map.get(raw_id, raw_id)] = "no" if item.expandable is False else "yes"
-    expanded_node = find_node(updated.root, node.id)
+    expanded_node = shapes.find(updated, node.id)
     stamps[node.id] = "no" if (expanded_node is not None
                               and len(expanded_node.children) >= MAX_CHILDREN) else "yes"
     _stamp_expandable(updated, stamps, max_depth=mindmap_contract.MAX_TREE_DEPTH)
@@ -7574,7 +7582,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     # 点下去却报 too_deep"的分叉。
     expandable: dict[str, str] = {}
     for node_id in stamps:
-        found = find_node(updated.root, node_id)
+        found = shapes.find(updated, node_id)
         if found is not None:
             expandable[node_id] = found.expandable
 
@@ -7587,7 +7595,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     # `path` 是父节点的子索引链，而这里的父节点就是被展开的节点本身。写成 `[]`
     # 会把新节点画到根下面，界面上看起来像"根上又长出三个分支"，而用户点的是
     # 第三层的某个叶子。算不出来就不发帧（宁可没有预览，也不给一个错位置）。
-    index_path = _index_path(content.root, node.id)
+    index_path = shapes.index_path(content, node.id)
     if index_path is not None:
         seen: set[tuple[tuple[int, ...] | None, str]] = set()
         for item in kept:
@@ -7641,7 +7649,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
             "partial": truncated,
             "truncated": truncated,
             "node_limit": node_limit,
-            "node_count": _count_nodes(updated.root),
+            "node_count": shapes.count_nodes(updated),
             "depth": depth,
             "path": path_text,
             # 展开之后每个新节点被判成哪一态：界面据此决定按钮的文字（`no` 就是
@@ -8037,37 +8045,41 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
 AUDIT_LIST_LIMIT = 20
 
 
-def _audit_walk(root: Node) -> tuple[int, int]:
-    """整树节点数与实际层数（root 计 1 层）。
+def _audit_walk(content: DiagramContent) -> tuple[int, int]:
+    """整图节点数与实际层数（每棵子树的根计 1 层）。
 
     显式栈而不是递归：树是模型给的，不假设深度上限成立（与 `ops.find_node`
-    同一条理由）。
+    同一条理由）。三套结构共用这一份——`shapes.walk_depths` 按每棵并列子树各自
+    从 1 起算，鱼骨图与流程图的"层数"因此仍是画布上那一列的深度。
     """
     total = 0
     deepest = 1
-    stack: list[tuple[Node, int]] = [(root, 1)]
-    while stack:
-        node, depth = stack.pop()
+    for _node, depth in shapes.walk_depths(content):
         total += 1
         deepest = max(deepest, depth)
-        stack.extend((child, depth + 1) for child in node.children)
     return total, deepest
 
 
-def _audit_branch_lists(root: Node) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
-                                             list[dict[str, Any]]]:
+def _audit_branch_lists(content: DiagramContent) -> tuple[list[dict[str, Any]],
+                                                          list[dict[str, Any]],
+                                                          list[dict[str, Any]]]:
     """`missing` / `thin` / `empty` 三个列表（口径见 `_audit_tree` 的 docstring）。
 
     纯函数、只读：它不碰 `ctx.candidate`，所以用例可以直接拿一棵树钉住判定。
     """
+    # "一级"按 `shapes.top_branches` 算：树是一级分支，鱼骨是六根骨，流程是各阶段。
+    # 这三样才是"从来没被展开过"的主语。
+    branches = shapes.top_branches(content)
     missing = [{"id": branch.id, "label": branch.label}
-               for branch in root.children if not branch.children]
+               for branch in branches if not branch.children]
     thin = [{"id": branch.id, "label": branch.label, "children": len(branch.children)}
-            for branch in root.children if len(branch.children) == 1]
+            for branch in branches if len(branch.children) == 1]
     empty: list[dict[str, Any]] = []
-    # 深度口径与 `_audit_walk` 一致：root 是第 1 层，一级分支第 2 层，所以一级
-    # 分支的子节点从第 3 层起。
-    stack = [(child, 3) for branch in root.children for child in branch.children]
+    # 深度口径与 `_audit_walk` 一致：树的 root 是第 1 层、一级分支第 2 层，所以
+    # 一级分支的子节点从第 3 层起；鱼骨与流程没有中心主题那一层，"最外那一层"
+    # 就是第 1 层，它的子节点从第 2 层起。
+    base_depth = 3 if isinstance(content, MindMapContent) else 2
+    stack = [(child, base_depth) for branch in branches for child in branch.children]
     while stack:
         node, depth = stack.pop()
         if not node.children:
@@ -8113,19 +8125,17 @@ def _audit_tree_tool(args: AuditTreeArgs, ctx: RunContext) -> ToolResult:
     content = ctx.candidate
     if content is None:
         return _fail("no_candidate", "当前还没有导图，没有可体检的东西。")
-    root = content.root
-    total, deepest = _audit_walk(root)
-    missing, thin, empty = _audit_branch_lists(root)
-    branches = len(root.children)
-    # 还能再展开的节点数（`expandable != "no"`）。**不含根**：根永远是 `unknown`
-    # 或 `yes`，把它算进来会让"8 支都到底了"显示成 1 处待展开。
-    pending = 0
-    stack = list(root.children)
-    while stack:
-        node = stack.pop()
-        if node.expandable != "no":
-            pending += 1
-        stack.extend(node.children)
+    total, deepest = _audit_walk(content)
+    missing, thin, empty = _audit_branch_lists(content)
+    branches = len(shapes.top_branches(content))
+    # 还能再展开的节点数（`expandable != "no"`）。树的**中心主题不算**：它永远是
+    # `unknown` 或 `yes`，把它算进来会让"8 支都到底了"显示成 1 处待展开。鱼骨与
+    # 流程没有中心主题那一层，六根骨与各阶段本身**要算**——它们就是最外层内容。
+    pending = sum(
+        1 for node in shapes.iter_nodes(content)
+        if node.expandable != "no"
+        and not (isinstance(content, MindMapContent) and node.id == content.root.id)
+    )
 
     expanded = branches - len(missing)
     parts = [
@@ -8173,7 +8183,7 @@ def _audit_tree_tool(args: AuditTreeArgs, ctx: RunContext) -> ToolResult:
     return ToolResult(ok=True, content="".join(parts), data=data)
 
 
-def _selection_scope(content: MindMapContent, ctx: RunContext) -> set[str] | None:
+def _selection_scope(content: DiagramContent, ctx: RunContext) -> set[str] | None:
     """用户这次允许改的节点集合；没限制时返回 `None`。
 
     单独抽出来是因为五个工具都要问同一个问题（批量与四个细粒度）。写成
@@ -8184,14 +8194,14 @@ def _selection_scope(content: MindMapContent, ctx: RunContext) -> set[str] | Non
         return None
     scope: set[str] = set()
     for selected in ctx.request.selected_ids:
-        node = find_node(content.root, selected)
+        node = shapes.find(content, selected)
         if node is not None:
             scope |= _node_ids(node)
     return scope
 
 
 def _outside_selection(
-    content: MindMapContent, ctx: RunContext, targets: Sequence[str],
+    content: DiagramContent, ctx: RunContext, targets: Sequence[str],
 ) -> list[str]:
     """这些目标里有哪几个落在用户选区**之外**。**只用来提醒，一律不拦。**
 
@@ -8224,7 +8234,7 @@ def _outside_selection(
 
 
 def _scope_note(
-    content: MindMapContent, ctx: RunContext, targets: Sequence[str],
+    content: DiagramContent, ctx: RunContext, targets: Sequence[str],
 ) -> tuple[str, list[str]]:
     """`(追加到回给模型那句话末尾的提示, 越界的 id 列表)`；没越界时是 `("", [])`。
 
@@ -8246,9 +8256,115 @@ def _scope_note(
     return note, outside
 
 
+_OP_NODE_FIELDS = ("id", "parent_id", "new_parent_id", "source", "target")
+
+
+def _op_target_ids(batch: OpBatch) -> list[str]:
+    """一批 op 里提到的**所有**节点 id（含临时 id，交给调用方去筛）。
+
+    宁可多收不可漏收：漏掉一个 `parent_id` 就可能把"跨容器"的批当成"单容器"，
+    而那个错误的后果是节点被搬进另一根骨——一种事后没人能察觉的静默结构错位。
+    """
+    seen: list[str] = []
+    for op in batch.ops:
+        for name in _OP_NODE_FIELDS:
+            value = getattr(op, name, None)
+            if isinstance(value, str) and value and value not in seen:
+                seen.append(value)
+    return seen
+
+
+def _holders_of(
+    content: DiagramContent, ids: Sequence[str],
+) -> list[tuple[int, str]]:
+    """这些 id 分别落在哪棵并列子树里：`[(子树序号, 子树根的 id)]`，去重保序。"""
+    holders: list[tuple[int, str]] = []
+    for index, root in enumerate(shapes.roots(content)):
+        known = {node.id for node in shapes.walk_nodes(root)}
+        if known & set(ids):
+            holders.append((index, root.id))
+    return holders
+
+
+def _apply_ops_any(content: DiagramContent, batch: OpBatch) -> DiagramContent:
+    """在三种结构上执行一批 op。
+
+    树直接交给 `apply_ops`（执行器只有一份）。鱼骨与流程是**多棵并列子树**，借用
+    同一条路：把命中的那棵子树当作一个临时 `MindMapContent` 的根跑一遍，再把结果
+    写回原位。原子性与 id 规范化因此仍然只有一份实现——"失败一个 op 都不落"这件事
+    不该被实现三遍。
+
+    **一批 op 只允许落在一棵子树里**（一根骨 / 一个阶段）。跨子树的搬动在数据上
+    没有"它该属于哪根骨"的确定答案：那是三套结构各自的语义，属于阶段 3。这里明确
+    报 `cross_container` 而不是猜一个位置——猜错的后果是内容静默地换了骨。
+    """
+    if isinstance(content, MindMapContent):
+        return apply_ops(content, batch)
+
+    holders = _holders_of(content, _op_target_ids(batch))
+    if not holders:
+        raise OpError(
+            "node_not_found", "ops",
+            "这一批操作提到的节点都不在当前导图里（鱼骨图与流程图按骨/阶段分片，"
+            "改之前先确认节点 id 取自这份导图）",
+        )
+    if len(holders) > 1:
+        names = "、".join(
+            f"「{shapes.find(content, root_id).label if shapes.find(content, root_id) else root_id}」"
+            for _, root_id in holders[:5])
+        raise OpError(
+            "cross_container", "ops",
+            f"这一批操作跨了 {len(holders)} 处（{names}）：鱼骨图的每一根骨、流程图的"
+            "每一个阶段是一棵独立的子树，一次只能改其中一处；请拆成几批",
+        )
+    _, root_id = holders[0]
+    root = shapes.find(content, root_id)
+    if root is None:  # 理论上不可达（`_holders_of` 就是从这棵子树里找到的）
+        raise OpError("node_not_found", "ops", f"子树根 {root_id} 不在这份导图里")
+    temp = MindMapContent(
+        title=content.title,
+        root=root,
+        theme=content.theme,
+        source_usage=list(content.source_usage),
+    )
+    updated_root = apply_ops(temp, batch).root
+    moved = shapes.replace_node(content, root_id, lambda _node: updated_root)
+    try:
+        return shapes.revalidate(moved)
+    except ValidationError as exc:
+        details = "；".join(error["msg"] for error in exc.errors()[:3])
+        raise OpError("tree_invalid", "ops", details or "改动之后整张图不合法") from exc
+
+
+def _is_descendant(content: DiagramContent, ancestor_id: str, candidate_id: str) -> bool:
+    """`candidate_id` 是不是 `ancestor_id` 的子孙（**含**自己）。
+
+    与 `ops.is_descendant` 同一份语义，区别只在"从哪棵子树开始找"：鱼骨与流程里
+    节点分散在各自骨/阶段下，从 `content.root` 出发的版本对它们根本不成立。
+    """
+    ancestor = shapes.find(content, ancestor_id)
+    if ancestor is None:
+        return False
+    return any(node.id == candidate_id for node in shapes.walk_nodes(ancestor))
+
+
+def _is_container_root(content: DiagramContent, node_id: str) -> bool:
+    """这个节点是不是**某个容器/整张图的根**（树的中心主题、一根骨、一个阶段的入口）。
+
+    它们删不得、移不得：删掉一根骨就不是鱼骨图了，移到别处则会多出一棵没有归属的
+    子树。判据按形状走（`shapes.roots`），不看 `diagram_type` 字段。
+
+    **不做**"这个节点是不是最后一个阶段"之类的三套语义判断——这里只回答一个结构
+    问题：它有没有上一层容器。
+    """
+    if isinstance(content, MindMapContent) and node_id == content.root.id:
+        return True
+    return any(root.id == node_id for root in shapes.roots(content))
+
+
 def _commit_drafts(
-    ctx: RunContext, content: MindMapContent, drafts: list[dict[str, Any]],
-) -> tuple[MindMapContent, OpBatch, dict[str, str]] | ToolResult:
+    ctx: RunContext, content: DiagramContent, drafts: list[dict[str, Any]],
+) -> tuple[DiagramContent, OpBatch, dict[str, str]] | ToolResult:
     """把一批草案落成工作树 `ctx.candidate`：规范化 id → 建批次 → 原子执行 → 记账。
 
     **五个写工具共用这一条路**（`mindmap_edit` 与四个细粒度工具）。抽出来不是
@@ -8262,7 +8378,7 @@ def _commit_drafts(
     字段），而它本来就该是一条正常的工具结果。
     """
     try:
-        ops, id_map = normalize_ops(drafts, _node_ids(content.root))
+        ops, id_map = normalize_ops(drafts, shapes.node_ids(content))
     except ValidationError as exc:
         detail = "；".join(
             f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
@@ -8272,7 +8388,7 @@ def _commit_drafts(
 
     batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
     try:
-        updated = apply_ops(content, batch)
+        updated = _apply_ops_any(content, batch)
     except OpError as exc:
         # 把执行器的错误原样回给模型：它知道是哪一条、哪个字段错了才能自己改对
         return _fail(exc.code, f"{exc.path}：{exc.message}", path=exc.path)
@@ -8285,7 +8401,7 @@ def _commit_drafts(
 
 def _single_result(
     ctx: RunContext,
-    updated: MindMapContent,
+    updated: DiagramContent,
     batch: OpBatch,
     id_map: dict[str, str],
     content: str,
@@ -8313,7 +8429,7 @@ def _single_result(
             "batches": [batch],
             "id_map": id_map,
             "revision": ctx.revision,
-            "node_count": _count_nodes(updated.root),
+            "node_count": shapes.count_nodes(updated),
             "changed_ids": sorted(set(changed)),
             "outside_selection": list(outside_selection),
             **data,
@@ -8385,7 +8501,7 @@ def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
     # 选区只是提示：父节点在选区外时照样加，但要在结果里说一声（`_scope_note`）。
     scope_note, outside = _scope_note(content, ctx, [args.parent_id])
 
-    parent = find_node(content.root, args.parent_id)
+    parent = shapes.find(content, args.parent_id)
     if parent is None:
         return _fail("parent_not_found", f"父节点 {args.parent_id} 不存在。")
     if len(parent.children) >= MAX_CHILDREN:
@@ -8395,7 +8511,7 @@ def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
             f"最多 {MAX_CHILDREN} 个，加不下了。",
         )
     node_limit = _node_limit()
-    used = _count_nodes(content.root)
+    used = shapes.count_nodes(content)
     if used >= node_limit:
         return _fail(
             "too_many_nodes",
@@ -8403,7 +8519,7 @@ def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
             "想继续加请先删掉一些节点。",
             node_count=used, node_limit=node_limit,
         )
-    depth = _depth_of(content.root,parent.id)
+    depth = shapes.depth_of(content, parent.id)
     if depth is not None and depth + 1 > mindmap_contract.MAX_TREE_DEPTH:
         return _fail(
             "too_deep",
@@ -8475,7 +8591,7 @@ def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
 
     scope_note, outside = _scope_note(content, ctx, [args.node_id])
 
-    node = find_node(content.root, args.node_id)
+    node = shapes.find(content, args.node_id)
     if node is None:
         return _fail("node_not_found", f"节点 {args.node_id} 不存在。")
 
@@ -8539,18 +8655,23 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
 
     scope_note, outside = _scope_note(content, ctx, [args.node_id])
 
-    if args.node_id == content.root.id:
-        return _fail("cannot_remove_root", "根节点不能删除：删了这张导图就没有中心主题了。")
-    node = find_node(content.root, args.node_id)
+    if _is_container_root(content, args.node_id):
+        return _fail(
+            "cannot_remove_root",
+            "这一处是整张图/一根骨/一个阶段的入口，删了它这张图就不成立；"
+            "要清空它请删它下面的节点。",
+        )
+    node = shapes.find(content, args.node_id)
     if node is None:
         return _fail("node_not_found", f"节点 {args.node_id} 不存在。")
 
-    parent = find_parent(content.root, args.node_id)
+    parent = shapes.find_parent(content, args.node_id)
     removed = [item.label for item in _iter_nodes(node)]
     # 被连带删掉的边：源或目标落在**这棵子树**里（含子孙）。必须在提交前算，
     # 提交之后就只剩一个已经删干净的新树，"删了几条线"这个数就没了。
     doomed = _node_ids(node)
-    removed_edges = [edge for edge in content.edges
+    existing_edges = content.edges if isinstance(content, MindMapContent) else []
+    removed_edges = [edge for edge in existing_edges
                      if edge.source in doomed or edge.target in doomed]
     draft = {"op": "remove", "id": args.node_id}
 
@@ -8598,17 +8719,17 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
     # 移动涉及两个节点（被移动的与新的父节点），两个都要算进"有没有出选区"。
     scope_note, outside = _scope_note(content, ctx, [args.node_id, args.new_parent_id])
 
-    if args.node_id == content.root.id:
+    if _is_container_root(content, args.node_id):
         return _fail("cannot_move_root", "根节点不能移动：它没有父节点。")
-    node = find_node(content.root, args.node_id)
+    node = shapes.find(content, args.node_id)
     if node is None:
         return _fail("node_not_found", f"节点 {args.node_id} 不存在。")
-    target = find_node(content.root, args.new_parent_id)
+    target = shapes.find(content, args.new_parent_id)
     if target is None:
         return _fail("parent_not_found", f"新的父节点 {args.new_parent_id} 不存在。")
     # 环检测要先做，否则下面那个深度算法会在环上转不出来（子树的高度不再有限）。
     # `is_descendant` 含自己，"挂到自己"与"挂到自己的子孙"由同一句拦住。
-    if is_descendant(content.root, args.node_id, args.new_parent_id):
+    if _is_descendant(content, args.node_id, args.new_parent_id):
         return _fail(
             "cycle_detected",
             f"节点 {args.new_parent_id} 在「{node.label}」的子树里，"
@@ -8616,7 +8737,7 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
             path=f"{args.node_id}->{args.new_parent_id}",
         )
 
-    parent_depth = _depth_of(content.root, args.new_parent_id) or 1
+    parent_depth = shapes.depth_of(content, args.new_parent_id) or 1
     height = _subtree_height(node)
     if parent_depth + height > mindmap_contract.MAX_TREE_DEPTH:
         return _fail(
@@ -8627,7 +8748,7 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
             depth=parent_depth + height,
             depth_limit=mindmap_contract.MAX_TREE_DEPTH,
         )
-    if len(target.children) >= MAX_CHILDREN and find_parent(content.root, node.id) is not target:
+    if len(target.children) >= MAX_CHILDREN and shapes.find_parent(content, node.id) is not target:
         return _fail(
             "too_many_children",
             f"节点「{target.label}」已经有 {len(target.children)} 个子节点，"
@@ -8635,7 +8756,7 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
         )
 
     index = len(target.children) if args.index is None else args.index
-    old_parent = find_parent(content.root, args.node_id)
+    old_parent = shapes.find_parent(content, args.node_id)
     if old_parent is not None and old_parent.id == args.new_parent_id:
         # 同父移动：先摘后插，所以此刻的长度已经少了一个。索引上界按移除后算，
         # 与 `_apply_move` / 前端 `ops.ts` 是同一条语义。
@@ -8704,6 +8825,13 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     content = _require_candidate(ctx)
     if isinstance(content, ToolResult):
         return content
+    if not isinstance(content, MindMapContent):
+        return _fail(
+            "edges_not_supported",
+            "这张图不是思维导图：鱼骨图没有附加边（六根骨的关系全部由层级表达），"
+            "流程图的跳转连的是**阶段**而不是节点。"
+            "这两套语义还没有工具入口——要改流程的阶段跳转，请重新生成一次。",
+        )
 
     scope_note, outside = _scope_note(content, ctx, [args.source, args.target])
 
@@ -8773,6 +8901,13 @@ def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
     content = _require_candidate(ctx)
     if isinstance(content, ToolResult):
         return content
+    if not isinstance(content, MindMapContent):
+        return _fail(
+            "edges_not_supported",
+            "这张图不是思维导图：鱼骨图没有附加边（六根骨的关系全部由层级表达），"
+            "流程图的跳转连的是**阶段**而不是节点。"
+            "这两套语义还没有工具入口——要改流程的阶段跳转，请重新生成一次。",
+        )
 
     edge = next((item for item in content.edges if item.id == args.edge_id), None)
     if edge is None:
@@ -8887,7 +9022,7 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
             if parent_id is None:
                 return _fail("invalid_ops", "add 必须给出 parent_id。", path=f"ops.{item.id}.parent_id")
             if "index" not in draft:
-                parent = None if parent_id.startswith("$") else find_node(content.root, parent_id)
+                parent = None if parent_id.startswith("$") else shapes.find(content, parent_id)
                 base = len(parent.children) if parent else 0
                 draft["index"] = base + pending.get(parent_id, 0)
                 pending[parent_id] = pending.get(parent_id, 0) + 1
@@ -8908,7 +9043,7 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
     }
     return ToolResult(
         ok=True,
-        content=(f"已应用 {len(ops)} 条修改，导图现在有 {_count_nodes(updated.root)} 个节点。"
+        content=(f"已应用 {len(ops)} 条修改，导图现在有 {shapes.count_nodes(updated)} 个节点。"
                  + scope_note),
         data={
             "batch": batch,
