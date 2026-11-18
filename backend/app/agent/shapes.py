@@ -325,3 +325,57 @@ def to_fishbone(
         ],
         source_usage=content.source_usage,
     ), len(extras)
+
+
+def to_flow(content: MindMapContent) -> tuple[FlowContent, int]:
+    """树 → 流程图：一级分支持成为**阶段**，根不再出现在产物里。
+
+    映射的三条规则：
+
+      - 阶段顺序 = 一级分支的顺序（执行先后由数组下标表达，见 `FlowContent` 的
+        注释）；`FlowStage.id` 用 `s_` 前缀，与节点 id 分属两个命名空间——契约
+        明确要求它们是两个命名空间，同值会让"这条边连的是阶段还是步骤"只能靠
+        形状猜；
+      - `root` 就是那条一级分支节点（阶段内部的步骤树）；
+      - `edges` 的端点从节点 id 重映射到阶段 id。**指向根的边整条丢掉**：流程的
+        主轴就是阶段序列，"从中心主题出发"那条边没有对应的阶段，它的信息量也不比
+        数组下标多。丢掉的条数返回给调用方报诊断。
+
+    返回 `(产物, 丢掉的边数)`。
+    """
+    children = list(content.root.children)
+    stages: list[FlowStage] = []
+    stage_of: dict[str, str] = {}
+    for child in children:
+        stage_id = f"s_{child.id}"
+        stage_of[child.id] = stage_id
+        stages.append(FlowStage(id=stage_id, root=child))
+    if not stages:
+        # 契约要求 `stages` 至少一个。走到这里说明上游已经放行了一棵没有一级分支
+        # 的树（`MIN_BRANCHES` 门槛会先拦住），保底补一个阶段而不是抛异常——用户
+        # 拿到一张"只有一段的流程"好过拿到一个 500。
+        stages.append(FlowStage(id=f"s_{content.root.id}", root=content.root))
+        stage_of[content.root.id] = stages[0].id
+
+    edges = []
+    dropped_edges = 0
+    for edge in content.edges:
+        source = stage_of.get(edge.source)
+        target = stage_of.get(edge.target)
+        if source is None or target is None:
+            dropped_edges += 1
+            continue
+        edges.append(edge.model_copy(update={"source": source, "target": target}))
+
+    node_ids = {node.id for node in walk_nodes(content.root)}
+    return FlowContent(
+        title=content.title,
+        stages=stages,
+        edges=edges,
+        theme=content.theme,
+        relations=[
+            item for item in content.relations
+            if item.source in node_ids and item.target in node_ids
+        ],
+        source_usage=content.source_usage,
+    ), dropped_edges

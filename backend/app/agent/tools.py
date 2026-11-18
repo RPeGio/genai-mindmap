@@ -73,6 +73,8 @@ from app.contracts.mindmap import (
     DiagramContent,
     Edge,
     FishboneContent,
+    FlowContent,
+    FlowStage,
     MindMapContent,
     Node,
     clip_label,
@@ -2407,29 +2409,31 @@ PLAN_PROMPT = (
 # 而"话题分类"之间本来就没有方向。模型按分类给一级分支，画出来是一张思维导图；
 # 按阶段给，父链才真的等于"下一步"。
 #
-# 为什么边只连 root 与一级分支：展开阶段的响应里**没有节点 id**（模型写的是
-# label/detail），那里产不出可引用的边。子层的关系由父子表达，跨支的汇合/回退
-# 才用边——这与 `Edge` 的 docstring 是同一条边界。
+# 为什么边只连**阶段之间**：产品里的流程图现在是 `FlowContent`（`stages` +
+# 阶段间跳转），边端点的命名空间是**阶段 id**——中心主题在产物里根本不存在。
+# 骨架这一层因此只要求阶段序号；旧写法里的 `"root"` 仍然被 `_skeleton_edges`
+# 认得（老前端、老模型都会写它），但转换时那几条边会被丢掉并记
+# `FLOW_EDGE_DROPPED`：`root` 没有对应的阶段，"从主题出发"那条线也不比数组
+# 下标多说什么。
 #
 # 为什么用**序号**而不是节点 id：真实 id 是服务端分配的，模型根本不知道。
-# 让它写 `"n_3f2a"` 只会得到一堆 dangling。序号（`0` 起）与 `"root"` 是它能可靠
-# 写对的东西，解析时由 `_skeleton_edges` 换回真实 id。
+# 让它写 `"n_3f2a"` 只会得到一堆 dangling。序号（`0` 起）是它能可靠写对的东西，
+# 解析时由 `_skeleton_edges` 换回真实 id。
 FLOW_PLAN_PROMPT = (
     "你在为一张**流程图**只定主干骨架：先定出流程的阶段，再给出阶段之间的跳转关系，"
     "不写任何子要点。只返回一个 JSON 对象，不要代码围栏，格式为 "
     '{"branches":[{"label":"提交申请","color":"blue","icon":"📝"},'
     '{"label":"形式审查","color":"amber","icon":"🔍"},'
     '{"label":"实质审查","color":"teal","icon":"🧪"}],'
-    '"edges":[{"source":"root","target":0,"kind":"flow"},'
-    '{"source":1,"target":2,"label":"是","kind":"branch"},'
+    '"edges":[{"source":1,"target":2,"label":"是","kind":"branch"},'
     '{"source":1,"target":0,"label":"驳回","kind":"loop"}]}。'
     f"每条一级分支是一个**流程阶段**（谁在什么条件下做什么，往前推进的一环），"
     f"不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；**按执行顺序排列**，彼此不重叠；"
     "不要编号，不要解释，不要编造具体数据、人名或文献。"
     # edges 的三条硬规矩，每条都对应一个真实会画错的形态。
-    "edges 里 source / target 只能写**一级分支的序号（0 起）**或字符串 \"root\"，"
-    "不要写节点标题，也不要自己编 id。"
-    "edges 只连 root 与一级分支，**不要连子节点**（子层的关系由父子层级表达）。"
+    "edges 里 source / target 只能写**阶段序号（0 起）**，"
+    "不要写节点标题，也不要自己编 id；也不要用 \"root\"——流程图上没有中心主题这个位置。"
+    "edges 只连阶段，**不要连阶段内部的步骤**（阶段内部的关系由父子层级表达）。"
     "kind 只能是 flow / branch / loop："
     "flow 表示跳过若干阶段的顺序跳转（相邻阶段的先后已经由 branches 的顺序表达，不要重复画）；"
     "branch 表示判断节点的两个出口，**必须带 label**，写「是」或「否」；"
@@ -2601,7 +2605,7 @@ def _plan_ask(
     if diagram_type == "flowchart":
         parts.append(
             "这次是流程图：一级分支按**执行先后**排列，每条是一个流程阶段；"
-            "有判断出口或回退时，用 edges 补上（source/target 写序号或 \"root\"）。")
+            "有判断出口或回退时，用 edges 补上（source/target 只写阶段序号）。")
     elif diagram_type == "fishbone":
         parts.append(
             "这次是鱼骨图：一级分支固定为人 / 机 / 料 / 法 / 环 / 测 六条，不要输出 edges；"
@@ -2782,6 +2786,35 @@ _GROUPED_ROOT_RULE = (
     "分支下面只写一层要点，不要再往下拆。"
 )
 GROUPED_TREE_RULES = _GROUPED_ROOT_RULE + _SKELETON_BODY
+
+# ---- 流程图的结构规则 ---------------------------------------------------------
+#
+# 流程图的一级分支是**阶段**，二级是阶段内部的步骤，而"步骤里哪一个是判定"必须
+# 由模型说出来：`Node.role` 在契约里，`Edge.kind` 的 `branch` 已经默认它的起点是
+# 个判定，靠出边数去猜会让一个刚画了一条边的节点闪变（见 `Node.role` 的注释）。
+#
+# 根规则与 `SKELETON_TREE_RULES` 只差一个词（"分支" → "阶段"），但那一个词值得
+# 单写一份：模型对"分支"的先验是话题分类，而流程图上阶段之间存在**方向**。
+_FLOW_ROOT_RULE = (
+    "\n这次的一级分支已经定好了，就是 user 消息里列出的那几个**流程阶段**："
+    "根节点下必须恰好是这几个阶段，顺序、名称都不改，不增不减。"
+)
+_FLOW_BODY = (
+    "每个阶段下面写它自己的步骤（1–4 个），按这个阶段里的先后排列，"
+    "最多再往下拆一层，不要把一个阶段写成另一张导图。"
+    "步骤写的是**做的那件事**，不要写成对阶段的解释。\n"
+    # role 四值。写不进契约的值会被 422（`Node.role` 是 Literal），所以这里把
+    # 取值集合写死，并给一个可对照的例子——只描述语义时模型会写 "judge" / "判断"。
+    "\n**每个节点可以带一个 role 字段，说明它在流程里扮演什么**：\n"
+    '- "decision"：需要判断的地方（「材料齐全吗」「金额超过十万吗」）。'
+    "一个阶段里通常 0–2 个，不要给普通步骤标它；\n"
+    '- "start"：流程的起点，只在第一个阶段的第一步上标一个；\n'
+    '- "end"：流程的终点，只在最后一个阶段收尾的那个节点上标一个；\n'
+    '- 普通步骤写 "step" 或者干脆不写这个字段。\n'
+    "role 只能是 step / decision / start / end 这四个值之一。\n"
+    + _SKELETON_BODY
+)
+FLOW_TREE_RULES = _FLOW_ROOT_RULE + _FLOW_BODY
 
 # ---- 鱼骨图的结构规则 ---------------------------------------------------------
 #
@@ -4216,6 +4249,68 @@ def _fishbone_shape_diagnostics(
     ))
 
 
+def _stamp_flow_roles(
+    content: FlowContent, diagnostics: list[Diagnostic],
+) -> FlowContent:
+    """给流程图补上**整张图一个都没有**的那两种角色：入口与出口。
+
+    只在"模型一个都没标"时补，不做"补一半"：模型标了 start 却没标 end 时替它挑
+    一个终点，等于代码替它决定"流程在哪里结束"——那句话是它对业务的理解，不是
+    结构事实。而**一个都没有**时的情形不同：起点就是第一个阶段的第一步、终点就是
+    最后那个收尾的叶子，这两件事由 `stages` 的顺序与 `children` 的形状直接决定。
+
+    `decision` 一律不补：哪个步骤需要判断，只有写这张图的模型知道。
+    """
+    roles = {node.role for node in shapes.iter_nodes(content)}
+    stages = list(content.stages)
+    if not stages:
+        return content
+
+    def rebuild(items: list[FlowStage]) -> FlowContent:
+        return FlowContent(
+            title=content.title, stages=items, edges=content.edges,
+            theme=content.theme, relations=content.relations,
+            source_usage=content.source_usage,
+        )
+
+    if "start" not in roles and stages[0].root.role is None:
+        first = stages[0].root
+        stages[0] = stages[0].model_copy(update={
+            "root": first.model_copy(update={"role": "start"}),
+        })
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="FLOW_ROLE_START_DEFAULTED",
+            message=(
+                "模型没有标出流程的起点，已把第一个阶段的第一步"
+                f"（「{first.label}」）标成 start"
+            ),
+        ))
+
+    if "end" not in roles:
+        last = stages[-1]
+        leaves = [node for node in shapes.walk_nodes(last.root) if not node.children]
+        target = leaves[-1] if leaves else last.root
+        if target.role == "start":
+            # 单阶段单步：start 与 end 会落在同一个节点上。起点优先——那个节点
+            # 同时是入口与出口时说两遍没有多出任何信息。
+            return rebuild(stages)
+        wrapped = rebuild(stages)
+        updated = shapes.replace_node(
+            wrapped, target.id,
+            lambda node: node.model_copy(update={"role": "end"}),
+        )
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="FLOW_ROLE_END_DEFAULTED",
+            message=(
+                "模型没有标出流程的终点，已把最后一个阶段收尾的那个节点"
+                f"（「{target.label}」）标成 end"
+            ),
+        ))
+        return updated if isinstance(updated, FlowContent) else wrapped
+
+    return rebuild(stages)
+
+
 def _top_level_rows(content: DiagramContent) -> list[dict[str, Any]]:
     """`data["branches"]` 的行：画布最外那一层（一级分支 / 六根骨 / 各阶段）。
 
@@ -4232,6 +4327,12 @@ def _top_level_rows(content: DiagramContent) -> list[dict[str, Any]]:
             {"id": bone.root.id, "label": bone.category,
              "points": len(bone.root.children)}
             for bone in content.bones
+        ]
+    if isinstance(content, FlowContent):
+        return [
+            {"id": stage.id, "label": stage.root.label,
+             "points": len(stage.root.children)}
+            for stage in content.stages
         ]
     return [
         {"id": child.id, "label": child.label, "points": len(child.children)}
@@ -4267,6 +4368,19 @@ def _shape_output(
                 ),
             ))
         _fishbone_shape_diagnostics(shaped, diagnostics)
+        return shaped
+    if diagram_type == "flowchart":
+        shaped, dropped = shapes.to_flow(content)
+        if dropped:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="FLOW_EDGE_DROPPED",
+                message=(
+                    f"{dropped} 条边连的是中心主题而不是阶段，已丢弃："
+                    "流程的主干由阶段的先后（数组顺序）表达，"
+                    "「从主题出发」那条线在流程图上没有对应的位置"
+                ),
+            ))
+        shaped = _stamp_flow_roles(shaped, diagnostics)
         return shaped
     return content.model_copy(update={"diagram_type": diagram_type})
 
@@ -4501,6 +4615,21 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         "\n\n这次的一级分支（已定好，按此顺序，不要增删改名）：\n"
     )
     user = f"主题：{args.topic}" + hint_block + skeleton_intro + skeleton_block
+    # 流程图的 `role` 必须**在 user 末尾**再说一遍（system 里已有 `FLOW_TREE_RULES`，
+    # 但实测第一版只写在 system 里时，两次采样一个 `decision` 都没标出来，而那份
+    # 流程里明明有「校验信息完整性」「验证账号唯一性」这种判定步骤）。
+    #
+    # 位置的理由与 `_detail_ask` 结尾那句自查同源：模型对**紧挨着输出位置**的那句
+    # 话最敏感，而 system 里的 role 说明夹在 `DETAIL_PROMPT` 的格式定义与「这一轮
+    # 不要写 detail」之间，被读成了一段泛泛的附加要求。
+    if diagram_type == "flowchart":
+        user += (
+            "\n\n**每个阶段里凡是需要判断走哪一条路的那一步**（校验 / 审核 / 检查 / "
+            "是否通过 / 是否超限这类），在它的节点对象上加一个字段 "
+            '"role": "decision"；流程的第一步加 "role": "start"，最后收尾的那一步加 '
+            '"role": "end"，普通步骤不用加。例如：'
+            '{"id":"…","label":"校验信息完整性","role":"decision","children":[]}。'
+        )
     if sections:
         user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"
                  "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
@@ -4520,6 +4649,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 根规则与那一段专属说明。
     shape_rules = (
         GROUPED_TREE_RULES if plan.grouped
+        else FLOW_TREE_RULES if diagram_type == "flowchart"
         else FISHBONE_TREE_RULES if diagram_type == "fishbone"
         else SKELETON_TREE_RULES
     )
