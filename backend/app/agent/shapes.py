@@ -381,7 +381,10 @@ def to_flow(content: MindMapContent) -> tuple[FlowContent, int]:
             continue
         edges.append(edge.model_copy(update={"source": source, "target": target}))
 
-    node_ids = {node.id for node in walk_nodes(content.root)}
+    # 关系线的端点是节点 id，而**中心主题不在产物里**（它是 `title`，不是阶段）：
+    # 留着它是一条指向不存在节点的关系，契约层会直接拒（`关系 X 的起点节点 Y
+    # 不在导图中`）。所以从各阶段的子树里收 id，不用整棵树。
+    node_ids = {node.id for stage in stages for node in walk_nodes(stage.root)}
     return FlowContent(
         title=content.title,
         stages=stages,

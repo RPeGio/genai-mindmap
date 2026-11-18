@@ -374,6 +374,23 @@ class TestStructureAdapter:
         assert [node.id for node in shapes.walk_nodes(content.bones[-1].root)] == [
             "b5", "b5-1", "b6", "b6-1"]
 
+    def test_to_flow_drops_relations_that_point_at_the_theme(self):
+        """指向中心主题的关系不进产物：那里没有节点，留着就是 dangling。"""
+        from app.contracts.mindmap import Relation
+
+        tree = MindMapContent(
+            title="t",
+            root=Node(id="r", label="t", children=[
+                Node(id="p", label="一"), Node(id="q", label="二")]),
+            relations=[
+                Relation(id="x1", source="p", target="q", type="depends"),
+                Relation(id="x2", source="r", target="p", type="ref"),
+            ],
+        )
+
+        content = shapes.revalidate(shapes.to_flow(tree)[0])
+        assert [(item.source, item.target) for item in content.relations] == [("p", "q")]
+
     def test_to_flow_maps_edges_and_drops_theme_edges(self):
         """端点重映射到阶段 id；指向中心主题的边丢掉（流程图上没有那个位置）。"""
         from app.contracts.mindmap import Edge
