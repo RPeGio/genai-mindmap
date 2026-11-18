@@ -2,7 +2,8 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { FishboneContent, FlowContent, MindMapContent, MindNode } from '../src/api/types';
-import { dropDanglingEdges, validateDraft } from '../src/mindmap/edits';
+import { dropDanglingEdges, pruneDanglingRefs, validateDraft } from '../src/mindmap/edits';
+import { applyOps } from '../src/mindmap/ops';
 import { useMindMapStore } from '../src/stores/mindmap';
 
 /**
@@ -126,5 +127,40 @@ describe('store.deleteNode：删完就能存', () => {
     const content = store.content as MindMapContent;
     expect(content.relations!.map(relation => relation.id)).toEqual(['r3']);
     expect(validateDraft(store.content!)).toBeNull();
+  });
+});
+
+/**
+ * `ops.applyOps`（模型发来的 op 批次在前端预演那条路）是删节点的**另一份实现**，
+ * 与后端 `ops._apply_remove` / `tools._prune_stage_edges` 逐条对齐。
+ *
+ * 它此前也只清 `content.edges`：同一个 op 批次在"前端预演"里整批失败
+ * （`assertContentValid` 拦住悬空关系 / 悬空阶段内边），在后端执行器里却能成功。
+ */
+describe('op 批次：删节点也清悬空引用', () => {
+  const removeBatch = (id: string) => ({
+    batch_id: 'b1', base_revision: 1, ops: [{ op: 'remove' as const, id }],
+  });
+
+  it('树：删掉被引用节点，那批 op 不再被悬空关系打回', () => {
+    const result = applyOps(tree(), removeBatch('a'));
+    expect((result.content as MindMapContent).relations!.map(item => item.id)).toEqual(['r3']);
+  });
+
+  it('鱼骨：relations 属于整图，写回之后那一步也要清', () => {
+    const result = applyOps(fishbone(), removeBatch('b11'));
+    expect((result.content as FishboneContent).relations!.map(item => item.id)).toEqual(['r2']);
+  });
+
+  it('流程：阶段内边与 relations 一起清', () => {
+    const result = applyOps(flow(), removeBatch('n12'));
+    const content = result.content as FlowContent;
+    expect(content.stages[0]!.edges).toEqual([]);
+    expect(content.relations!.map(item => item.id)).toEqual(['r2']);
+  });
+
+  it('一个也不命中时返回同一个对象', () => {
+    const content = tree();
+    expect(pruneDanglingRefs(content)).toBe(content);
   });
 });

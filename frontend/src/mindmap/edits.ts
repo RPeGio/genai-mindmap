@@ -4,6 +4,7 @@ import {
   edgesOfContent,
   isFishbone,
   isFlow,
+  iterNodesIn,
   rootsOf,
   stageInnerEdgesOf,
   stageOfNode,
@@ -315,6 +316,53 @@ export function dropDanglingEdges(content: DiagramContent, doomed: Set<string>):
   // `relations` 落在契约的 `ContentBase` 上，三种形状都有这个键，所以这一句对三者
   // 都成立；`as DiagramContent` 只是让联合类型认得出这条**共有**的键。
   return { ...next, relations: keptRelations } as DiagramContent;
+}
+
+/**
+ * 按**现存节点**清掉悬空的跨节点引用：`relations` 与**阶段内边**。
+ *
+ * 与 `dropDanglingEdges` 是同一个判据的两个入口，区别只在"什么时候知道哪些节点没了"：
+ *
+ *  - `dropDanglingEdges(content, doomed)`：删之前就算好了 `doomed`（界面删节点、
+ *    撤销快照那条路）；
+ *  - `pruneDanglingRefs(content)`：已经改完，只知道现在还剩谁（`ops.applyOps` 的
+ *    鱼骨/流程分支——op 批次在一棵临时 `MindMapContent` 里跑，而 `relations` 与
+ *    `stages[i].edges` 都**不在那棵树里**）。
+ *
+ * 两件事必须一起做，因为它们在同一个位置缺读者：
+ *  - 阶段内边的端点是**该阶段自己的**节点 id，删掉一个步骤之后它们就悬空了。这条
+ *    与后端 `tools._prune_stage_edges` 同口径（判据都是"端点是否还在"）；
+ *  - `relations` 落在契约 `ContentBase` 上，三种形状都有，端点永远是节点 id。与
+ *    后端 `tools._prune_dangling_relations` 同口径。
+ *
+ * 没有可丢的时候返回**同一个对象**：调用方靠引用相等判断"这次什么都没变"。
+ */
+export function pruneDanglingRefs(content: DiagramContent): DiagramContent {
+  let next = content;
+
+  if (isFlow(next)) {
+    let hit = false;
+    const stages = next.stages.map(stage => {
+      const alive = new Set<string>();
+      for (const node of walkNodes(stage.root)) alive.add(node.id);
+      const inner = stage.edges ?? [];
+      const kept = inner.filter(edge => alive.has(edge.source) && alive.has(edge.target));
+      if (kept.length === inner.length) return stage;
+      hit = true;
+      return { ...stage, edges: kept };
+    });
+    if (hit) next = { ...next, stages };
+  }
+
+  const relations = next.relations ?? [];
+  if (relations.length === 0) return next;
+  const alive = new Set<string>();
+  for (const node of iterNodesIn(next)) alive.add(node.id);
+  const kept = relations.filter(
+    relation => alive.has(relation.source) && alive.has(relation.target),
+  );
+  if (kept.length === relations.length) return next;
+  return { ...next, relations: kept } as DiagramContent;
 }
 
 /**

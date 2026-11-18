@@ -17,6 +17,7 @@ import {
   isNodeColor,
   LIMITS,
   NODE_COLORS,
+  pruneDanglingRefs,
   removeNode,
   subtreeIds,
 } from './edits';
@@ -280,7 +281,13 @@ export function applyOps(content: DiagramContent, batch: OpBatch): ApplyResult {
     source_usage: content.source_usage ?? [],
   };
   const applied = applyOpsOnTree(temp, batch);
-  const moved = replaceContainer(content, rootId, () => applied.content.root);
+  // 删节点连带删掉悬空的跨节点引用。**只能落在写回之后**：临时 `MindMapContent`
+  // 只有一棵子树，`relations`（属于整图）与 `stages[i].edges`（属于阶段，不在这棵
+  // 临时树里）在那里都看不见。与后端 `tools._prune_stage_edges` /
+  // `_prune_dangling_relations` 同一个位置、同一条判据（按存活节点判）——漏了这一处，
+  // 模型在鱼骨/流程上删一个被关系或阶段内边引用的节点时，前端预演会以"指向不存在
+  // 的节点"整批失败，而后端执行器已经能成功。
+  const moved = pruneDanglingRefs(replaceContainer(content, rootId, () => applied.content.root));
   // 写回之后再校验一次整份内容：临时树只能看到自己那一棵，跨容器的 id 唯一性与
   // 边/阶段的关系要在这里兜住（后端那一步是 `shapes.revalidate`）。
   assertContentValid(moved);
@@ -468,6 +475,13 @@ export function applyOpsOnTree(
         const removedIds = subtreeIds(doomed);
         next.edges = (next.edges ?? []).filter(
           edge => !removedIds.has(edge.source) && !removedIds.has(edge.target),
+        );
+        // `relations` 与 `edges` 是**两套字段、同一条判据**（契约对两者的 dangling
+        // 一样硬拒）。只清 edges 时，删一个被关系引用的节点会让这一批 op 在
+        // `assertContentValid` 里整批失败——而那条关系界面根本不渲染，用户连
+        // "是哪条线挡住的"都看不到。
+        next.relations = (next.relations ?? []).filter(
+          relation => !removedIds.has(relation.source) && !removedIds.has(relation.target),
         );
         changed.add(op.id);
         break;
