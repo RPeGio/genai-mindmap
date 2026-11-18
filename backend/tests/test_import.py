@@ -1327,6 +1327,53 @@ class RoundTripLossTest(unittest.TestCase):
         self.assertEqual([bone.category for bone in restored.bones], ["人", "机", "料"])
 
 
+    # --- P2-3：边标签里的括号 ------------------------------------------
+
+    def test_edge_label_with_parentheses_keeps_the_whole_edge(self):
+        """`Rejected (missing file)`：标签里的括号不再让**整条边**丢失。
+
+        此前后缀正则不许括号套括号，标签认不出来就留在端点上——端点对不上任何
+        节点，整条边被丢掉（边数 1→0 + `edges_dropped`）。
+        """
+        original = FlowContent.model_validate({
+            "title": "报销流程",
+            "stages": [{"id": "s1", "root": {"id": "n1", "label": "提交"}},
+                       {"id": "s2", "root": {"id": "n2", "label": "审查"}}],
+            "edges": [{"id": "e1", "source": "s1", "target": "s2",
+                       "label": "Rejected (missing file)"}],
+        })
+        result = parse_text("flow.md", to_markdown(original))
+        self.assertIsInstance(result.content, FlowContent)
+        self.assertEqual(len(result.content.edges), 1)
+        edge = result.content.edges[0]
+        self.assertEqual(edge.label, "Rejected (missing file)")
+        _labels, stages = label_maps(result.content)
+        self.assertEqual((stages[edge.source], stages[edge.target]), ("提交", "审查"))
+        self.assertNotIn("edges_dropped", codes(result.warnings))
+
+    def test_stage_inner_edge_label_with_parentheses_survives(self):
+        original = FlowContent.model_validate({
+            "title": "流程",
+            "stages": [{"id": "s1", "root": {
+                "id": "n1", "label": "审查",
+                "children": [{"id": "n11", "label": "形式审查"},
+                             {"id": "n12", "label": "实质审查"}]},
+                "edges": [{"id": "i1", "source": "n11", "target": "n12",
+                           "label": "Rejected (missing file)"}]}],
+        })
+        restored = parse_text("inner.md", to_markdown(original)).content
+        self.assertEqual(len(restored.stages[0].edges), 1)
+        self.assertEqual(restored.stages[0].edges[0].label, "Rejected (missing file)")
+
+    def test_nested_full_width_parentheses_survive(self):
+        original = MindMapContent.model_validate(build(
+            edges=[{"id": "e1", "source": "m1", "target": "t1",
+                    "label": "驳回（材料不全）"}]))
+        restored = parse_text("nested.md", to_markdown(original)).content
+        self.assertEqual(len(restored.edges), 1)
+        self.assertEqual(restored.edges[0].label, "驳回（材料不全）")
+
+
 class FlowMarkdownTest(unittest.TestCase):
     """流程图 markdown 的两个细节：阶段根的**正文**、阶段内边的端点归属。"""
 

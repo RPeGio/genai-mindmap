@@ -131,8 +131,10 @@ _INNER_SCOPE = re.compile(r"^\[(?P<stage>[^\]]+)\]\s*(?P<rest>.+)$")
 _DONE = re.compile(r"^\[[xX]\]\s*")
 _OPEN = re.compile(r"^\[\s?\]\s*")
 
-# 边行末尾的 `（标签）`。全角与半角括号都收：导出写全角，但用户可能改成半角。
-_EDGE_LABEL = re.compile(r"[（(]([^（）()]*)[）)]\s*$")
+# 边行末尾那对包住标签的括号。**第一对是导出的默认格式**（全角圆括号），另外两对
+# 是导出在"标签自己带圆括号"时换上去的（见 `export.service._wrap_edge_suffix`）。
+# 圆括号那一对把全角与半角一起数：导出写全角，用户很可能手改成半角。
+_EDGE_SUFFIX_PAIRS = (("（(", "）)"), ("〔", "〕"), ("【", "】"))
 
 # 箭头。导出写 `→`；用户手改时很可能写成 `->` 或 `-->`。
 _ARROWS = ("→", "-->", "->", "⇒", "=>")
@@ -182,12 +184,50 @@ def _append_text(existing: str | None, extra: str) -> str:
     return f"{existing} {part}" if existing else part
 
 
+def _split_edge_suffix(right: str) -> tuple[str, str | None]:
+    """从边行右端剥掉 `（标签）`，返回 `(主体, 标签 | None)`。
+
+    早先这里是一个"括号里不许有括号"的正则（`[（(]([^（）()]*)[）)]$`）。标签自己
+    带括号时（`Rejected (missing file)`）整个后缀认不出来，那几个字符留在端点上，
+    于是端点对不上任何节点、**整条边被丢掉**——超出"只丢部分 kind"的承诺
+    （codex 复审 P2-3）。
+
+    现在从右端按**同类括号的深度**往回数：配平到 0 的位置就是标签起点，标签里
+    嵌套几层都切得准。三种分隔符各数一遍（理由见 `_EDGE_SUFFIX_PAIRS`）。
+
+    配不平（`smile :(`）时**不拆**：那一对当不了边界，硬拆会把端点切掉半截，
+    而"端点带半截标签"比"标签缺失"更难查。导出侧对此有对策——标签里圆括号
+    配不平就换另一对分隔符，所以正常往返走不到这一支。
+    """
+    body = right.rstrip()
+    if not body:
+        return body, None
+    for open_chars, close_chars in _EDGE_SUFFIX_PAIRS:
+        if body[-1] not in close_chars:
+            continue
+        depth = 0
+        for index in range(len(body) - 1, -1, -1):
+            char = body[index]
+            if char in close_chars:
+                depth += 1
+            elif char in open_chars:
+                depth -= 1
+                if depth == 0:
+                    label = body[index + 1:-1].strip()
+                    return body[:index].rstrip(), label or None
+        # 这一对配不平：它包不住整段，换下一对试。
+    return body, None
+
+
 def edge_of(text: str) -> RawEdge | None:
     """`甲 → 乙（是）` → RawEdge。认不出箭头返回 None（该行不是边）。
 
     markdown 与 opml 共用：导出的边行在两种格式里是同一段文字（`_edge_line`），
     所以解析也必须只有一份。两处各写一遍的结局是 `→` 有一边不认、或者尾部
     `（是）` 在一处被当成节点名的一部分。
+
+    `text` 必须是**反转义之后**的文字（markdown 那边由调用方做，见 `_unescape`；
+    opml 的 XML 解析器已经把实体解开了，所以那边原样传）。
     """
     body = text.strip()
     for arrow in _ARROWS:
@@ -196,11 +236,7 @@ def edge_of(text: str) -> RawEdge | None:
             break
     else:
         return None
-    label: str | None = None
-    matched = _EDGE_LABEL.search(right)
-    if matched:
-        label = matched.group(1).strip() or None
-        right = right[:matched.start()]
+    right, label = _split_edge_suffix(right)
     source, target = left.strip(), right.strip()
     if not source or not target:
         return None

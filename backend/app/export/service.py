@@ -123,6 +123,53 @@ EDGE_KIND_LABELS = {
     "loop": "回退",
 }
 
+# 边行末尾那对包住说明的括号。**第一对是默认格式**（既有文件、既有用例都是它），
+# 只有它装不下时才换下一对。判据是"标签里自己带的圆括号"：
+#
+#   - 成对的（`Rejected (missing file)`）：从右端按深度数括号能切准，不必换；
+#   - 不成对的（`smile :(`、`O型）`）：那一对就再也当不了边界——导入侧从右端数
+#     括号会切在标签内部的括号上，切出来的端点带着半截标签（codex 复审 P2-3）。
+#
+# 换一对之后**导出侧保证分隔符不出现在标签里**，所以导入侧只要从右端找那一对
+# 就是边界，不必猜（`importing/markdown.py::_split_edge_suffix` 两档都实现了）。
+_EDGE_SUFFIX_PAIRS = (("（", "）"), ("〔", "〕"), ("【", "】"))
+#: 圆括号在正文里可能是半角，数深度时两种一起数（导出写全角，用户手改是半角）。
+_ROUND_OPEN = "（("
+_ROUND_CLOSE = "）)"
+
+
+def _rounds_are_balanced(text: str) -> bool:
+    """圆括号（全角与半角一起数）是否成对且序不倒挂。
+
+    `Rejected (missing file)` → True；`smile :(` 与 `)a(` → False。倒挂也算不平衡：
+    `)a(` 从右端数能凑成一对，但切出来的是 `(`，不是标签。
+    """
+    depth = 0
+    for char in text:
+        if char in _ROUND_OPEN:
+            depth += 1
+        elif char in _ROUND_CLOSE:
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _wrap_edge_suffix(text: str) -> str:
+    """把边行后缀包进一对**能当边界**的括号。
+
+    默认那一对（全角圆括号）只有两种情况下让位：标签里已经有圆括号字符、或者
+    圆括号不成对。三对都被占满时退回默认格式——此时这条边的**标签**会丢（端点
+    与边本身都还在），这是格式的边界，不是实现的偷懒；正常标签碰不到。
+    """
+    for open_char, close_char in _EDGE_SUFFIX_PAIRS:
+        if any(char in text for char in open_char + close_char):
+            continue
+        if open_char == "（" and not _rounds_are_balanced(text):
+            continue
+        return f"{open_char}{text}{close_char}"
+    return f"（{text}）"
+
 
 def _depth_marks(depth: int) -> str:
     """PlantUML mindmap 用星号数量表示层级。"""
@@ -222,9 +269,9 @@ def _edge_suffix(edge: Edge) -> str:
     kind 只是它的类别。两者都写会得到「驳回（回退）」，读起来像同义重复。
     """
     if edge.label:
-        return f"（{edge.label}）"
+        return _wrap_edge_suffix(edge.label)
     if edge.kind:
-        return f"（{EDGE_KIND_LABELS.get(edge.kind, edge.kind)}）"
+        return _wrap_edge_suffix(EDGE_KIND_LABELS.get(edge.kind, edge.kind))
     return ""
 
 

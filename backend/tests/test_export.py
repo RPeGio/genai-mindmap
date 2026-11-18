@@ -520,6 +520,48 @@ class FishboneBoneFieldsTest(unittest.TestCase):
                          {"category": "People", "note": "先 A --> B"})
 
 
+class EdgeSuffixDelimiterTest(unittest.TestCase):
+    """边标签里的括号不能把整条边弄丢（codex 复审 P2-3）。
+
+    `_edge_suffix` 默认用全角圆括号；**只有它装不下时才换**（标签里已有圆括号、
+    或圆括号配不平）。换一对之后导出保证分隔符不出现在标签里，导入从右端一找
+    就是边界。
+    """
+
+    def flow(self, label, kind=None):
+        from app.contracts.mindmap import FlowContent
+        edge = {"id": "e1", "source": "s1", "target": "s2"}
+        if label is not None:
+            edge["label"] = label
+        if kind is not None:
+            edge["kind"] = kind
+        return FlowContent.model_validate({
+            "title": "流程",
+            "stages": [{"id": "s1", "root": {"id": "n1", "label": "提交"}},
+                       {"id": "s2", "root": {"id": "n2", "label": "审查"}}],
+            "edges": [edge]})
+
+    def suffix_of(self, label, kind=None):
+        line = [row for row in to_markdown(self.flow(label, kind)).splitlines()
+                if row.startswith("- ") and "→" in row][0]
+        return line.split("→", 1)[1].strip()
+
+    def test_balanced_parentheses_keep_the_default_delimiters(self):
+        """`Rejected (missing file)` 的圆括号成对：默认格式照用，输出没变。"""
+        self.assertEqual(self.suffix_of("Rejected (missing file)"),
+                         "2. 审查（Rejected (missing file)）")
+
+    def test_unbalanced_parentheses_switch_to_the_next_pair(self):
+        self.assertEqual(self.suffix_of("smile :("), "2. 审查〔smile :(〕")
+        self.assertEqual(self.suffix_of("O型）"), "2. 审查〔O型）〕")
+
+    def test_full_width_parentheses_switch_too(self):
+        self.assertEqual(self.suffix_of("驳回（材料不全）"), "2. 审查〔驳回（材料不全）〕")
+
+    def test_kind_labels_never_need_the_second_pair(self):
+        self.assertEqual(self.suffix_of(None, "loop"), "2. 审查（回退）")
+
+
 class ByteIdenticalTest(unittest.TestCase):
     """三种既有格式的输出**逐字节**钉死。
 
