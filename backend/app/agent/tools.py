@@ -3027,15 +3027,26 @@ _FLOW_BODY = (
     "每个阶段下面写它自己的步骤（1–4 个），按这个阶段里的先后排列，"
     "最多再往下拆一层，不要把一个阶段写成另一张导图。"
     "步骤写的是**做的那件事**，不要写成对阶段的解释。\n"
-    # role 四值。写不进契约的值会被 422（`Node.role` 是 Literal），所以这里把
+    # role 六值。写不进契约的值会被 422（`Node.role` 是 Literal），所以这里把
     # 取值集合写死，并给一个可对照的例子——只描述语义时模型会写 "judge" / "判断"。
     "\n**每个节点可以带一个 role 字段，说明它在流程里扮演什么**：\n"
     '- "decision"：需要判断的地方（「材料齐全吗」「金额超过十万吗」）。'
     "一个阶段里通常 0–2 个，不要给普通步骤标它；\n"
     '- "start"：流程的起点，只在第一个阶段的第一步上标一个；\n'
     '- "end"：流程的终点，只在最后一个阶段收尾的那个节点上标一个；\n'
+    '- "data"：**输入或输出**的一步——这一步产出了材料、交出了单据、读进了金额，'
+    "它就是一份数据（「录入报销单」「出具审查意见」「接收回执」）；\n"
+    '- "database"：**读写存储**的一步——数据落进某个库/台账/档案，或从里面取'
+    "（「写入审批台账」「查询员工档案」「归档到系统」）；\n"
     '- 普通步骤写 "step" 或者干脆不写这个字段。\n'
-    "role 只能是 step / decision / start / end 这四个值之一。\n"
+    "role 只能是 step / decision / start / end / data / database 这六个值之一。\n"
+    # data / database 与"处理"的界线要一句话说清：模型很容易把"填表"当 data、
+    # 把"保存"当 step，两种都会让平行四边形与圆柱变成装饰。判据只有一条——这一步
+    # 的对象是**数据本身**（产出它、交出它、存下它、取出它）才标，处理业务规则
+    # 的那一步仍然是 step。
+    "判据只有一条：这一步**打交道的对象是数据本身**（产出 / 交出 / 存下 / 取出）"
+    "才标 data 或 database；在数据之上做业务判断或加工的那一步仍然是 step。"
+    "摄入与落库都算，只是别给一张图标满——通常每个阶段 0–2 个。\n"
     # 判定节点的两条出口。**没有这一段时 `branch` 边恒为 0**：role 标了，边没地方
     # 写，`FlowStage.edges`（阶段内的边）就一直是空的。目标写**节点标题**而不是 id
     # —— id 是模型自己编的，它经常写错；标题它刚写完，抄得准。解析时 id 也认
@@ -4485,6 +4496,12 @@ def _fishbone_shape_diagnostics(
     ))
 
 
+# 「这一步的对象是数据本身」的两个角色。收在这里是因为有两处要读同一份口径：
+# `_stamp_flow_roles` 挑终点时要躲开它们（`role` 是单值字段，改写会把形状抹掉），
+# 而新增第三种数据形状时也必须在这两处一起想到。
+_FLOW_DATA_ROLES = frozenset({"data", "database"})
+
+
 def _stamp_flow_roles(
     content: FlowContent, diagnostics: list[Diagnostic],
 ) -> FlowContent:
@@ -4495,7 +4512,8 @@ def _stamp_flow_roles(
     结构事实。而**一个都没有**时的情形不同：起点就是第一个阶段的第一步、终点就是
     最后那个收尾的叶子，这两件事由 `stages` 的顺序与 `children` 的形状直接决定。
 
-    `decision` 一律不补：哪个步骤需要判断，只有写这张图的模型知道。
+    `decision` 一律不补：哪个步骤需要判断，只有写这张图的模型知道。`data` /
+    `database` 同样不补——但终点那一格会**躲开**它们（见下面那段注释）。
     """
     roles = {node.role for node in shapes.iter_nodes(content)}
     stages = list(content.stages)
@@ -4526,6 +4544,33 @@ def _stamp_flow_roles(
         last = stages[-1]
         leaves = [node for node in shapes.walk_nodes(last.root) if not node.children]
         target = leaves[-1] if leaves else last.root
+        # 末端的存储步骤（「归档到系统」「写入台账」）很常见，而 `role` 是**单值**
+        # 字段：把它改成 end 就等于把模型标的那只圆柱抹掉。所以终点往前挪一步，
+        # 两边语义都保住——`end` 是结构事实（流程在哪结束），`data` / `database`
+        # 是模型对这一步的理解，后者不该被前者吃掉。
+        if target.role in _FLOW_DATA_ROLES:
+            plain = [node for node in leaves if node.role not in _FLOW_DATA_ROLES]
+            if plain:
+                target = plain[-1]
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.info, code="FLOW_ROLE_END_MOVED_UP",
+                    message=(
+                        f"最后一个阶段收尾的那一步标了 {leaves[-1].role}"
+                        f"（「{leaves[-1].label}」），形状要留给它；"
+                        f"终点因此标在前一步（「{target.label}」）上"
+                    ),
+                ))
+            else:
+                # 整个阶段都是数据步骤（一个"收尾但不碰数据"的节点都没有）：
+                # 终点比形状重要（流程图必须有出口），但这一处取舍要说出来，
+                # 否则用户只会看到"我标的圆柱少了一个"，而没有任何线索。
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.info, code="FLOW_ROLE_END_OVERRIDES_DATA",
+                    message=(
+                        f"最后一个阶段的每一步都在跟数据打交道，终点只能落在最后一步"
+                        f"（「{target.label}」）上，原来标的 {target.role} 让位给 end"
+                    ),
+                ))
         if target.role == "start":
             # 单阶段单步：start 与 end 会落在同一个节点上。起点优先——那个节点
             # 同时是入口与出口时说两遍没有多出任何信息。
@@ -4886,6 +4931,23 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             '{"yes":"走「是」时到的那个节点的标题","no":"走「否」时到的那个节点的标题"}。'
             "标题要**逐字**抄这份响应里另一个节点的 label（可以是本阶段后面的某一步，"
             '也可以是另一个阶段里的一步）；这条路到此结束时写 "结束"。'
+            # 新形状（平行四边形 / 圆柱）的判据必须写在这里，理由与上面那段 `role`
+            # 完全相同：系统提示词里的 `_FLOW_BODY` 有一段一样的说明，而 stage 2 的
+            # 实测是"同一句话写在 system 里，两次采样一个都没标出来"。
+            #
+            # 措辞刻意用**对象是数据本身**这一条判据，而不是"读写数据"——后者太宽，
+            # 模型会把每个填单子的步骤都标成 data（实测见
+            # `scripts/measure_flow_data_roles.py` 的报告），平行四边形于是变成装饰。
+            '\n**哪一步在跟数据打交道，就把它标出来**（这两种形状在画布上是平行四边形'
+            '与圆柱，读图的人靠它分清算数据与干活）：'
+            '这一步**产出了数据**（录入 / 填单 / 出具 / 生成报表）、或者**交出了数据**'
+            '（提交 / 上报 / 发送回执）就加 "role": "data"；'
+            '这一步**写进存储**（落库 / 入台账 / 归档 / 记账）或**从存储里取**'
+            '（查询 / 调取档案 / 读取余额）就加 "role": "database"。'
+            '判据是这一步**对象就是数据本身**，在数据之上做业务判断的那一步仍然是普通步骤'
+            "（那样的一步如果确实要选路，它才该标 decision）。"
+            '例如：{"id":"…","label":"录入报销单","role":"data","children":[]}、'
+            '{"id":"…","label":"写入审批台账","role":"database","children":[]}。'
         )
     if sections:
         user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"

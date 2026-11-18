@@ -272,6 +272,52 @@ class TestFlowGeneration:
         assert "FLOW_ROLE_START_DEFAULTED" not in codes
         assert "FLOW_ROLE_END_DEFAULTED" not in codes
 
+    def test_end_does_not_eat_a_data_or_database_shape(self):
+        """收尾那一步标了 database 时，终点往前挪一步——`role` 是单值字段。
+
+        这条钉的是一个具体取舍：末端常常是「归档到系统」「写入台账」，而它标的是
+        `database`（圆柱）。把同一个节点改成 `end` 会让那只圆柱消失，读者再也看不出
+        这一步在落库；而终点是**结构事实**（流程在哪结束），它必须存在。两全的办法
+        是终点落前一步，并且把这次挪动说出来。
+        """
+        structure = _tree_from(
+            ["提交申请", "形式审查", "实质审查"],
+            roles={"实质审查·二": "database"},
+        )
+        result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                     structure=structure)
+
+        content = ctx.candidate
+        leaves = [node for node in shapes.walk_nodes(content.stages[-1].root)
+                  if not node.children]
+        # 收尾那一步保住了它的 database（圆柱没被 end 顶掉）。
+        assert leaves[-1].role == "database"
+        # 终点落在它前面那个普通步骤上。
+        assert leaves[-2].role == "end"
+        codes = [item["code"] for item in result.data["diagnostics"]]
+        assert "FLOW_ROLE_END_MOVED_UP" in codes
+        assert "FLOW_ROLE_END_DEFAULTED" in codes
+
+    def test_end_takes_precedence_when_every_step_touches_data(self):
+        """整个阶段都是数据步骤时，终点仍然要给出来——覆盖并**记一条说明**。
+
+        静默覆盖是最难查的一种：用户只会看到"我标的圆柱少了一个"。所以这一支也
+        必须留下诊断，哪怕结论是"这里只能二选一"。
+        """
+        structure = _tree_from(
+            ["提交申请", "形式审查", "实质审查"],
+            roles={"实质审查·一": "data", "实质审查·二": "database"},
+        )
+        result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                     structure=structure)
+
+        leaves = [node for node in shapes.walk_nodes(ctx.candidate.stages[-1].root)
+                  if not node.children]
+        assert leaves[-1].role == "end"
+        assert leaves[0].role == "data"
+        codes = [item["code"] for item in result.data["diagnostics"]]
+        assert "FLOW_ROLE_END_OVERRIDES_DATA" in codes
+
 
 # ---------------------------------------------------------------- 阶段内的判定出边
 #
