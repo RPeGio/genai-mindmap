@@ -218,6 +218,58 @@ describe('材料缩略图', () => {
     expect(panel.text()).toContain('添加文件（可多选）');
     expect(panel.text()).toContain('录音添加来源');
   });
+
+  it('还没点「添加」的材料正文在生成态之后还在（组件被卸载也不丢）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    await wrapper.get('#material-text').setValue('还没点添加的一段正文');
+
+    const sources = useSourcesStore();
+    expect(sources.draftText).toBe('还没点添加的一段正文');
+
+    // 进入生成态：整块对话框换成一条细进度，材料面板那个组件被 `v-if` 整个卸载。
+    // 草稿以前住在那里面，这一刻就没了。
+    const store = useMindMapStore();
+    store.busy = true;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('#material-text').exists()).toBe(false);
+    expect(sources.draftText).toBe('还没点添加的一段正文');
+
+    store.busy = false;
+    await wrapper.vm.$nextTick();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    const box = wrapper.get('#material-text').element as HTMLTextAreaElement;
+    expect(box.value).toBe('还没点添加的一段正文');
+  });
+
+  it('草稿算刹车：有没点「添加」的正文时，成功也不淡出', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    await wrapper.get('#material-text').setValue('写了一半的材料');
+
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    store.preview(TREE, 'right');
+    store.generatedSummary = { nodes: 2, changes: null };
+    await wrapper.vm.$nextTick();
+
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(false);
+
+    // 草稿清掉之后才允许淡出：计时器要重新开始（watch 的源里有它）。
+    sources.draftText = '';
+    await wrapper.vm.$nextTick();
+    vi.advanceTimersByTime(2100);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(true);
+  });
 });
 
 describe('语音模式', () => {

@@ -47,6 +47,18 @@ export const useSourcesStore = defineStore('sources', () => {
   const items = ref<SourceItem[]>([]);
   const error = ref('');
   /**
+   * 「粘贴材料正文」框里还没点「添加」的草稿。
+   *
+   * **必须住在这里，不能住组件里**：那个框住在底部对话框的材料面板，而整个对话框
+   * 主体在"生成中"那一段被 `v-if="compact"` 换成一条细进度——组件被卸载，本地
+   * `ref` 里的几百字正文连同它的 `beforeunload` 提醒一起消失。用户切一下语音、
+   * 生成一次，草稿就没了，而界面上没有任何提示。
+   *
+   * 放在 store 之后，它同时被三件事看见：`ChatDock` 的淡出刹车（有草稿就不淡出）、
+   * `beforeunload`（关页面提醒，挂在常驻的 `ChatDock` 上）、以及「新对话」的清空。
+   */
+  const draftText = ref('');
+  /**
    * 正在录音。
    *
    * 放在这里而不是某个组件里，因为**两个组件都要看它**：`RecordButton` 那边决定
@@ -113,8 +125,19 @@ export const useSourcesStore = defineStore('sources', () => {
     return true;
   }
 
-  async function parseItem(item: SourceItem): Promise<void> {
-    const file = files.get(item.key);
+  /**
+   * 把草稿加进来源，成功才清空草稿。
+   *
+   * 失败时**保留正文**：超上限、内容为空这两种失败下清空输入框，等于把用户刚贴的
+   * 那段文字扔了——而失败原因恰恰要求他改一改再试。
+   */
+  function addDraft(): boolean {
+    if (!addText(draftText.value)) return false;
+    draftText.value = '';
+    return true;
+  }
+
+  async function parseItem(item: SourceItem): Promise<void> {    const file = files.get(item.key);
     if (!file) return;
     item.error = '';
     item.seconds = 0;
@@ -255,11 +278,15 @@ export const useSourcesStore = defineStore('sources', () => {
     items.value = [];
     error.value = '';
     recording.value = false;
+    // `draftText` **不在这里清**：这个函数服务的是"清空来源"那个按钮，而草稿是
+    // 还没成为来源的一段正文。用户点"清空来源"时把他在粘贴框里写了半天的字一起
+    // 抹掉，是另一件事。「新对话」要清它时自己清（`App.newConversation`）。
   }
 
   onScopeDispose(clear);
   return {
     items, error, parsing, recording, readySources, problem, materialProblem,
-    addText, addFiles, retry, remove, clear, remap,
+    draftText,
+    addText, addDraft, addFiles, retry, remove, clear, remap,
   };
 });

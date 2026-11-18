@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed } from 'vue';
 
 import RecordButton from './RecordButton.vue';
 import { FILE_ACCEPT, MAX_INPUT_CHARS, MAX_SOURCES, mergedCharCount, SOURCE_LABELS, sourceWarning } from '../sources/input';
@@ -12,18 +12,16 @@ import { useSourcesStore } from '../stores/sources';
  *
  * 这里只放材料：粘贴的正文、上传的文档/图片、录音，以及它们的来源列表与清空。
  * 主题和「怎么改」不在这里——那是画布底部那条对话框（`ChatDock.vue` 的 `#intent`）。
+ *
+ * **正文草稿不在这个组件里**（`sources.draftText`）。它曾经是这里的 `ref`，而这个
+ * 组件在生成中会被 `v-if` 整个卸载（对话框收成一条细进度）：还没点「添加」的正文
+ * 当场消失，用户以为是自己弄丢了。`beforeunload` 提醒同理由跟着搬到常驻的
+ * `ChatDock`。
  */
 const store = useMindMapStore();
 const sources = useSourcesStore();
 
-/**
- * 待加入来源的正文草稿。
- *
- * 它**不是**主题：点「添加文本到来源」之后才变成一份材料。这个区别必须在界面上
- * 写清楚——老用户习惯"在左侧框里打字然后点生成"，不写的话他会把主题当材料塞进来，
- * 然后疑惑为什么生成出来的图跟他想的不一样。
- */
-const materialText = ref('');
+/** 关页面提醒的挂载点放在 `ChatDock`（它常驻），这里只留一个说明性引用。 */
 
 const recording = computed(() => sources.recording);
 /** 生成期间整块冻结：中途加的来源对这一轮不生效，让用户以为它生效比禁用更糟。 */
@@ -49,10 +47,6 @@ function refHits(sourceId: string) {
   return store.refIndex.hits[sourceId] ?? [];
 }
 
-function addText() {
-  if (sources.addText(materialText.value)) materialText.value = '';
-}
-
 async function onPickFiles(event: Event) {
   const input = event.target as HTMLInputElement;
   const selected = Array.from(input.files ?? []);
@@ -60,15 +54,6 @@ async function onPickFiles(event: Event) {
   input.value = '';
   await sources.addFiles(selected);
 }
-
-function beforeUnload(event: BeforeUnloadEvent) {
-  if (!sources.items.length && !materialText.value.trim() && !recording.value) return;
-  event.preventDefault();
-  event.returnValue = '';
-}
-
-onMounted(() => window.addEventListener('beforeunload', beforeUnload));
-onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 </script>
 
 <template>
@@ -86,7 +71,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
     <label for="material-text" class="text-xs font-medium text-slate-600">粘贴材料正文</label>
     <textarea
       id="material-text"
-      v-model="materialText"
+      v-model="sources.draftText"
       rows="3"
       :disabled="generating"
       class="resize-y rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
@@ -95,8 +80,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
     <button
       type="button"
       class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-      :disabled="generating || !materialText.trim()"
-      @click="addText"
+      :disabled="generating || !sources.draftText.trim()"
+      @click="sources.addDraft()"
     >添加文本到来源</button>
     <p class="text-xs leading-relaxed text-slate-400">
       这里加的东西都算材料；写主题、说「怎么改」在画布底部那个对话框里。

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import SourceInputs from './SourceInputs.vue';
 import VoicePress from './VoicePress.vue';
@@ -485,15 +485,18 @@ function clearDismiss(): void {
 /**
  * 生成成功后"只剩画布"这一件事，什么时候该让位。
  *
- * 三条刹车（缺一条都会让用户下一步不知道点哪儿）：
+ * 刹车（缺一条都会让用户下一步不知道点哪儿）：
  *   1. 画布上还没有图——他从没成功过，收走对话框等于收走了唯一的入口；
  *   2. 输入框里还有没发出去的字——那是他正在写的东西，收走就丢了；
- *   3. 这一次失败了 / 部分完成 / 有冲突 / 有上次没保存的结果——这几种都在等他做决定。
+ *   3. 材料粘贴框里还有没点「添加」的正文——同上，而且它住在一个会因为淡出而
+ *      看不到的面板里（草稿本身在 store 里，不丢；但看不见 = 以为丢了）；
+ *   4. 这一次失败了 / 部分完成 / 有冲突 / 有上次没保存的结果——这几种都在等他做决定。
  */
 const shouldKeep = computed(() => {
   if (pinned.value) return true;
   if (!store.content) return true;
   if (typed.value) return true;
+  if (sources.draftText.trim()) return true;
   const kind = statusKind.value;
   if (kind && kind !== 'ok' && kind !== 'running') return true;
   if (kind === 'running') return true;
@@ -501,12 +504,12 @@ const shouldKeep = computed(() => {
 });
 
 watch(
-  () => [statusKind.value, typed.value, store.nodeCount] as const,
+  () => [statusKind.value, typed.value, store.nodeCount, sources.draftText] as const,
   ([kind]) => {
     clearDismiss();
     dismissed.value = false;
-    // 只有"成功且有图、没有草稿"这一种才安排淡出。其余状态对话框留着。
-    if (kind === 'ok' && store.content && !typed.value) {
+    // 只有"成功且有图、没有任何草稿"这一种才安排淡出。其余状态对话框留着。
+    if (kind === 'ok' && store.content && !typed.value && !sources.draftText.trim()) {
       dismissTimer = setTimeout(() => {
         // 定时器到点时把 `pinned` 一并松开：用户点过「改」把对话框叫回来之后，
         // 那一轮结束后它仍然该按状态判（否则它再也淡不出去）。
@@ -561,7 +564,24 @@ async function onPickMaterials(event: Event): Promise<void> {
 onBeforeUnmount(() => {
   stopElapsed();
   clearDismiss();
+  window.removeEventListener('beforeunload', guardUnload);
 });
+
+/**
+ * 关页面提醒：材料没入库、粘贴框里还有没点「添加」的正文、或者正在录音。
+ *
+ * **挂在 `ChatDock` 而不是 `SourceInputs`**：后者在生成中会被 `v-if` 整个卸载
+ * （对话框收成一条细进度），那一刻起提醒就没了——而"草稿还在、关掉就丢"这件事
+ * 恰恰发生在用户最可能离开的时候。`ChatDock` 只淡出不卸载，是这个提醒唯一
+ * 站得住的挂载点。
+ */
+function guardUnload(event: BeforeUnloadEvent): void {
+  if (!sources.items.length && !sources.draftText.trim() && !sources.recording) return;
+  event.preventDefault();
+  event.returnValue = '';
+}
+
+onMounted(() => window.addEventListener('beforeunload', guardUnload));
 
 defineExpose({ openComposer, openMaterial, closeMaterial, focusInput: () => openComposer() });
 </script>
