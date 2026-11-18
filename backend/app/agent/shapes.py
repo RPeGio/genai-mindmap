@@ -36,11 +36,12 @@
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from typing import Literal
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import Literal, NamedTuple
 
 from app.contracts.mindmap import (
     DiagramContent,
+    Edge,
     FishboneBone,
     FishboneContent,
     FlowContent,
@@ -341,7 +342,27 @@ def to_fishbone(
     ), len(extras)
 
 
-def to_flow(content: MindMapContent) -> tuple[FlowContent, int]:
+class FlowEdgeLoss(NamedTuple):
+    """树 → 流程时，附加边的三种去向各自的条数。
+
+    三个数**分开算**，因为它们的用户动作不同：
+
+      - `dropped`：这条边没有位置可落（连到中心主题，或者端点在整棵树里都找不到）。
+        它是"信息真的丢了"，用户想知道丢了几条；
+      - `demoted`：阶段**之间**的深层步骤跳转（「驳回」从阶段 2 的某一步回到阶段 1
+        的某一步）被降级成阶段级的一条线——`FlowContent.edges` 的端点只能是阶段 id，
+        所以精确端点保不住，但方向还在；
+      - `inner`：落进 `FlowStage.edges` 的阶段内边（判定节点的「是 / 否」）。它是
+        **成功**的条数，不是在报告损失——留在这里是为了让调用方与实测脚本能一眼看到
+        "这次真的写进去几条判定出边"。
+    """
+
+    dropped: int
+    demoted: int
+    inner: int
+
+
+def to_flow(content: MindMapContent) -> tuple[FlowContent, FlowEdgeLoss]:
     """树 → 流程图：一级分支持成为**阶段**，根不再出现在产物里。
 
     映射的三条规则：
@@ -351,11 +372,11 @@ def to_flow(content: MindMapContent) -> tuple[FlowContent, int]:
         明确要求它们是两个命名空间，同值会让"这条边连的是阶段还是步骤"只能靠
         形状猜；
       - `root` 就是那条一级分支节点（阶段内部的步骤树）；
-      - `edges` 的端点从节点 id 重映射到阶段 id。**指向根的边整条丢掉**：流程的
-        主轴就是阶段序列，"从中心主题出发"那条边没有对应的阶段，它的信息量也不比
-        数组下标多。丢掉的条数返回给调用方报诊断。
+      - 附加边按**端点归属**分流到两个数组（见 `_split_edges`）。指向根的边整条
+        丢掉：流程的主轴就是阶段序列，"从中心主题出发"那条边没有对应的阶段，它的
+        信息量也不比数组下标多。
 
-    返回 `(产物, 丢掉的边数)`。
+    返回 `(产物, FlowEdgeLoss)`。
     """
     children = list(content.root.children)
     stages: list[FlowStage] = []
@@ -371,15 +392,12 @@ def to_flow(content: MindMapContent) -> tuple[FlowContent, int]:
         stages.append(FlowStage(id=f"s_{content.root.id}", root=content.root))
         stage_of[content.root.id] = stages[0].id
 
-    edges = []
-    dropped_edges = 0
-    for edge in content.edges:
-        source = stage_of.get(edge.source)
-        target = stage_of.get(edge.target)
-        if source is None or target is None:
-            dropped_edges += 1
-            continue
-        edges.append(edge.model_copy(update={"source": source, "target": target}))
+    inner_edges, outer_edges, loss = _split_edges(content.edges, stages, stage_of)
+    if inner_edges:
+        stages = [
+            stage.model_copy(update={"edges": inner_edges.get(stage.id, [])})
+            for stage in stages
+        ]
 
     # 关系线的端点是节点 id，而**中心主题不在产物里**（它是 `title`，不是阶段）：
     # 留着它是一条指向不存在节点的关系，契约层会直接拒（`关系 X 的起点节点 Y
@@ -388,11 +406,61 @@ def to_flow(content: MindMapContent) -> tuple[FlowContent, int]:
     return FlowContent(
         title=content.title,
         stages=stages,
-        edges=edges,
+        edges=outer_edges,
         theme=content.theme,
         relations=[
             item for item in content.relations
             if item.source in node_ids and item.target in node_ids
         ],
         source_usage=content.source_usage,
-    ), dropped_edges
+    ), loss
+
+
+def _split_edges(
+    edges: Sequence[Edge],
+    stages: Sequence[FlowStage],
+    stage_of: Mapping[str, str],
+) -> tuple[dict[str, list[Edge]], list[Edge], FlowEdgeLoss]:
+    """树上的附加边 → `(各阶段的阶段内边, 阶段间边, 损失计数)`。
+
+    **这是两个命名空间唯一的分流点**，三条判据按顺序：
+
+      1. 端点不在任何阶段的子树里（中心主题、或已被裁剪掉的 id）→ 丢，计
+         `dropped`。前端的边渲染按 id 找节点，找不到就白屏（见 `_validate_edges`
+         的注释），所以"指向不存在的节点"永远不能进产物。
+      2. 两个端点属于**同一个阶段** → 进那个阶段的 `edges`，端点保持节点 id。
+         判定节点的「是 / 否」两条出边走的就是这一支，这也是 `FlowStage.edges`
+         存在的全部理由。
+      3. 两个端点属于**不同阶段** → 端点换成各自的阶段 id 进 `FlowContent.edges`。
+         两端本来**就是阶段根**时这是原生跳转（骨架那一次产出的就是这种边，不记
+         `demoted`）；一端或两端是阶段内部的深层步骤时，精确端点保不住，记一次
+         `demoted`——方向还在，位置退了半步。这是"阶段间边的端点只能是阶段 id"
+         的必然代价，不在这里假装它没发生。
+    """
+    owner_of: dict[str, str] = {}
+    for stage in stages:
+        for node in walk_nodes(stage.root):
+            owner_of[node.id] = stage.id
+
+    inner: dict[str, list[Edge]] = {stage.id: [] for stage in stages}
+    outer: list[Edge] = []
+    dropped = 0
+    demoted = 0
+    for edge in edges:
+        source_owner = owner_of.get(edge.source)
+        target_owner = owner_of.get(edge.target)
+        if source_owner is None or target_owner is None:
+            dropped += 1
+            continue
+        if source_owner == target_owner:
+            inner[source_owner].append(edge)
+            continue
+        if not (edge.source in stage_of and edge.target in stage_of):
+            demoted += 1
+        outer.append(edge.model_copy(
+            update={"source": source_owner, "target": target_owner}))
+    return inner, outer, FlowEdgeLoss(
+        dropped=dropped,
+        demoted=demoted,
+        inner=sum(len(items) for items in inner.values()),
+    )

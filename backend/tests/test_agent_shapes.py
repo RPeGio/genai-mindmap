@@ -273,6 +273,130 @@ class TestFlowGeneration:
         assert "FLOW_ROLE_END_DEFAULTED" not in codes
 
 
+# ---------------------------------------------------------------- 阶段内的判定出边
+#
+# 这一组补的是**阶段 1 契约的真实空洞**：`FlowContent.edges` 的端点是阶段 id，而
+# `role="decision"` 的节点在阶段内部——模型标了判定节点，它的「是 / 否」两条出边
+# 却无处可写（阶段 2 实测：5 个判定节点、`branch` 边 0 条）。
+#
+# 现在 `FlowStage.edges` 给了它们位置，这一组钉的是**生成侧真的把模型写的东西填
+# 进去了**：解析、端点、标签、以及"写歪的出口不判失败但要说出来"。
+
+
+def _flow_structure(branch: Any = None, *, role: str | None = "decision") -> dict[str, Any]:
+    """结构那一轮的响应：三个阶段，第二个阶段里有一个带 `branch` 的判定节点。
+
+    判定节点的两条出口都指向**同一个阶段内**的其它步骤（这正是 `FlowStage.edges`
+    要装的东西；跨阶段的那种在 `shapes._split_edges` 的用例里）。
+    """
+    decision: dict[str, Any] = {"id": "b1-1", "label": "材料齐全吗", "children": []}
+    if role is not None:
+        decision["role"] = role
+    if branch is not None:
+        decision["branch"] = branch
+    return {"title": TOPIC, "root": {"id": "r", "label": TOPIC, "children": [
+        {"id": "b0", "label": "提交申请", "children": [
+            {"id": "b0-1", "label": "填表"}]},
+        {"id": "b1", "label": "形式审查", "children": [
+            decision,
+            {"id": "b1-2", "label": "转实质审查"},
+            {"id": "b1-3", "label": "通知补正"},
+        ]},
+        {"id": "b2", "label": "实质审查", "children": [
+            {"id": "b2-1", "label": "专家评审"}]},
+    ]}}
+
+
+class TestFlowBranchEdges:
+    def test_two_labelled_out_edges_land_in_the_stage(self):
+        """两个出口写的是**标题**时，解析成真实节点 id 并落进那个阶段的 `edges`。"""
+        structure = _flow_structure({"yes": "转实质审查", "no": "通知补正"})
+        _, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                structure=structure)
+
+        content = ctx.candidate
+        assert isinstance(content, FlowContent)
+        stage = content.stages[1]
+        assert [(edge.source, edge.target, edge.label) for edge in stage.edges] == [
+            ("b1-1", "b1-2", "是"), ("b1-1", "b1-3", "否")]
+        assert all(edge.kind == "branch" for edge in stage.edges)
+        # 端点确实是真的节点（不是模型抄过来的标题）。
+        known = {node.id for node in shapes.iter_nodes(content)}
+        assert {edge.source for edge in stage.edges} | {
+            edge.target for edge in stage.edges} <= known
+
+    def test_targets_written_as_node_ids_are_accepted(self):
+        """出口写 id 也认（先认 id 再认标题）——模型两种写法都有。"""
+        structure = _flow_structure({"yes": "b1-2", "no": "b1-3"})
+        _, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                structure=structure)
+
+        assert [(edge.target, edge.label)
+                for edge in ctx.candidate.stages[1].edges] == [
+            ("b1-2", "是"), ("b1-3", "否")]
+
+    def test_a_branch_field_never_invalidates_the_tree(self):
+        """`branch` 会在校验之前被摘掉：`Node` 是 `extra="forbid"`，留着会 422。
+
+        这条是回归点——`_harvest_flow_branches` 少摘一次，用户看到的就是
+        "模型返回的导图不合法"，而模型其实完全照提示词写了。
+        """
+        structure = _flow_structure({"yes": "转实质审查", "no": "通知补正"},
+                                    role=None)  # 连 role 都没标，只有 branch
+        result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                     structure=structure)
+
+        assert result.ok, result.content
+        assert len(ctx.candidate.stages[1].edges) == 2
+
+    def test_end_word_means_the_flow_stops_here(self):
+        """「结束」不是节点：那一支不出边，也不该被算成解析失败。"""
+        structure = _flow_structure({"yes": "转实质审查", "no": "结束"})
+        result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                     structure=structure)
+
+        edges = ctx.candidate.stages[1].edges
+        assert [(edge.target, edge.label) for edge in edges] == [("b1-2", "是")]
+        codes = [item["code"] for item in result.data["diagnostics"]]
+        assert "FLOW_BRANCH_UNRESOLVED" not in codes
+
+    def test_an_unresolvable_target_is_dropped_and_reported(self):
+        """目标写了一个不存在的标题：丢那一条边、记一条诊断，**不判失败**。"""
+        structure = _flow_structure({"yes": "转实质审查", "no": "根本不存在的步骤"})
+        result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                     structure=structure)
+
+        assert result.ok, result.content
+        assert len(ctx.candidate.stages[1].edges) == 1
+        codes = [item["code"] for item in result.data["diagnostics"]]
+        assert "FLOW_BRANCH_UNRESOLVED" in codes
+
+    def test_no_branch_field_leaves_the_stage_edges_empty(self):
+        """模型没写 branch 时阶段内没有边：这是阶段 2 实测到的那个状态，仍能成图。"""
+        _, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                structure=_flow_structure(None))
+
+        assert [stage.edges for stage in ctx.candidate.stages] == [[], [], []]
+
+    def test_cross_stage_target_is_demoted_to_a_stage_edge(self):
+        """指向另一个阶段的判定出口：精确端点保不住 → 降级成阶段级的一条线。"""
+        structure = _flow_structure({"yes": "专家评审", "no": "通知补正"})
+        result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                     structure=structure)
+
+        content = ctx.candidate
+        # 阶段内只剩「否」那条（「是」指向另一个阶段）。
+        assert [(edge.target, edge.label) for edge in content.stages[1].edges] == [
+            ("b1-3", "否")]
+        stage_ids = {stage.id for stage in content.stages}
+        assert all(edge.source in stage_ids and edge.target in stage_ids
+                   for edge in content.edges)
+        # 降级过的跳转与骨架那条「是」指向同一对阶段：契约层去重只留一条。
+        branch_edges = [edge for edge in content.edges if edge.source == "s_b1"
+                        and edge.target == "s_b2"]
+        assert len(branch_edges) == 1
+
+
 # ---------------------------------------------------------------- 树（一个字不改）
 
 
@@ -405,12 +529,48 @@ class TestStructureAdapter:
             ],
         )
 
-        content, dropped = shapes.to_flow(tree)
+        content, loss = shapes.to_flow(tree)
 
-        assert dropped == 1
+        assert loss.dropped == 1
+        assert loss.demoted == 0
         assert len(content.edges) == 1
         assert (content.edges[0].source, content.edges[0].target) == ("s_p", "s_q")
         assert {stage.id for stage in content.stages} == {"s_p", "s_q"}
+
+    def test_to_flow_puts_same_stage_edges_into_the_stage(self):
+        """阶段**内部**的边落进 `FlowStage.edges`；跨阶段的深层跳转降级并计数。
+
+        这是 `FlowStage.edges` 存在的理由：判定节点的两条出边都在一个阶段里，
+        阶段之间没有它们的位置。
+        """
+        from app.contracts.mindmap import Edge
+
+        tree = MindMapContent(
+            title="t",
+            root=Node(id="r", label="t", children=[
+                Node(id="p", label="提交", children=[
+                    Node(id="p1", label="填表", children=[Node(id="p1a", label="校验")])]),
+                Node(id="q", label="审查", children=[Node(id="q1", label="核验")]),
+            ]),
+            edges=[
+                # 阶段内的判定出边：两端都在阶段 p 里。
+                Edge(id="b1", source="p1", target="p1a", label="是", kind="branch"),
+                # 阶段之间的深层跳转：p1a → q1，精确端点保不住，降级成 s_p → s_q。
+                Edge(id="b2", source="p1a", target="q1", label="否", kind="branch"),
+            ],
+        )
+
+        content, loss = shapes.to_flow(tree)
+
+        assert loss.inner == 1
+        assert loss.demoted == 1
+        assert loss.dropped == 0
+        first = content.stages[0]
+        assert [(edge.source, edge.target, edge.label) for edge in first.edges] == [
+            ("p1", "p1a", "是")]
+        # 阶段内边的端点仍是**节点** id，阶段间边的端点才是阶段 id。
+        assert [(edge.source, edge.target) for edge in content.edges] == [("s_p", "s_q")]
+        assert content.stages[1].edges == []
 
 
 # ---------------------------------------------------------------- 非树的编辑

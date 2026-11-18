@@ -38,7 +38,7 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import Any, Callable, Collection, Literal, Protocol, Sequence, TypeVar
+from typing import Any, Callable, Collection, Iterator, Literal, Protocol, Sequence, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -1573,6 +1573,217 @@ def clip_edge_label(value: Any) -> str | None:
     return text[:MAX_EDGE_LABEL_CHARS] if text else None
 
 
+# ---------------------------------------------------------------- 阶段内的判定出边
+#
+# 这一段的来历是一次实测：`FlowContent.edges` 的端点是**阶段 id**，而 `role="decision"`
+# 的节点在阶段**内部**——模型标出来的判定节点，它的「是 / 否」两条出边在两个数组里
+# 都没有位置，于是产出里 `branch` 边恒为 0。契约补了 `FlowStage.edges`（阶段内的边、
+# 端点用该阶段的节点 id），这里负责**从模型响应里把这两条边取出来**。
+#
+# 为什么在**结构那一次**产出、而不是单开一次调用：
+#   - 判定节点的两条出口是"这一步走哪条路"，而模型正在写这一步。等它写完一整棵树
+#     再问一次"哪两条路去哪"，它得把刚写的东西在上下文里重新读一遍，多花一次完整
+#     往返（十几秒 + 全额 token）换一个它此刻已经知道答案的问题；
+#   - 骨架那一次问不出来：那一次的响应里只有阶段标题，阶段内部的步骤还不存在；
+#   - 代价是结构那一次的提示词再长一段，而 role 那一段本来就在那里——实测
+#     `FLOW_TREE_RULES` 写在 system 里时一个 decision 都没标出来，把同一件事写到
+#     user 末尾才有效（见 `_generate` 里那段注释），所以这一段也写在那里。
+
+
+@dataclass(frozen=True)
+class _FlowBranch:
+    """模型写在判定节点上的两条出口，**还没解析成节点 id**。
+
+    `node_id` 是模型自己写的那个 id（它在同一份响应里自己编的，服务端不重分配），
+    `yes` / `no` 是目标的原始写法——可能是标题、可能是 id、可能是「结束」。
+    """
+
+    node_id: str
+    label: str
+    yes: str | None
+    no: str | None
+
+
+# 判定节点的出口写成这些词时表示"流程在这里结束"，不是一个节点。
+# 收小写 + 中文两种写法：模型对"结束"的英文写法在 `end` / `finish` / `stop` 之间摆，
+# 而它们都表达同一件事，为一个词的选择丢掉一条出口不值得。
+_FLOW_END_WORDS = frozenset({"结束", "end", "finish", "stop", "无", "none", "null"})
+
+
+def _branch_ends(value: Any) -> tuple[str | None, str | None]:
+    """`branch` 字段 → `(yes, no)`；认不出的形状返回 `(None, None)`。
+
+    三种写法都收，因为它们表达的是同一个东西：
+      - `{"yes": …, "no": …}`（提示词要求的形状）；
+      - `{"是": …, "否": …}`（模型把标签当成键）；
+      - `["…", "…"]`（两项数组，顺序即 是 / 否）。
+
+    容错的理由与 `_skeleton_edges` 的端点写法同源：这里丢掉的是**整条出口**，
+    而它比"字段名写歪了一位"严重得多。
+    """
+    def text_of(item: Any) -> str | None:
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+        return None
+
+    if isinstance(value, dict):
+        for yes_key, no_key in (("yes", "no"), ("是", "否"), ("true", "false"),
+                                ("y", "n"), ("通过", "不通过")):
+            if yes_key in value or no_key in value:
+                return text_of(value.get(yes_key)), text_of(value.get(no_key))
+        return None, None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return text_of(value[0]), text_of(value[1])
+    return None, None
+
+
+def _harvest_flow_branches(raw: Any) -> tuple[Any, list[_FlowBranch]]:
+    """从结构那一次的响应里摘出判定节点的 `branch`，并从 raw 里**删掉**它。
+
+    为什么必须删：`Node` 是 `extra="forbid"`，留着这个键整棵树会 422，用户看到的
+    是"模型返回的导图不合法"——而这条信息本来完全可以解析成一条边。所以摘取发生
+    在 `validate_generated_content` **之前**，且只对 `flowchart` 做（树与鱼骨的
+    提示词里没有这个字段，多跑一趟只会把"模型乱写的东西"当数据）。
+
+    只认 `role == "decision"` 的节点吗？**不认**。模型偶尔会把 `role` 写漏或写成
+    `"判断"`（不在 `Literal` 里会被契约拒，但那时整张图已经失败了），而它写了
+    `branch` 这件事本身就是"这一步有两条出口"的充分证据。多收一条边不会画错，
+    漏收一条就少一个出口。
+
+    深度优先、就地修改：`raw` 是刚解析出来的 dict，`deepcopy` 在
+    `validate_generated_content` 里还会做一次。
+    """
+    if not isinstance(raw, dict):
+        return raw, []
+    root = raw.get("root")
+    if not isinstance(root, dict):
+        return raw, []
+
+    found: list[_FlowBranch] = []
+    stack: list[dict[str, Any]] = [root]
+    while stack:
+        node = stack.pop()
+        node_id = node.get("id")
+        raw_branch = node.pop("branch", None)
+        if raw_branch is not None and isinstance(node_id, str) and node_id.strip():
+            yes, no = _branch_ends(raw_branch)
+            if yes is not None or no is not None:
+                label = node.get("label")
+                found.append(_FlowBranch(
+                    node_id=node_id.strip(),
+                    label=label.strip() if isinstance(label, str) else node_id.strip(),
+                    yes=yes, no=no,
+                ))
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(item for item in children if isinstance(item, dict))
+    return raw, found
+
+
+def _resolve_branch_target(
+    text: str | None, by_id: dict[str, str], by_label: dict[str, str],
+) -> str | None:
+    """一个出口的原始写法 → 真实节点 id；解析不出来返回 `None`。
+
+    三条写法依次试，与 `_skeleton_edges` 的端点解析同一条思路（"先认它能可靠写对
+    的东西"）：**id 优先**（它就是那一份响应里的 id，服务端没有重分配）、标题其次
+    （折叠空白后比对）、「结束」直接判无。
+    """
+    if text is None:
+        return None
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if candidate in by_id:
+        return by_id[candidate]
+    key = _skeleton_key(candidate)
+    if key.lower() in _FLOW_END_WORDS:
+        return None
+    return by_label.get(key)
+
+
+@dataclass
+class _BranchEdgeReport:
+    """阶段内边的解析结果：成功的边 + 三种没落地的原因各自的条数。"""
+
+    edges: list[Edge] = field(default_factory=list)
+    #: 判定节点自己不在树里（被裁剪掉、或模型写了一个没落树的 id）
+    lost_sources: int = 0
+    #: 出口写了一个对不上的目标（标题打错、指向一个不存在的节点）
+    unresolved: int = 0
+    #: 出口写成「结束」——不是失败，是流程在这里收尾
+    ended: int = 0
+    #: 两条出口指向同一个节点：两条边里只留「是」那条（画布上它们是同一条线）
+    same_target: int = 0
+
+
+def _flow_branch_edges(
+    branches: Sequence[_FlowBranch], content: MindMapContent,
+) -> _BranchEdgeReport:
+    """把 `_FlowBranch` 解析成契约边（**树命名空间**，端点是节点 id）。
+
+    为什么端点先用节点 id、到 `shapes.to_flow` 才分流：树上本来就只有一套节点 id，
+    而"这条边属于哪个阶段"是**形状转换**才知道的事（`to_flow` 会把节点分回各自
+    阶段）。在这里提前判阶段只会多一份"哪些节点属于哪个阶段"的映射。
+
+    **解析不出来就丢，不判失败**：边是结构的附加产物，一条写歪的出口不该把一整棵
+    已经长好的树判废（与 `_skeleton_edges` 的 `EDGE_DANGLING` 同一条取舍）。丢掉的
+    数量由调用方聚合成一条诊断。
+    """
+    nodes = list(_walk_tree(content.root))
+    by_id = {node.id: node.id for node in nodes}
+    # 同名节点**不解析**：一张图里两个「校验信息」很常见，按标题连过去可能连错那一个，
+    # 而错误的分支比缺失的分支更难被发现（它看起来完全合法）。
+    seen_labels: dict[str, str | None] = {}
+    for node in nodes:
+        key = _skeleton_key(node.label)
+        seen_labels[key] = node.id if key not in seen_labels else None
+    by_label = {key: value for key, value in seen_labels.items() if value is not None}
+
+    report = _BranchEdgeReport()
+    for ordinal, branch in enumerate(branches):
+        source = _resolve_branch_target(branch.node_id, by_id, by_label)
+        if source is None:
+            report.lost_sources += 1
+            continue
+        made: dict[str, str] = {}
+        for label, raw in (("是", branch.yes), ("否", branch.no)):
+            if raw is None:
+                continue
+            target = _resolve_branch_target(raw, by_id, by_label)
+            if target is None:
+                if _skeleton_key(raw).lower() in _FLOW_END_WORDS:
+                    report.ended += 1
+                else:
+                    report.unresolved += 1
+                continue
+            if target == source:
+                # 出口指回自己：契约层会按自环拒，而"这一步回到自己"在图上没有语义。
+                report.unresolved += 1
+                continue
+            if target in made.values():
+                report.same_target += 1
+                continue
+            made[label] = target
+            report.edges.append(Edge(
+                id=f"fb_{ordinal}_{label}_{uuid4().hex[:8]}",
+                source=source,
+                target=target,
+                label=label,
+                kind="branch",
+            ))
+    return report
+
+
+def _walk_tree(root: Node) -> Iterator[Node]:
+    """深度优先遍历一棵子树（含根）。`shapes.walk_nodes` 的树专用版本。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(node.children)
+
+
 @dataclass(frozen=True)
 class _BranchEvidence:
     """一条一级分支自己的检索结果：给模型看的那一段 + 用来筛引用的那几段原文。
@@ -2820,6 +3031,18 @@ _FLOW_BODY = (
     '- "end"：流程的终点，只在最后一个阶段收尾的那个节点上标一个；\n'
     '- 普通步骤写 "step" 或者干脆不写这个字段。\n'
     "role 只能是 step / decision / start / end 这四个值之一。\n"
+    # 判定节点的两条出口。**没有这一段时 `branch` 边恒为 0**：role 标了，边没地方
+    # 写，`FlowStage.edges`（阶段内的边）就一直是空的。目标写**节点标题**而不是 id
+    # —— id 是模型自己编的，它经常写错；标题它刚写完，抄得准。解析时 id 也认
+    # （见 `_resolve_branch_target`），所以两种写法都能落地。
+    '\n**标了 decision 的节点必须写出它的两条出口**：加一个 branch 字段，例如 '
+    '{"id":"…","label":"材料齐全吗","role":"decision",'
+    '"branch":{"yes":"转入审查","no":"通知补正"},"children":[]}。\n'
+    "yes / no 的值写**目标节点的标题原文**（同一份响应里某个节点的 label），"
+    "它可以是这个阶段后面的某一步，也可以是另一个阶段里的一步——判定本来就常常"
+    '跨阶段分支。流程在这里结束时写 "结束"。\n'
+    "**两条都要写**：缺一条，画布上那个判定就只有一个出口，读图的人看不出另一条路"
+    "去哪。也不要两条写成同一个节点（那是同一条线，等于只有一条分支）。\n"
     + _SKELETON_BODY
 )
 FLOW_TREE_RULES = _FLOW_ROOT_RULE + _FLOW_BODY
@@ -4378,14 +4601,26 @@ def _shape_output(
         _fishbone_shape_diagnostics(shaped, diagnostics)
         return shaped
     if diagram_type == "flowchart":
-        shaped, dropped = shapes.to_flow(content)
-        if dropped:
+        shaped, loss = shapes.to_flow(content)
+        if loss.dropped:
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.warn, code="FLOW_EDGE_DROPPED",
                 message=(
-                    f"{dropped} 条边连的是中心主题而不是阶段，已丢弃："
+                    f"{loss.dropped} 条边连的是中心主题而不是阶段，已丢弃："
                     "流程的主干由阶段的先后（数组顺序）表达，"
                     "「从主题出发」那条线在流程图上没有对应的位置"
+                ),
+            ))
+        if loss.demoted:
+            # 降级**必须说出来**：端点从"阶段 2 的某一步"退到"阶段 2"，画出来的
+            # 那条线还在，但它不再指向用户写的那一步。不说的话，用户会以为自己
+            # 的"驳回到补正资料"没被采纳。
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="FLOW_EDGE_DEMOTED",
+                message=(
+                    f"{loss.demoted} 条跨阶段的步骤跳转已按**阶段**落线："
+                    "阶段之间的边端点只能是阶段（`FlowContent.edges`），"
+                    "所以精确到步骤的那一端保不住，方向保留"
                 ),
             ))
         shaped = _stamp_flow_roles(shaped, diagnostics)
@@ -4637,6 +4872,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             '"role": "decision"；流程的第一步加 "role": "start"，最后收尾的那一步加 '
             '"role": "end"，普通步骤不用加。例如：'
             '{"id":"…","label":"校验信息完整性","role":"decision","children":[]}。'
+            # 两条出口与 role 写在同一处：它们是**同一个决定**的两半——标了判定却
+            # 没写出口，那个节点在画布上就只有一个出口（甚至零个），比不标还费解。
+            # 实测（`docs`/阶段 2 的记录）：只要求 role 时模型会标出 3–5 个判定节点，
+            # 而它们的出边数为 0——因为契约当时没有位置。
+            '\n**标了 decision 的节点，紧接着把它的两条出口一起写出来**：'
+            '在同一个节点对象上加 "branch" 字段，'
+            '{"yes":"走「是」时到的那个节点的标题","no":"走「否」时到的那个节点的标题"}。'
+            "标题要**逐字**抄这份响应里另一个节点的 label（可以是本阶段后面的某一步，"
+            '也可以是另一个阶段里的一步）；这条路到此结束时写 "结束"。'
         )
     if sections:
         user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"
@@ -4690,6 +4934,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # ---- 收尾：校验、裁剪、体检（与旧的整树出口同一套）--------------------------
     declared_refs = _raw_ref_count(raw)
     verify_sources = _verify_sources(ctx)
+    # 判定节点的两条出口在**校验之前**摘出来：`Node` 是 `extra="forbid"`，留着
+    # `branch` 这个键整棵树会 422，而它本来就是一条可解析的边（见 `_harvest_flow_branches`）。
+    flow_branches: list[_FlowBranch] = []
+    if diagram_type == "flowchart":
+        raw, flow_branches = _harvest_flow_branches(raw)
     # 证据只在真给过的时候传：空序列与"没给"必须是同一条路（`verify_source_refs`
     # 的空证据等价无证据，用例钉着逐字节不变）。
     evidence = tuple(ctx.evidence) if ctx.evidence else None
@@ -4743,6 +4992,33 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     content, edge_diagnostics = _apply_skeleton(
         content, plan, raw_plan, diagram_type=diagram_type)
     diagnostics.extend(edge_diagnostics)
+
+    # 判定节点的「是 / 否」两条出边（阶段**内部**的边）。也放在裁剪之后，理由与上面
+    # 那一句相同：端点表要按裁剪后还活着的节点建，否则 `clean_edges` 会把一条指向
+    # 已消失节点的边留在树里。这里只解析成**树命名空间**的边，分流到
+    # `FlowStage.edges` / `FlowContent.edges` 是 `_shape_output` 收尾时的事。
+    if flow_branches:
+        branch_report = _flow_branch_edges(flow_branches, content)
+        if branch_report.edges:
+            kept, branch_diag = clean_edges(
+                branch_report.edges, shapes.node_ids(content))
+            diagnostics.extend(branch_diag)
+            # 骨架的阶段间边在前、判定出边在后：`clean_edges` 去重按
+            # `(source, target, label)`，两批之间的重复（同一条出口被骨架也画了一次）
+            # 会在保存时被契约层去重，这里不合并判一次是因为那会把骨架那批的
+            # 诊断再报一遍。
+            content = content.model_copy(update={"edges": [*content.edges, *kept]})
+        dropped = branch_report.lost_sources + branch_report.unresolved
+        if dropped:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="FLOW_BRANCH_UNRESOLVED",
+                message=(
+                    f"{dropped} 条判定出口没有落到节点上（判定节点不在最终树里 "
+                    f"{branch_report.lost_sources} 条 / 目标写了一个对不上的标题 "
+                    f"{branch_report.unresolved} 条）：这些判定在画布上会缺一条分支。"
+                    "保留的边数见本条诊断之外的结构说明"
+                ),
+            ))
 
     # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------
     #
@@ -8297,6 +8573,16 @@ def _apply_ops_any(content: DiagramContent, batch: OpBatch) -> DiagramContent:
     **一批 op 只允许落在一棵子树里**（一根骨 / 一个阶段）。跨子树的搬动在数据上
     没有"它该属于哪根骨"的确定答案：那是三套结构各自的语义，属于阶段 3。这里明确
     报 `cross_container` 而不是猜一个位置——猜错的后果是内容静默地换了骨。
+
+    `add_edge` / `remove_edge` 在非树上**明确拒绝**（`edges_not_supported`）。
+    这不是"还没做"，是那个实现**会静默丢数据**：借道执行器时边落在那棵临时
+    `MindMapContent` 的 `edges` 里，而写回只换子树根（`replace_node` 只换 `root`）
+    ——工具回一句"已连接"，`ctx.candidate` 里一条边都没有。宁可说清楚，也不让
+    用户以为线画上了。
+
+    至于流程图的阶段内边该怎么由工具落库（`FlowStage.edges` 的端点是节点 id、
+    阶段间边的端点是阶段 id，一条 op 得先判它属于哪一层），那是 3c 的工具入口，
+    不在这里顺手编一个。
     """
     if isinstance(content, MindMapContent):
         return apply_ops(content, batch)
