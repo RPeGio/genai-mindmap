@@ -202,19 +202,42 @@ const edgeTargets = computed(() => {
  */
 const edgeNodeName = computed(() => store.edgeNameOf);
 
-/** 选中节点相关的边，拼成"谁 → 谁（标签）"给列表用。 */
-const selectedEdgeRows = computed(() => store.selectedEdges.map(edge => ({
-  id: edge.id,
-  text: `${edgeNodeName.value(edge.source)} → ${edgeNodeName.value(edge.target)}`,
-  label: edge.label ?? '',
-  kind: edge.kind ?? 'flow',
-})));
+/**
+ * 选中节点相关的边，拼成"谁 → 谁（标签）"给列表用。
+ *
+ * **两层分开两份**（而不是拼成一份带标记的列表）：阶段之间与阶段内部是两个数组、
+ * 两个命名空间（`FlowContent.edges` 的端点是阶段 id，`FlowStage.edges` 的端点是
+ * 该阶段的节点 id），界面上也确实是两种东西——一个是这张图的走向，一个是某一步上
+ * 的分叉。混在一列里用户读到"提交申请 → 付款"和"审不审 → 退回"会以为是同一类关系。
+ */
+function edgeRow(edge: { id: string; source: string; target: string; label?: string | null; kind?: string | null }) {
+  return {
+    id: edge.id,
+    text: `${edgeNodeName.value(edge.source)} → ${edgeNodeName.value(edge.target)}`,
+    label: edge.label ?? '',
+    kind: edge.kind ?? 'flow',
+  };
+}
+
+const selectedEdgeRows = computed(() => store.selectedEdges.map(edgeRow));
+
+/** 阶段内部的边（判定节点的「是 / 否」与步骤之间的顺序跳转）。 */
+const selectedInnerEdgeRows = computed(() => store.selectedInnerEdges.map(edgeRow));
+
+/** 两条列表加起来才是"这个节点有几条附加关系"。 */
+const selectedEdgeTotal = computed(
+  () => selectedEdgeRows.value.length + selectedInnerEdgeRows.value.length,
+);
 
 const edgeHint = computed(() => {
   if (!selected.value) return '';
   if (!store.content) return '先生成或打开一张导图。';
   if (store.busy) return '正在生成，完成之后才能加关系。';
-  if (store.contentEdges.length >= 200) return '附加关系已到上限（200 条），请先删掉一些。';
+  // 上限**两类各算 200**（判据与 store 的 `connectNodes` 一致）：阶段之间的边与
+  // 某个阶段内部的边是两份独立的账，合计起来算的话，一条吵闹的阶段会先把主轴的
+  // 额度吃光，而两者在画布上的规模本来就不成比例。
+  if (store.contentEdges.length >= 200) return '阶段之间的附加关系已到上限（200 条），请先删掉一些。';
+  if (store.contentInnerEdges.length >= 200) return '阶段内部的附加关系已到上限（200 条），请先删掉一些。';
   if (!edgeTarget.value) return '选一个终点节点，再点「连一条关系」。';
   return '关系只画连线，不会改变节点位置。';
 });
@@ -239,7 +262,9 @@ const edgeHint = computed(() => {
  * 也要有专属区块时，这个区别就是要害。
  */
 const showEdgeSection = computed(
-  () => (store.content?.diagram_type ?? 'tree') === 'flowchart' || store.contentEdges.length > 0,
+  () => (store.content?.diagram_type ?? 'tree') === 'flowchart'
+    || store.contentEdges.length > 0
+    || store.contentInnerEdges.length > 0,
 );
 
 /**
@@ -1494,6 +1519,12 @@ async function copyBody() {
             没有别的地方能改。删边同样在这里——画布上点线不做选中，因为节点
             已经有选中态了，两套选中语义混在一起会让「Delete 删什么」变得不可预测。
 
+            **两层分开列**：`FlowContent.edges`（阶段之间，端点用阶段 id）与
+            `FlowStage.edges`（阶段内部，端点用该阶段的节点 id）是两个数组、两个
+            命名空间。合成一列的话，"审不审 → 退回（否）"与"提交申请 → 付款"长得
+            一样，而它们在这张图里是两件不同的事：一个是主干走向，一个是某一步上的
+            分叉。删除按钮两边都有——只列不删等于把用户引进一个死胡同。
+
             `v-if` 的依据是产物自己的 `diagram_type`（见 `showEdgeSection`）：
             对思维导图与鱼骨图来说，"没有附加关系"不是缺陷而是定义。
           -->
@@ -1503,30 +1534,63 @@ async function copyBody() {
             aria-label="附加关系"
           >
             <h3 class="text-xs font-medium text-slate-500">
-              附加关系（{{ selectedEdgeRows.length }}）
+              附加关系（{{ selectedEdgeTotal }}）
             </h3>
-            <ul v-if="selectedEdgeRows.length" class="flex flex-col gap-1">
-              <li
-                v-for="row in selectedEdgeRows"
-                :key="row.id"
-                class="flex items-center gap-2 rounded-md border border-slate-200 px-2 py-1"
-                :class="row.kind === 'loop' ? 'border-amber-200 bg-amber-50' : ''"
-              >
-                <span class="min-w-0 flex-1 truncate text-xs text-slate-700" :title="row.text">
-                  {{ row.text }}
-                  <span v-if="row.label" class="text-slate-500">（{{ row.label }}）</span>
-                </span>
-                <button
-                  type="button"
-                  class="shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
-                  :title="`删除这条关系（${row.id}）`"
-                  @click="disconnectEdge(row.id)"
+            <!--
+              两组分开列。第一组是**阶段之间**的跳转（端点存在阶段 id 上），第二组
+              是**阶段内部**的判定出边（端点存在该阶段的节点 id 上）。合成一列的话，
+              "审不审 → 退回（否）"与"提交申请 → 付款"长得一模一样，而它们在这张图里
+              是两件不同的事：一个是主干的走向，一个是某一步上的分叉。
+            -->
+            <div v-if="selectedEdgeRows.length" class="flex flex-col gap-1">
+              <p v-if="selectedInnerEdgeRows.length" class="text-[11px] text-slate-400">阶段之间</p>
+              <ul class="flex flex-col gap-1">
+                <li
+                  v-for="row in selectedEdgeRows"
+                  :key="row.id"
+                  class="flex items-center gap-2 rounded-md border border-slate-200 px-2 py-1"
+                  :class="row.kind === 'loop' ? 'border-amber-200 bg-amber-50' : ''"
                 >
-                  删除
-                </button>
-              </li>
-            </ul>
-            <p v-else class="text-xs text-slate-400">
+                  <span class="min-w-0 flex-1 truncate text-xs text-slate-700" :title="row.text">
+                    {{ row.text }}
+                    <span v-if="row.label" class="text-slate-500">（{{ row.label }}）</span>
+                  </span>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                    :title="`删除这条关系（${row.id}）`"
+                    @click="disconnectEdge(row.id)"
+                  >
+                    删除
+                  </button>
+                </li>
+              </ul>
+            </div>
+            <div v-if="selectedInnerEdgeRows.length" class="flex flex-col gap-1">
+              <p class="text-[11px] text-slate-400">阶段内部（判定出口）</p>
+              <ul class="flex flex-col gap-1">
+                <li
+                  v-for="row in selectedInnerEdgeRows"
+                  :key="row.id"
+                  class="flex items-center gap-2 rounded-md border border-dashed border-slate-200 px-2 py-1"
+                  :class="row.kind === 'loop' ? 'border-amber-200 bg-amber-50' : ''"
+                >
+                  <span class="min-w-0 flex-1 truncate text-xs text-slate-700" :title="row.text">
+                    {{ row.text }}
+                    <span v-if="row.label" class="text-slate-500">（{{ row.label }}）</span>
+                  </span>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                    :title="`删除这条关系（${row.id}）`"
+                    @click="disconnectEdge(row.id)"
+                  >
+                    删除
+                  </button>
+                </li>
+              </ul>
+            </div>
+            <p v-if="!selectedEdgeTotal" class="text-xs text-slate-400">
               这个节点没有附加关系。流程图里的条件分支与回退线都记在这里。
             </p>
 

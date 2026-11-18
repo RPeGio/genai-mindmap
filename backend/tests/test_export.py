@@ -163,6 +163,117 @@ class NoteTextTest(unittest.TestCase):
         ET.fromstring(to_opml(content))
 
 
+class TwoLayerExportTest(unittest.TestCase):
+    """流程图与鱼骨图也要能导出，而且**阶段内部的边不能丢**。
+
+    在此之前三个文本导出函数的入参标着 `MindMapContent` 却真的去读 `content.root`：
+    一份 `FlowContent` 走到那里就是 `AttributeError`（接口 500）。这是同一处空洞的另
+    一半——契约上早就有两种形状了，导出侧一处都没跟上。
+
+    流程图还有第二个问题：它的边分成**两个数组、两个命名空间**（`content.edges` 的
+    端点是阶段 id，`stages[i].edges` 的端点是该阶段的节点 id）。只导一处的话，
+    判定节点的「是 / 否」在导出文件里一条都不剩，而"图上明明有两条线"是用户会
+    立刻发现的那种缺失。
+    """
+
+    def flow(self):
+        from app.contracts.mindmap import FlowContent
+        return FlowContent.model_validate({
+            "title": "报销流程",
+            "diagram_type": "flowchart",
+            "stages": [
+                {"id": "s_1", "root": {"id": "n1", "label": "提交申请", "children": [
+                    {"id": "n11", "label": "填单", "children": []},
+                    {"id": "n12", "label": "审不审", "children": []},
+                ]}, "edges": [
+                    {"id": "e_i1", "source": "n12", "target": "n11", "label": "否",
+                     "kind": "branch"},
+                ]},
+                {"id": "s_2", "root": {"id": "n2", "label": "付款", "children": []}},
+            ],
+            "edges": [{"id": "e_1", "source": "s_1", "target": "s_2", "label": "通过"}],
+        })
+
+    def fishbone(self):
+        from app.contracts.mindmap import FishboneContent
+        return FishboneContent.model_validate({
+            "title": "报销慢的原因分析",
+            "diagram_type": "fishbone",
+            "problem": "为什么报销要 11 天",
+            "bones": [
+                {"category": "人", "root": {"id": "b1", "label": "人", "children": [
+                    {"id": "c1", "label": "审批的人不在", "children": []}]}},
+                {"category": "机", "root": {"id": "b2", "label": "机", "children": []}},
+            ],
+        })
+
+    # ---- 流程图 ----
+
+    def test_flow_markdown_keeps_both_edge_layers(self):
+        text = to_markdown(self.flow())
+        self.assertTrue(text.startswith("# 报销流程"))
+        self.assertIn("### 1. 提交申请", text)
+        # 阶段之间的边：端点换成阶段名，读得懂"谁跳到谁"
+        self.assertIn("## 附加关系（阶段之间）", text)
+        self.assertIn("- 1. 提交申请 → 2. 付款（通过）", text)
+        # 阶段内部的边：端点用节点标题，行首带阶段名（否则两条 n1→n12 看起来一样）
+        self.assertIn("## 附加关系（阶段内部）", text)
+        self.assertIn("- [1. 提交申请] 审不审 → 填单（否）", text)
+
+    def test_flow_puml_is_mindmap_syntax_with_edge_comments(self):
+        text = to_puml(self.flow())
+        self.assertTrue(text.startswith("@startmindmap"))
+        self.assertTrue(text.rstrip().endswith("@endmindmap"))
+        # 阶段按顺序排成分支，读得出先后
+        self.assertIn("** 1. 提交申请", text)
+        self.assertIn("*** 填单", text)
+        # 两段边清单都是注释行：文件仍可解析（mindmap 语法里 `A --> B` 是语法错）
+        self.assertIn("' 1. 提交申请 --> 2. 付款 : 通过", text)
+        self.assertIn("' [1. 提交申请] 审不审 → 填单（否）", text)
+        # 文件头必须说明"这不是 activity 图"——不写的话读的人会以为丢了判定分支
+        self.assertIn("不是 PlantUML activity 图", text)
+
+    def test_flow_opml_is_valid_xml_with_edge_outlines(self):
+        root = ET.fromstring(to_opml(self.flow()))
+        labels = [node.get("text") for node in root.findall(".//outline")]
+        self.assertIn("1. 提交申请", labels)
+        self.assertIn("填单", labels)
+        self.assertIn("附加关系（阶段之间）", labels)
+        self.assertIn("附加关系（阶段内部）", labels)
+        self.assertIn("1. 提交申请 → 2. 付款（通过）", labels)
+        self.assertIn("[1. 提交申请] 审不审 → 填单（否）", labels)
+
+    def test_flow_without_inner_edges_has_no_inner_section(self):
+        from app.contracts.mindmap import FlowContent
+        content = FlowContent.model_validate({
+            "title": "t", "diagram_type": "flowchart",
+            "stages": [{"id": "s_1", "root": {"id": "n1", "label": "甲", "children": []}}],
+        })
+        self.assertNotIn("附加关系（阶段内部）", to_markdown(content))
+        self.assertNotIn("附加关系", to_puml(content))
+
+    # ---- 鱼骨图 ----
+
+    def test_fishbone_exports_the_problem_as_the_head(self):
+        content = self.fishbone()
+        self.assertIn("* 为什么报销要 11 天", to_puml(content))
+        self.assertIn("** 人", to_puml(content))
+        md = to_markdown(content)
+        self.assertIn("- 为什么报销要 11 天", md)
+        self.assertIn("  - 审批的人不在", md)
+        # 鱼骨图没有 `edges`，三种格式都不该冒出边清单
+        self.assertNotIn("附加关系", md)
+
+    def test_fishbone_opml_nesting_is_preserved(self):
+        root = ET.fromstring(to_opml(self.fishbone()))
+        head = root.find("./body/outline")
+        self.assertEqual(head.get("text"), "为什么报销要 11 天")
+        bones = [node.get("text") for node in head.findall("./outline")]
+        self.assertEqual(bones, ["人", "机"])
+        self.assertEqual([node.get("text") for node in head.findall("./outline/outline")],
+                         ["审批的人不在"])
+
+
 class ByteIdenticalTest(unittest.TestCase):
     """三种既有格式的输出**逐字节**钉死。
 

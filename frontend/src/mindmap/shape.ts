@@ -298,7 +298,24 @@ export function edgesOfContent(content: DiagramContent): MindEdge[] {
 }
 
 /**
- * **画布上用的边**：流程图的阶段跳转要把端点换成"阶段入口节点"的 id。
+ * **阶段内部**的附加边：`stages[i].edges` 这一批。
+ *
+ * 端点是**该阶段自己的节点 id**（与 `FlowContent.edges` 的阶段 id 是两个命名
+ * 空间，见 `types.ts::FlowStage`）。它此前一处也读不到——不是画歪，是没有代码
+ * 在找它：所有读边的地方都走 `edgesOfContent()`，而那个函数读的是
+ * `content.edges`（阶段之间那一层）。
+ *
+ * **不改 `edgesOfContent()` 的语义**：它是"内容真相"，侧栏删除要靠它知道该删
+ * 哪一层数组（阶段内的边删的是 `stage.edges`，阶段间的删 `content.edges`）。
+ * 所以这里另起一个函数，让"阶段内"这一层有名字、有调用点、可数。
+ */
+export function stageInnerEdgesOf(content: DiagramContent): MindEdge[] {
+  if (!isFlow(content)) return [];
+  return content.stages.flatMap(stage => stage.edges ?? []);
+}
+
+/**
+ * **画布上用的阶段间边**：流程图的阶段跳转要把端点换成"阶段入口节点"的 id。
  *
  * `FlowContent.edges` 的端点是**阶段 id**（`s_…`），而画布上所有坐标、句柄、连线
  * 都按**节点 id** 索引。不换的话有两个后果，都不是"少画一条线"那么轻：
@@ -310,8 +327,16 @@ export function edgesOfContent(content: DiagramContent): MindEdge[] {
  * 换取的是"画布视角"的端点，**不是**内容的真相：`content.edges` 一个字节都不动，
  * 侧栏（`contentEdges` / `selectedEdges` / 删除）读的仍是阶段 id。边界就在这里——
  * 画布那一条路读 `canvasEdgesOf()`，其余全部读 `edgesOfContent()`。
+ *
+ * ## 为什么这一路单独存在（而不是并进 `canvasEdgesOf`）
+ *
+ * 因为**布局**要的正是"只有阶段间"这一路：`layoutFlow` 用 dagre 按边分层，一条
+ * 阶段内的「是 / 否」出边（`order.has(node.id)` 为 true）会把目标步骤强行推到下一
+ * rank，与 `Edge` 契约里"边不参与布局"直接冲突——加了边之后流程图的分层会变形，
+ * 而且看起来"像是 dagre 该做的"。所以两路各有各的名字：布局吃这一个，画布吃
+ * `canvasEdgesOf`（= 这一路 + 阶段内那一路）。
  */
-export function canvasEdgesOf(content: DiagramContent): MindEdge[] {
+export function canvasStageEdgesOf(content: DiagramContent): MindEdge[] {
   const edges = edgesOfContent(content);
   if (!isFlow(content)) return edges;
   const entry = new Map(content.stages.map(stage => [stage.id, stage.root.id]));
@@ -324,6 +349,23 @@ export function canvasEdgesOf(content: DiagramContent): MindEdge[] {
     out.push({ ...edge, source, target });
   }
   return out;
+}
+
+/**
+ * **画布上要画的全部边**：阶段间（上面那一路）+ 阶段内（原样追加）。
+ *
+ * 阶段内边的端点**本来就是节点 id**，所以不做任何映射。这里必须**追加**而不是
+ * 丢进上面那个 `entry` 映射里：那段循环对"端点不是已知阶段"会 `continue`，阶段内
+ * 边的端点永远不是阶段 id——直接拼进去会被静默吞掉，而表现正好是"契约上有了、
+ * 视觉上完全没有"。
+ *
+ * 没有阶段内边时返回的就是 `canvasStageEdgesOf()` 的那个数组**本身**（树型下
+ * 更是 `content.edges` 原对象）：不复制、不重排，树的行为一个字节都不变。
+ */
+export function canvasEdgesOf(content: DiagramContent): MindEdge[] {
+  const outer = canvasStageEdgesOf(content);
+  const inner = stageInnerEdgesOf(content);
+  return inner.length === 0 ? outer : [...outer, ...inner];
 }
 
 /** 阶段 id → 那个阶段的根节点（只有流程有）。 */

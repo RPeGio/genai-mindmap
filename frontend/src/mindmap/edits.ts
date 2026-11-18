@@ -1,5 +1,14 @@
 import type { DiagramContent, EdgeKind, MindEdge, MindNode, NodeColor } from '../api/types';
-import { containersOf, edgesOfContent, isFishbone, isFlow, rootsOf, stageOfNode } from './shape';
+import {
+  containersOf,
+  edgesOfContent,
+  isFishbone,
+  isFlow,
+  rootsOf,
+  stageInnerEdgesOf,
+  stageOfNode,
+  walkNodes,
+} from './shape';
 
 /**
  * 与服务端 Pydantic 约束逐条对应（`backend/app/contracts/mindmap.py`）：
@@ -116,6 +125,23 @@ export function newEdgeId(): string {
 }
 
 /**
+ * 边 id 是**两个数组共用**的一个命名空间（契约 `FlowContent.validate_flow` 会跨
+ * `content.edges` 与全部 `stages[i].edges` 查重名）。所以生成 id 时要拿两边已有的
+ * id 一起避开，否则随机撞上之后表现是"另一条边永远画不出来"。
+ */
+function freshEdgeId(content: DiagramContent): string {
+  const taken = new Set([
+    ...edgesOf(content).map(edge => edge.id),
+    ...stageInnerEdgesOf(content).map(edge => edge.id),
+  ]);
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const candidate = newEdgeId();
+    if (!taken.has(candidate)) return candidate;
+  }
+  return newEdgeId();
+}
+
+/**
  * 加一条边。返回新内容与这条边；**不动原对象**。
  *
  * 与 `addChild` 同一套约定：纯函数、结构共享、调用方拿到新内容自己决定何时提交。
@@ -129,10 +155,11 @@ export function newEdgeId(): string {
  * ## 三种形状各连的是什么（这里唯一需要判形状的地方）
  *
  *  - 树：端点是**节点 id**，与入参一致；
- *  - 流程：`FlowContent.edges` 的端点是**阶段 id**，而入参（界面上的下拉框、
- *    模型给的 op）是节点 id。所以这里把两个节点各自映到它所在的阶段再落库——
- *    映射不到的（节点不在流程里）与同一阶段内部的（后端契约明确说"暂不支持
- *    阶段内部步骤之间的边"）都当场拒掉，别让它到保存时才 422；
+ *  - 流程：**两个数组、两个命名空间**（契约 `FlowStage` 的注释）。两个端点在
+ *    **不同**阶段 → 写 `content.edges`，端点换成各自的**阶段 id**；两个端点在
+ *    **同一个**阶段 → 写那个阶段的 `stage.edges`，端点保持**节点 id**。后者正是
+ *    判定节点的「是 / 否」两条出边——此前这里明确拒绝（"同一个阶段里的步骤之间
+ *    暂不支持连关系"），于是模型标出的判定节点在画布上没有出口，而用户也补不上；
  *  - 鱼骨：顶层结构里根本没有 `edges`，加不了。说清楚比静默丢弃好。
  */
 export function addEdge(
@@ -147,43 +174,132 @@ export function addEdge(
     throw new Error('鱼骨图暂不支持附加关系：它的一级结构是类别，跨骨的关系还没有语义');
   }
 
-  let from = source;
-  let to = target;
+  const text = (label ?? '').trim();
+  const normalized = text ? text.slice(0, LIMITS.edgeLabel) : null;
+
   if (isFlow(content)) {
     const sourceStage = stageOfNode(content, source);
     const targetStage = stageOfNode(content, target);
     if (!sourceStage || !targetStage) throw new Error('端点节点不存在');
-    if (sourceStage === targetStage) {
-      throw new Error('同一个阶段里的步骤之间暂不支持连关系，请连到别的阶段');
+    const duplicated = (items: readonly MindEdge[], from: string, to: string) => items.some(
+      edge => edge.source === from && edge.target === to && (edge.label ?? null) === normalized,
+    );
+
+    if (sourceStage !== targetStage) {
+      const edges = edgesOf(content);
+      if (duplicated(edges, sourceStage, targetStage)) throw new Error('这条关系已经存在');
+      const edge: MindEdge = {
+        id: freshEdgeId(content),
+        source: sourceStage,
+        target: targetStage,
+        label: normalized,
+        kind: kind ?? null,
+      };
+      return { content: { ...content, edges: [...edges, edge] }, edge };
     }
-    from = sourceStage;
-    to = targetStage;
-  } else {
-    if (!findNode(content.root, source)) throw new Error('起点节点不存在');
-    if (!findNode(content.root, target)) throw new Error('终点节点不存在');
+
+    // 同一个阶段内部：端点就是两个节点的 id，落进这个阶段自己的数组。
+    const stage = content.stages.find(item => item.id === sourceStage)!;
+    const inner = stage.edges ?? [];
+    if (duplicated(inner, source, target)) throw new Error('这条关系已经存在');
+    const edge: MindEdge = {
+      id: freshEdgeId(content),
+      source,
+      target,
+      label: normalized,
+      kind: kind ?? null,
+    };
+    return {
+      content: {
+        ...content,
+        stages: content.stages.map(item => (
+          item.id === sourceStage ? { ...item, edges: [...inner, edge] } : item
+        )),
+      },
+      edge,
+    };
   }
 
-  const text = (label ?? '').trim();
-  const normalized = text ? text.slice(0, LIMITS.edgeLabel) : null;
+  if (!findNode(content.root, source)) throw new Error('起点节点不存在');
+  if (!findNode(content.root, target)) throw new Error('终点节点不存在');
+
   const edges = edgesOf(content);
-  if (edges.some(edge => edge.source === from && edge.target === to
+  if (edges.some(edge => edge.source === source && edge.target === target
     && (edge.label ?? null) === normalized)) {
     throw new Error('这条关系已经存在');
   }
 
   const edge: MindEdge = {
-    id: newEdgeId(),
-    source: from,
-    target: to,
+    id: freshEdgeId(content),
+    source,
+    target,
     label: normalized,
     kind: kind ?? null,
   };
   return { content: { ...content, edges: [...edges, edge] }, edge };
 }
 
-/** 删一条边。只动 `edges`，树一个字节都不变。 */
+/**
+ * 删一条边。只动装着它的那个数组，树与另一个数组一个字节都不变。
+ *
+ * **按 id 查两个数组**：阶段内的边活在 `stages[i].edges` 里，只查 `content.edges`
+ * 的话，侧栏列出来（`stageInnerEdgesOf` 读得到）却删不掉——按钮点了没反应，而
+ * 用户只会以为界面坏了。
+ */
 export function removeEdge(content: DiagramContent, edgeId: string): DiagramContent {
+  if (isFlow(content)) {
+    const holder = content.stages.find(stage => (stage.edges ?? []).some(edge => edge.id === edgeId));
+    if (holder) {
+      // 只重写持有它的那一个阶段：其余阶段保持原对象（结构共享），
+      // 撤销栈与 diff 都靠"没变的还是同一个引用"这件事省事。
+      return {
+        ...content,
+        stages: content.stages.map(stage => (
+          stage === holder
+            ? { ...stage, edges: (stage.edges ?? []).filter(edge => edge.id !== edgeId) }
+            : stage
+        )),
+      };
+    }
+  }
   return { ...content, edges: edgesOf(content).filter(edge => edge.id !== edgeId) };
+}
+
+/**
+ * 删掉一批节点之后，把端点已经不存在的边一起清掉。**两张表都清**。
+ *
+ * 与后端 `ops::_apply_remove` 同一语义（"删节点连带删边"）：留着悬空边，下一次
+ * 保存就是 422，而报错指向某条边，与用户刚才做的事隔得很远。
+ *
+ * 三种形状各自的"边端点是节点 id"这一层不同：
+ *  - 树：`content.edges` 的端点就是节点 id；
+ *  - 流程：`content.edges` 的端点是**阶段 id**（删一个步骤碰不到它），而
+ *    `stages[i].edges` 的端点才是**该阶段的节点 id**——这一层以前没有读者，所以
+ *    "流程删节点不用管边"曾经是成立的；现在它不成立了；
+ *  - 鱼骨：本来就没有边。
+ */
+export function dropDanglingEdges(content: DiagramContent, doomed: Set<string>): DiagramContent {
+  const alive = (edge: MindEdge) => !doomed.has(edge.source) && !doomed.has(edge.target);
+
+  if (isFishbone(content)) return content;
+
+  if (isFlow(content)) {
+    let hit = false;
+    const stages = content.stages.map(stage => {
+      const inner = stage.edges ?? [];
+      const kept = inner.filter(alive);
+      if (kept.length === inner.length) return stage;
+      hit = true;
+      return { ...stage, edges: kept };
+    });
+    // 一条都没删到时返回**同一个对象**：调用方靠引用相等判断"这次什么都没变"，
+    // 无谓的复制会让"删节点却没删掉边"看起来像改过。
+    return hit ? { ...content, stages } : content;
+  }
+
+  const edges = edgesOf(content);
+  const kept = edges.filter(alive);
+  return kept.length === edges.length ? content : { ...content, edges: kept };
 }
 
 /**
@@ -474,6 +590,33 @@ export function validateDraft(content: DiagramContent): string | null {
     if (edge.source === edge.target) return `附加关系 ${edge.id} 的起点与终点不能是同一个${edgeNoun}`;
     if (charLength(edge.label ?? '') > LIMITS.edgeLabel) {
       return `附加关系 ${edge.id} 的文字超过 ${LIMITS.edgeLabel} 个字`;
+    }
+  }
+
+  // 阶段**内部**的边是另一个命名空间（端点是该阶段自己的节点 id），判据一模一样、
+  // 集合不同——与后端 `FlowContent.validate_flow` 逐条对应：先查逐阶段端点，再查
+  // **两个数组之间**的边 id 唯一性（`edgeIds` 是共用的那一份）。
+  //
+  // 不在这里拦的话，一张"阶段内边连到了另一个阶段的节点"的图会一路存到后端才
+  // 422，而报错只说"边 X 的终点节点 Y 不在阶段 s_2 里"，用户手上没有任何线索。
+  if (isFlow(content)) {
+    for (const stage of content.stages) {
+      const own = new Set<string>();
+      for (const node of walkNodes(stage.root)) own.add(node.id);
+      for (const edge of stage.edges ?? []) {
+        if (edgeIds.has(edge.id)) return `边 ID 必须唯一（重复的是 ${edge.id}）`;
+        edgeIds.add(edge.id);
+        if (!own.has(edge.source) || !own.has(edge.target)) {
+          const missing = !own.has(edge.source) ? edge.source : edge.target;
+          return `附加关系 ${edge.id} 指向不存在的节点 ${missing}（不在阶段 ${stage.id} 里）`;
+        }
+        if (edge.source === edge.target) {
+          return `附加关系 ${edge.id} 的起点与终点不能是同一个节点`;
+        }
+        if (charLength(edge.label ?? '') > LIMITS.edgeLabel) {
+          return `附加关系 ${edge.id} 的文字超过 ${LIMITS.edgeLabel} 个字`;
+        }
+      }
     }
   }
 

@@ -36,6 +36,16 @@ const props = defineProps<EdgeProps<{
    * 完全可能指向上一层，那时它在读图人的眼里就是回退，得画成虚线。
    */
   back?: boolean;
+  /**
+   * 这条边在**阶段内部**（`FlowStage.edges`：判定节点的「是 / 否」出边、步骤之间的
+   * 顺序跳转），而不是阶段之间的主轴跳转。
+   *
+   * 两者必须分得开：阶段间是这张图的**主轴**（提交 → 审查 → 付款），阶段内是某一
+   * 步上的**分叉**。画成同一个粗细时，一条「否」在画面上与"下一阶段"没有任何区别，
+   * 读图的人会顺着它把流程读错。所以阶段内一律细一档、淡一档，`kind` 的颜色仍然
+   * 保留（「是 / 否」靠颜色分辨这件事不能被削弱）。
+   */
+  inner?: boolean;
 }>>();
 
 /** 缺省按 `flow` 画：`kind` 为 `null` 的边就是普通顺序箭头。 */
@@ -47,11 +57,22 @@ const STYLES: Record<EdgeKind, { stroke: string; dash?: string; width: number }>
   loop: { stroke: '#f59e0b', width: 2, dash: '6 4' },
 };
 
+/**
+ * 阶段内边的画法：**细一档**，且 `flow` 再淡一档。
+ *
+ * 只改粗细不该有争议；`flow` 那条额外换色是有原因的——阶段内的顺序跳转没有语义
+ * 颜色可用，若与阶段间的 `flow` 同为 `#94a3b8`，两条 1px/1.5px 的灰线在缩放之后
+ * 几乎分不开。`branch` / `loop` 保持原色：它们靠颜色说明"是 / 否 / 退回"，那层信息
+ * 不能因为"这是细线"而丢掉。
+ */
+const INNER_STROKE = '#cbd5e1';
+
 const style = computed(() => {
   const preset = STYLES[kind.value];
+  const inner = props.data?.inner === true;
   return {
-    stroke: preset.stroke,
-    strokeWidth: preset.width,
+    stroke: inner && kind.value === 'flow' ? INNER_STROKE : preset.stroke,
+    strokeWidth: inner ? Math.max(1, preset.width - 0.75) : preset.width,
     // 回退线一律虚线；`loop` 本来就是虚线，不必再叠一层短划。
     strokeDasharray: preset.dash ?? (props.data?.back ? '4 3' : undefined),
   };
@@ -78,7 +99,9 @@ const path = computed(() => getSmoothStepPath({
 
 const labelText = computed(() => (props.data?.label ?? '').trim());
 
-/** 标签底色跟着 kind 走：徽标落在线上时，颜色是"这条线是什么"的第二重信号。 */
+/**
+ * 标签底色跟着 kind 走：徽标落在线上时，颜色是"这条线是什么"的第二重信号。
+ */
 const labelClass = computed(() => (
   kind.value === 'branch'
     ? 'border-indigo-300 bg-indigo-50 text-indigo-800'
@@ -86,6 +109,9 @@ const labelClass = computed(() => (
       ? 'border-amber-300 bg-amber-50 text-amber-800'
       : 'border-slate-200 bg-white text-slate-600'
 ));
+
+/** 阶段内的标签比主轴的再小一号：细线配大徽标会把那条线压得看不见。 */
+const labelSize = computed(() => (props.data?.inner === true ? 'text-[10px]' : 'text-[11px]'));
 </script>
 
 <template>
@@ -109,8 +135,8 @@ const labelClass = computed(() => (
   />
   <EdgeLabelRenderer v-if="labelText">
     <div
-      class="nodrag nopan pointer-events-none absolute rounded border px-1.5 py-0.5 text-[11px] leading-none shadow-sm"
-      :class="labelClass"
+      class="nodrag nopan pointer-events-none absolute rounded border px-1.5 py-0.5 leading-none shadow-sm"
+      :class="[labelClass, labelSize]"
       :style="{
         transform: `translate(-50%, -50%) translate(${path[1]}px, ${path[2]}px)`,
       }"

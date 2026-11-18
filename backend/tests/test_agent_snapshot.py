@@ -241,23 +241,44 @@ class TestEditOnNonTreeShapes:
         assert result.data["code"] == "cross_container"
         assert "每一个阶段是一棵独立的子树" in result.content
 
-    def test_add_edge_is_refused_rather_than_silently_lost(self):
-        """`add_edge` 在非树上明确拒绝。
+    def test_add_edge_lands_in_the_right_layer_of_a_flow(self):
+        """`add_edge` 在流程图上**按层级落笔**，不再拒绝。
 
-        它原本会**静默丢**：借道 `apply_ops` 时边落在那棵临时 `MindMapContent` 的
-        `edges` 里，而写回只换子树根——工具回一句"已连接"，候选图里一条边都没有。
-        让用户以为线画上了，比拒绝他严重得多。
+        它曾经明确拒绝（`edges_not_supported`），因为那时实现会**静默丢**：借道
+        `apply_ops` 时边落在那棵临时 `MindMapContent` 的 `edges` 里，而写回只换子树
+        根——工具回一句"已连接"，候选图里一条边都没有。让用户以为线画上了，比拒绝
+        他严重得多。
+
+        现在判层级这一层真的存在了（`ops.resolve_flow_edge_placement` 与生成侧的
+        `shapes._split_edges` 同一套规则），所以这条路径上要守的东西变了：
+        **同阶段的两个步骤落在 stage.edges、端点保持节点 id；跨阶段落在 content.edges、
+        端点换成阶段 id**。落错数组的表现是"画出来多了一条主轴"，比丢掉更隐蔽。
         """
         ctx = _ctx(_flow_payload())
-
+        # a1 与 b1 分属两个阶段 → 阶段之间的连线，端点换成 s_1 → s_2。
         result = _add_edge(AddEdgeArgs(source="a1", target="b1", label="否"), ctx)
 
-        assert not result.ok
-        assert result.data["code"] == "edges_not_supported"
-        # 文案要说清"位置有了、入口还没有"，而不是"不支持这两种图"——前者是现状，
-        # 后者会让用户以为流程图永远画不了连线。
-        assert "阶段之间" in result.content and "阶段内部" in result.content
-        assert "没有任何内容被改动" in result.content
+        assert result.ok, result.content
+        assert isinstance(ctx.candidate, FlowContent)
+        assert [(edge.source, edge.target) for edge in ctx.candidate.edges] == [
+            ("s_1", "s_2"), ("s_1", "s_2")]
+        assert result.data["edge_layer"] == "stage"
+        assert "阶段之间" in result.content
+
+    def test_add_edge_inside_one_stage_lands_in_that_stage(self):
+        """同一阶段里的两个步骤 → 那个阶段的 `edges`，端点**保持节点 id**。"""
+        ctx = _ctx(_flow_payload())
+        result = _add_edge(AddEdgeArgs(source="a1", target="a", label="退回"), ctx)
+
+        assert result.ok, result.content
+        assert isinstance(ctx.candidate, FlowContent)
+        stage = ctx.candidate.stages[0]
+        assert [(edge.source, edge.target, edge.label) for edge in stage.edges] == [
+            ("a1", "a", "退回")]
+        # 阶段之间那一层一个字节都没动（新增的只有原来那条）
+        assert [(edge.source, edge.target) for edge in ctx.candidate.edges] == [("s_1", "s_2")]
+        assert result.data["edge_layer"] == "inner"
+        assert "阶段内边" in result.content
 
     def test_the_executor_itself_refuses_edge_ops_on_a_fishbone(self):
         """执行器自己也不接这一批：它不该在"写不回去"的路径上返回成功。

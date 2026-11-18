@@ -10,6 +10,7 @@ import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import {
   canvasEdgesOf,
+  canvasStageEdgesOf,
   canvasTreeOf,
   containerNoun,
   containerOfNode,
@@ -25,6 +26,7 @@ import {
   pathToIn,
   replaceContainer,
   rootsOf,
+  stageInnerEdgesOf,
   stageOfNode,
 } from '../mindmap/shape';
 import { sourceInputError } from '../sources/input';
@@ -36,6 +38,7 @@ import {
   addEdge as addEdgeToContent,
   addSibling,
   charLength,
+  dropDanglingEdges,
   edgesOf,
   findNode,
   LIMITS,
@@ -642,8 +645,23 @@ interface RenderSource {
    *
    * 这是"树 + 边"能成立的前提之一——边要是参与布局，用户每连一条线，整张画布
    * 都会重排，他刚记住的位置就没了。预览（生成中）没有边，是空数组。
+   *
+   * 流程图上这里装的是**两路**（阶段之间 + 阶段内部，见 `shape.canvasEdgesOf`）：
+   * 两路都要画出来，否则契约里已经有的判定出边在画面上一条都看不见。
    */
   edges: MindEdge[];
+  /**
+   * **喂给布局**的那一路边：只有阶段**之间**的（缺省 = `edges`）。
+   *
+   * 与 `edges` 分成两个字段，而不是让布局函数自己过滤：`layoutFlow` 分不出这两
+   * 层——阶段内边的端点也是节点 id，`order.has()` 一样为 true，它会老老实实把
+   * 一条「是 / 否」出边当成"下一步"排进 dagre，把目标步骤推到下一层。那不叫
+   * "dagre 该做的"，那是布局在吃它不该吃的东西（`Edge` 契约写明边不参与布局）。
+   *
+   * 树与鱼骨没有这个区别（`canvasStageEdgesOf` 与 `canvasEdgesOf` 返回同一个
+   * 数组），所以那两种形状下这两个字段相等，布局输入一个字节都没变。
+   */
+  layoutEdges?: MindEdge[];
 }
 
 /** 共用的空表：非预览来源不需要这份映射，别每次重算都新建一个。 */
@@ -1342,9 +1360,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
         syntheticId: tree.synthetic ? tree.root.id : null,
         kind: 'content',
         expandable: NO_EXPANDABLE,
-        // 画布用的边：流程图的阶段跳转在这里换成阶段入口节点的 id（见 `canvasEdgesOf`）。
-        // 侧栏与删除仍然读 `contentEdges`，那是内容真相。
+        // 画布用的边：流程图的阶段跳转在这里换成阶段入口节点的 id（见 `canvasEdgesOf`），
+        // 阶段内的边原样追加在后面。侧栏与删除仍然读内容数组，那是内容真相。
         edges: canvasEdgesOf(content.value),
+        // 布局只吃阶段**之间**那一路（见 `RenderSource.layoutEdges`）：阶段内的判定
+        // 出边要是进了 dagre，整张流程图的分层就会为了两条"是 / 否"变形。
+        layoutEdges: canvasStageEdgesOf(content.value),
       };
     }
     if (agentPreview.value) {
@@ -1369,7 +1390,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (!source) return null;
     return layoutDiagram({
       root: source.root,
-      edges: source.edges,
+      // 布局吃 `layoutEdges`（流程图里只有阶段间边），画布吃 `edges`。两者在树与
+      // 鱼骨上同一个数组，所以那两种形状的入参与改动前逐字节相同。
+      edges: source.layoutEdges ?? source.edges,
       // 生成中的预览没有 content，也就还没有图型：那一刻按树排，节点一个一个长出来
       // 的样子与旧行为一致。等 `done` 把结果装进 content，图型才第一次生效。
       diagramType: diagramTypeOf(content.value),
@@ -1397,25 +1420,40 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 向上穿过整张图的线，正好压在主干上。它们一律改走**左侧**（出左、进左），
    * 绕在图的边上。这也是 `backEdges` 唯一的用处：判定归布局，接线归这里。
    */
+  /**
+   * **阶段内部**边的 id 集合：这些边在画布上画成细线（`MindEdge.vue` 的 `inner`）。
+   *
+   * 判据只能从内容取，不能从 `renderSource.edges` 反推：后者已经把阶段间的端点
+   * 换成了节点 id，两路混在一起之后，"这条线是主轴还是判定出边"在数组里再也看不
+   * 出来。用 id 对齐是唯一可靠的对应关系（边 id 在两张表里都唯一，契约层硬保证）。
+   */
+  const innerEdgeIds = computed<Set<string>>(() => {
+    const current = content.value;
+    return new Set(current ? stageInnerEdgesOf(current).map(edge => edge.id) : []);
+  });
+
   const attachEdges = computed(() => {
     const current = layout.value;
     const source = renderSource.value;
     if (!current || !source) return [];
 
-    const out: Array<{ edge: MindEdge; side: ChildSide; targetSide: ChildSide }> = [];
+    const out: Array<{
+      edge: MindEdge; side: ChildSide; targetSide: ChildSide; inner: boolean;
+    }> = [];
     for (const edge of source.edges) {
       const from = current.positions.get(edge.source);
       const to = current.positions.get(edge.target);
       if (!from || !to) continue;
+      const inner = innerEdgeIds.value.has(edge.id);
       if (current.backEdges?.has(edge.id)) {
-        out.push({ edge, side: 'left', targetSide: 'left' });
+        out.push({ edge, side: 'left', targetSide: 'left', inner });
         continue;
       }
       const side = childSide(from, to, current.direction);
       // 与父子线同一套端点约定（见 `edges` 里 targetHandle 那一行）：从哪一侧出去，
       // 就从对面那侧进来。
       const targetSide: ChildSide = side === 'left' ? 'right' : side === 'right' ? 'left' : 'top';
-      out.push({ edge, side, targetSide });
+      out.push({ edge, side, targetSide, inner });
     }
     return out;
   });
@@ -1608,7 +1646,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     //     一个默认标签块，样式没法跟着 kind 变。
     //   - id 前缀 `attach:`，避免与 `${parentId}->${node.id}` 这种父子线 id 撞车
     //     （两个节点之间可以同时存在父子线与一条回退线，id 撞了只会剩一条）。
-    for (const { edge, side, targetSide } of attachEdges.value) {
+    for (const { edge, side, targetSide, inner } of attachEdges.value) {
       out.push({
         id: `attach:${edge.id}`,
         source: edge.source,
@@ -1623,7 +1661,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
           // 布局判出来的回退（目标层号 ≤ 源层号）。它是**几何事实**，与 `kind`
           // 不冲突：`kind` 说这条线是什么关系（是/否/回退），`back` 说它在这张
           // 图的层级里是不是在往回走。只有流程图会给它，树图型下恒为 undefined。
+          //
+          // 阶段内的边永远不会进这里：它们不参与分层，也就没有"回退"这个判据
+          // （`layoutFlow` 从未见过它们，`backEdges` 里不可能有它们的 id）。
           back: current.backEdges?.has(edge.id) || undefined,
+          // 阶段内部的边（判定节点的「是 / 否」）。画成细线，否则一条"否"看起来
+          // 与阶段之间的主轴跳转一模一样，读图的人分不出哪条是主干。
+          inner: inner || undefined,
         },
       });
     }
@@ -1689,6 +1733,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const contentEdges = computed<MindEdge[]>(() => edgesOf(content.value));
 
   /**
+   * 已应用内容里的**阶段内部**边（`stages[i].edges`）。
+   *
+   * 与 `contentEdges` 分成两个 computed 而不是并成一个：它们是**两个数组、两个
+   * 命名空间**（见契约 `FlowStage`）。并起来之后侧栏只能给出一串 id，而"删除"
+   * 必须知道该删哪一层——那正是 `edgesOfContent` 的语义不能动的原因。
+   *
+   * 树与鱼骨恒为空数组。
+   */
+  const contentInnerEdges = computed<MindEdge[]>(() => (
+    content.value ? stageInnerEdgesOf(content.value) : []
+  ));
+
+  /**
    * 与当前选中节点相关的边（源或目标命中它）。
    *
    * 侧栏只用这一份而不是全量：一张流程图可能有几十条线，全列出来用户得自己在
@@ -1707,6 +1764,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
       edge.source === id || edge.target === id
       || (stage !== null && (edge.source === stage || edge.target === stage))
     ));
+  });
+
+  /**
+   * 与选中节点相关的**阶段内**边。
+   *
+   * 判据只按**节点 id**（不做"该阶段全都列"那一层放宽）：阶段间的边属于**阶段**，
+   * 所以选中阶段里任何一步都该看见它；阶段内的边属于**具体两个步骤**，把一整个
+   * 阶段的判定出边都铺给每一步看，只会让侧栏在一个 8 步阶段里塞进十几条与当前
+   * 节点无关的线。选中的是阶段入口节点时它天然命中（那个节点就是边的端点）。
+   */
+  const selectedInnerEdges = computed<MindEdge[]>(() => {
+    const id = selectedId.value;
+    if (!id) return [];
+    return contentInnerEdges.value.filter(edge => edge.source === id || edge.target === id);
   });
 
   /**
@@ -2192,18 +2263,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 语义。只清被点名的那一个节点的话，子孙身上的边会悬空，而 dangling 是契约层
     // 的硬拒——下一次保存就 422，用户却只是"删了一个节点"。
     //
-    // 只有树的边端点是**节点 id**。流程的边连的是阶段（`s_…`，另一个命名空间），
-    // 删阶段内一个节点碰不到任何一条边——这里的过滤对流程恒为空操作，正合契约。
+    // 两张边表都要清，理由见 `dropDanglingEdges`：流程图的阶段间边端点是阶段 id
+    // （删步骤碰不到），而阶段内边端点是**节点 id**——那一层以前没有读者，所以
+    // "流程删节点不用管边"这条旧结论在这里不再成立。
     const doomed = subtreeIds(doomedNode);
     const removed = replaceContainer(content.value, id, root => removeNode(root, id));
-    const nextContent: DiagramContent = isTree(removed)
-      ? {
-        ...removed,
-        edges: edgesOf(removed).filter(
-          edge => !doomed.has(edge.source) && !doomed.has(edge.target),
-        ),
-      }
-      : removed;
+    const nextContent = dropDanglingEdges(removed, doomed);
     if (!applyContent(nextContent, true)) return;
     setPrimary(parent?.id ?? null);
     editingId.value = null;
@@ -2228,8 +2293,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = '端点节点不存在';
       return false;
     }
-    if (edgesOf(content.value).length >= LIMITS.edges) {
-      status.value = `最多 ${LIMITS.edges} 条附加关系，请先删掉一些`;
+    // 上限**两类各算 200**（不是合计）。判据与契约一致：`_validate_edges` 是按
+    // 数组各自调用的，`edge_diagnostics` 也是按各自的清单报 `EDGE_LIMIT`；把两批
+    // 加在一起算，一条吵闹的阶段会先把阶段之间的额度吃光，而两者在画布上的规模
+    // 本来就不成比例（一个阶段的判定出边天然只有个位数）。
+    const sameStage = stageOfNode(content.value, source) !== null
+      && stageOfNode(content.value, source) === stageOfNode(content.value, target);
+    const used = sameStage ? contentInnerEdges.value.length : contentEdges.value.length;
+    if (used >= LIMITS.edges) {
+      status.value = sameStage
+        ? `这个阶段内部最多 ${LIMITS.edges} 条附加关系，请先删掉一些`
+        : `最多 ${LIMITS.edges} 条附加关系，请先删掉一些`;
       return false;
     }
     let next: DiagramContent;
@@ -2240,14 +2314,23 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return false;
     }
     if (!applyContent(next, true)) return false;
-    status.value = '已加一条附加关系，记得保存。';
+    status.value = sameStage
+      ? '已加一条阶段内部的附加关系，记得保存。'
+      : '已加一条附加关系，记得保存。';
     return true;
   }
 
-  /** 删一条附加关系。删线不动结构，所以不检查节点数/层数，也不需要重算布局。 */
+  /**
+   * 删一条附加关系。删线不动结构，所以不检查节点数/层数，也不需要重算布局。
+   *
+   * **两个数组都查**（`removeEdge` 里判层级）：阶段内的边只查 `content.edges` 的话，
+   * 侧栏列得出来却删不掉——按钮点了没反应。
+   */
   function deleteEdge(edgeId: string): boolean {
     if (!content.value) return false;
-    if (!edgesOf(content.value).some(edge => edge.id === edgeId)) return false;
+    const known = contentEdges.value.some(edge => edge.id === edgeId)
+      || contentInnerEdges.value.some(edge => edge.id === edgeId);
+    if (!known) return false;
     if (!applyContent(removeEdgeFromContent(content.value, edgeId), true)) return false;
     status.value = '已删除这条附加关系，可撤销。';
     return true;
@@ -3367,8 +3450,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     edges,
     nodeCount,
     // 附加关系：当前树上的全部边 + 与"选中节点"相关的那几条（侧栏用）。
+    // 两层分开返回：侧栏分组显示、删除按 id 判层级，都靠"谁属于哪一层"这件事。
     contentEdges,
+    contentInnerEdges,
     selectedEdges,
+    selectedInnerEdges,
     // 边端点 id → 显示名：流程的边连的是阶段 id，只查节点会显示成一串 `s_xxx`
     edgeNameOf,
     connectNodes,

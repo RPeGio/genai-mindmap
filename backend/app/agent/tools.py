@@ -46,11 +46,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from app.agent.contracts import RunContext, ToolCall, ToolResult, ToolSpec
 from app.agent.diagram_intent import SOURCE_MODEL, SOURCE_REQUEST
 from app.agent.ops import (
+    INNER_LAYER,
+    STAGE_LAYER,
     TEMP_ID_PREFIX,
+    apply_flow_edge_ops,
     apply_ops,
     find_node,
     new_node_id,
     normalize_ops,
+    resolve_flow_edge_placement,
+    validate_flow,
 )
 from app.agent.stream_items import StreamItem, closed_items
 from app.agent import shapes  # 三种图型的结构适配（遍历 / 定位 / 出口转换）
@@ -8574,31 +8579,78 @@ def _apply_ops_any(content: DiagramContent, batch: OpBatch) -> DiagramContent:
     没有"它该属于哪根骨"的确定答案：那是三套结构各自的语义，属于阶段 3。这里明确
     报 `cross_container` 而不是猜一个位置——猜错的后果是内容静默地换了骨。
 
-    `add_edge` / `remove_edge` 在非树上**明确拒绝**（`edges_not_supported`）。
-    这不是"还没做"，是那个实现**会静默丢数据**：借道执行器时边落在那棵临时
-    `MindMapContent` 的 `edges` 里，而写回只换子树根（`replace_node` 只换 `root`）
-    ——工具回一句"已连接"，`ctx.candidate` 里一条边都没有。宁可说清楚，也不让
-    用户以为线画上了。
+    ## 边 op（`add_edge` / `remove_edge`）按图型分流
 
-    至于流程图的阶段内边该怎么由工具落库（`FlowStage.edges` 的端点是节点 id、
-    阶段间边的端点是阶段 id，一条 op 得先判它属于哪一层），那是 3c 的工具入口，
-    不在这里顺手编一个。
+      - **树**：交给树的执行器（端点是节点 id）。
+      - **鱼骨**：仍然明确拒绝（`edges_not_supported`）——它的顶层结构里根本
+        没有 `edges`，这是个结构事实，不是"还没做"。
+      - **流程**：**按层级落笔**（`ops.resolve_flow_edge_placement`）。两个端点都是
+        阶段 id → `content.edges`；同属一个阶段 → 那个阶段的 `edges`。批次里既有节点
+        op 又有边 op 时，**先节点后边**：先 `add` 出来的节点才能被边引用，这也正是
+        模型写 op 的顺序。
     """
     if isinstance(content, MindMapContent):
         return apply_ops(content, batch)
 
-    edge_op_index = next(
-        (index for index, op in enumerate(batch.ops)
-         if op.op in ("add_edge", "remove_edge")), None)
-    if edge_op_index is not None:
+    # 边 op 单独摘出来：鱼骨要拒，流程要走"判层级"那条路。**保留原始下标**——
+    # `OpError.path` 用的是 `ops.<下标>`，重排之后报错会指向另一条 op。
+    edge_items = [
+        (f"ops.{index}", op) for index, op in enumerate(batch.ops)
+        if op.op in ("add_edge", "remove_edge")
+    ]
+    if edge_items and not isinstance(content, FlowContent):
+        # `path` 指到**第一条**边 op：模型要知道是哪一条没落下去（`ops.3` 比 `ops` 有用）。
+        _, first = edge_items[0]
         raise OpError(
-            "edges_not_supported", f"ops.{edge_op_index}",
-            "这张图不是思维导图：鱼骨图没有附加边，流程图的边分成**阶段之间**"
-            "（端点用阶段 id）与**阶段内部**（端点用该阶段的节点 id）两层。"
-            "这一次没有改动任何一个节点——要改流程的连线，请用 add_edge 之外的"
-            "路径或重新生成。",
+            "edges_not_supported", edge_items[0][0],
+            "鱼骨图没有附加边：六根骨之间的关系全部由层级表达，"
+            f"这条 {first.op} 没有位置可落。这一次没有改动任何一个节点。",
         )
 
+    if isinstance(content, FlowContent):
+        current: DiagramContent = content
+        node_items = [op for op in batch.ops if op.op not in ("add_edge", "remove_edge")]
+        if node_items:
+            current = _apply_ops_in_container(
+                current, batch.model_copy(update={"ops": node_items}), validate=False)
+            # 连带删边（与树上 `_apply_remove` 同一语义）：删掉一个步骤之后，端点是它的
+            # 阶段内边必须一起消失。留着它们，`validate_flow` 会以 `tree_invalid` 拒掉
+            # 整批，而模型只是"删了一个节点"——它改不动任何一张带判定出边的流程。
+            current = _prune_stage_edges(current)
+        if edge_items:
+            current = apply_flow_edge_ops(current, edge_items)
+        elif node_items:
+            current = validate_flow(current)
+        return current
+
+    return _apply_ops_in_container(content, batch)
+
+
+def _prune_stage_edges(content: FlowContent) -> FlowContent:
+    """把端点已经不存在的阶段内边丢掉。没有可丢的时候返回**同一个对象**。"""
+    stages: list = []
+    changed = False
+    for stage in content.stages:
+        alive = {node.id for node in shapes.walk_nodes(stage.root)}
+        kept = [edge for edge in stage.edges
+                if edge.source in alive and edge.target in alive]
+        if len(kept) != len(stage.edges):
+            changed = True
+            stages.append(stage.model_copy(update={"edges": kept}))
+        else:
+            stages.append(stage)
+    return content.model_copy(update={"stages": stages}) if changed else content
+
+
+def _apply_ops_in_container(
+    content: DiagramContent, batch: OpBatch, *, validate: bool = True,
+) -> DiagramContent:
+    """把一批**节点** op 落进它们命中的那一棵子树（一根骨 / 一个阶段）。
+
+    `validate=False` 让调用方在"还有别的批次要接在后面"时跳过那次整图校验——
+    流程那条路会在节点 op 之后先剪掉悬空边、再落边 op，最后统一校验一次。
+    中途校验会把"边马上要被清掉"的中间态判成非法。
+    """
     holders = _holders_of(content, _op_target_ids(batch))
     if not holders:
         raise OpError(
@@ -8627,6 +8679,8 @@ def _apply_ops_any(content: DiagramContent, batch: OpBatch) -> DiagramContent:
     )
     updated_root = apply_ops(temp, batch).root
     moved = shapes.replace_node(content, root_id, lambda _node: updated_root)
+    if not validate:
+        return moved
     try:
         return shapes.revalidate(moved)
     except ValidationError as exc:
@@ -9110,17 +9164,52 @@ def _check_kind_arg(value: str | None) -> str | None:
 
 
 def _fail_edges_not_supported() -> ToolResult:
-    """`add_edge` / `remove_edge` 落在非树结构上的**同一句**人话。
+    """`add_edge` / `remove_edge` 落在**鱼骨图**上的同一句人话。
 
     抽出来是因为两条工具必须说同一件事：两处各写一份文案，改一处忘一处时，用户
-    会从"加边"和"删边"两个入口得到互相矛盾的说明。措辞的判据见 `_add_edge`。
+    会从"加边"和"删边"两个入口得到互相矛盾的说明。
+
+    **只剩鱼骨这一种了**：流程图的边现在分两层落笔（阶段之间 / 阶段内部），判据在
+    `ops.resolve_flow_edge_placement`。鱼骨仍然没有位置可放——它的顶层结构里根本
+    没有 `edges`（六根骨的关系全部由层级表达），那是个结构事实，不是"还没做"。
     """
     return _fail(
         "edges_not_supported",
-        "这张图不是思维导图：鱼骨图没有附加边（六根骨的关系全部由层级表达）；"
-        "流程图的边分成**阶段之间**（端点用阶段 id）与**阶段内部**（端点用该阶段"
-        "的节点 id）两层，这两层还没有工具入口。这一次没有任何内容被改动。",
+        "鱼骨图没有附加边：六根骨之间的关系全部由层级表达，没有「谁指向谁」这个槽位。"
+        "这一次没有任何内容被改动。",
     )
+
+
+def _flow_edge_layer_summary(content: FlowContent, placement) -> str:
+    """这条边落在流程图哪一层的人话（给模型读，所以要说清**写进了哪个数组**）。"""
+    if placement.layer == INNER_LAYER:
+        return f"落在{_flow_stage_label(content, placement.stage_id)}内部（阶段内边，端点用该阶段的节点 id）"
+    if placement.demoted:
+        return ("两个端点分属不同阶段，已按阶段之间的连线记录——`FlowContent.edges` 的"
+                "端点只能是阶段 id，所以精确到步骤的位置保不住，方向还在")
+    return "落在阶段之间（`FlowContent.edges`，端点用阶段 id）"
+
+
+def _flow_stage_label(content: FlowContent, stage_id: str | None) -> str:
+    """阶段 id → 「阶段名」。找不到退回 id（排查时它至少指得回原始数据）。"""
+    stage = next((item for item in content.stages if item.id == stage_id), None)
+    if stage is None:
+        return f"阶段 {stage_id}"
+    return f"阶段「{stage.root.label.strip()}」"
+
+
+def _flow_endpoint_label(content: FlowContent, endpoint_id: str) -> str:
+    """边端点 → 显示名。**两个命名空间**：先当阶段（`s_…`），再当节点。
+
+    顺序不能反：一个阶段的入口节点与那个阶段指的是同一块内容，而当 id 只可能是
+    其中一种时（`s_` 前缀由后端分配，真实节点 id 不带它），先查哪种都一样；但报错
+    文案里写「阶段「形式审查」」比写节点标题更能说清"这条线连的是阶段"。
+    """
+    stage = next((item for item in content.stages if item.id == endpoint_id), None)
+    if stage is not None:
+        return f"{stage.root.label.strip()}（阶段）"
+    node = shapes.find(content, endpoint_id)
+    return node.label.strip() if node is not None else endpoint_id
 
 
 def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
@@ -9133,40 +9222,71 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     允许**成环**（A→B 之后 B→A）：那正是回退线，是流程图的核心需求。上限只有
     "单图 200 条边"（`MAX_EDGES`，与契约的诊断口径同一个数）——超过时明确拒绝
     并说明，而不是让第 201 条在保存时被 422 打回。
+
+    ## 流程图：先判这条边属于哪一层（`ops.resolve_flow_edge_placement`）
+
+    两个端点都是**阶段 id** → 落 `FlowContent.edges`（阶段之间的主轴）；
+    两个端点同属一个阶段 → 落那个阶段的 `FlowStage.edges`（判定节点的「是 / 否」）。
+    这是"一张图两处数组"的唯一分流点，与生成侧 `shapes._split_edges` 同一套规则——
+    两处不同源的话，同一对端点在生成路径与编辑路径上会落进不同的数组。
     """
     content = _require_candidate(ctx)
     if isinstance(content, ToolResult):
         return content
-    if not isinstance(content, MindMapContent):
+    if isinstance(content, FishboneContent):
         return _fail_edges_not_supported()
+
+    placement = None
+    if isinstance(content, FlowContent):
+        try:
+            placement = resolve_flow_edge_placement(content, args.source, args.target)
+        except OpError as exc:
+            return _fail(exc.code, exc.message, path=exc.path)
 
     scope_note, outside = _scope_note(content, ctx, [args.source, args.target])
 
-    source = find_node(content.root, args.source)
-    if source is None:
+    source = shapes.find(content, args.source)
+    target = shapes.find(content, args.target)
+    if isinstance(content, FlowContent) and placement is not None:
+        source_name = _flow_endpoint_label(content, args.source)
+        target_name = _flow_endpoint_label(content, args.target)
+    else:
+        source_name = source.label.strip() if source is not None else args.source
+        target_name = target.label.strip() if target is not None else args.target
+    if source is None and not (isinstance(content, FlowContent) and placement is not None):
         return _fail("node_not_found", f"起点节点 {args.source} 不存在。")
-    target = find_node(content.root, args.target)
-    if target is None:
+    if target is None and not (isinstance(content, FlowContent) and placement is not None):
         return _fail("node_not_found", f"终点节点 {args.target} 不存在。")
     if args.source == args.target:
         return _fail(
             "self_loop",
-            f"「{source.label}」不能连到自己：自环在画布上只会渲染成一个点。",
+            f"「{source_name}」不能连到自己：自环在画布上只会渲染成一个点。",
         )
+
+    # 上限与去重按**这条边要落进去的那个数组**判（两层各算 200）：判整体的话，
+    # 模型会被"另一个数组满了"挡住一条本来放得下的线，而错误文案也指不清是哪一层。
+    if isinstance(content, FlowContent) and placement is not None:
+        sibling = (content.edges if placement.layer == STAGE_LAYER else next(
+            stage.edges for stage in content.stages if stage.id == placement.stage_id))
+        where = "阶段之间" if placement.layer == STAGE_LAYER else "这个阶段内部"
+    else:
+        sibling = content.edges
+        where = "这张图"
     if any(edge.source == args.source and edge.target == args.target
-           and edge.label == (args.label or None) for edge in content.edges):
+           and edge.label == (args.label or None) for edge in sibling):
         same = f"（标签「{args.label}」）" if args.label else ""
         return _fail(
             "duplicate_edge",
-            f"「{source.label}」→「{target.label}」{same} 这条边已经存在。"
-            "要两条平行边，请给不同的 label（例如「是」与「否」）。",
+            f"「{source_name}」→「{target_name}」{same} "
+            f"这条边已经存在（{where}）。要两条平行边，请给不同的 label"
+            "（例如「是」与「否」）。",
         )
-    if len(content.edges) >= MAX_EDGES:
+    if len(sibling) >= MAX_EDGES:
         return _fail(
             "too_many_edges",
-            f"这张图已经有 {len(content.edges)} 条附加边，达到上限 {MAX_EDGES} 条，"
+            f"{where}已经有 {len(sibling)} 条附加边，达到上限 {MAX_EDGES} 条，"
             "加不了新边。请先删掉一些用不上的关系。",
-            edge_count=len(content.edges), edge_limit=MAX_EDGES,
+            edge_count=len(sibling), edge_limit=MAX_EDGES,
         )
 
     draft = {
@@ -9187,15 +9307,23 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     label_text = f"（{args.label}）" if args.label else ""
     kind_text = {"branch": "条件分支", "loop": "回退", None: "顺序跳转", "flow": "顺序跳转"}
     summary = (
-        f"已连接「{source.label}」→「{target.label}」{label_text}，"
-        f"类型：{kind_text.get(args.kind or 'flow', '顺序跳转')}（边 id {edge_id}）。"
+        f"已连接「{source_name}」→「{target_name}」{label_text}，"
+        f"类型：{kind_text.get(args.kind or 'flow', '顺序跳转')}（边 id {edge_id}）"
     )
+    if isinstance(updated, FlowContent) and placement is not None:
+        summary += f"；{_flow_edge_layer_summary(updated, placement)}"
+        edge_count = (len(updated.edges) if placement.layer == STAGE_LAYER else len(next(
+            stage.edges for stage in updated.stages if stage.id == placement.stage_id)))
+    else:
+        edge_count = len(updated.edges)
+    summary += "。"
     return _single_result(
         ctx, updated, batch, id_map, summary + scope_note,
         changed=[args.source, args.target],
         outside_selection=outside,
         edge_id=edge_id, source=args.source, target=args.target,
-        edge_count=len(updated.edges),
+        edge_layer=None if placement is None else placement.layer,
+        edge_count=edge_count,
     )
 
 
@@ -9204,14 +9332,25 @@ def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
 
     存在的边才删得掉：给一个不存在的 id 直接报 `edge_not_found`，而不是
     "默默成功"——后者会让模型以为那条线没了，而画布上仍然挂着。
+
+    流程图**两个数组都查**（`content.edges` 与各阶段自己的 `edges`）：只查前者的话，
+    阶段内的判定出边列得出来却删不掉，而"删不掉"在模型那边表现为"边不存在"，
+    下一轮它会继续试同一条。
     """
     content = _require_candidate(ctx)
     if isinstance(content, ToolResult):
         return content
-    if not isinstance(content, MindMapContent):
+    if isinstance(content, FishboneContent):
         return _fail_edges_not_supported()
 
     edge = next((item for item in content.edges if item.id == args.edge_id), None)
+    layer = STAGE_LAYER
+    if edge is None and isinstance(content, FlowContent):
+        for stage in content.stages:
+            edge = next((item for item in stage.edges if item.id == args.edge_id), None)
+            if edge is not None:
+                layer = INNER_LAYER
+                break
     if edge is None:
         return _fail("edge_not_found", f"边 {args.edge_id} 不存在。")
 
@@ -9223,7 +9362,12 @@ def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
     summary = f"已删除「{edge.source}」→「{edge.target}」这条附加关系"
     if edge.label:
         summary += f"（{edge.label}）"
-    summary += f"；现在还剩 {len(updated.edges)} 条。"
+    summary += f"（{ '阶段内部' if layer == INNER_LAYER else '阶段之间' if isinstance(updated, FlowContent) else '这张图'}）"
+    if isinstance(updated, FlowContent):
+        remaining = len(updated.edges) + sum(len(stage.edges) for stage in updated.stages)
+        summary += f"；整张图还剩 {remaining} 条。"
+    else:
+        summary += f"；现在还剩 {len(updated.edges)} 条。"
     # 删边不动节点，但两个端点仍然决定"这次动到了哪一片"：删一条跨选区的线，
     # 与删一条选区内部的线，对用户来说是两件不同的事。
     scope_note, outside = _scope_note(content, ctx, [edge.source, edge.target])
@@ -9231,7 +9375,9 @@ def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
         ctx, updated, batch, id_map, summary + scope_note,
         changed=[edge.source, edge.target],
         outside_selection=outside,
-        edge_id=args.edge_id, edge_count=len(updated.edges),
+        edge_id=args.edge_id, edge_layer=layer,
+        edge_count=(len(updated.edges) if not isinstance(updated, FlowContent)
+                    else len(updated.edges) + sum(len(stage.edges) for stage in updated.stages)),
     )
 
 

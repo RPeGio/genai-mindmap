@@ -232,9 +232,16 @@ function assertContentValid(content: DiagramContent): void {
  * 报 `cross_container` 而不是猜一个位置——猜错的后果是内容静默地换了骨，而那种
  * 错位事后没人看得出来。
  *
- * 一个已知的口径缺口（与后端一致，不是这里漏了）：非树路径只把 `root` 写回原位，
- * 临时树上的 `edges` 不落回内容。流程图的边端点是**阶段 id**，而 op 的端点是节点
- * id，两者之间的映射是另一套语义——真要做，该两边一起做。
+ * 一个已知的口径缺口（**后端已经补上，这里还没跟**）：非树路径只把 `root` 写回原位，
+ * 临时树上的 `edges` 不落回内容。后端那边现在按层级判（`ops.resolve_flow_edge_placement`：
+ * 两个阶段 id → `FlowContent.edges`，同阶段两个节点 → `FlowStage.edges`），所以
+ * **`edit` 意图在流程图上能连出阶段内的边**。
+ *
+ * 这里不跟的理由是这条路当前不可达：`stores/mindmap.ts::runGeneration` 在非树内容上
+ * 直接拒绝 `expand` / `edit`（后端 `AgentRunRequest.snapshot` 收的是三种形状，但
+ * 前端那一层先拦了，给的是人话）。前端 `ops.ts` 只用于镜像"生成过程中收到的 op 批
+ * 次"，而那条路上不会有流程图。要放开那条闸门时，这里必须一起改——否则模型发来的
+ * `add_edge` 会在这层被静默丢掉，画布与后端候选图不一致。
  */
 /** 树上的调用点（含既有用例）拿到的仍是 `MindMapContent`，`content.root` 照旧可用。 */
 export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult<MindMapContent>;
