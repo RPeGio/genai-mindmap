@@ -630,7 +630,7 @@ class TestExport:
         assert "- 形式审查 → 付款（是）" in text
         assert "- 形式审查 → 提交申请（驳回）" in text
         # 不硬塞进树：那一节在末尾，树行仍然是缩进列表。
-        assert text.index("## 附加关系") > text.index("  - 付款")
+        assert text.index("## 附加关系") > text.index("    - 付款")
 
     def test_opml_has_a_sibling_outline(self):
         import xml.etree.ElementTree as ET
@@ -657,7 +657,8 @@ class TestExport:
         assert text.replace("' 图型：思维导图（tree）\n", "") == \
             "@startmindmap\n* 报销\n** 提交申请\n** 形式审查\n** 付款\n@endmindmap\n"
         assert text.split("\n")[1] == "' 图型：思维导图（tree）"
-        assert to_markdown(plain) == "# 报销流程\n\n- 报销\n  - 提交申请\n  - 形式审查\n  - 付款\n"
+        assert to_markdown(plain) == (
+            "# 报销流程\n\n- 报销\n    - 提交申请\n    - 形式审查\n    - 付款\n")
         assert "附加关系" not in to_opml(plain)
 
 

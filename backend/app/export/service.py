@@ -384,19 +384,22 @@ def _markdown_tree(content: MindMapContent) -> str:
 
     节点的 `detail` 以引用块跟在它自己那一行下面（见 `_markdown_quote`）。
 
-    **缩进是 2 个空格，而且这一条没有跟鱼骨/流程一起改成 4 个（故意的）**：
-    树的 markdown 输出被 `tests/test_export.py::ByteIdenticalTest` 逐字节钉死，
-    本轮修复的边界也明确写着"树的既有行为逐字节不变"。代价是**已知的**：
-    同一份文件在 Python-Markdown 下会被读成同级列表（它按 `tab_length=4` 判层级，
-    CommonMark 从 2 格起算）。实测 HTML 与"改 4 格要动哪几处"记在
-    `docs/IMPORT.md` 的「两个 Markdown 解析器」一节——它是一个待决策项，不是漏改。
+    **缩进是 4 个空格**，与其他两种形状一致：2 个空格只有 CommonMark 认，
+    Python-Markdown 按 `tab_length=4` 判层级，会把根与一级分支画成**同级**
+    ——同一份导出在两个阅读器里是两张图。这条曾长期是 2 格，`ByteIdenticalTest`
+    把当时的输出逐字节钉住，于是"一个已知缺陷"被一条"防止意外改动"的用例保护了
+    起来（codex 复审后由 YG 明确：那条用例守的是"不要再动"，不是"缺陷不许修"）。
+    改成 4 格之后两边嵌套一致，实测 HTML 见 `docs/IMPORT.md`。
+
+    代价说清楚：**用户重新导出会得到与上次不同的文件**（每层多两个空格）。
+    语义、导入结果、往返都不变（导入按缩进栈比较相邻两行，不按倍数算层）。
     """
     lines: list[str] = [f"# {_escape_markdown(content.title)}", ""]
     lines.append(f"- {_escape_markdown(_node_text(content.root))}")
     lines += _markdown_quote(content.root.detail, "  ")
 
     def walk(node: Node, depth: int) -> None:
-        pad = "  " * depth
+        pad = "    " * depth
         for child in node.children:
             lines.append(f"{pad}- {_escape_markdown(_node_text(child))}")
             lines.extend(_markdown_quote(child.detail, pad + "  "))

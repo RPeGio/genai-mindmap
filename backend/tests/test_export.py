@@ -54,9 +54,9 @@ class MarkdownTest(unittest.TestCase):
         text = to_markdown(SAMPLE)
         self.assertTrue(text.startswith("# 季度规划"))
         self.assertIn("- 产品", text)
-        self.assertIn("  - 市场", text)          # 第 1 层
-        self.assertIn("    - 竞品调研", text)     # 第 2 层
-        self.assertIn("      - 存储选型", text)   # 第 3 层，6 个空格
+        self.assertIn("    - 市场", text)          # 第 1 层，4 个空格
+        self.assertIn("        - 竞品调研", text)   # 第 2 层，8 个空格
+        self.assertIn("            - 存储选型", text)  # 第 3 层，12 个空格
 
     def test_root_is_kept_when_title_differs(self):
         """title 与 root.label 允许不同，跳过根节点会让它的文字凭空消失。"""
@@ -260,7 +260,8 @@ class TwoLayerExportTest(unittest.TestCase):
         self.assertIn("** 人", to_puml(content))
         md = to_markdown(content)
         self.assertIn("- 为什么报销要 11 天", md)
-        self.assertIn("  - 审批的人不在", md)
+        # 原因在鱼骨的第三级（depth=2）→ 8 个空格。精确断言，不靠子串碰巧匹配。
+        self.assertIn("        - 审批的人不在", md)
         # 鱼骨图没有 `edges`，三种格式都不该冒出边清单
         self.assertNotIn("附加关系", md)
 
@@ -339,10 +340,12 @@ class DetailExportTest(unittest.TestCase):
     def test_markdown_puts_detail_in_a_quote_under_the_node(self):
         lines = to_markdown(self.content()).splitlines()
         self.assertIn("- 提交申请", lines)
+        # 根的引用块：节点行缩进 0，引用块 +2
         self.assertEqual(lines[lines.index("- 提交申请") + 1],
                          "  > 把报销单和发票拍照上传。")
-        self.assertIn("  - 填单", lines)
-        self.assertIn("    > 写清事由与金额。", lines)
+        self.assertIn("    - 填单", lines)
+        # 第 1 层的引用块：节点行 4，引用块 6（**永远是节点行 +2，不随层宽放大**）
+        self.assertIn("      > 写清事由与金额。", lines)
 
     def test_puml_puts_detail_in_a_comment(self):
         text = to_puml(self.content())
@@ -592,10 +595,13 @@ class ByteIdenticalTest(unittest.TestCase):
     """
 
     def test_markdown_is_byte_identical(self):
+        # 期望值从 2 格改成 4 格，不是"放宽守卫"而是"把守卫对准正确的东西"：
+        # 2 格在 Python-Markdown 下会把父子读成同级（它按 tab_length=4 判层级），
+        # 4 格 CommonMark 与 Python-Markdown 都认。这个测试继续守着"以后别再动"。
         self.assertEqual(
             to_markdown(SAMPLE),
-            "# 季度规划\n\n- 产品\n  - 市场\n    - 竞品调研\n    - 用户访谈\n"
-            "  - 技术\n    - 架构设计\n      - 存储选型\n")
+            "# 季度规划\n\n- 产品\n    - 市场\n        - 竞品调研\n        - 用户访谈\n"
+            "    - 技术\n        - 架构设计\n            - 存储选型\n")
 
     def test_opml_is_byte_identical(self):
         self.assertEqual(

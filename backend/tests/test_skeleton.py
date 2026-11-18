@@ -159,7 +159,7 @@ class SkeletonTest(unittest.TestCase):
         text = raw.decode()
         self.assertTrue(text.startswith("# 测试导图"))
         self.assertIn("- 根", text)
-        self.assertIn("  - 重复项", text)
+        self.assertIn("    - 重复项", text)
 
     def test_export_opml(self):
         status, raw = request("POST", "/api/export/opml", {"content": MAP})
