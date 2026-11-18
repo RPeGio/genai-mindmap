@@ -2367,13 +2367,6 @@
             "minLength": 1,
             "title": "Title"
           },
-          "root": {
-            "$ref": "#/components/schemas/Node-Input"
-          },
-          "layout": {
-            "$ref": "#/components/schemas/LayoutKind",
-            "default": "tree"
-          },
           "theme": {
             "$ref": "#/components/schemas/Theme"
           },
@@ -2392,6 +2385,13 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Input"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/LayoutKind",
+            "default": "tree"
           },
           "edges": {
             "items": {
@@ -2433,13 +2433,6 @@
             "minLength": 1,
             "title": "Title"
           },
-          "root": {
-            "$ref": "#/components/schemas/Node-Output"
-          },
-          "layout": {
-            "$ref": "#/components/schemas/LayoutKind",
-            "default": "tree"
-          },
           "theme": {
             "$ref": "#/components/schemas/Theme"
           },
@@ -2458,6 +2451,13 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Output"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/LayoutKind",
+            "default": "tree"
           },
           "edges": {
             "items": {

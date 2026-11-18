@@ -14,6 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from collections.abc import Sequence
+
 from app.contracts.edits import EditEventIn, MAX_EVENTS_PER_SAVE
 from app.contracts.source import SourceRef, SourceUsage
 
@@ -416,15 +418,149 @@ class Node(BaseModel):
         return value if value and value.strip() else None
 
 
-class MindMapContent(BaseModel):
+def _unique_source_ids(source_usage: Sequence[SourceUsage]) -> set[str]:
+    """`source_usage` 的来源 ID 集合，顺带拒掉重复。
+
+    重复的来源摘要不是"多写了一遍"：同一份材料在图上被引用时，`source_refs` 只能
+    指向一个 `source_id`，两份摘要并存意味着"这条引用到底对应哪一份"没有答案。
+    所以它在三种图型里都是硬拒。
+    """
+    ids = {source.source_id for source in source_usage}
+    if len(ids) != len(source_usage):
+        raise ValueError("来源摘要中的来源 ID 不能重复")
+    return ids
+
+
+def _scan_tree(
+    root: Node, source_ids: set[str], seen: set[str] | None = None,
+) -> tuple[set[str], bool]:
+    """遍历一棵子树，返回 `(节点 id 集合, 是否有节点带坐标)`。
+
+    四件事一次做完，因为它们必须在**同一次**遍历里、按同一个顺序判：id 唯一、
+    节点总数 ≤ `MAX_TREE_NODES`、深度 ≤ `MAX_TREE_DEPTH`、`source_refs` 都指回
+    `source_usage`。分成四趟会让错误顺序变，而错误顺序是用户看到的第一句话。
+
+    `seen` 传入时复用同一份 id 空间——鱼骨图有六根骨、流程图有若干阶段，它们是
+    并列的子树而不是一棵树，但**节点 id 必须全局唯一**：前端按 id 建索引，两根骨
+    各有一个 `n1` 时点一下会跳到另一根骨上。节点总数也按全部子树合计算，因为
+    画布承受的是整张图。
+
+    深度仍按**每棵子树**从 1 数：一根骨挂在主骨上，但画布上它是从自己的根展开的
+    一列，层数限制针对的正是那个"列"。
+    """
+    ids = seen if seen is not None else set()
+    has_position = False
+    stack: list[tuple[Node, int]] = [(root, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if node.id in ids:
+            raise ValueError("节点 ID 必须唯一")
+        ids.add(node.id)
+        if node.pos is not None:
+            has_position = True
+        if len(ids) > MAX_TREE_NODES or depth > MAX_TREE_DEPTH:
+            raise ValueError(
+                f"导图最多 {MAX_TREE_NODES} 个节点，深度不超过 {MAX_TREE_DEPTH} 层")
+        for ref in node.source_refs:
+            if ref.source_id not in source_ids:
+                raise ValueError(f"节点 {node.id} 引用的来源 {ref.source_id} 不在 source_usage 中")
+        stack.extend((child, depth + 1) for child in node.children)
+    return ids, has_position
+
+
+def _validate_relations(relations: Sequence[Relation], node_ids: set[str]) -> None:
+    """跨节点关系线的四条约束。三种图型共用：`relations` 落在 `ContentBase` 上。"""
+    relation_ids: set[str] = set()
+    relation_keys: set[tuple[str, str, RelationType]] = set()
+    for relation in relations:
+        if relation.id in relation_ids:
+            raise ValueError("关系 ID 必须唯一")
+        relation_ids.add(relation.id)
+        if relation.source not in node_ids:
+            raise ValueError(f"关系 {relation.id} 的起点节点 {relation.source} 不在导图中")
+        if relation.target not in node_ids:
+            raise ValueError(f"关系 {relation.id} 的终点节点 {relation.target} 不在导图中")
+        if relation.source == relation.target:
+            raise ValueError(f"关系 {relation.id} 的起点与终点不能是同一个节点")
+        key = (relation.source, relation.target, relation.type)
+        if key in relation_keys:
+            raise ValueError("同一对节点之间的同类关系不能重复添加")
+        relation_keys.add(key)
+
+
+def _validate_edges(edges: Sequence[Edge], node_ids: set[str]) -> None:
+    """附加边的三条硬约束：条数上限、id 唯一、端点存在且不是自环。
+
+    与 `relations` 的差别在**硬拒的边界**：条数用的是 `MAX_EDGES_LIMIT`（承载能力）
+    而不是 `MAX_EDGES`（产品口径）——后者只报 warn，理由见 `MAX_EDGES` 的注释。
+    """
+    if len(edges) > MAX_EDGES_LIMIT:
+        raise ValueError(f"附加边最多 {MAX_EDGES_LIMIT} 条")
+    edge_ids: set[str] = set()
+    for edge in edges:
+        if edge.id in edge_ids:
+            raise ValueError(f"边 ID 必须唯一，重复的是 {edge.id}")
+        edge_ids.add(edge.id)
+        # dangling 在这里**硬拒**，与 EDGE_LIMIT / EDGE_CYCLE_TOO_LONG 那两个
+        # 只报 warn 的码不同。理由不是严格，是渲染：前端按 id 找节点算端点，
+        # 找不到就是一条 `source: undefined` 的边，Vue Flow 会抛错而不是跳过，
+        # 整张画布白屏。所以"指向不存在的节点"永远不能进到落库/渲染的图里；
+        # 生成路径会在构造之前先把这种边滤掉并报 `EDGE_DANGLING`（见
+        # `app/mindmaps/edges.py::clean_edges`），两条路都不让脏边活下来。
+        if edge.source not in node_ids:
+            raise ValueError(f"边 {edge.id} 的起点节点 {edge.source} 不在导图中")
+        if edge.target not in node_ids:
+            raise ValueError(f"边 {edge.id} 的终点节点 {edge.target} 不在导图中")
+        # 自环画不出来——它只会渲染成一个点，用户看不出那里有一条线，
+        # 却会因为"边数 +1"而困惑。而"节点到自己"这件事在图上没有语义。
+        if edge.source == edge.target:
+            raise ValueError(f"边 {edge.id} 的起点与终点不能是同一个节点（自环无法绘制）")
+
+
+class ContentBase(BaseModel):
+    """三种图型（思维导图 / 鱼骨图 / 流程图）共用的顶层字段。
+
+    抽出来的只有"三套都会有、且语义一模一样"的五个：版本、标题、主题、跨节点
+    关系、来源摘要。**`extra="forbid"` 也在这里**——它是三种图型能被同一个联合类型
+    分派的前提（见文件末尾 `DiagramContent` 的注释），漏在任何一个子类上都会让
+    判别退化成"谁先声明谁赢"。
+
+    不抽的字段都是"某一种图型才有的顶层结构"：树有 `root` / `layout`，鱼骨有
+    `problem` / `bones`，流程有 `stages` / `edges`。它们的差别不是命名，是**这张图
+    按什么读**，硬塞进基类只会得到三个恒为 `None` 的字段。
+    """
+
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal[2] = 2
     title: str = Field(min_length=1, max_length=200)
-    root: Node
-    layout: LayoutKind = LayoutKind.tree
     theme: Theme = Field(default_factory=Theme)
     relations: list[Relation] = Field(default_factory=list, max_length=MAX_RELATIONS)
     source_usage: list[SourceUsage] = Field(default_factory=list, max_length=50)
+
+    @field_validator("title")
+    @classmethod
+    def title_not_blank(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("导图标题不能为空")
+        return text
+
+
+class MindMapContent(ContentBase):
+    # 思维导图的顶层结构：一棵 `Node` 树 + 排布 + 附加边。**tree 图型走它。**
+    #
+    # 说明写成注释而不是 docstring：docstring 会作为 `description` 进 openapi 与
+    # `schema.d.ts`（`Edge` / `Relation` 就是这样），而下面这段是**迁移史**，不是
+    # 给调用方读的契约语义——把它广播到前端的生成类型里只是噪音。
+    #
+    # `diagram_type` 在这里是**宽**的（`DiagramKind`，默认 `tree`），有意不收窄成
+    # `Literal["tree"]`：库里与前端手里有一批 `diagram_type == "fishbone"` 但形状仍
+    # 是一棵树的记录（生成链路还不产出鱼骨形状，阶段 2 才做），收窄它们会在下一次
+    # 保存时 422——用户什么都没改，图却存不回去。判别由**形状**做，不由这个字段做，
+    # 理由见 `DiagramContent`。
+
+    root: Node
+    layout: LayoutKind = LayoutKind.tree
     # 跨父子节点的附加边。**默认空列表**，旧图缺这个键时 Pydantic 直接补一个空
     # 列表——这就是"旧图零迁移"的全部实现，不需要改库、不需要停机、不需要
     # `schema_version` 升级（树 + 边的**树**那一半形状没变，读完写回时多出来的
@@ -443,14 +579,6 @@ class MindMapContent(BaseModel):
     # `tree`——**零迁移**，与 `edges` 同一条规矩（不改库、不升 `schema_version`）。
     # 而"旧图本来就是思维导图"这句是真的：它们全部由 `tree` 那条提示词生成。
     diagram_type: DiagramKind = "tree"
-
-    @field_validator("title")
-    @classmethod
-    def title_not_blank(cls, value: str) -> str:
-        text = value.strip()
-        if not text:
-            raise ValueError("导图标题不能为空")
-        return text
 
     @field_validator("edges")
     @classmethod
@@ -479,26 +607,8 @@ class MindMapContent(BaseModel):
     @model_validator(mode="after")
     def validate_tree(self) -> MindMapContent:
         # 第二层：保存、读取和所有接收导图的接口共用同一关联约束。
-        source_ids = {source.source_id for source in self.source_usage}
-        if len(source_ids) != len(self.source_usage):
-            raise ValueError("来源摘要中的来源 ID 不能重复")
-        seen: set[str] = set()
-        has_position = False
-        stack = [(self.root, 1)]
-        while stack:
-            node, depth = stack.pop()
-            if node.id in seen:
-                raise ValueError("节点 ID 必须唯一")
-            seen.add(node.id)
-            if node.pos is not None:
-                has_position = True
-            if len(seen) > MAX_TREE_NODES or depth > MAX_TREE_DEPTH:
-                raise ValueError(
-                    f"导图最多 {MAX_TREE_NODES} 个节点，深度不超过 {MAX_TREE_DEPTH} 层")
-            for ref in node.source_refs:
-                if ref.source_id not in source_ids:
-                    raise ValueError(f"节点 {node.id} 引用的来源 {ref.source_id} 不在 source_usage 中")
-            stack.extend((child, depth + 1) for child in node.children)
+        source_ids = _unique_source_ids(self.source_usage)
+        node_ids, has_position = _scan_tree(self.root, source_ids)
 
         # 坐标只在手动布局下有意义：自动布局的图带着历史坐标，换布局时会被
         # 当成"用户想把这个节点放这里"，画出来是一团乱麻。
@@ -508,44 +618,8 @@ class MindMapContent(BaseModel):
         elif has_position:
             raise ValueError("只有手动布局才允许保存节点坐标")
 
-        relation_ids: set[str] = set()
-        relation_keys: set[tuple[str, str, RelationType]] = set()
-        for relation in self.relations:
-            if relation.id in relation_ids:
-                raise ValueError("关系 ID 必须唯一")
-            relation_ids.add(relation.id)
-            if relation.source not in seen:
-                raise ValueError(f"关系 {relation.id} 的起点节点 {relation.source} 不在导图中")
-            if relation.target not in seen:
-                raise ValueError(f"关系 {relation.id} 的终点节点 {relation.target} 不在导图中")
-            if relation.source == relation.target:
-                raise ValueError(f"关系 {relation.id} 的起点与终点不能是同一个节点")
-            key = (relation.source, relation.target, relation.type)
-            if key in relation_keys:
-                raise ValueError("同一对节点之间的同类关系不能重复添加")
-            relation_keys.add(key)
-
-        if len(self.edges) > MAX_EDGES_LIMIT:
-            raise ValueError(f"附加边最多 {MAX_EDGES_LIMIT} 条")
-        edge_ids: set[str] = set()
-        for edge in self.edges:
-            if edge.id in edge_ids:
-                raise ValueError(f"边 ID 必须唯一，重复的是 {edge.id}")
-            edge_ids.add(edge.id)
-            # dangling 在这里**硬拒**，与 EDGE_LIMIT / EDGE_CYCLE_TOO_LONG 那两个
-            # 只报 warn 的码不同。理由不是严格，是渲染：前端按 id 找节点算端点，
-            # 找不到就是一条 `source: undefined` 的边，Vue Flow 会抛错而不是跳过，
-            # 整张画布白屏。所以"指向不存在的节点"永远不能进到落库/渲染的图里；
-            # 生成路径会在构造之前先把这种边滤掉并报 `EDGE_DANGLING`（见
-            # `app/mindmaps/edges.py::clean_edges`），两条路都不让脏边活下来。
-            if edge.source not in seen:
-                raise ValueError(f"边 {edge.id} 的起点节点 {edge.source} 不在导图中")
-            if edge.target not in seen:
-                raise ValueError(f"边 {edge.id} 的终点节点 {edge.target} 不在导图中")
-            # 自环画不出来——它只会渲染成一个点，用户看不出那里有一条线，
-            # 却会因为"边数 +1"而困惑。而"节点到自己"这件事在图上没有语义。
-            if edge.source == edge.target:
-                raise ValueError(f"边 {edge.id} 的起点与终点不能是同一个节点（自环无法绘制）")
+        _validate_relations(self.relations, node_ids)
+        _validate_edges(self.edges, node_ids)
         return self
 
 
