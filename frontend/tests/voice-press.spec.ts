@@ -15,12 +15,17 @@ import type { ActiveRecording } from '../src/audio/recorder';
  * 松手（应当取消这一段）与卸载（应当取消并复位全局录音标记）。
  */
 
-function fakeRecording(): ActiveRecording & { stop: ReturnType<typeof vi.fn>; cancel: ReturnType<typeof vi.fn> } {
-  return {
-    elapsedSeconds: () => 0,
-    stop: vi.fn(async () => new File([new Uint8Array([1, 2, 3])], 'voice.wav', { type: 'audio/wav' })),
-    cancel: vi.fn(),
-  };
+function fakeRecording() {
+  const file = new File([new Uint8Array([1, 2, 3])], 'voice.wav', { type: 'audio/wav' });
+  const stop = vi.fn<() => Promise<File>>(async () => file);
+  const cancel = vi.fn<() => void>();
+  const recording: ActiveRecording = { elapsedSeconds: () => 0, stop, cancel };
+  return { recording, stop, cancel };
+}
+
+/** `emitted()` 的最后一条：`Array.prototype.at` 不在本仓库的 TS lib 里。 */
+function lastEmitted(events: unknown[][] | undefined): unknown[] | undefined {
+  return events && events.length ? events[events.length - 1] : undefined;
 }
 
 interface Deferred {
@@ -62,14 +67,14 @@ describe('按住说话的时序', () => {
     await flushPromises();
 
     const recording = fakeRecording();
-    state.resolve(recording);
+    state.resolve(recording.recording);
     await flushPromises();
 
     expect(recording.cancel).toHaveBeenCalledTimes(1);
     expect(recording.stop).not.toHaveBeenCalled();
     expect(wrapper.get('[data-test="press-to-talk"]').text()).toContain('按住说话');
     // 松手也要把"正在录音"的标志放掉，否则生成按钮会被它锁住。
-    expect(wrapper.emitted('active')?.at(-1)).toEqual([false]);
+    expect(lastEmitted(wrapper.emitted('active'))).toEqual([false]);
     wrapper.unmount();
   });
 
@@ -84,15 +89,14 @@ describe('按住说话的时序', () => {
     // `v-if="voiceMode"` 切回键盘：组件整个卸载，而麦克风还悬在授权上
     wrapper.unmount();
     const recording = fakeRecording();
-    state.resolve(recording);
+    state.resolve(recording.recording);
     await flushPromises();
 
     expect(recording.cancel).toHaveBeenCalledTimes(1);
     expect(recording.stop).not.toHaveBeenCalled();
     // 最后一条必须是 false：`sources.recording` 由这个事件驱动，漏了它用户
     // 切一次键盘就再也生成不了，而界面上只说"正在录音"。
-    const events = wrapper.emitted('active') ?? [];
-    expect(events.at(-1)).toEqual([false]);
+    expect(lastEmitted(wrapper.emitted('active'))).toEqual([false]);
   });
 
   it('按住不松手、授权回来后正常进入录音态，松手才 stop', async () => {
@@ -101,7 +105,7 @@ describe('按住说话的时序', () => {
 
     await wrapper.get('[data-test="press-to-talk"]').trigger('pointerdown');
     const recording = fakeRecording();
-    state.resolve(recording);
+    state.resolve(recording.recording);
     await flushPromises();
 
     expect(recording.cancel).not.toHaveBeenCalled();
@@ -111,7 +115,7 @@ describe('按住说话的时序', () => {
     await flushPromises();
     expect(recording.stop).toHaveBeenCalledTimes(1);
     expect(wrapper.emitted('recorded')).toHaveLength(1);
-    expect(wrapper.emitted('active')?.at(-1)).toEqual([false]);
+    expect(lastEmitted(wrapper.emitted('active'))).toEqual([false]);
     wrapper.unmount();
   });
 });
