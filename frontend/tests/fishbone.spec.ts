@@ -6,6 +6,7 @@ import FishboneEdge from '../src/canvas/FishboneEdge.vue';
 import {
   BONE_ANGLE_DEG,
   FISHBONE_SLOTS,
+  SPINE_ARROW_SIZE,
   fishboneSlotOf,
   layoutFishbone,
 } from '../src/canvas/layout/fishbone';
@@ -164,6 +165,7 @@ describe('鱼骨的斜骨几何', () => {
 
     for (const [id, points] of result.fishbone.links) {
       if (points.length !== 3) continue; // 只验主骨→大类那三点的骨线
+      if (!id.startsWith('r->')) continue; // 中骨的骨线另有自己的起点（见下面那组）
       const anchor = points[1]!;
       const tip = points[2]!;
       const dx = Math.abs(tip.x - anchor.x);
@@ -267,8 +269,12 @@ describe('鱼骨图的完整性', () => {
     };
     const result = layoutFishbone(root);
     expect(result.positions.size).toBe(count(root));
-    // 深层节点排在祖先左侧
-    expect(result.positions.get('g1')!.x).toBeLessThan(result.positions.get('c1')!.x);
+    const point = (id: string) => result.positions.get(id)!;
+    // `c1` 带子节点 → 它是一根中骨：标签落在自己那条乐道的**最外**一格，`g1` 用水平
+    // 短线挂在它身上。乐道是 60° 斜的，所以"往外" = 更高、更左——两个方向一起读才是
+    // "沿骨向外"，只看 x 会得出反的结论（改动前一律往左排一列，那里的判据才是 x）。
+    expect(Math.abs(point('g1').y)).toBeLessThan(Math.abs(point('c1').y));
+    expect(point('g1').x).toBeGreaterThan(point('c1').x);
   });
 
   it('根节点在原点，包围盒包住所有节点框', () => {
@@ -294,6 +300,296 @@ describe('鱼骨图的完整性', () => {
     expect(result.fishbone.links.size).toBe(0);
     expect(result.bounds.width).toBe(NODE_SIZE.width);
     expect(result.bounds.height).toBe(NODE_SIZE.height);
+    // 没有骨就没有方向：箭头是"主骨指向结果"这件事的记号，主骨不存在时它无从谈起
+    expect(result.fishbone.spineArrow).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 两层鱼骨：改动前什么样，现在还得什么样
+// ---------------------------------------------------------------------------
+
+/**
+ * 当前的六成鱼骨都是两层（骨 → 原因），中骨那套几何**只能**在真的有第三层时才
+ * 出场。这一组把改动前那套数字逐项写死：坐标、骨长、折线。
+ *
+ * 写死而不是"用公式再算一遍"：公式在这条用例里是**被检验对象**，拿它自己验自己
+ * 什么也证明不了。
+ */
+describe('两层鱼骨与改动前逐像素相同', () => {
+  const golden = () => layoutFishbone(sixBoneTree());
+
+  it('节点坐标：锚点 -138、第一格 80、骨长 124、大类框 -148', () => {
+    const result = golden();
+    // 主骨头在原点，第一根骨（人，槽位 0）的锚点 = -90 - 48
+    expect(result.positions.get('r')).toEqual({ x: 0, y: 0 });
+    // 原因框中心：锚点左移 80/tan60，再退一个短线 16 与半个框宽 90
+    expect(result.positions.get('人0')!.y).toBeCloseTo(-80, 9);
+    expect(result.positions.get('人0')!.x).toBeCloseTo(-90 - 48 - 80 / Math.tan(Math.PI / 3) - 16 - 90, 9);
+    // 一个原因 → 骨长 124（80 + 24 + 20），大类框再往外半个框
+    expect(result.positions.get('人')!.y).toBeCloseTo(-148, 9);
+    expect(result.positions.get('人')!.x).toBeCloseTo(-138 - 124 / Math.tan(Math.PI / 3), 9);
+    // 法在槽位 1：锚点再往左 132，方向朝下
+    expect(result.positions.get('法0')!.y).toBeCloseTo(80, 9);
+    expect(result.positions.get('法')!.y).toBeCloseTo(148, 9);
+  });
+
+  it('折线：三点骨线 + 两点水平短线，主骨从 -90 走到最远的锚点', () => {
+    const result = golden();
+    expect(result.fishbone.links.get('r->人')).toEqual([
+      { x: -90, y: 0 },
+      { x: -138, y: 0 },
+      { x: -138 - 124 / Math.tan(Math.PI / 3), y: -124 },
+    ]);
+    const stub = result.fishbone.links.get('人->人0')!;
+    expect(stub[0]).toEqual({ x: -138 - 80 / Math.tan(Math.PI / 3), y: -80 });
+    expect(stub[1]).toEqual({ x: -138 - 80 / Math.tan(Math.PI / 3) - 16, y: -80 });
+    // 主骨末端就是最远那根骨（槽位 5）的锚点
+    expect(result.fishbone.spine.to).toEqual({ x: -90 - 48 - 5 * 132, y: 0 });
+  });
+
+  it('同侧骨长仍然取齐，12 个原因仍然换紧凑档 56', () => {
+    const twelve = layoutFishbone(sixBoneTree({ 人: 12 }));
+    const gaps = [0, 1, 2].map(index =>
+      Math.abs(twelve.positions.get(`人${index + 1}`)!.y) - Math.abs(twelve.positions.get(`人${index}`)!.y));
+    for (const gap of gaps) expect(gap).toBeCloseTo(56, 9);
+    // 紧凑档的"对半分余量"：48 + (56-48)/2 + 24 = 76
+    expect(Math.abs(twelve.positions.get('人0')!.y)).toBeCloseTo(76, 9);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 中骨：骨上的骨
+// ---------------------------------------------------------------------------
+
+/**
+ * 三层深（骨 → 原因 → 原因的原因）。上下两侧各留一根中骨，且中骨与叶子原因做
+ * 兄弟——混合才是最难的排布，"全是中骨"的图反而好排。
+ */
+function threeLevelTree(): MindNode {
+  return {
+    id: 'r',
+    label: '交付延期',
+    children: [
+      {
+        id: '人', label: '人（人员）',
+        children: [
+          {
+            id: '培训不足', label: '培训不足',
+            children: [
+              { id: '新人多', label: '新人多', children: [] },
+              { id: '老人走了', label: '老人走了', children: [] },
+            ],
+          },
+          { id: '激励不足', label: '激励不足', children: [] },
+        ],
+      },
+      {
+        id: '法', label: '法（方法）',
+        children: [
+          {
+            id: '流程不清', label: '流程不清',
+            children: [{ id: '没写下来', label: '没写下来', children: [] }],
+          },
+          { id: '无审批', label: '无审批', children: [] },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * 一根骨那条**斜线**在给定 rise 上的横坐标。
+ *
+ * 由它自己的三点折线（主骨起点 → 锚点 → 骨尖）里的后两点反推，不借布局的公式：
+ * 公式在这种用例里是被检验对象。
+ */
+function boneLineAt(result: ReturnType<typeof layoutFishbone>, id: string, rise: number): number {
+  const [, anchor, tip] = result.fishbone.links.get(`r->${id}`)!;
+  const ratio = (rise - Math.abs(anchor!.y)) / (Math.abs(tip!.y) - Math.abs(anchor!.y));
+  return anchor!.x + (tip!.x - anchor!.x) * ratio;
+}
+
+describe('中骨：骨上的骨', () => {
+  it('中骨沿大骨斜出：一截横向连接短线 + 一段与大骨同斜率的骨身 + 挂标签的短线', () => {
+    const result = layoutFishbone(threeLevelTree());
+    const points = result.fishbone.links.get('人->培训不足')!;
+    expect(points).toHaveLength(4);
+
+    const [hook, midStart, midTip, labelRight] = points;
+    // 挂点在大骨那条线上（同一个 rise 的横坐标）
+    expect(hook!.x).toBeCloseTo(boneLineAt(result, '人', Math.abs(hook!.y)), 9);
+    // 第一段是水平的：连接短线两边 y 相同、x 差一个偏移
+    expect(midStart!.y).toBe(hook!.y);
+    expect(hook!.x - midStart!.x).toBeGreaterThan(0);
+    expect(hook!.x - midStart!.x).toBeLessThanOrEqual(56); // 同侧骨距里唯一一份余量（见 fishbone.ts 文件头）
+    // 第二段与大骨**同斜率**：60°，只是整体平移了
+    const midSlope = (midTip!.x - midStart!.x) / (midTip!.y - midStart!.y);
+    const bigSlope = (result.fishbone.links.get('r->人')![2]!.x - result.fishbone.links.get('r->人')![1]!.x)
+      / (result.fishbone.links.get('r->人')![2]!.y - result.fishbone.links.get('r->人')![1]!.y);
+    expect(midSlope).toBeCloseTo(bigSlope, 9);
+    expect(Math.abs(midSlope)).toBeCloseTo(1 / Math.tan(Math.PI / 3), 9);
+    // 骨身确实是往外长的：越往上越左
+    expect(Math.abs(midTip!.y)).toBeGreaterThan(Math.abs(midStart!.y));
+    expect(midTip!.x).toBeLessThan(midStart!.x);
+    // 末段是接标签框的水平短线（与大骨上那些"小横杠"同一个长度、同一个方向）
+    expect(labelRight!.y).toBe(midTip!.y);
+    expect(midTip!.x - labelRight!.x).toBeCloseTo(16, 9);
+    expect(labelRight!.x).toBeCloseTo(rect(result, '培训不足').x2, 9);
+  });
+
+  it('小原因挂在**中骨**上：短线起点正好落在中骨那条线上', () => {
+    const result = layoutFishbone(threeLevelTree());
+    const [, midStart, midTip] = result.fishbone.links.get('人->培训不足')!;
+    for (const id of ['新人多', '老人走了']) {
+      const link = result.fishbone.links.get(`培训不足->${id}`)!;
+      const [hook, end] = link;
+      const rise = Math.abs(hook!.y);
+      // 由中骨自己的两个端点线性插值出"这个高度上骨在哪"——起点必须就是那一点
+      const ratio = (rise - Math.abs(midStart!.y)) / (Math.abs(midTip!.y) - Math.abs(midStart!.y));
+      expect(hook!.x, id).toBeCloseTo(midStart!.x + (midTip!.x - midStart!.x) * ratio, 9);
+      expect(hook!.y).toBe(-rise); // 人这根骨在上半侧
+      // 短线水平，终点是原因框的右沿
+      expect(end!.y).toBe(hook!.y);
+      expect(end!.x).toBeLessThan(hook!.x);
+      expect(end!.x).toBeCloseTo(rect(result, id).x2, 9);
+    }
+  });
+
+  it('中骨的标签落在自己那条乐道的最外一格，不与自己的小原因挤在一起', () => {
+    const result = layoutFishbone(threeLevelTree());
+    const labelId = '培训不足';
+    const kidIds = ['新人多', '老人走了'];
+    const midStart = result.fishbone.links.get('人->培训不足')![1]!;
+    const midTip = result.fishbone.links.get('人->培训不足')![2]!;
+    const midLineAt = (rise: number) => midStart.x
+      + (midTip.x - midStart.x) * ((rise - Math.abs(midStart.y)) / (Math.abs(midTip.y) - Math.abs(midStart.y)));
+
+    // 乐道是斜的（60°）：同一列的框在**自己的高度上**各有一个横坐标。判据不是"x 相同"，
+    // 而是"框的右沿恒在骨线左边一个短线长"——中骨的标签与它的小原因共用这一条。
+    for (const id of [labelId, ...kidIds]) {
+      const point = result.positions.get(id)!;
+      expect(rect(result, id).x2, id).toBeCloseTo(midLineAt(Math.abs(point.y)) - 16, 9);
+    }
+    // 标签在三个框里最外，且与最近的小原因隔着一个框高以上
+    const label = result.positions.get(labelId)!;
+    for (const id of kidIds) {
+      expect(Math.abs(label.y)).toBeGreaterThan(Math.abs(result.positions.get(id)!.y) + NODE_SIZE.height);
+    }
+    // 中骨的骨尖就落在标签框的**中心线**上（末段那截短线接到框的右沿）
+    expect(Math.abs(midTip.y)).toBeCloseTo(Math.abs(label.y), 9);
+    // 标签框整体比骨尖靠左：不骑到外侧邻骨那条斜线上（见下一条）
+    expect(rect(result, labelId).x2).toBeLessThan(midTip.x);
+  });
+
+  it('中骨那条乐道留得住 12px 净空：不压到同侧外侧邻骨的那条斜线', () => {
+    // 六根骨全都长中骨——最挤的形态，邻骨就在旁边。
+    const root: MindNode = {
+      id: 'r', label: '结果',
+      children: ['人', '机', '料', '法', '环', '测'].map(name => ({
+        id: name,
+        label: name,
+        children: [
+          {
+            id: `${name}中骨`,
+            label: `${name}中骨`,
+            children: [
+              { id: `${name}小1`, label: `${name}小1`, children: [] },
+              { id: `${name}小2`, label: `${name}小2`, children: [] },
+            ],
+          },
+          { id: `${name}叶`, label: `${name}叶`, children: [] },
+        ],
+      })),
+    };
+    const result = layoutFishbone(root);
+    assertNoOverlap(root, result);
+
+    // 槽位 0/2/4 与 1/3/5 各自一侧；同一侧相邻骨的锚点相距 2 * 132 = 264。
+    const SLOT_SPACING = 264;
+    for (const name of ['人', '机']) {
+      for (const id of [`${name}小1`, `${name}小2`, `${name}中骨`]) {
+        const box = rect(result, id);
+        const rise = Math.abs(result.positions.get(id)!.y);
+        const neighbourLine = boneLineAt(result, name, rise) - SLOT_SPACING;
+        // 中骨那条乐道的左沿在大骨线左边 252（偏移 56 + 短线 16 + 框宽 180），
+        // 外侧邻骨的斜线在大骨线左边 264 —— 两者之间正好 12。
+        expect(box.x1 - neighbourLine, `${id} 与外侧邻骨的斜线`).toBeGreaterThanOrEqual(12 - 1e-9);
+      }
+    }
+  });
+
+  it('文字不会被裁：中骨的框与原因框同尺寸，一个字符都不少地待在框内', () => {
+    // 布局层能保证的是"框还是那个 180×48"，以及乐道宽度够——换行与截断由节点组件负责。
+    expect(NODE_SIZE).toEqual({ width: 180, height: 48 });
+    const result = layoutFishbone(threeLevelTree());
+    for (const id of ['培训不足', '新人多', '老人走了', '流程不清', '没写下来']) {
+      const box = rect(result, id);
+      expect(box.x2 - box.x1).toBeCloseTo(NODE_SIZE.width, 9);
+      expect(box.y2 - box.y1).toBeCloseTo(NODE_SIZE.height, 9);
+    }
+  });
+
+  it('第四层及更深仍然不丢节点', () => {
+    const root: MindNode = {
+      id: 'r', label: '结果',
+      children: [{
+        id: '人', label: '人',
+        children: [{
+          id: 'm', label: '中骨',
+          children: [{
+            id: 's', label: '小原因',
+            children: [{ id: 'deep', label: '再下层的', children: [] }],
+          }],
+        }],
+      }],
+    };
+    const result = layoutFishbone(root);
+    expect(result.positions.size).toBe(count(root));
+    // 兜底仍然是"往左排一列"：在父节点左侧一个框宽 + 24
+    expect(result.positions.get('deep')!.x)
+      .toBeCloseTo(result.positions.get('s')!.x - NODE_SIZE.width - 24, 9);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 主骨末端的箭头
+// ---------------------------------------------------------------------------
+
+describe('主骨末端的箭头', () => {
+  it('尖端压在鱼头左沿、朝向 +x，交给锚点最靠右的那条骨线画', () => {
+    const result = layoutFishbone(sixBoneTree());
+    const arrow = result.fishbone.spineArrow!;
+    expect(arrow.link).toBe('r->人'); // 槽位 0 = 离鱼头最近
+    expect(arrow.points).toEqual([
+      { x: -NODE_SIZE.width / 2, y: 0 },
+      { x: -NODE_SIZE.width / 2 - 12, y: -5 },
+      { x: -NODE_SIZE.width / 2 - 12, y: 5 },
+    ]);
+    // 尖端与主骨起点重合 = 箭头正好收在主骨指向鱼头的那一端
+    expect(arrow.points[0]).toEqual(result.fishbone.spine.from);
+    // 所有点在底边的右侧（朝向 +x，不可能反过来）
+    expect(arrow.points[1]!.x).toBeLessThan(arrow.points[0]!.x);
+    expect(arrow.points[2]!.x).toBeLessThan(arrow.points[0]!.x);
+  });
+
+  it('换了谁离鱼头最近，箭头就跟着换那条骨线', () => {
+    const root: MindNode = {
+      id: 'r', label: '结果',
+      children: [{
+        id: '法', label: '法',
+        children: [{ id: 'x', label: 'x', children: [] }],
+      }],
+    };
+    expect(layoutFishbone(root).fishbone.spineArrow!.link).toBe('r->法');
+  });
+
+  it('箭头尺寸是布局坐标里的常量，与描边粗细无关', () => {
+    expect(SPINE_ARROW_SIZE).toEqual({ length: 12, halfHeight: 5 });
+    const arrow = layoutFishbone(sixBoneTree()).fishbone.spineArrow!;
+    const [tip, top, bottom] = arrow.points;
+    expect(tip!.x - top!.x).toBe(SPINE_ARROW_SIZE.length);
+    expect(bottom!.y - top!.y).toBe(SPINE_ARROW_SIZE.halfHeight * 2);
   });
 });
 
@@ -309,7 +605,10 @@ const stubs = {
   },
 };
 
-function mountBone(points: Array<{ x: number; y: number }>) {
+function mountBone(
+  points: Array<{ x: number; y: number }>,
+  arrow?: Array<{ x: number; y: number }>,
+) {
   return mount(FishboneEdge, {
     props: {
       id: 'r->人',
@@ -321,7 +620,7 @@ function mountBone(points: Array<{ x: number; y: number }>) {
       targetY: 0,
       sourcePosition: 'left',
       targetPosition: 'right',
-      data: { points },
+      data: arrow ? { points, arrow } : { points },
     } as never,
     global: { stubs },
   });
@@ -337,7 +636,7 @@ describe('鱼骨连线的渲染', () => {
     expect(path.attributes('d')).toBe('M 0.00 0.00 L -48.00 0.00 L -100.00 -90.50');
     // 骨线是中性的浅灰：它是结构，不该比节点边框更显眼
     expect(path.attributes('style')).toContain('rgb(203, 213, 225)');
-    // 没有箭头：鱼骨表达归类，不表达流向
+    // 骨线自己不带 marker：鱼骨表达归类，不表达流向（唯一的箭头在主骨末端，见下一条）
     expect(path.attributes('marker-end')).toBeUndefined();
   });
 
