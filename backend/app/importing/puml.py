@@ -11,16 +11,21 @@
     ' 甲 --> 乙 : 是
     @endmindmap
 
-星号数量 = 层级（1 个是根），所以导入是"数星号 + 建栈"。两处特别处理：
+星号数量 = 层级（1 个是根），所以导入是"数星号 + 建栈"。三处特别处理：
 
   1. **`' 图型：…（fishbone）` 读回来**。`mindmap` 语法本身分不出流程图与鱼骨图
      ——形状可以一模一样——这行注释是唯一留下的痕迹。不读它，往返一次
      `diagram_type` 就退回 `tree`，而界面上「附加关系」区块的可见性正是按它判的。
   2. **`' ----` 开头的分隔注释要跳过**。它里面也含 `-->`（"以下按 A --> B 记录"），
      不先跳过就会被当成一条边，端点是"以下按 A"和"B : label 记录"这种鬼名字。
+  3. **`' 说明：…` 是上一行节点的 `detail`**。它是导出的第二个文字通道
+     （`export._puml_note`），读回来之后 `.puml` 与 markdown 一样能保住 `detail`。
+     早先这里把它当普通注释跳过，`docs/IMPORT.md` 的往返矩阵因此写着"detail 在、
+     但导入侧不读"——那句话本身就是自相矛盾（codex 复审 P3-5）。
 
 做不到的：导出把正文里的 `*` 换成了 `·`（星号是层级标记），这个替换是**单向**的。
-所以 `.puml` 往返之后，原文里本来有星号的标题会变成间隔号。这一点在告警里说明，
+所以 `.puml` 往返之后，原文里本来有星号的标题会变成间隔号。说明里的 `-->` 也被
+换成 `→`（否则那行注释会被读成一条边），同样不可逆。这两点都在告警里说明，
 而不是假装能还原。
 """
 from __future__ import annotations
@@ -28,6 +33,7 @@ from __future__ import annotations
 import re
 
 from app.importing.errors import ParseFailure
+from app.importing.markdown import append_text
 from app.importing.model import (
     FORMAT_NOTICE,
     RAW_NODE_HARD_CAP,
@@ -42,6 +48,8 @@ _START = re.compile(r"^\s*@startmindmap\b", re.IGNORECASE)
 _END = re.compile(r"^\s*@endmindmap\b", re.IGNORECASE)
 # 图型注释。中文全角括号与英文括号都收——用户可能手改过。
 _DIAGRAM = re.compile(r"^\s*'\s*图型：\s*(?P<label>.*?)\s*[（(](?P<key>[A-Za-z_]+)[）)]")
+# 说明注释：`export._puml_note` 写的第二通道（`' 说明：…`）。
+_NOTE = re.compile(r"^\s*'\s*说明：\s*(?P<text>.*)$")
 _SEPARATOR = re.compile(r"^\s*'\s*-{2,}")
 _EDGE = re.compile(
     r"^\s*'\s*(?P<source>.+?)\s*-->\s*(?P<target>.+?)(?:\s*:\s*(?P<label>.*))?$")
@@ -106,6 +114,15 @@ def parse(raw: bytes) -> RawMap:
             diagram_type = hint.group("key")
             continue
         if line.lstrip().startswith("'"):
+            note = _NOTE.match(line)
+            if note and nodes:
+                # `' 说明：…` 是 `export._puml_note` 写的第二通道，挂在**它上面
+                # 那一行节点**上（导出就是紧跟着节点行写的）。早先这里只把它当
+                # 普通注释跳过，于是 `detail` 落在文件里却读不回来——文档的往返
+                # 矩阵因此自相矛盾（codex 复审 P3-5）。
+                nodes[-1][1].detail = append_text(
+                    nodes[-1][1].detail, note.group("text"))
+                continue
             edge = _edge_of(line)
             if edge is not None:
                 edges.append(edge)

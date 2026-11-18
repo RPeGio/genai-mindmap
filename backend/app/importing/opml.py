@@ -46,6 +46,20 @@ def _label(element: Element) -> str:
     return ""
 
 
+def _detail(element: Element) -> str | None:
+    """`_note` 属性 → `detail`。导出写的就是它（`export._opml_note`）。
+
+    早先这里一个属性都不读，`_note` 落在文件里却没人看——`docs/IMPORT.md` 的
+    往返矩阵因此自相矛盾（矩阵说 `detail` 在"往返之后还剩什么"里，括号里又写
+    "导入侧不读它"，而实测导回来是空的；codex 复审 P3-5）。
+
+    `_note` 是 OmniOutliner 用了几十年的备注约定，XMind / 幕布见到也只是一个普通
+    属性——读它不会误伤别人的文件，读到空值就当没有。
+    """
+    value = element.get("_note")
+    return value.strip() or None if value else None
+
+
 def parse(raw: bytes) -> RawMap:
     text = decode_text(raw)
     document = parse_xml(text, "OPML")
@@ -77,7 +91,7 @@ def parse(raw: bytes) -> RawMap:
     budget.take()  # 根节点自己
     first = tree_outlines[0]
     # 文字为空不在这里兜底：`normalize` 统一填「（无标题）」并计数。
-    root = RawNode(label=_label(first))
+    root = RawNode(label=_label(first), detail=_detail(first))
     over_cap = False
 
     stack: list[tuple[Element, RawNode]] = [(first, root)]
@@ -87,7 +101,7 @@ def parse(raw: bytes) -> RawMap:
             if not budget.take():
                 over_cap = True
                 break
-            child_node = RawNode(label=_label(child))
+            child_node = RawNode(label=_label(child), detail=_detail(child))
             node.children.append(child_node)
             stack.append((child, child_node))
         if over_cap:
@@ -100,7 +114,7 @@ def parse(raw: bytes) -> RawMap:
             if not budget.take():
                 over_cap = True
                 break
-            extra_node = RawNode(label=_label(extra))
+            extra_node = RawNode(label=_label(extra), detail=_detail(extra))
             root.children.append(extra_node)
             attached += 1
             # 额外顶层大纲自己的子树也要搬过来，否则它们会被静默丢掉。
@@ -111,7 +125,7 @@ def parse(raw: bytes) -> RawMap:
                     if not budget.take():
                         over_cap = True
                         break
-                    child_node = RawNode(label=_label(child))
+                    child_node = RawNode(label=_label(child), detail=_detail(child))
                     node.children.append(child_node)
                     extra_stack.append((child, child_node))
                 if over_cap:

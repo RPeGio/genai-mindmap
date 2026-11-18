@@ -1407,6 +1407,43 @@ class RoundTripLossTest(unittest.TestCase):
         self.assertEqual(restored.edges[0].label, "a<b & c")
 
 
+    # --- P3-5：OPML / PlantUML 的 detail --------------------------------
+
+    def test_opml_note_attribute_comes_back_as_detail(self):
+        """`_note` 是导出写的第二通道，导入侧读它（此前只写不读）。"""
+        original = MindMapContent.model_validate({
+            "title": "报销", "root": {
+                "id": "r", "label": "提交申请", "detail": "把单据拍照上传。",
+                "children": [{"id": "c", "label": "填单", "detail": "写清事由。"}]},
+        })
+        restored = parse_text("d.opml", to_opml(original)).content
+        self.assertEqual(restored.root.detail, "把单据拍照上传。")
+        self.assertEqual(restored.root.children[0].detail, "写清事由。")
+
+    def test_puml_note_comment_comes_back_as_detail(self):
+        original = MindMapContent.model_validate({
+            "title": "报销", "root": {
+                "id": "r", "label": "提交申请", "detail": "把单据拍照上传。",
+                "children": [{"id": "c", "label": "填单", "detail": "写清事由。"}]},
+        })
+        restored = parse_text("d.puml", to_puml(original)).content
+        self.assertEqual(restored.root.detail, "把单据拍照上传。")
+        self.assertEqual(restored.root.children[0].detail, "写清事由。")
+
+    def test_puml_note_does_not_grow_an_edge(self):
+        """`' 说明：…` 里的箭头一旦被 `_EDGE` 抢先读成边，就凭空多出一条关系。
+
+        导出侧已经把 `-->` 压成 `→`（`export._puml_note`，单向替换），这条钉住
+        导入侧读回说明时**不长边**、并且如实留下压过的文字。
+        """
+        original = MindMapContent.model_validate({
+            "title": "t", "root": {"id": "r", "label": "根",
+                                   "detail": "先 A --> B 再回 C", "children": []}})
+        restored = parse_text("d.puml", to_puml(original)).content
+        self.assertEqual(restored.edges, [])
+        self.assertEqual(restored.root.detail, "先 A → B 再回 C")
+
+
 class FlowMarkdownTest(unittest.TestCase):
     """流程图 markdown 的两个细节：阶段根的**正文**、阶段内边的端点归属。"""
 

@@ -184,12 +184,15 @@ def _label_of(text: str) -> tuple[str, str | None, str | None]:
     return _unescape(body).strip(), icon, color
 
 
-def _append_text(existing: str | None, extra: str) -> str:
+def append_text(existing: str | None, extra: str) -> str:
     """把一句续行拼到已有文字后面。
 
     引用块可以连着写好几行（用户把一句长说明手动折行了）。用空格拼起来而不是换行：
     `detail` 在画布与导出里都是**一句**话，留着换行会在下一次导出时被 `_one_line`
     折掉——那时"往返之后多了一个换行符"就成了查无可查的怪事。
+
+    **公开**（不带下划线）：puml 的 `' 说明：…` 也要按同一条规则续拼，两处各写
+    一份的结局是一份留了换行、一份折了。与 `edge_of` 同一条理由。
     """
     part = extra.strip()
     if not part:
@@ -408,7 +411,7 @@ def _parse_tree(text: str) -> RawMap:
         detail = _DETAIL.match(line)
         if detail:
             if owner is not None:
-                owner.detail = _append_text(
+                owner.detail = append_text(
                     owner.detail, _unescape(detail.group("text")))
             continue
         item = _ITEM.match(line)
@@ -547,7 +550,7 @@ def _parse_fishbone(text: str) -> RawMap | None:
         detail = _DETAIL.match(line)
         if detail:
             if owner is not None:
-                owner.detail = _append_text(
+                owner.detail = append_text(
                     owner.detail, _unescape(detail.group("text")))
             continue
         item = _ITEM.match(line)
@@ -666,7 +669,7 @@ def _parse_flow(text: str) -> RawMap | None:
         detail = _DETAIL.match(line)
         if detail:
             if owner is not None:
-                owner.detail = _append_text(
+                owner.detail = append_text(
                     owner.detail, _unescape(detail.group("text")))
             continue
         item = _ITEM.match(line)
