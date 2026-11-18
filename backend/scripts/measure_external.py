@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import statistics
 import sys
@@ -49,6 +50,11 @@ from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
+
+# **必须关掉检索缓存**（`external_cache`）。这个脚本量的是"一次真实检索花多少秒、
+# 返回几条"，而缓存命中会让耗时变成 0、候选池变成上一次的快照——那不是测量，是
+# 复述上一轮的数字。用 `setdefault` 是为了让"想故意量缓存命中"的人还能在外面覆盖。
+os.environ.setdefault("MINDMAP_EXTERNAL_CACHE", "0")
 
 from app.knowledge import external  # noqa: E402
 

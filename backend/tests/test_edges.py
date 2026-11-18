@@ -417,7 +417,16 @@ class TestTreeIsByteIdentical:
         比的是三份东西：回给模型的那句话、`data` 的键与值、以及候选树的整份
         `model_dump()`。tree 这一支多出来任何字段（哪怕一个恒为 0 的 `edges`），
         这条用例就会红——这正是"现有行为一字不改"该有的守门方式。
+
+        **例外只有一句**：外部检索开关在测试环境里是关的（`conftest.clean_env`），
+        而"你关掉了联网检索…"是后来加的用户可见行为。它与此处钉的东西（`diagram_type`
+        这一支的产出）无关，比对前剥掉；它自己的守卫在
+        `test_one_path.test_external_switch_off_says_it_was_switched_off`。
+        剥的时候引用 `tools.EXTERNAL_DISABLED_NOTE` 而不是抄字面量——抄一份就成了
+        第三处真相，下次改文案这里会静默失效。
         """
+        from app.agent.tools import EXTERNAL_DISABLED_NOTE
+
         baseline = _load_baseline_tools()
 
         _GENERATION_SNAPSHOT.seq = _uuid_sequence()
@@ -428,8 +437,20 @@ class TestTreeIsByteIdentical:
         new_content, new_data, new_tree = _generation_snapshot(
             new_tools, diagram_args={"diagram_type": "tree"})
 
+        assert EXTERNAL_DISABLED_NOTE not in old_content, (
+            "基线版本不该有这句话——有了说明基线选错了，剥掉就等于掩盖")
+        new_content = new_content.replace(EXTERNAL_DISABLED_NOTE, "")
+        # `data.diagnostics` 里同一条也得滤掉；浅拷贝是为了不改动被比的产物本身。
+        comparable = {
+            **new_data,
+            "diagnostics": [item for item in new_data["diagnostics"]
+                            if item["code"] != "GENERATION_EXTERNAL_DISABLED"],
+        }
+        assert len(comparable["diagnostics"]) == len(new_data["diagnostics"]) - 1, \
+            "这条过滤本身要能被验证：诊断里确实少了一条"
+
         assert new_content == old_content
-        assert json.dumps(new_data, ensure_ascii=False, sort_keys=True) == \
+        assert json.dumps(comparable, ensure_ascii=False, sort_keys=True) == \
                json.dumps(old_data, ensure_ascii=False, sort_keys=True)
         assert json.dumps(new_tree, ensure_ascii=False, sort_keys=True) == \
                json.dumps(old_tree, ensure_ascii=False, sort_keys=True)

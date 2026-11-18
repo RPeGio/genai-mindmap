@@ -52,6 +52,24 @@ hit 形状、第二套引用格式、第二套校验。所以这个模块只做�
 生成：调用方（`agent.tools._generate`）拿不到结果就退回"只凭主题"的那条路。总预算
 （`REQUEST_LIMIT` 次请求 / `DEADLINE_SECONDS` 秒）是硬的，理由见 `_Budget`。
 
+## 同一 query 24 小时内只打一次网
+
+`search_external` 的最终产物会按**归一化 query** 存进 `external_cache`（同库另一张
+表），24 小时内同一个 query 再来就不发一个 HTTP 请求。三个边界决定了它长成这样：
+
+  - **缓存的是 `ExternalHit` 的字段，不是 `Source`**：`Source.id` 每次入库都是新的，
+    存下来下次也用不上；真正稳定的是 title/text/url/source_name/language/raw_chars。
+    命中之后转 `Source`、`library.ingest`、检索、引用校验**全部照常走**——入库那一步
+    会因 `content_hash` 判重变成 no-op，这是对的（缓存省的是再搜一次，不是再入库一次）。
+  - **失败不进缓存，"0 条"进**：外网不通是暂时的，缓存住它会让"网络恢复了但一天没
+    结果"；而"搜到了 0 条"是个有效结论，重搜一遍仍然是 0 条（`_worth_caching`）。
+  - **注入方向时不碰缓存**：`directions is not None` 是测量脚本与用例的出口，它们要的
+    是真实耗时与真实候选池（理由见 `search_external`）。
+
+命中时仍走完整条后续链路，只是跳过 HTTP；`data.external.cached` 把"这次是缓存命中
+还是真搜"报给用户看（`ExternalHits.cached`）。`hit_count` 那个同样的问题
+（"这个主题被搜过几次"）留给缓存表自己回答。
+
 ## 多方向检索：查一遍 = 一个方面，短主题要的是几个方面
 
 `碳中和` 这样的主题，用户期待的是"政策 / 技术路径 / 企业案例"这类**多面覆盖**，而
@@ -119,6 +137,10 @@ from app.contracts.source import ISO_SECONDS_FORMAT
 # 已经吃过"代码围栏 / 前后多写字 / 括号收支错位"这三类真实故障，在这里另写一套剥围栏
 # 逻辑等于把那些故障的两套判定带到两个模块里。
 from app.generation.service import chat_async, parse_model_json
+# 缓存层只认 dict，不认 `ExternalHit`——所以它可以被这里 import 而不反向依赖本模块
+# （`external_cache` 不 import `external`，两者没有环）。命中/回写时的形状校验在
+# `_record_hit` / `_hit_record` 里，那两个函数是"缓存 ↔ 命中"的唯一转接点。
+from app.knowledge import external_cache
 # 私有名跨模块引用：分词这件事已经有实现（`_token_list`），门必须与检索用同一套
 # "什么算同一个词"，另写一份就是两处真相。模块级导入而不是函数内懒导入——两者
 # 之间没有循环（`service` 不引用 `external`），懒导入只会把导入期错误推后。
@@ -333,6 +355,45 @@ class ExternalHit:
     direction: str = ""
 
 
+class ExternalHits(list):
+    """`search_external` 的返回值：一个普通列表 + 一个 `cached` 标记。
+
+    **必须是 `list` 的子类而不是换一个返回类型**：这条链的调用方全都按列表用——
+    `tools._external_sources` 迭代它、`scripts/measure_external*.py` 取 `len(hits)`、
+    十几条用例写 `assert external.search_external(...) == []`。换成一个 dataclass
+    会让那些地方全部要改一遍，而真正新增的信息只有一个布尔值。
+
+    所以 `cached` 走属性，别处一律按 `list` 处理。读取方用
+    `getattr(hits, "cached", False)` 而不是直接取属性——用例与脚本会把这个函数
+    `monkeypatch` 成 `lambda: [hit]`，那是一个普通 list，没有这个属性。
+    """
+
+    cached: bool = False
+
+    def __init__(self, hits=(), *, cached: bool = False) -> None:
+        super().__init__(hits)
+        self.cached = cached
+
+
+@dataclass(frozen=True)
+class _SearchRun:
+    """一次检索过程的自述：拿到什么、发了几个请求、几个源失败了。
+
+    三个数一起才够回答"这次结果能不能当结论缓存下来"（`_worth_caching`）：只有
+    `hits` 时空列表分不清"源里确实没有"与"五个源全挂了"——而这两件事一个是有效
+    结论、另一个必须下次重试。
+
+    `failures` 数的是**源级失败**（超时 / 5xx / 脏响应 / 连接被拒），由各源自己的
+    `except` 与 `_run_source` 的兜底各记一次（`_Budget.note_failure`）。它不记
+    "维基的三个候选条目里抓失败了两个"这种部分失败——那种情况下源整体是通的，
+    调用方拿到的是它成功的部分，那是可缓存的结论。
+    """
+
+    hits: list[ExternalHit]
+    requests: int
+    failures: int
+
+
 @dataclass(frozen=True)
 class _Slot:
     """一个方向在这次检索里的请求槽位：`key` 是它的名字，`limit` 是它的请求上限。
@@ -370,12 +431,31 @@ class _Budget:
         self._used = 0
         # 槽位名 → 已用次数。键是方向的序号（`str(index)`），不值钱。
         self._by_slot: dict[str, int] = {}
+        # 源级失败次数。它记在这儿而不是另造一个对象，是因为"这次检索的共享状态"
+        # 已经只有这一份了（五个源在线程里跑，任何新对象都得自己带锁）；而
+        # `note_failure()` 的调用点全在各源的 `except` 里，手里正好有这个 budget。
+        self._failures = 0
         self._lock = threading.Lock()
 
     @property
     def used(self) -> int:
         with self._lock:
             return self._used
+
+    @property
+    def failures(self) -> int:
+        with self._lock:
+            return self._failures
+
+    def note_failure(self) -> None:
+        """记一次**源级失败**（超时 / 5xx / 脏响应 / 连接被拒）。
+
+        唯一的读者是 `_worth_caching`：一次全源失败的检索返回的是空列表，与"确实
+        没有 0 条"在返回值上完全一样，而只有后者该进缓存（否则代理没开的那一次会把
+        "没有结果"钉在库里 24 小时，用户开上代理再生成还是空）。
+        """
+        with self._lock:
+            self._failures += 1
 
     def slot_used(self, key: str) -> int:
         with self._lock:
@@ -635,6 +715,7 @@ def _wikipedia(
                 if hit is not None:
                     hits.append(hit)
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        budget.note_failure()
         logger.warning("外部检索：中文维基失败（%s）：%s",
                        type(exc).__name__, str(exc)[:160])
     return hits
@@ -690,6 +771,7 @@ def _arxiv(
             }, timeout=timeout)
         return _parse_arxiv(response.text, limit)
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        budget.note_failure()
         logger.warning("外部检索：arXiv 失败（%s）：%s",
                        type(exc).__name__, str(exc)[:160])
         return []
@@ -818,6 +900,7 @@ def _openalex(
             }, timeout=timeout).json()
         return _parse_openalex(payload, limit)
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        budget.note_failure()
         logger.warning("外部检索：OpenAlex 失败（%s）：%s",
                        type(exc).__name__, str(exc)[:160])
         return []
@@ -892,6 +975,7 @@ def _crossref(
             }, timeout=timeout).json()
         return _parse_crossref(payload, limit)
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        budget.note_failure()
         logger.warning("外部检索：Crossref 失败（%s）：%s",
                        type(exc).__name__, str(exc)[:160])
         return []
@@ -983,6 +1067,7 @@ def _baike(
         # 改名的词条会 404）。
         return _parse_baike(response.text, limit, url=str(response.url))
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        budget.note_failure()
         logger.warning("外部检索：快懂百科失败（%s）：%s",
                        type(exc).__name__, str(exc)[:160])
         return []
@@ -1039,16 +1124,22 @@ def _query_language(query: str) -> str | None:
     return "zh" if _CJK_RE.search(query or "") else None
 
 
-def _run_source(name: str, fetch: Any) -> list[ExternalHit]:
+def _run_source(name: str, fetch: Any, budget: _Budget | None = None) -> list[ExternalHit]:
     """跑一个源，**永不抛**。
 
     每个源自己已经吞过异常；这里再兜一层是因为"某个源写错一个字段名"不该让
     整天生成挂掉——而 `AttributeError` 恰恰不会被源内部的 `except Exception` 之外
     的任何地方拦住。
+
+    `budget` 只用来记一次失败（`note_failure`）：这一层捕获的是源自己**漏网**的
+    异常，它同样是"这个源这次没给出东西"，对 `_worth_caching` 的判据与源内部的
+    失败没有区别。给成可选是为了让"只想换个源函数试试"的调用点不必造一个预算。
     """
     try:
         return list(fetch())
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        if budget is not None:
+            budget.note_failure()
         logger.warning("外部检索：%s 失败（%s）：%s",
                        name, type(exc).__name__, str(exc)[:160])
         return []
@@ -1102,7 +1193,8 @@ def _search_one(
     if not planned:
         return collected
     with ThreadPoolExecutor(max_workers=len(planned)) as pool:
-        futures = [pool.submit(_run_source, name, fetch) for name, fetch in planned]
+        futures = [pool.submit(_run_source, name, fetch, budget)
+                   for name, fetch in planned]
         for (name, _), future in zip(planned, futures):
             hits = future.result()
             collected.extend(hits)
@@ -1440,8 +1532,11 @@ def _relevant_hits(query: str, hits: Sequence[ExternalHit]) -> list[ExternalHit]
 
 def search_external(
     query: str, *, limit: int = DEFAULT_LIMIT, directions: Sequence[str] | None = None,
-) -> list[ExternalHit]:
+) -> ExternalHits:
     """去外部源搜一次，返回最多 `limit` 条命中。**失败返回空列表，永不抛。**
+
+    返回值是 `ExternalHits`（`list` 的子类）：`cached` 说明这次是命中缓存还是真搜了
+    一次网。它给 `data.external.cached` 用，也是"这次为什么这么快"的唯一解释。
 
     这是整条外部检索的入口，两条路：
 
@@ -1467,10 +1562,41 @@ def search_external(
 
     `directions` 是给调用方（测量脚本、用例）**注入**方向的出口：不传就自己拆
     （`plan_directions`），传了就不调模型——拆方向的效果可以脱离模型单独量。
+
+    ## 缓存：什么时候用它，什么时候绕开
+
+    命中就整段跳过 HTTP（`external_cache`，24 小时 / 归一化 query），但**后续链路一条
+    都不少**：转 `Source`、入库、检索、引用校验全在调用方，缓存命中时照常走。
+
+    三个判断值得单独说：
+
+      - `directions is not None` → **不读也不写**。那是测量脚本与用例的出口：它们要
+        真实耗时与真实候选池，命中缓存会让"这次检索花了几秒"变成 0、让 A/B 两组拿到
+        同一份池子（`scripts/measure_external_relevance.py` 的 `--collect-single` 与
+        `--collect-directions` 正是这么调用的）。生产链路永远不传 `directions`。
+      - 空结果也写缓存（`_worth_caching`）：区分"确实 0 条"与"源全挂了"是 `_Budget`
+        记账的失败次数，不是返回值的形状。
+      - 缓存写失败只是少一次加速，`external_cache.put` 自己吞异常并返回 False。
     """
     text = (query or "").strip()[:QUERY_MAX_CHARS]
     if not text or limit <= 0:
-        return []
+        return ExternalHits((), cached=False)
+
+    use_cache = directions is None
+    if use_cache:
+        cached = external_cache.get(text, limit=limit)
+        if cached is not None:
+            records, hits_before = cached
+            hits = [hit for hit in (_record_hit(record) for record in records)
+                    if hit is not None]
+            # `records` 与 `hits` 不等长说明某些行解不出（见 `_record_hit`）：那几行
+            # 不明不白地少一条，比重新搜一次更糟——"这次只有 1 条资料"看起来像结论。
+            if len(hits) == len(records):
+                logger.info(
+                    "外部检索：%r 命中缓存 %d 条（此前命中 %d 次，跳过全部 HTTP）",
+                    text, len(hits), hits_before,
+                )
+                return ExternalHits(hits, cached=True)
 
     started = time.perf_counter()
     if directions is not None:
@@ -1491,8 +1617,87 @@ def search_external(
         # 降级路径：**一个方向**。没有拆方向、拆出来只有一条、或拆失败——三者都走
         # 这里，且与 `3c40ba6` 的单方向实现逐字节相同（同一份预算、同一批源、同一
         # 道门、同一行日志）。"拆方向失败"不能顺带改变别的东西。
-        return _search_single(usable[0] if usable else text, limit, started)
-    return _search_many(text, usable, limit, started)
+        run = _search_single(usable[0] if usable else text, limit, started)
+    else:
+        run = _search_many(text, usable, limit, started)
+
+    if use_cache and _worth_caching(run):
+        external_cache.put(
+            text, limit=limit, records=[_hit_record(hit) for hit in run.hits])
+    return ExternalHits(run.hits, cached=False)
+
+
+def _worth_caching(run: _SearchRun) -> bool:
+    """这次结果该不该记成结论。
+
+    两种情况写：
+
+      - **拿到了东西**（`hits` 非空）。哪怕某几个源失败了：返回的这批是这次检索的
+        真实产出，24 小时内重搜一遍多半仍是这一批（源站的排序不会隔天翻面）；
+      - **一条都没拿到，但没有一个源失败**（`failures == 0 and requests > 0`）。
+        那是"搜过，确实 0 条"——一个有效结论。`requests > 0` 是必要条件：一次请求
+        都没发出去（`limit <= 0` 之外的情况：预算被 `DEADLINE_SECONDS=0` 提前耗光）
+        不能算"查过"。
+
+    反过来，**全源失败的空结果不写**：代理没开、外网被封时五个源一起超时，把它缓存
+    24 小时意味着"网络恢复了但一天没结果"——而用户重试的正是那一刻。部分失败但
+    仍拿到了东西时会写（见上），代价是那几个失败源的内容在 TTL 内缺失；这个取舍的
+    方向是明确的：宁可少一条资料，也不要让用户等两次一样长的等待。
+    """
+    if run.hits:
+        return True
+    return run.failures == 0 and run.requests > 0
+
+
+# 缓存 ↔ `ExternalHit` 的字段转接。**只搬 `ExternalHit` 自己声明的字段**：`Source`
+# 的 id / content_hash / status 每次都重新生成（`library.ingest` 会重算），存下来下次
+# 也用不上，而存了它们会让"缓存里那份是不是就是库里那份"变成一个新问题。
+_HIT_FIELDS: tuple[str, ...] = (
+    "title", "text", "url", "source_name", "fetched_at", "language", "raw_chars",
+    "direction",
+)
+
+
+def _hit_record(hit: ExternalHit) -> dict[str, Any]:
+    """`ExternalHit` → 可 JSON 化的 dict。`direction` 一起存：多方向检索时它是
+    "这条命中来自哪个方面"，丢了它重建出来的 `ExternalHit` 与第一次的不等。"""
+    return {name: getattr(hit, name) for name in _HIT_FIELDS}
+
+
+def _record_hit(record: dict[str, Any]) -> ExternalHit | None:
+    """dict → `ExternalHit`；形状不对返回 None（调用方据此整条缓存作废）。
+
+    **按最严的写法校验**：缓存表是本地 sqlite，可能被旧版本写过、被人手动改过、
+    被磁盘故障截断过。`title` / `text` / `source_name` 缺了或不是字符串，这条命中
+    就过不了 `_hit_blob` 与 `_external_source`（`filename` 要拼字符串）；`raw_chars`
+    给了个字符串会让 `max(hit.raw_chars, len(text))` 抛 `TypeError`——那会从
+    "少一条资料"升级成"整次生成失败"，而这两件事没有因果关系。
+    """
+    title = record.get("title")
+    body = record.get("text")
+    source_name = record.get("source_name")
+    if not isinstance(title, str) or not isinstance(body, str):
+        return None
+    if not isinstance(source_name, str) or not source_name:
+        return None
+    url = record.get("url")
+    fetched_at = record.get("fetched_at")
+    language = record.get("language")
+    direction = record.get("direction")
+    raw_chars = record.get("raw_chars")
+    if not isinstance(url, str):
+        url = ""
+    if not isinstance(fetched_at, str) or not fetched_at:
+        fetched_at = _now()
+    if not isinstance(language, str) or not language:
+        language = _guess_language(title)
+    if not isinstance(raw_chars, int) or isinstance(raw_chars, bool) or raw_chars < 0:
+        raw_chars = len(body)
+    return ExternalHit(
+        title=title, text=body, url=url, source_name=source_name,
+        fetched_at=fetched_at, language=language, raw_chars=raw_chars,
+        direction=direction if isinstance(direction, str) else "",
+    )
 
 
 def _plan_directions_sync(topic: str) -> list[str]:
@@ -1514,11 +1719,14 @@ def _plan_directions_sync(topic: str) -> list[str]:
         return list(pool.submit(asyncio.run, coro).result())
 
 
-def _search_single(query: str, limit: int, started: float) -> list[ExternalHit]:
+def _search_single(query: str, limit: int, started: float) -> _SearchRun:
     """单方向检索：**这就是 `3c40ba6` 的 `search_external` 主体**，一行都没改。
 
     单独成函数是为了让"降级"有唯一的落点：`search_external` 里任何一条拆方向失败
     的支路都汇到这里，而不是各自复制一份预算与门。
+
+    返回 `_SearchRun` 而不是裸列表：`search_external` 要用后两个数判断"这个空结果
+    该不该缓存"（`_worth_caching`），而预算对象里的两个计数只有这里拿得到。
     """
     budget = _Budget(REQUEST_LIMIT, DEADLINE_SECONDS)
     collected = _search_one(query, limit, budget=budget)
@@ -1533,7 +1741,7 @@ def _search_single(query: str, limit: int, started: float) -> list[ExternalHit]:
         query, len(hits), ", ".join(f"{hit.source_name}/{hit.title}" for hit in hits[:3]),
         len(collected), len(relevant), budget.used, time.perf_counter() - started,
     )
-    return hits
+    return _SearchRun(hits, budget.used, budget.failures)
 
 
 def _search_many(
@@ -1585,7 +1793,7 @@ def _search_many(
         sum(len(group) for group in per_direction), duplicated, budget.used,
         time.perf_counter() - started,
     )
-    return hits
+    return _SearchRun(hits, budget.used, budget.failures)
 
 
 def _hit_key(hit: ExternalHit) -> str:

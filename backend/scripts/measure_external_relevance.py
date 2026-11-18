@@ -226,6 +226,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -234,6 +235,12 @@ from typing import Any
 
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
+
+# **必须关掉检索缓存**（`external_cache`）。这里的每一条读数都建立在"这次真打了一轮
+# 网"上：耗时、候选池、按源分布。命中缓存会让 `--collect` 写出一份上一轮的池子、
+# 让 `--collect-single` 与 `--collect-directions` 拿到同一份数据——那两组对照就没意义
+# 了（它们存在的全部理由就是"同环境下的两份池子"）。
+os.environ.setdefault("MINDMAP_EXTERNAL_CACHE", "0")
 
 from app.knowledge import external, rerank  # noqa: E402
 

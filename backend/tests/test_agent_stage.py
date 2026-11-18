@@ -200,7 +200,7 @@ def test_stage_text_separates_the_three_empty_cases():
     assert agent_tools._external_stage_text(fetch([source], 1, 0.1)) == "已找到 1 条外部资料"
     assert agent_tools._external_stage_text(fetch([], 2, 0.1)) == "找到 2 条外部资料，但没能存进资料库"
     assert agent_tools._external_stage_text(fetch([], 0, 0.1, "ConnectError")) == "外部检索没成功，按主题生成"
-    assert agent_tools._external_stage_text(fetch([], 0, 0.1)) == "没有搜到外部资料，按主题生成"
+    assert agent_tools._external_stage_text(fetch([], 0, 0.1)) == "联网检索没有找到相关资料，按主题生成"
 
 
 # ---------------------------------------------------------------- 3 分派与校验

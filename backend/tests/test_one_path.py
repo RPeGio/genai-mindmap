@@ -494,7 +494,7 @@ def test_short_material_is_topped_up_by_external_sources(monkeypatch):
 
 
 def test_external_empty_says_it_found_nothing(monkeypatch):
-    """外部检索空手而归：仍然出图，但必须在 `content` 里说清"没有搜到外部资料"。"""
+    """外部检索空手而归：仍然出图，但必须在 `content` 里说清"没有找到相关资料"。"""
     monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
     monkeypatch.setattr(external_knowledge, "search_external", lambda *a, **k: [])
 
@@ -502,7 +502,7 @@ def test_external_empty_says_it_found_nothing(monkeypatch):
 
     assert result.ok, result.content
     assert "GENERATION_WITHOUT_EXTERNAL" in _codes(result)
-    assert "没有搜到外部资料" in result.content
+    assert "联网检索没有找到相关资料" in result.content
     assert result.data["external"]["sources"] == 0
     assert result.data["retrieval"]["mode"] == "off"
 
@@ -520,7 +520,7 @@ def test_external_failure_is_reported_as_a_failure_not_as_absence(monkeypatch):
 
     assert result.ok, result.content
     assert "外部检索出错" in result.content
-    assert "没有搜到外部资料" not in result.content
+    assert "联网检索没有找到相关资料" not in result.content
     assert result.data["external"]["failed"]
 
 
@@ -560,16 +560,41 @@ def test_user_switch_off_skips_the_search_and_says_so(monkeypatch):
     assert result.ok, result.content
     assert forbidden == [], "开关关着时不该发外部请求"
     # 诊断码分开：那条旧码的语义是"试过了没拿到"（可以重试），这条是"根本没试"
-    assert "EXTERNAL_SEARCH_DISABLED" in _codes(result)
+    assert "GENERATION_EXTERNAL_DISABLED" in _codes(result)
     assert "GENERATION_WITHOUT_EXTERNAL" not in _codes(result)
-    assert "你在设置里关掉了联网检索" in result.content
-    assert "这次没有去外面搜资料" in result.content
+    assert "你关掉了联网检索" in result.content
     # 两件事都不能出现："没搜到"的结论、以及关着时无效的那条建议
     assert "没有搜到外部资料" not in result.content
     assert "换一个更常见的主题词" not in result.content
-    # 有效动作写出来了：去哪把开关打开
-    assert "把画布右上角的「联网检索」勾上" in result.content
+    # 有效动作写出来了（就在那句里，不是另起一句）
+    assert "要出处就打开联网检索再生成一次" in result.content
+    # 同一句话不能出现两遍：常量本身就是完整句，拼接处再补一遍就成同义反复
+    assert result.content.count("你关掉了联网检索") == 1
     # 键集不变：不多出 `external`（与闸门关着时逐字节相同的那条约定）
+    assert "external" not in result.data
+    assert result.data["retrieval"]["mode"] == "off"
+
+
+def test_deployment_switch_off_reports_a_different_code_than_a_failed_search(monkeypatch):
+    """部署方关掉（环境变量）与"搜了没搜到"必须是两个码。
+
+    这一支与上面那条测的不是同一件事：那条是**用户**在界面上关的，诊断文案要给出
+    他能做的动作（去把开关打开）；这一条是**部署方**关的，用户没有任何动作可做，
+    所以它连诊断都不发——行为与加这个开关之前逐字节相同。这里钉的正是那个区别：
+    部署方关掉时 `GENERATION_WITHOUT_EXTERNAL` 不出现，而"没搜到"那套话术也不出现。
+    """
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "0")
+    monkeypatch.setattr(
+        external_knowledge, "search_external",
+        lambda *args, **kwargs: pytest.fail("开关关着时不该发外部请求"))
+
+    result = _run(_ctx(), _tree_chat())
+
+    assert result.ok, result.content
+    # 部署方关掉：不报回退码（那是"试过了没拿到"），也不报用户开关那个码
+    assert "GENERATION_WITHOUT_EXTERNAL" not in _codes(result)
+    assert "GENERATION_EXTERNAL_DISABLED" not in _codes(result)
+    assert "联网检索没有找到相关资料" not in result.content
     assert "external" not in result.data
     assert result.data["retrieval"]["mode"] == "off"
 
@@ -593,6 +618,69 @@ def test_turning_it_back_on_restores_the_search(monkeypatch):
 
     assert result.ok, result.content
     assert asked == [TOPIC]
-    assert "EXTERNAL_SEARCH_DISABLED" not in _codes(result)
+    assert "GENERATION_EXTERNAL_DISABLED" not in _codes(result)
     assert result.data["external"]["sources"] == 1
     assert _all_refs(ctx.candidate.root), "开着时引用应当活到候选树上"
+
+
+def test_external_switch_off_does_not_fire_when_material_is_present(monkeypatch):
+    """带材料那一路不说"你关掉了联网检索"：用户根本没要求联网。"""
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "0")
+
+    result = _run(_ctx([_material()]), _tree_chat(seen=None,
+                                                  branches=("预算审批", "报销时限", "采购合规")))
+
+    assert result.ok, result.content
+    assert "GENERATION_EXTERNAL_DISABLED" not in _codes(result)
+    assert "你关掉了联网检索" not in result.content
+
+
+def test_external_cache_hit_is_reported_in_data(monkeypatch):
+    """`data.external.cached` 必须能分开"缓存命中"与"真搜了一次网"。
+
+    少了它，`seconds` 从 4.5 秒掉到 0.02 秒会被读成"外部检索不稳定"，而真相是
+    "这个主题 24 小时内搜过"。
+    """
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
+    hit = _hit(Source(kind=SourceKind.web, status="parsed", text=EXTERNAL_TEXT))
+    monkeypatch.setattr(
+        external_knowledge, "search_external",
+        lambda *args, **kwargs: external_knowledge_module.ExternalHits([hit], cached=True))
+
+    result = _run(_ctx(), _tree_chat())
+
+    assert result.ok, result.content
+    assert result.data["external"]["cached"] is True
+    # 缓存命中照样走完整条链：入库、检索、引用都在（缓存跳过的只有 HTTP）
+    assert result.data["external"]["sources"] == 1
+    assert "GENERATION_FROM_EXTERNAL" in _codes(result)
+
+
+def test_external_cache_miss_reports_false(monkeypatch):
+    """普通 `list`（没有 `cached` 属性）读作"没命中缓存"：十几条用例都是这么 patch 的。"""
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
+    hit = _hit(Source(kind=SourceKind.web, status="parsed", text=EXTERNAL_TEXT))
+    monkeypatch.setattr(external_knowledge, "search_external", lambda *a, **k: [hit])
+
+    result = _run(_ctx(), _tree_chat())
+
+    assert result.ok, result.content
+    assert result.data["external"]["cached"] is False
+
+
+def test_no_source_rules_forbid_fake_precision():
+    """无引用时没有任何东西能拦住编造，所以提示词要正面要求"别写看起来精确的东西"。
+
+    有引用时逐字校验至少能拦住"引文是编的"（模型挂上出处的那句话必须能在原文里
+    逐字找到）。无引用时那条防线不存在：一个"2015 年《自然》上那篇论文指出……"的
+    节点与一句正确的结论在界面上长得一模一样，而前者随时可能是三个真实碎片被拼成
+    一件没发生过的事。
+    """
+    rules = generation_service.DETAIL_NO_SOURCE_RULES
+
+    assert "没有任何可核对的原文" in rules
+    for forbidden in ("年份", "人名", "论文标题", "数字统计"):
+        assert forbidden in rules, forbidden
+    assert "不确定的就略过" in rules
+    # 引用那条老约束不能被新句子挤掉：没有材料时写 `source_refs` 会让整棵树作废。
+    assert "不要写 source_refs" in rules

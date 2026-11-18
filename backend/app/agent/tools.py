@@ -419,6 +419,24 @@ EXTERNAL_OFF_NOTE = "你在设置里关掉了联网检索"
 # `count`、结束一帧带条数），所以前端不用为它分叉。
 DETAIL_STAGE = "detail"
 
+# 用户**自己把联网检索关掉**时的那句话。单独提成常量有两个理由：
+#
+#   - 它与"搜了但没搜到"是两件事（那条说"联网检索没有找到相关资料"），而两条路
+#     （`_generate` / `_generate_deep`）都要说同一句话——两份字面量迟早会有一份先改；
+#   - 向后兼容类的回归用例（`test_edges` / `test_agent_diagram_type` 拿旧版本
+#     `tools.py` 逐字节比 `content`）要在比对前把这句剥掉。剥的时候需要一个**唯一
+#     的**真相，抄在用例里就是第三份字面量。
+#
+# 这句话为什么必须有："关掉了"的正确下一步是打开开关，"没搜到"的正确下一步是换个
+# 说法——共用一句会让关掉开关的人反复改主题去试一个根本不会发生的搜索。
+#
+# **句号在常量里**：它是"一句完整的、用户能直接看到的话"，不是半句。剥掉它做比对的
+# 用例（见上）因此只需要一个 `str.replace`，拼接处不再有第二处判断。
+EXTERNAL_DISABLED_NOTE = (
+    "你关掉了联网检索，这张图完全基于模型知识，节点没有出处；"
+    "要出处就打开联网检索再生成一次。"
+)
+
 # 材料总字数低于这个值时不走材料路径，改成"把短材料当主题提示 + 走外部检索/纯主题"
 # （`_generate_deep` 的退化规则，话术见 `MATERIAL_TOO_SHORT`）。
 #
@@ -3355,12 +3373,18 @@ class _ExternalFetch:
     非空是**检索本身出错**（代理没开、源 500、超时），None 是**源里确实没有**
     （中文主题在 arXiv 上 0 条是常态）。两者给用户的文案必须分开——把"这次没查成"
     说成"网上没有"是谎报，反过来则是让人白等一次重试。
+
+    `cached` 说明这批结果是**缓存复用的**（24 小时内的同一个 query）还是这次真搜的。
+    它只用于 `data.external.cached` 与日志，**不影响任何下游判断**：缓存命中的那一批
+    与真搜回来的那一批在后面走的是同一条路（转 `Source`、入库、检索、引用校验），
+    入库那一步会因 `content_hash` 判重变成 no-op，那是对的。
     """
 
     sources: list[Source]
     hits: int
     elapsed: float
     failure: str | None = None
+    cached: bool = False
 
 
 def _external_source(hit: external_knowledge.ExternalHit) -> Source:
@@ -3470,7 +3494,7 @@ def _external_stage_text(fetch: _ExternalFetch) -> str:
         return f"找到 {fetch.hits} 条外部资料，但没能存进资料库"
     if fetch.failure:
         return "外部检索没成功，按主题生成"
-    return "没有搜到外部资料，按主题生成"
+    return "联网检索没有找到相关资料，按主题生成"
 
 
 async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
@@ -3490,6 +3514,10 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
 
     耗时与条数各记一行日志：这是用户点"生成"之后**多出来的**一次等待，混在总耗时
     里就永远看不出"慢在哪"（与 `_search_branch` 的同一条规矩）。
+
+    `cached` 由 `search_external` 的返回值带出来（`ExternalHits.cached`），用
+    `getattr` 取：这条链的十几条用例把这个函数 `monkeypatch` 成返回普通 `list` 的
+    lambda，那上面没有这个属性，而"没有标记"在这里的正确读法就是"没命中缓存"。
     """
     started = time.perf_counter()
     query = (topic or "").strip()
@@ -3505,6 +3533,7 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
         logger.warning("外部检索失败（耗时 %.2fs）：%s", elapsed, reason)
         return _ExternalFetch([], 0, elapsed, reason)
 
+    cached = bool(getattr(hits, "cached", False))
     built: list[Source] = []
     for hit in hits:
         source = _external_source(hit)
@@ -3521,9 +3550,9 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
 
     elapsed = time.perf_counter() - started
     logger.info(
-        "外部检索：主题=%r 入库 %d 条（抓取 %d 条），耗时 %.2fs",
-        query[:50], len(built), len(hits), elapsed)
-    return _ExternalFetch(built, len(hits), elapsed)
+        "外部检索：主题=%r 入库 %d 条（抓取 %d 条，%s），耗时 %.2fs",
+        query[:50], len(built), len(hits), "缓存命中" if cached else "本次真搜", elapsed)
+    return _ExternalFetch(built, len(hits), elapsed, None, cached)
 
 
 # ---------------------------------------------------------------- 工具实现
@@ -4464,7 +4493,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         elif external_used:
             short_note += "，只用模型自己的知识（外部资料没能检索出可用片段）。"
         elif external is not None:
-            short_note += "，只用模型自己的知识（没有搜到外部资料）。"
+            short_note += "，只用模型自己的知识（联网检索没有找到相关资料）。"
         else:
             # 到这一支时 `external is None` 只可能是闸门关着：材料被判成"太短"之后
             # `sources` 为空，闸门开着就一定会去搜一次。于是"谁关的"决定这句话——
@@ -4506,16 +4535,20 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 次也一样，除非去把开关打开）。遥测按 code 聚合，混成一个码会让"外部源
         # 挂了"与"用户关了开关"在报表里再也分不开。
         external_note = EXTERNAL_OFF_NOTE
+        # 码与下面那支分开：`GENERATION_WITHOUT_EXTERNAL` 的语义是"试过了，一条都没
+        # 拿到"（可以换个时间重试），这一支是"根本没试"（重试一百次也一样，除非去把
+        # 开关打开）。遥测按 code 聚合，混成一个码会让"外部源挂了"与"开关是关的"
+        # 在报表里再也分不开。
         diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="EXTERNAL_SEARCH_DISABLED",
+            level=DiagnosticLevel.info, code="GENERATION_EXTERNAL_DISABLED",
             message=(
-                f"{external_note}：这张图只基于主题「{args.topic}」生成，"
-                "没有外部资料依据，节点上也不会有指向原文的引用"
+                f"{EXTERNAL_DISABLED_NOTE}（主题「{args.topic}」）"
+                "打开联网检索再生成，引用就能逐字校验、点回原文"
             ),
         ))
     elif external_empty:
         external_note = (f"外部检索出错（{external.failure}）" if external.failure
-                         else "没有搜到外部资料")
+                         else "联网检索没有找到相关资料")
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EXTERNAL",
             message=(
@@ -4541,13 +4574,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         if external_off:
             # 关着的时候**不能照抄下面那句**："换一个更常见的主题词后重试"在这个
             # 情况下是错的动作——重试一百次也不会联网。这里给的是唯一有效的那个：
-            # 去把开关打开。句子里同时点出"这次没有去外面搜资料"，因为它的缺失
-            # 正是用户看不出差别的地方（没有引用会被读成"搜了但没搜到"）。
-            summary += (
-                f"{external_note}，这次没有去外面搜资料，这张图只基于主题"
-                f"「{args.topic}」生成，节点上不会有引用；"
-                "把画布右上角的「联网检索」勾上再生成一次，就会有能点回原文的引用。"
-            )
+            # 去把开关打开。
+            # 直接用那个完整句，不再往后补一句：它已经说了"完全基于模型知识、
+            # 节点没有出处"，以及唯一有效的动作（打开开关再生成一次）。补一句
+            # "这张图只基于主题「X」生成"就与前半句同义反复了。
+            summary += EXTERNAL_DISABLED_NOTE
         else:
             summary += (
                 f"{external_note}，这张图只基于主题「{args.topic}」生成，"
@@ -4666,6 +4697,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "sources": len(external.sources),
             "seconds": round(external.elapsed, 3),
             "failed": external.failure,
+            # 这次是缓存命中还是真搜了一次网。少了它就分不开"1.9 秒"与"0.02 秒"——
+            # 而那个差别正是"下次同一个主题还要不要等"的唯一依据。
+            "cached": external.cached,
         }
     if short_material:
         data["material"] = {
@@ -6050,7 +6084,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             # 搜到了资料，但这批资料里没检索出可用片段（语义上等价于"没搜到"）。
             short_note += "，只用模型自己的知识（外部资料没能检索出可用片段）。"
         elif external is not None:
-            short_note += "，只用模型自己的知识（没有搜到外部资料）。"
+            short_note += "，只用模型自己的知识（联网检索没有找到相关资料）。"
         else:
             short_note += "，只用模型自己的知识（外部检索未开启）。"
         lead.append(Diagnostic(
@@ -6069,12 +6103,38 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     external_note = None
     if external_empty:
         external_note = (f"外部检索出错（{external.failure}）" if external.failure
-                         else "没有搜到外部资料")
+                         else "联网检索没有找到相关资料")
         lead.append(Diagnostic(
             level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EXTERNAL",
             message=(
                 f"{external_note}：这张图只基于主题「{args.topic}」生成，"
                 "没有外部资料依据，节点上也不会有指向原文的引用"
+            ),
+        ))
+
+    # **第三种情况**：用户自己把联网检索关掉了。它与上面那条（搜了但没搜到）在界面
+    # 上曾经共用一句话，而两者的正确反应相反：
+    #
+    #   - 关掉了：重试、换主题词都没有意义，唯一有用的是把开关打开；
+    #   - 没搜到：开关是开的，换个说法或换个时间还有机会。
+    #
+    # 共用一句的后果是可观测的——用户会反复改主题去试一个**根本不会发生的搜索**，
+    # 而每次那棵树都长得一样（无出处）。所以这里给它自己的 code 与自己的句子。
+    #
+    # 判据是三个"空"：没有走外部检索（`external is None`）、没有材料、也不是材料
+    # 太短被降级（那条有自己的 `MATERIAL_TOO_SHORT`，里面已经说了"外部检索未开启"）。
+    # 缺任何一条都会把"用户传了材料"误报成"你关了联网检索"。
+    #
+    # `info` 而不是 `warn`：这是用户主动做的选择，不是故障。
+    external_disabled_note = None
+    if external is None and not short_material and not sources:
+        external_disabled_note = EXTERNAL_DISABLED_NOTE
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.info, code="GENERATION_EXTERNAL_DISABLED",
+            message=(
+                "联网检索开关是关的：这张图完全基于模型知识生成，"
+                f"节点上没有出处，也不会有指向原文的引用（主题「{args.topic}」）；"
+                "打开联网检索再生成，引用就能逐字校验、点回原文"
             ),
         ))
 
@@ -6111,6 +6171,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             f"{external_note}，这张图只基于主题「{args.topic}」生成，"
             "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
         )
+    if external_disabled_note and not short_note:
+        # C'：关掉开关的那一次。与 C 同一位置（都是"这次为什么没有引用"），但句子
+        # 完全不同——这里给的下一步是"打开开关"，不是"换个主题词"。
+        content_parts.append(external_disabled_note)
     if external_used_note:
         # B：搜到并用了。与 C 是两个方向的同一件事——用户要能分清"没有引用是因为
         # 没搜到"和"有引用是因为搜到了"。
@@ -6369,6 +6433,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "sources": len(external.sources),
                 "seconds": round(external.elapsed, 3),
                 "failed": external.failure,
+                # 缓存命中的那一次 `seconds` 里没有 HTTP 的时间，光看它会把
+                # "外部检索中位 4.5 秒"读成"有时 0.02 秒，性能不稳定"。
+                "cached": external.cached,
             }} if external is not None else {}),
             **({"material": {
                 # 材料明明传了、这次却没用：机器读的那一半（用户读的那一半在

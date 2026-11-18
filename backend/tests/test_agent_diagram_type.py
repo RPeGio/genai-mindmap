@@ -244,7 +244,15 @@ class TestRequestWithoutDiagramTypeIsUnchanged:
         桩里的骨架**带全颜色**：让"缺色由调色板补"这条新加的行为不参与比较（它有
         自己的用例）。否则这条回归会被那条改动牵连成一片红，反而看不出图型这条链
         有没有接歪。
+
+        **例外只有一句**：外部检索开关在测试环境里是关的（`conftest.clean_env`），
+        而"你关掉了联网检索…"是后来加的用户可见行为，与"图型参数不影响输出"无关。
+        比对前剥掉，并引用 `tools.EXTERNAL_DISABLED_NOTE` 而不是抄字面量——抄一份
+        就是第三处真相，下次改文案这里会静默失效。它的守卫在
+        `test_one_path.test_external_switch_off_says_it_was_switched_off`。
         """
+        from app.agent.tools import EXTERNAL_DISABLED_NOTE
+
         baseline = _load_baseline_tools()
         old_content, old_data, old_tree = _snapshot(
             baseline, request_diagram_type=None, arguments={})
@@ -253,8 +261,20 @@ class TestRequestWithoutDiagramTypeIsUnchanged:
         new_content, new_data, new_tree = _snapshot(
             new_tools, request_diagram_type=None, arguments={})
 
+        assert EXTERNAL_DISABLED_NOTE not in old_content, (
+            "基线版本不该有这句话——有了说明基线选错了，剥掉就等于掩盖")
+        new_content = new_content.replace(EXTERNAL_DISABLED_NOTE, "")
+        # `data.diagnostics` 里同一条也得滤掉；浅拷贝是为了不改动被比的产物本身。
+        comparable = {
+            **new_data,
+            "diagnostics": [item for item in new_data["diagnostics"]
+                            if item["code"] != "GENERATION_EXTERNAL_DISABLED"],
+        }
+        assert new_data["diagnostics"], "这条过滤本身要能被验证：诊断列表不该本来就空"
+        assert len(comparable["diagnostics"]) == len(new_data["diagnostics"]) - 1
+
         assert new_content == old_content
-        assert json.dumps(new_data, ensure_ascii=False, sort_keys=True) == \
+        assert json.dumps(comparable, ensure_ascii=False, sort_keys=True) == \
                json.dumps(old_data, ensure_ascii=False, sort_keys=True)
         assert json.dumps(new_tree, ensure_ascii=False, sort_keys=True) == \
                json.dumps(old_tree, ensure_ascii=False, sort_keys=True)

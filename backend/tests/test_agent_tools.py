@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -28,6 +29,8 @@ from app.agent.provider import _MAX_TOKENS_CAP
 from app.agent.tools import (
     BRANCH_EXPAND_PROMPT,
     DEEP_CONCURRENCY,
+    EXTERNAL_DISABLED_NOTE,
+    EXTERNAL_KNOWLEDGE_ENV,
     MAX_OUTPUT_TOKENS_CAP,
     PLAN_PROMPT,
     SUBNODE_EXPAND_PROMPT,
@@ -168,6 +171,38 @@ class GenerateDeepToolTest(unittest.TestCase):
         # 子节点"这种上下文带进一条还没有子节点的分支里。
         self.assertTrue(systems[0].startswith(PLAN_PROMPT))
         self.assertTrue(all(item.startswith(BRANCH_EXPAND_PROMPT) for item in systems[1:]))
+
+    def test_external_switch_off_is_reported_on_the_deep_path(self):
+        """主路径（`create_deep`）关掉外部检索时也要说清"是关掉了"，不是"没搜到"。
+
+        `_generate` 那条路由 `test_one_path.test_external_switch_off_says_it_was_switched_off`
+        钉着；这里是另一个函数。两条路各写一遍不是重复：任一条漏了，一半用户看到的
+        就是"关掉了"与"没搜到"共用一句话的世界，而那句错误的话会让他们反复改主题词
+        去试一个根本不会发生的搜索。
+        """
+        titles = ["范围", "原理", "实现"]
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan(*titles)
+            return _points(3, _branch_title(user))
+
+        ctx = _ctx(max_model_calls=8)
+        with patch.dict(os.environ, {EXTERNAL_KNOWLEDGE_ENV: "0"}):
+            with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+                result = _run(build_registry("create_deep").execute(_call(
+                    "mindmap_generate_deep", topic="机器学习", branches=3,
+                    points_per_branch=3), ctx))
+
+        self.assertTrue(result.ok, result.content)
+        codes = [item["code"] for item in result.data["diagnostics"]]
+        self.assertIn("GENERATION_EXTERNAL_DISABLED", codes)
+        self.assertNotIn("GENERATION_WITHOUT_EXTERNAL", codes)
+        self.assertIn(EXTERNAL_DISABLED_NOTE, result.content)
+        # "没搜到"那一套话术不能出现——那是把用户的选择说成一次失败的检索。
+        self.assertNotIn("联网检索没有找到相关资料", result.content)
+        # 开关关着时不写 `external` 键：键集本身就是契约。
+        self.assertNotIn("external", result.data)
 
     def test_branch_expansions_overlap(self):
         """并发确实发生：串行实现也能把调用次数跑对，只有重叠数能证伪它。
@@ -312,7 +347,13 @@ class GenerateDeepToolTest(unittest.TestCase):
         branch = next(item for item in ctx.candidate.root.children if item.label == "乙")
         self.assertEqual([child.label for child in branch.children],
                          ["乙要点一", "乙要点二", "乙要点三"])
-        self.assertEqual([item["code"] for item in result.data["diagnostics"]], [])
+        # 外部检索开关在测试环境里是关的（`conftest.clean_env`），会多一条
+        # `GENERATION_EXTERNAL_DISABLED`。那是"用户关掉了联网检索"的既有行为，
+        # 与这条用例钉的东西（只补那一支、骨架只调一次）无关，所以滤掉再比——
+        # 它自己的守卫在 `test_one_path.test_external_switch_off_says_it_was_switched_off`。
+        codes = [item["code"] for item in result.data["diagnostics"]
+                 if item["code"] != "GENERATION_EXTERNAL_DISABLED"]
+        self.assertEqual(codes, [])
 
     def test_budget_shortfall_returns_partial_tree(self):
         """额度只够骨架 + 一支：给出已展开的部分，并显式标 partial。"""
@@ -599,8 +640,13 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertFalse(result.data["partial"])
         # 这个 fake 一个字都没写 expandable：树顶到层数上限时必须明确报出
         # 「标记被忽略」，否则「模型到底用没用这个字段」只能靠猜。
-        self.assertEqual([item["code"] for item in result.data["diagnostics"]],
-                         ["EXPAND_FLAG_IGNORED"])
+        # `GENERATION_EXTERNAL_DISABLED` 是测试环境里外部开关关着带来的既有诊断，
+        # 与这条用例（层数与标记）无关，滤掉（理由同
+        # `test_sparse_branch_is_retried_without_redoing_skeleton`）。
+        self.assertEqual(
+            [item["code"] for item in result.data["diagnostics"]
+             if item["code"] != "GENERATION_EXTERNAL_DISABLED"],
+            ["EXPAND_FLAG_IGNORED"])
         self.assertEqual(result.data["depth_limit"], 3)
 
     def test_depth_cap_stops_recursion(self):
