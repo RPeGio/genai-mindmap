@@ -119,6 +119,27 @@ describe('自定义边渲染', () => {
       wrapper.find('marker').attributes('id');
     expect(idOf(first)).not.toBe(idOf(second));
   });
+
+  it('layout 判出来的回退（back）画虚线，但颜色仍跟着 kind 走', () => {
+    // kind=flow（普通顺序跳转）+ back → 灰线但虚线：几何上它在往回走。
+    const back = mountEdge({ kind: 'flow', back: true });
+    expect(back.find('path.vue-flow__edge-path').attributes('style')).toContain('4 3');
+    expect(back.find('path.vue-flow__edge-path').attributes('style')).toContain('rgb(148, 163, 184)');
+
+    // kind=branch + back → 仍是靛蓝色，虚线不夺走"这是条件分支"的信息。
+    const branch = mountEdge({ label: '否', kind: 'branch', back: true });
+    expect(branch.find('path.vue-flow__edge-path').attributes('style')).toContain('rgb(99, 102, 241)');
+    expect(branch.find('path.vue-flow__edge-path').attributes('style')).toContain('4 3');
+  });
+
+  it('没有 back 标记时一根线都不动（树图型的渲染必须逐像素不变）', () => {
+    for (const kind of ['flow', 'branch', 'loop'] as const) {
+      const withFlag = mountEdge({ kind, back: false });
+      const without = mountEdge({ kind });
+      expect(withFlag.find('path.vue-flow__edge-path').attributes('style'))
+        .toBe(without.find('path.vue-flow__edge-path').attributes('style'));
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

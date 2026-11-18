@@ -5,9 +5,19 @@ import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import { NODE_SIZE } from './layout/tidy';
+import FishboneEdge from './FishboneEdge.vue';
 import MindEdge from './MindEdge.vue';
 import MindNode from './MindNode.vue';
 
+/**
+ * 画布是**纯渲染**：节点坐标、连线句柄、鱼骨的骨线折线都由 store 算好
+ * （分派在 `canvas/layout/index.ts` 的 `layoutDiagram`，按 `content.diagram_type`）。
+ *
+ * 分派为什么不在这里：本组件手上没有那棵树，只有扁平的 `nodes` / `edges`；而连线
+ * 的句柄是按节点坐标反推的，两处各算一次布局，节点与连线立刻分家。这里唯一按图型
+ * 分叉的地方是连线的**渲染器**——`smoothstep`（父子线）/ `mindEdge`（附加关系）/
+ * `fishbone`（骨线）。
+ */
 const store = useMindMapStore();
 const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
   useVueFlow();
@@ -154,6 +164,13 @@ onBeforeUnmount(() => {
       -->
       <template #edge-mindEdge="edgeProps">
         <MindEdge v-bind="edgeProps" />
+      </template>
+      <!--
+        鱼骨图的骨线（主骨段 + 60° 斜骨、以及原因那截水平短线）。点的来源是
+        `layout/fishbone.ts` 算好的折线，这里只描边——几何不在这层猜。
+      -->
+      <template #edge-fishbone="edgeProps">
+        <FishboneEdge v-bind="edgeProps" />
       </template>
     </VueFlow>
 

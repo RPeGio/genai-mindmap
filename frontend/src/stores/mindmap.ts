@@ -10,7 +10,8 @@ import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
 import { useSourcesStore } from './sources';
-import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
+import { childSide, NODE_SIZE, type ChildSide, type Direction } from '../canvas/layout/tidy';
+import { diagramTypeOf, layoutDiagram, type DiagramLayout } from '../canvas/layout';
 import {
   addChild,
   addEdge as addEdgeToContent,
@@ -1266,9 +1267,26 @@ export const useMindMapStore = defineStore('mindmap', () => {
     return null;
   });
 
-  const layout = computed<LayoutResult | null>(() => {
+  /**
+   * 画布几何。**图型在这里分派**，树 / 流程图 / 鱼骨图各走各的（见
+   * `canvas/layout/index.ts` 的 `layoutDiagram`）。
+   *
+   * 分派放在 store 而不是画布组件：`nodes` 与 `edges` 都从这一份结果里读坐标，
+   * 而连线的手柄是按坐标反推的——两处各算一次，节点与连线一定会分家。
+   *
+   * 树图型仍然逐像素等于 `layoutTidy(root, { direction })`：默认值就是它。
+   */
+  const layout = computed<DiagramLayout | null>(() => {
     const source = renderSource.value;
-    return source ? layoutTidy(source.root, { direction: direction.value }) : null;
+    if (!source) return null;
+    return layoutDiagram({
+      root: source.root,
+      edges: source.edges,
+      // 生成中的预览没有 content，也就还没有图型：那一刻按树排，节点一个一个长出来
+      // 的样子与旧行为一致。等 `done` 把结果装进 content，图型才第一次生效。
+      diagramType: diagramTypeOf(content.value),
+      direction: direction.value,
+    });
   });
 
   const flatNodes = computed<FlatNode[]>(() => {
@@ -1285,6 +1303,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *
    * 端点找不到（不该发生：契约层硬拒 dangling，这里只是兜底）就跳过这条边，
    * 而不是画一条 `source: undefined` 的线——Vue Flow 会因此抛错，整张画布白屏。
+   *
+   * 流程图里被 dagre 判成**回退**的边（目标层号 ≤ 源层号）单独处理：按坐标算出的
+   * 侧边会是 `bottom`，于是回退线从源节点底部出去、扎进目标节点顶部——一条笔直
+   * 向上穿过整张图的线，正好压在主干上。它们一律改走**左侧**（出左、进左），
+   * 绕在图的边上。这也是 `backEdges` 唯一的用处：判定归布局，接线归这里。
    */
   const attachEdges = computed(() => {
     const current = layout.value;
@@ -1296,7 +1319,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const from = current.positions.get(edge.source);
       const to = current.positions.get(edge.target);
       if (!from || !to) continue;
-      const side = childSide(from, to, direction.value);
+      if (current.backEdges?.has(edge.id)) {
+        out.push({ edge, side: 'left', targetSide: 'left' });
+        continue;
+      }
+      const side = childSide(from, to, current.direction);
       // 与父子线同一套端点约定（见 `edges` 里 targetHandle 那一行）：从哪一侧出去，
       // 就从对面那侧进来。
       const targetSide: ChildSide = side === 'left' ? 'right' : side === 'right' ? 'left' : 'top';
@@ -1375,7 +1402,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
       for (const child of node.children) {
         const childPoint = current.positions.get(child.id);
         if (!childPoint) continue;
-        const side = childSide(point, childPoint, direction.value);
+        // 侧边按**这份布局自己报的朝向**算，而不是 `theme.direction`：流程图的分层
+        // 永远是上下（dagre TB），鱼骨的骨线永远是左右，两者都与"用户把树摆成
+        // 哪个方向"无关。树布局里这两个值恒等，所以对树没有任何影响。
+        const side = childSide(point, childPoint, current.direction);
         if (!outSides.includes(side)) outSides.push(side);
       }
 
@@ -1383,7 +1413,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const inSides: ChildSide[] = [];
       const parentPoint = current.positions.get(parentOf.get(node.id) ?? '');
       if (parentPoint) {
-        const side = childSide(parentPoint, point, direction.value);
+        const side = childSide(parentPoint, point, current.direction);
         inSides.push(side === 'left' ? 'right' : side === 'right' ? 'left' : 'top');
       }
 
@@ -1448,9 +1478,29 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const childPoint = current.positions.get(node.id);
       if (!parentPoint || !childPoint) continue;
 
-      const side = childSide(parentPoint, childPoint, direction.value);
+      const id = `${parentId}->${node.id}`;
+      // 鱼骨图的骨线不是两点直线：主骨段 + 60° 斜骨，或者一段十几像素的水平短线。
+      // 折线由布局算好（`layout/fishbone.ts` 的 `links`），这里只交给对应的渲染器。
+      // 句柄仍按约定给：`out-left` / `in-right` 在鱼骨里恒成立（子永远在父的左侧），
+      // 这些句柄也确实由下面 `nodes` 那段按几何算出来了——给错 id 的话 Vue Flow
+      // 找不到句柄，线会从头节点中心乱连。
+      const bone = current.fishbone?.links.get(id);
+      if (bone) {
+        out.push({
+          id,
+          source: parentId,
+          sourceHandle: 'out-left',
+          target: node.id,
+          targetHandle: 'in-right',
+          type: 'fishbone',
+          data: { points: bone },
+        });
+        continue;
+      }
+
+      const side = childSide(parentPoint, childPoint, current.direction);
       out.push({
-        id: `${parentId}->${node.id}`,
+        id,
         source: parentId,
         sourceHandle: `out-${side}`,
         target: node.id,
@@ -1479,6 +1529,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
           label: edge.label ?? undefined,
           kind: edge.kind ?? 'flow',
           edgeId: edge.id,
+          // 布局判出来的回退（目标层号 ≤ 源层号）。它是**几何事实**，与 `kind`
+          // 不冲突：`kind` 说这条线是什么关系（是/否/回退），`back` 说它在这张
+          // 图的层级里是不是在往回走。只有流程图会给它，树图型下恒为 undefined。
+          back: current.backEdges?.has(edge.id) || undefined,
         },
       });
     }

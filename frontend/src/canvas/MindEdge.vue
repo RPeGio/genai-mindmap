@@ -28,6 +28,14 @@ const props = defineProps<EdgeProps<{
   kind?: EdgeKind;
   /** 原始的边 id（画布上的边 id 带了 `attach:` 前缀，删线要用原始那个）。 */
   edgeId?: string;
+  /**
+   * 布局判出来的**回退**（目标层号 ≤ 源层号，只有流程图会给）。
+   *
+   * 与 `kind` 分工：`kind` 是数据里的语义（是/否/回退），`back` 是这张图**排完版
+   * 之后**的几何事实。两者会不一致——一条 `flow`（普通顺序跳转）的边在分层之后
+   * 完全可能指向上一层，那时它在读图人的眼里就是回退，得画成虚线。
+   */
+  back?: boolean;
 }>>();
 
 /** 缺省按 `flow` 画：`kind` 为 `null` 的边就是普通顺序箭头。 */
@@ -44,7 +52,8 @@ const style = computed(() => {
   return {
     stroke: preset.stroke,
     strokeWidth: preset.width,
-    strokeDasharray: preset.dash,
+    // 回退线一律虚线；`loop` 本来就是虚线，不必再叠一层短划。
+    strokeDasharray: preset.dash ?? (props.data?.back ? '4 3' : undefined),
   };
 });
 
