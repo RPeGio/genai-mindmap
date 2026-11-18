@@ -1,6 +1,6 @@
 import type { DiagramType, MindEdge, MindNode } from '../../api/types';
 import { layoutFishbone, type FishboneGeometry } from './fishbone';
-import { layoutFlow } from './flow';
+import { layoutFlow, type NodeSize } from './flow';
 import { layoutTidy, type Direction, type LayoutResult } from './tidy';
 
 /**
@@ -21,6 +21,14 @@ import { layoutTidy, type Direction, type LayoutResult } from './tidy';
  * 几何（流程图的回退边、鱼骨图的骨线）作为可选字段挂在同一份结果上，谁需要谁读。
  */
 export interface DiagramLayout extends LayoutResult {
+  /**
+   * 流程图才有：**每个**节点的外接框（判定节点的菱形比 `NODE_SIZE` 大）。
+   *
+   * 可选并且**只由 `layoutFlow` 填**，所以"有没有这个字段"就是"这张图是不是按流程
+   * 排的"的判据。渲染层拿它当 gate：没有它 → 尺寸恒为 `NODE_SIZE`、形状恒为矩形，
+   * 树与鱼骨的画法与加菱形之前逐像素相同（哪怕节点上带着 `role`）。
+   */
+  sizes?: Map<string, NodeSize>;
   /** 流程图才有：目标层号 ≤ 源层号的附加边 id。 */
   backEdges?: ReadonlySet<string>;
   /** 鱼骨图才有：主骨与斜骨上的挂点（`父id->子id` → 折线）。 */

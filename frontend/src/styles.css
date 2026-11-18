@@ -97,3 +97,153 @@ body {
   border-left-width: 4px;
   border-left-color: var(--mind-node-accent);
 }
+
+/*
+ * 判定节点的菱形（`MindNode.vue` 的 `data-node-shape="diamond"`）。
+ *
+ * ## 为什么是三层同形的 clip-path，而不是 border
+ *
+ * `clip-path` 会把**整个元素的绘制内容**按路径裁掉：`border`、`border-radius`、
+ * `ring`（box-shadow）、`box-shadow` 一个都留不下。所以菱形不能靠 border 画描边——
+ * 那会得到"代码里写了边框，屏幕上什么都没有"。
+ *
+ * 这里的画法是三层同形状的路径叠出来：
+ *   - `.diamond-stroke`：整块背景 = **描边色**；
+ *   - `.diamond-fill`  ：`inset: var(--diamond-inset)`，收缩后同一形状 = **填充色**；
+ *   - `.diamond-glow`  ：向外撑开 `--diamond-glow-spread` = 悬停/改动的光晕。
+ * 中间那圈露出来的就是描边。**三态因此不各写一套结构**，只改三个变量。
+ * （选中要加粗？改 `--diamond-inset`。改动要琥珀色？改 `--diamond-stroke` + 光晕。）
+ *
+ * ## 顶点与句柄
+ *
+ * `polygon(50% 0, 100% 50%, 50% 100%, 0 50%)` 的四个顶点，正好落在**外接框四条边
+ * 的中点**上；而 Vue Flow 的 `Position.Top/Right/Bottom/Left` 也把句柄放在四条边的
+ * 中点。所以连线天然从菱形的顶点进出，不需要挪句柄、也不会落在看不见的棱上。
+ * （会落到棱上的是"旋转 45° 的正方形"——那里顶点在外接框的对角线上。方案 B 的
+ * 代价里唯一真正致命的其实是这一条，不是反向旋转。）
+ *
+ * ## 内容层不裁切
+ *
+ * 文字、图标、引用角标、悬停卡片、内联输入框全都在 `.diamond-content` 里，它是普通
+ * 盒子。宽度收到 68%：220×110 的菱形在中带（两行文字 ≈ 35px 高，即 y = ±17.5）处
+ * 的可用宽度是 `220 × (1 − 35/110) ≈ 150px`，而 `220 × 68% ≈ 150px`——正好贴住，
+ * 再多就会顶出斜边。
+ */
+.mind-diamond {
+  /* 缺省描边 = 矩形那一档的 `border-slate-300`：流程图里两种节点挨着站，
+     描边深浅不一致会看起来像两套组件。 */
+  --diamond-stroke: #cbd5e1;
+  --diamond-fill: var(--mind-color-surface);
+  --diamond-inset: 2px;
+  --diamond-glow: transparent;
+  --diamond-glow-spread: 0px;
+  --diamond-text: #334155;
+  position: relative;
+  /* 三层背景要压在内容下面，又要压在节点自己的背景上面：isolate 把它们关进
+     同一个层叠上下文，避免光晕渗到相邻节点上。 */
+  isolation: isolate;
+  text-align: center;
+}
+
+.mind-diamond .diamond-layer {
+  position: absolute;
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.mind-diamond .diamond-glow {
+  inset: calc(-1 * var(--diamond-glow-spread));
+  background: var(--diamond-glow);
+  transition: inset 120ms ease-out;
+}
+
+.mind-diamond .diamond-stroke {
+  inset: 0;
+  background: var(--diamond-stroke);
+}
+
+.mind-diamond .diamond-fill {
+  inset: var(--diamond-inset);
+  background: var(--diamond-fill);
+}
+
+/*
+ * 文字收到菱形中带，但**不新增一层 div**：内联输入框与标题仍然是这个盒子直接
+ * 的子元素（`margin: auto` 在 flex 容器里就能居中）。少一层容器的直接好处是矩形
+ * 节点的 DOM 结构与加菱形之前一模一样——`parentElement` 这种断言不用跟着改，
+ * "树一个像素都没变"也不只是推理出来的。
+ */
+.mind-diamond > .line-clamp-2,
+.mind-diamond > input {
+  position: relative;
+  z-index: 1;
+  max-width: 68%;
+  margin-inline: auto;
+  color: var(--diamond-text);
+}
+
+/* 语义色染描边。**不染填充**：菱形里要写字，淡底已经由渲染层的 tone 决定过，
+   再叠一层色会让判定节点的可读性跟着配色走。 */
+.mind-diamond[data-node-color] {
+  --diamond-stroke: var(--mind-node-accent);
+}
+
+/* 深度 0 = 根 / 流程图顶端：实心深底，与矩形根节点同一套语言。 */
+.mind-diamond[data-diamond-tone="root"] {
+  --diamond-stroke: #0f172a;
+  --diamond-fill: #0f172a;
+  --diamond-text: #ffffff;
+}
+
+/* 预览：草稿不该有实心描边，用虚线语言表达不了（clip-path 没有 stroke-dasharray），
+   所以用"更淡的描边 + 更透的整体"来对应矩形的 `border-dashed opacity-60`。 */
+.mind-diamond[data-diamond-tone="preview"] {
+  --diamond-stroke: #cbd5e1;
+  opacity: 0.6;
+}
+
+.mind-diamond[data-diamond-tone="preview-leaf"] {
+  --diamond-stroke: #e2e8f0;
+  opacity: 0.4;
+}
+
+/* 选中：描边变深、变粗（inset 变小 = 环变厚）。shadow-md 在菱形上会被裁掉，
+   所以"选中"这件事只能靠描边说清楚——这也是它必须够粗的原因。 */
+.mind-diamond[data-diamond-tone="selected"] {
+  --diamond-stroke: #0f172a;
+  --diamond-inset: 3px;
+}
+
+/* 改动过的节点：琥珀色描边 + 一圈琥珀光晕。光晕是 `ring-2 ring-amber-300` 在
+   菱形上的等价物（ring 会被裁掉）。 */
+.mind-diamond[data-diamond-tone="changed"] {
+  --diamond-stroke: #d97706;
+  --diamond-glow: rgba(251, 191, 36, 0.55);
+  --diamond-glow-spread: 5px;
+}
+
+/* 悬停：任何 tone 下都加一层灰光晕。**只改光晕不改描边色**——换色会和选中/
+   改动的颜色打架，而"悬停"是临时状态，不该盖掉一个持久状态。 */
+.mind-diamond:hover {
+  --diamond-glow: rgba(100, 116, 139, 0.35);
+  --diamond-glow-spread: 4px;
+}
+
+.mind-diamond[data-diamond-tone="changed"]:hover {
+  --diamond-glow: rgba(251, 191, 36, 0.75);
+  --diamond-glow-spread: 6px;
+}
+
+/* 暗色主题下描边要跟着底色走，否则白底一变，白色描边就消失了。 */
+@media (prefers-color-scheme: dark) {
+  .mind-diamond[data-diamond-tone="root"] {
+    --diamond-stroke: #e2e8f0;
+    --diamond-fill: #0f172a;
+  }
+
+  .mind-diamond[data-diamond-tone="selected"] {
+    --diamond-stroke: #e2e8f0;
+  }
+}
+

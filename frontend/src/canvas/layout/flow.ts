@@ -33,7 +33,43 @@ const TREE_EDGE_WEIGHT = 4;
 /** 附加边的权重：低一档，让树在排序里更有话语权。 */
 const ATTACH_EDGE_WEIGHT = 1;
 
+/** 一个节点的外接框（宽高，px）。中心点由布局给，外框由这里给。 */
+export interface NodeSize {
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * 判定节点的外接框。**只有流程图用，`NODE_SIZE` 一个字都不动。**
+ *
+ * 为什么不复用 `NODE_SIZE`（180×48）：菱形是外接框的**内接**形状，可用的文字区
+ * 只剩中间一段。180×48 的菱形在两行文字（`leading-tight` ≈ 35px）处的宽度是
+ * `180 × (1 − 35/48) ≈ 49px`——一行放不下四个汉字，`line-clamp-2` 会当场裁字。
+ * 而 `NODE_SIZE` 是布局与渲染共读的一份尺寸（`tidy.ts` 导出，树与鱼骨都在读），
+ * 改它等于让几十条钉着逐像素坐标的用例一起变，所以这里给判定节点单独一份。
+ *
+ * 220×110 = 2:1，与教科书里的判定菱形同一个比例：中带的可用宽度是
+ * `220 × (1 − 35/110) ≈ 150px`（约 10 个汉字/行），两行放得下 16 字的上限标题。
+ *
+ * 尺寸只进 `layoutFlow`，树与鱼骨的入参一个字节都没变。
+ */
+export const DECISION_SIZE = { width: 220, height: 110 } as const;
+
+/** role → 外接框。除判定节点之外一律是 `NODE_SIZE`（= 与加菱形之前逐像素相同）。 */
+export function flowNodeSize(role: MindNode['role']): NodeSize {
+  return role === 'decision' ? DECISION_SIZE : NODE_SIZE;
+}
+
 export interface FlowLayout extends LayoutResult {
+  /**
+   * 节点 id → 外接框（**每个**节点都有，不只是判定节点）。
+   *
+   * 为什么由布局报出来，而不是渲染层自己按 role 再查一次：坐标是节点**中心**，
+   * 画到画布上要换成左上角，那一步必须减去半个外接框。两边各算一次尺寸，只要
+   * 有一处漏了角色，节点就会被画偏半个 `DECISION_SIZE - NODE_SIZE`，而连线仍然
+   * 按布局坐标画——表现是"线从节点旁边擦过去"。几何只有一份真相，在这里。
+   */
+  sizes: Map<string, NodeSize>;
   /** 节点 id → 层号（0 起、连续）。附加边的回退判定与调试都读它。 */
   layers: Map<string, number>;
   /**
@@ -124,8 +160,13 @@ export function layoutFlow(
   });
   graph.setDefaultEdgeLabel(() => ({}));
 
+  // 外接框按角色分（判定节点更大，见 `DECISION_SIZE`）。dagre 用这个尺寸算间距，
+  // 所以它必须是**渲染出来的那个框**——用小尺寸排、用大尺寸画，节点会互相压住。
+  const sizes = new Map<string, NodeSize>();
   for (const { node } of entries) {
-    graph.setNode(node.id, { width: NODE_SIZE.width, height: NODE_SIZE.height });
+    const size = flowNodeSize(node.role);
+    sizes.set(node.id, size);
+    graph.setNode(node.id, { width: size.width, height: size.height });
   }
   for (const { node, parentId } of entries) {
     if (!parentId) continue;
@@ -186,10 +227,13 @@ export function layoutFlow(
       y: (label?.y ?? offsetY) - offsetY,
     };
     positions.set(node.id, point);
-    minX = Math.min(minX, point.x - NODE_SIZE.width / 2);
-    maxX = Math.max(maxX, point.x + NODE_SIZE.width / 2);
-    minY = Math.min(minY, point.y - NODE_SIZE.height / 2);
-    maxY = Math.max(maxY, point.y + NODE_SIZE.height / 2);
+    // 包围盒按**每个节点自己的**外接框算：判定节点比 `NODE_SIZE` 大，用统一尺寸算
+    // 会让它的一半露在包围盒外，`fitView` 就把菱形的尖角切掉了。
+    const size = sizes.get(node.id) ?? NODE_SIZE;
+    minX = Math.min(minX, point.x - size.width / 2);
+    maxX = Math.max(maxX, point.x + size.width / 2);
+    minY = Math.min(minY, point.y - size.height / 2);
+    maxY = Math.max(maxY, point.y + size.height / 2);
   }
 
   if (!Number.isFinite(minX)) {
@@ -198,6 +242,7 @@ export function layoutFlow(
 
   return {
     positions,
+    sizes,
     layers,
     backEdges,
     bounds: { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY },
@@ -212,21 +257,28 @@ export function layoutFlow(
 }
 
 /**
- * 判定节点（有多条出边的节点）的形状问题，记录在这里而不是代码里做了半截。
+ * 判定节点的形状：**已经画成菱形了**（`clip-path` + 分层描边）。
  *
- * **结论：保持矩形**。`@vue-flow/core` 换形状不是换个 CSS：
+ * 这份注释原来是"结论：保持矩形"，逐条写着换形状的代价。那些代价里有三条真的成立，
+ * 一条不成立，落地时按下面的取舍处理：
  *
- *  1. 节点是 `MindNode.vue` 里一个固定 48×180 的 div，圆角矩形由 `border-radius`
- *     给；菱形只有两条路——CSS `clip-path`（边框会一起被裁掉，得垫一层 SVG 描边）
- *     或把 div 旋转 45°（里面的标题、图标、引用角标、悬停卡片、内联输入框全都要
- *     反向旋转，`line-clamp-2` 的换行宽度也会变成外接正方形）。
- *  2. 句柄位置来自 `Position.Top/Right/Bottom/Left`，即**外接框各边中点**；菱形的
- *     真实顶点在外接框四角，两者不是一回事，连线会落在看不见的棱上。
- *  3. `NODE_SIZE` 是布局与渲染共用的一份尺寸（`tidy.ts` 导出，两处都读），菱形要
- *     更大的外接框，等于让"节点尺寸"从一个数变成"按形状分叉"，树布局的逐像素
- *     不变性会被一起拖下水。
+ *  1. **`clip-path` 会把 `border` 一起裁掉** —— 成立。解法不是 SVG 描边，而是
+ *     「同形三层 `clip-path`」：外层背景当描边色、内层 `inset` 缩进当填充色，中间
+ *     那圈就是边框。选中 / 悬停 / `changed` 三态因此不需要各写一套描边，只改三个
+ *     CSS 变量（`styles.css` 的 `.mind-diamond`）。
+ *  2. **旋转 45° 要反向旋转全部内容** —— 成立，所以没走那条路。文字、图标、引用
+ *     角标、悬停卡片、内联输入框全部保持水平：菱形只画在**背景层**，内容层独立
+ *     且不裁切（内容层宽度收到 68%，那是菱形中带的安全宽度，见 `MindNode.vue`）。
+ *  3. **句柄在外接框各边中点，菱形顶点在外接框四角** —— **不成立**，这条是原记录
+ *     里唯一的误判。`clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%)` 的四个
+ *     顶点**正好**落在外接框四条边的中点上，而 `Position.Top/Right/Bottom/Left`
+ *     就是四条边的中点。所以连线天然落在菱形的顶点上，不需要挪句柄。
+ *     （会落到"看不见的棱上"的是**旋转 45° 的正方形**，那时顶点才在外接框对角线上。）
+ *  4. **`NODE_SIZE` 是布局与渲染共读的一份尺寸** —— 成立，所以判定节点没有改
+ *     `NODE_SIZE`，而是由本文件给一份单独的 `DECISION_SIZE`，并通过 `sizes` 出参
+ *     交给渲染层。树与鱼骨仍然只读 `NODE_SIZE`，逐像素不变。
  *
- * 所以：判定节点在**布局**上已经能得到它该有的东西（多出边 → dagre 把它排到
- * 分叉层、下一条边从它的下一层开始），视觉上的"菱形"留给单独一次改动去做。
+ * 判据是 `Node.role === 'decision'`，不看出边数：用户编辑到一半的节点出边数会闪变，
+ * 拿它推断形状会让菱形闪一下又变回矩形（`Node.role` 的注释里写了同一条理由）。
  */
-export const DECISION_SHAPE_NOTE = 'kept-rectangle';
+export const DECISION_SHAPE_NOTE = 'diamond-clip-path';

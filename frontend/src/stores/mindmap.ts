@@ -23,16 +23,20 @@ import {
   isContainerRoot,
   isTree,
   kindOf,
+  nodeShapeOf,
   pathToIn,
   replaceContainer,
   rootsOf,
   stageInnerEdgesOf,
   stageOfNode,
+  type NodeRole,
+  type NodeShape,
 } from '../mindmap/shape';
 import { sourceInputError } from '../sources/input';
 import { useSourcesStore } from './sources';
 import { childSide, NODE_SIZE, type ChildSide, type Direction } from '../canvas/layout/tidy';
 import { diagramTypeOf, layoutDiagram, type DiagramLayout } from '../canvas/layout';
+import type { NodeSize } from '../canvas/layout/flow';
 import {
   addChild,
   addEdge as addEdgeToContent,
@@ -557,6 +561,28 @@ export interface MindNodeData {
   color?: NodeColor;
   /** 图标（目前是 emoji）。画在 label 前面。 */
   icon?: string;
+  /**
+   * 这个节点在图里扮演什么（`role` 契约字段）。**只有流程图会把它带到这里**：
+   * 树与鱼骨上它是 `undefined`，渲染路径与加这个字段之前完全相同。
+   */
+  role?: NodeRole;
+  /**
+   * 画布形状。`undefined` / `rect` 走原来那条矩形渲染路径；`diamond` 是判定节点
+   * （见 `canvas/layout/flow.ts` 的 `DECISION_SHAPE_NOTE`），`pill` 是起点/终点。
+   *
+   * 形状由**布局结果**决定（`layout.sizes` 存在才可能有非 `rect`），不是直接读
+   * `role`：一张 `diagram_type=flowchart` 但形状其实是树的历史记录里，也可能有节点
+   * 带着 `role`，那时布局走的是树——形状必须跟着**实际跑的布局**，否则菱形会画在
+   * 一套按矩形排的坐标上。两边各判一次是这类错位的标准来源。
+   */
+  shape?: NodeShape;
+  /**
+   * 外接框（px）。缺省 `NODE_SIZE`。判定节点更大（`flow.DECISION_SIZE`）。
+   *
+   * 渲染层用它设 DOM 尺寸，`position` 用它算左上角——同一个数只有一个来源，
+   * 否则节点会被画偏半个差值，而连线仍按布局坐标画。
+   */
+  size?: NodeSize;
   /**
    * 这个节点在**这次生成的改动清单**里被点名（新增除外——新增的节点在画布上还没
    * 有位置）。
@@ -1526,6 +1552,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 面包屑、`expand` 请求一起对着一个 `findIn()` 找不到的 id 说话。
       const inContent = node.id !== source.syntheticId;
 
+      /**
+       * 外接框与形状。
+       *
+       * `current.sizes` **只有流程图会填**（`layoutFlow` 的 `sizes` 出参），树与鱼骨
+       * 没有这个字段。于是这两个派生量本身就是"这张图是不是按流程排的"的判据：
+       * 树与鱼骨恒定 `NODE_SIZE` + `shape: undefined`，渲染路径一个像素都不变——
+       * 哪怕某个历史节点上带着 `role: 'decision'`。这条 gate 是"打开旧图不许变样"
+       * 的执行点，别把它换成直接读 `node.role`。
+       */
+      const size = current.sizes?.get(node.id) ?? NODE_SIZE;
+      const shape = current.sizes ? nodeShapeOf(node.role) : undefined;
+
       // 子节点在哪几侧，就在哪几侧留出口（双向布局里根的两边都有）。
       const outSides: ChildSide[] = [];
       for (const child of node.children) {
@@ -1570,8 +1608,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 只亮一个的话，用户圈完三个节点看不出另外两个算不算数。
         selected: editable && inContent && selectedIds.value.includes(node.id),
         position: {
-          x: point.x - NODE_SIZE.width / 2,
-          y: point.y - NODE_SIZE.height / 2,
+          x: point.x - size.width / 2,
+          y: point.y - size.height / 2,
         },
         data: {
           label: displayTitle(node),
@@ -1591,6 +1629,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
           icon: editable ? node.icon ?? undefined : undefined,
           // 高亮只在"画布上这棵树 + 有一份生成改动清单"时成立，所以它天然只对 content 生效。
           changed: changedNodeIds.value.has(node.id),
+          // 形状与尺寸只在流程图上出现（见上面 `size` / `shape` 那段的 gate）。
+          role: shape === undefined ? undefined : node.role ?? undefined,
+          shape,
+          size: shape === undefined ? undefined : size,
         },
       } satisfies MindFlowNode;
     });

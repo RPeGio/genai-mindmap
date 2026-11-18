@@ -97,13 +97,19 @@ watch(() => store.direction, scheduleFit);
 // 从引用列表跳过来时把目标挪到视野中心。位置就是布局算出的绝对坐标，
 // 中心点 = 左上角 + 半个节点；不需要访问 Vue Flow 内部的节点实例。
 // 跳转后关掉自动适配：用户按自己的意志看某一支，下一帧被拉回全图会很难受。
+//
+// 半个节点取**这个节点自己的**外接框（`data.size`）：判定节点的菱形是 220×110，
+// 按 `NODE_SIZE` 加半个会把判定节点跳偏 20/31 像素，而偏移在跳转动画里看不出来。
+// 树与鱼骨没有 `data.size`，回退到 `NODE_SIZE`，与改动前逐像素相同。
 watch(() => store.focusTick, () => {
   const target = store.nodes.find(node => node.id === store.selectedId);
   if (!target) return;
   store.viewAdjusted = true;
+  const width = target.data?.size?.width ?? NODE_SIZE.width;
+  const height = target.data?.size?.height ?? NODE_SIZE.height;
   void setCenter(
-    target.position.x + NODE_SIZE.width / 2,
-    target.position.y + NODE_SIZE.height / 2,
+    target.position.x + width / 2,
+    target.position.y + height / 2,
     { duration: 250, zoom: 1 },
   );
 });
@@ -115,8 +121,25 @@ const handleSignature = computed(() =>
   store.edges.map(edge => `${edge.sourceHandle}>${edge.targetHandle}`).join('|'),
 );
 
+/**
+ * 节点外接框的签名。
+ *
+ * 判定节点的菱形比 `NODE_SIZE` 大，句柄的**绝对位置**跟着变（左右句柄在 x 上偏
+ * 20 像素、上下句柄在 y 上偏 31 像素）。Vue Flow 的 ResizeObserver 通常能自己发现，
+ * 但"测量"与"句柄注册"是两条路，漏一次的表现为"线还挂在旧坐标上"。这里把尺寸也
+ * 算进重测的触发条件。
+ *
+ * 树与鱼骨没有 `data.size`（`stores/mindmap` 只在流程图里发它），签名恒为空串，
+ * 这条 watch 对它们一次都不会额外触发。
+ */
+const sizeSignature = computed(() =>
+  store.nodes
+    .map(node => `${node.id}:${node.data?.size?.width ?? 0}x${node.data?.size?.height ?? 0}`)
+    .join('|'),
+);
+
 watch(
-  [() => store.direction, () => store.nodeCount, handleSignature],
+  [() => store.direction, () => store.nodeCount, handleSignature, sizeSignature],
   async () => {
     await nextTick();
     updateNodeInternals(store.nodes.map(node => node.id));
