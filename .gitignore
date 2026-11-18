@@ -53,3 +53,7 @@ AGENTS.md
 !AGENTS.md
 AGENTS.local.md
 *.gz
+
+# codex 派活脚本的产物：报告与事件流都属于一次性排障材料
+codex-report-*.md
+codex-raw-*.log

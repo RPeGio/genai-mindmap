@@ -96,6 +96,7 @@ from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
 from app.mindmaps.edges import UNRESOLVED_ENDPOINT, clean_edges
 from app.knowledge.service import (
+    EXTERNAL_SOURCE_KINDS,
     LEAF_MAX_CHARS,
     EvidenceHit,
     SourceFilter,
@@ -316,7 +317,7 @@ def library_search_enabled() -> bool:
     return os.getenv(LIBRARY_SEARCH_ENV, "1").strip().lower() in LIBRARY_SEARCH_TRUTHY
 
 
-def library_source_count() -> int:
+def library_source_count(*, drop_external: bool = False) -> int:
     """库里现有多少份材料（**不含正文**，最多数到 `LIBRARY_COUNT_LIMIT`）。
 
     只用于两件"给模型看"的事：材料清单末尾那行"知识库中另有 N 份"，以及
@@ -326,9 +327,18 @@ def library_source_count() -> int:
     库不可用（文件被锁、磁盘满、表被删）时返回 0 并记 warning，**不抛**：知识库
     是加分项，它坏了不该让"只带材料"的那条路跟着失败。这里捕获 `Exception` 而
     不是 `sqlite3.Error`，因为这条路上任何异常的正确处置都只有一种——当成空库。
+
+    `drop_external` 把外部检索抓回来的那批一起排除掉。**它与 `external_knowledge_enabled()`
+    是两件事**：那个管"这一次要不要发外网请求"，这个管"算不算数"。关掉开关之后，
+    库里那些昨天入库的维基正文仍然躺在那儿，不排除的话
+    「知识库里现有的 N 份材料都没有匹配」这句话会把它们算进分母——而它们恰恰是
+    用户刚刚说不要的东西。
     """
     try:
-        return len(knowledge_library.list_sources(limit=LIBRARY_COUNT_LIMIT))
+        rows = knowledge_library.list_sources(limit=LIBRARY_COUNT_LIMIT)
+        if drop_external:
+            rows = [row for row in rows if row["kind"] not in EXTERNAL_SOURCE_KINDS]
+        return len(rows)
     except Exception as exc:  # noqa: BLE001 — 库坏了就退化成空库，理由见 docstring
         logger.warning("读不到知识库（%s），本次按空库处理：%s",
                        type(exc).__name__, str(exc)[:160])
@@ -513,6 +523,32 @@ def external_knowledge_enabled() -> bool:
     这种状态的来源。
     """
     return not external_knowledge_off_reason()
+
+
+def library_drop_external() -> bool:
+    """`knowledge.service` 的 `drop_external` 参数：库检索要不要剔掉外部来源。
+
+    `external_knowledge_enabled()` 只管"这一次要不要发外网请求"。它挡不住第二件
+    事：外部命中是会入库的（`_external_sources` → `library.ingest`，见那里的三条
+    理由），入库之后它们就成了知识库里普通的持久来源，`rag_query` / `node_expand`
+    默认（`library_search_enabled()` 为真）会照常把它们捞回来。于是用户关掉
+    「联网检索」之后，生成的图里仍然有维基/论文的依据，而 `content` 同时宣称
+    "这张图完全基于模型知识"——一边否认、一边列着出处。
+
+    判据取 `prefs.external_search_enabled()` 这**一半**，不取
+    `external_knowledge_enabled()` 那个合取：部署方关掉
+    （`MINDMAP_EXTERNAL_KNOWLEDGE=0`）的意思是"这台机器上不了网"，而库里已经存在
+    着的东西不需要网也能读，把它也排除等于白白丢掉一台离线机器本来还能用的资料；
+    用户关掉的意思是"我不要外部资料"，那才必须连复用一起停掉。
+
+    这就是那条偏好读路径的**第二个**落点（第一个是 `_intake` 的闸）。两个落点必须
+    都在，因为它们是两件事："别去外面拿"与"别拿以前的"。只做前一半，bug 就是
+    "关了还在搜"。
+
+    取反写在这一处：调用点各自写 `not ...` 的话，迟早有一处忘记取反，而那种错的
+    表现恰好是"开关反着生效"，看起来像权限问题。
+    """
+    return not prefs.external_search_enabled()
 
 
 # `source_name` → `SourceKind`。表而不是三元表达式：加一个新源时只能改这里一处，
@@ -6956,7 +6992,8 @@ def _expand_reference(ctx: RunContext, chain: Sequence[Node], sources: list[Sour
     if not query:
         return None, {"query": "", "hits": 0, "skipped": "空查询"}
     hits = search_parent(sources, query, DEEP_BRANCH_TOP_K,
-                         library=library_search_enabled())
+                         library=library_search_enabled(),
+                         drop_external=library_drop_external())
     if not hits:
         return None, {"query": query, "hits": 0, "top_k": DEEP_BRANCH_TOP_K}
     # 库命中的持久 id 要先取回 `Source`：`_citable_hits` 没有正文就给不出
@@ -7530,7 +7567,7 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     filters = _rag_filters(args.filters)
     # 只在开关打开时问一次库的大小：这既是"库空且请求无材料"那条判定的依据，
     # 也是空结果话术要用的数字。开关关着时它恒为 0，且一次库查询都不发生。
-    library_total = library_source_count() if library_on else 0
+    library_total = library_source_count(drop_external=library_drop_external()) if library_on else 0
 
     # 查询计划默认关（`MINDMAP_QUERY_EXPANSION`）。关着时 `plan_query` 在返回
     # `None` 之前不发任何请求，这里的 `if` 必须让那条路**一个额外调用都没有**：
@@ -7549,7 +7586,8 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         queries.extend(plan.intents)
         queries.extend(plan.subqueries)
         hits = await search_multi(sources, queries, args.top_k, filters=filters,
-                                  hyde=plan.hyde, library=library_on)
+                                  hyde=plan.hyde, library=library_on,
+                                  drop_external=library_drop_external())
     else:
         # 单路走 `search_parent`：**不在这里再判一次开关**。关着时它内部直接返回
         # `search_sources(...)` 的结果（同一个函数，逐字段相同由
@@ -7562,7 +7600,8 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         # "库里存着的"两批来源，融合规则（本次命中保底占半数席位）在
         # `knowledge.service._merge_batches` 里，不在这一层。
         hits = search_parent(sources, args.question, args.top_k, filters=filters,
-                             library=library_on)
+                             library=library_on,
+                             drop_external=library_drop_external())
     if not hits:
         # 四种"什么都没有"必须给四句不同的话——模型据此决定下一步做什么，而它
         # 看不到任何日志与指标。
