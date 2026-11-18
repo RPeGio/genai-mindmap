@@ -24,17 +24,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import patch
 
 from app.agent import tools as tools_module
-from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
+from app.agent.contracts import (
+    AgentRunRequest,
+    Completion,
+    RunBudget,
+    RunContext,
+    ToolCall,
+)
+from app.agent.service import run as run_agent
 from app.agent.tools import EXTERNAL_KNOWLEDGE_ENV, build_registry
 from app.contracts.source import Source, SourceKind
 from app.knowledge import external as external_knowledge_module
 from app.knowledge import library, service as knowledge_service
 from app.prefs import service as prefs
 
-from test_one_path import _tree_chat
+from test_one_path import BRANCHES, _tree_chat
 
 TOPIC = "机器学习"
 
@@ -73,15 +81,16 @@ def _own_source() -> Source:
                   filename="机器学习项目排期.docx", text=OWN_TEXT)
 
 
-def _ctx() -> RunContext:
-    return RunContext(
-        request=AgentRunRequest(
-            goal=TOPIC, intent="create", thinking_model="default", sources=[],
-            budget=RunBudget(max_model_calls=20, max_tool_calls=8, max_seconds=60.0,
-                             max_output_tokens=8192, max_repairs=1),
-        ),
-        sources_by_id={},
+def _request() -> AgentRunRequest:
+    return AgentRunRequest(
+        goal=TOPIC, intent="create", thinking_model="default", sources=[],
+        budget=RunBudget(max_model_calls=20, max_tool_calls=8, max_seconds=60.0,
+                         max_output_tokens=8192, max_repairs=1),
     )
+
+
+def _ctx() -> RunContext:
+    return RunContext(request=_request(), sources_by_id={})
 
 
 def _store_external_source() -> str:
@@ -190,3 +199,145 @@ def test_drop_external_is_a_retrieval_side_switch_not_a_filter(monkeypatch):
 
     assert kept, "库里有东西时开着开关必须命中（否则这条用例证明不了什么）"
     assert dropped == [], "drop_external=True 时外部来源不该出现在候选池里"
+
+
+def test_closed_switch_leaves_no_rag_query_tool(monkeypatch):
+    """关掉联网之后，如果库里**只剩**外部检索入库的那批，`rag_query` 不该被注册。
+
+    这一条钉的是一个真实故障：关掉开关 + 不带材料时，库被剔空，但工具还在清单里。
+    模型照着调、拿到 `no_sources`、再试一次、撞上"累计失败 2 次"的闸——整轮运行
+    停掉，用户看到的是一次"生成失败"，而真相是那个工具本就不该出现。
+
+    判据仍是**结果**而不是动作：不查"rag_query 有没有被调用"，直接看注册表里
+    有没有它。前者在工具存在但模型没调时也会绿。
+    """
+    monkeypatch.setenv(tools_module.LIBRARY_SEARCH_ENV, "1")
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
+
+    # 库里只有一条外部检索抓回来的来源——这正是关掉联网之后剩下的全部
+    _store_external_source()
+    assert tools_module.library_source_count() == 1
+    assert tools_module.library_source_count(drop_external=True) == 0
+
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "true")
+    assert tools_module.library_available() is True, "开着时库里有东西，工具该在"
+
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "false")
+    assert tools_module.library_available() is False, \
+        "关掉之后库里只剩外部来源，剔空即视为没有库——否则模型会调一个必然失败的工具"
+
+    names = build_registry("create", has_sources=False).names()
+    assert "rag_query" not in names
+
+
+# ------------------------------------------------- 端到端：那一轮生成真的跑完
+#
+# 上面那条只钉住"注册表里没有它"。注册表对了，链路仍可能挂着（比如 system 里
+# 还在叫模型去检索，或者失败闸的语义变了）——所以这一条跑一整轮真实的
+# `service.run`：真注册表、真工具、真失败计数，只有模型与被替换掉的那次外网
+# 往返是替身。
+
+
+def _tool_turn(call: ToolCall) -> Completion:
+    """一轮"模型要调这个工具"。消息体照 OpenAI 的形状写：循环会原样回填。"""
+    return Completion(
+        message={"role": "assistant", "content": "", "tool_calls": [{
+            "id": call.call_id, "type": "function",
+            "function": {"name": call.name,
+                         "arguments": json.dumps(call.arguments, ensure_ascii=False)},
+        }]},
+        tool_calls=[call],
+        finish_reason="tool_calls",
+    )
+
+
+class _ToolListDrivenModel:
+    """脚本化模型：**工具清单里有什么，它就用什么**。
+
+    这一点是整条证据链的关键。写死"先调 rag_query"的脚本在修复之后照样会挂
+    （它去调一个不在清单里的工具，那是 `unknown_tool`，同样计入失败），于是这条
+    用例永远证明不了修复有效——它证明的只是"模型会调坏工具"。真实模型的输入就是
+    那份清单：清单里有它就查（`_RAG_INTENT_RULES` 还明写着"先调用 rag_query
+    检索"），清单里没有就只剩生成这一条路。
+
+    两次检索的**问句不同**：线上模型看到 `no_sources` 之后会换个说法再试一次
+    （`execute` 那段注释说的"下一轮它通常能自己改对"），而只读工具的同参重复调用
+    会先被判成 `duplicate_call`、那一条**不计入**失败数——同一个问句重复两次在
+    这里证明不了任何关于失败闸的事。
+    """
+
+    def __init__(self) -> None:
+        self.tools_per_turn: list[set[str]] = []
+        self.system_per_turn: list[str] = []
+        self.searches = 0
+        self.generated = False
+
+    async def complete_tools(self, messages, tools, *, budget) -> Completion:
+        names = {item["function"]["name"] for item in tools}
+        self.tools_per_turn.append(names)
+        self.system_per_turn.append(str(messages[0].get("content") or ""))
+        if "rag_query" in names and self.searches < 2:
+            self.searches += 1
+            question = TOPIC if self.searches == 1 else f"{TOPIC} 的定义与分类"
+            return _tool_turn(ToolCall(call_id=f"rag-{self.searches}", name="rag_query",
+                                       arguments={"question": question}))
+        if not self.generated:
+            self.generated = True
+            return _tool_turn(ToolCall(call_id="gen-1", name="mindmap_generate",
+                                       arguments={"topic": TOPIC, "branches": 3}))
+        return Completion(message={"role": "assistant", "content": "导图已经生成。"},
+                          finish_reason="stop")
+
+
+def _run_whole_turn(monkeypatch, model: _ToolListDrivenModel) -> list:
+    """跑一整轮生成，返回事件列表。外部检索与工具内的模型调用都是替身。"""
+    monkeypatch.setattr(tools_module.external_knowledge, "search_external",
+                        lambda *a, **k: [])
+
+    async def drain():
+        return [event async for event in run_agent(_request(), provider=model)]
+
+    with patch("app.agent.tools.chat_async", new=_tree_chat()):
+        return asyncio.run(drain())
+
+
+def test_closed_switch_generates_instead_of_dying_on_a_dead_tool(monkeypatch):
+    """用户实测的那个故障，端到端跑一遍：关掉联网 + 不带材料 → 生成正常完成。
+
+    「关掉联网检索」+「库只剩外部来源」这个组合，四件事必须同时成立才算修好：
+
+      1. 模型收到的**清单**里没有 `rag_query`（注册表的产物，也是模型的输入）；
+      2. system 里不再叫它"先调用 rag_query 检索"（`_intent_rule` 与注册表问的是
+         同一个 `library_available()`，只改一处就只剩半条链）；
+      3. 模型没有收到过 `no_sources`——它一次都没被"无处可查"打断；
+      4. 没有 `too_many_failures`，而且 `done` 带着一棵树。用户在界面上看到的
+         是图，不是"生成失败"。
+
+    修复前这条会红在 1 与 2：清单里多出 `rag_query`，system 里多出那句"先调用
+    rag_query 检索"，模型照着做两次、撞上 `max_repairs=1`，事件流以
+    `error(too_many_failures)` 收尾、没有 `done`。
+    """
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "false")
+    _store_external_source()          # 库里只剩这一条外部检索抓回来的
+
+    model = _ToolListDrivenModel()
+    events = _run_whole_turn(monkeypatch, model)
+
+    assert model.tools_per_turn[0] == {"mindmap_generate"}, \
+        f"模型这一轮看到的工具清单不对：{sorted(model.tools_per_turn[0])}"
+    assert "先调用 rag_query" not in model.system_per_turn[0], \
+        "system 里还在叫模型去检索，而清单里没有那个工具"
+
+    codes = [event.result_summary.get("code")
+             for event in events if event.type == "tool_end"]
+    assert "no_sources" not in codes, f"模型还是收到了 no_sources：{codes}"
+    assert [event.code for event in events if event.type == "error"] == []
+    assert model.searches == 0, "模型不该有一次检索尝试——清单里没有这个工具"
+
+    assert events[-1].type == "done"
+    content = events[-1].content
+    assert content is not None, "这一轮没有产出树"
+    # 不去断言根 label：那是树替身自己写的字面量（`test_one_path.TOPIC`），
+    # 与本文件的主题无关。要看的是"树真的长出来了"——三条一级分支都在。
+    assert [child.label for child in content.root.children] == list(BRANCHES)
