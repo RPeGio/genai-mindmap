@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
 import type { MindMapContent } from '../src/api/types';
+import { textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { useSourcesStore } from '../src/stores/sources';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 /**
@@ -173,5 +175,54 @@ describe('节点工具条', () => {
     await flushPromises();
 
     expect(wrapper.get('[data-test="node-action-delete"]').attributes('disabled')).toBeDefined();
+  });
+
+  it('点「展开」把当前材料一起发出去（旧图 + 新材料那条路）', async () => {
+    /** 只关心开流那一条的请求体：其它请求（prefs / health）照旧回空。 */
+    const streams: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ version: 'test' }) } as unknown as Response;
+      }
+      if (url.endsWith('/agent/runs/stream')) {
+        streams.push(JSON.parse(String(init?.body ?? '{}')));
+        const encoder = new TextEncoder();
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({ type: 'done', seq: 1, content: TREE, mode: 'model' })}\n\n`));
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          },
+        });
+        return { ok: true, status: 200, body, json: async () => ({}) } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
+    }));
+
+    placeNode('a');
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    // 旧图：画布上已经有一棵树（`source_refs` 里没有这份新材料）
+    store.preview(TREE, 'right');
+    // 新上传的材料：只活在当前会话里，后端回查不到，只能由请求带过去
+    sources.items = [{
+      key: 's1', id: 'doc-new', label: '新材料.pdf', kind: 'document', state: 'ready',
+      source: { ...textSource('新材料正文'), id: 'doc-new', kind: 'document', filename: '新材料.pdf' },
+      error: '', seconds: 0,
+    }];
+    store.select('a');
+    await flushPromises();
+
+    await wrapper.get('[data-test="node-action-expand"]').trigger('click');
+    await flushPromises();
+
+    expect(streams).toHaveLength(1);
+    expect(streams[0].intent).toBe('expand');
+    const sent = streams[0].sources as Array<{ id: string }>;
+    expect(sent.map(source => source.id)).toEqual(['doc-new']);
   });
 });

@@ -17,7 +17,15 @@ import { useMindMapStore } from '../stores/mindmap';
  */
 const store = useMindMapStore();
 
-const emit = defineEmits<{ edit: [label: string] }>();
+/**
+ * `expand` 交回 `App.vue`，与「改」同一条路。
+ *
+ * 工具条自己**不**调 `store.expandSelected()`：那条函数收一个 `sources` 参数，而
+ * 工具条手里没有材料——只有 `useSourcesStore()` 里的当前那一份。两个组件各自读一次
+ * 材料列表，就会出现"工具条传的是旧快照、App 传的是新快照"这种两条真相。
+ * `App.vue` 的 `expandBranch` 是带材料的唯一入口，工具条只发一个意图。
+ */
+const emit = defineEmits<{ edit: [label: string]; expand: [] }>();
 
 const anchor = ref<{ x: number; y: number } | null>(null);
 const paletteOpen = ref(false);
@@ -83,7 +91,8 @@ function edit(): void {
 }
 
 function expand(): void {
-  void store.expandSelected();
+  // 不调 `store.expandSelected()`：那条路不带材料（见 `emit` 的注释）。
+  emit('expand');
 }
 
 function remove(): void {

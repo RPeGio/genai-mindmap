@@ -322,9 +322,18 @@ const expandState = computed(() => {
   };
 });
 
+/**
+ * 「展开这一支」——**带材料**的唯一起点。
+ *
+ * 两处按钮（抽屉里那个、节点工具条上那个）都走这里，不是各自调 `store.expandSelected()`：
+ * 工具条原先自己调的版本没传 `sources`，于是"给旧图新上传一份材料、再点节点上的展开"
+ * 时，请求里只有节点 id，后端只能按 `source_refs` 回查图里的旧引用——新材料这一次
+ * 完全没用上，而界面上材料就在那儿摆着。两条入口各写一遍 = 漏一半，所以只留这一条。
+ *
+ * 材料正文只在本次会话内存里；重新打开旧图时它是空的，后端会按节点的
+ * `source_refs` 从知识库把来源找回来，所以这里照传、传空也不拦。
+ */
 function expandBranch() {
-  // 材料正文只在本次会话内存里；重新打开旧图时它是空的，后端会按节点的
-  // `source_refs` 从知识库把来源找回来，所以这里照传、传空也不拦。
   void store.expandSelected(sources.readySources);
 }
 
@@ -1004,7 +1013,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
           选中节点旁浮出的工具条（`[改][展开][删][色]`）。它读画布 DOM 定位，
           不改动一个像素的渲染——"点节点要求 AI 修改"这条需求的落点就在这里。
         -->
-        <NodeToolbar @edit="onNodeEdit" />
+        <NodeToolbar @edit="onNodeEdit" @expand="expandBranch" />
 
         <!--
           底部对话框。**生成中**收成一条细进度、**生成完**淡出，只剩画布 + 悬浮球；
