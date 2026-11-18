@@ -169,6 +169,79 @@ describe('底部对话框的状态机', () => {
     await wrapper.vm.$nextTick();
     expect(dockFaded(wrapper)).toBe(false);
   });
+
+  it('输入法组合中（v-model 还是空的）不算"没在写"：计时到点也不淡出', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.generatedSummary = { nodes: 2, changes: null };
+    await wrapper.vm.$nextTick();
+
+    const box = wrapper.get('textarea#intent');
+    // 只发组合事件、不给焦点：钉住 `composing` 自己就能当刹车（有些浏览器把
+    // 组合输入打进一个还没触发 focus 的元素，也可能反过来）。
+    await box.trigger('compositionstart');
+    expect((box.element as HTMLTextAreaElement).value).toBe('');
+
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(false);
+  });
+
+  it('焦点在输入框里就不淡出，失焦且无草稿之后才走完那 2 秒', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.generatedSummary = { nodes: 2, changes: null };
+    await wrapper.vm.$nextTick();
+
+    const box = wrapper.get('textarea#intent');
+    await box.trigger('focus');
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(false);
+
+    // 失焦：不是"立刻淡出"，而是重新计满 2 秒——用户可能只是点了一下画布。
+    await box.trigger('blur');
+    vi.advanceTimersByTime(1000);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(false);
+
+    vi.advanceTimersByTime(1200);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(true);
+  });
+
+  it('上次没保存的结果独立成一条：成功时不被"已落到画布"挤掉，也不淡出', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.generatedSummary = { nodes: 2, changes: null };
+    store.resumableRun = {
+      run_id: 'run-old', status: 'done', intent: 'create', goal: '上一张图',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+    };
+    await wrapper.vm.$nextTick();
+
+    // 两条同时在场：状态行说这一次，提示说上一次。
+    expect(wrapper.get('[data-test="run-status"]').text()).toContain('已落到画布');
+    const notice = wrapper.get('[data-test="resumable-notice"]');
+    expect(notice.text()).toContain('还没保存');
+    expect(notice.text()).toContain('上一张图');
+
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(false);
+
+    // 处理掉它（不用了）之后才允许淡出。
+    await notice.findAll('button')[1].trigger('click');
+    vi.advanceTimersByTime(2100);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(true);
+  });
 });
 
 describe('材料缩略图', () => {

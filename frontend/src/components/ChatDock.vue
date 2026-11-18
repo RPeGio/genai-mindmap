@@ -255,6 +255,10 @@ async function submitIntent() {
   const intent = intentState.value === 'create' ? 'create' : 'edit';
   const wanted = goal;
   intentText.value = '';
+  // 主动收走焦点：组合输入与焦点都算"他正在写"的刹车，而提交之后他不再在写。
+  // 不显式失焦的话，某些浏览器对 `disabled` 的 textarea 不发 blur，`focused` 会一直
+  // 为真——那一轮成功之后对话框就再也不淡出了。
+  (document.activeElement as HTMLElement | null)?.blur?.();
   // 这句话发出去之后，"用户要求留着"这件事就结束了：输入框已经空出来，
   // 接下来该按状态判（生成中就收起、成功就淡出）。
   pinned.value = false;
@@ -301,17 +305,36 @@ function onRecorded(file: File): void {
 
 // ---------------------------------------------------------------- 状态行
 
-type StatusKind = 'running' | 'error' | 'warn' | 'ok' | 'conflict' | 'info';
+type StatusKind = 'running' | 'error' | 'warn' | 'ok' | 'conflict';
 
 const agentPartial = computed(
   () => store.agentWarnings.find(item => item.kind === 'partial') ?? null,
 );
 
 /**
+ * 输入法组合中 / 焦点在主题框里。
+ *
+ * **为什么需要这两个**：`v-model` 在组合期间**不更新**——中文用户打「机器学习」四个字
+ * 时，`intentText` 一直是空的，直到上屏那一刻才变成四个字。淡出计时器只看 `typed`，
+ * 于是"他正在打字"与"他什么都没写"在代码里长得一模一样：2 秒到点，对话框连同他
+ * 正在打的字一起淡出，上屏之后又淡回来——一次肉眼可见的闪烁，而且窗口期里他
+ * 根本看不到自己打的东西。
+ *
+ * 焦点单独也要认：组合结束到松手之间还有一个空窗（`compositionend` 先到、字的
+ * `input` 事件后到），只盯 `composing` 会在那一瞬间漏掉。
+ */
+const composing = ref(false);
+const focused = ref(false);
+
+/**
  * 这一行现在在说什么。**优先级从上到下**，同一时刻只说一件。
  *
  * 冲突排第一：它要用户在两个都会丢东西的选择里做决定，压住它就是丢数据。
  * 运行中排第二：进度要压过上一次的结果。异常排第三：失败不能因为"上次成功过"就不显示。
+ *
+ * 「上次没接住的结果」（`resumableRun`）**不在这张表里**：它是一份独立的待办，
+ * 不是"此刻的状态"。塞进来就排在 `ok` 后面——刚生成成功那一次，上一次没保存的结果
+ * 被这条状态行遮住、跟着对话框一起淡出，用户再没机会点「载入」。
  */
 const statusKind = computed<StatusKind | null>(() => {
   if (store.conflictDraft) return 'conflict';
@@ -319,8 +342,29 @@ const statusKind = computed<StatusKind | null>(() => {
   if (store.agentError) return 'error';
   if (agentPartial.value) return 'warn';
   if (store.generatedSummary) return 'ok';
-  if (store.resumableRun) return 'info';
   return null;
+});
+
+/**
+ * 上次那次运行的结果还等着处理：**独立一条**，与状态行并存。
+ *
+ * 运行中不显示：那会儿进度才是他要看的，而这条提示不会因为这一轮结束而消失。
+ */
+const resumable = computed(() => (statusKind.value === 'running' ? null : store.resumableRun));
+
+/** 这条提示的那句话。文案与"被中断"分开——"完成了没保存"与"中途断了"不是一回事。 */
+const resumableText = computed(() => {
+  const run = resumable.value;
+  if (!run) return '';
+  const date = new Date(run.updated_at);
+  const clock = Number.isNaN(date.getTime())
+    ? ''
+    : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const when = clock ? `（${clock}）` : '';
+  const what = run.status === 'cancelled'
+    ? `上次${when}那次生成被中断了，已经生成的部分还留着`
+    : `上次${when}生成完的导图还没保存`;
+  return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
 });
 
 const runningVerb = computed(() => {
@@ -381,21 +425,6 @@ const statusText = computed(() => {
       const changes = summary.changes == null ? '' : `，改了 ${summary.changes} 处`;
       return `已落到画布${nodes ? `（${nodes}${changes}）` : changes} · 还没保存`;
     }
-    case 'info': {
-      // 只给时间与目标，不给整棵树：这是一句通知，要不要捡回来是用户的决定。
-      // "完成了但没保存"与"被中断了但已产出一部分"对他的意义完全不同，不能糊成一句。
-      const run = store.resumableRun;
-      if (!run) return '';
-      const date = new Date(run.updated_at);
-      const clock = Number.isNaN(date.getTime())
-        ? ''
-        : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
-      const when = clock ? `（${clock}）` : '';
-      const what = run.status === 'cancelled'
-        ? `上次${when}那次生成被中断了，已经生成的部分还留着`
-        : `上次${when}生成完的导图还没保存`;
-      return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
-    }
     default:
       return '';
   }
@@ -421,15 +450,16 @@ const statusActions = computed<StatusAction[]>(() => {
         ? [{ key: 'undo', label: '回到生成之前', test: 'run-status-undo',
             run: () => store.undoGenerate() }]
         : [];
-    case 'info':
-      return [
-        { key: 'load', label: '载入', test: 'run-status-load', run: () => store.resumeRun() },
-        { key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() },
-      ];
     default:
       return [];
   }
 });
+
+/** 「上次没接住的结果」那两个动作：捡回来，或者这次会话里不要再问。 */
+const resumableActions = computed<StatusAction[]>(() => [
+  { key: 'load', label: '载入', test: 'run-status-load', run: () => store.resumeRun() },
+  { key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() },
+]);
 
 const statusTone = computed(() => {
   switch (statusKind.value) {
@@ -440,8 +470,6 @@ const statusTone = computed(() => {
       return 'border-amber-300 bg-amber-50 text-amber-900 ring-1 ring-amber-200';
     case 'ok':
       return 'border-emerald-200 bg-white text-slate-700';
-    case 'info':
-      return 'border-sky-200 bg-sky-50 text-sky-900';
     default:
       return 'border-slate-200 bg-white text-slate-700';
   }
@@ -459,7 +487,7 @@ const statusDot = computed(() => {
 });
 
 const showDetailAction = computed(
-  () => statusKind.value !== null && statusKind.value !== 'info',
+  () => statusKind.value !== null,
 );
 
 /** 抽屉里有没有东西可展开（判据与 `AgentPanel` 共用）。 */
@@ -487,7 +515,8 @@ function clearDismiss(): void {
  *
  * 刹车（缺一条都会让用户下一步不知道点哪儿）：
  *   1. 画布上还没有图——他从没成功过，收走对话框等于收走了唯一的入口；
- *   2. 输入框里还有没发出去的字——那是他正在写的东西，收走就丢了；
+ *   2. 输入框里还有没发出去的字，或者**正在用输入法打**（组合中 `v-model` 是空的）、
+ *      或者焦点还在框里——都是"他正在写"，收走就丢了；
  *   3. 材料粘贴框里还有没点「添加」的正文——同上，而且它住在一个会因为淡出而
  *      看不到的面板里（草稿本身在 store 里，不丢；但看不见 = 以为丢了）；
  *   4. 这一次失败了 / 部分完成 / 有冲突 / 有上次没保存的结果——这几种都在等他做决定。
@@ -496,27 +525,42 @@ const shouldKeep = computed(() => {
   if (pinned.value) return true;
   if (!store.content) return true;
   if (typed.value) return true;
+  if (composing.value || focused.value) return true;
   if (sources.draftText.trim()) return true;
+  if (store.resumableRun) return true;
   const kind = statusKind.value;
   if (kind && kind !== 'ok' && kind !== 'running') return true;
   if (kind === 'running') return true;
   return false;
 });
 
+/**
+ * 这一刻"成功且有图、没有任何东西正在被写"——只有这种才安排淡出。
+ *
+ * 单独成 computed 而不是让 watch 里去重算 `shouldKeep`：`shouldKeep` 含 `pinned`，
+ * 而定时器到点时要把 `pinned` 松开（见下面）。两件事混在一个布尔里，淡出要么永远
+ * 等不到（pinned 被当成刹车），要么把"用户刚点开输入框"也淡出去。
+ */
+const canFade = computed(() => statusKind.value === 'ok'
+  && !!store.content
+  && !typed.value
+  && !composing.value
+  && !focused.value
+  && !sources.draftText.trim()
+  && !store.resumableRun);
+
 watch(
-  () => [statusKind.value, typed.value, store.nodeCount, sources.draftText] as const,
-  ([kind]) => {
+  () => [canFade.value, store.nodeCount] as const,
+  ([fadeable]) => {
     clearDismiss();
     dismissed.value = false;
-    // 只有"成功且有图、没有任何草稿"这一种才安排淡出。其余状态对话框留着。
-    if (kind === 'ok' && store.content && !typed.value && !sources.draftText.trim()) {
-      dismissTimer = setTimeout(() => {
-        // 定时器到点时把 `pinned` 一并松开：用户点过「改」把对话框叫回来之后，
-        // 那一轮结束后它仍然该按状态判（否则它再也淡不出去）。
-        pinned.value = false;
-        dismissed.value = true;
-      }, FADE_DELAY_MS);
-    }
+    if (!fadeable) return;
+    dismissTimer = setTimeout(() => {
+      // 定时器到点时把 `pinned` 一并松开：用户点过「改」把对话框叫回来之后，
+      // 那一轮结束后它仍然该按状态判（否则它再也淡不出去）。
+      pinned.value = false;
+      dismissed.value = true;
+    }, FADE_DELAY_MS);
   },
   { immediate: true },
 );
@@ -705,6 +749,10 @@ defineExpose({ openComposer, openMaterial, closeMaterial, focusInput: () => open
             :disabled="runBlocked"
             :placeholder="intentPlaceholder"
             @keydown="onIntentKeydown"
+            @compositionstart="composing = true"
+            @compositionend="composing = false"
+            @focus="focused = true"
+            @blur="focused = false"
           />
 
           <!--
@@ -855,13 +903,11 @@ defineExpose({ openComposer, openMaterial, closeMaterial, focusInput: () => open
             :class="intentHintWarn ? 'text-amber-700' : 'text-slate-400'"
           >{{ intentHint }}</p>
 
-          <!-- 状态行：失败 / 部分完成 / 冲突 / 上次没保存的结果。运行中的那一版在
-               上面的细进度条里，两者不会同时出现。 -->
+          <!-- 状态行：失败 / 部分完成 / 冲突 / 成功。运行中的那一版在上面的细进度条里。 -->
           <div
             v-if="statusKind"
             data-test="run-status"
             aria-live="polite"
-            :aria-label="statusKind === 'info' ? '上次的运行结果' : undefined"
             class="flex items-center gap-2 rounded-lg border px-2 py-1.5 text-xs"
             :class="statusTone"
           >
@@ -885,6 +931,36 @@ defineExpose({ openComposer, openMaterial, closeMaterial, focusInput: () => open
               title="打开右侧抽屉：改动清单、诊断逐条、生成中的预览"
               @click="emit('detail')"
             >明细</button>
+          </div>
+
+          <!--
+            「上次没接住的结果」：**独立一条**，与上面那行状态并存。
+
+            它以前是 `statusKind` 里的 `info`，排在 `ok` 后面。于是"刚生成成功、
+            上一次的结果还没保存"这种最普通的情形下，它被状态行遮住，随后跟着对话框
+            一起淡出——`runs` 表里那份结果从"该被捡回来"变成"没人知道它在"。
+            它是一件**等用户做决定**的待办（载入 / 不用了），不是"此刻的状态"，
+            所以既不能被抢位，也要当淡出刹车（见 `shouldKeep`）。
+          -->
+          <div
+            v-if="resumable"
+            data-test="resumable-notice"
+            aria-label="上次的运行结果"
+            aria-live="polite"
+            class="flex items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-2 py-1.5 text-xs text-sky-900"
+          >
+            <span class="h-2 w-2 shrink-0 rounded-full bg-sky-400" aria-hidden="true" />
+            <span class="min-w-0 flex-1 truncate font-medium" :title="resumableText">
+              {{ resumableText }}
+            </span>
+            <button
+              v-for="action in resumableActions"
+              :key="action.key"
+              type="button"
+              :data-test="action.test"
+              class="shrink-0 rounded-md border border-sky-300 bg-white px-2 py-0.5 text-xs hover:bg-sky-50"
+              @click="action.run()"
+            >{{ action.label }}</button>
           </div>
 
           <!-- `role="status"` 只该有一个来源：这一行。生成中不渲染（细进度条已经占位）。 -->
