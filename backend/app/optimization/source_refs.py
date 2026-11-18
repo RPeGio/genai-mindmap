@@ -6,7 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
-from app.contracts.mindmap import MindMapContent, Node
+from app.agent import shapes
+from app.contracts.mindmap import DiagramContent, Node
 from app.contracts.source import Source, SourceRef
 
 logger = logging.getLogger(__name__)
@@ -309,7 +310,7 @@ def _outside_evidence(ref: SourceRef, evidence: Sequence[EvidenceSpan]) -> bool:
                    for span in covering)
 
 
-def verify_source_refs(content: MindMapContent, sources: list[Source], *,
+def verify_source_refs(content: DiagramContent, sources: list[Source], *,
                        remove_invalid: bool = False,
                        evidence: Sequence[EvidenceSpan] | None = None,
                        ) -> list[Diagnostic]:
@@ -342,9 +343,10 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
     if len(by_id) != len(sources):
         raise ValueError("核验来源 ID 不能重复")
     diagnostics: list[Diagnostic] = []
-    stack = [content.root]
-    while stack:
-        node = stack.pop()
+    # 三套结构共用这一份遍历（`shapes.iter_nodes`）：鱼骨的六根骨、流程的各阶段
+    # 都是并列子树，节点藏在 `bones[i].root` / `stages[i].root` 下面。顺序与改动
+    # 之前逐字相同（前序，父在子前），所以诊断的先后也不变。
+    for node in shapes.iter_nodes(content):
         verified: list[SourceRef] = []
         for ref in node.source_refs:
             verdict = _check_reference(ref, by_id.get(ref.source_id), evidence=evidence)
@@ -392,7 +394,6 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
                 level=DiagnosticLevel.warn, code="UNSOURCED_NODE", node_id=node.id,
                 message=f"节点「{node.label}」没有可核验的原文引用；不代表节点内容错误",
             ))
-        stack.extend(reversed(node.children))
     return diagnostics
 
 
@@ -458,7 +459,7 @@ def _claim_of(node: Node) -> str:
     return f"{label}{joiner}{clipped}"[:MAX_CLAIM_CHARS]
 
 
-def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnostic]:
+def annotate_nli(content: DiagramContent, sources: list[Source]) -> list[Diagnostic]:
     """可选层：对**已通过前两层**的引用跑语义蕴含打分。
 
     前两层是机械判据（字段合法、quote 逐字出现在原文里），它们管不住
@@ -486,9 +487,8 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
     diagnostics: list[Diagnostic] = []
     checked = 0
     skipped = 0
-    stack = [content.root]
-    while stack:
-        node = stack.pop()
+    # 与 `verify_source_refs` 同一份遍历（三套结构共用，前序）。
+    for node in shapes.iter_nodes(content):
         for ref in node.source_refs:
             evidence = ref.quote
             if not evidence and ref.start is not None and ref.end is not None:
@@ -524,7 +524,6 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
                              f"{result['label']}（{result['score']:.2f}）"),
                     evidence=ref.quote,
                 ))
-        stack.extend(reversed(node.children))
 
     if skipped:
         logger.info("NLI 评估达到上限 %d 条，另有 %d 条引用跳过", MAX_NLI_CHECKS, skipped)
