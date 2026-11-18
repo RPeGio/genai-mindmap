@@ -1202,9 +1202,13 @@ async def _loop(
                 if summary["code"] != "duplicate_call":
                     failures += 1
                     if failures > budget.max_repairs:
+                        # 文案把两个数都写出来。原来只写"（上限 N 次）"，读起来像
+                        # "第 N 次就停"，而判据是 `>`——`max_repairs=1` 实际允许
+                        # 2 次失败。差一个的边界写在括号里没人看得懂，而它会让
+                        # 下一个人（包括写这行的人）误判成"阈值太紧"。
                         message = (
-                            f"工具执行已累计失败 {failures} 次（上限 {budget.max_repairs} 次），"
-                            "继续重试没有意义，已停止。"
+                            f"工具执行已失败 {failures} 次，"
+                            f"最多允许重试 {budget.max_repairs} 次，继续重试没有意义，已停止。"
                         )
                         _log_failure(
                             ctx, tool_calls, call=call, code="too_many_failures", message=message,
