@@ -9008,6 +9008,28 @@ def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
     )
 
 
+def _edges_endpointed_in(content: DiagramContent, doomed: set[str]) -> list[Edge]:
+    """端点落在 `doomed` 里的边。**两张边表都算**。
+
+    流程图的边分两层：`FlowContent.edges` 的端点是**阶段 id**（删一个步骤碰不到
+    它），`FlowStage.edges` 的端点才是节点 id。只数前一层的话，删掉一个带判定出边
+    的步骤时这里返回空列表，于是工具报 `removed_edge_count: 0`——而画布上那两条线
+    已经跟着没了。模型据此以为"一条关系都没删"，下一轮要么重复添加、要么漏掉补边。
+
+    数的必须是**真被删掉**的那一批：清边的两个地方（`ops._apply_remove` 与
+    `_prune_stage_edges`）判的都是"端点已不存在"，与这里同一个判据。
+    鱼骨没有边表，返回空列表。
+    """
+    pools: list[list[Edge]] = []
+    if isinstance(content, MindMapContent):
+        pools.append(content.edges)
+    elif isinstance(content, FlowContent):
+        pools.append(content.edges)
+        pools.extend(stage.edges for stage in content.stages)
+    return [edge for pool in pools for edge in pool
+            if edge.source in doomed or edge.target in doomed]
+
+
 def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
     """删一个节点——**连同它的整棵子树**（级联）。
 
@@ -9048,12 +9070,12 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
 
     parent = shapes.find_parent(content, args.node_id)
     removed = [item.label for item in _iter_nodes(node)]
-    # 被连带删掉的边：源或目标落在**这棵子树**里（含子孙）。必须在提交前算，
-    # 提交之后就只剩一个已经删干净的新树，"删了几条线"这个数就没了。
+    # 被连带删掉的边与关系：端点落在**这棵子树**里（含子孙）。必须在提交前算，
+    # 提交之后就只剩一个已经删干净的新图，"删了几条线"这个数就没了。
     doomed = _node_ids(node)
-    existing_edges = content.edges if isinstance(content, MindMapContent) else []
-    removed_edges = [edge for edge in existing_edges
-                     if edge.source in doomed or edge.target in doomed]
+    removed_edges = _edges_endpointed_in(content, doomed)
+    removed_relations = [relation for relation in content.relations
+                         if relation.source in doomed or relation.target in doomed]
     draft = {"op": "remove", "id": args.node_id}
 
     committed = _commit_drafts(ctx, content, [draft])
@@ -9068,6 +9090,10 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
     if removed_edges:
         # 连带删边也要说出来，理由同上：模型看不到画布，不说它会以为线还在。
         summary += f"，同时删掉了 {len(removed_edges)} 条与它相关的附加关系"
+    if removed_relations:
+        # `relations` 界面不渲染，模型在别处也读不到它们的存续——不说，它连
+        # "这两条线已经没了"都无法知道。
+        summary += f"，以及 {len(removed_relations)} 条跨节点关系"
     summary += "。画布上可以撤销。"
     return _single_result(
         ctx, updated, batch, id_map, summary + scope_note,
@@ -9077,6 +9103,8 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
         removed_count=len(removed),
         removed_edges=[edge.id for edge in removed_edges],
         removed_edge_count=len(removed_edges),
+        removed_relations=[relation.id for relation in removed_relations],
+        removed_relation_count=len(removed_relations),
         parent_id=parent.id if parent is not None else None,
     )
 

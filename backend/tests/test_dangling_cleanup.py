@@ -159,6 +159,40 @@ class TestFlowRemoveKeepsRelationsValid:
         assert _relation_ids(content) == ["r2"]
         FlowContent.model_validate(content.model_dump())
 
+    def test_removed_edge_count_equals_what_really_disappeared(self):
+        """P2-⑥：上报的条数 = 内容里**真少掉的**条数（两张边表一起数）。
+
+        只数 `content.edges` 时这里会得到 0，而阶段内的两条线已经没了——模型据此
+        以为"一条关系都没删"，下一轮要么重复添加、要么漏掉补边。
+        """
+        ctx = _ctx(_flow_payload())
+        content = ctx.candidate
+        assert isinstance(content, FlowContent)
+        before = [edge.id for stage in content.stages for edge in stage.edges]
+        before += [edge.id for edge in content.edges]
+
+        result = _remove_node(RemoveNodeArgs(node_id="a2"), ctx)
+
+        assert result.ok, result.content
+        content = ctx.candidate
+        after = [edge.id for stage in content.stages for edge in stage.edges]
+        after += [edge.id for edge in content.edges]
+        # e_i1（a → a2）与 e_i2（a1 → a2）两条都以 a2 为端点
+        assert sorted(result.data["removed_edges"]) == ["e_i1", "e_i2"]
+        assert result.data["removed_edge_count"] == len(before) - len(after) == 2
+        assert "附加关系" in result.content
+
+    def test_removed_relations_are_reported_too(self):
+        """顺手清掉的关系也要说：`relations` 界面不渲染，不说模型就查不到。"""
+        ctx = _ctx(_flow_payload())
+
+        result = _remove_node(RemoveNodeArgs(node_id="a2"), ctx)
+
+        assert result.ok, result.content
+        assert result.data["removed_relations"] == ["r1"]
+        assert result.data["removed_relation_count"] == 1
+        assert "跨节点关系" in result.content
+
     def test_removing_a_step_without_inner_edges_reports_zero(self):
         ctx = _ctx({
             "title": "报销流程",
