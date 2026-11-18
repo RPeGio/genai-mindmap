@@ -327,6 +327,13 @@ def _markdown_tree(content: MindMapContent) -> str:
     把"从第 5 步退回第 2 步"画成缩进，读者会把它当成第 6 步的子节点。
 
     节点的 `detail` 以引用块跟在它自己那一行下面（见 `_markdown_quote`）。
+
+    **缩进是 2 个空格，而且这一条没有跟鱼骨/流程一起改成 4 个（故意的）**：
+    树的 markdown 输出被 `tests/test_export.py::ByteIdenticalTest` 逐字节钉死，
+    本轮修复的边界也明确写着"树的既有行为逐字节不变"。代价是**已知的**：
+    同一份文件在 Python-Markdown 下会被读成同级列表（它按 `tab_length=4` 判层级，
+    CommonMark 从 2 格起算）。实测 HTML 与"改 4 格要动哪几处"记在
+    `docs/IMPORT.md` 的「两个 Markdown 解析器」一节——它是一个待决策项，不是漏改。
     """
     lines: list[str] = [f"# {_escape_markdown(content.title)}", ""]
     lines.append(f"- {_escape_markdown(_node_text(content.root))}")
@@ -443,10 +450,20 @@ def _puml_fishbone(content: FishboneContent) -> str:
 def _markdown_fishbone(content: FishboneContent) -> str:
     """鱼骨图 → Markdown 大纲。骨是鱼头的**子项**，原因再按缩进分层。
 
-    骨与原因必须是**两级不同的缩进**（`  - 人` / `    - 审批的人不在`）。此前两者
-    都写成顶格列表项（`- 人` 与 `    - 原因` 之间只差原因的缩进），普通 Markdown
+    骨与原因必须是**两级不同的缩进**（`    - 人` / `        - 审批的人不在`）。此前
+    两者都写成顶格列表项（`- 人` 与 `    - 原因` 之间只差原因的缩进），普通 Markdown
     阅读器把鱼头与六根骨画成**同一级**的七个要点——读起来不是"一条鱼"，是"七条
-    并列笔记"。缩进一改，层级就是阅读器自己算出来的，不依赖谁去数。
+    并列笔记"。
+
+    **每层 4 个空格，不是 2 个。** 2 个空格是 CommonMark 允许的最小值，而
+    Python-Markdown（GitHub 之外的另一个大用户，也是本仓库 `pip` 里装着的那个）
+    按 `tab_length=4` 判层级：`  - 骨` 比上一行深 2 格，它认不出这是子列表，
+    于是把鱼头和六根骨画成**同一级**——同一份文件在两个解析器里是两张图
+    （codex 复审 P2-1）。4 个空格两边都认（实测见 `docs/IMPORT.md`）。
+
+    缩进只影响渲染，不影响导入：`importing/markdown.py` 的层级靠**缩进栈**比较
+    相邻两行的相对大小，不按"除以几"算层，所以 2 空格的老文件、4 空格的新文件、
+    用户手改成 Tab 的文件读出来是同一棵树。
 
     第二行是形状标记（见 `shape_marker`）：缩进能表达"谁挂在谁下面"，表达不了
     "这几条是骨"。标记让导入侧不必猜。
@@ -457,7 +474,7 @@ def _markdown_fishbone(content: FishboneContent) -> str:
         "",
     ]
     for depth, text, detail in _fishbone_lines(content):
-        pad = "  " * depth
+        pad = "    " * depth
         lines.append(f"{pad}- {_escape_markdown(text)}")
         lines += _markdown_quote(detail, pad + "  ")
     return "\n".join(lines) + "\n"
@@ -644,6 +661,11 @@ def _markdown_flow(content: FlowContent) -> str:
     降成一列缩进之后，"这里是第二个阶段"只能从缩进层级去数。树（`-` 列表）的
     逐字节输出不受影响——这条分派在 `to_markdown` 的第一行。
 
+    阶段内部的步骤树按**每层 4 个空格**缩进，与鱼骨同一条理由：2 个空格只有
+    CommonMark 认，Python-Markdown 按 `tab_length=4` 判层级，会把它读成同一级
+    （见 `_markdown_fishbone`）。阶段标题上的 `###` 让阶段边界不依赖缩进，
+    但阶段**内部**的三层步骤仍要靠缩进表达。
+
     第二行的形状标记让导入侧知道"这些 `###` 是阶段，不是普通小标题"（见
     `shape_marker`）；阶段根自己的 `detail` 以引用块挂在标题下面。
     """
@@ -659,7 +681,7 @@ def _markdown_flow(content: FlowContent) -> str:
         stack = [(child, 0) for child in reversed(stage.root.children)]
         while stack:
             node, depth = stack.pop()
-            pad = "  " * depth
+            pad = "    " * depth
             lines.append(f"{pad}- {_escape_markdown(_node_text(node))}")
             lines.extend(_markdown_quote(node.detail, pad + "  "))
             stack.extend((child, depth + 1) for child in reversed(node.children))

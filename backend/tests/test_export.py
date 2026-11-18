@@ -401,16 +401,22 @@ class DetailExportTest(unittest.TestCase):
                               "detail": "两位主程同时不在"}]}}],
         })
         bones = to_markdown(fishbone)
-        self.assertIn("    > 两位主程同时不在", bones)
+        # 原因在 depth=2（pad 8 格），它的引用块比节点行深 2 格——精确断言，
+        # 免得子串匹配在缩进改宽之后仍然"碰巧通过"。
+        self.assertIn("          > 两位主程同时不在", bones)
         self.assertIn("' 说明：两位主程同时不在", to_puml(fishbone))
         self.assertIn('_note="两位主程同时不在"', to_opml(fishbone))
 
 
 class FishboneIndentationTest(unittest.TestCase):
-    """P2-⑦：鱼头、骨、原因必须是三级不同的缩进。
+    """鱼头、骨、原因必须是三级不同的缩进，**每级 4 个空格**。
 
     早先骨与鱼头都是顶格列表项（`- 为什么…` 与 `- 人`），普通 Markdown 阅读器把
     它们画成**同一级**的七个要点——读起来不是"一条鱼"，是"七条并列笔记"。
+
+    缩进改成 4 个空格是 codex 复审 P2-1：2 个空格只有 CommonMark 认，Python-Markdown
+    按 `tab_length=4` 判层级，把鱼头与骨读成同级（同一份文件在两个解析器里是两张图）。
+    4 个空格两边都认，实测 HTML 记在 `docs/IMPORT.md`。
     """
 
     def content(self):
@@ -433,12 +439,24 @@ class FishboneIndentationTest(unittest.TestCase):
                  if line.strip() and not line.startswith(("#", "<!--"))]
         self.assertEqual(lines, [
             "- 为什么报销要 11 天",
-            "  - 人",
-            "    - 审批的人不在",
-            "    - 交接不完整",
-            "      - 没写清谁接手",
-            "  - 机",
+            "    - 人",
+            "        - 审批的人不在",
+            "        - 交接不完整",
+            "            - 没写清谁接手",
+            "    - 机",
         ])
+
+    def test_every_level_is_a_multiple_of_four_spaces(self):
+        """判据是**每层 4 个空格**，不是"有这么几行"。
+
+        2 个空格在 Python-Markdown 里读不出层级（`tab_length` 是 4），所以这条
+        钉的不是"缩进是多少"，而是"缩进能被两个解析器都认出来"。漏改回 2 格时
+        上一行对比那条仍会通过（骨确实比鱼头深），只有这条会红。
+        """
+        lines = [line for line in to_markdown(self.content()).splitlines()
+                 if line.strip() and not line.startswith(("#", "<!--"))]
+        widths = [len(line) - len(line.lstrip(" ")) for line in lines]
+        self.assertEqual(widths, [0, 4, 8, 8, 12, 4])
 
     def test_every_bone_is_deeper_than_the_head(self):
         """判据是**每根骨都比鱼头深**，不是"有这么几行"：漏了缩进时上一行对比的
