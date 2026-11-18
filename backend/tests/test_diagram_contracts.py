@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -18,7 +20,11 @@ from app.contracts.mindmap import (
     MAX_FLOW_STAGES,
     FishboneContent,
     FlowContent,
+    MindMapContent,
+    SaveRequest,
+    TreeContent,
 )
+from app.mindmaps import repository
 
 
 def node(node_id: str, label: str | None = None, children=None, **extra):
@@ -289,3 +295,109 @@ class TestFlowValidation:
     def test_tree_fields_are_not_accepted(self):
         with pytest.raises(ValidationError):
             FlowContent.model_validate(flow(root=node("r")))
+
+
+def content_of(payload: dict):
+    """按**保存入口**（`SaveRequest.content`）解析，拿到判别后的成员。
+
+    用它而不是 `TypeAdapter(DiagramContent)`：真实入口就是这里，而联合的分派规则
+    只在被请求体校验时才真正生效（pydantic 会把 `Field(union_mode=...)` 收进模型
+    自己的 core schema）。
+    """
+    return SaveRequest.model_validate({"content": payload}).content
+
+
+class TestDiagramUnion:
+    def test_old_record_without_diagram_type_is_a_tree(self):
+        """旧图（连 `diagram_type` 都没有）落在联合的第一个成员上。"""
+        parsed = content_of({"title": "旧图", "root": node("r")})
+        assert isinstance(parsed, MindMapContent)
+        assert parsed.diagram_type == "tree"
+
+    def test_old_fishbone_labelled_tree_still_parses_as_tree(self):
+        """**最要紧的一条**：`diagram_type == "fishbone"` 但形状是一棵树。
+
+        阶段 2 之前生成链路就是这么产出的（`agent/tools.py` 拿 `MindMapContent` 改一下
+        `diagram_type` 就算鱼骨图）。这批图必须继续读成树、继续存得回去——判别要是
+        认 `diagram_type` 而不是形状，它们会在下一次保存时 422，而用户什么都没改。
+        """
+        parsed = content_of({"title": "旧鱼骨", "diagram_type": "fishbone",
+                             "root": node("r")})
+        assert isinstance(parsed, MindMapContent)
+        assert parsed.diagram_type == "fishbone"   # 自述保留，不被改写
+
+    def test_fishbone_shape_parses_as_fishbone(self):
+        parsed = content_of({"title": "缺陷", "problem": "为什么漏检",
+                             "bones": [bone("人")]})
+        assert isinstance(parsed, FishboneContent)
+        assert parsed.diagram_type == "fishbone"
+
+    def test_flow_shape_parses_as_flow(self):
+        parsed = content_of({"title": "流程", "stages": [stage("s1", node("n1"))]})
+        assert isinstance(parsed, FlowContent)
+        assert parsed.diagram_type == "flowchart"
+
+    def test_a_shape_is_never_ambiguous(self):
+        """三套的必填字段与 `extra="forbid"` 让形状互斥，不需要退回"挑匹配最多"。"""
+        tree_only = content_of({"title": "t", "root": node("r")})
+        fish_only = content_of({"title": "t", "problem": "p", "bones": [bone("人")]})
+        flow_only = content_of({"title": "t", "stages": [stage("s1", node("n1"))]})
+        assert [type(item) for item in (tree_only, fish_only, flow_only)] == [
+            MindMapContent, FishboneContent, FlowContent]
+
+    def test_a_payload_that_fits_none_is_rejected(self):
+        with pytest.raises(ValidationError):
+            content_of({"title": "空的"})
+
+    def test_tree_extra_keys_are_still_forbidden(self):
+        """`extra="forbid"` 没有因为联合而放宽：树上带 `problem` 仍然 422。"""
+        with pytest.raises(ValidationError):
+            content_of({"title": "t", "root": node("r"), "problem": "p"})
+
+    def test_tree_content_is_the_same_class(self):
+        """`TreeContent` 是别名，不是子类：同一份定义，减少一份重复的 schema。"""
+        assert TreeContent is MindMapContent
+
+
+@pytest.fixture()
+def temp_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "repo.db"))
+    yield
+
+
+class TestRepositoryRoundTrip:
+    """三套形状都能经 `SaveRequest` → `repository` 存进去、原样读出来。"""
+
+    def test_all_three_shapes_survive_a_round_trip(self, temp_db):
+        payloads = [
+            {"title": "树", "root": node("r")},
+            {"title": "鱼骨", "problem": "为什么漏检", "bones": [bone("人")]},
+            {"title": "流程", "stages": [stage("s1", node("n1"))],
+             "edges": []},
+        ]
+        for payload in payloads:
+            body = SaveRequest.model_validate({"content": payload})
+            record = repository.create_map(body.content)
+            again = repository.get_map(record.id)
+            assert again is not None
+            assert type(again.content) is type(body.content)
+            assert again.content.model_dump() == body.content.model_dump()
+
+    def test_a_legacy_row_reads_as_a_tree(self, temp_db):
+        """库里一条 v2 早期记录（没有 `diagram_type` / `edges`）读出来是树。"""
+        import sqlite3
+        from contextlib import closing
+
+        with closing(sqlite3.connect(repository.db_path())) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS mindmaps (id TEXT PRIMARY KEY,"
+                         " version INTEGER NOT NULL, content TEXT NOT NULL,"
+                         " updated_at TEXT NOT NULL)")
+            conn.execute("INSERT INTO mindmaps VALUES ('legacy', 1, ?,"
+                         " '2026-11-01T00:00:00.000Z')",
+                         (json.dumps({"schema_version": 2, "title": "旧图",
+                                      "root": node("r")}, ensure_ascii=False),))
+        record = repository.get_map("legacy")
+        assert record is not None
+        assert isinstance(record.content, MindMapContent)
+        assert record.content.diagram_type == "tree"
+        assert record.content.edges == []

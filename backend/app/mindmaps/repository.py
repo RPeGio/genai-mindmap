@@ -9,7 +9,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
-from app.contracts.mindmap import MapRecord, MindMapContent, migrate_content
+from app.contracts.mindmap import DiagramContent, MapRecord, migrate_content
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +235,7 @@ def get_map(map_id: str) -> MapRecord | None:
     return _record(row) if row else None
 
 
-def create_map(content: MindMapContent) -> MapRecord:
+def create_map(content: DiagramContent) -> MapRecord:
     map_id = str(uuid4())
     with closing(connect()) as conn, conn:
         conn.execute("INSERT INTO mindmaps VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
@@ -243,7 +243,7 @@ def create_map(content: MindMapContent) -> MapRecord:
     return get_map(map_id)  # type: ignore[return-value]
 
 
-def update_map(map_id: str, version: int, content: MindMapContent) -> str:
+def update_map(map_id: str, version: int, content: DiagramContent) -> str:
     with closing(connect()) as conn, conn:
         result = conn.execute("""UPDATE mindmaps SET content = ?, version = version + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')

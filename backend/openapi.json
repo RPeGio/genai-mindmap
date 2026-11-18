@@ -1405,7 +1405,18 @@
       "CheckRequest": {
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Input"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              }
+            ],
+            "title": "Content"
           },
           "events": {
             "items": {
@@ -2069,6 +2080,412 @@
         "title": "EditSummary",
         "description": "`GET /mindmaps/{id}/edits/summary` 的响应。\n\n两条恒等式让数字可以先自校验再读结论：\n\n  - `sum(by_actor) == total`；\n  - `sum(by_field) == by_kind[\"update\"] + by_kind[\"style\"]`。\n\n对不上就说明有写入路径绕过了契约，而不是\"统计有点怪\"。\n\n改动量与\"本来可以不改\"的分母分列四组，全部是原始量（比例让读的人自己除）：\n分母 `generated_nodes`、分子 `changed_events`、以及\"这次生成一处都没被改\"的\n`untouched_runs`。三者必须能对上：`untouched_runs <= generated_runs`，而\n`changed_events == 0` 时 `untouched_runs == generated_runs`。"
       },
+      "FishboneBone-Input": {
+        "properties": {
+          "category": {
+            "type": "string",
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Category"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Input"
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "category",
+          "root"
+        ],
+        "title": "FishboneBone",
+        "description": "鱼骨图上的一根骨：一个类别 + 一棵子树。\n\n**`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /\n`detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层\n`Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。\n`causes` 就是 `root.children`，多一层数组只会让\"这条原因下面还能不能再展开\"\n这件事换个地方回答。\n\n骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**\n（人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。"
+      },
+      "FishboneBone-Output": {
+        "properties": {
+          "category": {
+            "type": "string",
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Category"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Output"
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "category",
+          "root"
+        ],
+        "title": "FishboneBone",
+        "description": "鱼骨图上的一根骨：一个类别 + 一棵子树。\n\n**`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /\n`detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层\n`Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。\n`causes` 就是 `root.children`，多一层数组只会让\"这条原因下面还能不能再展开\"\n这件事换个地方回答。\n\n骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**\n（人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。"
+      },
+      "FishboneContent-Input": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "fishbone",
+            "title": "Diagram Type",
+            "default": "fishbone"
+          },
+          "problem": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Problem"
+          },
+          "bones": {
+            "items": {
+              "$ref": "#/components/schemas/FishboneBone-Input"
+            },
+            "type": "array",
+            "maxItems": 6,
+            "title": "Bones"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "problem"
+        ],
+        "title": "FishboneContent",
+        "description": "鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。\n\n与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：\n\n  - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），\n    让用户选\"横向还是纵向\"只会得到一张画歪的鱼。前端按 `diagram_type` 分派\n    （`canvas/layout/index.ts`），不读 `layout`。\n  - `problem` 独立于 `title`。`title` 是文件名（\"报销慢的原因分析\"），\n    `problem` 是主骨上那一句（\"为什么报销要 11 天\"）——后半句才是这张图的论点，\n    而它会被画在鱼头里，长度与字号都受位置限制。\n  - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是\n    **类别**，不是\"原因 1 / 原因 2\"。"
+      },
+      "FishboneContent-Output": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "fishbone",
+            "title": "Diagram Type",
+            "default": "fishbone"
+          },
+          "problem": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Problem"
+          },
+          "bones": {
+            "items": {
+              "$ref": "#/components/schemas/FishboneBone-Output"
+            },
+            "type": "array",
+            "maxItems": 6,
+            "title": "Bones"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "problem"
+        ],
+        "title": "FishboneContent",
+        "description": "鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。\n\n与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：\n\n  - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），\n    让用户选\"横向还是纵向\"只会得到一张画歪的鱼。前端按 `diagram_type` 分派\n    （`canvas/layout/index.ts`），不读 `layout`。\n  - `problem` 独立于 `title`。`title` 是文件名（\"报销慢的原因分析\"），\n    `problem` 是主骨上那一句（\"为什么报销要 11 天\"）——后半句才是这张图的论点，\n    而它会被画在鱼头里，长度与字号都受位置限制。\n  - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是\n    **类别**，不是\"原因 1 / 原因 2\"。"
+      },
+      "FlowContent-Input": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "flowchart",
+            "title": "Diagram Type",
+            "default": "flowchart"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/FlowStage-Input"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Stages"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "stages"
+        ],
+        "title": "FlowContent",
+        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`\n    刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的\n    `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`\n    表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个\n    \"第三种命名空间\"。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
+      },
+      "FlowContent-Output": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "flowchart",
+            "title": "Diagram Type",
+            "default": "flowchart"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/FlowStage-Output"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Stages"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "stages"
+        ],
+        "title": "FlowContent",
+        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`\n    刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的\n    `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`\n    表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个\n    \"第三种命名空间\"。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
+      },
+      "FlowStage-Input": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Input"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "root"
+        ],
+        "title": "FlowStage",
+        "description": "流程里的一个阶段：一个 id + 一棵步骤树。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并\n是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画出来的\n东西完全不同（一条主轴 vs 一条细线）。"
+      },
+      "FlowStage-Output": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Output"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "root"
+        ],
+        "title": "FlowStage",
+        "description": "流程里的一个阶段：一个 id + 一棵步骤树。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并\n是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画出来的\n东西完全不同（一条主轴 vs 一条细线）。"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -2337,7 +2754,18 @@
             "title": "Version"
           },
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Output"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Output"
+              }
+            ],
+            "title": "Content"
           },
           "updated_at": {
             "type": "string",
@@ -2351,7 +2779,8 @@
           "content",
           "updated_at"
         ],
-        "title": "MapRecord"
+        "title": "MapRecord",
+        "description": "一条落库的导图。`content` 与 `SaveRequest.content` 是同一个联合类型——\n写进来的是什么形状，读出去就是什么形状（JSON 里 `diagram_type` 与形状都在）。"
       },
       "MindMapContent-Input": {
         "properties": {
@@ -3148,7 +3577,18 @@
       "SaveRequest": {
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Input"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              }
+            ],
+            "title": "Content"
           },
           "events": {
             "items": {
@@ -3170,7 +3610,7 @@
           "content"
         ],
         "title": "SaveRequest",
-        "description": "保存一份导图，**顺带提交这一次保存里攒下的改动日志**。\n\n事件为什么不走独立端点（`POST /mindmaps/{id}/edits`）：第一次保存之前根本\n没有 `map_id`。要么发不出去，要么必须先 create 再补发，于是多出一种半截状态\n——内容存了、事件没存——而统计从此只看见部分改动，且没有任何地方能察觉。\n放进同一个请求体，两者天然同成败：409 冲突时一起失败、重试就都补上。\n\n`events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是\n重新点了一下保存）与上一版请求体逐字节相同。"
+        "description": "保存一份导图，**顺带提交这一次保存里攒下的改动日志**。\n\n事件为什么不走独立端点（`POST /mindmaps/{id}/edits`）：第一次保存之前根本\n没有 `map_id`。要么发不出去，要么必须先 create 再补发，于是多出一种半截状态\n——内容存了、事件没存——而统计从此只看见部分改动，且没有任何地方能察觉。\n放进同一个请求体，两者天然同成败：409 冲突时一起失败、重试就都补上。\n\n`events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是\n重新点了一下保存）与上一版请求体逐字节相同。\n\n`content` 是**三种图型的联合**（`DiagramContent`），不是 `MindMapContent`：\n鱼骨图与流程图的顶层结构不同（`problem` + `bones` / `stages` + 阶段间跳转），\n用树那一套 `extra=\"forbid\"` 装不下。判别靠形状，所以旧前端（只发树形状）的\n请求与加这个联合之前逐字节相同。"
       },
       "Saved": {
         "properties": {
@@ -3729,7 +4169,18 @@
       "UpdateRequest": {
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Input"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              }
+            ],
+            "title": "Content"
           },
           "events": {
             "items": {

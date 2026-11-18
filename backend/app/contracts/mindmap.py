@@ -9,12 +9,11 @@ v1 记录不需要迁移脚本就能读进来（`migrate_content()` 负责这一
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Sequence
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-from collections.abc import Sequence
 
 from app.contracts.edits import EditEventIn, MAX_EVENTS_PER_SAVE
 from app.contracts.source import SourceRef, SourceUsage
@@ -784,7 +783,10 @@ class FlowContent(ContentBase):
     diagram_type: Literal["flowchart"] = "flowchart"
     # 顺序就是 `stages` 的顺序：流程图的"先后"是数组下标，不需要另一个 `order` 字段
     # ——两个来源说同一件事时，它们迟早会互相矛盾。
-    stages: list[FlowStage] = Field(default_factory=list, max_length=MAX_FLOW_STAGES)
+    #
+    # `min_length=1` 不只是产品口径，也是**判别的必要条件**：`stages` 若可缺省，
+    # 任何一份只有 `title` 的畸形请求体都会静默落成一个"空流程图"而不是 422。
+    stages: list[FlowStage] = Field(min_length=1, max_length=MAX_FLOW_STAGES)
     edges: list[Edge] = Field(default_factory=list)
 
     @field_validator("edges")
@@ -809,6 +811,53 @@ class FlowContent(ContentBase):
         _validate_edges(self.edges, stage_ids, what="阶段")
         _validate_relations(self.relations, node_ids)
         return self
+
+
+# 三种图型的顶层结构，用在"保存 / 读取"这一层（`SaveRequest.content` 与
+# `MapRecord.content`）。
+#
+# **判别靠形状，不靠 `diagram_type`。** 这是这一层唯一的判断题，理由有四条：
+#
+#   1. **`diagram_type` 现在装不下这个职责。** 库里与前端手里有一批
+#      `diagram_type == "fishbone"` 但形状仍是一棵树的记录——生成链路在阶段 2 之前
+#      就是这么产出的（`agent/tools.py` 拿 `MindMapContent` 改一下 `diagram_type`
+#      就算鱼骨图）。把 `TreeContent.diagram_type` 收窄成 `Literal["tree"]`，这批
+#      图下一次保存就 422：用户什么都没改，图却存不回去。
+#   2. **反过来也不行。** 让 `MindMapContent.diagram_type` 保持宽（`DiagramKind`），
+#      判别键就不是单值，tagged union 不成立。
+#   3. **形状判别是免费的。** `extra="forbid"` 在 `ContentBase` 上，加上每套各有
+#      必填字段，三套天然互斥：树必有 `root`（且不许有 `problem` / `stages`），鱼骨
+#      必有 `problem` + `bones`（且不许有 `root`），流程必有 `stages`。这不是巧合，
+#      而是把 `extra="forbid"` 放进基类的原因。
+#   4. **`diagram_type` 已有的职责够重了。** 它是**产物自述**：前端据此决定摆不摆
+#      「附加关系」区块、导出的 PUML 文件头写哪一行、排查"我要的鱼骨图怎么成了导图"
+#      时那张图自己说得出来。让一个"自述"同时承担"判别键"，等于往库里一个已经有三
+#      类值的旧字段上再加一条它兑现不了的责任。
+#
+# `left_to_right` 而不是 smart：旧图全是树，排在第一位一次验证就命中；smart 模式
+# 会把三套都试一遍，而树是可能上千节点的大对象。失败的两个成员是廉价的（缺必填
+# 字段立刻失败），但顺序带来的**确定性**（同一份 JSON 永远解析成同一个成员）比
+# smart 的"挑匹配字段最多的"更值得依赖。
+#
+# `TreeContent` 是 `MindMapContent` 的语义别名，不是子类：
+#   - 子类会在 openapi 里多出一份与 `MindMapContent` 完全相同的 schema
+#     （`TreeContent-Input` / `-Output`），而 `contract-check.ts` 与 `schema.d.ts`
+#     要为这份重复买单，收益是零；
+#   - `MindMapContent` 必须保持可构造（生成链路、导入、导出、上百条用例都在用它），
+#     别名保证"同一份定义"；子类会让 `isinstance` 与 `model_json_schema` 分成两个；
+#   - 语义上"思维导图的顶层契约"就叫 `MindMapContent`，这个名字已经在
+#     `docs/CONTRACT_V2.md`、前端 `types.ts`、导入导出里用了上百处，不该为对称性
+#     再造一个同形的名字。
+#
+# **旧图零迁移**的全部实现仍然是"字段默认值"：旧记录缺 `diagram_type` 由
+# `MindMapContent` 补 `tree`，缺 `edges` 补空列表，而形状本来就是树——所以它落在
+# 联合的第一个成员上，一个字节都不用改，也不需要给 `migrate_content()` 加任何分支。
+TreeContent = MindMapContent
+
+DiagramContent = Annotated[
+    Union[MindMapContent, FishboneContent, FlowContent],
+    Field(union_mode="left_to_right"),
+]
 
 
 # v1 记录里缺的字段。只补顶层：Node 的新字段由 Pydantic 默认值补齐，不需要
@@ -847,9 +896,14 @@ class SaveRequest(BaseModel):
 
     `events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是
     重新点了一下保存）与上一版请求体逐字节相同。
+
+    `content` 是**三种图型的联合**（`DiagramContent`），不是 `MindMapContent`：
+    鱼骨图与流程图的顶层结构不同（`problem` + `bones` / `stages` + 阶段间跳转），
+    用树那一套 `extra="forbid"` 装不下。判别靠形状，所以旧前端（只发树形状）的
+    请求与加这个联合之前逐字节相同。
     """
 
-    content: MindMapContent
+    content: DiagramContent
     events: list[EditEventIn] = Field(default_factory=list, max_length=MAX_EVENTS_PER_SAVE)
     #: 前端这一次**没带上**多少条（超出 `MAX_EVENTS_PER_SAVE` 的部分留在前端队列里
     #: 等下次保存）。只用来记一条服务端 warning，不落表：往行为事件表里插一条假事件，
@@ -862,7 +916,10 @@ class UpdateRequest(SaveRequest):
 
 
 class MapRecord(BaseModel):
+    """一条落库的导图。`content` 与 `SaveRequest.content` 是同一个联合类型——
+    写进来的是什么形状，读出去就是什么形状（JSON 里 `diagram_type` 与形状都在）。"""
+
     id: str
     version: int
-    content: MindMapContent
+    content: DiagramContent
     updated_at: str

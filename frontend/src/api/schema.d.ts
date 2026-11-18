@@ -673,7 +673,8 @@ export interface components {
         };
         /** CheckRequest */
         CheckRequest: {
-            content: components["schemas"]["MindMapContent-Input"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"];
             /** Events */
             events?: components["schemas"]["EditEventIn"][];
             /**
@@ -928,6 +929,252 @@ export interface components {
              */
             untouched_runs: number;
         };
+        /**
+         * FishboneBone
+         * @description 鱼骨图上的一根骨：一个类别 + 一棵子树。
+         *
+         *     **`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /
+         *     `detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层
+         *     `Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。
+         *     `causes` 就是 `root.children`，多一层数组只会让"这条原因下面还能不能再展开"
+         *     这件事换个地方回答。
+         *
+         *     骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**
+         *     （人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。
+         */
+        "FishboneBone-Input": {
+            /** Category */
+            category: string;
+            root: components["schemas"]["Node-Input"];
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
+        };
+        /**
+         * FishboneBone
+         * @description 鱼骨图上的一根骨：一个类别 + 一棵子树。
+         *
+         *     **`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /
+         *     `detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层
+         *     `Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。
+         *     `causes` 就是 `root.children`，多一层数组只会让"这条原因下面还能不能再展开"
+         *     这件事换个地方回答。
+         *
+         *     骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**
+         *     （人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。
+         */
+        "FishboneBone-Output": {
+            /** Category */
+            category: string;
+            root: components["schemas"]["Node-Output"];
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
+        };
+        /**
+         * FishboneContent
+         * @description 鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。
+         *
+         *     与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：
+         *
+         *       - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），
+         *         让用户选"横向还是纵向"只会得到一张画歪的鱼。前端按 `diagram_type` 分派
+         *         （`canvas/layout/index.ts`），不读 `layout`。
+         *       - `problem` 独立于 `title`。`title` 是文件名（"报销慢的原因分析"），
+         *         `problem` 是主骨上那一句（"为什么报销要 11 天"）——后半句才是这张图的论点，
+         *         而它会被画在鱼头里，长度与字号都受位置限制。
+         *       - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是
+         *         **类别**，不是"原因 1 / 原因 2"。
+         */
+        "FishboneContent-Input": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default fishbone
+             * @constant
+             */
+            diagram_type: "fishbone";
+            /** Problem */
+            problem: string;
+            /** Bones */
+            bones?: components["schemas"]["FishboneBone-Input"][];
+        };
+        /**
+         * FishboneContent
+         * @description 鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。
+         *
+         *     与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：
+         *
+         *       - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），
+         *         让用户选"横向还是纵向"只会得到一张画歪的鱼。前端按 `diagram_type` 分派
+         *         （`canvas/layout/index.ts`），不读 `layout`。
+         *       - `problem` 独立于 `title`。`title` 是文件名（"报销慢的原因分析"），
+         *         `problem` 是主骨上那一句（"为什么报销要 11 天"）——后半句才是这张图的论点，
+         *         而它会被画在鱼头里，长度与字号都受位置限制。
+         *       - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是
+         *         **类别**，不是"原因 1 / 原因 2"。
+         */
+        "FishboneContent-Output": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default fishbone
+             * @constant
+             */
+            diagram_type: "fishbone";
+            /** Problem */
+            problem: string;
+            /** Bones */
+            bones?: components["schemas"]["FishboneBone-Output"][];
+        };
+        /**
+         * FlowContent
+         * @description 流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。
+         *
+         *     与 `MindMapContent` 的三个差别：
+         *
+         *       - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步
+         *         还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让"这是阶段"与
+         *         "这是阶段里的第一步"在数据里长得一样。
+         *       - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`
+         *         刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的
+         *         `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`
+         *         表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个
+         *         "第三种命名空间"。
+         *       - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。
+         *         `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。
+         */
+        "FlowContent-Input": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default flowchart
+             * @constant
+             */
+            diagram_type: "flowchart";
+            /** Stages */
+            stages: components["schemas"]["FlowStage-Input"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+        };
+        /**
+         * FlowContent
+         * @description 流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。
+         *
+         *     与 `MindMapContent` 的三个差别：
+         *
+         *       - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步
+         *         还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让"这是阶段"与
+         *         "这是阶段里的第一步"在数据里长得一样。
+         *       - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`
+         *         刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的
+         *         `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`
+         *         表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个
+         *         "第三种命名空间"。
+         *       - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。
+         *         `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。
+         */
+        "FlowContent-Output": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default flowchart
+             * @constant
+             */
+            diagram_type: "flowchart";
+            /** Stages */
+            stages: components["schemas"]["FlowStage-Output"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+        };
+        /**
+         * FlowStage
+         * @description 流程里的一个阶段：一个 id + 一棵步骤树。
+         *
+         *     `root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——
+         *     `Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，
+         *     而第一层"步骤"与第 N 层"步骤"在数据里本来就该是同一个东西。`steps` 就是
+         *     `root.children`。
+         *
+         *     `id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点
+         *     引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并
+         *     是因为合并之后"这条边连的是阶段还是步骤"要靠形状猜，而两者在画布上画出来的
+         *     东西完全不同（一条主轴 vs 一条细线）。
+         */
+        "FlowStage-Input": {
+            /** Id */
+            id: string;
+            root: components["schemas"]["Node-Input"];
+        };
+        /**
+         * FlowStage
+         * @description 流程里的一个阶段：一个 id + 一棵步骤树。
+         *
+         *     `root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——
+         *     `Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，
+         *     而第一层"步骤"与第 N 层"步骤"在数据里本来就该是同一个东西。`steps` 就是
+         *     `root.children`。
+         *
+         *     `id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点
+         *     引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并
+         *     是因为合并之后"这条边连的是阶段还是步骤"要靠形状猜，而两者在画布上画出来的
+         *     东西完全不同（一条主轴 vs 一条细线）。
+         */
+        "FlowStage-Output": {
+            /** Id */
+            id: string;
+            root: components["schemas"]["Node-Output"];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1043,13 +1290,18 @@ export interface components {
             /** Total Chars */
             total_chars: number;
         };
-        /** MapRecord */
+        /**
+         * MapRecord
+         * @description 一条落库的导图。`content` 与 `SaveRequest.content` 是同一个联合类型——
+         *     写进来的是什么形状，读出去就是什么形状（JSON 里 `diagram_type` 与形状都在）。
+         */
         MapRecord: {
             /** Id */
             id: string;
             /** Version */
             version: number;
-            content: components["schemas"]["MindMapContent-Output"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Output"] | components["schemas"]["FishboneContent-Output"] | components["schemas"]["FlowContent-Output"];
             /** Updated At */
             updated_at: string;
         };
@@ -1063,14 +1315,14 @@ export interface components {
             schema_version: 2;
             /** Title */
             title: string;
-            root: components["schemas"]["Node-Input"];
-            /** @default tree */
-            layout: components["schemas"]["LayoutKind"];
             theme?: components["schemas"]["Theme"];
             /** Relations */
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            root: components["schemas"]["Node-Input"];
+            /** @default tree */
+            layout: components["schemas"]["LayoutKind"];
             /** Edges */
             edges?: components["schemas"]["Edge"][];
             /**
@@ -1090,14 +1342,14 @@ export interface components {
             schema_version: 2;
             /** Title */
             title: string;
-            root: components["schemas"]["Node-Output"];
-            /** @default tree */
-            layout: components["schemas"]["LayoutKind"];
             theme?: components["schemas"]["Theme"];
             /** Relations */
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            root: components["schemas"]["Node-Output"];
+            /** @default tree */
+            layout: components["schemas"]["LayoutKind"];
             /** Edges */
             edges?: components["schemas"]["Edge"][];
             /**
@@ -1398,9 +1650,15 @@ export interface components {
          *
          *     `events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是
          *     重新点了一下保存）与上一版请求体逐字节相同。
+         *
+         *     `content` 是**三种图型的联合**（`DiagramContent`），不是 `MindMapContent`：
+         *     鱼骨图与流程图的顶层结构不同（`problem` + `bones` / `stages` + 阶段间跳转），
+         *     用树那一套 `extra="forbid"` 装不下。判别靠形状，所以旧前端（只发树形状）的
+         *     请求与加这个联合之前逐字节相同。
          */
         SaveRequest: {
-            content: components["schemas"]["MindMapContent-Input"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"];
             /** Events */
             events?: components["schemas"]["EditEventIn"][];
             /**
@@ -1617,7 +1875,8 @@ export interface components {
         };
         /** UpdateRequest */
         UpdateRequest: {
-            content: components["schemas"]["MindMapContent-Input"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"];
             /** Events */
             events?: components["schemas"]["EditEventIn"][];
             /**
