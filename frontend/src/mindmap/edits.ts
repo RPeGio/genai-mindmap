@@ -266,23 +266,30 @@ export function removeEdge(content: DiagramContent, edgeId: string): DiagramCont
 }
 
 /**
- * 删掉一批节点之后，把端点已经不存在的边一起清掉。**两张表都清**。
+ * 删掉一批节点之后，把端点已经不存在的边**与关系**一起清掉。三张表都清。
  *
- * 与后端 `ops::_apply_remove` 同一语义（"删节点连带删边"）：留着悬空边，下一次
- * 保存就是 422，而报错指向某条边，与用户刚才做的事隔得很远。
+ * 与后端 `ops::_apply_remove` 同一语义（"删节点连带删边/关系"）：留着悬空项，下一次
+ * 保存就是 422，而报错指向某条边或某条关系，与用户刚才做的事隔得很远。
  *
- * 三种形状各自的"边端点是节点 id"这一层不同：
+ * 三种形状各自的"端点是节点 id"这一层不同：
  *  - 树：`content.edges` 的端点就是节点 id；
  *  - 流程：`content.edges` 的端点是**阶段 id**（删一个步骤碰不到它），而
  *    `stages[i].edges` 的端点才是**该阶段的节点 id**——这一层以前没有读者，所以
  *    "流程删节点不用管边"曾经是成立的；现在它不成立了；
- *  - 鱼骨：本来就没有边。
+ *  - 鱼骨：没有边。
+ *
+ * 但 `relations`（跨节点关系线）**三种形状的顶层都有**（契约 `ContentBase`），端点
+ * 永远是节点 id，与形状无关。此前这里只清 `edges`：删一个被关系引用的节点之后，
+ * 保存会被契约 `_validate_relations` 硬拒（"关系 X 的起点节点 Y 不在导图中"），
+ * 而界面根本不渲染 `relations`——用户既看不到那条残留的关系，也没法删掉它，
+ * 只能看着保存 422。所以"删节点连带删"的范围必须包含它。
  */
 export function dropDanglingEdges(content: DiagramContent, doomed: Set<string>): DiagramContent {
-  const alive = (edge: MindEdge) => !doomed.has(edge.source) && !doomed.has(edge.target);
+  const alive = (edge: { source: string; target: string }) => (
+    !doomed.has(edge.source) && !doomed.has(edge.target)
+  );
 
-  if (isFishbone(content)) return content;
-
+  let next: DiagramContent = content;
   if (isFlow(content)) {
     let hit = false;
     const stages = content.stages.map(stage => {
@@ -294,12 +301,20 @@ export function dropDanglingEdges(content: DiagramContent, doomed: Set<string>):
     });
     // 一条都没删到时返回**同一个对象**：调用方靠引用相等判断"这次什么都没变"，
     // 无谓的复制会让"删节点却没删掉边"看起来像改过。
-    return hit ? { ...content, stages } : content;
+    if (hit) next = { ...content, stages };
+  } else if (!isFishbone(content)) {
+    const edges = edgesOf(content);
+    const kept = edges.filter(alive);
+    if (kept.length !== edges.length) next = { ...content, edges: kept };
   }
+  // 鱼骨落到这里时 `next` 还是原内容：它的顶层本来就没有 `edges`。
 
-  const edges = edgesOf(content);
-  const kept = edges.filter(alive);
-  return kept.length === edges.length ? content : { ...content, edges: kept };
+  const relations = content.relations ?? [];
+  const keptRelations = relations.filter(alive);
+  if (keptRelations.length === relations.length) return next;
+  // `relations` 落在契约的 `ContentBase` 上，三种形状都有这个键，所以这一句对三者
+  // 都成立；`as DiagramContent` 只是让联合类型认得出这条**共有**的键。
+  return { ...next, relations: keptRelations } as DiagramContent;
 }
 
 /**
@@ -563,6 +578,21 @@ export function validateDraft(content: DiagramContent): string | null {
       }
 
       for (const child of node.children) stack.push({ node: child, depth: depth + 1 });
+    }
+  }
+
+  // 跨节点关系（`relations`）与附加边是**两套字段、同一条 dangling 判据**：契约
+  // `_validate_relations` 对三种形状都硬拒指向不存在节点的关系，而"删节点"正是造出
+  // 这种关系的那双手。`dropDanglingEdges` 已经在删的时候清掉了，这里再拦一次是为了
+  // 另一半来源——库里读出来的旧图 / 导入进来的图本来就带悬空关系（界面不渲染
+  // `relations`，用户既看不到也删不掉），那时保存 422 且指不到任何可操作的东西。
+  //
+  // 只查"端点存在"这一条：id 唯一、自环、同三元组重复在界面上造不出来（`addEdge`
+  // 与导入侧各自拦过），重复写一遍只会让同一条规则有两处说法。
+  for (const relation of content.relations ?? []) {
+    if (!seen.has(relation.source) || !seen.has(relation.target)) {
+      const missing = !seen.has(relation.source) ? relation.source : relation.target;
+      return `关系 ${relation.id} 指向不存在的节点 ${missing}`;
     }
   }
 
