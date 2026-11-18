@@ -21,9 +21,11 @@ import pytest
 
 from app.agent import provider as provider_module
 from app.agent.contracts import AgentRunRequest, Completion, DoneEvent, RunBudget, ToolCall
-from app.agent.provider import DEEP_MODEL_ENV, _model_for
 from app.agent.service import REASONING_TEXT_LIMIT, run
 from app.contracts.mindmap import MindMapContent
+# 模型名的判定只有一份，在 generation 那边：两条出口（provider 与 chat_async）
+# 都从那里取名字，所以这里也从那里导入。
+from app.generation.service import DEEP_MODEL_ENV, _model_for
 
 TREE = {
     "title": "机器学习",

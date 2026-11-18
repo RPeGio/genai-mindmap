@@ -1066,6 +1066,35 @@ def _max_tokens(ctx: RunContext) -> int:
     return min(ctx.request.budget.max_output_tokens, max_tokens_cap())
 
 
+async def _chat(
+    ctx: RunContext,
+    system: str,
+    user: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """工具内部**唯一**的模型出口：`chat_async` + 这一次的 `deep_thinking`。
+
+    `deep_thinking` 不在调用点各传一遍，而是从 `ctx.request` 取。理由是这条链上
+    有六个调用点（骨架 / 结构 / 说明的两半 / 分片展开 / node_expand），逐个手传的
+    结果已经出现过：开关只换了外层工具循环的模型，六个点里一个都没换，而
+    「深度思考」的承诺是整次生成更聪明。
+
+    放在 Context 上取而不是加全局开关：两次并发请求各勾各的，环境变量式的开关会
+    让先到的那个决定后到的那个用哪个模型。
+
+    `tests/test_model_exit_single_path.py` 用 AST 钉着"tools.py 里除了这个函数
+    没有别处直接调 `chat_async`"，新增调用点忘记走它也过不了 CI。
+
+    **不勾时不把这个参数发下去**（而不是发 `deep_thinking=False`）：`chat_async`
+    的缺省值就是 `False`，少传一次等于"与加这个开关之前逐字节相同"，既有那些
+    按脚本回放的假出口（`chat(system, user, *, max_tokens=None, on_delta=None)`）
+    一行都不用改。
+    """
+    if ctx.request.deep_thinking:
+        kwargs["deep_thinking"] = True
+    return await chat_async(system, user, **kwargs)
+
+
 # 一次调用除节点之外的输入开销估计（user 消息 + 证据数组 + 系统提示词）。
 # 数值取实测上界：分片展开的 user 含 3 条父块（每条 450–700 字）+ 路径 + 已有
 # 要点，约 3000 字 ≈ 2000 token；系统提示词（含思维模型块）约 4000 字 ≈ 2700
@@ -3498,8 +3527,9 @@ async def _fill_details_half(
         system += DETAIL_NO_SOURCE_RULES
     started = time.perf_counter()
     try:
-        raw = await chat_async(
-            system, _detail_ask(topic, targets, sections), max_tokens=_max_tokens(ctx))
+        raw = await _chat(
+            ctx, system, _detail_ask(topic, targets, sections),
+            max_tokens=_max_tokens(ctx))
     except GenerationError as exc:
         half.skipped = "error"
         half.failure = str(exc)
@@ -4824,7 +4854,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         plan_system += "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES
     plan_started = time.perf_counter()
     try:
-        raw_plan = await chat_async(
+        raw_plan = await _chat(
+            ctx,
             plan_system,
             _plan_ask(
                 args.topic, args.branches, outline=outline,
@@ -4993,7 +5024,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
     structure_started = time.perf_counter()
     try:
-        raw = await chat_async(system, user, max_tokens=_max_tokens(ctx), **stream_kwargs)
+        raw = await _chat(ctx, system, user, max_tokens=_max_tokens(ctx), **stream_kwargs)
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
     structure_seconds = time.perf_counter() - structure_started
@@ -5655,11 +5686,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         """
         system = prompt + thinking
         if ctx.emit is None or parent is None:
-            raw = await chat_async(system, user, max_tokens=_max_tokens(ctx))
+            raw = await _chat(ctx, system, user, max_tokens=_max_tokens(ctx))
         else:
             stream = _GrowStream(ctx, reported_grow, parent, base_index, quota=quota)
-            raw = await chat_async(
-                system, user, max_tokens=_max_tokens(ctx), on_delta=stream.feed,
+            raw = await _chat(
+                ctx, system, user, max_tokens=_max_tokens(ctx), on_delta=stream.feed,
             )
         # 截断在这里统一记账：四个调用点（骨架 / 分支 / 补点 / 深层）都从这里出去，
         # 各判一次的结果是"某一条路截断了但没人说"。判定只看返回值类型，不改形状
@@ -7804,7 +7835,7 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
         if not ctx.reserve_model_call():
             return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法展开。")
         ctx.extra_model_calls += 1
-        raw = await chat_async(system, ask, max_tokens=_max_tokens(ctx))
+        raw = await _chat(ctx, system, ask, max_tokens=_max_tokens(ctx))
     except GenerationError as exc:
         return _fail("generation_failed", f"展开失败：{exc}")
 

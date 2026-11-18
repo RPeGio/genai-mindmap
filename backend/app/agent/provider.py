@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import httpx
@@ -26,6 +25,11 @@ from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     GenerationError,
     _config,
+    # 模型名的判定与「深度思考」那三档优先级只有一份实现，在 generation 那边：
+    # 工具内部的 `chat_async` 也要用同一套名字（两条出口同一个开关）。这里只是
+    # 复用，不重新定义——两处各写一份的结果已经出现过一次：勾上深度思考只换了
+    # 外层工具循环的模型，骨架/结构/说明仍是普通模型。
+    _model_for,
     context_overflow_error,
     estimate_input_tokens,
     max_tokens_cap,
@@ -48,34 +52,11 @@ _TIMEOUT_SECONDS = 600.0
 # 而 qwen 系只认 32768 这件事不该要求改代码。
 _MAX_TOKENS_CAP = 65536
 
-
-# 「深度思考」那一次要用的模型名。两个模型在同一个 endpoint 上，差别只有这个名字
-# （`api.deepseek.com/chat/completions` 同时收 `deepseek-chat` 与 `deepseek-reasoner`）。
-#
-# 三档取值，顺序就是优先级：
-#
-#   1. `MINDMAP_LLM_MODEL_DEEP`（显式配置）——换供应商时唯一该改的地方；
-#   2. 什么都没配、但端点/模型名里带 `deepseek` → `deepseek-reasoner`；
-#   3. 否则**沿用原模型名**。
-#
-# 第 3 档是本节最要紧的一条：不能"猜一个推理模型名"往别人的端点上发。那会得到
-# 一个 400/404，而错误文案只能读成"模型服务出错"——用户不知道是自己没配
-# `MINDMAP_LLM_MODEL_DEEP`。宁可这一次退化成普通模型（界面上如实显示发出去的名字），
-# 也不要整条链路报废。
-DEEP_MODEL_ENV = "MINDMAP_LLM_MODEL_DEEP"
-DEEP_MODEL_FALLBACK = "deepseek-reasoner"
-
-
-def _model_for(base: str, model: str, deep_thinking: bool) -> str:
-    """这一次真正要发出去的模型名。纯函数，便于单独测。"""
-    if not deep_thinking:
-        return model
-    explicit = os.getenv(DEEP_MODEL_ENV, "").strip()
-    if explicit:
-        return explicit
-    if "deepseek" in base.lower() or "deepseek" in model.lower():
-        return DEEP_MODEL_FALLBACK
-    return model
+# 「深度思考」用的模型名判定（`_model_for`）与 `DEEP_MODEL_ENV` /
+# `DEEP_MODEL_FALLBACK` 两个常量都在 `generation/service.py`：那是模型出口的家，
+# 工具内部的 `chat_async` 也走同一份判定。要读那两个常量请从
+# `app.generation.service` 导入——`provider` 这边**不转发**，否则又会出现第二个
+# 可以 import 得到的位置。
 
 
 def _estimate_request_tokens(

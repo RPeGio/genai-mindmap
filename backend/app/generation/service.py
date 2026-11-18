@@ -796,6 +796,46 @@ def _config() -> tuple[str, str, str]:
     return base, key, model
 
 
+# 「深度思考」那一次要用的模型名。两个模型在同一个 endpoint 上，差别只有这个名字
+# （`api.deepseek.com/chat/completions` 同时收 `deepseek-chat` 与 `deepseek-reasoner`）。
+#
+# **放在这里而不是 `app/agent/provider.py`**：模型名有两条出口——外层工具循环走
+# `provider.complete_tools`，工具内部（骨架 / 结构 / 说明 / 展开）走 `chat_async`。
+# 这个判定原先只写在 provider 那一侧，于是勾上「深度思考」时只有"决定调哪个工具"
+# 那一次次对话换了模型，真正写内容的几次仍然走普通模型。判定必须只有一份实现，
+# 两条出口都从它取名字。
+#
+# 三档取值，顺序就是优先级：
+#
+#   1. `MINDMAP_LLM_MODEL_DEEP`（显式配置）——换供应商时唯一该改的地方；
+#   2. 什么都没配、但端点/模型名里带 `deepseek` → `deepseek-reasoner`；
+#   3. 否则**沿用原模型名**。
+#
+# 第 3 档是本节最要紧的一条：不能"猜一个推理模型名"往别人的端点上发。那会得到
+# 一个 400/404，而错误文案只能读成"模型服务出错"——用户不知道是自己没配
+# `MINDMAP_LLM_MODEL_DEEP`。宁可这一次退化成普通模型（`done` 帧上如实显示发出去的
+# 名字），也不要整条链路报废。
+DEEP_MODEL_ENV = "MINDMAP_LLM_MODEL_DEEP"
+DEEP_MODEL_FALLBACK = "deepseek-reasoner"
+
+
+def _model_for(base: str, model: str, deep_thinking: bool) -> str:
+    """这一次真正要发出去的模型名。纯函数，便于单独测。
+
+    调用方只有两个：`app/agent/provider.py`（外层工具循环）与本文件的
+    `chat_async`（工具内部的每一次生成）。任何新增的模型出口都必须过它，
+    否则「深度思考」会再次变成"只有一半链路换了模型"。
+    """
+    if not deep_thinking:
+        return model
+    explicit = os.getenv(DEEP_MODEL_ENV, "").strip()
+    if explicit:
+        return explicit
+    if "deepseek" in base.lower() or "deepseek" in model.lower():
+        return DEEP_MODEL_FALLBACK
+    return model
+
+
 def _stream_frame(data: str) -> tuple[str, str | None] | None:
     """一帧 `data:` 里的 `(delta.content, finish_reason)`；形状不对返回 None。
 
@@ -1054,8 +1094,18 @@ async def chat_async(
     *,
     max_tokens: int | None = None,
     on_delta: Callable[[str], Awaitable[None]] | None = None,
+    deep_thinking: bool = False,
 ) -> dict[str, Any]:
     """agent 的工具（生成 / 展开 / 编辑）唯一的模型出口。
+
+    **`deep_thinking` 必须由调用方从 `RunContext.request` 传进来**：这个开关的
+    语义是"这一次整条生成链都走推理模型"，而这条出口承担的是骨架、结构、说明、
+    展开——也就是真正写内容的那几次调用。少传一处，用户勾上之后得到的仍然是
+    "选工具那一步聪明了一点、写出来的东西没变"，而界面上没有任何迹象。
+
+    agent 工具侧不要直接调本函数：走 `tools._chat(ctx, ...)`，它从
+    `ctx.request.deep_thinking` 取值，`tests/test_model_exit_single_path.py`
+    钉着"除那个封装之外没有第二条路"。
 
     全程异步是硬要求：客户端断开时 Starlette 会 cancel 生成器，异步 httpx
     会随之关闭连接、停止计费；同步 httpx 跑在线程里，取消只能丢掉结果，
@@ -1069,8 +1119,13 @@ async def chat_async(
 
     `max_tokens` 由调用方给：工具这条出口的上限来自 `RunBudget`，在这里再写
     一个默认值，预算里写的数与请求里发的数就会各走各的。
+
+    `deep_thinking` 走 `_model_for()`——与 `provider.complete_tools` 同一个函数。
     """
     base, key, model = _config()
+    # 模型名在工作区里只有这一份判定（理由见 `_model_for` 的注释）：勾了深度思考
+    # 时，工具内部的每一次调用都必须和外层工具循环发同一个名字。
+    model = _model_for(base, model, deep_thinking)
     # 输入侧的物理边界，与调用方是谁无关：装不装得进模型窗口由这里统一守，
     # 否则每个出口各守一个数，迟早分叉。
     ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
