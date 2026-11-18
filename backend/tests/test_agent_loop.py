@@ -590,7 +590,7 @@ class BudgetTest(unittest.TestCase):
             # 2 次刚好够「外层发工具 + 工具内那一次骨架」，展开就没有额度了
             events = _collect(
                 _request(budget=RunBudget(max_model_calls=2, max_tool_calls=50)),
-                provider, build_registry("create"))
+                provider, build_registry("create_deep"))
 
         self.assertEqual(events[-1].type, "done")
         self.assertIsNotNone(events[-1].content)
@@ -672,7 +672,7 @@ class BudgetTest(unittest.TestCase):
         with patch("app.agent.tools.chat_async", new=fake_chat):
             events = _collect(
                 _request(budget=RunBudget(max_model_calls=1)),
-                provider, build_registry("create"),
+                provider, build_registry("create_deep"),
             )
 
         self.assertEqual(provider.calls + len(chats), 1)
@@ -700,7 +700,7 @@ class BudgetTest(unittest.TestCase):
         with patch("app.agent.tools.chat_async", new=fake_chat):
             events = _collect(
                 _request(budget=RunBudget(max_model_calls=2)),
-                provider, build_registry("create"),
+                provider, build_registry("create_deep"),
             )
 
         # 第二次额度给了骨架那一次调用：展开一次都没发（额度已经用完）
@@ -740,7 +740,7 @@ class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
             _completion(),
         ])
         with patch("app.agent.tools.chat_async", new=fake_chat):
-            events = _collect(_request(), provider, build_registry("create"))
+            events = _collect(_request(), provider, build_registry("create_deep"))
 
         self.assertEqual(events[-1].type, "done")
         self.assertEqual(len(events[-1].content.root.children), 6)
@@ -778,7 +778,7 @@ class DeepRunUnderDefaultBudgetTest(unittest.TestCase):
             _completion(),
         ])
         with patch("app.agent.tools.chat_async", new=fake_chat):
-            events = _collect(_request(), provider, build_registry("create"))
+            events = _collect(_request(), provider, build_registry("create_deep"))
 
         self.assertEqual(events[-1].type, "done")
         root = events[-1].content.root
@@ -862,7 +862,7 @@ class SnapshotEmissionTest(unittest.TestCase):
                                    "points_per_branch": 2, "max_depth": 2})
         provider = ScriptedProvider([_completion([call], finish="tool_calls"), _completion()])
         with patch("app.agent.tools.chat_async", new=fake_chat):
-            events = _collect(_request(), provider, build_registry("create"))
+            events = _collect(_request(), provider, build_registry("create_deep"))
 
         types = [event.type for event in events]
         # 顺序即契约：tool_end 之后、done 之前；分片生成不产生 op 批次，
@@ -964,7 +964,7 @@ class CancelTest(unittest.TestCase):
         """取消必须穿透循环，不能被吞成一次正常结束。"""
         async def scenario():
             provider = ScriptedProvider([asyncio.CancelledError()])
-            async for _ in run(_request(), provider=provider, tools=build_registry("create")):
+            async for _ in run(_request(), provider=provider, tools=build_registry("create_deep")):
                 pass
 
         with self.assertRaises(asyncio.CancelledError):

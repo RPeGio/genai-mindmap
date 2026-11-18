@@ -305,7 +305,7 @@ def _generate(request: AgentRunRequest):
         diagram_source=intent.source, diagram_stripped=intent.stripped,
     )
     registry = build_registry(
-        "create", has_library=False, diagram_type=request.diagram_type)
+        "create_deep", has_library=False, diagram_type=request.diagram_type)
     systems: list[str] = []
     with patch("app.agent.tools.chat_async", new=_stub(systems)):
         result = asyncio.run(registry.execute(

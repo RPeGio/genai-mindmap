@@ -108,7 +108,7 @@ def _install(monkeypatch, *, search, chat, whole=None, text_search=None) -> None
 
 
 def _execute(ctx: RunContext, branches: int = BRANCHES):
-    registry = build_registry("create", has_sources=True)
+    registry = build_registry("create_deep", has_sources=True)
     return asyncio.run(registry.execute(
         ToolCall(call_id="c-pipeline", name="mindmap_generate_deep",
                  arguments={"topic": "管理办法", "branches": branches,

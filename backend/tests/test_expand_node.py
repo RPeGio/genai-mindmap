@@ -464,7 +464,7 @@ def test_first_generation_marks_its_leaves_expandable():
 
     ctx = _ctx(intent="create", selected=[])
     with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-        result = _run(build_registry("create").execute(
+        result = _run(build_registry("create_deep").execute(
             _call("mindmap_generate_deep", topic="测试方案", branches=3,
                   points_per_branch=2, max_depth=3), ctx))
 
@@ -500,7 +500,7 @@ def test_quota_truncated_branch_is_unknown_not_no():
     # 骨架 1 次 + 只能再展开 1 支 → 另外两支从没被问过
     ctx = _ctx(intent="create", selected=[], max_model_calls=2)
     with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-        result = _run(build_registry("create").execute(
+        result = _run(build_registry("create_deep").execute(
             _call("mindmap_generate_deep", topic="测试方案", branches=3,
                   points_per_branch=2, max_depth=3), ctx))
 

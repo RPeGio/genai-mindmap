@@ -137,7 +137,7 @@ def _generate_once(ctx: RunContext) -> Any:
         return await _deep_chat(system, user)
 
     with patch.object(agent_tools, "chat_async", chat):
-        return _run(agent_tools.build_registry("create").execute(
+        return _run(agent_tools.build_registry("create_deep").execute(
             ToolCall(call_id="c-gen", name="mindmap_generate_deep",
                      arguments={"topic": TOPIC, "branches": 3,
                                 "points_per_branch": 2, "max_depth": 2}), ctx))
@@ -276,7 +276,7 @@ def _drain_with_stamps(monkeypatch, search: Any, *, external_on: bool = True) ->
         _CLOCK["origin"] = time.monotonic()
         with patch.object(agent_tools, "chat_async", chat):
             async for event in run(request, provider=provider,
-                                   tools=agent_tools.build_registry("create")):
+                                   tools=agent_tools.build_registry("create_deep")):
                 stamps.append((event.type, getattr(event, "stage", ""),
                                time.monotonic() - _CLOCK["origin"], event))
         return stamps
@@ -363,7 +363,7 @@ def test_no_frames_when_external_search_is_off(monkeypatch):
     assert [stamp[3] for stamp in stamps if stamp[1] == "external_search"] == []
 
 
-@pytest.mark.parametrize("intent", ["create"])
+@pytest.mark.parametrize("intent", ["create_deep"])
 def test_stage_frames_do_not_leak_into_tool_result(monkeypatch, intent):
     """进度信号只走事件通道，不进 `ToolResult.data`：契约里没有它的位置。"""
     monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")

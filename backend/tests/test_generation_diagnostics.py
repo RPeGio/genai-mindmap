@@ -133,7 +133,7 @@ def _run(ctx: RunContext, chat, *, arguments: dict | None = None):
     args = {"topic": TOPIC, "branches": len(BRANCHES), "points_per_branch": 2,
             "max_depth": 2}
     args |= arguments or {}
-    registry = build_registry("create", has_sources=True, has_library=False)
+    registry = build_registry("create_deep", has_sources=True, has_library=False)
     with patch("app.agent.tools.chat_async", new=chat):
         return asyncio.run(registry.execute(
             ToolCall(call_id="c-deep", name="mindmap_generate_deep", arguments=args),
@@ -415,7 +415,7 @@ def test_nli_does_not_block_the_event_loop(monkeypatch):
                 last = now
 
         beat = asyncio.create_task(ticker())
-        registry = build_registry("create", has_sources=True, has_library=False)
+        registry = build_registry("create_deep", has_sources=True, has_library=False)
         try:
             with patch("app.optimization.nli.available", return_value=True), \
                     patch("app.optimization.nli.judge", new=slow_judge), \

@@ -307,7 +307,7 @@ def _generate_with_icons() -> MindMapContent:
         return {"points": ["要点一", "要点二"]}
 
     with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-        result = asyncio.run(build_registry("create").execute(
+        result = asyncio.run(build_registry("create_deep").execute(
             ToolCall(call_id="c-gen", name="mindmap_generate_deep", arguments={
                 "topic": "机器学习", "branches": 3, "points_per_branch": 2}), ctx))
 
@@ -517,6 +517,34 @@ def _frames(text: str) -> list[dict]:
     return out
 
 
+def _branches_in(user: str) -> list[str]:
+    """从生成那一次的 user 消息里取出骨架清单（`1. 甲` 这样的行）。"""
+    marker = "不要增删改名）：\n"
+    if marker not in user:
+        return []
+    titles: list[str] = []
+    for line in user.split(marker, 1)[1].splitlines():
+        if not line.strip():
+            break
+        head, _, tail = line.partition(". ")
+        if head.isdigit() and tail:
+            titles.append(tail)
+    return titles
+
+
+def _whole_tree(user: str) -> dict:
+    """整树一次生成的替身：按骨架清单造一棵两层的树。"""
+    titles = _branches_in(user)
+    return {"title": "机器学习", "root": {
+        "id": "root", "label": "机器学习", "children": [
+            {"id": f"n{index}", "label": title, "children": [
+                {"id": f"n{index}-1", "label": f"{title}·一", "detail": "一句说明。"},
+                {"id": f"n{index}-2", "label": f"{title}·二", "detail": "另一句说明。"},
+            ]}
+            for index, title in enumerate(titles)
+        ]}}
+
+
 def _acceptance_generate(run_id: str, body: dict[str, Any]) -> dict:
     """跑一次真的生成（模型两层都 mock 掉），返回 done 帧的内容。
 
@@ -534,10 +562,10 @@ def _acceptance_generate(run_id: str, body: dict[str, Any]) -> dict:
             return {"branches": ["人", "机", "料", "法", "环", "测"]}
         if system.startswith(PLAN_PROMPT):
             return {"branches": ["甲", "乙", "丙"]}
-        return {"points": ["要点一", "要点二"]}
+        return _whole_tree(user)
 
     class OneShot:
-        """第一轮发一次 `mindmap_generate_deep`，第二轮收尾。"""
+        """第一轮发一次 `mindmap_generate`，第二轮收尾。"""
 
         def __init__(self) -> None:
             self.rounds = 0
@@ -548,8 +576,8 @@ def _acceptance_generate(run_id: str, body: dict[str, Any]) -> dict:
                 return Completion(message={"role": "assistant", "content": "好了"},
                                   finish_reason="stop")
             call = ToolCall(
-                call_id="c-gen", name="mindmap_generate_deep",
-                arguments={"topic": "机器学习", "branches": 6, "points_per_branch": 2})
+                call_id="c-gen", name="mindmap_generate",
+                arguments={"topic": "机器学习", "branches": 6})
             return Completion(
                 message={"role": "assistant", "content": "生成", "tool_calls": [
                     {"id": call.call_id, "type": "function", "function": {

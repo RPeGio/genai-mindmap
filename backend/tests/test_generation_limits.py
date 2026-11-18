@@ -45,7 +45,7 @@ def _call(name: str, **arguments) -> ToolCall:
 
 def _run(tool: str, arguments: dict, ctx: RunContext):
     with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=_fake)):
-        return asyncio.run(build_registry("create").execute(_call(tool, **arguments), ctx))
+        return asyncio.run(build_registry("create_deep").execute(_call(tool, **arguments), ctx))
 
 
 def _children(*labels: str) -> dict:

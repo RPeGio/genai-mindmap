@@ -110,7 +110,7 @@ def _generate(ctx: RunContext, plan: dict[str, Any] | None = None,
               *, systems: list[str] | None = None, **arguments):
     """按请求里的图型建注册表，然后执行一次生成。工具参数由调用方决定写不写。"""
     registry = build_registry(
-        "create", has_library=False, diagram_type=ctx.request.diagram_type)
+        "create_deep", has_library=False, diagram_type=ctx.request.diagram_type)
     with patch("app.agent.tools.chat_async", new=_stub(plan, systems=systems)):
         return _run(registry.execute(
             _call("mindmap_generate_deep", topic="报销流程", branches=3,
@@ -468,7 +468,7 @@ def test_plan_prompt_composition_rules_hold_per_type(monkeypatch, diagram_type):
     ]
     with_material.sources_by_id = {source.id: source for source in with_material.request.sources}
     result = _run(
-        build_registry("create", has_sources=True, has_library=False,
+        build_registry("create_deep", has_sources=True, has_library=False,
                        diagram_type=diagram_type).execute(
             _call("mindmap_generate_deep", topic="管理办法", branches=3,
                   points_per_branch=2, max_depth=2),

@@ -149,7 +149,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(3, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=5,
                 points_per_branch=3), ctx))
 
@@ -193,7 +193,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(2, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2), ctx))
 
@@ -220,7 +220,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(2, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=8,
                 points_per_branch=2), ctx))
 
@@ -233,7 +233,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         ctx = _ctx()
         mocked = AsyncMock(return_value=_plan("甲", "乙"))
         with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3), ctx))
 
         self.assertFalse(result.ok)
@@ -251,7 +251,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(2, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=4,
                 points_per_branch=2), ctx))
 
@@ -273,7 +273,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(2, title)
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3,
                 points_per_branch=2), ctx))
 
@@ -302,7 +302,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return {"points": ["乙要点二", "乙要点三"]}
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3,
                 points_per_branch=3), ctx))
 
@@ -324,7 +324,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(2, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3,
                 points_per_branch=2), ctx))
 
@@ -345,7 +345,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         ctx.model_calls_used = 1
         mocked = AsyncMock(return_value=_plan("甲", "乙", "丙"))
         with patch("app.agent.tools.chat_async", new=mocked):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x"), ctx))
 
         self.assertFalse(result.ok)
@@ -362,7 +362,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             raise GenerationError("模型服务返回 HTTP 500")
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3), ctx))
 
         self.assertFalse(result.ok)
@@ -386,7 +386,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(3, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=6,
                 points_per_branch=3), ctx))
 
@@ -412,7 +412,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(2, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2), ctx))
 
@@ -440,7 +440,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return {"points": []}  # 补点也没补出来
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3,
                 points_per_branch=3), ctx))
 
@@ -479,7 +479,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return {"points": ["乙要点二", "乙要点三"]}
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3,
                 points_per_branch=3), ctx))
 
@@ -510,7 +510,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return {"points": ["乙要点一", "乙要点一"]}  # 同一要点返回两次
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3,
                 points_per_branch=3), ctx))
 
@@ -541,7 +541,7 @@ class GenerateDeepToolTest(unittest.TestCase):
                 return _points(2, _branch_title(user))
 
             with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-                result = _run(build_registry("create").execute(_call(
+                result = _run(build_registry("create_deep").execute(_call(
                     "mindmap_generate_deep", topic="机器学习", branches=branches,
                     points_per_branch=2), ctx))
 
@@ -576,7 +576,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children_with_grandchildren(title, 3, 2)
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=5,
                 points_per_branch=3, max_depth=3), ctx))
 
@@ -618,7 +618,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children(_subnode_label(user) + "·细节")
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -650,7 +650,7 @@ class GenerateDeepToolTest(unittest.TestCase):
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked, \
                 patch("app.agent.tools._node_limit", return_value=26):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=5,
                 points_per_branch=3, max_depth=3), ctx))
 
@@ -679,7 +679,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children(_subnode_label(user) + "·细节")
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -713,7 +713,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children(_subnode_label(user) + "·细节")
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -755,7 +755,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children(_subnode_label(user) + "·细节")
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -786,7 +786,7 @@ class GenerateDeepToolTest(unittest.TestCase):
                 return _children(_subnode_label(user) + "·细节")
 
             with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-                result = _run(build_registry("create").execute(_call(
+                result = _run(build_registry("create_deep").execute(_call(
                     "mindmap_generate_deep", topic="机器学习", branches=3,
                     points_per_branch=2, max_depth=max_depth), ctx))
 
@@ -819,7 +819,7 @@ class GenerateDeepToolTest(unittest.TestCase):
                 return _children(_subnode_label(user) + "·细节")
 
             with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-                result = _run(build_registry("create").execute(_call(
+                result = _run(build_registry("create_deep").execute(_call(
                     "mindmap_generate_deep", topic="机器学习", branches=3,
                     points_per_branch=2, max_depth=requested), ctx))
 
@@ -843,7 +843,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children_with_grandchildren(title, 3, 2)
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=3, max_depth=2), ctx))
 
@@ -874,7 +874,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return {"children": []}
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -919,7 +919,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children(_subnode_label(user) + "·细节")
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -949,7 +949,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _flagged((f"{title}一", False), (f"{title}二", False))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -983,7 +983,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _children(_subnode_label(user) + "·细节")
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -1009,7 +1009,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _points(2, _branch_title(user))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -1039,7 +1039,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _flagged((_subnode_label(user) + "·细节", True))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=3), ctx))
 
@@ -1063,7 +1063,7 @@ class GenerateDeepToolTest(unittest.TestCase):
             return _flagged((f"{title}一", False), (f"{title}二", False))
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)) as mocked:
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2, max_depth=4), ctx))
 
@@ -1338,7 +1338,7 @@ class DeepBudgetFloorTest(unittest.TestCase):
         ctx = _ctx(intent="create", max_model_calls=2)
         titles = {"branches": ["一", "二", "三", "四", "五"]}
         with patch("app.agent.tools.chat_async", new=AsyncMock(return_value=titles)):
-            result = _run(build_registry("create").execute(
+            result = _run(build_registry("create_deep").execute(
                 _call("mindmap_generate_deep", topic="主题", branches=5), ctx))
         self.assertTrue(result.ok)
         self.assertTrue(result.data.get("partial"))
@@ -1348,7 +1348,7 @@ class DeepBudgetFloorTest(unittest.TestCase):
 class RegistryTest(unittest.TestCase):
     def test_create_intent_offers_only_the_sliced_generator(self):
         """create 下只有一个生成工具：形态已经不存在，没有第二个选项可选。"""
-        self.assertEqual(build_registry("create").names(), ["mindmap_generate_deep"])
+        self.assertEqual(build_registry("create_deep").names(), ["mindmap_generate_deep"])
 
     def test_sources_do_not_change_the_create_registry(self):
         """带材料与不带材料给出同一个生成工具。
@@ -1358,11 +1358,11 @@ class RegistryTest(unittest.TestCase):
         不该因此换掉工具。
         """
         self.assertEqual(
-            build_registry("create", has_sources=True).names(),
+            build_registry("create_deep", has_sources=True).names(),
             ["mindmap_generate_deep"],
         )
         self.assertEqual(
-            build_registry("create", has_sources=False).names(),
+            build_registry("create_deep", has_sources=False).names(),
             ["mindmap_generate_deep"],
         )
 
@@ -1407,7 +1407,7 @@ class RegistryTest(unittest.TestCase):
         self.assertNotIn("rag_query", build_registry("edit").names())
 
     def test_unknown_tool_lists_available(self):
-        result = _run(build_registry("create").execute(_call("generate_mindmap", topic="x"), _ctx()))
+        result = _run(build_registry("create_deep").execute(_call("generate_mindmap", topic="x"), _ctx()))
         self.assertFalse(result.ok)
         self.assertEqual(result.data["code"], "unknown_tool")
         self.assertIn("mindmap_generate", result.content)
@@ -1442,7 +1442,7 @@ class BranchVisualsTest(unittest.TestCase):
             ]}
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-            result = _run(build_registry("create").execute(_call(
+            result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="机器学习", branches=3,
                 points_per_branch=2), ctx))
 

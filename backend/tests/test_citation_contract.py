@@ -289,7 +289,7 @@ def _run_deep(titles: tuple[str, ...], *, max_model_calls: int = 30):
         title = user.split("本条一级分支：", 1)[1].split("\n", 1)[0]
         return _expansion(title)
 
-    registry = build_registry("create", has_sources=True)
+    registry = build_registry("create_deep", has_sources=True)
     with patch("app.agent.tools.search_parent", new=spy), \
             patch("app.agent.tools.chat_async", new=chat):
         result = asyncio.run(registry.execute(
@@ -358,7 +358,7 @@ def test_supplementary_retrieval_never_touches_tool_calls():
             return {"branches": list(titles)}
         return _expansion(user.split("本条一级分支：", 1)[1].split("\n", 1)[0])
 
-    registry = build_registry("create", has_sources=True)
+    registry = build_registry("create_deep", has_sources=True)
 
     class CountingRegistry:
         """只数工具调用次数，其余原样转发。"""

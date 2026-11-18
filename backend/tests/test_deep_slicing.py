@@ -143,7 +143,7 @@ def _run_deep(ctx: RunContext, chat, *, registry_with_sources: bool = True, **ar
     """
     args = {"topic": "管理办法", "branches": 3, "points_per_branch": 2}
     args.update(arguments)
-    registry = build_registry("create", has_sources=registry_with_sources)
+    registry = build_registry("create_deep", has_sources=registry_with_sources)
     with patch("app.agent.tools.chat_async", new=chat):
         return asyncio.run(registry.execute(
             ToolCall(call_id="c-deep", name="mindmap_generate_deep", arguments=args),
@@ -450,13 +450,12 @@ def test_branch_retrieval_does_not_consume_tool_calls():
     """跑一次真正的 agent 循环：`tool_calls` 计数必须是 1，不是 1+N。
 
     检索发生在工具内部，是服务端自己的并发检索——模型看到的仍然只是一次
-    `mindmap_generate_deep` 调用。这条如果退化（比如把检索做成 N 个独立工具），
+    `mindmap_generate` 调用。这条如果退化（比如把检索做成 N 个独立工具），
     工具调用数会变成 1+N 并随分支数线性增长，几十支的图上迟早撞上
     `max_tool_calls`（默认 50），而且撞在"刚生成完骨架"的位置上。
     """
-    deep_call = ToolCall(call_id="deep-1", name="mindmap_generate_deep",
-                         arguments={"topic": "管理办法", "branches": 3,
-                                    "points_per_branch": 2})
+    deep_call = ToolCall(call_id="deep-1", name="mindmap_generate",
+                         arguments={"topic": "管理办法", "branches": 3})
 
     class Provider:
         def __init__(self) -> None:
@@ -480,15 +479,29 @@ def test_branch_retrieval_does_not_consume_tool_calls():
                               usage={"prompt_tokens": 1, "completion_tokens": 1,
                                      "total_tokens": 2})
 
+    async def whole_tree(system: str, user: str, *, max_tokens=None,
+                         on_delta=None) -> dict:
+        """一次生成那条路的替身：骨架三条，一次写出整棵树（不看证据）。"""
+        if system.startswith(PLAN_PROMPT):
+            return _plan(*BRANCHES)
+        return {"title": "管理办法", "root": {
+            "id": "root", "label": "管理办法", "children": [
+                {"id": f"branch{index}", "label": title, "children": [
+                    {"id": f"branch{index}-1", "label": f"{title}·一", "detail": "说明。"},
+                    {"id": f"branch{index}-2", "label": f"{title}·二", "detail": "说明。"},
+                ]}
+                for index, title in enumerate(BRANCHES)
+            ]}}
+
     async def drain():
         return [event async for event in run(_ctx().request, provider=Provider())]
 
-    with patch("app.agent.tools.chat_async", new=_plain_chat):
+    with patch("app.agent.tools.chat_async", new=whole_tree):
         events = asyncio.run(drain())
 
     tool_ends = [event for event in events if event.type == "tool_end"]
     assert len(tool_ends) == 1, [event.type for event in events]
-    assert tool_ends[0].name == "mindmap_generate_deep"
+    assert tool_ends[0].name == "mindmap_generate"
     assert tool_ends[0].ok, tool_ends[0].result_summary
     # 检索确实跑过（不是"因为没跑所以没占额度"）
     assert tool_ends[0].result_summary["retrieval"]["mode"] == "branch"

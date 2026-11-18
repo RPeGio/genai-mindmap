@@ -46,7 +46,7 @@ cd frontend && npm run dev
 
 ## 约定（每条都对应一次真实 bug，别删"为什么"）
 
-- **改一个能力的入口，要检查所有会走到它的路径。** 生成侧现在只有一条入口（`_generate_deep`），但它同时承担四件事：材料准备（短材料退化）、外部检索、按支检索、合并验收。上任那个横切开关（`MINDMAP_SOURCE_MODE`）已删除（`docs/ONE-PATH.md`），别再按"两种形态"的旧心智改提示词——历史上四次"只改了两三条路径"，单点测试全绿而链路是断的。
+- **改一个能力的入口，要检查所有会走到它的路径。** 生成侧现在有**两条**实现、一条注册：`mindmap_generate`（`create` 唯一注册的生成路：骨架一次 → 每支检索一次 → 内容一次写完）与 `mindmap_generate_deep`（分片，代码与规格都在，但**不注册到 `create`**，服务的是"一次响应写不下 200+ 节点"的大图，见 `_generate_deep_spec`）。两条共用材料准备（`_intake`：短材料退化 + 外部检索）、骨架（`_skeleton_outline` / `_plan_ask`）与按支检索（`_retrieve_branches`）——**改这几处等于同时改两条路**，只改一条会得到一个"看起来都能跑、实际行为分叉"的入口。上任那个横切开关（`MINDMAP_SOURCE_MODE`）已删除（`docs/ONE-PATH.md`），别再按"两种形态"的旧心智改提示词——历史上四次"只改了两三条路径"，单点测试全绿而链路是断的。这次回到一次生成的理由与实测（含 detail 变短这个已知代价）见 `docs/ONE-CALL.md`。
 - **父块坐标只认区间全等去重。** `_near_duplicate` / `_pick_ordered` 是为"同一份证据被切成两块"设计的，只能用于**块坐标**；父块之间的重叠来自切块器的句首吸附，套重叠率判据会把两个不同父块判成重复、静默吞掉一条（父块坐标用 `_dedupe_exact`）。
 - **保底席位的口径必须跨过 rerank。** `_reserve_seats` 按交付口径（`top_k`）算，不是候选池口径（`depth`）。`_rerank_top(reserve=...)` 就是这件事的兑现点，漏了它扩池等于把交付口径偷换成池口径。
 - **改一个开关后，关掉时必须与上一个提交逐字节一致。** 用旧模块对比（`git show <commit>:path` 载入旧模块跑同一批输入），不是"测试还绿"——测试可能只覆盖一半：`test_short_parents_are_not_deduped` 早年只测 `library=False`，库分支的 bug 因此活了很久。

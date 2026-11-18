@@ -3,10 +3,13 @@
 注册表只负责分派与参数校验，业务逻辑在各个 `_xxx` 函数里。
 
 四个工具的划分照「用户意图 + 作用域」而不是 CRUD 动词：
-- `mindmap_generate_deep` 只在没有导图时可用，拆成「骨架 → 并发展开 → 验收 →
-  局部重试」四段（理由见该函数的 docstring）。它是**唯一**的生成路：有材料时
-  分片 + 按支检索实测 30.5%，而整树一次成型只能靠一次 top_k=5 的预检索，
-  实测 5.1%（`docs/ONE-PATH.md`、`docs/RAG-DECISIONS.md` 第 5 节）
+- `mindmap_generate` 只在没有导图时可用：**骨架一次 → 每支检索一次 → 内容一次
+  写完**（理由与该改动的三条实测依据见该函数的 docstring）。它是 `create` 唯一
+  注册的生成路
+- `mindmap_generate_deep` 是分片生成（骨架 → 并发展开 → 验收 → 局部重试）。
+  **代码与规格都在，但不注册到 `create`**：它服务的是"一次响应写不下 200+ 节点"
+  的大图，70 余个既有用例钉着它的行为，需要时把名字加回 `_ALLOWED_BY_INTENT`
+  即可（定位见 `_generate_deep_spec` 的 docstring）
 - `node_expand` 只能在已选中的节点下加子节点，不能删、不能移
 - `rag_query` 只读，查本次请求带来的来源**与知识库**（`library=True`，默认开；
   库命中的 `source_id` 是持久 id，收尾校验前要用 `library.load()` 取回原文）
@@ -15,8 +18,9 @@
   的理由是"模型以为自己写完了"——`expand` 意图下没有代码替它数，而它看到的大纲
   只列前 200 个节点（口径见该工具的 docstring）
 
-`create` 只剩这一条生成路：整树一次成型的 `mindmap_generate` 已随
-`MINDMAP_SOURCE_MODE=full` 形态一起删除（决策与代价见 `docs/ONE-PATH.md`）。
+`create` 只剩一条注册的生成路（整树一次生成）：它保留分片那条路的检索质量
+（骨架定好之后每支各检索一次、证据按支分组一次给），又不付 1+N 次调用与跨支
+重复的代价（决策与实测见 `docs/ONE-PATH.md`）。
 
 这样切是为了把「改错地方」的风险压到协议层：`node_expand` 的入参里没有
 `parent_id` 的自由度（只能是你当前选中的那个），模型想乱挂也挂不了。
@@ -76,6 +80,7 @@ from app.generation.service import (
     CONTENT_FREEDOM_CONTRACT,
     CONTEXT_TOKEN_LIMIT,
     DETAIL_NO_SOURCE_RULES,
+    DETAIL_PROMPT,
     EXTERNAL_TRUST_RULES,
     MIN_BRANCHES,
     GenerationError,
@@ -83,7 +88,9 @@ from app.generation.service import (
     estimate_input_tokens,
     max_tokens_cap,
     thinking_block,
+    validate_generated_content,
 )
+from app.generation.stream_partial import collect_new_nodes, parse_partial
 from app.knowledge import external as external_knowledge
 from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
@@ -552,6 +559,32 @@ class GenerateDeepArgs(BaseModel):
     )
 
 
+class GenerateArgs(BaseModel):
+    """整树一次生成的入参。
+
+    比 `GenerateDeepArgs` 少了三个字段，少的每一个都是"分片才需要"的旋钮：
+
+      - `points_per_branch` —— 分片按支分配额度用；整树没有"每支一次调用"，
+        内容多少由一次响应里的树自己决定；
+      - `max_depth` —— 分片的递归深度预算；整树的层数由 `DETAIL_PROMPT` 里的
+        初次规模（`INITIAL_MAX_DEPTH`，root 之下 3 层）约束，不另开旋钮；
+      - `fanout`（由 `points_per_branch` 推）—— 同上。
+
+    留着它们会让模型以为"这次可以要求每支 5 个要点"，而整树路径根本没有那个
+    分配器，填了也不生效——一个永远填了没用的参数比没有这个参数更糟。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
+    # 与 `GenerateDeepArgs.branches` 同一个区间：它同时是**要求**和**上限**
+    # （骨架给多了会被截到 `DEEP_MAX_BRANCHES`）。
+    branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
+    diagram_type: Literal["tree", "flowchart", "fishbone"] = Field(
+        default="tree",
+        description="图型：tree 思维导图（默认）/ flowchart 流程图（可带附加边）/ fishbone 鱼骨图",
+    )
+
+
 class ExpandArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     node_id: str = Field(min_length=1, max_length=100, description="要展开的节点 id，取自当前大纲")
@@ -919,7 +952,7 @@ def _nodes_per_call(ctx: RunContext, *, system: str = "") -> int:
 
 def _require_candidate(ctx: RunContext) -> MindMapContent | ToolResult:
     if ctx.candidate is None:
-        return _fail("no_candidate", "当前还没有导图，请先调用 mindmap_generate_deep 生成。")
+        return _fail("no_candidate", "当前还没有导图，请先调用 mindmap_generate 生成。")
     return ctx.candidate
 
 
@@ -1676,6 +1709,65 @@ class _GrowStream:
             await self._report(own, position, child)
 
 
+@dataclass
+class _GenerateGrowStream:
+    """整树响应的增量上报器：响应里自带节点 id，要换成预览协议里的父索引链。
+
+    与 `_GrowStream` 并列而不是合并：那个认的是"一次只写一层"的
+    `{"children":[...]}`（`stream_items.closed_items`），这个认的是整棵树
+    （`{"root":{...}}`，`generation.stream_partial`）。两套提取器对应两种响应
+    形状，合起来会得到一个要判"这次是哪种形状"的分支——而形状由调用方决定，
+    不是由文本决定。
+
+    `path_of` / `child_counts` 是"节点 id → 它在树里的子索引链 / 已经报了几个
+    孩子"。之所以要自己记：预览协议的 `path` 是**父节点的索引链**，而整树响应里
+    只给了父 id，索引要按出现顺序现数。
+
+    `pending` 处理增量提取的顺序异常：先拿到孩子、后拿到父亲时，孩子先存着，
+    等父亲报出去之后再补报。直接跳过的话，那几个孩子在此后的 delta 里再也不会
+    出现（提取器已经把它们记进 `seen` 了）。
+
+    通道为 None 时这个类根本不会被创建（`_generate` 里判过一次），所以这里不判空。
+    """
+
+    ctx: RunContext
+    buffer: str = ""
+    seen: dict[str, str] = field(default_factory=dict)
+    reported: set[tuple[tuple[int, ...] | None, str]] = field(default_factory=set)
+    path_of: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    child_counts: dict[str, int] = field(default_factory=dict)
+    pending: dict[str, list[dict]] = field(default_factory=dict)
+
+    async def feed(self, delta: str) -> None:
+        self.buffer += delta
+        obj = parse_partial(self.buffer)
+        if obj is None:
+            return
+        for parent_id, node in collect_new_nodes(obj, self.seen, self.buffer):
+            await self._report(parent_id, node)
+
+    async def _report(self, parent_id: str | None, node: dict) -> None:
+        if parent_id is not None and parent_id not in self.path_of:
+            # 增量提取顺序异常时可能先拿到孩子；提取器已记住孩子的 id，
+            # 这里若直接跳过，后续 delta 就再也不会返回这些孩子。
+            self.pending.setdefault(parent_id, []).append(node)
+            return
+
+        path: tuple[int, ...] | None = None
+        own: tuple[int, ...] = ()
+        if parent_id is not None:
+            path = self.path_of[parent_id]
+            index = self.child_counts.get(parent_id, 0)
+            self.child_counts[parent_id] = index + 1
+            own = (*path, index)
+
+        # 整树提取器只保留 id/label，不能把它补出的空 children 当作不可展开。
+        await _emit_grow(self.ctx, self.reported, path, node["label"].strip()[:200], None)
+        self.path_of[node["id"]] = own
+        for child in self.pending.pop(node["id"], []):
+            await self._report(node["id"], child)
+
+
 def _audit_branches(
     content: MindMapContent, minimum: int,
 ) -> tuple[list[tuple[int, str, str, int]], list[str]]:
@@ -2167,6 +2259,66 @@ BRANCH_NO_EVIDENCE_RULES = (
 )
 
 
+# ---------------------------------------------------------------- 整树一次生成
+#
+# `_generate` 与 `_generate_deep` 的区别只有**生成的调用次数**：骨架、检索、
+# 收尾校验三件事是同一套（`_intake` / `_skeleton_*` / `_retrieve_branches`）。
+# 所以下面这几段只描述"这一次的一级分支已经由上一次调用定好了"，不复述树规则
+# ——树规则在 `DETAIL_PROMPT` 里，只此一份。
+
+# 骨架必须出现在**生成**那一次的 user 消息里。不写这一句时模型会按
+# `DETAIL_PROMPT` 自己的"3-6 条一级分支"重排一遍：骨架那次调用的产物（分支名、
+# 颜色、flowchart 的 edges 端点）在树上找不到对应节点，等于那一整次调用白花，
+# 而用户看到的是"我选的 8 条变成了 5 条"。
+#
+# "不要重复其他分支"这一条**代码兜不住**（跨支重复只能靠模型自己看全局），
+# 这也正是整树一次生成相对分片的结构优势：分片展开时每一支只看得到自己那条
+# 标题链，兄弟支写了什么它不知道（`PLAN_PROMPT` 里那句"彼此覆盖的范围不重叠"
+# 模型并不听）；这里全部骨架与全部证据在同一次响应里，它至少有可能看住。
+SKELETON_TREE_RULES = (
+    "\n这次的一级分支已经定好了，就是 user 消息里列出的那几条："
+    "根节点下必须恰好是这几条，顺序、名称都不改，不增不减。"
+    "每条分支只写它标题说的范围，同一件事不要挂在两条分支下——"
+    "重复的内容会被画成两块，用户还要自己删一个。"
+    # 下面这两句是这条路**唯一的质量风险**的补丁：一次写几十个节点时，模型会在
+    # 后面几支上开始节约。**实测它没有效果**（deepseek-chat：加之前 detail 平均
+    # 45/28 字，加之后 28.5/26.2 字，同一水平）——瓶颈不是提示词，是一次输出里要塞
+    # 几十段说明（数字与两条路的对比见 `docs/ONE-CALL.md`）。留着是因为它把要求写成
+    # 了可数的数字，换模型或换输出预算时可能有用；真要把 detail 拿回来，得加一段
+    # 只写说明的调用，那是另一件事。
+    "\n每个节点的 detail 写满 2–3 句、**不少于 60 字**的具体说明（是什么、怎么做、"
+    "有什么条件或数字）；不要只写一句短语，也不要用「简要说明」「详见教材」这类"
+    "占位话。这一次要在一份响应里写完所有分支，写到后面容易越写越短——"
+    "输出之前回头看一眼前面几支的详细程度，保持一样。\n"
+)
+
+# 有证据时拼在 `DETAIL_PROMPT` 之后的那一段。与 `BRANCH_EVIDENCE_RULES` 是同一份
+# 引用契约的两种投递方式：那边每支一个数组（只给一支看），这边按分支分组一次给
+# 全部。字段形状必须说到与那边一致，否则同一个模型在两条路上的引用写法会分叉。
+#
+# 为什么要求"只能引用本组"：证据全在这一次响应里，模型从第 3 支抄一句挂到第 5 支
+# 的节点上不会被任何代码拦住（`verify_source_refs` 只看"这句在不在原文里"，
+# 不看"它属于哪一支"）。分组是提示词层唯一的约束，所以必须明写。
+BRANCHED_EVIDENCE_RULES = (
+    "\n本次已经**按一级分支各做过一次检索**，结果按分支分组附在 user 消息末尾"
+    "（每组一个 evidence 数组，与 rag_query 的返回同形，组标题写明它属于哪一支）。"
+    "写某一支的内容时，出处只能从**那一组**里抄；不要跨组引用，"
+    "也不要把一组里的句子挂到另一支的节点上。"
+    '引用写在节点自己的 source_refs 数组里，例如 {"source_id":"…","start":0,'
+    '"end":12,"quote":"…"}；source_refs 与 label、detail 平级，不要写进 detail。'
+    "优先用 evidence_* 那一组：start、end、quote 分别取 evidence_start、"
+    "evidence_end、evidence_quote 的值；没有 evidence_* 时只抄 quote 里连续的"
+    "一段（不超过 300 字），这时不要写 start 和 end。"
+    "引文逐字照抄，不要改写、不要概括、不要自己算偏移，也不要写 page。"
+    "自己补的内容 source_refs 给空数组——不挂引用是对的，编造不是。\n"
+)
+
+# 分组渲染的表头。为什么带序号与标题：`evidence` 是裸 JSON 数组，同一次响应里有
+# 八组、每组形状一样，不带归属的话模型无法知道哪一条命中对应哪一支（这正是分片
+# 那条路不需要、而整树这条路必须解决的问题）。
+EVIDENCE_SECTION_HEADER = "第 {index} 支「{title}」的检索结果（evidence 数组）："
+
+
 @dataclass(frozen=True)
 class _ExternalFetch:
     """一次外部检索的产物。
@@ -2594,6 +2746,659 @@ def _needs_supplementary(raw: Any, slots: list[_Slot]) -> bool:
     return _slot_ref_count(slots) == 0
 
 
+@dataclass(frozen=True)
+class _Intake:
+    """生成前那三段材料处理的产物。两个生成工具共用同一份实现。
+
+    `sources` 是**这次真正可以检索的来源**：空正文的已滤掉、太短的已被换成
+    `short_material`、没有材料时由外部检索补上。
+
+    `hint_block` 与 `short_material` 是同一件事的两个面向：太短的材料不当语料
+    （它切不出可区分的检索单元，只会产生落不到段落的假依据），但**用户写的东西
+    一个字都不丢**——它以"主题补充说明"的身份进 prompt，并明确要求不要从它里面
+    挑引用。
+
+    `external` 为 None 表示这次没走外部检索（有材料，或开关关着）。它同时决定
+    `data` 里有没有那个键——开关关着时的键集必须与加这个能力之前逐字节相同。
+    """
+
+    sources: list[Source]
+    short_material: list[Source]
+    material_chars: int
+    hint_block: str
+    external: _ExternalFetch | None
+
+
+async def _intake(topic: str, ctx: RunContext) -> _Intake:
+    """材料入口三段：只喂有正文的来源、短材料退化、没有材料时先做外部检索。
+
+    这三段原来长在 `_generate` 里，整树生成删掉之后搬进 `_generate_deep`；现在
+    两个生成工具都在，再搬一次不如抽成一份——两处各写一遍的话，"材料太短"的
+    阈值与"外部检索什么时候发"迟早会有一个分支先改。
+
+    空正文的来源不参与（`status` 是给界面看的，能检索的只有 `text`）；不滤的话，
+    一个还没解析成功的空来源会让检索与 `source_usage` 各自撞上一次空正文。
+
+    **不改 `ctx.request.sources`**：材料是用户给的，界面上还要显示它、它还在收尾
+    校验的可查来源里（`_verify_sources`）。被改掉的只是"这次喂给模型什么"。
+
+    外部检索排在额度预探**之后**（调用方先判额度再调这里）：额度已经用光时，
+    白等一次 6 秒的外网往返没有意义。
+    """
+    picked = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
+    material_chars = sum(len((source.text or "").strip()) for source in picked)
+    short_material = picked if 0 < material_chars < SHORT_MATERIAL_CHARS else []
+    sources = [] if short_material else picked
+    hint_block = ""
+    if short_material:
+        hint_block = (
+            "\n\n用户还附了这段文字（{chars} 字，太短，不足以作为可检索的材料，"
+            "只当作主题的补充说明，不要从它里面挑句子当引用）：\n{hint}"
+        ).format(chars=material_chars,
+                 hint=" ".join((source.text or "").strip() for source in short_material))
+    external: _ExternalFetch | None = None
+    if not sources and external_knowledge_enabled():
+        # 检索期间界面上什么都不动，看起来像卡死（实测中位 4.3 秒、最坏 20 秒）。
+        # 一帧"开始"、一帧"结束"，结束帧**一定带 count**（包括 0）：前端靠
+        # "有没有这个字段"区分开始与结束，`0` 与"还没结束"必须分得开。
+        await _emit_stage(ctx, EXTERNAL_SEARCH_STAGE, "正在检索外部资料…")
+        external = await _external_sources(_external_query(topic, short_material), ctx)
+        await _emit_stage(
+            ctx, EXTERNAL_SEARCH_STAGE, _external_stage_text(external),
+            count=len(external.sources),
+        )
+        sources = external.sources
+    return _Intake(sources, short_material, material_chars, hint_block, external)
+
+
+def _apply_skeleton(
+    content: MindMapContent, branches: Sequence[_SkeletonBranch], raw_plan: Any,
+    *, diagram_type: str,
+) -> tuple[MindMapContent, list[Diagnostic]]:
+    """把**骨架那一次**的产物（颜色 / 图标 / flowchart 的附加边）套到生成出来的树上。
+
+    两件产物都来自骨架响应，而树来自生成响应，两者唯一的共同坐标是"第几支"。
+    匹配按 label 优先、序号兜底：名字完全一致时按名字更安全（模型可能真的换了
+    顺序），名字被改写了一个字（加了"的"、少了括号）时序号还能把它对回去。
+
+    为什么必须做这一步：骨架每次调用都会给出（或由 `_fill_branch_colors` 补出）
+    一级分支的颜色，而生成响应里不含这个字段。不套的话，"一级分支一个颜色、
+    后代继承"这个唯一的分组信号整张图都没有——用户看到一片中性灰，看不出哪几块
+    是同一支。边同理：流程图的条件分支与回退线全在骨架响应里。
+
+    端点用**裁剪后**的真实 id 建表：`_skeleton_edges` 认得序号 / "root" / 标题，
+    而 `clean_edges` 要把指向已裁剪节点的边整条丢掉——拿裁剪前的表建就丢不掉。
+    """
+    children = list(content.root.children)
+    by_label = {branch.label: branch for branch in branches}
+    applied: list[Node] = []
+    for index, child in enumerate(children):
+        branch = by_label.get(child.label) or (
+            branches[index] if index < len(branches) else None)
+        if branch is None or (branch.color is None and branch.icon is None):
+            applied.append(child)
+            continue
+        # 模型自己写的 color/icon 优先：骨架是"该长什么样"的建议，而生成响应里
+        # 若它显式给了一个，那个才是它对这一支的最终判断。
+        applied.append(child.model_copy(update={
+            "color": child.color or branch.color,
+            "icon": child.icon or branch.icon,
+        }))
+    if applied != children:
+        content = content.model_copy(
+            update={"root": content.root.model_copy(update={"children": applied})})
+    if diagram_type != "flowchart" or not applied:
+        return content, []
+    skeleton = [(child.label, child.id) for child in applied]
+    skeleton_ids = {content.root.id} | {child.id for child in applied}
+    edges, edge_diagnostics = clean_edges(
+        _skeleton_edges(raw_plan, skeleton, content.root.id), skeleton_ids)
+    if edges:
+        content = content.model_copy(update={"edges": edges})
+    return content, edge_diagnostics
+
+
+def _raw_ref_count(raw: Any) -> int:
+    """模型**声明**了几条引用（逐字校验之前）。
+
+    与校验之后数一次配对用：只报"最后剩下 0 条"会把"它没写"与"写了但全被剔除"
+    压成同一句话，而这两件事对用户的下一步完全不同（前者是提示词没被遵守，
+    后者是引文抄错了）。
+    """
+    stack = [raw.get("root") if isinstance(raw, dict) else None]
+    total = 0
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        refs = node.get("source_refs")
+        if isinstance(refs, list):
+            total += len(refs)
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(children)
+    return total
+
+
+async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
+    """整树一次生成：**骨架一次、每支检索一次、内容一次写完**。
+
+    接线（三段，前两段与 `_generate_deep` 完全共用）：
+
+      1. 骨架：`_intake` 定材料 → `_skeleton_outline` 给目录（覆盖率 ≥60% 才给）
+         → `_plan_ask` 让模型定一级分支。有材料却没目录时也是这一步定骨架，所以
+         "有材料 / 无材料"两条路在这里合流，差别只有 prompt 里那几句引用规则。
+      2. 证据：`_retrieve_branches` 每支各检索一次（第一支先行预热块向量，其余
+         并行）。命中按分支分组渲染进 user 消息，**带分支归属**——这是与旧版
+         整树生成最大的差别：旧版只做一次主题级 top_k=5 预检索，实测对 14,120 字
+         材料的覆盖率 5.1%，而按支检索是 30.5%（`docs/RAG-DECISIONS.md` 第 5 节）。
+      3. 生成：一次 `chat_async`，骨架 + 全部命中一起给。
+
+    **为什么回到一次生成**（三条实测依据，缺一条这个改动就站不住）：
+
+      - 真实用法 100% 是无材料：`runs` 里 16 次运行 `sources` 全是 0 份。
+      - 分片的覆盖率优势需要材料才成立（30.5% vs 5.1%）；没有材料时分片付了
+        全部代价（1+N 次调用、三十秒）拿到零收益。
+      - 分片有结构性缺陷：**跨支重复**。每支展开时只看到自己那条标题链，兄弟支
+        写了什么它不知道，`PLAN_PROMPT` 里"彼此覆盖的范围不重叠"模型并不听
+        （实测那张 56 节点的图里，「无监督学习：无标注找结构」在两条不同的
+        分支下一字不差出现了两次）。一次生成时全部骨架在同一份响应里，模型至少
+        有可能看住全局。
+
+    **最大风险是 detail 质量**：一次写几十个节点，模型可能开始糊弄（"简要说明"
+    "详见教材"）。所以这条路的规格与分片对齐而不是放宽：`DETAIL_PROMPT` 里的
+    "detail 是 2–3 句"与 `MAX_NODE_DETAIL_CHARS` 都没动，节点数与层数仍由
+    `INITIAL_MAX_NODES` / `INITIAL_MAX_DEPTH` 守着（初次 80 节点 / 4 层含根）。
+
+    **"全部支都没命中"不兜底整树检索**（与 `_generate_deep` 不同）。那条路的兜底
+    是必要的：空支在它那里就是一块空白。这里所有证据本来就在同一次响应里，
+    "全空"就是真的全空，模型照 `DETAIL_NO_SOURCE_RULES` 写满内容、引用留空——
+    再加一次主题级 top_k=5 检索，正是上面被淘汰的那条 5.1% 的路，而且它还会让
+    一棵没有依据的树看起来有依据。
+
+    `partial` 在这条路上有两个来源：输出被长度上限截断（`SalvagedOutput`），以及
+    节点数超过 `INITIAL_MAX_NODES` 被裁剪。两者都不是失败（树仍然可用），但用户
+    必须能看见——`ok=true` 与"完整成功"长得一模一样，差别只有这两个字段。
+    """
+    if ctx.request.intent != "create":
+        return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
+    if ctx.candidate is not None and ctx.candidate.root.children:
+        return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
+
+    # ---- 材料入口（与 `_generate_deep` 同一份实现）------------------------------
+    if ctx.model_calls_used >= ctx.request.budget.max_model_calls:
+        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法生成。")
+    intake = await _intake(args.topic, ctx)
+    sources = intake.sources
+    short_material = intake.short_material
+    material_chars = intake.material_chars
+    hint_block = intake.hint_block
+    external = intake.external
+
+    diagnostics: list[Diagnostic] = []
+    thinking = thinking_block(ctx.request.thinking_model)
+    # 图型：请求层权威（理由与 `_generate_deep` 同一段注释——模型看不见界面，
+    # `diagram_type` 只要默认值存在它就会走默认值）。
+    diagram_type = ctx.request.diagram_type or args.diagram_type
+    source_of_diagram = ctx.diagram_source or (
+        SOURCE_REQUEST if ctx.request.diagram_type else SOURCE_MODEL)
+    if ctx.request.diagram_type and args.diagram_type != ctx.request.diagram_type:
+        logger.debug(
+            "图型以请求为准：请求=%s，工具参数=%s（模型的写法不生效）",
+            ctx.request.diagram_type, args.diagram_type,
+        )
+
+    # ---- 第一步：骨架 ----------------------------------------------------------
+    #
+    # 有材料时优先用材料自带的章节（`_skeleton_outline`：覆盖率 ≥60% 才拼，
+    # 低于阈值不拼的理由见那个常量）。拿不到目录就让模型从主题定——两条路走的
+    # 是**同一次调用**，差别只有 user 消息里那一段目录块有没有。
+    #
+    # 额度在调用之前占：请求一旦发出就是一次真实计费，哪怕它随后抛错。
+    if not ctx.reserve_model_call():
+        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，出不了骨架，无法生成导图。")
+    ctx.extra_model_calls += 1
+    outline = _skeleton_outline(sources)
+    base_plan = (
+        PLAN_PROMPT if diagram_type == "tree"
+        else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
+        else FISHBONE_PLAN_PROMPT
+    )
+    # 没有可检索材料时补那两句纯文本契约（与 `_generate_deep` 的骨架段同一条
+    # 判定）：它们不含输出格式，不会与 `PLAN_PROMPT` 的"只返回 branches"打架。
+    plan_system = base_plan if sources else (
+        base_plan + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
+    try:
+        raw_plan = await chat_async(
+            plan_system,
+            _plan_ask(
+                args.topic, args.branches, outline=outline,
+                diagram_type=diagram_type,
+            ) + hint_block,
+            max_tokens=_max_tokens(ctx),
+        )
+    except GenerationError as exc:
+        return _fail("generation_failed", f"骨架生成失败：{exc}")
+    _note_truncation(diagnostics, raw_plan)
+
+    branches = _skeleton_branches(raw_plan)
+    if len(branches) < MIN_BRANCHES:
+        return _fail(
+            "too_few_branches",
+            f"模型只给了 {len(branches)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
+            branches=len(branches),
+        )
+    # 截断在配色之前：只给真的要上画布的那几条分配颜色，否则"第 4 支拿到第 4 个
+    # 颜色"这种事会因为一条被截掉的尾巴而错位。
+    branches = _fill_branch_colors(branches[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)])
+    if not prefs.icons_enabled():
+        branches = [replace(branch, icon=None) for branch in branches]
+    titles = [branch.label for branch in branches]
+    if not args.branches - 1 <= len(titles) <= args.branches + 1:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SKELETON_SIZE_OFF",
+            message=f"请求 {args.branches} 条一级分支，模型给了 {len(titles)} 条，已按实际条数继续。",
+        ))
+
+    # ---- 第二步：每支各检索一次（并行，第一支预热）------------------------------
+    #
+    # 这一段是"保留分片那条路的检索质量"的全部：query 是分支标题本身
+    # （`_branch_query`，三组消融见该函数），top_k 与分片一致（`DEEP_BRANCH_TOP_K`），
+    # 预热策略也一致（`_retrieve_branches` 的"第一支先串一条"）。
+    evidences: list[_BranchEvidence | None] = []
+    retrieval_queries: list[str] = []
+    expansions: dict[str, list[str]] = {}
+    retrieval_seconds = 0.0
+    if sources:
+        retrieval_started = time.perf_counter()
+        expansions = await _expand_branches(sources, titles)
+        retrieval_queries = [
+            query for title in titles
+            for query in _branch_queries(_branch_query(title), expansions.get(title, ()))
+        ]
+        hits_by_branch = await _retrieve_branches(
+            sources, titles, expansions=expansions)
+        retrieval_seconds = time.perf_counter() - retrieval_started
+        for hits in hits_by_branch:
+            evidence = _branch_evidence(hits, sources) if hits else None
+            evidences.append(evidence)
+            if evidence is not None:
+                # 命中并进本次运行的证据集：收尾的 `verify_source_refs` 要按它判
+                # "这条引用落在可见的父块里吗"。少记一条，模型照它抄的引用就会
+                # 被判成编的（与 `_rag` / `_generate_deep` 记的是同一份东西）。
+                ctx.record_evidence(evidence.spans)
+    with_evidence = sum(1 for item in evidences if item is not None)
+
+    # ---- 第三步：一次写完 ------------------------------------------------------
+    #
+    # 分组渲染是这一段唯一的新东西：同一次响应里可能有十几组形状相同的 evidence
+    # 数组，不带归属的话模型无法知道哪条命中属于哪一支（分片那条路不需要这层，
+    # 它每次只给一支看）。
+    sections = [
+        EVIDENCE_SECTION_HEADER.format(index=index, title=title) + "\n" + evidence.text
+        for index, (title, evidence) in enumerate(zip(titles, evidences), start=1)
+        if evidence is not None
+    ]
+    skeleton_block = "\n".join(
+        f"{index}. {title}" for index, title in enumerate(titles, start=1))
+    user = (
+        f"主题：{args.topic}" + hint_block
+        + "\n\n这次的一级分支（已定好，按此顺序，不要增删改名）：\n" + skeleton_block
+    )
+    if sections:
+        user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"
+                 "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
+    external_rules = (
+        EXTERNAL_TRUST_RULES
+        if sections and any(source.kind in (SourceKind.web, SourceKind.paper)
+                            for source in sources)
+        else ""
+    )
+    if sources and sections:
+        system = (DETAIL_PROMPT + thinking + SKELETON_TREE_RULES
+                  + BRANCHED_EVIDENCE_RULES + external_rules)
+    elif sources:
+        # 有材料但这一轮一条都没命中：与旧的整树路径同一条降级——按无来源写满，
+        # 引用留空。**不把 `sources` 判成 None**：模型在本次运行前几轮可能已经
+        # `rag_query` 到过真片段，逐字校验照跑，留下的只可能是真依据。
+        system = DETAIL_PROMPT + thinking + SKELETON_TREE_RULES + DETAIL_NO_SOURCE_RULES
+    else:
+        system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
+
+    if not ctx.reserve_model_call():
+        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图内容。")
+    ctx.extra_model_calls += 1
+    # 通道为 None 时连 `on_delta` 都不传：这条路上工具行为与加生长事件之前逐字
+    # 相同（`_GenerateGrowStream` 根本不会被创建）。
+    stream_kwargs = {}
+    if ctx.emit is not None:
+        stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
+    try:
+        raw = await chat_async(system, user, max_tokens=_max_tokens(ctx), **stream_kwargs)
+    except GenerationError as exc:
+        return _fail("generation_failed", f"生成失败：{exc}")
+
+    # ---- 收尾：校验、裁剪、体检（与旧的整树出口同一套）--------------------------
+    declared_refs = _raw_ref_count(raw)
+    verify_sources = _verify_sources(ctx)
+    # 证据只在真给过的时候传：空序列与"没给"必须是同一条路（`verify_source_refs`
+    # 的空证据等价无证据，用例钉着逐字节不变）。
+    evidence = tuple(ctx.evidence) if ctx.evidence else None
+    try:
+        content, validated = validate_generated_content(
+            raw, sources=verify_sources or None, evidence=evidence)
+    except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
+        return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
+    diagnostics.extend(validated)
+    truncated = _note_truncation(diagnostics, raw)
+
+    before_clip = _count_nodes(content.root)
+    clipped = 0
+    cut_ids: set[str] = set()
+    if before_clip > INITIAL_MAX_NODES:
+        original_root = content.root
+        content, clipped = _clip_tree(content, INITIAL_MAX_NODES)
+        cut_ids = _shortened_ids(original_root, content.root)
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
+            message=(
+                f"模型返回了 {before_clip} 个节点，超过初次生成的 {INITIAL_MAX_NODES} 个上限，"
+                f"已保留前 {INITIAL_MAX_NODES} 个（尾部 {clipped} 个未保留）；"
+                "想要更大的树，请生成后用 node_expand 逐支展开"
+            ),
+        ))
+
+    # 骨架的产物（颜色 / 图标 / flowgraph 的边）套上去。放在裁剪之后：端点表必须
+    # 用裁剪后还活着的 id 建，否则 `clean_edges` 会把边留在指向已消失节点的状态。
+    content, edge_diagnostics = _apply_skeleton(
+        content, branches, raw_plan, diagram_type=diagram_type)
+    diagnostics.extend(edge_diagnostics)
+    if diagram_type != "tree":
+        # 产物自己声明"我是什么图型"。`validate_generated_content` 只会按模型输出的
+        # `{"title","root"}` 建树，图型不在模型输出里——不加这一行，一张六支的
+        # 鱼骨图与一张六支的思维导图在树上完全一样，而"要不要摆附加关系区块、
+        # 导出文件头怎么写"两件事都只能靠这个字段（与 `_generate_deep` 的建树段
+        # 同一个决定）。
+        content = content.model_copy(update={"diagram_type": diagram_type})
+
+    # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"
+    # ——这个区别在这里最实，用户下一步就是点开某个节点继续展开，而把被裁的那几个
+    # 标成 `no`，界面上恰好是唯一能再长的地方灰着。
+    _stamp_expandable(content, {node_id: "unknown" for node_id in cut_ids},
+                      max_depth=mindmap_contract.MAX_TREE_DEPTH)
+
+    # 结构与语义两层复核（与 `_generate_deep` 的收尾同一份）：诊断只是提示，
+    # 不影响这棵树能不能用——契约校验在上一步就决定过了。
+    diagnostics.extend(check(content))
+    if verify_sources:
+        diagnostics.extend(annotate_nli(content, verify_sources))
+
+    # 跨支重复：分片那条路的结构性缺陷，也是这次回到一次生成要说清的那条收益。
+    # **只报不删**（判据与理由见 `_cross_branch_duplicates`）。放在 `check()` 之后：
+    # 它比同级重名更"远"，读诊断的人应该先看到结构问题、再看到内容重复。
+    duplicates = _cross_branch_duplicates(content.root)
+    if duplicates:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="CROSS_BRANCH_DUPLICATE",
+            message=(
+                f"{sum(len(places) for _, places in duplicates)} 个节点跨分支重复"
+                f"（{len(duplicates)} 个说法各写了 "
+                f"{'/'.join(str(len(places)) for _, places in duplicates[:3])} 遍）："
+                + "；".join(
+                    f"「{label}」（{'、'.join(places)}）" for label, places in duplicates[:5]
+                )
+                + ("…" if len(duplicates) > 5 else "")
+                + "。重复的节点没有被删——要保留哪一处由你决定。"
+            ),
+        ))
+
+    # 退化成"只凭主题"的那一版：请求带了材料，但这次一条依据都没拿到。
+    unsourced = bool(sources) and not with_evidence
+    if unsourced:
+        # 逐节点重复几十遍的 `UNSOURCED_NODE` 会淹掉别的诊断，聚成一条说清
+        # "为什么整张图没有引用"（与 `_generate_deep` 的处理一致）。
+        diagnostics = [item for item in diagnostics if item.code != "UNSOURCED_NODE"]
+    external_empty = external is not None and not external.sources
+    external_used = external is not None and bool(external.sources)
+
+    ctx.candidate = content
+    ctx.revision += 1
+    count = _count_nodes(content.root)
+    kept_refs = _count_refs(content.root)
+
+    # 证据拼进了 prompt、树上却一条引用都没留下：`rag` 形态下唯一没有信号的失败面
+    # ——"把证据给了模型"与"模型用了证据"在产出上长得不一样，而失败的样子却与
+    # "本来就没有证据"完全相同。分母按 `(source_id, start, end)` 去重后数，
+    # 逐支相加会把同一段命中说成好几条。
+    evidence_total = len({
+        (entry.get("source_id"), entry.get("start"), entry.get("end"))
+        for branch in evidences if branch is not None
+        for entry in branch.payload
+    })
+    evidence_unused = bool(evidence_total) and not kept_refs
+    if evidence_unused:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="EVIDENCE_UNUSED",
+            message=(
+                f"本次把 {evidence_total} 条检索到的原文（按支分组）拼进了提示词，"
+                f"但生成的 {count} 个节点最终 0 条 source_refs"
+                + (f"（模型写了 {declared_refs} 条，全部没通过逐字校验）"
+                   if declared_refs else "（模型一条引用都没有写）")
+                + "；证据给了却没被用上，不等于材料里没有相关内容"
+            ),
+        ))
+    if unsourced:
+        reason = ("检索出错" if any(item is None for item in evidences) and not sections
+                  else "材料里没有查到与这个主题相关的原文片段")
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EVIDENCE",
+            message=(
+                f"{reason}：这张图只基于主题「{args.topic}」生成，"
+                "没有任何材料依据，节点上也不会有引用"
+            ),
+        ))
+
+    # 三种退化各自一条诊断 + 一句给用户的话，三句话术互不相同：用户要能从
+    # `content` 里读懂"这次为什么没有引用（或为什么有）"。与 `_generate_deep`
+    # 那三段的措辞保持同源，同一个功能在两条路上不该有第二套说法。
+    lead: list[Diagnostic] = []
+    short_note = None
+    if short_material:
+        short_note = (
+            f"材料只有 {material_chars} 字，不足以支撑检索"
+            f"（低于 {SHORT_MATERIAL_CHARS} 字时整份材料塞得进一条引用，引用落不到具体段落），"
+            "这次按主题生成"
+        )
+        if with_evidence:
+            short_note += (f"，并用外部检索到的 {len(sources)} 条资料"
+                           f"（{_external_source_names(sources)}）补全依据。")
+        elif external_used:
+            short_note += "，只用模型自己的知识（外部资料没能检索出可用片段）。"
+        elif external is not None:
+            short_note += "，只用模型自己的知识（没有搜到外部资料）。"
+        else:
+            short_note += "，只用模型自己的知识（外部检索未开启）。"
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="MATERIAL_TOO_SHORT",
+            message=(
+                f"材料总字数只有 {material_chars} 字（阈值 {SHORT_MATERIAL_CHARS} 字）："
+                f"这个长度切不出可区分的检索单元，按材料生成只会得到"
+                f"「引用落不到具体段落」的假依据，所以这次没有走材料路径，"
+                f"{len(short_material)} 份材料只当作主题提示"
+                + ("，依据由外部检索补上" if with_evidence else "，依据来自模型自己的知识")
+            ),
+        ))
+    external_used_note = None
+    if external_used:
+        lead.append(Diagnostic(
+            level=DiagnosticLevel.info, code="GENERATION_FROM_EXTERNAL",
+            message=(
+                f"本次引用来自外部检索的 {len(external.sources)} 条资料"
+                f"（{_external_source_names(external.sources)}）；"
+                "逐字校验保证引文出自这些来源，不保证来源本身与主题高度相关"
+            ),
+        ))
+        if not short_material:
+            external_used_note = (
+                f"本次有 {len(external.sources)} 条依据来自外部检索"
+                f"（{_external_source_names(external.sources)}）："
+                "引用逐字可校验、能点回原文，但外部内容不像你上传的材料那样权威，"
+                "当作参考资料看即可。"
+            )
+    external_note = None
+    if external_empty:
+        external_note = (f"外部检索出错（{external.failure}）" if external.failure
+                         else "没有搜到外部资料")
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EXTERNAL",
+            message=(
+                f"{external_note}：这张图只基于主题「{args.topic}」生成，"
+                "没有外部资料依据，节点上也不会有指向原文的引用"
+            ),
+        ))
+    diagnostics = lead + diagnostics
+
+    readiness = _source_readiness_diagnostic(ctx)
+    if readiness is not None:
+        diagnostics.append(readiness)
+
+    summary = f"已生成导图「{content.title}」，共 {count} 个节点。"
+    if short_note:
+        summary += short_note
+    elif unsourced:
+        summary += (
+            "材料里没有查到与这个主题相关的原文片段，这张图只基于主题生成，"
+            "不含任何材料依据；要一张有依据的图，请换一个更贴近材料内容的说法后重试。"
+        )
+    if external_note and not short_note:
+        summary += (
+            f"{external_note}，这张图只基于主题「{args.topic}」生成，"
+            "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
+        )
+    if external_used_note:
+        summary += external_used_note
+    if evidence_unused:
+        summary += (
+            f"本次按支检索到 {evidence_total} 条原文并已拼进提示词，"
+            "但这张图的节点没有留下任何引用（模型没写，或写了没通过逐字校验）；"
+            "这不代表「材料里没有相关内容」，换一个更贴近原文的说法重试可能就好了。"
+        )
+    if clipped:
+        summary += (
+            f"节点数超过初次生成的 {INITIAL_MAX_NODES} 个上限，已保留前 "
+            f"{INITIAL_MAX_NODES} 个；想要更大的树，用 node_expand 逐支展开。"
+        )
+
+    data: dict[str, Any] = {
+        "root_id": content.root.id,
+        "node_count": count,
+        "revision": ctx.revision,
+        "planned_branches": len(branches),
+        # 初次规模的两个上限：报出来才能解释"为什么这棵树只有这么深/这么大"。
+        # 两者都是既有常量，这次改动没有动它们。
+        "node_limit": INITIAL_MAX_NODES,
+        "depth_limit": INITIAL_MAX_DEPTH,
+        # 两个来源：输出被截断（`SalvagedOutput`）、节点被裁剪。都是"少了一块"
+        # 而不是失败，而 `ok=true` 与"完整成功"长得一模一样。
+        "partial": bool(truncated or clipped),
+        "cut_nodes": clipped,
+        # 跨支重复的**节点数**（判据见 `_cross_branch_duplicates`）：库里那张
+        # 56 节点的分片图量出来是 6（3 个说法各写 2 遍），这个数就是这次改动最想
+        # 改善的指标。只在诊断里说一句"有重复"的话，事后比较两条路还得人肉数。
+        "cross_branch_duplicates": sum(len(places) for _, places in duplicates),
+        "branches": [
+            {"id": child.id, "label": child.label, "points": len(child.children)}
+            for child in content.root.children
+        ],
+        "retrieval": {
+            "mode": "branch" if sources else "off",
+            "top_k": DEEP_BRANCH_TOP_K,
+            "queries": retrieval_queries,
+            "expanded_branches": len(expansions),
+            "branches_with_hits": with_evidence,
+            "empty_branches": [title for title, item in zip(titles, evidences)
+                               if item is None],
+            "hits": sum(len(item.payload) for item in evidences if item is not None),
+            # 这一次检索是用户点"生成"之后**多出来的**一次等待（N 支各一次，
+            # 第一支串行预热），混进总耗时就永远看不出"慢在哪"。
+            "seconds": round(retrieval_seconds, 3),
+        },
+        "source_refs": {"declared": declared_refs, "kept": kept_refs},
+        "diagnostics": [item.model_dump() for item in diagnostics],
+    }
+    if external is not None:
+        # 只在外部队列真的走过时才有这个键：开关关着时 `data` 的键集与加这个
+        # 能力之前逐字节相同（回归用例比的是键集，不只是值）。
+        data["external"] = {
+            "hits": external.hits,
+            "sources": len(external.sources),
+            "seconds": round(external.elapsed, 3),
+            "failed": external.failure,
+        }
+    if short_material:
+        data["material"] = {
+            "chars": material_chars,
+            "sources": len(short_material),
+            "threshold": SHORT_MATERIAL_CHARS,
+            "degraded": True,
+        }
+    if diagram_type != "tree":
+        # 图型与附加边：`diagram_type` 是**输入**，`edges` 是**产出**。"选了流程图
+        # 但一条边都没画出来"与"选了思维导图"在树上长得一样，而前者是要去补的动作。
+        data["diagram"] = {
+            "type": diagram_type,
+            "source": source_of_diagram,
+            "edges": len(content.edges),
+        }
+    return ToolResult(ok=True, content=summary, data=data)
+
+
+def _cross_branch_duplicates(root: Node) -> list[tuple[str, list[str]]]:
+    """跨分支重复的节点：`(label, [出现在哪些父节点下])`。
+
+    这是分片那条路的**结构性缺陷**，也是这次回到一次生成要说清的那条收益：分片
+    每支展开时只看得到自己那条标题链，兄弟支写了什么它不知道（`PLAN_PROMPT` 里
+    "彼此覆盖的范围不重叠"模型并不听），于是同一个说法会挂在两条分支下。一次
+    生成时全部骨架在同一份响应里，模型至少有可能看住；这里数的是"它看住没有"。
+
+    **判据是 label 级**（归一化后逐字相同、且不在同一条祖先链上），**不要求
+    detail 也相同**。这一条是拿真实数据校准出来的，不是拍的：库里那三张
+    `机器学习的主要方向`（56/57 节点）各有 3 个 label 跨支重复、共 6 个重复节点
+    （「Python库与框架」「半监督与强化学习」「无监督学习：无标注找结构」），
+    而它们的 detail **各不相同**——按"连 detail 也要相同"判，这条诊断对真实
+    缺陷完全瞎掉（量出来 0）。
+
+    为什么 label 相同就够了：同一个概念挂在两条一级分支下，无论说明怎么写，
+    用户都会看到两块内容在讲同一件事；而"交叉指认"（两支都要提到同一个概念）
+    正确写法是指向已有节点，不是复制一份。
+
+    保守的那一半在**不做语义归一**：`无监督学习` 与 `非监督学习`、`监督学习` 与
+    `有监督学习` 不算重复（不确定就别报）。宁可漏，不误报——这条诊断不删任何
+    节点，只把"哪几句写了两遍"摆出来，误报会让整条信号变成噪声。
+
+    只报不删：留哪一处是用户的决定。
+    """
+    found: dict[str, list[tuple[str, ...]]] = {}
+    stack: list[tuple[Node, tuple[str, ...]]] = [(child, ()) for child in root.children]
+    while stack:
+        node, chain = stack.pop()
+        label = re.sub(r"\s+", "", node.label or "")
+        if label:
+            found.setdefault(label, []).append((*chain, node.label))
+        for child in node.children:
+            stack.append((child, (*chain, node.label)))
+    duplicates: list[tuple[str, list[str]]] = []
+    for label, places in found.items():
+        if len(places) < 2:
+            continue
+        # 同一条祖先链上的两处不算跨支（父子同一句话是另一类问题，`check()` 管）。
+        parents = {place[:-1] for place in places}
+        if len(parents) < 2:
+            continue
+        duplicates.append((label, sorted("/".join(place[:-1]) or "根" for place in places)))
+    return duplicates
+
+
 async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     """分片生成：先出骨架，再按层并发展开，最后确定性验收并只补不合格的那一支。
 
@@ -2693,66 +3498,20 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     # ---- 材料准备：只喂有正文的来源、短材料退化、没有材料时先做外部检索 --------
     #
-    # 这三段原来是整树生成那条路的入口（`_generate`，已随 `full` 形态删除），
-    # 现在只剩这一条生成路，它们也就是"生成前怎么处理用户给的材料"的唯一实现。
-    #
-    # 空正文的来源不参与（`status` 是给界面看的，能检索的只有 `text`）；不滤的话，
-    # 一个还没解析成功的空来源会让检索与 `source_usage` 各自撞上一次空正文。
-    picked = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
-    # 材料太短 → 当成"没有材料"（理由与阈值见 `SHORT_MATERIAL_CHARS`）。
-    #
-    # 这里**不改 `ctx.request.sources`**：材料是用户给的，界面上还要显示它、它还在
-    # 收尾校验的可查来源里（`_verify_sources`）。被改掉的只是"这次喂给模型什么"——
-    # 一份 8 字的材料塞进检索之后只会回 1 条 9 字命中，模型据此生成几十个节点、
-    # 其中几个带引用，而界面看不出其余都是它自己补的。
-    #
-    # 它仍然有用：作为外部检索的**主题提示**（`_external_query`）。所以这条退化
-    # 不是"丢掉用户的输入"，是"换个用法"。
-    material_chars = sum(len((source.text or "").strip()) for source in picked)
-    short_material = picked if 0 < material_chars < SHORT_MATERIAL_CHARS else []
-    sources = [] if short_material else picked
-    # 太短的材料**不当语料、但当说明**：文字仍然进 prompt（用户写的东西一个字都
-    # 不丢），只是它不再产生 evidence、不再产生引用。上面那次外部检索也用它当了
-    # 查询词（`_external_query`），两处用的是同一份文字、不同的用途。
-    #
-    # 为什么不直接拼进 `args.topic`：主题是这张图的中心节点，把那 8 个字并进去会
-    # 改变 `content.title` 与骨架的检索问法；提示是附加说明，位置分开、语义才不混。
-    hint_block = ""
-    if short_material:
-        hint_block = (
-            "\n\n用户还附了这段文字（{chars} 字，太短，不足以作为可检索的材料，"
-            "只当作主题的补充说明，不要从它里面挑句子当引用）：\n{hint}"
-        ).format(chars=material_chars,
-                 hint=" ".join((source.text or "").strip() for source in short_material))
-    # 没有材料时先去外部知识源搜一次。默认开（实测与失败场景见
-    # `EXTERNAL_KNOWLEDGE_ENV` 上面那段注释）。"没有材料"包含两种输入：本来就没传，
-    # 以及传了但太短（`short_material`）——两者都拿不出可检索的正文；差别只在于
-    # 后者的文字被并进了查询词，而且它必须**被说出来**（`MATERIAL_TOO_SHORT`），
-    # 否则用户会以为那 8 个字被当成材料用了。
-    #
-    # 外部结果**不做任何特殊处理**：它们只是 `sources`，下面按支检索、`_citable_hits`、
-    # `verify_source_refs` 全都照旧跑。这就是"外部结果一律转成 Source 并入库"的
-    # 全部好处——引用校验、父块坐标、`library.load` 回查自动成立，没有第二条链。
+    # 三段都在 `_intake` 里，与 `_generate` 共用一份实现（两处各写一遍的话，
+    # "材料太短"的阈值与"外部检索什么时候发"迟早会有一个分支先改）。
     #
     # 先探一次额度再外呼：外部检索不花模型调用，但"额度在别的工具里已经烧光"时
     # 白等一次 6 秒的外网往返没有意义（`reserve_model_call` 只是这份额度的记账，
     # 这里只读不占）。
     if ctx.model_calls_used >= ctx.request.budget.max_model_calls:
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
-    external: _ExternalFetch | None = None
-    if not sources and external_knowledge_enabled():
-        # 检索期间界面上什么都不动，看起来像卡死（实测中位 4.3 秒、最坏 20 秒）。
-        # 一帧"开始"、一帧"结束"，两帧都在 `_run_tool` 里被立刻转发出去——工具跑
-        # 在任务里，主循环一边等一边转帧，所以这行 await 不会把帧憋住。
-        await _emit_stage(ctx, EXTERNAL_SEARCH_STAGE, "正在检索外部资料…")
-        external = await _external_sources(_external_query(args.topic, short_material), ctx)
-        # 结束帧**一定带 count**（包括 0）：前端靠"有没有这个字段"区分开始与结束，
-        # `0` 与"还没结束"必须分得开。
-        await _emit_stage(
-            ctx, EXTERNAL_SEARCH_STAGE, _external_stage_text(external),
-            count=len(external.sources),
-        )
-        sources = external.sources
+    intake = await _intake(args.topic, ctx)
+    sources = intake.sources
+    short_material = intake.short_material
+    material_chars = intake.material_chars
+    hint_block = intake.hint_block
+    external = intake.external
     # 分片检索的前提：真的有可检索的正文。空正文的来源不参与。
     slicing = bool(sources)
 
@@ -6386,10 +7145,15 @@ def _batch_id(ctx: RunContext) -> str:
 
 # 意图 -> 允许的工具。这张表就是"模型这条路能走多远"的唯一声明。
 #
-# `create` 只有一条生成路：分片（`mindmap_generate_deep`）。整树一次成型的
-# `mindmap_generate` 已随 `MINDMAP_SOURCE_MODE=full` 形态一起删除
-# （决策见 `docs/ONE-PATH.md`）。形态不再参与裁剪——有没有来源，模型看到的
-# 生成工具都是同一个。
+# `create` 只有一条生成路：**整树一次生成**（`mindmap_generate`）——骨架一次、
+# 每支检索一次、内容一次写完。分片生成（`mindmap_generate_deep`）的代码与规格
+# 都还在（`_TOOL_SPECS` 里有 **两个**生成工具），但**不注册到这里**：它服务的
+# 是"更大的规模"，即一次响应写不下 200+ 节点时，靠 N+1 次调用把单次输出量与
+# 整图上限脱钩。真实用法跑不到那个规模（`runs` 里 16 次运行 `sources` 全为 0、
+# 没有材料时分片付了全部代价拿到零收益），所以默认给一次写完的那条；等真有大图
+# 需求时把 `"mindmap_generate_deep"` 加进这一行即可，实现一行都不用改。
+#
+# 形态不再参与裁剪——有没有来源，模型看到的生成工具都是同一个。
 #
 # `edit` 给**七个**：六个细粒度（加/改/删/移 + 两条边）外加批量 `mindmap_edit`。
 # 为什么不只留批量：批量的参数是一张 op 表，改一处也要写出 `[{"op":"update",
@@ -6399,7 +7163,14 @@ def _batch_id(ctx: RunContext) -> str:
 # 一次工具调用改十处，省下的不是"额度"（50 次够细粒度改 49 处），而是四十次
 # 模型往返——每次工具调用都要等模型再看一眼结果。
 _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
-    "create": ("mindmap_generate_deep",),
+    "create": ("mindmap_generate",),
+    # `create_deep` 不是一个产品意图，它是**给分片那条路留的入口**：`create` 现在
+    # 只给整树一次生成，而分片的实现、规格与既有用例都还在。挂在这个名字下，
+    # "分片没被注册进 `create`"这件事就是可断言的（用例断言 `create` 的名单里
+    # 没有它），同时它也没有从代码里消失——`service.run` 永远不会把 intent 解成
+    # 这个名字，所以生产路径看不到它，将来要把它挂回大图时把 `create` 那一行
+    # 换成它（或并列）即可。
+    "create_deep": ("mindmap_generate_deep",),
     # `audit_tree` 只给 `expand`：那条路上模型是**逐个** `node_expand` 展开的，
     # "还有哪几支没展开"没有任何代码在替它数——`mindmap_generate_deep` 内部那套
     # 验收（`_audit_branches` / `partial`）只覆盖生成那一次，用户在生成之后说
@@ -6430,6 +7201,9 @@ _SOURCE_AWARE_INTENTS = ("expand", "edit")
 # 列表是有先验的，先看到的那几个更容易被选。这一条不是玄学——四个细粒度工具
 # 每个只花一次调用，批量则是"最后手段"，顺序把这条分工又强调了一次。
 _TOOL_ORDER = (
+    "mindmap_generate",
+    # 未注册到任何意图（见 `_ALLOWED_BY_INTENT` 的注释）。留在顺序表里是为了
+    # 将来把它挂回 `create` 时，注册顺序与它的规格一起就位。
     "mindmap_generate_deep",
     "node_expand",
     "rag_query",
@@ -6453,10 +7227,63 @@ _DIAGRAM_HINTS = {
 }
 
 
-def _generate_deep_spec(diagram_type: str | None = None) -> ToolSpec:
-    """分片生成的工具定义。`diagram_type` 非 None 表示**用户已经选了**。
+def _generate_spec(diagram_type: str | None = None) -> ToolSpec:
+    """整树一次生成的工具定义。`diagram_type` 非 None 表示**用户已经选了**。
 
-    两条分支的差别就是"这个参数谁来定"：
+    两条分支的差别与 `_generate_deep_spec` 完全同构（参数谁来定），所以这里只写
+    差异：描述里的第一句必须说清"一次调用出整棵树"，因为模型对"生成"的默认
+    预期是分步的；不说的话它会在一次调用之后还想再展开一轮。
+    """
+    if diagram_type is None:
+        diagram_sentence = (
+            "diagram_type 选图型：tree 思维导图（默认，按话题分解）；"
+            "flowchart 流程图（一级分支是阶段，会额外给出条件分支与回退的连线）；"
+            "fishbone 鱼骨图（一级分支固定为人/机/料/法/环/测）。"
+        )
+    else:
+        diagram_sentence = (
+            f"本次图型已由用户在界面上选定：{_DIAGRAM_HINTS[diagram_type]}。"
+            "按这个图型生成，不要再自行判断图型（这个参数不会下发给工具）。"
+        )
+    return ToolSpec(
+        name="mindmap_generate",
+        description=(
+            "生成一张完整思维导图：一次调用出整棵树（定骨架 → 按支检索 → 一次写完）。"
+            "带材料时它会先看一眼材料自带的章节标题来定一级骨架，再为每条一级分支"
+            "各自检索一次，最后把骨架与全部检索结果一起交给模型写完；"
+            "它不会把全文读进来。没有材料时直接按主题生成。"
+            "初次上限是 80 个节点、4 层（含中心主题），更细的内容留给生成之后的"
+            "node_expand 逐支展开。"
+            + diagram_sentence
+            + "只有当前还没有导图时可用。"
+        ),
+        args_model=GenerateArgs,
+        fn=_generate,
+        hidden_args=() if diagram_type is None else ("diagram_type",),
+    )
+
+
+def _generate_deep_spec(diagram_type: str | None = None) -> ToolSpec:
+    """分片生成的工具定义。**当前未注册到任何意图**（见 `_ALLOWED_BY_INTENT`）。
+
+    定位（写给下一个要把它挂回去的人）：
+
+      - **它服务的是规模，不是质量**。整树一次生成（`mindmap_generate`）把全部
+        分支放进一次响应，好处是跨支不重复、耗时三到八秒；代价是单次输出上限
+        ——一棵 4 层满额的 200 节点图约 4 万字 detail，任何 provider 一次都写不下
+        （`MAX_OUTPUT_TOKENS` 封顶 65536 token，超了就是截断，而截断出来的树
+        尾部整支消失）。分片把"单次输出量"与"整图上限"解耦：每次只写一支。
+      - **门槛在哪**：`INITIAL_MAX_NODES = 80`。初次生成走整树，80 节点装得进
+        一次响应；要 200+ 节点时整树会先被 `_clip_tree` 裁到 80，那时才需要这一条。
+      - **挂回去的方式**：把 `"mindmap_generate_deep"` 加进 `_ALLOWED_BY_INTENT`
+        的 `create` 那一行（它的 spec 已经在 `_TOOL_SPECS` 里、顺序在
+        `_TOOL_ORDER` 里），实现一行都不用改。
+      - **代价要说清**：没有材料时它相对整树没有任何收益（真实用法 100% 无材料），
+        却要 1+N 次调用与三十秒；有材料时它的覆盖率更高（30.5% vs 5.1%），但那时
+        整树那条路也按支检索了（`_retrieve_branches`），两边证据同源，差别只剩下
+        单次输出量。
+
+    `diagram_type` 非 None 表示**用户已经选了**。两条分支的差别就是"这个参数谁来定"：
 
       - `None`（老前端、或用户选了"自动判断"）：参数留在 schema 里，由模型判断
         ——这是 `2ed92ac` 的行为，逐字节不变。
@@ -6506,6 +7333,11 @@ def _generate_deep_spec(diagram_type: str | None = None) -> ToolSpec:
 
 
 _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
+    # `create` 的生成路（唯一的）：骨架 + 按支检索 + **一次**写完。
+    "mindmap_generate": lambda: _generate_spec(),
+    # 分片生成。代码留着、规格留着，但**不在 `_ALLOWED_BY_INTENT` 里**——它服务的
+    # 是"更大的规模"（一次写不下 200+ 节点时的唯一办法），需要时把它加回
+    # `create` 那一行即可，不必恢复任何一行实现。
     "mindmap_generate_deep": lambda: _generate_deep_spec(),
     "node_expand": lambda: ToolSpec(
         name="node_expand",
@@ -6666,7 +7498,7 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     失败三次才转向，白白烧掉调用额度。看不到这个工具，它就只能走对的那条路。
 
     裁剪规则：
-      - `create` 只给分片生成（`mindmap_generate_deep`），没有第二个选项
+      - `create` 只给整树一次生成（`mindmap_generate`），没有第二个选项
       - `expand` 给 `node_expand` + `audit_tree`（整图体检，用户要求"补完"时
         模型靠它知道还差哪几支；那条路上没有代码替它数），请求带来源时再加
         `rag_query`
@@ -6676,20 +7508,24 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
         改五处以上用批量（一次调用改十处，省下的是**模型往返**——每次调用都要一轮）
       - `expand` / `edit` 在请求带来源时加 `rag_query`：那两条路不读来源，
         模型只能自己查。
-      - **不**给 `create`：分片生成在工具内部自己检索（骨架之后每支一次、限额
-        补查再各一次）。早先这里是反的——那时整树还不预检索，不给工具模型就只能
-        凭标题编。补上预检索之后，再给工具就只剩**重复**：模型查到的片段进不了
-        `mindmap_generate_deep` 的任何参数，它只能自己在文字里复述，而每一支的
-        检索用的是那支的标题。`max_tool_calls` 从 8 到 50 不改变这一点。
+      - **不**给 `create`：生成工具在内部自己检索（骨架之后每支一次）。早先这里
+        是反的——那时整树还不预检索，不给工具模型就只能凭标题编。补上预检索之后，
+        再给工具就只剩**重复**：模型查到的片段进不了生成工具的任何参数，它只能
+        自己在文字里复述，而每一支的检索用的是那支的标题。`max_tool_calls` 从 8
+        到 50 不改变这一点。
       - **请求不带来源、但知识库非空**时，任何意图都加 `rag_query`（见下）。
 
-    **为什么 `create` 只剩一条路**：整树一次成型的 `mindmap_generate` 随
-    `MINDMAP_SOURCE_MODE=full` 一起删除了（`docs/ONE-PATH.md`）。它唯一比这里
-    强的地方是"正文整份在 prompt 里，模型能自己扫全文"（实测覆盖 100%），而那
-    正是被删掉的形态；在"正文不进 prompt"之下，整树只有一次 `top_k=5` 的主题
-    预检索，对同一份 14,120 字材料覆盖 **5.1%**，分片按支检索覆盖 **30.5%**
-    （`scripts/measure_deep_slicing.py`，8 支、纯 BM25；`docs/RAG-DECISIONS.md`
-    第 5 节）。所以这不是"少给一个选项"，是"少给一条覆盖低六倍的路"。
+    **为什么生成只剩一条路**：分片好用的前提是**有材料**——它相对整树唯一的真
+    优势是覆盖率（按支检索 30.5% vs 整树一次 top_k=5 的 5.1%，
+    `scripts/measure_deep_slicing.py`，8 支、纯 BM25），而真实用法是 100% 无材料
+    （`runs` 里 16 次运行 `sources` 全为 0），那时它付了 1+N 次调用与三十秒，
+    换来的收益是零，还额外引入跨支重复（每支只看得到自己那条标题链）。
+
+    所以 `create` 现在是**整树一次生成**，而它并没有退回到那 5.1%：骨架照旧由
+    材料目录或模型定（`_skeleton_outline` / `_plan_ask`），证据照旧**每支各检索
+    一次**（`_retrieve_branches`），只是把"并发展开"换成"一次写完"。分片那条路
+    （`mindmap_generate_deep`）的代码与规格都还在 `_TOOL_SPECS` 里，服务的是
+    200+ 节点那种一次写不下的大图，需要时加回上面那一行即可。
 
     `rag_query` 只在**真有可查的东西**时才注册：没来源也没库的检索必然返回
     「没有找到」，注册它只会诱导模型拿它当"思考"用。这里的"有"包含知识库：
@@ -6704,17 +7540,16 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
 
     `diagram_type` 是**用户在界面上选的那个图型**（`AgentRunRequest.diagram_type`）。
     非 None 时生成工具的 `diagram_type` 参数从 schema 里消失、描述改成"已选定"
-    ——见 `_generate_deep_spec`。其余九个工具与它无关：`expand` / `edit` 那两侧
-    不生成骨架，图型对它们没有任何意义（用例钉着这一点）。
+    ——见 `_generate_spec` / `_generate_deep_spec`。其余九个工具与它无关：
+    `expand` / `edit` 那两侧不生成骨架，图型对它们没有任何意义（用例钉着这一点）。
     """
     if has_library is None:
         has_library = library_available()
     allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
     if has_sources:
-        # `create` **不**补 `rag_query`：分片生成在工具内部先检索（骨架之后按支
-        # 一次、限额补查再各一次），模型再自行查是**重复**——它查到的片段进不了
-        # `mindmap_generate_deep` 的任何参数，只能自己在文字里复述一遍。
-        # `expand` / `edit` 仍需要：那两条路不读来源，模型只能自己查。
+        # `create` **不**补 `rag_query`：生成工具在内部先检索（骨架之后按支一次），
+        # 模型再自行查是**重复**——它查到的片段进不了任何生成工具的参数，只能
+        # 自己在文字里复述一遍。`expand` / `edit` 仍需要：那两条路不读来源。
         if intent in _SOURCE_AWARE_INTENTS:
             allowed.add("rag_query")
     if has_library and not has_sources:
@@ -6722,8 +7557,14 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
 
     registry = ToolRegistry()
     for name in _TOOL_ORDER:
-        if name in allowed:
+        if name not in allowed:
+            continue
+        # 两个生成工具都要看 `diagram_type`：请求层定了图型时，那个参数对模型
+        # 不存在（各自的 spec 函数里处理 `hidden_args`）。
+        if name in ("mindmap_generate", "mindmap_generate_deep"):
             registry.register(
-                _generate_deep_spec(diagram_type) if name == "mindmap_generate_deep"
-                else _TOOL_SPECS[name]())
+                _generate_spec(diagram_type) if name == "mindmap_generate"
+                else _generate_deep_spec(diagram_type))
+            continue
+        registry.register(_TOOL_SPECS[name]())
     return registry

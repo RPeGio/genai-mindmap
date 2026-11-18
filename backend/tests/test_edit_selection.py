@@ -233,7 +233,7 @@ def test_edit_intent_still_offers_all_seven_tools():
 
 
 def test_create_registry_is_untouched():
-    assert build_registry("create", has_library=False).names() == ["mindmap_generate_deep"]
+    assert build_registry("create_deep", has_library=False).names() == ["mindmap_generate_deep"]
 
 
 def test_expand_registry_is_untouched():

@@ -286,7 +286,7 @@ class TestDiagramType:
         """`flowchart` 的骨架里那些合法边要真的落到树上，写错的端点被丢掉。"""
         ctx = _ctx()
         with patch("app.agent.tools.chat_async", new=_stub()):
-            result = _run(build_registry("create", has_library=False).execute(
+            result = _run(build_registry("create_deep", has_library=False).execute(
                 _call("mindmap_generate_deep", topic="报销", branches=3,
                       points_per_branch=2, max_depth=2, diagram_type="flowchart"),
                 ctx,
@@ -308,7 +308,7 @@ class TestDiagramType:
         """每一条边引用的 id 都必须在树里（否则落库时契约会拒）。"""
         ctx = _ctx()
         with patch("app.agent.tools.chat_async", new=_stub()):
-            result = _run(build_registry("create", has_library=False).execute(
+            result = _run(build_registry("create_deep", has_library=False).execute(
                 _call("mindmap_generate_deep", topic="报销", branches=3,
                       points_per_branch=2, max_depth=2, diagram_type="flowchart"),
                 ctx,
@@ -327,7 +327,7 @@ class TestDiagramType:
     def test_fishbone_emits_no_edges(self):
         ctx = _ctx()
         with patch("app.agent.tools.chat_async", new=_stub()):
-            result = _run(build_registry("create", has_library=False).execute(
+            result = _run(build_registry("create_deep", has_library=False).execute(
                 _call("mindmap_generate_deep", topic="缺陷原因", branches=3,
                       points_per_branch=2, max_depth=2, diagram_type="fishbone"),
                 ctx,

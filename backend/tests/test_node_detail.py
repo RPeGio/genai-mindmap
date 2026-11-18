@@ -191,7 +191,7 @@ def test_deep_generation_labels_are_short_and_carry_detail():
     )
     ctx = RunContext(request=request, sources_by_id={})
     with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-        result = asyncio.run(build_registry("create").execute(
+        result = asyncio.run(build_registry("create_deep").execute(
             ToolCall(call_id="c", name="mindmap_generate_deep",
                      arguments={"topic": "预算管理办法", "branches": 3,
                                 "points_per_branch": 2}),
@@ -284,7 +284,7 @@ def test_root_label_is_clipped_too():
     )
     ctx = RunContext(request=request, sources_by_id={})
     with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
-        result = asyncio.run(build_registry("create").execute(
+        result = asyncio.run(build_registry("create_deep").execute(
             ToolCall(call_id="c", name="mindmap_generate_deep",
                      arguments={"topic": "帮我整理这份预算管理办法的全部要点",
                                 "branches": 3, "points_per_branch": 2}),

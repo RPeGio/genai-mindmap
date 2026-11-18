@@ -207,7 +207,7 @@ class DeepGrowReportTest(unittest.TestCase):
         chat = _streaming_chat(_plan("范围", "原理", "实现"), expand, chunk)
         call = _call(topic=TOPIC, branches=3, points_per_branch=2, max_depth=max_depth)
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=chat)):
-            result = _run(build_registry("create").execute(call, ctx))
+            result = _run(build_registry("create_deep").execute(call, ctx))
         self.assertTrue(result.ok, result.content)
         return frames
 
@@ -293,7 +293,7 @@ class DeepGrowReportTest(unittest.TestCase):
 
         call = _call(topic=TOPIC, branches=3, points_per_branch=2, max_depth=2)
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=chat)):
-            result = _run(build_registry("create").execute(call, ctx))
+            result = _run(build_registry("create_deep").execute(call, ctx))
 
         self.assertTrue(result.ok, result.content)
         # 三次首轮展开各自：半截时不新增，闭合后正好新增一条
@@ -352,7 +352,7 @@ class DeepGrowReportTest(unittest.TestCase):
         ctx = _ctx(emit=None)
         call = _call(topic=TOPIC, branches=3, points_per_branch=2, max_depth=2)
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=chat)):
-            result = _run(build_registry("create").execute(call, ctx))
+            result = _run(build_registry("create_deep").execute(call, ctx))
 
         self.assertTrue(result.ok, result.content)
         self.assertTrue(calls)
@@ -374,7 +374,7 @@ class DeepGrowReportTest(unittest.TestCase):
         ctx = _ctx(emit=emit)
         call = _call(topic=TOPIC, branches=3, points_per_branch=2, max_depth=2)
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=chat)):
-            result = _run(build_registry("create").execute(call, ctx))
+            result = _run(build_registry("create_deep").execute(call, ctx))
 
         self.assertTrue(result.ok, result.content)
         self.assertEqual(seen[0], False)          # 骨架：只关心结构，不必流式
@@ -463,7 +463,7 @@ class RunFramesTest(unittest.TestCase):
 
         async def drain():
             return [event async for event in
-                    run(request, provider=provider, tools=build_registry("create"))]
+                    run(request, provider=provider, tools=build_registry("create_deep"))]
 
         with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=chat)):
             return _run(drain())

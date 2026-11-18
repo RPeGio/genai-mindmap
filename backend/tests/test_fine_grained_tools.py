@@ -119,7 +119,7 @@ def test_create_and_expand_registries_are_unchanged():
     细粒度工具不能漏到这两个意图里；`audit_tree` 是例外，因为它是 `readonly`
     且不产节点——它数的是树上已有的东西（见 `tests/test_agent_audit.py`）。
     """
-    assert build_registry("create", has_library=False).names() == ["mindmap_generate_deep"]
+    assert build_registry("create_deep", has_library=False).names() == ["mindmap_generate_deep"]
     assert build_registry("expand", has_library=False).names() == [
         "audit_tree", "node_expand"]
 

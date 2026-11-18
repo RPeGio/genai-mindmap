@@ -335,7 +335,7 @@ def _run_deep(sources: list[Source]):
     ctx = RunContext(request=request, candidate=None,
                      sources_by_id={source.id: source for source in sources})
     model = _Plan()
-    registry = build_registry("create", has_sources=True)
+    registry = build_registry("create_deep", has_sources=True)
     with patch("app.agent.tools.chat_async", new=model):
         result = asyncio.run(registry.execute(
             ToolCall(call_id="c-deep", name="mindmap_generate_deep",

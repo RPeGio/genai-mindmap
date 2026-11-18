@@ -405,7 +405,7 @@ def _run_deep(monkeypatch, chat, expansion=None):
     if expansion is not None:
         _fake_chat(monkeypatch, expansion)
 
-    registry = build_registry("create", has_sources=True)
+    registry = build_registry("create_deep", has_sources=True)
     return run(registry.execute(
         ToolCall(call_id="c-deep", name="mindmap_generate_deep",
                  arguments={"topic": "管理办法", "branches": len(TITLES),

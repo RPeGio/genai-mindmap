@@ -1,21 +1,24 @@
-"""一条生成路的契约：`create` 只有分片，形态开关已经不存在。
+"""一条生成路的契约：`create` 只有**整树一次生成**，形态开关已经不存在。
 
-这次删除把 `MINDMAP_SOURCE_MODE=full`（正文整份进 prompt）与整树一次成型的
-`mindmap_generate` 一起去掉了（决策与代价见 `docs/ONE-PATH.md`）。这个文件钉三件事：
+`MINDMAP_SOURCE_MODE=full`（正文整份进 prompt）与它的提示词早就删了
+（决策与代价见 `docs/ONE-PATH.md`）。这个文件钉四件事：
 
-  1. **注册表只有分片**：`create` 无论有没有来源、库里有没有材料，生成工具都只有
-     `mindmap_generate_deep`。这是"删干净"里最容易退回去的一处——把整树加回来
-     只需要在 `_ALLOWED_BY_INTENT` 里多写一个名字。
+  1. **注册表只有一次生成**：`create` 无论有没有来源、库里有没有材料，生成工具都
+     只有 `mindmap_generate`。分片（`mindmap_generate_deep`）的代码还在，但**不在
+     `create` 的名字表里**——这是"它没被注册回主路径"里最容易静默退回去的一处。
   2. **形态开关真的没了**：`generation.service` 里那个形态判定函数与它的常量都不在，
-     `app/` 下没有任何一处读 `MINDMAP_SOURCE_MODE`。留着一条只认一个值的分支，
-     下一个人就会以为它还能切回去。
-  3. **原属整树路的三个入口行为还在**（它们随 `_generate` 一起搬进了分片）：
-     无材料 → 外部检索、带材料 → 按支检索、材料过短 → 退化成主题 + 外部补全。
-     这三条是端到端的：从 `build_registry` 进、到 `ctx.candidate` 与 `content` 出。
+     `app/` 下没有任何一处读 `MINDMAP_SOURCE_MODE`。
+  3. **三个材料入口行为还在**：无材料 → 外部检索、带材料 → 按支检索（每支一次，
+     不是一次）、材料过短 → 退化成主题 + 外部补全。三条都是端到端的：从
+     `build_registry` 进、到 `ctx.candidate` 与 `content` 出。
+  4. **没有退化成"一次主题检索"**：这条路保留了分片按支检索的证据形状——命中
+     按分支分组进 prompt、每支各发一次检索。退回去的表现是 `queries` 只有一条，
+     而那正是当年整树路径覆盖 5.1% 的原因。
 
 为什么这些用例不写在 `test_deep_slicing.py`：那个文件钉的是**检索覆盖度**的机制
 （每支只看自己的 hits、并发、降级），这个文件钉的是**入口语义**（材料怎么来、
-没有材料时发生什么）。混在一起时，一次失败读不出是哪一层的契约坏了。
+没有材料时发生什么、一次调用怎么写完整棵树）。混在一起时，一次失败读不出是哪
+一层的契约坏了。
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ from unittest.mock import patch
 
 import pytest
 
+from app.agent import tools as tools_module
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
     EXTERNAL_KNOWLEDGE_ENV,
@@ -114,15 +118,20 @@ def _hit(source: Source) -> external_knowledge_module.ExternalHit:
     )
 
 
-def _branch_of(user: str) -> str:
-    return user.split("本条一级分支：", 1)[1].split("\n", 1)[0]
+def _evidence_groups(user: str) -> dict[str, list[dict]]:
+    """取出 user 里按分支分组的 evidence 数组：`标题 -> 命中列表`。
 
-
-def _evidence_of(user: str) -> list[dict]:
-    """取出拼在 user 末尾的 evidence 数组；没有就是空。"""
-    if "evidence 数组）：\n" not in user:
-        return []
-    return json.loads(user.split("evidence 数组）：\n", 1)[1])
+    分组表头是**一行**、数组是**下一行**（`json.dumps` 不换行）。按行读而不是按
+    空行切：父块 `quote` 里可能本来就有连续换行，按空行切会把数组切坏。
+    """
+    groups: dict[str, list[dict]] = {}
+    lines = user.splitlines()
+    for index, line in enumerate(lines):
+        if "的检索结果（evidence 数组）：" not in line:
+            continue
+        title = line.split("「", 1)[1].split("」", 1)[0]
+        groups[title] = json.loads(lines[index + 1])
+    return groups
 
 
 def _ref_from(hit: dict) -> dict:
@@ -130,8 +139,8 @@ def _ref_from(hit: dict) -> dict:
 
     没有 `evidence_*`（单级检索）时只抄 `quote`、且**不超过 300 字**并省掉 start/end：
     这是提示词明确要求模型的抄法（超长只截一段连续的），也是 `SourceRef.quote` 的
-    长度上限。整段 370 字的父块原样抄过去会被 `_ref_from` 当成不合格丢掉，看起来
-    像"引用被校验剔了"，其实模型没按规矩抄。
+    长度上限。整段 370 字的父块原样抄过去会被逐字校验判不合格丢掉，看起来像
+    "引用被校验剔了"，其实模型没按规矩抄。
     """
     ref = {"source_id": hit["source_id"]}
     if hit.get("evidence_quote"):
@@ -144,7 +153,7 @@ def _ref_from(hit: dict) -> dict:
 
 def _run(ctx: RunContext, chat, *, arguments: dict | None = None,
          has_sources: bool | None = None):
-    args = {"topic": TOPIC, "branches": 3, "points_per_branch": 2, "max_depth": 2}
+    args = {"topic": TOPIC, "branches": 3}
     args |= arguments or {}
     registry = build_registry(
         "create",
@@ -153,7 +162,7 @@ def _run(ctx: RunContext, chat, *, arguments: dict | None = None,
     )
     with patch("app.agent.tools.chat_async", new=chat):
         return asyncio.run(registry.execute(
-            ToolCall(call_id="c-deep", name="mindmap_generate_deep", arguments=args),
+            ToolCall(call_id="c-gen", name="mindmap_generate", arguments=args),
             ctx,
         ))
 
@@ -172,52 +181,80 @@ def _codes(result) -> list[str]:
     return [item["code"] for item in result.data["diagnostics"]]
 
 
-def _citable_chat(seen: list[tuple[str, str]] | None = None,
-                  branches: tuple[str, ...] = BRANCHES):
-    """模型替身：骨架给 `branches`、每支两个要点，引用照抄本支 evidence 的第一条。
+def _tree_chat(seen: list[tuple[str, str]] | None = None,
+               branches: tuple[str, ...] = BRANCHES):
+    """模型替身：骨架给 `branches`，生成那一次写出整棵树（每支两个要点）。
 
-    引用必须**照抄**而不是自己编：收尾的逐字校验会剔掉编造的引用，而这条用例要
-    验的正是"外部来源的引用活到了候选树上"。
+    生成调用**只发一次**——这正是这条路与分片的全部差别，用例据此断言。
+    引用照抄**本支**分组的第一个命中：收尾的逐字校验会剔掉编造的引用，而这条
+    用例要验的正是"证据的引用活到了候选树上"。
     """
     async def chat(system: str, user: str, *, max_tokens=None, on_delta=None) -> dict:
         if seen is not None:
             seen.append((system, user))
         if system.startswith(PLAN_PROMPT):
             return {"branches": list(branches)}
-        payload = _evidence_of(user)
-        refs = [_ref_from(payload[0])] if payload else []
-        return {"children": [
-            {"label": f"{_branch_of(user)}·一", "expandable": False, "source_refs": refs},
-            {"label": f"{_branch_of(user)}·二", "expandable": False},
-        ]}
+        groups = _evidence_groups(user)
+        children = []
+        for index, title in enumerate(branches):
+            payload = groups.get(title, [])
+            refs = [_ref_from(payload[0])] if payload else []
+            children.append({
+                "id": f"b{index}", "label": title, "children": [
+                    {"id": f"b{index}-1", "label": f"{title}·一", "detail": "一句说明。",
+                     "source_refs": refs},
+                    {"id": f"b{index}-2", "label": f"{title}·二", "detail": "另一句说明。"},
+                ],
+            })
+        return {"title": TOPIC, "root": {
+            "id": "root", "label": TOPIC, "detail": "中心主题", "children": children,
+        }}
     return chat
 
 
-# ---------------------------------------------------------------- 1. 注册表只有分片
+def _generate_users(seen: list[tuple[str, str]]) -> list[str]:
+    """所有非骨架的 user 消息（这条路只该有一条）。"""
+    return [user for system, user in seen if not system.startswith(PLAN_PROMPT)]
+
+
+# ---------------------------------------------------------------- 1. 注册表只有一次生成
 
 
 @pytest.mark.parametrize("has_sources", [False, True])
 @pytest.mark.parametrize("has_library", [False, True])
-def test_create_intent_offers_only_the_sliced_generator(has_sources, has_library):
+def test_create_intent_offers_only_the_single_call_generator(has_sources, has_library):
     """`create` 的生成工具**只有一个**，与来源/知识库无关。
 
-    早先这里是"按形态二选一"：`full` 下给整树、`rag` 下给分片。形态删掉之后，
-    任何一组入参都该得到同一个答案——留一条形态分支就会让"带材料的请求走哪条路"
-    重新变成一个需要读代码才能回答的问题。
+    早先这里是"按形态二选一"（`full` 给整树、`rag` 给分片），后来变成"只有分片"。
+    形态删掉之后，任何一组入参都该得到同一个答案——留一条形态分支就会让"带材料的
+    请求走哪条路"重新变成一个需要读代码才能回答的问题。
     """
     registry = build_registry("create", has_sources=has_sources,
                               has_library=has_library)
     names = registry.names()
     # 生成工具只有一个；除了它，`create` 只可能多一个 `rag_query`
     # （请求不带材料但库里有东西时，检索是模型唯一能碰到原文的入口）。
-    assert [name for name in names if "generate" in name] == ["mindmap_generate_deep"]
-    assert set(names) - {"mindmap_generate_deep"} <= {"rag_query"}
+    assert [name for name in names if "generate" in name] == ["mindmap_generate"]
+    assert set(names) - {"mindmap_generate"} <= {"rag_query"}
 
 
-def test_the_sliced_generator_is_the_only_create_tool_that_generates():
+def test_the_single_call_generator_is_the_only_create_tool_that_generates():
     """更硬的一条：`create` 的可选工具集里除了检索，只有它。"""
     names = build_registry("create", has_sources=True, has_library=True).names()
-    assert set(names) <= {"mindmap_generate_deep", "rag_query"}, names
+    assert set(names) <= {"mindmap_generate", "rag_query"}, names
+
+
+def test_the_sliced_generator_survives_but_is_not_registered_under_create():
+    """分片那条路**代码还在**，只是不挂在 `create` 上。
+
+    它服务的是"一次响应写不下 200+ 节点"的大图（见 `_generate_deep_spec` 的
+    docstring）。把它从代码里删掉与把它注册回 `create` 是两种不同的错：后者会让
+    真实用法（100% 无材料）重新变成 1+N 次调用与三十秒。
+    """
+    assert "mindmap_generate_deep" not in build_registry("create").names()
+    # 它仍然可以被显式调到（`create_deep` 是给这条路留的入口，不是产品意图）：
+    deep = build_registry("create_deep", has_library=False)
+    assert deep.names() == ["mindmap_generate_deep"]
 
 
 # ---------------------------------------------------------------- 2. 开关真的没了
@@ -257,9 +294,11 @@ def test_source_mode_switch_is_gone():
 
 
 def test_sourced_prompt_and_the_whole_tree_prompt_are_gone():
-    """整树那四份提示词不再导出：`create` 走的只有分片那三份。
+    """`full` 形态那四份提示词不再导出：`rag` 那个形态的正文入口永远不存在了。
 
-    名字同样拼起来写，理由见上一条。
+    名字同样拼起来写，理由见上一条。注意这条与"整树一次生成回来了"不冲突：
+    回来的是**一次生成这件事**，不是"正文整份塞进 prompt"那个形态——现在的整树
+    生成照样只吃检索命中（`_retrieve_branches`），一个字都不读全文。
     """
     gone = (
         "SOURCED_DETAIL" + "_PROMPT",
@@ -289,15 +328,15 @@ def test_no_material_goes_to_external_and_keeps_the_citation(monkeypatch):
     frames: list[tuple[str, str, int | None]] = []
 
     async def emit(frame) -> None:
-        # `_emit_stage` 交给消费者的是 `exclude_none=True` 的 dict（见 `_stage_frame`），
-        # 不是事件对象——这里按 dict 读，与前端收到的那一份同形。
+        # `_emit_stage` 交给消费者的是 `exclude_none=True` 的 dict，不是事件对象
+        # ——这里按 dict 读，与前端收到的那一份同形。
         if frame.get("type") == "stage":
             frames.append((frame["stage"], frame["detail"], frame.get("count")))
 
     ctx = _ctx()
     ctx.emit = emit
     seen: list[tuple[str, str]] = []
-    result = _run(ctx, _citable_chat(seen))
+    result = _run(ctx, _tree_chat(seen))
 
     assert result.ok, result.content
     # 进度帧：一帧开始（没有 count）、一帧结束（一定带 count，包括 0）。
@@ -306,12 +345,10 @@ def test_no_material_goes_to_external_and_keeps_the_citation(monkeypatch):
     assert stages[0][2] is None
     assert stages[1][2] == 1
 
-    # 外部正文进的是**检索命中**，不是 prompt 全文：system 里从来没有整份正文
-    # （"正文整份进 prompt"那条路已经不存在了）。
+    # 外部正文进的是**检索命中**，不是 prompt 全文：system 里从来没有整份正文。
     assert "二零二五年前完成一次摸底" not in "".join(system for system, _ in seen)
     # 不可信数据的声明必须在 system 里：它约束的是模型怎么对待这些内容。
-    system = next(system for system, user in seen if "本条一级分支：" in user)
-    assert "外部抓取的内容" in system
+    assert "外部抓取的内容" in seen[-1][0]
 
     refs = _all_refs(ctx.candidate.root)
     assert refs, "外部来源的引用被校验剔掉了"
@@ -324,11 +361,15 @@ def test_no_material_goes_to_external_and_keeps_the_citation(monkeypatch):
     assert "外部检索" in result.content
 
 
-def test_material_takes_the_sliced_path_and_never_asks_the_outside(monkeypatch):
-    """带材料 → 分片 + 按支检索；外部检索一次都不发。
+def test_material_takes_the_sliced_retrieval_and_never_asks_the_outside(monkeypatch):
+    """带材料 → 骨架读目录 + **每支各检索一次**；外部检索一次都不发。
 
     这条不是优化而是语义：用户上传了材料，"这次该依据什么"已经有答案，再去网上
     抓一份混进来，会让引用指向他自己没给过的来源。
+
+    "每支各检索一次"是这条路从分片那里继承来的**唯一**关键能力：退回一次主题
+    检索（top_k=5）时覆盖率对同一份 14,120 字材料只有 5.1%，而按支是 30.5%。
+    所以这里直接数检索调用次数，不只数证据条数。
     """
     monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
     forbidden: list[str] = []
@@ -336,24 +377,36 @@ def test_material_takes_the_sliced_path_and_never_asks_the_outside(monkeypatch):
         external_knowledge, "search_external",
         lambda *args, **kwargs: forbidden.append("called") or [])
 
+    calls: list[str] = []
+    real_search_branch = tools_module._search_branch
+
+    async def counting(sources, title, intents=()):
+        calls.append(title)
+        return await real_search_branch(sources, title, intents)
+
+    monkeypatch.setattr(tools_module, "_search_branch", counting)
+
     seen: list[tuple[str, str]] = []
     ctx = _ctx([_material()])
     # 分支标题必须对着材料自己的章节：这一条验的是"材料能被按支检索到"，
     # 用一组与材料无关的标题（比如`碳中和`那三条）只会得到三条空命中。
     material_branches = ("预算审批", "报销时限", "采购合规")
-    result = _run(ctx, _citable_chat(seen, material_branches))
+    result = _run(ctx, _tree_chat(seen, material_branches))
 
     assert result.ok, result.content
     assert forbidden == [], "请求自带材料时不该发外部请求"
     assert "external" not in result.data
+    # 检索次数 = 分支数，不是 1
+    assert calls == list(material_branches), calls
     # 骨架那一次看到了材料自带的章节（标题行，不是正文）
     plan_system, plan_user = seen[0]
     assert plan_system.startswith(PLAN_PROMPT)
     assert "预算审批" in plan_user
-    # 每支各检索一次：展开消息里有且只有自己的 evidence
-    expand_users = [user for _, user in seen if "本条一级分支：" in user]
-    assert len(expand_users) == len(material_branches)
-    assert all("evidence 数组）：" in user for user in expand_users)
+    # 生成只发一次，且它的 user 里有**三组**证据（按支分组，带归属）
+    generate_users = _generate_users(seen)
+    assert len(generate_users) == 1, generate_users
+    groups = _evidence_groups(generate_users[0])
+    assert set(groups) == set(material_branches), groups
     # 检索到的东西确实进了候选树的引用里（逐字校验之后仍在）
     refs = _all_refs(ctx.candidate.root)
     assert refs, (result.data["source_refs"], result.content)
@@ -371,20 +424,22 @@ def test_short_material_degrades_to_a_topic_hint(monkeypatch):
     monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "0")
     seen: list[tuple[str, str]] = []
     result = _run(_ctx([_material(SHORT_TEXT, source_id="s-short")]),
-                  _citable_chat(seen))
+                  _tree_chat(seen))
 
     assert result.ok, result.content
     assert "MATERIAL_TOO_SHORT" in _codes(result)
     assert result.data["material"]["degraded"] is True
     assert result.data["material"]["sources"] == 1
     assert result.data["material"]["chars"] == len(SHORT_TEXT)
-    # 那 8 个字没有被丢掉：它们进了骨架的 user 消息，只是不再产生证据。
+    # 那 8 个字没有被丢掉：它们进了骨架与生成两步的 user 消息，只是不再产生证据。
     plan_user = seen[0][1]
     assert SHORT_TEXT in plan_user
     assert "不足以作为可检索的材料" in plan_user
+    assert SHORT_TEXT in _generate_users(seen)[0]
     # 没有材料时 system 里必须说清"别写 source_refs"——否则模型凭习惯写出的引用
     # 会让整棵树因为 `source_usage` 为空被判 `tree_invalid`。
     assert "不要写 source_refs" in seen[0][0]
+    assert "不要写 source_refs" in seen[-1][0]
     assert "材料只有" in result.content
     assert "外部检索未开启" in result.content
     assert result.data["retrieval"]["mode"] == "off"
@@ -403,7 +458,7 @@ def test_short_material_is_topped_up_by_external_sources(monkeypatch):
     monkeypatch.setattr(external_knowledge, "search_external", search)
 
     ctx = _ctx([_material(SHORT_TEXT, source_id="s-short")])
-    result = _run(ctx, _citable_chat())
+    result = _run(ctx, _tree_chat())
 
     assert result.ok, result.content
     # 短材料的文字被并进了外部检索的查询词（换个用法，不是丢掉）
@@ -420,7 +475,7 @@ def test_external_empty_says_it_found_nothing(monkeypatch):
     monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
     monkeypatch.setattr(external_knowledge, "search_external", lambda *a, **k: [])
 
-    result = _run(_ctx(), _citable_chat())
+    result = _run(_ctx(), _tree_chat())
 
     assert result.ok, result.content
     assert "GENERATION_WITHOUT_EXTERNAL" in _codes(result)
@@ -438,7 +493,7 @@ def test_external_failure_is_reported_as_a_failure_not_as_absence(monkeypatch):
 
     monkeypatch.setattr(external_knowledge, "search_external", boom)
 
-    result = _run(_ctx(), _citable_chat())
+    result = _run(_ctx(), _tree_chat())
 
     assert result.ok, result.content
     assert "外部检索出错" in result.content
@@ -454,7 +509,7 @@ def test_external_switch_off_keeps_the_data_keyset(monkeypatch):
         external_knowledge, "search_external",
         lambda *args, **kwargs: forbidden.append("called") or [])
 
-    result = _run(_ctx(), _citable_chat())
+    result = _run(_ctx(), _tree_chat())
 
     assert result.ok, result.content
     assert forbidden == []

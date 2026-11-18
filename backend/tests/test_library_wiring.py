@@ -208,7 +208,7 @@ def test_registry_offers_rag_query_when_only_the_library_has_material():
     assert "rag_query" in names
     # 撤掉分片生成的**唯一**理由是"正文整份已经在 prompt 里"（`full` + 有来源）。
     # 请求没带材料时那个前提不成立，所以它必须还在。
-    assert "mindmap_generate_deep" in names
+    assert "mindmap_generate" in names
     # expand / edit 下没有生成工具，库照样给检索入口。
     assert "rag_query" in build_registry("expand").names()
     assert "rag_query" in build_registry("edit").names()

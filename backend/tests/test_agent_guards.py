@@ -481,7 +481,7 @@ def test_create_intent_still_gets_no_rag_query():
     模型查完只能自己在文字里复述，而每一支检索用的是**那支的标题**。
     查了→扔掉，白烧一次模型往返。预算从 8 到 50 不改变这件事。
     """
-    assert build_registry("create", has_sources=True, has_library=True).names() == [
+    assert build_registry("create_deep", has_sources=True, has_library=True).names() == [
         "mindmap_generate_deep",
     ]
     assert "rag_query" in build_registry("edit", has_sources=True,
