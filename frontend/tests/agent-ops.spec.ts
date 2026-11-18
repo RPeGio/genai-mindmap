@@ -31,8 +31,6 @@ function opsFrame(baseRevision: number, label: string, seq = 1) {
   };
 }
 
-const doneFrame = (payload: MindMapContent) => ({ type: 'done', seq: 9, content: payload });
-
 /**
  * 手动控制节奏的 SSE 响应。
  *
@@ -75,8 +73,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('ops 帧进候选', () => {
-  it('合法批次改的是候选，画布不动', async () => {
+describe('ops 帧进工作副本', () => {
+  it('增量帧只进工作副本，直到 done 才整树落地', async () => {
     const gate = controllableReply();
     stubFetch(() => gate.response);
     const store = useMindMapStore();
@@ -85,19 +83,22 @@ describe('ops 帧进候选', () => {
     const running = store.runGeneration('把甲改个名字', 'edit');
     gate.push(opsFrame(0, '改后的甲'));
 
-    await vi.waitFor(() => expect(store.candidate?.root.children[0].label).toBe('改后的甲'));
-    // 关键约束：增量帧只进候选，采纳仍然要用户点「应用」
+    await vi.waitFor(() => expect(store.status).toContain('已应用 1 条修改'));
+    // 关键约束：增量帧不直接改画布——一次生成可能十几批，每条都落地会把 25 秒的
+    // 中间态全摊给用户、撤销栈切成十几步半成品。
     expect(store.content?.root.children[0].label).toBe('甲');
     expect(store.dirty).toBe(false);
-    // 有东西在动，用户才相信这次运行真的在改
-    expect(store.status).toContain('已应用 1 条修改');
 
-    gate.push(doneFrame(content('改后的甲')));
+    // done 不带整树：说明这次落地用的是工作副本本身，正好验证增量真的拼上了。
+    gate.push({ type: 'done', seq: 2, content: null });
     gate.finish();
     await running;
+
+    expect(store.content?.root.children[0].label).toBe('改后的甲');
+    expect(store.dirty).toBe(true);
   });
 
-  it('base_revision 对不上的批次静默丢弃，候选保持原样', async () => {
+  it('base_revision 对不上的批次静默丢弃，工作副本保持原样', async () => {
     const gate = controllableReply();
     stubFetch(() => gate.response);
     const store = useMindMapStore();
@@ -105,22 +106,21 @@ describe('ops 帧进候选', () => {
 
     const running = store.runGeneration('把甲改个名字', 'edit');
     gate.push(opsFrame(0, '第一次改'));
-    await vi.waitFor(() => expect(store.candidate?.root.children[0].label).toBe('第一次改'));
+    await vi.waitFor(() => expect(store.status).toContain('已应用 1 条修改'));
 
     // 中间漏了一批（丢帧 / 乱序）：这一批的依据不是当前这棵树，套上去只会错位
     gate.push(opsFrame(5, '错位的一批', 2));
     // 等这一帧被消费：进了 agentEvents 就说明 switch 已经走过一遍
     await vi.waitFor(() => expect(store.agentEvents).toHaveLength(2));
 
-    // 静默丢弃：候选不变、不抛错、状态行也不改成报错
-    expect(store.candidate?.root.children[0].label).toBe('第一次改');
+    // 静默丢弃：不抛错、状态行也不改成报错
     expect(store.status).not.toContain('失败');
 
-    // 丢弃不会让这一轮跑崩，后续的 done 照常收尾
-    gate.push(doneFrame(content('最终结果')));
+    // 丢弃不会让这一轮跑崩，后续的 done 照常收尾（落地的是错位批次被丢掉的那棵树）
+    gate.push({ type: 'done', seq: 3, content: null });
     gate.finish();
     await expect(running).resolves.toBeUndefined();
-    expect(store.candidate?.root.label).toBe('最终结果');
+    expect(store.content?.root.children[0].label).toBe('第一次改');
   });
 });
 

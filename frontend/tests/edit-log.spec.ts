@@ -279,40 +279,38 @@ describe('store：事件攒到保存时提交', () => {
     });
   });
 
-  it('应用候选记成 agent，并带上那次 run 的 id', async () => {
+  it('生成落地带来的改动记成 agent，并带上那次 run 的 id', async () => {
     const store = useMindMapStore();
     store.preview(tree(), 'right');
     stubFetch(() => streamWithDone(content(node('root', '主题', [node('a', '改过的甲', [node('b', '乙')])]))));
 
     await store.runGeneration('把甲改个名', 'edit');
-    expect(store.acceptCandidate()).toBe('applied');
 
-    const changes = store.pendingEdits.filter(event => event.kind !== 'accept');
+    const changes = store.pendingEdits.filter(event => event.kind !== 'generate');
     expect(changes.length).toBeGreaterThan(0);
     expect(changes.every(event => event.actor === 'agent')).toBe(true);
     expect(changes[0].runId).toMatch(/^run-/);
     expect(changes[0].after).toBe('改过的甲');
   });
 
-  it('create 意图接受候选：一条 accept，changeCount 为 0', async () => {
-    // 整棵树不是 diff，但"接受"这个动作必须留痕——否则"一字未改"与"从没用过"
+  it('create 意图落地：一条 generate，nodeCount 是整棵树的节点数', async () => {
+    // 整棵树不是 diff，但"这次生成"必须留痕——否则"一字未改"与"从没用过"
     // 在表里是同一件事，而缺的正是那个分母。
     const store = useMindMapStore();
     stubFetch(() => streamWithDone(tree()));
 
     await store.runGeneration('做一张图', 'create');
-    expect(store.acceptCandidate()).toBe('applied');
 
     expect(store.pendingEdits).toHaveLength(1);
     expect(store.pendingEdits[0]).toMatchObject({
-      actor: 'user', kind: 'accept', changeCount: 0,
+      actor: 'agent', kind: 'generate', nodeCount: 3,
     });
     expect(store.pendingEdits[0].nodeId).toBeUndefined();
     expect(store.pendingEdits[0].field).toBeUndefined();
     expect(store.pendingEdits[0].runId).toMatch(/^run-/);
   });
 
-  it('expand 意图接受候选也记一条 accept，changeCount 是这次改动的条数', async () => {
+  it('expand 意图也记一条 generate，nodeCount 是落地后整棵树的节点数', async () => {
     const store = useMindMapStore();
     store.preview(tree(), 'right');
     store.select('a');
@@ -320,40 +318,38 @@ describe('store：事件攒到保存时提交', () => {
     stubFetch(() => streamWithDone(grown));
 
     await store.runGeneration('展开甲', 'expand');
-    expect(store.acceptCandidate()).toBe('applied');
 
-    const accepts = store.pendingEdits.filter(event => event.kind === 'accept');
-    expect(accepts).toHaveLength(1);
-    expect(accepts[0].actor).toBe('user');
-    // 新增一个子节点 = 1 条 add，加上 accept 自己两条事件。
-    expect(accepts[0].changeCount).toBe(1);
+    const generates = store.pendingEdits.filter(event => event.kind === 'generate');
+    expect(generates).toHaveLength(1);
+    expect(generates[0].actor).toBe('agent');
+    // 分母数的是"这次落进画布的那棵树有几个节点"，不是"新加了几个"——
+    // 后者只有 add 事件知道，而分母要跨 create / expand / edit 三种意图可比。
+    expect(generates[0].nodeCount).toBe(4);
     expect(store.pendingEdits).toHaveLength(2);
     expect(store.pendingEdits[0]).toMatchObject({ actor: 'agent', kind: 'add' });
   });
 
-  it('edit 意图接受一份"什么都没改"的候选：仍然记一条 accept(0)', async () => {
-    // 用户点了应用，模型交回来的树一模一样。这也是"用户接受了生成结果"的一次真实
-    // 观测，跳过它等于把正样本删掉。
+  it('edit 意图什么都没改：别的没有，但 generate 仍然记一条', async () => {
+    // 模型交回来的树一模一样。这也是"用户接受了生成结果"的一次真实观测，
+    // 跳过它等于把正样本删掉——后端那条 `untouched_runs` 就是数它的。
     const store = useMindMapStore();
     store.preview(tree(), 'right');
     stubFetch(() => streamWithDone(tree()));
 
     await store.runGeneration('什么也别改', 'edit');
-    expect(store.acceptCandidate()).toBe('applied');
 
     expect(store.pendingEdits).toHaveLength(1);
     expect(store.pendingEdits[0]).toMatchObject({
-      actor: 'user', kind: 'accept', changeCount: 0,
+      actor: 'agent', kind: 'generate', nodeCount: 3,
     });
   });
 
-  it('accept 与它带来的改动共享同一个 at', async () => {
+  it('generate 与它带来的改动共享同一个 at', async () => {
     const store = useMindMapStore();
     store.preview(tree(), 'right');
     stubFetch(() => streamWithDone(content(node('root', '主题', [node('a', '改过的甲', [node('b', '乙')])]))));
 
     await store.runGeneration('把甲改个名', 'edit');
-    store.acceptCandidate();
 
     // 同一个 at 是"这次操作产生了哪几条事件"的唯一分组依据（GROUP BY at）。
     expect(new Set(store.pendingEdits.map(event => event.at)).size).toBe(1);
@@ -483,21 +479,38 @@ describe('store：事件攒到保存时提交', () => {
     });
   });
 
-  it('accept 的 change_count 以 snake_case 进请求体', async () => {
+  it('generate 的 node_count 以 snake_case 进请求体', async () => {
     const store = useMindMapStore();
     stubFetch(() => streamWithDone(tree()));
     await store.runGeneration('做一张图', 'create');
-    store.acceptCandidate();
 
     stubFetch(() => jsonResponse(RECORD));
     await store.save();
 
     const post = calls.find(call => call.method === 'POST')!;
     // 后端 `EditEventIn` 是 `extra="forbid"`：字段名漂移的表现是保存直接 422，
-    // 所以这一条只能靠"请求体里真的叫 change_count"来钉。
+    // 所以这一条只能靠"请求体里真的叫 node_count"来钉。
     expect((post.body.events as Record<string, unknown>[])[0]).toMatchObject({
-      actor: 'user', kind: 'accept', change_count: 0,
+      actor: 'agent', kind: 'generate', node_count: 3,
     });
+  });
+
+  it('保存成功之后上报"这份结果被存了"', async () => {
+    const store = useMindMapStore();
+    stubFetch(() => streamWithDone(tree()));
+    await store.runGeneration('做一张图', 'create');
+    const runId = store.pendingEdits[0].runId!;
+
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return jsonResponse(RECORD);
+    }));
+    await store.save();
+
+    // `applied_at` 现在的语义是"被保存下来了"：它是"下次进页面还要不要提醒"
+    // 的唯一判据（`runs.pending`），所以必须由保存成功这条路打点。
+    expect(urls).toContain(`/api/agent/runs/${runId}/applied`);
   });
 
   it('撤销与重做不产生事件', () => {

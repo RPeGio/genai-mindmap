@@ -1,8 +1,11 @@
 /**
  * 「上次的运行结果」：run 身份落到界面上的那一条链路。
  *
- * 验的是"这张表有没有人读"——`runs` 里的候选若没人捡，那四十秒只是从内存白花
- * 变成写进数据库白花。所以这里从探测一直走到"应用后上报"，四步都钉住。
+ * 验的是"这张表有没有人读"——`runs` 里的结果若没人捡，那四十秒只是从内存白花
+ * 变成写进数据库白花。所以这里从探测一直走到"载入 → 保存 → 上报已保存"。
+ *
+ * 注意这里没有"候选"这个中间层：生成结果当时**已经进了画布**（只是没保存），
+ * 所以「载入」是把它装回画布（可撤销），不是"把一份提案摆出来等用户点应用"。
  */
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
@@ -17,7 +20,7 @@ vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
   default: { name: 'MindMapCanvasStub', template: '<div data-test="canvas" />' },
 }));
 
-const CANDIDATE: MindMapContent = {
+const RESULT: MindMapContent = {
   title: '上次那张图',
   root: {
     id: 'r',
@@ -35,13 +38,12 @@ function summary(overrides: Partial<RunSummary> = {}): RunSummary {
     created_at: '2024-01-01T03:00:00Z',
     updated_at: '2024-01-01T03:12:00Z',
     applied_at: null,
-    dismissed_at: null,
     ...overrides,
   };
 }
 
 function detail(overrides: Partial<RunDetail> = {}): RunDetail {
-  return { ...summary(), candidate: CANDIDATE, mode: 'model', failure: null, ...overrides };
+  return { ...summary(), candidate: RESULT, mode: 'model', failure: null, ...overrides };
 }
 
 interface Call {
@@ -58,8 +60,17 @@ function stubFetch(routes: {
   const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, method: init?.method ?? 'GET' });
-    if (url.endsWith('/applied') || url.endsWith('/dismissed')) {
+    if (url.endsWith('/applied')) {
       return { ok: true, status: 204, json: async () => ({}) } as unknown as Response;
+    }
+    if (url.includes('/api/mindmaps')) {
+      // 保存：回一条记录，让 `reportRunSaved()` 真的走到
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          id: 'map-new', version: 1, content: RESULT, updated_at: '2024-01-01T04:00:00Z',
+        }),
+      } as unknown as Response;
     }
     if (url.includes('/agent/runs/')) {
       const found = routes.detail === undefined ? detail() : routes.detail;
@@ -99,7 +110,7 @@ afterEach(() => {
 });
 
 describe('上次的运行结果', () => {
-  it('有"完成了但没应用"的运行 → 提示一句，不弹窗', async () => {
+  it('有"生成了但没保存"的运行 → 提示一句，不弹窗', async () => {
     stubFetch({ list: [summary()] });
     const wrapper = mountApp();
 
@@ -107,14 +118,14 @@ describe('上次的运行结果', () => {
     await flushPromises();
 
     const notice = wrapper.get(NOTICE);
-    expect(notice.text()).toContain('还没有应用到画布');
+    expect(notice.text()).toContain('还没保存');
     expect(notice.text()).toContain('机器学习');
-    expect(buttonByText(wrapper, '查看')).toBeTruthy();
+    expect(buttonByText(wrapper, '载入')).toBeTruthy();
     // 提示是页面上的一行字，不是遮挡界面的对话框。
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
   });
 
-  it('被中断但已经产出草稿的那次同样提醒，措辞与"完成了"分开', async () => {
+  it('被中断但已经产出结果的那次同样提醒，措辞与"完成了"分开', async () => {
     stubFetch({ list: [summary({ run_id: 'run-cancel', status: 'cancelled' })] });
     const wrapper = mountApp();
 
@@ -123,7 +134,7 @@ describe('上次的运行结果', () => {
 
     const text = wrapper.get(NOTICE).text();
     expect(text).toContain('被中断');
-    expect(text).not.toContain('生成完成了');
+    expect(text).not.toContain('生成完的导图还没保存');
   });
 
   it('没有待处理的结果时不出现提示', async () => {
@@ -150,42 +161,49 @@ describe('上次的运行结果', () => {
     expect(wrapper.text()).not.toContain('服务挂了');
   });
 
-  it('点「查看」把候选载入现有的确认流程：面板出现，画布不动', async () => {
+  it('点「载入」把上次的结果直接装进画布，可撤销', async () => {
     const calls = stubFetch({ list: [summary()] });
     const wrapper = mountApp();
     const store = useMindMapStore();
 
     await store.probeResumableRun();
     await flushPromises();
-    await buttonByText(wrapper, '查看').trigger('click');
+    await buttonByText(wrapper, '载入').trigger('click');
     await flushPromises();
 
     expect(calls.some(call => call.url.endsWith('/api/agent/runs/run-abc'))).toBe(true);
-    // 载入的是候选，不是画布：用户还没点「应用」。
-    expect(store.candidate?.title).toBe('上次那张图');
-    expect(store.content).toBeNull();
-    expect(buttonByText(wrapper, '应用到画布')).toBeTruthy();
-    // 提示消失：候选已经在面板上等着确认，留着只会问两遍。
+    // 没有"确认"这一步了：点载入就是明确要它，再让他点一次「应用」是把同一个
+    // 意图问第二遍。但它仍然走 `commitGenerated`，所以撤销栈一步不少。
+    expect(store.content?.title).toBe('上次那张图');
+    expect(store.dirty).toBe(true);
+    expect(store.canUndo).toBe(true);
+    // 提示消失：结果已经在画布上，留着只会问两遍。
     expect(wrapper.find(NOTICE).exists()).toBe(false);
   });
 
-  it('从上次的候选点「应用」后上报 applied；不影响画布内容', async () => {
+  it('载入之后保存，才上报 applied', async () => {
     const calls = stubFetch({ list: [summary()] });
     const wrapper = mountApp();
     const store = useMindMapStore();
 
     await store.probeResumableRun();
     await flushPromises();
-    await buttonByText(wrapper, '查看').trigger('click');
+    await buttonByText(wrapper, '载入').trigger('click');
     await flushPromises();
-    await buttonByText(wrapper, '应用到画布').trigger('click');
+
+    // 载入本身不写"已保存"：它只是把树放进画布，用户还没存。
+    expect(calls.some(call => call.url.endsWith('/applied'))).toBe(false);
+
+    await store.save();
     await flushPromises();
 
     expect(store.content?.title).toBe('上次那张图');
+    // `applied_at` 现在的语义就是"这份结果被存下来了"，它是下次进页面要不要
+    // 提醒的唯一判据——所以必须由保存成功这条路打点。
     expect(calls.some(call => call.url.endsWith('/applied') && call.method === 'POST')).toBe(true);
   });
 
-  it('点「丢弃」既消掉提示也告诉服务端，下次进页面不再问', async () => {
+  it('点「不用了」只在本会话静音，不写库', async () => {
     const calls = stubFetch({ list: [summary()] });
     const wrapper = mountApp();
     const store = useMindMapStore();
@@ -196,8 +214,10 @@ describe('上次的运行结果', () => {
     await flushPromises();
 
     expect(wrapper.find(NOTICE).exists()).toBe(false);
-    expect(store.candidate).toBeNull();
-    expect(calls.some(call => call.url.endsWith('/dismissed') && call.method === 'POST')).toBe(true);
+    expect(store.content).toBeNull();
+    // `dismissed_at` 那一列已经删掉：没有"丢弃候选"这个动作，也就没有要上报的
+    // 东西。界面上不再问，是一件纯本地的事。
+    expect(calls.some(call => call.url.includes('/dismissed'))).toBe(false);
 
     // 再探一次也不再冒出来：这次会话里已经明确说过"不要"。
     await store.probeResumableRun();
@@ -205,17 +225,18 @@ describe('上次的运行结果', () => {
     expect(wrapper.find(NOTICE).exists()).toBe(false);
   });
 
-  it('详情里没有候选时给一句实话，而不是塞一棵空树', async () => {
+  it('详情里没有结果时给一句实话，而不是塞一棵空树', async () => {
     stubFetch({ list: [summary()], detail: detail({ candidate: null }) });
     const wrapper = mountApp();
     const store = useMindMapStore();
 
     await store.probeResumableRun();
     await flushPromises();
-    await buttonByText(wrapper, '查看').trigger('click');
+    await buttonByText(wrapper, '载入').trigger('click');
     await flushPromises();
 
-    expect(store.candidate).toBeNull();
+    expect(store.content).toBeNull();
+    expect(store.generatedSummary).toBeNull();
     expect(wrapper.get('[role="status"]').text()).toContain('没有留下可用的内容');
   });
 });
@@ -229,7 +250,7 @@ describe('运行身份', () => {
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(encoder.encode(
-            `data: ${JSON.stringify({ type: 'done', seq: 1, content: CANDIDATE, mode: 'model' })}\n\n`));
+            `data: ${JSON.stringify({ type: 'done', seq: 1, content: RESULT, mode: 'model' })}\n\n`));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           controller.close();
         },
@@ -239,10 +260,10 @@ describe('运行身份', () => {
 
     const store = useMindMapStore();
     await store.runGeneration('机器学习', 'create');
-    store.discardCandidate();
+    // 第二次生成：画布上已经有上一轮的结果，这时是新的一轮（新 run_id）
     await store.runGeneration('机器学习', 'create');
 
-    // 只看开流那两条：中间的"丢弃上报"是另一回事（它没有请求体）。
+    // 只看开流那两条：别的一概不管（它们没有请求体）。
     const streams = calls.filter(call => call.url.endsWith('/agent/runs/stream'));
     const [first, second] = streams.map(call => (call.body as { run_id?: string }).run_id);
     expect(first).toMatch(/^[A-Za-z0-9_.-]+$/);

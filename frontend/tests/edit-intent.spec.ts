@@ -453,7 +453,7 @@ describe('候选 diff 的范围标记', () => {
     store.select('a');
     await store.runGeneration('给甲补一个子节点', 'edit');
 
-    const changes = store.candidateDiff!;
+    const changes = store.generatedChanges!;
     const added = changes.find(item => item.kind === 'added')!;
     expect(added.id).toBe('a1');
     expect(added.inSelection).toBe(true);

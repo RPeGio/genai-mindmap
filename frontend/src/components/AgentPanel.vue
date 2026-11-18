@@ -4,15 +4,20 @@ import { computed } from 'vue';
 import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
 
 /**
- * agent 运行面板：工具进度、候选骨架、候选确认、丢弃。
+ * agent 运行面板：工具进度、生成中的预览、生成落地之后"改了什么"、以及冲突裁决。
  *
- * 候选**不会自动应用**。这是这次改造的核心约束：模型算出来的是一份提案，
- * 用户点「应用」才算数。自动应用等于把「重新生成冲掉我的编辑」换个说法重演。
+ * **没有「应用」这一步了**：生成结果直接进画布并标成未保存（见 `store.commitGenerated`）。
+ * 于是这个面板的职责从"让你确认一份提案"变成了"告诉你刚才发生了什么、以及怎么退回去"：
+ * 生成中显示在长什么，生成完显示改了几处，想反悔就有「回到生成前」。
  */
 const store = useMindMapStore();
 
 const visible = computed(() =>
-  store.agentRunning || store.candidate !== null || store.agentEvents.length > 0 || !!store.agentError,
+  store.agentRunning
+  || store.generatedSummary !== null
+  || store.conflictDraft !== null
+  || store.agentEvents.length > 0
+  || !!store.agentError,
 );
 
 /** 毫秒 → 「4.3 秒」。把 4341ms 直接摆给用户看是工程口吻。 */
@@ -77,13 +82,6 @@ const calls = computed<ToolRow[]>(() => {
   return order.map(id => byId.get(id)!);
 });
 
-/** 候选骨架里的一条一级分支。 */
-interface CandidateBranch {
-  id: string;
-  label: string;
-  children: number;
-}
-
 /**
  * 外部检索那一行：取**最后一条** `external_search` 阶段帧。
  *
@@ -101,22 +99,6 @@ const searchNote = computed(() => {
   }
   return null;
 });
-
-/** 最多列几条分支：再往下列就不是"先看一眼"，而是让用户读长文了。 */
-const BRANCH_LIMIT = 12;
-
-const branches = computed<CandidateBranch[]>(() => {
-  const root = store.candidate?.root;
-  if (!root) return [];
-  return root.children.map(child => ({
-    id: child.id,
-    label: child.label,
-    children: child.children.length,
-  }));
-});
-
-const shownBranches = computed(() => branches.value.slice(0, BRANCH_LIMIT));
-const hiddenBranches = computed(() => branches.value.length - shownBranches.value.length);
 
 /** 生长中的预览里的一行。层级摊平成缩进，模板里就不用递归组件。 */
 interface PreviewRow {
@@ -164,27 +146,39 @@ const previewTitle = computed(() => {
   return expand ? '上次展开中断时的预览' : '上次生成中断时的预览';
 });
 
-const canAccept = computed(() => store.candidate !== null && !store.agentRunning);
-
 /**
- * 待确认候选相对画布的改动清单（`edit` / `expand` 意图）。
+ * 「已完成」那一行说的话。
  *
- * `null` 表示"没有可比基线"（`create` 是一整张新图，谈差异无从谈起），
- * 空数组表示"算出来了，但一处都没改"——两者必须分开：前者要显示"这是新图"，
- * 后者要显示"这次什么都没改"，否则用户面对一个"候选已就绪"看不出该不该点。
+ * 三个信息缺一不可：`nodes` 是这次落进画布的规模，`changes` 是改了几处（`null` 表示
+ * 画布本来是空的，整棵树都是新的——那时说"改了 0 处"是误导），外加"还没保存"。
  */
-const diff = computed<ScopedChange[] | null>(() => store.candidateDiff);
+const resultLine = computed(() => {
+  const summary = store.generatedSummary;
+  if (!summary) return '';
+  const shape = `已落到画布 · ${summary.nodes} 个节点`;
+  if (summary.changes === null) return `${shape}（整张新图）`;
+  return summary.changes === 0 ? `${shape} · 一处都没改` : `${shape} · 改了 ${summary.changes} 处`;
+});
 
 /**
- * 这一轮「改这张图」是不是带着选区发出去的。
+ * 这次生成改了什么。
  *
- * 为空表示"没圈任何节点"（或候选是从服务端捡回来的，见 `resumeRun`）——那时
+ * `null` 表示"没有可比基线"（画布本来是空的），空数组表示"算出来了，一处都没改"
+ * ——两者必须分开：前者不该显示清单，后者要显示"这次什么都没改"。它是**落地那一刻
+ * 冻结**的快照（`store.generatedChanges`），用户之后改画布不会改写它。
+ */
+const diff = computed<ScopedChange[] | null>(() => store.generatedChanges);
+
+/**
+ * 这次生成是不是带着选区发出去的。
+ *
+ * 为空表示"没圈任何节点"（或结果是从服务端捡回来的，见 `resumeRun`）——那时
  * 「范围内/外」不成立，标记整片不显示。没选区却显示一个"范围外"，是纯粹的噪音，
  * 还会让人以为模型越权了。
  */
-const showScope = computed(() => store.candidateSelection.length > 0);
+const showScope = computed(() => store.generationSelection.length > 0);
 
-/** 改动清单最多列几条：再往下列就不是"确认一下"，而是让用户读变更日志。 */
+/** 改动清单最多列几条：再往下列就不是"看一眼改了什么"，而是让用户读变更日志。 */
 const DIFF_LIMIT = 8;
 
 /**
@@ -215,10 +209,10 @@ const outScopeCount = computed(() => (diff.value?.length ?? 0) - inScopeCount.va
 const scopeSummary = computed(() => {
   if (!showScope.value) return '';
   const total = diff.value?.length ?? 0;
-  const head = `带着「已选 ${store.candidateSelection.length} 个节点」发起：`
+  const head = `带着「已选 ${store.generationSelection.length} 个节点」发起：`
     + `${total} 处改动里 ${inScopeCount.value} 处在选中范围内`;
   return outScopeCount.value > 0
-    ? `${head}，${outScopeCount.value} 处改到了范围外——那是模型判断必须一起动的地方，看一眼再应用。`
+    ? `${head}，${outScopeCount.value} 处改到了范围外——那是模型判断必须一起动的地方，看一眼对不对。`
     : `${head}，没有改到范围外。`;
 });
 
@@ -257,9 +251,9 @@ const OUT_SCOPE_CLASS = 'bg-rose-50 text-rose-600 ring-1 ring-rose-200';
 /**
  * 点一条改动就跳到那个节点。
  *
- * 新增的节点在画布上还不存在（画布画的是已应用的 `content`），`locate` 会静默
- * 不选中它——这是刻意的：为了跳转方便就往 `content` 里塞一个预览节点，等于让
- * "画布上有什么"和"用户的作品是什么"分叉。
+ * 删除的节点已经不在画布上了，`locate` 会静默不选中它——这是刻意的：为了跳转方便
+ * 就往 `content` 里塞一个已删除的节点，等于让"画布上有什么"和"用户的作品是什么"
+ * 分叉。
  */
 function jumpTo(id: string) {
   store.locate(id);
@@ -280,11 +274,12 @@ const modelText = computed(() => {
   }
   return null;
 });
+
 /**
  * 结果不完整的证据：partial 标记单独摆在标题行，诊断逐条列 message。
  *
  * 后端在 `ok=true` 的同时给出这些信息，界面只认 ok 的话，「3 个分支失败」
- * 和「全部成功」长得一模一样，用户点完接受才发现树缺了一块。
+ * 和「全部成功」长得一模一样——而树已经在画布上了，用户改到一半才发现某几支是空的。
  */
 const partialWarning = computed(
   () => store.agentWarnings.find(item => item.kind === 'partial') ?? null,
@@ -296,12 +291,17 @@ const DIAGNOSTIC_LIMIT = 3;
 const shownDiagnostics = computed(() => diagnostics.value.slice(0, DIAGNOSTIC_LIMIT));
 const hiddenDiagnostics = computed(() => diagnostics.value.length - shownDiagnostics.value.length);
 
-function accept() {
-  store.acceptCandidate();
+/**
+ * 冲突裁决：`generated` = 用模型的结果，`mine` = 保留画布。
+ *
+ * 这条分支正常永远不出现（生成期间画布被 `busy` 锁着），它是数据要丢时的兜底。
+ */
+function resolve(choice: 'generated' | 'mine') {
+  store.resolveConflict(choice);
 }
 
-function discard() {
-  store.discardCandidate();
+function undoGenerate() {
+  store.undoGenerate();
 }
 
 function cancel() {
@@ -316,7 +316,9 @@ function cancel() {
     aria-label="模型协作进度"
   >
     <div class="flex items-center justify-between">
-      <h3 class="font-medium text-slate-700">模型协作</h3>
+      <h3 class="font-medium text-slate-700">
+        {{ store.agentRunning ? '正在生成' : '模型协作' }}
+      </h3>
       <button
         v-if="store.agentRunning"
         type="button"
@@ -368,7 +370,7 @@ function cancel() {
       </details>
     </div>
 
-    <!-- 部分完成与诊断：放在候选上方，用户先看到"这棵树不完整"，再决定接不接受。 -->
+    <!-- 部分完成与诊断：放在结果上方，用户先看到"这棵树不完整"，再去改。 -->
     <div
       v-if="store.agentWarnings.length"
       role="status"
@@ -389,9 +391,9 @@ function cancel() {
     </div>
 
     <!-- 生成中的预览：节点边跑边上屏，用户先看清树在往哪个方向长。
-         它和候选是两份内容——预览没经过整树校验，最终以候选为准。 -->
+         它和最终结果可能不一致（分片失败会被裁掉），那一句就写在块尾。 -->
     <details
-      v-if="store.agentPreview && !store.candidate"
+      v-if="store.agentPreview"
       open
       class="mt-2 rounded bg-white px-2 py-1"
     >
@@ -428,46 +430,70 @@ function cancel() {
       <p v-if="hiddenPreview > 0" class="mt-1 text-[11px] text-slate-400">
         ……还有 {{ hiddenPreview }} 个节点
       </p>
-      <p class="mt-1 text-[11px] text-slate-400">这是生成过程中的预览，以最终候选为准。</p>
+      <p class="mt-1 text-[11px] text-slate-400">这是生成过程中的预览，以落进画布的结果为准。</p>
     </details>
 
-    <!-- 候选骨架：让用户在点「应用」之前先看清这棵树长什么样，而不是盲点。 -->
-    <details v-if="store.candidate" open class="mt-2 rounded bg-white px-2 py-1">
-      <summary class="cursor-pointer font-medium text-slate-700">候选（未应用）</summary>
-      <p class="mt-1 break-words font-medium text-slate-700">{{ store.candidate.root.label }}</p>
-      <ul
-        v-if="shownBranches.length"
-        class="mt-1 flex flex-col gap-0.5 text-[11px] leading-relaxed text-slate-600"
-      >
-        <li v-for="branch in shownBranches" :key="branch.id" class="break-words">
-          {{ branch.label }}
-          <span class="text-slate-400">（{{ branch.children }} 个子节点）</span>
-        </li>
-      </ul>
-      <p v-else class="mt-1 text-[11px] text-slate-400">只有根节点，没有分支。</p>
-      <p v-if="hiddenBranches > 0" class="mt-1 text-[11px] text-slate-400">
-        ……还有 {{ hiddenBranches }} 个分支
-      </p>
-    </details>
+    <!-- 冲突裁决：生成期间画布变了（`undo` 之类绕过 busy 闸门的入口），两棵树都留着。 -->
+    <div
+      v-if="store.conflictDraft"
+      role="alertdialog"
+      data-test="generate-conflict"
+      class="mt-2 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 leading-relaxed text-amber-900"
+    >
+      <p class="font-medium">生成期间你改过这张图</p>
+      <p class="mt-1 text-[11px]">两棵树都还在。用模型的结果会覆盖你的改动（覆盖之后仍可撤销），保留你的就丢掉这次生成。</p>
+      <div class="mt-2 flex gap-2">
+        <button
+          type="button"
+          class="rounded-md bg-slate-900 px-3 py-1.5 text-white"
+          @click="resolve('generated')"
+        >用模型的结果</button>
+        <button
+          type="button"
+          class="rounded-md border border-slate-300 px-3 py-1.5 text-slate-700"
+          @click="resolve('mine')"
+        >保留我的</button>
+      </div>
+    </div>
 
     <!--
-      这次改动：`edit` / `expand` 意图的候选是"在当前树上的改动"，而画布优先渲染
-      已应用的那棵树（用户的作品），所以候选节点根本不在画布上。没有这份清单，
-      用户面对「候选已就绪」只能盲点「应用」——他不知道 agent 动了哪几个节点。
-      清单是**对比两份树算出来的**（`stores/mindmap.diffCandidate`），不是按收到的
-      op 帧记账：op 帧可能丢、也可能被主动丢弃，而"树到底哪里不一样"永远算得出来。
+      生成结果已经落到画布（没有「应用」这一步了）。这里只说三件事：落了多大、
+      改了几处、以及怎么退回去。原因：画布整棵树换了一遍，不做说明的话用户只知道
+      "我的图变了"，却不知道变在哪、能不能反悔。
+    -->
+    <div
+      v-if="store.generatedSummary && !store.conflictDraft"
+      role="status"
+      data-test="generate-done"
+      class="mt-2 flex flex-col gap-1 rounded bg-white px-2 py-1.5"
+    >
+      <p class="font-medium text-slate-700">{{ resultLine }}</p>
+      <p class="text-[11px] text-slate-500">还没保存。可以直接改，也可以退回生成之前。</p>
+      <button
+        v-if="store.canUndoGenerate"
+        type="button"
+        data-test="undo-generate"
+        class="self-start rounded-md border border-slate-300 px-3 py-1.5 text-slate-700"
+        @click="undoGenerate"
+      >回到生成之前</button>
+    </div>
+
+    <!--
+      这次生成改了什么。清单是**对比两份树算出来的**（`stores/mindmap.diffCandidate`），
+      不是按收到的 op 帧记账：op 帧可能丢、也可能被主动丢弃，而"树到底哪里不一样"
+      永远算得出来。
     -->
     <details
-      v-if="store.candidate && diff"
+      v-if="diff"
       open
       class="mt-2 rounded bg-white px-2 py-1"
       aria-label="这次改动"
     >
       <summary class="cursor-pointer font-medium text-slate-700">
-        这次改动（{{ diff.length }} 处）
+        这次改了什么（{{ diff.length }} 处）
       </summary>
       <p v-if="!diff.length" class="mt-1 text-[11px] text-slate-400">
-        候选和当前画布一模一样，没有改动。
+        和生成之前一模一样，模型一处都没改。
       </p>
       <ul v-else class="mt-1 flex flex-col gap-1 text-[11px] leading-relaxed">
         <li v-for="item in shownDiff" :key="`${item.kind}:${item.id}`" class="break-words">
@@ -499,21 +525,5 @@ function cancel() {
         {{ scopeSummary }}
       </p>
     </details>
-
-    <div v-if="canAccept" class="mt-2 flex flex-col gap-1">
-      <p class="leading-relaxed text-slate-600">候选已就绪，应用后才会改动画布。</p>
-      <div class="flex gap-2">
-        <button
-          type="button"
-          class="rounded-md bg-slate-900 px-3 py-1.5 text-white"
-          @click="accept"
-        >应用到画布</button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-slate-700"
-          @click="discard"
-        >丢弃</button>
-      </div>
-    </div>
   </section>
 </template>

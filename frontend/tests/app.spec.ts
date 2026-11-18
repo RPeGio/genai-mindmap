@@ -125,7 +125,7 @@ describe('App', () => {
     expect(agentUrls(fetchMock)).toEqual([]);
     expect(wrapper.get('[data-test="intent-box"]').text()).toContain('写一个主题，或者先在左侧添加材料');  });
 
-  it('点生成把请求打到 agent 路由，候选不自动落画布', async () => {
+  it('点生成把请求打到 agent 路由，结果直接落画布', async () => {
     const fetchMock = vi.fn(async () => streamReply([
       { type: 'stage', seq: 1, stage: '准备' },
       doneFrame('model'),
@@ -139,24 +139,23 @@ describe('App', () => {
     // 生成只剩这一条通道
     await vi.waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith('/api/agent/runs/stream', expect.anything()));
-    // 候选要用户点「应用」才算数：画布可以先预览它，但 content 必须还是空的
-    await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
-    expect(useMindMapStore().content).toBeNull();
+    // 没有「应用」这一步了：done 一到树就进画布，并标成未保存
+    await vi.waitFor(() => expect(useMindMapStore().content).not.toBeNull());
+    expect(useMindMapStore().dirty).toBe(true);
+    expect(wrapper.text()).not.toContain('应用到画布');
   });
 
   it.each([
     { mode: 'model' as const, badge: '模型生成' },
     { mode: 'demo' as const, badge: '演示模式（非 AI 生成）' },
-  ])('接受候选后按 done 帧的 $mode 显示来源徽标', async ({ mode, badge }) => {
+  ])('落地后按 done 帧的 $mode 显示来源徽标', async ({ mode, badge }) => {
     // 演示模式产出的是一棵占位树，界面不能替它贴上"模型生成"。
-    // 来源只有 done 帧说得准，所以整条链路（帧 → 候选 → 接受 → 徽标）一起验。
+    // 来源只有 done 帧说得准，所以整条链路（帧 → 落地 → 徽标）一起验。
     vi.stubGlobal('fetch', vi.fn(async () => streamReply([doneFrame(mode)])));
     const wrapper = mountApp();
 
     await wrapper.get(INTENT).setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
-    await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
-    await buttonByText(wrapper, '应用到画布').trigger('click');
 
     await vi.waitFor(() => expect(wrapper.text()).toContain('3 个节点'));
     expect(wrapper.text()).toContain(badge);

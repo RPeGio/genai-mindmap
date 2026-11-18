@@ -23,11 +23,16 @@ mindmaps.repository → contracts` 就成环了，只能靠函数内 import 打�
     一整棵被删的子树，不是每个后代各一条——否则 depth 2…5 各留几条，看起来"每层
     都在被删"，真实动作却只有一个。加列之前的老数据是 `NULL`（当时没记），统计把
     它们单列成 `removed_subtree["size_unknown"]`，**不**当成 1。
-  - **`kind="accept"` 是一次"应用候选"，不是改动。** 每次接受记一条，`change_count`
-    是这次接受带来的改动条数，`0` = 一字未改。没有它，"生成完一字不改直接保存"在
-    表里是 0 行，与"用户从没用过"不可区分——缺的不是样本而是分母，偏差永远朝
-    "生成质量更差"。它复用 `after` 会把计数伪装成文本摘要（`CAST(after AS INTEGER)`
-    对每条文字摘要静默返回 0），所以用一个独立的整数列。
+  - **`kind="generate"` 是"一次生成落到了画布上"，不是改动。** 每次生成完成记一条，
+    `node_count` 是这次落进画布的那棵树有几个节点——**在生成完成那一刻定死**，不是
+    保存时数：用户改完之后树上的节点数已经变了，那数出来的是"改后的规模"。
+    它就是统计的分母：`SUM(node_count) WHERE kind='generate'`。
+    `change_count` 曾经承担过"这次接受带来几处改动"，现在不用了——"这次生成有没有
+    被改"只要看同一个 `run_id` 下有没有改动事件就够了，不需要前端算好塞进来。
+  - **`kind="accept"` 保留在字面量里，但已不再写入。** 它是"应用候选"那个动作的
+    遗迹：候选层删掉之后没有"应用"这一步，新数据一律是 `generate`。留着它是因为
+    库里已有几千行历史（`by_kind` 要能读到它们），而老前端还会发——拒收会让一次
+    真实保存失败，代价方向错了。
   - **时间有两个。** `at` 是前端说的事件时刻（可能漂移：用户改系统时间、页面开了
     很久），`recorded_at` 是入库时刻（永远可信）。
 """
@@ -50,9 +55,10 @@ MAX_SUMMARY_CHARS = 400
 #: 与前端 `mindmap/edit-log.ts` 的三个联合类型逐字对应。写成 `Literal` 而不是 `str`：
 #: 它们会进 OpenAPI，前端镜像那边是同一份字面量联合，两端对齐靠契约。
 #:
-#: `accept` 与其余六种并列：它不是"改了什么"，而是"本来可以改却没改"的那个分母。
+#: `generate` 与其余六种并列：它不是"改了什么"，而是"本来可以改却没改"的那个分母。
+#: `accept` 是它的前身（候选层的"应用到画布"），只读不写，见文件头。
 EditActor = Literal["user", "agent"]
-EditKind = Literal["add", "remove", "update", "move", "edge", "style", "accept"]
+EditKind = Literal["add", "remove", "update", "move", "edge", "style", "accept", "generate"]
 EditField = Literal["label", "title", "detail", "note", "color", "icon"]
 
 
@@ -83,10 +89,22 @@ class EditEventIn(BaseModel):
     subtree_size: int | None = Field(default=None, ge=1)
     #: 这次 `accept` 带来的改动条数，`0` = 一字未改。只有 `kind="accept"` 有值。
     #:
+    #: **新数据不再写它**（候选层已删，见文件头）。保留列与字段是为了历史行可读：
+    #: 老行上它有值，新行上是 `NULL`，两者在统计里都不参与运算。
+    #:
     #: 不进 `after`：`after` 的语义是"截断后的文本摘要"，把计数塞进去会让
     #: `CAST(after AS INTEGER)` 对每一条文字摘要静默返回 0——一个看起来合理、实际
     #: 全错的聚合，比报错糟得多。下限 0，同样不设上限（它是个实测计数，不是用户输入）。
     change_count: int | None = Field(default=None, ge=0)
+    #: 这次生成落进画布的那棵树有几个节点。只有 `kind="generate"` 有值。
+    #:
+    #: **在生成完成那一刻定死**：那一刻用户还没开始改，`node_count` 说的就是"模型
+    #: 交给你多少东西"。保存时才数会数到改后的树——一次"删掉一半再保存"会把分母
+    #: 算成改后的规模，比例永久偏高。
+    #:
+    #: 不设下限：树至少有一个根，但把 `0` 判成非法只会在某个边界分支上让一次真实
+    #: 保存失败，而"这次生成是空的"本身也是一条值得记的事实。
+    node_count: int | None = Field(default=None, ge=0)
     #: 这次改动动的是哪个 run 的产物。只有"应用候选"那一步对得上，手工编辑留空。
     run_id: str | None = Field(default=None, max_length=100)
     #: 事件发生的时刻（前端 `new Date().toISOString()`）。**可为空**：拿不到合法
@@ -120,10 +138,10 @@ class EditEventRow(EditEventIn):
 class LabelShrunk(BaseModel):
     """标题被改短的统计，**只统计 `actor="user"`**。
 
-    过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（用户点了应用），它不
-    反映用户的偏好。混进来时 `count` 会比用户的真实条数多（实测 B 图 3 条 user 的
-    缩短被算成 4 条，多出来的那条是 agent 的 13→10 字），而"用户的缩短偏好"正是这
-    个数字要回答的东西。
+    过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（生成直接落画布时那批
+    改动记在 `agent` 名下），它不反映用户的偏好。混进来时 `count` 会比用户的真实
+    条数多（实测 B 图 3 条 user 的缩短被算成 4 条，多出来的那条是 agent 的 13→10
+    字），而"用户的缩短偏好"正是这个数字要回答的东西。
 
     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：
@@ -144,6 +162,11 @@ class EditSummary(BaseModel):
       - `sum(by_field) == by_kind["update"] + by_kind["style"]`。
 
     对不上就说明有写入路径绕过了契约，而不是"统计有点怪"。
+
+    改动量与"本来可以不改"的分母分列四组，全部是原始量（比例让读的人自己除）：
+    分母 `generated_nodes`、分子 `changed_events`、以及"这次生成一处都没被改"的
+    `untouched_runs`。三者必须能对上：`untouched_runs <= generated_runs`，而
+    `changed_events == 0` 时 `untouched_runs == generated_runs`。
     """
 
     total: int
@@ -166,13 +189,27 @@ class EditSummary(BaseModel):
     #: `size_unknown` 是加列之前的老数据（`subtree_size` 为 NULL），它们**不进**
     #: `removed_depth`——否则"每层都在被删"那次污染还在。
     removed_subtree: dict[str, int]
+    #: 生成次数：`kind='generate'` 的行数。
+    generated_runs: int = 0
+    #: **分母**：`SUM(node_count) WHERE kind='generate'`。即"模型一共交给用户多少个
+    #: 节点"。用户删掉一半再保存，这数不变——它说的是模型给了什么。
+    generated_nodes: int = 0
+    #: **分子**：`COUNT(*) WHERE kind IN ('update','remove','add','move','style')`。
+    #: `edge` 不进：分母数的是节点，把"加了一条关系"算进节点改动会让比例失去意义。
+    changed_events: int = 0
+    #: 那个 `run_id` 下**一条改动事件都没有**的 generate 行数——"生成完一字未改"。
+    #:
+    #: 这是整张表最贵的一个数：没有它，10 张图里 9 张没被改、1 张改了 10 处，统计
+    #: 只会读到"标题被普遍改短"，然后去压生成侧的上限，而那 9 张本来合适的图在表里
+    #: 根本没出现过，偏差方向永远朝"生成质量更差"。
+    untouched_runs: int = 0
 
 
 class EditHealth(BaseModel):
     """跨图的日志链路健康检查（`GET /mindmaps/edits/health`）。
 
-    判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次应用候选都记
-    一条 `accept`（连一字未改也记），所以"昨日有保存、昨日零事件"只能是链路断了
+    判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次生成完成都记
+    一条 `generate`（连一处没改也记），所以"昨日有保存、昨日零事件"只能是链路断了
     ——前端在发、后端在丢，或者事件根本没进请求体。实测有过 40 分钟这个状态（8000
     跑旧代码），而当时没有任何告警：单图的 `total=0` 看着和"没人改过"一模一样。
 

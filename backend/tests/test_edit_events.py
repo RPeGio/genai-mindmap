@@ -8,8 +8,9 @@
   3. **三个关键指标**：`label_shrunk`（只算 user）、`removed_depth`（只算零散删除）、
      `removed_subtree`（删除规模直方图）——它们直接对应"生成侧该改什么"，数字错一位，
      结论就指向错误的地方；
-  4. **两处"分母"**：`accept` 事件（连"一字未改"也记）与 `last_event_at`
-     （空表是 null，不是空串）——没有它们，统计只剩"改过的那些"；
+  4. **两处"分母"**：`generate` 事件（连"一字未改"也记，`node_count` 是分母）与
+     `last_event_at`（空表是 null，不是空串）——没有它们，统计只剩"改过的那些"；
+     外加"分母换人"之后的两条新口径：`changed_events` 与 `untouched_runs`；
   5. **边界**：超量 422、字段名漂移 422、非法时间戳退化、409 时不落事件、
      以及"事件写失败不能让保存失败"。
 
@@ -253,8 +254,9 @@ def test_subtree_size_is_stored_and_zero_is_rejected():
 def test_accept_event_records_zero_changes():
     """`accept` + `change_count=0` 就是"一字未改"。
 
-    它是这一版最重要的**分母**：没有它，那 9 张生成完没改过的图与"用户从没用过"
-    在表里完全不可区分。
+    这是**候选层还在时**的分母。候选层删掉之后新数据一律写 `generate`，这条留着
+    守两件事：历史行读得回来；老前端还在发 `accept` 时不 422（那条路会让一次真实
+    保存失败——为了契约整洁丢掉用户的内容，代价方向错了）。
     """
     map_id = _create([_event(
         actor="user", kind="accept", field=None, node_id=None,
@@ -284,6 +286,103 @@ def test_accept_keeps_both_identities_intact():
     assert sum(summary["by_field"].values()) == (
         summary["by_kind"].get("update", 0) + summary["by_kind"].get("style", 0))
     # accept 不进 removed_depth / label_shrunk：它既不是删除也不是改标题。
+    assert summary["removed_depth"] == {}
+    assert summary["label_shrunk"]["count"] == 1
+
+
+# ---------------------------------------------------------------- generate：新的分母
+
+
+def _generate(run_id: str, node_count: int, **overrides) -> dict:
+    """一次"生成落进画布"的事件：没有节点、没有字段，只有规模与 run。"""
+    base = {
+        "actor": "agent", "kind": "generate", "node_id": None, "field": None,
+        "before": None, "after": None, "depth": None,
+        "node_count": node_count, "run_id": run_id,
+        "at": "2026-11-17T09:31:02.123Z",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_generate_event_stores_node_count_and_run_id():
+    map_id = _create([_generate("run-1", 42)])
+
+    row = client.get(f"/api/mindmaps/{map_id}/edits").json()[0]
+
+    assert row["kind"] == "generate"
+    assert row["node_count"] == 42
+    assert row["run_id"] == "run-1"
+    # 与 accept 一样，它不是"改动"，所以这三格必须是空的——否则
+    # `removed_depth` / `label_shrunk` 会被一条没有节点的行污染。
+    assert row["node_id"] is None and row["field"] is None and row["depth"] is None
+
+
+def test_generate_is_the_denominator():
+    """分母 = `SUM(node_count) WHERE kind='generate'`，分子是节点改动条数。"""
+    map_id = _create([
+        _generate("run-1", 10),
+        _generate("run-2", 30),
+        # run-1 上确实改了两处。
+        _event(actor="agent", kind="update", field="label", node_id="a",
+               before="旧标题", after="新标题", run_id="run-1"),
+        _event(actor="agent", kind="remove", field=None, node_id="b", before="孙节点",
+               after=None, depth=3, subtree_size=1, run_id="run-1"),
+        # 一条边不算节点改动：分母数的是节点，混进来比例就失去意义。
+        _event(actor="agent", kind="edge", field=None, node_id="a", before=None,
+               after="a → b", run_id="run-2"),
+    ])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["generated_runs"] == 2
+    assert summary["generated_nodes"] == 40
+    assert summary["changed_events"] == 2
+    # run-2 只有一条 edge，没有任何节点改动 → 它是一次"一字未改"的生成。
+    assert summary["untouched_runs"] == 1
+
+
+def test_untouched_runs_is_every_generation_when_nothing_was_changed():
+    map_id = _create([_generate("run-1", 8), _generate("run-2", 12)])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["generated_nodes"] == 20
+    assert summary["changed_events"] == 0
+    assert summary["untouched_runs"] == 2
+
+
+def test_generate_without_run_id_is_not_counted_as_untouched():
+    """没有 `run_id` 的老行不是"一字未改"，是"当时没记"。
+
+    `NULL = NULL` 在 SQL 里不成立，所以"这个 run 下有没有改动"那条 `NOT EXISTS`
+    会把无 run_id 的行判成"没有改动"。不显式排掉，一次迁移就能凭空造出几十条
+    "生成完一字没改"的正样本——而那正是这张表最贵的那个数。
+    """
+    map_id = _create([_generate(None, 5)])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["generated_runs"] == 1
+    assert summary["generated_nodes"] == 5
+    assert summary["untouched_runs"] == 0
+
+
+def test_generate_keeps_both_identities_intact():
+    """`generate` 不扰动两条恒等式与三个关键指标。"""
+    map_id = _create([
+        _generate("run-1", 20),
+        _event(),
+        _event(kind="style", field="color", before="无", after="red"),
+    ])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["total"] == 3
+    assert sum(summary["by_actor"].values()) == summary["total"]
+    assert sum(summary["by_field"].values()) == (
+        summary["by_kind"].get("update", 0) + summary["by_kind"].get("style", 0))
+    # generate 不是删除、也没碰标题。
     assert summary["removed_depth"] == {}
     assert summary["label_shrunk"]["count"] == 1
 

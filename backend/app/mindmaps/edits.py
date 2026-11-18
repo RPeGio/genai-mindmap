@@ -49,7 +49,7 @@ def record(map_id: str, events: Sequence[EditEventIn]) -> int:
     rows = [
         (map_id, event.run_id, event.actor, event.kind, event.node_id, event.field,
          event.before, event.after, event.depth, event.subtree_size, event.change_count,
-         event.at)
+         event.node_count, event.at)
         for event in events
     ]
     try:
@@ -57,8 +57,8 @@ def record(map_id: str, events: Sequence[EditEventIn]) -> int:
             conn.executemany(
                 f"""INSERT INTO edit_events
                         (map_id, run_id, actor, kind, node_id, field, before, after, depth,
-                         subtree_size, change_count, at, recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, {_NOW}), {_NOW})""",
+                         subtree_size, change_count, node_count, at, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, {_NOW}), {_NOW})""",
                 rows,
             )
     except Exception:  # noqa: BLE001 — 统计写失败不该让用户的保存失败
@@ -91,7 +91,18 @@ def summary(map_id: str) -> EditSummary:
       - 删掉的是整支还是零散 → "整支被删"更像"这一支根本不该生成"，与"挖太深"是
         两件事，混在一起读会得出错的处方。
 
-    但它们只说"发生了什么"，不说"为什么"——局限见 `docs/EDIT-LOG.md`。
+    **分母是 `kind='generate'` 的 `node_count` 之和**（候选层删掉之后的口径，见
+    `contracts/edits.py`）。三个数一起读才成立：
+
+      - `generated_nodes` = SUM(node_count)：模型一共交出多少个节点；
+      - `changed_events`：这些图上发生了多少条节点改动（含用户手工改的）；
+      - `untouched_runs`：关掉"改动事件"这一轴之后，有多少次生成一处都没被碰。
+
+    只看前两个会得出"每个节点被改 0.8 次"这种看不出方向的数；加上第三个才知道
+    "是普遍改了 0.8 次"还是"9 次一字未改、1 次改了 8 处"——这两种情况的处方完全
+    相反。
+
+    它们只说"发生了什么"，不说"为什么"——局限见 `docs/EDIT-LOG.md`。
     """
     with closing(repository.connect()) as conn:
         totals = conn.execute(
@@ -102,11 +113,45 @@ def summary(map_id: str) -> EditSummary:
         by_kind = _count_by(conn, "kind", map_id)
         by_field = _count_by(conn, "field", map_id)
 
+        # 分母与生成次数。`COALESCE(SUM(...), 0)`：只有 generate 行而它们全都没有
+        # `node_count`（加列之前的老行）时，`SUM` 是 NULL 而不是 0，直接进 JSON
+        # 会变成一个 `null` 分母。
+        generated = conn.execute(
+            """SELECT COUNT(*), COALESCE(SUM(node_count), 0) FROM edit_events
+               WHERE map_id = ? AND kind = 'generate'""",
+            (map_id,),
+        ).fetchone()
+
+        # 分子。`edge` 不进：分母数的是节点，把"加了一条关系"算成节点改动，比例就
+        # 再也读不出"每个节点被改了几次"。
+        changed_events = conn.execute(
+            """SELECT COUNT(*) FROM edit_events
+               WHERE map_id = ? AND kind IN ('update', 'remove', 'add', 'move', 'style')""",
+            (map_id,),
+        ).fetchone()[0]
+
+        # 零改动次数。**与分子的 kind 集合逐字相同**（`edge` 在两边都不算）：只要
+        # 一边多认一种，就会出现"既不算改动事件、也不算一字未改"的黑洞，而那正是
+        # `changed_events == 0 ⇒ untouched_runs == generated_runs` 这条恒等式破掉的样子。
+        # `g.run_id IS NOT NULL`：老数据里 generate 行可能没有 run_id
+        # （NULL = NULL 在 SQL 里不成立，会被 `NOT EXISTS` 判成"没有改动事件"），
+        # 那条数不是"一字未改"，是"当时没记"。
+        untouched = conn.execute(
+            """SELECT COUNT(*) FROM edit_events AS g
+               WHERE g.map_id = ? AND g.kind = 'generate' AND g.run_id IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM edit_events AS e
+                    WHERE e.map_id = g.map_id AND e.run_id = g.run_id
+                      AND e.kind IN ('update', 'remove', 'add', 'move', 'style')
+                 )""",
+            (map_id,),
+        ).fetchone()[0]
+
         # `length()` 对 TEXT 在 UTF-8 下按**字符**算，与前端 `charLength`（码点）
         # 同一口径。两处过滤各管一件事：
         #  - `field='label'`：`title`（导图标题）的改动是另一件事，混进来会让"节点
         #    标题被改短"这个信号被导图标题稀释；
-        #  - `actor='user'`：`agent` 那批是"用户点了应用、模型又改了一遍"，性质完全
+        #  - `actor='user'`：`agent` 那批是"生成自己的改动记在模型名下"，性质完全
         #    不同。实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条。
         shrunk = conn.execute(
             """SELECT COUNT(*), AVG(length(before)), AVG(length(after))
@@ -148,6 +193,10 @@ def summary(map_id: str) -> EditSummary:
         ),
         removed_depth={row[0]: row[1] for row in depths},
         removed_subtree=_subtree_histogram(sizes),
+        generated_runs=generated[0] or 0,
+        generated_nodes=generated[1] or 0,
+        changed_events=changed_events,
+        untouched_runs=untouched,
     )
 
 
@@ -167,8 +216,8 @@ def _subtree_histogram(rows: Sequence[tuple[int | None, int]]) -> dict[str, int]
 def health() -> EditHealth:
     """跨图的链路健康检查：昨日编辑过的图数 vs 昨日保存的图数。
 
-    判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次应用候选都记
-    一条 `accept`（连一字未改也记），所以 `saved > 0 且 edited == 0` 只能是链路断了。
+    判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次生成完成都记
+    一条 `generate`（连一字未改也记），所以 `saved > 0 且 edited == 0` 只能是链路断了。
 
     两个方向不对称，这很重要：链路真断时这个判据**一定**报警（事件收不到 → edited
     恒为 0）；反过来它只会漏报，不会因为"数据少"而误报成健康。唯一的误报窗口是跨
@@ -233,6 +282,7 @@ def recent(map_id: str, limit: int = RECENT_DEFAULT) -> list[EditEventRow]:
             kind=row["kind"], node_id=row["node_id"], field=row["field"],
             before=row["before"], after=row["after"], depth=row["depth"],
             subtree_size=row["subtree_size"], change_count=row["change_count"],
+            node_count=row["node_count"],
             at=row["at"], recorded_at=row["recorded_at"],
         )
         for row in rows

@@ -33,10 +33,10 @@ flowchart TD
 
 | 入口 | 接口 | 输入 | 输出 | 状态 |
 |---|---|---|---|---|
-| 生成（唯一入口） | `POST /api/agent/runs/stream` | 目标 + 来源 + 当前树 | SSE v2：阶段 / 工具进度 / 整树候选 / op 批次 / 节点生长预览 | 已实现，页面默认且唯一走这条；产物是候选，需用户接受 |
+| 生成（唯一入口） | `POST /api/agent/runs/stream` | 目标 + 来源 + 当前树 | SSE v2：阶段 / 工具进度 / 整树结果 / op 批次 / 节点生长预览 | 已实现，页面默认且唯一走这条；结果**直接落画布**并标成未保存，可一步撤销 |
 | 目标驱动 | `POST /api/agent/tasks` | 一句目标 | 阶段骨架 | 桩（不产生导图） |
 
-两条路由都挂在 agent 上，但只有 `/agent/runs/stream` 真的产出内容：它把改动落进候选副本（`snapshot` 整树或 `ops` 批次），用户点了接受才进画布；`/agent/tasks` 只回固定阶段列表。原先的 `POST /api/generations`（同步）、`POST /api/generations/stream`（流式）与 `POST /api/pipeline/generate`（多来源流水线）已删除，前端也不再保留对应的两条通道。
+两条路由都挂在 agent 上，但只有 `/agent/runs/stream` 真的产出内容：它把改动落进**生成期的工作副本**（`snapshot` 整树或 `ops` 批次），`done` 那一刻整树换进画布（并压一步撤销）——没有「候选 / 接受」这一层；`/agent/tasks` 只回固定阶段列表。原先的 `POST /api/generations`（同步）、`POST /api/generations/stream`（流式）与 `POST /api/pipeline/generate`（多来源流水线）已删除，前端也不再保留对应的两条通道。
 
 ## 3 每个环节的输入输出
 
@@ -64,15 +64,15 @@ flowchart TD
 
 | 前端位置 | 调用 | 用途 |
 |---|---|---|
-| 输入框（`src/App.vue`） | `POST /api/agent/runs/stream` | **已接入**：输入 → 工具循环 → 候选就绪 → 用户点接受才进画布 |
+| 输入框（`src/App.vue`） | `POST /api/agent/runs/stream` | **已接入**：输入 → 工具循环 → 结果直接落画布（未保存，可一步撤销） |
 | 画布（R2） | 无请求 | **已接入**：`src/canvas/MindMapCanvas.vue` 消费 `content`，坐标由 `src/canvas/layout/tidy.ts` 计算；可平移缩放点选，双击内联改文字，Tab / Enter / Delete 建树，撤销栈最多 50 步 |
 | 保存（R3） | `POST /api/mindmaps` / `PUT /api/mindmaps/{map_id}` | **已接入**：首次保存 POST 建新图，之后 PUT 带 `version`；409 弹三选（重新加载服务端版本 / 另存为新导图 / 取消）；Ctrl+S 触发，`beforeunload` 拦未保存离开 |
 | 打开列表（R3） | `GET /api/mindmaps` / `GET /api/mindmaps/{map_id}` | **已接入**：顶部"打开"弹层列出已保存导图，点开替换画布并清空撤销栈 |
 | 上传面板 | `POST /api/ingestion/files` | **已接入**：`src/components/SourceInputs.vue` 上传文档 / 图片 / WAV，解析后进来源列表，再随生成请求一起发给 agent |
-| 多来源生成 | `POST /api/agent/runs/stream` | **已接入**：`src/stores/mindmap.ts` 的 `runGeneration(goal, intent, sources)`，来源原样随请求发出（不拼进 goal），产物是候选 |
+| 多来源生成 | `POST /api/agent/runs/stream` | **已接入**：`src/stores/mindmap.ts` 的 `runGeneration(goal, intent, sources)`，来源原样随请求发出（不拼进 goal），结果直接落画布 |
 | 录音输入 | `POST /api/ingestion/files` | **已接入**：`src/components/RecordButton.vue` + `src/audio/recorder.ts` 采集 16kHz WAV 后走同一条上传链路 |
 | 导出按钮 | `POST /api/export/{puml,markdown,opml}` | **已接入**：标题栏下拉菜单，浏览器端落盘 |
-| Agent 面板 | `POST /api/agent/runs/stream` | **已接入**：`src/components/AgentPanel.vue` 显示工具进度，候选需点接受才落到画布 |
+| Agent 面板 | `POST /api/agent/runs/stream` | **已接入**：`src/components/AgentPanel.vue` 显示工具进度、生成中预览、落地后的「这次改了什么」与「回到生成之前」 |
 | 诊断面板（待接入） | `POST /api/optimization/check` / `/suggest` | 接口已实现，界面还没渲染 `diagnostics`；建议需用户确认后再改 |
 | 引用展示 | 无请求（读 `node.source_refs`） | **已接入**：`src/mindmap/refs.ts` 负责定位与截断，节点右上角显示引用条数，选中后在详情面板列出来源与位置，点一条在右侧抽屉里看原文并高亮命中句；左侧来源行反向显示"被 N 个节点引用"，点节点名跳转（`buildRefIndex`）；原文只在本次会话可回查 |
 | 正文编辑 | 随保存一起发（`note`） | **已接入**：详情面板的 textarea 编辑 `node.note`（≤2000 字，Esc 放弃），失焦或 Ctrl+S 提交；画布与导出都取 `note or label`，朝向（`layout` / `theme.direction`）也随保存与打开往返 |

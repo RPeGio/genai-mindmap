@@ -116,7 +116,7 @@ function toEventPayload(event: EditEvent): EditEventPayload {
     ...(event.after !== undefined ? { after: event.after } : {}),
     ...(event.depth !== undefined ? { depth: event.depth } : {}),
     ...(event.subtreeSize !== undefined ? { subtree_size: event.subtreeSize } : {}),
-    ...(event.changeCount !== undefined ? { change_count: event.changeCount } : {}),
+    ...(event.nodeCount !== undefined ? { node_count: event.nodeCount } : {}),
     ...(event.runId !== undefined ? { run_id: event.runId } : {}),
   };
 }
@@ -297,11 +297,11 @@ export function runAgentStream(
 // ---- 运行台账（run 的身份与草稿）----
 
 /**
- * 上次跑完、但用户还没处理过的运行。
+ * 上次跑完、但结果还没被保存的运行。
  *
- * 默认取后端给的"有草稿且未应用/未丢弃"那一批，其中**包含"被取消但已经产出草稿"
- * 的运行**：那正是"关掉页面那 40 秒别白花"要捡回来的东西。只查 `done` 的话，
- * 草稿会被写进库、然后再也没人读过——表就成了一行字。
+ * 默认取后端给的"有结果且没保存过"那一批，其中**包含"被取消但已经产出结果"的
+ * 运行**：那正是"关掉页面那 40 秒别白花"要捡回来的东西。只查 `done` 的话，
+ * 结果会被写进库、然后再也没人读过——表就成了一行字。
  */
 export function listRuns(status?: RunSummary['status']): Promise<RunSummary[]> {
   const query = new URLSearchParams({ unapplied: 'true' });
@@ -309,22 +309,20 @@ export function listRuns(status?: RunSummary['status']): Promise<RunSummary[]> {
   return request<RunSummary[]>(`/agent/runs?${query.toString()}`);
 }
 
-/** 单条详情，带候选正文。只有点「查看」时才值得走这一趟。 */
+/** 单条详情，带结果正文。只有点「载入」时才值得走这一趟。 */
 export function getRun(runId: string): Promise<RunDetail> {
   return request<RunDetail>(`/agent/runs/${encodeURIComponent(runId)}`);
 }
 
 /**
- * 候选进了画布 / 被用户丢弃。两者分开记：`applied_at` 是"采纳过"，`dismissed_at`
- * 是"嫌弃过"，下次进页面该不该再问是由它们区分的。
+ * 这次生成的结果**被保存进库了**。
  *
- * 幂等，且只在"本来为空"时打第一个时间戳，所以前端可以放心重试。
+ * 它不是"用户点了应用"（那个动作已经不存在了，生成结果直接落画布）：删掉候选层
+ * 之后，`applied_at` 回答的是"这份结果后来有没有存下来"，也正是"下次进页面还要
+ * 不要提醒"的判据。幂等，只在本来为空时打第一个时间戳，所以前端可以放心重试。
  */
-export function markRunResolved(
-  runId: string,
-  resolution: 'applied' | 'dismissed',
-): Promise<void> {
-  return request<void>(`/agent/runs/${encodeURIComponent(runId)}/${resolution}`, {
+export function markRunSaved(runId: string): Promise<void> {
+  return request<void>(`/agent/runs/${encodeURIComponent(runId)}/applied`, {
     method: 'POST',
   });
 }

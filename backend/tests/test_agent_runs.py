@@ -235,17 +235,21 @@ def test_pending_only_returns_done_runs_that_were_never_applied():
             "done-unapplied", "cancelled-with-draft"}
 
 
-def test_dismissed_runs_stop_showing_up():
+def test_saved_runs_stop_showing_up():
+    """存下来之后就不再提醒。
+
+    候选层删掉之后没有"丢弃"这个动作了，`applied_at` 是唯一的"处理过了"标记：
+    它现在说的是"这份结果被保存进库了"，而不是"用户点了应用"。
+    """
     runs.begin("r1", {})
     runs.finish("r1", runs.STATUS_DONE, candidate=CANDIDATE)
 
-    assert runs.mark_dismissed("r1") is True
+    assert runs.mark_applied("r1") is True
 
     assert runs.pending() == []
-    # 与"应用过"分开记：丢弃过的候选仍能被查到，只是不再提醒。
+    # 记过账的行仍然查得到，只是不再进 pending。
     row = runs.get("r1")
-    assert row.dismissed_at is not None
-    assert row.applied_at is None
+    assert row.applied_at is not None
 
 
 def test_mark_applied_is_idempotent_and_keeps_the_first_stamp():
@@ -571,7 +575,7 @@ def test_detail_endpoint_returns_the_tree_and_the_failure_reason():
     assert client.get("/api/agent/runs/nope").status_code == 404
 
 
-def test_applied_and_dismissed_endpoints_are_idempotent_and_404_for_unknown():
+def test_applied_endpoint_is_idempotent_and_404_for_unknown():
     runs.begin("r1", {})
     runs.finish("r1", runs.STATUS_DONE, candidate=CANDIDATE)
 
@@ -580,13 +584,22 @@ def test_applied_and_dismissed_endpoints_are_idempotent_and_404_for_unknown():
     assert runs.get("r1").applied_at is not None
     assert client.get("/api/agent/runs").json() == []
 
-    runs.begin("r2", {})
-    runs.finish("r2", runs.STATUS_DONE, candidate=CANDIDATE)
-    assert client.post("/api/agent/runs/r2/dismissed").status_code == 204
-    assert runs.get("r2").dismissed_at is not None
-
     assert client.post("/api/agent/runs/nope/applied").status_code == 404
-    assert client.post("/api/agent/runs/nope/dismissed").status_code == 404
+
+
+def test_dismissed_endpoint_is_gone():
+    """没有"丢弃候选"这个动作了，那条写入口必须一起消失。
+
+    判在 OpenAPI 上而不是判 `POST /runs/x/dismissed` 的状态码：那条路现在会 404
+    （路径不存在），与"没有这次运行"撞成同一个码，断言它区分不出"端点删了"与
+    "端点还在但行不在"——而这两件事的后果完全不同。
+    """
+    document = client.get("/openapi.json").json()
+    assert "/api/agent/runs/{run_id}/applied" in document["paths"]
+    assert "/api/agent/runs/{run_id}/dismissed" not in document["paths"]
+    # 列表/详情里也不该再出现这个列：前端镜像着它，留着就会有人去读。
+    schemas = document["components"]["schemas"]
+    assert "dismissed_at" not in schemas["RunSummary"]["properties"]
 
 
 if __name__ == "__main__":

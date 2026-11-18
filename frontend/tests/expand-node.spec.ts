@@ -287,20 +287,19 @@ describe('候选 → 确认 → 应用', () => {
     await wrapper.vm.$nextTick();
 
     await expandButton(wrapper).trigger('click');
-    await vi.waitFor(() => expect(store.candidate).not.toBeNull());
+    await vi.waitFor(() => expect(store.generatedSummary).not.toBeNull());
 
-    // 候选只是"看得见"，画布还没变
-    expect(store.content?.root.children[0].children[0].children).toEqual([]);
-    const candidateRisk = store.candidate!.root.children[0].children[0];
-    expect(candidateRisk.children.map(child => child.label)).toEqual(['冒烟范围', '回归范围']);
-
-    expect(store.acceptCandidate()).toBe('applied');
+    // ops 只进工作副本，done 一到整树落地：新节点挂在被展开的那个节点下
     const risk = store.content!.root.children[0].children[0];
     expect(risk.children.map(child => child.label)).toEqual(['冒烟范围', '回归范围']);
     expect(risk.children[0].detail).toBe('先跑冒烟。');
     // 其余分支一个节点都没动
     expect(store.content!.root.children[0].children.map(child => child.label))
       .toEqual(['风险', '已到底', '旧节点']);
+
+    // 一步撤销退回展开之前：这是删掉候选层之后唯一的后悔药
+    store.undo();
+    expect(store.content!.root.children[0].children[0].children).toEqual([]);
   });
 });
 

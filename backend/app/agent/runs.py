@@ -5,12 +5,11 @@
 
   1. **重复提交生成两张图**。请求里没有 run id，服务端就没有能力识别"这是同一次
      运行又投递了一遍"——换标签页、刷新重发、客户端重试都会新开一次真跑，花两倍
-     钱产出两份候选，两个标签页各点一次「应用」就是两张图。原有的两道防线都在
-     错的那一层：run 内的 `ctx.dedupe` 只活在一次运行里，保存层的版本乐观锁只
-     认得"同一张已保存的图"。
+     钱产出两份结果，两个标签页各存一次就是两张图。原有的两道防线都在错的那一层：
+     run 内的 `ctx.dedupe` 只活在一次运行里，保存层的版本乐观锁只认得"同一张已
+     保存的图"。
   2. **关掉页面那 40 秒白花**。连接一断，生成器被 `aclosing` 关掉、工具里的模型
-     请求被取消，已经付过钱的调用不回滚，而 `ctx.candidate` 只活在内存里。用户
-     回来什么都看不到。
+     请求被取消，已经付过钱的调用不回滚，而结果只活在内存里。用户回来什么都看不到。
 
 所以：**SSE 从"run 本身"降级成"这一行的一次观察窗口"**（帧格式一个字节都没动）。
 连接断了不代表运行没了，重发请求也不等于第二次运行。
@@ -20,8 +19,10 @@
 - 身份：`begin()` 是唯一的入口，它在**一条 SQL 事务里**决定"这次是真跑、还是重复
   投递"。判在进程内的字典里不行——uvicorn 多 worker 时两个进程各有一份字典，
   "只有一个真跑"立刻变成"每个进程各跑一次"。
-- 草稿：`finish()` 在运行结束时（**含被取消**）把候选写进来。写在 `finally` 里，
-  所以取消、异常、正常收尾三条路都只写一次。
+- 结果：`finish()` 在运行结束时（**含被取消**）把产出写进来。写在 `finally` 里，
+  所以取消、异常、正常收尾三条路都只写一次。这一份**不是待确认的草稿**：生成结果
+  已经直接进了画布（见 `docs/` 与前端 `stores/mindmap.ts`），存下来只为两件事——
+  关掉页面还能捡回来，以及将来做生成历史。
 """
 from __future__ import annotations
 
@@ -52,7 +53,13 @@ _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 @dataclass(frozen=True)
 class RunRecord:
-    """`runs` 里的一行。`candidate` 已按契约解析过，不是原始 JSON 字符串。"""
+    """`runs` 里的一行。`candidate` 已按契约解析过，不是原始 JSON 字符串。
+
+    `candidate` 的语义变了：它不再是"等你点应用的草稿"，而是**这次生成产出的那棵树
+    的快照**。生成结果已经直接进了画布，这份存下来是为了两件事——关掉页面再回来
+    还能把上次的结果捡回来（`pending`），以及将来做生成历史。它不再有任何"落地
+    与否"的含义，那个由前端画布的 `dirty` 与 `applied_at` 回答。
+    """
 
     run_id: str
     status: str
@@ -61,8 +68,11 @@ class RunRecord:
     failure: dict[str, Any] | None
     created_at: str
     updated_at: str
+    #: 这次生成的结果**被保存进 `mindmaps` 了**。空值 = 生成过、但还没存下来。
+    #:
+    #: 它曾经是"用户点了应用"，候选层删掉之后那一天没有用户动作可记；剩下的、
+    #: 也是唯一有区分度的判据是"后来有没有存"。
     applied_at: str | None = None
-    dismissed_at: str | None = None
     #: 候选是怎么来的（`demo` / `model`）。重放时原样回填 `done` 帧的 `mode`，
     #: 否则一棵占位树会被贴上"模型生成"的标签——那正是 `DoneEvent.mode` 要防的。
     mode: str | None = None
@@ -128,7 +138,6 @@ def _record(row: sqlite3.Row) -> RunRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         applied_at=row["applied_at"],
-        dismissed_at=row["dismissed_at"],
         mode=row["mode"],
     )
 
@@ -227,25 +236,29 @@ def pending(
     statuses: Sequence[str] = (STATUS_DONE,),
     unresolved_only: bool = True,
 ) -> list[RunRecord]:
-    """有草稿、而且用户还没处理过的运行，最新的在前。
+    """有结果、而且后来没被保存过的运行，最新的在前。
 
-    默认只要 `done`——"生成完成了但没应用"是这条查询的字面含义。前端展示时传
-    `(done, cancelled)`：被取消但已经产出草稿的运行同样值得捡起来（那 40 秒就是
-    这么省回来的），只是措辞不同（"上次被中断了"而不是"上次完成了"）。
+    默认只要 `done`。前端展示时传 `(done, cancelled)`：被取消但已经产出结果的运行
+    同样值得捡起来（那 40 秒就是这么省回来的），只是措辞不同（"上次被中断了"而不是
+    "上次完成了"）。
 
-    判据是 `applied_at` / `dismissed_at` 两个时间戳，不是"候选有没有写进
-    `mindmaps` 表"：那份内容可能被 PUT 到一张已有导图上（推不出新记录），也可能
-    用户应用之后又撤销、存成了另一张——用 `mindmaps` 反推只会得到一堆猜。
+    判据是 `applied_at`，不是"结果有没有写进 `mindmaps` 表"：那份内容可能被 PUT 到
+    一张已有导图上（推不出新记录），也可能用户存成了另一张——用 `mindmaps` 反推
+    只会得到一堆猜。
 
-    `unresolved_only=False` 时不去管"有没有草稿""处理过没有"，只按状态列：
-    那是查台账的用法（"上次那次失败到底怎么失败的"），与"提醒用户"是两件事，
-    所以做成一个开关而不是两条 SQL。
+    `dismissed_at` 那半个条件已经删掉：没有"丢弃候选"这个动作了，而"用户没保存就
+    走了"与"用户不要这份结果"在删掉候选层之后是同一件事——他现在可以撤销、可以
+    直接改，也可以什么都不做。
+
+    `unresolved_only=False` 时不去管"保存过没有"，只按状态列：那是查台账的用法
+    （"上次那次失败到底怎么失败的"），与"提醒用户"是两件事，所以做成一个开关
+    而不是两条 SQL。
     """
     if not statuses:
         return []
     placeholders = ", ".join("?" for _ in statuses)
-    unresolved = ("AND candidate IS NOT NULL "
-                  "AND applied_at IS NULL AND dismissed_at IS NULL") if unresolved_only else ""
+    unresolved = ("AND candidate IS NOT NULL AND applied_at IS NULL"
+                  ) if unresolved_only else ""
     with closing(_connect()) as conn:
         rows = conn.execute(
             f"""SELECT * FROM runs
@@ -258,18 +271,17 @@ def pending(
 
 
 def mark_applied(run_id: str) -> bool:
-    """候选真的进了画布。幂等：已经有时间戳就不再改。"""
+    """这次生成的结果**被保存进库了**。幂等：已经有时间戳就不再改。
+
+    前端在保存成功之后调用一次。删掉候选层之后它是"生成过但没保存"的唯一反向证据：
+    没有它，每次生成都会在下次进页面时重新问一遍"要不要捡回上次的结果"。
+    """
     return _mark(run_id, "applied_at")
 
 
-def mark_dismissed(run_id: str) -> bool:
-    """用户主动丢弃了这份候选。与"应用过"分开记：两者的后续处理完全不同。"""
-    return _mark(run_id, "dismissed_at")
-
-
 def _mark(run_id: str, column: str) -> bool:
-    # 只有两个固定列名会走到这里，不是拼接外部输入。
-    assert column in ("applied_at", "dismissed_at")
+    # 只有一个固定列名会走到这里，不是拼接外部输入。
+    assert column == "applied_at"
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -297,6 +309,5 @@ __all__ = [
     "finish",
     "get",
     "mark_applied",
-    "mark_dismissed",
     "pending",
 ]

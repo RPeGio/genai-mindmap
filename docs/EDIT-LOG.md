@@ -70,24 +70,54 @@ type EditEvent = {
 | `edge` | `"A → B（是）"` | 边只有 id，人对不上 |
 | `depth` | 层数，`remove` 填删除前所在层 | `removed_depth` 按它分组（只对零散删除） |
 | `subtreeSize` | `remove` 删掉的节点数，含自己 | 一整支被删只该有一条事件 |
-| `changeCount` | `accept` 带来的改动条数 | `0` 就是"一字未改"，最强的正样本 |
+| `changeCount` | `accept` 带来的改动条数（**历史列，新数据不写**） | `0` 是"一字未改"的旧写法 |
+| `nodeCount` | `generate` 落进画布那棵树的节点数（**分母**） | 在生成完成那一刻定死，保存时不重算 |
 
 `depth` 是这一版最容易被忽略、又最值钱的一个字段：没有它，"删掉的集中在第几层"
 就只能靠事后猜。
 
 ## 二·五、三处"新增"，都是为了不让结论朝一个方向偏
 
-**① `accept`：补上分母。** `create` 意图接受候选时 diff 是 0 条，于是"生成完一字
+**① `generate`：补上分母。** `create` 意图落地时 diff 是 0 条，于是"生成完一字
 不改直接保存"在 `edit_events` 里是 0 行，与"这个用户从没用过"完全不可区分。10 张图
 里 9 张一字未改、1 张改 10 处，只统计改动会得出"标题被普遍改短"，然后去把 16 字上限
 压到 12——而那 9 张本来合适的图在表里根本没出现过。**缺的不是样本，是分母**，偏差
 方向永远朝"生成质量更差"。
 
-所以每次应用候选（`create` / `expand` / `edit` 三条路）都记**一条** `accept`，不管
-改了几处；它 `actor='user'`（点应用的是用户）、`node_id` / `field` / `depth` 全空。
-`changeCount` 用**独立的整数列**而不是塞进 `after`：`after` 的语义是"截断后的文本
+所以每次生成落地（`create` / `expand` / `edit` 三条路）都记**一条** `generate`，
+`actor='agent'`、`node_id` / `field` / `depth` 全空，只带两个数：`node_count`（落进
+画布的那棵树有几个节点，**在生成完成那一刻定死**）与 `run_id`。
+
+> **换人说明（候选层删掉之后）。** 这条事件的前身是 `accept`：那时生成结果先进
+> "候选"，用户点「应用到画布」才记一条 `accept`（`actor='user'`，载荷是
+> `change_count`）。候选层删掉之后没有"应用"这个动作了，于是：
+>
+> - 事件改叫 `generate`，`actor` 变成 `agent`（产出这棵树的是模型）；
+> - `change_count` 不再写——"这次生成有没有被改"直接查"有没有同一个 `run_id` 的
+>   改动事件"就够，不需要前端算好塞进来；
+> - 老数据里的 `accept` 行原样保留，`by_kind` 仍然读得到（所以后端的 `EditKind`
+>   里两个字面量都在）。
+
+`node_count` 用**独立的整数列**而不是塞进 `after`：`after` 的语义是"截断后的文本
 摘要"，把计数混进去，`CAST(after AS INTEGER)` 会对每一条文字摘要静默返回 0——一个看
 起来合理、实际全错的聚合，比报错糟得多。
+
+统计口径（`GET /mindmaps/{id}/edits/summary`）：
+
+```
+分母      generated_nodes  = SUM(node_count) WHERE kind='generate'
+分子      changed_events   = COUNT(*) WHERE kind IN ('update','remove','add','move','style')
+生成次数  generated_runs   = COUNT(*) WHERE kind='generate'
+零改动    untouched_runs   = 那个 run_id 下一条改动事件都没有的 generate 行数
+```
+
+`edge` **不进分子**：分母数的是节点，"加了一条关系"算进节点改动会让比例失去意义。
+零改动那边的 kind 集合与分子**逐字相同**——只要一边多认一种，就会出现"既不算改动、
+也不算一字未改"的黑洞，而那条恒等式（`changed_events = 0 ⇒ untouched_runs =
+generated_runs`）正是读这份统计的前提。`run_id` 为空的老 generate 行不算零改动：
+那不是"一字未改"，是"当时没记"。
+
+`label_shrunk` / `removed_depth` / `removed_subtree` 三个指标没变，只是分母换了人。
 
 **② `subtreeSize`：别把"删了一支"读成"每层都在删"。** 以前删一整支会在 depth 2…5
 各留几条 `remove`，`removed_depth` 看起来"每层都在被删"，于是"初次生成挖太深"这个
@@ -125,7 +155,7 @@ type EditEvent = {
 | 不记 | 理由 |
 |---|---|
 | 撤销 / 重做 | 一次被撤销的编辑不是用户的最终意图。记了它，`label_shrunk` 会同时收到"18→9"和"9→18"，平均值被拉回中性、次数却翻倍——比不记更糟。"用户反复撤销"该是另一个指标，这一版不做。 |
-| `create` 接受候选的**整棵树** | 整棵树都是"新增"，那不是 diff，是把整棵树重念一遍。与 `diffCandidate` 对 `create` 返回 `null` 同一条判断。注意这条只否掉了"整棵树"这个载荷，**没有否掉"接受"这个动作**——动作记成一条 `accept`（见二·五）。 |
+| `create` 落地的**整棵树** | 整棵树都是"新增"，那不是 diff，是把整棵树重念一遍。与 `diffCandidate` 对空基线返回 `null` 同一条判断。注意这条只否掉了"整棵树"这个载荷，**没有否掉"生成"这个动作**——动作记成一条 `generate`（见二·五）。 |
 | 换朝向 / 换布局 | 它写在 `content` 里，但回答不了"生成侧该改什么"，记下来只是噪音。 |
 
 ## 四·五、死表探测器：一张永远 0 行的表不会自己喊
@@ -140,8 +170,8 @@ type EditEvent = {
   `total=0` 与"这张图没人改过"长得一样，`last_event_at=null` 说的是另一件事——这张
   图从来没有过任何事件。
 - 跨图：`GET /api/mindmaps/edits/health` 给昨日编辑过的图数 / 昨日保存的图数。
-  **判据："保存了但没有任何事件"在正常情况下不该发生**（每次应用候选都记一条
-  `accept`，连一字未改也记），所以 `saved > 0 且 edited == 0` 就是链路断了。
+  **判据："保存了但没有任何事件"在正常情况下不该发生**（每次生成落地都记一条
+  `generate`，连一处没改也记），所以 `saved > 0 且 edited == 0` 就是链路断了。
 
 两个方向不对称，这很重要：链路真断时它**一定**报警；反过来只会漏报（`saved_maps`
 是下界：`mindmaps` 只留最后一次保存时刻），不会因为"数据少"就报成健康。唯一的误报
@@ -150,17 +180,21 @@ type EditEvent = {
 ## 五、局限：不要让日志看起来能回答所有问题
 
 一次真实跑批（20 节点的旧图，用户改 12 条标题、上 3 个色、写 2 条备注、挪 1 个节点、
-加 4 个、零散删 7 个、把一支 4 个节点的整支删掉，再让 agent 应用一轮候选）得到：
+加 4 个、零散删 7 个、把一支 4 个节点的整支删掉，再让 agent 生成一轮）得到：
 
 ```
-total 37   by_actor {user:31, agent:6}      ← user 里那条是 accept
-by_kind {update:20, remove:8, add:4, style:3, move:1, accept:1}
+total 37   by_actor {user:31, agent:6}
+by_kind {update:20, remove:8, add:4, style:3, move:1, generate:1}
 by_field {label:16, color:3, detail:2, note:2}
 label_shrunk {count:13, avg_before:14.4, avg_after:6.0}   ← 只算 user
 removed_depth {3:2, 4:4, 5:1}                             ← 只算零散删除（7 条）
 removed_subtree {size_1:7, size_4:1}                      ← 另有一支 4 个节点整支被删
+generated_runs 1   generated_nodes 22   changed_events 36   untouched_runs 0
 last_event_at "2026-11-17T09:35:11.208Z"
 ```
+
+（`by_kind` 里 `generate` 的位置在过去是 `accept`：候选层删掉之前，那一轮是"用户点了
+应用"才记的。老图上的历史行仍然显示 `accept`，口径见二·五。）
 
 看起来能直接推导出三条处方：**标题太长了**（13 条缩短，14.4 → 6.0 字）、**生成挖得
 太深**（零散删掉的 7 个里 4 个在第 4 层）、**有一整支不该生成**（4 个节点被一次删掉）。
@@ -177,10 +211,13 @@ last_event_at "2026-11-17T09:35:11.208Z"
   还能补查"的地方。
 - **整支被删 ≠ 某一层被嫌弃。** `size_4` 那条说的是"这一支整体没用"，它可能很浅也
   可能很深；`removed_depth` 现在只数零散删除，正是为了让这两件事别混成一条。
-- **`by_actor` 里 `user` 含一条 `accept`。** "用户亲手改的"是 `user` 事件减去
-  `accept`；`agent` 那 6 条是用户点了「应用」之后一次性落地的，不代表用户认同每一处
-  ——用户可能只想改 1 条，接受了 6 条。`changeCount` 给的是"这次接受带来几处"，而
-  "用户是不是根本没动"要看它等于 0 的那些事件。
+- **`by_actor` 里 `agent` 那 6 条是生成一次性落地的**，不代表用户认同每一处——用户
+  可能只想改 1 条，落地带来了 6 条。判断"用户是不是根本没动"看的是
+  `untouched_runs` / 同一个 `run_id` 下有没有改动事件，而不是看某一条事件。
+- **"一次生成改了几处"与"这次生成有没有被改"是两个问题。** 前者是 `changed_events`
+  与 `generated_nodes` 的比，后者是 `untouched_runs`。只看前者会得出"每节点被改 0.8
+  次"这种看不出方向的数；加上后者才知道那是"普遍改了 0.8 次"还是"9 次一字未改、
+  1 次改了 8 处"——两种情况的处方完全相反。
 - **"改了又改回去"会被记成两次改动。** 撤销重做刻意不记，但用户手工把 9 字改回 18
   字是一次真实的 `label` 改动：`label_shrunk` 收到 18→9，也收到 9→18（后者不计入
   `count`，因为没变短）；两条都留在 `by_field` 里。要判"这个用户改来改去"需要按

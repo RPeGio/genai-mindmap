@@ -798,8 +798,12 @@ function formatTime(iso: string): string {
  * 「上次的运行结果」这条提示的文案。
  *
  * 只给时间与目标，不给整棵树：这是一句通知，用户要不要捡回来是他的决定。两种状态
- * 分开说——"完成了但没应用"和"被中断了但已经产出了一部分"对他的意义完全不同，
+ * 分开说——"完成了但没保存"和"被中断了但已经产出了一部分"对他的意义完全不同，
  * 用同一句话糊过去，他会以为后者是一次完整的结果。
+ *
+ * 注意措辞里没有"应用"这个动作：生成结果当时**已经进了画布**，关掉页面丢掉的是
+ * 那份没保存的改动，不是"一份还没被采纳的提案"。点「载入」= 把上次那棵树装回画布
+ * （可撤销），点「不用了」只是这次会话不再提。
  */
 const resumableText = computed(() => {
   const run = store.resumableRun;
@@ -811,7 +815,7 @@ const resumableText = computed(() => {
   const when = clock ? `（${clock}）` : '';
   const what = run.status === 'cancelled'
     ? `上次${when}那次生成被中断了，已经生成的部分还留着`
-    : `上次${when}有一次生成完成了，但还没有应用到画布`;
+    : `上次${when}生成完的导图还没保存`;
   return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
 });
 
@@ -1200,8 +1204,9 @@ async function copyBody() {
         <PrefsPanel />
         <!--
           上次运行留下的结果。**只是一条提示，不是弹窗**：用户可能正在做别的事，
-          打断他比让他知道这件事更烦。点「查看」把那份候选载入现有的确认流程
-          （应用/丢弃、过时检查、整树校验一步都不少），点「丢弃」就再也不问。
+          打断他比让他知道这件事更烦。点「载入」把上次那棵树直接装回画布（撤销栈、
+          `generate` 事件、身份重置、冲突判定一步都不少），点「不用了」只是这次
+          会话不再提——它仍然是真的，下次开新会话会再问一次。
         -->
         <section
           v-if="store.resumableRun"
@@ -1215,14 +1220,14 @@ async function copyBody() {
               class="rounded-md border border-sky-300 bg-white px-2 py-1 text-sky-800 hover:bg-sky-100"
               @click="store.resumeRun()"
             >
-              查看
+              载入
             </button>
             <button
               type="button"
               class="rounded-md border border-slate-300 bg-white px-2 py-1 text-slate-600 hover:bg-slate-50"
-              @click="store.dismissResumable()"
+              @click="store.ignoreResumable()"
             >
-              丢弃
+              不用了
             </button>
           </div>
         </section>

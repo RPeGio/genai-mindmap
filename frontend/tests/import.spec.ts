@@ -292,7 +292,9 @@ describe('store.importMap', () => {
     expect(store.savedAt).toBeNull();
     expect(store.mode).toBe('import');
     expect(store.dirty).toBe(true);
-    expect(store.candidate).toBeNull();
+    // 上一张图的生成记录也一起清掉：它说的是另一棵树"改了什么"
+    expect(store.generatedSummary).toBeNull();
+    expect(store.generatedChanges).toBeNull();
   });
 
   it('朝向来自文件本身，而不是默认值', () => {

@@ -7,8 +7,12 @@
 之前就要返回普通 HTTP 错误（422 / 503 / 409），前端能按状态码区分；一旦开始推送，
 HTTP 状态码已经发出去了，后续只能以流内的 `error` 帧表达。
 
-`/runs` 是这次新增的**读**入口（列表 / 单条 / 标记已应用或已丢弃）。没有它们，
-`runs` 表就是一张"写了没人读"的死表——落库的草稿永远没人捡起来。
+`/runs` 是这次新增的**读**入口（列表 / 单条 / 标记已保存）。没有它们，
+`runs` 表就是一张"写了没人读"的死表——落库的结果永远没人捡起来。
+
+注意这里说的"结果"不是"待确认的候选"：生成完成时前端已经把树装进画布了（画布标成
+未保存），`runs.candidate` 只是那份结果的快照，用于关掉页面之后捡回来、以及将来做
+生成历史。所以没有"应用/丢弃"这一对动作，只有"保存成功"这一个时间戳。
 """
 from __future__ import annotations
 
@@ -131,14 +135,14 @@ def _request_summary(body: AgentRunRequest) -> dict[str, Any]:
 async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
     """把一个已经有结论的 run 原样"重放"成一条流。
 
-    帧格式与真跑一模一样（`snapshot → done → [DONE]`），所以前端那条
-    "候选确认"的流程一行都不用改：它收到的还是候选。
+    帧格式与真跑一模一样（`snapshot → done → [DONE]`）：同一个 run_id 再投一次时，
+    客户端拿到的仍是那棵树与那个 `mode`，前端走的还是"落画布"那条路。
 
     这条路存在的意义是**不再调模型**：同一个 run_id 已经跑完过一次，再花一遍钱
     只为得到同一棵树，是这张表要消灭的第一件事。`mode` 也照原样回填——占位树
     被重放成 `mode=model` 就是界面替它撒谎。
 
-    `done` 但没有候选的 run 同样重放（内容是空）：它在服务端已经是一次有结论的
+    `done` 但没有结果的 run 同样重放（内容是空）：它在服务端已经是一次有结论的
     运行，重跑一次并不比"如实说没产出"更可能成功。用户真想重试时，前端每次点击
     都会生成新的 run_id，走的是另外一条路。
     """
@@ -301,26 +305,26 @@ async def stream_run(body: AgentRunRequest) -> StreamingResponse:
 # ---------------------------------------------------------------- 读：run 的台账
 
 class RunSummary(BaseModel):
-    """列表里的一行：**不带候选正文**。
+    """列表里的一行：**不带结果正文**。
 
-    候选是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句
-    "上次有一次生成完成了"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。
+    结果是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句
+    "上次有一次生成还没保存"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。
     """
 
     model_config = ConfigDict(extra="forbid")
     run_id: str
     status: str
-    #: 原样回填给前端：`create` 的候选落地时不能继承当前图的身份，`edit`/`expand` 要。
+    #: 原样回填给前端：`create` 的结果落画布时不能继承当前图的身份，`edit`/`expand` 要。
     intent: str
     goal: str
     created_at: str
     updated_at: str
+    #: 这份结果后来被保存了。空值 = 生成过、还没存下来，下次进页面会提醒一次。
     applied_at: str | None = None
-    dismissed_at: str | None = None
 
 
 class RunDetail(RunSummary):
-    """单条：带候选正文与失败原因。"""
+    """单条：带结果正文与失败原因。"""
 
     model_config = ConfigDict(extra="forbid")
     candidate: Any | None = None
@@ -338,7 +342,6 @@ def _summary(record: runs.RunRecord) -> RunSummary:
         created_at=record.created_at,
         updated_at=record.updated_at,
         applied_at=record.applied_at,
-        dismissed_at=record.dismissed_at,
     )
 
 
@@ -346,21 +349,21 @@ def _summary(record: runs.RunRecord) -> RunSummary:
 def list_runs(
     status_filter: Literal["done", "cancelled", "failed", "running"] | None = Query(
         default=None, alias="status",
-        description="只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。",
+        description="只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。",
     ),
     unapplied: bool = Query(
         default=True,
-        description="只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。",
+        description="只列有结果、且后来没被保存过的；置 false 则把这段台账原样列出来。",
     ),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> list[RunSummary]:
-    """运行台账。默认回答的是"上次跑完、我还没处理的是哪一次"。
+    """运行台账。默认回答的是"上次跑完、我还没存下来的是哪一次"。
 
-    `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出草稿的那次
+    `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出结果的那次
     同样要能被捡起来**——否则"关掉页面那 40 秒"照样白花，只是从内存白花变成写进
     数据库白花。
 
-    这条查询就是这张表草稿列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
+    这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
     """
     statuses: tuple[str, ...] = (
         (status_filter,) if status_filter else (runs.STATUS_DONE, runs.STATUS_CANCELLED)
@@ -385,22 +388,13 @@ def get_run(run_id: str) -> RunDetail:
 
 @router.post("/runs/{run_id}/applied", status_code=status.HTTP_204_NO_CONTENT)
 def mark_run_applied(run_id: str) -> Response:
-    """候选进了画布。前端在「应用」成功后调用一次，幂等。
+    """这次生成的结果**被保存进库了**。前端在保存成功后调用一次，幂等。
 
-    "done 但已应用"与"done 但没应用"只能靠这个时间戳分开：候选可能被 PUT 到一张
-    已有导图上（推不出新记录），也可能应用之后又被撤销。用 `mindmaps` 表反推，
-    得到的全是猜。
+    "生成过但没保存"与"生成过、也存下来了"只能靠这个时间戳分开：那份内容可能被
+    PUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`
+    表反推，得到的全是猜。
     """
     if not runs.mark_applied(run_id):
-        raise HTTPException(status_code=404,
-                            detail={"code": "run_not_found", "message": "没有这次运行的记录"})
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@router.post("/runs/{run_id}/dismissed", status_code=status.HTTP_204_NO_CONTENT)
-def mark_run_dismissed(run_id: str) -> Response:
-    """用户主动丢弃了这份候选。与"应用过"分开记：下次进页面不该再问同一次。"""
-    if not runs.mark_dismissed(run_id):
         raise HTTPException(status_code=404,
                             detail={"code": "run_not_found", "message": "没有这次运行的记录"})
     return Response(status_code=status.HTTP_204_NO_CONTENT)

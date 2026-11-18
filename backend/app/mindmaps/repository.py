@@ -7,6 +7,7 @@ import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from typing import Sequence
 from uuid import uuid4
 from app.contracts.mindmap import MapRecord, MindMapContent, migrate_content
 
@@ -34,6 +35,24 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
+def _drop_columns(conn: sqlite3.Connection, table: str, columns: Sequence[str]) -> None:
+    """删掉不再有语义的列。幂等，且**失败只记 warning**。
+
+    与 `_ensure_columns` 对称：`CREATE TABLE IF NOT EXISTS` 同样不会替老库删列。
+    但删列比补列危险得多（`DROP COLUMN` 要 SQLite ≥ 3.35，而且会重写整张表），
+    所以这里逐列 try：删不掉就留着那一列——它在代码里已经没有读者，一列恒为 NULL
+    的文本字段既不占空间也不影响任何查询。**没删掉不是故障，代码不读它才是。**
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name in columns:
+        if name not in existing:
+            continue
+        try:
+            conn.execute(f'ALTER TABLE {table} DROP COLUMN "{name}"')
+        except sqlite3.Error:
+            logger.warning("%s.%s 应该删掉但没删成，代码已不再读写它", table, name)
+
+
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,10 +67,16 @@ def connect() -> sqlite3.Connection:
     # 再有一次"发现表不存在 → 建表"的分支——被取消时多一个可能抛错的分支，就等于
     # 把唯一要落库的草稿丢掉。
     #
-    # 三列时间戳各管一件事，别合并：`updated_at` 是这一行最后一次状态变化（提示里
-    # 那个"12:03"用它），`applied_at` 是候选真的进了画布，`dismissed_at` 是用户
-    # 主动说"这份不要了"。合并成"处理过了"一个布尔值，就再也分不清"应用过"与
-    # "嫌弃过"，而"上次生成的导图去哪了"正是靠这个区别回答的。
+    # 两列时间戳各管一件事，别合并：`updated_at` 是这一行最后一次状态变化（提示里
+    # 那个"12:03"用它），`applied_at` 是这次生成的结果**真的被保存了**。
+    #
+    # `applied_at` 曾经的意思是"候选进了画布"（用户点了应用）。候选层删掉之后，
+    # 生成结果直接落画布，那一刻没有用户动作可记；真正有区分度、也是 `pending()`
+    # 唯一读者要的那个信号变成了"这份结果后来有没有被存下来"——生成完关掉页面
+    # 却不保存的那一次，才是下次进页面该被捡回来的那一次。
+    #
+    # `dismissed_at` 已删：没有"丢弃候选"这个动作了。留下它只会让"这两个时间戳
+    # 都为空 = 还没处理"这类判据永远带着一个死分支。
     conn.execute("""CREATE TABLE IF NOT EXISTS runs (
         run_id       TEXT PRIMARY KEY,
         status       TEXT NOT NULL,
@@ -61,9 +86,9 @@ def connect() -> sqlite3.Connection:
         mode         TEXT,
         created_at   TEXT NOT NULL,
         updated_at   TEXT NOT NULL,
-        applied_at   TEXT,
-        dismissed_at TEXT
+        applied_at   TEXT
     )""")
+    _drop_columns(conn, "runs", ["dismissed_at"])
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
     # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
     # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该
@@ -105,9 +130,14 @@ def connect() -> sqlite3.Connection:
     # 被删的子树：每个后代各记一条会让 `removed_depth` 在 2…5 层各留几条，看起来
     # "每层都在被删"，而真实动作只有一个。
     #
-    # `change_count` 是 `kind='accept'` 那条事件的载荷：这次接受带来几处改动，0 = 一字
-    # 未改。**与 `after` 分列**：`after` 是文本摘要，把计数混进去，`CAST(after AS INTEGER)`
-    # 会对每条文字摘要静默返回 0——一个看起来合理、实际全错的聚合。
+    # `change_count` 是 `kind='accept'` 那条事件的载荷（历史列，候选层删掉之后不再
+    # 写入）：那次接受带来几处改动，0 = 一字未改。**与 `after` 分列**：`after` 是文本
+    # 摘要，把计数混进去，`CAST(after AS INTEGER)` 会对每条文字摘要静默返回 0——一个
+    # 看起来合理、实际全错的聚合。
+    #
+    # `node_count` 是 `kind='generate'` 那条事件的载荷，也是**统计的分母**：这次生成
+    # 落进画布的那棵树有几个节点。它与 `at` / `recorded_at` 一样属于"发生那一刻的
+    # 事实"，保存时不再重算——用户改完之后树上的节点数已经变了。
     #
     # `at` 由前端给（事件发生的时刻），`recorded_at` 是入库时刻。分开是为了能诊断
     # "事件说它 09:31 发生、实际 09:35 才入库"——前端的时钟不可信。
@@ -127,6 +157,7 @@ def connect() -> sqlite3.Connection:
         depth       INTEGER,
         subtree_size INTEGER,
         change_count INTEGER,
+        node_count  INTEGER,
         at          TEXT NOT NULL,
         recorded_at TEXT NOT NULL
     )""")
@@ -134,7 +165,9 @@ def connect() -> sqlite3.Connection:
     # 565 行了。少了这一步，`edits.record()` 的 INSERT 会因为"no such column"抛错，
     # 被它自己的 `except` 吞掉 → **所有事件静默不落库**，正好是这张表最擅长的那种坏法
     # （`total` 一直是 0，看着和"没人改过"一模一样）。所以补列必须幂等且在这里做。
-    _ensure_columns(conn, "edit_events", {"subtree_size": "INTEGER", "change_count": "INTEGER"})
+    _ensure_columns(conn, "edit_events",
+                    {"subtree_size": "INTEGER", "change_count": "INTEGER",
+                     "node_count": "INTEGER"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edit_events_map ON edit_events(map_id, at)")
     # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
     # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"

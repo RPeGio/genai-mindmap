@@ -363,13 +363,13 @@ export interface paths {
         };
         /**
          * List Runs
-         * @description 运行台账。默认回答的是"上次跑完、我还没处理的是哪一次"。
+         * @description 运行台账。默认回答的是"上次跑完、我还没存下来的是哪一次"。
          *
-         *     `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出草稿的那次
+         *     `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出结果的那次
          *     同样要能被捡起来**——否则"关掉页面那 40 秒"照样白花，只是从内存白花变成写进
          *     数据库白花。
          *
-         *     这条查询就是这张表草稿列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
+         *     这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
          */
         get: operations["list_runs_api_agent_runs_get"];
         put?: never;
@@ -408,33 +408,13 @@ export interface paths {
         put?: never;
         /**
          * Mark Run Applied
-         * @description 候选进了画布。前端在「应用」成功后调用一次，幂等。
+         * @description 这次生成的结果**被保存进库了**。前端在保存成功后调用一次，幂等。
          *
-         *     "done 但已应用"与"done 但没应用"只能靠这个时间戳分开：候选可能被 PUT 到一张
-         *     已有导图上（推不出新记录），也可能应用之后又被撤销。用 `mindmaps` 表反推，
-         *     得到的全是猜。
+         *     "生成过但没保存"与"生成过、也存下来了"只能靠这个时间戳分开：那份内容可能被
+         *     PUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`
+         *     表反推，得到的全是猜。
          */
         post: operations["mark_run_applied_api_agent_runs__run_id__applied_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/agent/runs/{run_id}/dismissed": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Mark Run Dismissed
-         * @description 用户主动丢弃了这份候选。与"应用过"分开记：下次进页面不该再问同一次。
-         */
-        post: operations["mark_run_dismissed_api_agent_runs__run_id__dismissed_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -794,7 +774,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept";
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate";
             /** Node Id */
             node_id?: string | null;
             /** Field */
@@ -809,6 +789,8 @@ export interface components {
             subtree_size?: number | null;
             /** Change Count */
             change_count?: number | null;
+            /** Node Count */
+            node_count?: number | null;
             /** Run Id */
             run_id?: string | null;
             /** At */
@@ -828,7 +810,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept";
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate";
             /** Node Id */
             node_id?: string | null;
             /** Field */
@@ -843,6 +825,8 @@ export interface components {
             subtree_size?: number | null;
             /** Change Count */
             change_count?: number | null;
+            /** Node Count */
+            node_count?: number | null;
             /** Run Id */
             run_id?: string | null;
             /** At */
@@ -858,8 +842,8 @@ export interface components {
          * EditHealth
          * @description 跨图的日志链路健康检查（`GET /mindmaps/edits/health`）。
          *
-         *     判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次应用候选都记
-         *     一条 `accept`（连一字未改也记），所以"昨日有保存、昨日零事件"只能是链路断了
+         *     判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次生成完成都记
+         *     一条 `generate`（连一处没改也记），所以"昨日有保存、昨日零事件"只能是链路断了
          *     ——前端在发、后端在丢，或者事件根本没进请求体。实测有过 40 分钟这个状态（8000
          *     跑旧代码），而当时没有任何告警：单图的 `total=0` 看着和"没人改过"一模一样。
          *
@@ -891,6 +875,11 @@ export interface components {
          *       - `sum(by_field) == by_kind["update"] + by_kind["style"]`。
          *
          *     对不上就说明有写入路径绕过了契约，而不是"统计有点怪"。
+         *
+         *     改动量与"本来可以不改"的分母分列四组，全部是原始量（比例让读的人自己除）：
+         *     分母 `generated_nodes`、分子 `changed_events`、以及"这次生成一处都没被改"的
+         *     `untouched_runs`。三者必须能对上：`untouched_runs <= generated_runs`，而
+         *     `changed_events == 0` 时 `untouched_runs == generated_runs`。
          */
         EditSummary: {
             /** Total */
@@ -918,6 +907,26 @@ export interface components {
             removed_subtree: {
                 [key: string]: number;
             };
+            /**
+             * Generated Runs
+             * @default 0
+             */
+            generated_runs: number;
+            /**
+             * Generated Nodes
+             * @default 0
+             */
+            generated_nodes: number;
+            /**
+             * Changed Events
+             * @default 0
+             */
+            changed_events: number;
+            /**
+             * Untouched Runs
+             * @default 0
+             */
+            untouched_runs: number;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -961,10 +970,10 @@ export interface components {
          * LabelShrunk
          * @description 标题被改短的统计，**只统计 `actor="user"`**。
          *
-         *     过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（用户点了应用），它不
-         *     反映用户的偏好。混进来时 `count` 会比用户的真实条数多（实测 B 图 3 条 user 的
-         *     缩短被算成 4 条，多出来的那条是 agent 的 13→10 字），而"用户的缩短偏好"正是这
-         *     个数字要回答的东西。
+         *     过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（生成直接落画布时那批
+         *     改动记在 `agent` 名下），它不反映用户的偏好。混进来时 `count` 会比用户的真实
+         *     条数多（实测 B 图 3 条 user 的缩短被算成 4 条，多出来的那条是 agent 的 13→10
+         *     字），而"用户的缩短偏好"正是这个数字要回答的东西。
          *
          *     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
          *     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：
@@ -1329,7 +1338,7 @@ export interface components {
         };
         /**
          * RunDetail
-         * @description 单条：带候选正文与失败原因。
+         * @description 单条：带结果正文与失败原因。
          */
         RunDetail: {
             /** Run Id */
@@ -1346,8 +1355,6 @@ export interface components {
             updated_at: string;
             /** Applied At */
             applied_at?: string | null;
-            /** Dismissed At */
-            dismissed_at?: string | null;
             /** Candidate */
             candidate?: unknown | null;
             /** Failure */
@@ -1359,10 +1366,10 @@ export interface components {
         };
         /**
          * RunSummary
-         * @description 列表里的一行：**不带候选正文**。
+         * @description 列表里的一行：**不带结果正文**。
          *
-         *     候选是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句
-         *     "上次有一次生成完成了"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。
+         *     结果是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句
+         *     "上次有一次生成还没保存"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。
          */
         RunSummary: {
             /** Run Id */
@@ -1379,8 +1386,6 @@ export interface components {
             updated_at: string;
             /** Applied At */
             applied_at?: string | null;
-            /** Dismissed At */
-            dismissed_at?: string | null;
         };
         /**
          * SaveRequest
@@ -2256,9 +2261,9 @@ export interface operations {
     list_runs_api_agent_runs_get: {
         parameters: {
             query?: {
-                /** @description 只看某一种状态。缺省 = 有草稿且还没被处理过的（done + cancelled）。 */
+                /** @description 只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。 */
                 status?: ("done" | "cancelled" | "failed" | "running") | null;
-                /** @description 只列有草稿、且用户既没应用也没丢弃的；置 false 则把这段台账原样列出来。 */
+                /** @description 只列有结果、且后来没被保存过的；置 false 则把这段台账原样列出来。 */
                 unapplied?: boolean;
                 limit?: number;
             };
@@ -2320,35 +2325,6 @@ export interface operations {
         };
     };
     mark_run_applied_api_agent_runs__run_id__applied_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    mark_run_dismissed_api_agent_runs__run_id__dismissed_post: {
         parameters: {
             query?: never;
             header?: never;

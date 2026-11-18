@@ -80,9 +80,9 @@
  "run_id":null,"at":"2026-11-17T09:30:01.250Z"}
 ```
 
-`kind` ∈ `add` / `remove` / `update` / `move` / `edge` / `style` / `accept`；`field` **只在 `update` / `style` 上有值**（`label` / `title` / `detail` / `note` / `color` / `icon`）。这条规则让统计能自校验：`sum(by_field) == by_kind.update + by_kind.style`，`sum(by_actor) == total`。对不上就说明有写入路径绕过了契约。
+`kind` ∈ `add` / `remove` / `update` / `move` / `edge` / `style` / `generate`（历史行里还有 `accept`）；`field` **只在 `update` / `style` 上有值**（`label` / `title` / `detail` / `note` / `color` / `icon`）。这条规则让统计能自校验：`sum(by_field) == by_kind.update + by_kind.style`，`sum(by_actor) == total`。对不上就说明有写入路径绕过了契约。
 
-`accept` 是**一次"应用候选"**（`create` / `expand` / `edit` 三条路都算），不是改动：`node_id` / `field` / `depth` 全空，只有一个 `change_count`（这次接受带来几处改动，**`0` = 一字未改**），`actor` 固定 `user`（点应用的是用户，改动本身记在 `agent` 头上）。它**每次都记**，哪怕 diff 是空的——没有它，"生成完一字不改直接保存"在表里是 0 行，与"用户从没用过"不可区分，缺的不是样本而是分母。
+`generate` 是**一次"生成落到画布"**（`create` / `expand` / `edit` 三条路都算），不是改动：`node_id` / `field` / `depth` 全空，只有 `node_count`（这次落进画布的那棵树有几个节点，**在生成完成那一刻定死**）与 `run_id`，`actor` 固定 `agent`。它**每次都记**，哪怕一处都没改——没有它，"生成完一字不改直接保存"在表里是 0 行，与"用户从没用过"不可区分，缺的不是样本而是分母。它的前身是 `accept`（候选层还在时"用户点了应用"，`actor='user'` + `change_count`）；候选层删掉之后新数据一律写 `generate`，老行原样保留、`by_kind` 照样读得到。
 
 `depth` 是节点层数（**根是 1**），`remove` 事件填删除前所在层。`subtree_size` 是这条 `remove` **一共删掉几个节点**（含自己，数的是真的消失的那些）：删一个叶节点是 1，删一整支 12 个节点是**一条**事件、`subtree_size=12`。加列之前的老数据这一位是 `null`（当时没记，不做回填）。`at` 由前端给（事件发生的时刻，非法时退回入库时刻），`recorded_at` 是服务端写入时刻——分开才诊断得出时钟漂移。单次保存最多 500 条，超出的部分留在前端队列里**等下一次**（分批，不是丢弃），只把条数上报成一条服务端 warning。
 
@@ -92,11 +92,11 @@
 
 这几个数直接对应生成侧该改什么：标题普遍被缩短 → 16 字上限可能还不够短；零散删掉的集中在第 4 层 → 初次深度太深；成规模删掉的是整支 → 那一支根本不该生成。**它们只说发生了什么，不说为什么**（见 `docs/EDIT-LOG.md` 的局限一节）。
 
-`last_event_at` 是这张图最近一条事件的**入库**时刻（`recorded_at`，不是前端给的 `at`；空表是 `null` 而不是空串）。`GET /mindmaps/edits/health` 是跨图的死表探测器：**"保存了但没有任何事件"在正常情况下不该发生**（每次应用候选都记一条 `accept`，连一字未改也记），所以"昨日保存 > 0 且昨日编辑 = 0"判定 `chain_suspect`——前端在发、后端在丢的那种静默故障，40 分钟里没有任何告警，就靠这一条捞。
-| `POST /api/agent/runs/stream` | `{"run_id":"…","goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"prefs_applied":["diagram_type.default=fishbone"],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `sources` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `heartbeat` / `done` / `error`；**有材料时**响应体最前面还有一行 **SSE 注释帧** `: 正在把材料收进知识库`（入库在首帧之前，先用它把首字节送出去；不是数据帧、不占 `seq`；没有材料时整段跳过，所以不带材料的请求帧与加这段之前逐字节相同）。`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`），产物是**候选**；**只在没产出导图时** `done` 还带 `text` / `reasoning`（模型收尾那一轮的原话与思考，各截断到 4000 字）；模型思考期间有 `heartbeat` 帧（`{seq, type:"heartbeat", waited_ms}`，每 10 秒一帧，只保活）；`sources` 帧**只在材料真的进了知识库时出现**（旧 id → 库里的持久 id） | 目标为空 422；来源合计超出模型上下文 422；同一个 `run_id` 正在跑 409（`run_in_progress`）；预算用尽或模型失败以 `error` 事件下发 |
-| `GET /api/agent/runs` | 查询参数 `status`（`done` / `cancelled` / `failed` / `running`，可省略）、`unapplied`（默认 `true`）、`limit`（1–100，默认 20） | 运行台账数组（`run_id` / `status` / `intent` / `goal` / 时间戳），**不含候选正文**。`status` 省略时取 `done` + `cancelled` 中"有草稿且既没应用也没丢弃"的 | — |
-| `GET /api/agent/runs/{run_id}` | 无 | 同上再加 `candidate`（整棵树）、`failure`、`mode` | 不存在 404 |
-| `POST /api/agent/runs/{run_id}/applied`<br>`POST /api/agent/runs/{run_id}/dismissed` | 无 | 204；幂等（只打第一个时间戳） | 不存在 404 |
+`last_event_at` 是这张图最近一条事件的**入库**时刻（`recorded_at`，不是前端给的 `at`；空表是 `null` 而不是空串）。`GET /mindmaps/edits/health` 是跨图的死表探测器：**"保存了但没有任何事件"在正常情况下不该发生**（每次生成落地都记一条 `generate`，连一处没改也记），所以"昨日保存 > 0 且昨日编辑 = 0"判定 `chain_suspect`——前端在发、后端在丢的那种静默故障，40 分钟里没有任何告警，就靠这一条捞。
+| `POST /api/agent/runs/stream` | `{"run_id":"…","goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"prefs_applied":["diagram_type.default=fishbone"],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `sources` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `heartbeat` / `done` / `error`；**有材料时**响应体最前面还有一行 **SSE 注释帧** `: 正在把材料收进知识库`（入库在首帧之前，先用它把首字节送出去；不是数据帧、不占 `seq`；没有材料时整段跳过，所以不带材料的请求帧与加这段之前逐字节相同）。`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`），`content` 是这次生成的整棵树（前端拿到就直接落画布并标成未保存，没有"候选待确认"这一步）；**只在没产出导图时** `done` 还带 `text` / `reasoning`（模型收尾那一轮的原话与思考，各截断到 4000 字）；模型思考期间有 `heartbeat` 帧（`{seq, type:"heartbeat", waited_ms}`，每 10 秒一帧，只保活）；`sources` 帧**只在材料真的进了知识库时出现**（旧 id → 库里的持久 id） | 目标为空 422；来源合计超出模型上下文 422；同一个 `run_id` 正在跑 409（`run_in_progress`）；预算用尽或模型失败以 `error` 事件下发 |
+| `GET /api/agent/runs` | 查询参数 `status`（`done` / `cancelled` / `failed` / `running`，可省略）、`unapplied`（默认 `true`）、`limit`（1–100，默认 20） | 运行台账数组（`run_id` / `status` / `intent` / `goal` / 时间戳），**不含结果正文**。`status` 省略时取 `done` + `cancelled` 中"有结果且没被保存过"的 | — |
+| `GET /api/agent/runs/{run_id}` | 无 | 同上再加 `candidate`（整棵树；字段名沿用，语义是"这次生成产出的树"）、`failure`、`mode` | 不存在 404 |
+| `POST /api/agent/runs/{run_id}/applied` | 无 | 204；幂等（只打第一个时间戳）。语义是**这份结果被保存进库了**（前端在保存成功后调用），它决定下次进页面还要不要提醒 | 不存在 404 |
 | `GET /api/prefs` | 无 | 全部偏好：`key` / `value` / `scope` / `source` / 两个时间戳，以及 `last_applied_at`（来自 `runs.request.prefs_applied`，为空 = 从未生效） | — |
 | `PUT /api/prefs/{pref_key}` | `{"value":"…","source":"user_explicit / suggestion_accepted","source_run_id":null}` | `{"pref":…,"changed":true/false}`；同值重复提交 `changed=false` 且不刷新 `updated_at` | 键非法 / 枚举外 / 备注超 8 条或 500 字 400（`pref_key_invalid` / `pref_value_invalid` / `pref_limit_exceeded`） |
 | `DELETE /api/prefs/{pref_key}` | 无 | 204，硬删（没有软删） | 不存在 404（与"删了但还在"必须分得开） |
@@ -107,14 +107,14 @@
 
 **流式接口只有一套帧格式**，就是 `/api/agent/runs/stream` 的这套；旧的 `/api/generations/stream`（`stage` / `skeleton` / `node` / `done` / `error` + 末尾 `data: [DONE]`）已连路由一起删除。`backend/app/generation/stream_partial.py` 现在只剩增量解析器（`parse_partial` / `collect_new_nodes`），供 agent 的 `node_grow` 预览调用，不再有帧拼装。
 
-**`run_id` 让一次运行有身份（新增）。** 以前请求里没有 run id，服务端没有能力识别"同一次运行又投递了一遍"，于是换标签页、刷新重发、客户端重试都会新开一次真跑——两倍的钱、两份候选，两个标签页各点一次「应用」就是两张图（`create_map` 每次 `uuid4()`）。现在：
+**`run_id` 让一次运行有身份（新增）。** 以前请求里没有 run id，服务端没有能力识别"同一次运行又投递了一遍"，于是换标签页、刷新重发、客户端重试都会新开一次真跑——两倍的钱、两份结果，两个标签页各存一次就是两张图（`create_map` 每次 `uuid4()`）。现在：
 
 - 带同一个 `run_id` 且该行 `status=running` → 409 `run_in_progress`（同一个 run 并发跑两次会互相打架）。
-- 带同一个 `run_id` 且该行 `done` → 直接把已有候选按原样的帧重放（`snapshot` → `done`，`mode` 照原值），**不再调模型**。
+- 带同一个 `run_id` 且该行 `done` → 直接把已有结果按原样的帧重放（`snapshot` → `done`，`mode` 照原值），**不再调模型**。
 - 带同一个 `run_id` 且该行 `cancelled` / `failed` → 允许重跑，复用同一个 id（那是用户主动重试，不是重复投递）。重跑期间不清空上一轮的草稿。
 - 不带 `run_id`（老客户端）→ 服务端补一个，**响应体逐字节不变**，只是额外落一行台账。
 
-`done` 之后这行冻结：一条迟到的取消不许把已经交付的候选改写成 `cancelled`。SSE 因此从"run 本身"降级成"这一行的一次观察窗口"，帧格式一个字节都没改。
+`done` 之后这行冻结：一条迟到的取消不许把已经交付的结果改写成 `cancelled`。SSE 因此从"run 本身"降级成"这一行的一次观察窗口"，帧格式一个字节都没改。
 
 **运行结束（含被取消）时草稿落库。** 这是"关掉页面那 40 秒白花"的解：abort 会让 uvicorn 关掉生成器、`aclosing` 触发 `task.cancel()`，工具里的模型请求被取消且已经花掉的调用不回滚——原先 `ctx.candidate` 只活内存，用户回来什么都看不到。现在 `_frames` 的 `finally` 里写一次（正常 → `done`，异常 → `failed` + `failure`，什么都没发出去就断了 → `cancelled`，**只要候选非空就写**）。前端进页面时问一次 `GET /api/agent/runs`，有残留就在侧栏提示一句（不是弹窗），点「查看」把它载入现有的候选确认流程，点「丢弃」记一笔 `dismissed_at`。
 信封只有 `{seq, type, ...}`：`seq` 由服务端补齐，没有 `v` / `runId` / revision 字段（轮次与候选版本在各事件自己的 payload 里）。产物是 `ops` 操作批次或整树 `snapshot` 而不是"增量节点上屏"；`node_grow` 只作深层生成的预览帧、收到 `snapshot` 即作废，前端把它挂在候选副本上，用户点接受才落到画布。`MINDMAP_LLM_MODE=demo` 也作用于 agent：`run()` 入口直接发 `stage` / `snapshot` / `done` 三帧（`done.mode=demo`），不调用模型，因此演示模式下没有 `tool_start` / `ops` / `node_grow` 帧。协议见 `docs/AGENT_STREAM_PROTOCOL.md`，设计背景见 `docs/AGENT_PLAN.md`。

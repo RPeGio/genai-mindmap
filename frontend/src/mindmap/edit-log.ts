@@ -38,25 +38,35 @@
  *  - **撤销 / 重做**：一次被撤销的编辑不是用户的最终意图。记了它，`label_shrunk`
  *    会同时收到"18→9"和"9→18"两条，平均值被拉回中性、次数却翻倍——比不记更糟。
  *    要审计"用户反复撤销"该是另一个指标，这一版不做。
- *  - **create 意图接受候选的整棵树**（空画布 → 一整棵树）：整棵树都是"新增"，
- *    那不是 diff，是把整棵树重念一遍。与 `stores/mindmap.ts::diffCandidate` 对
- *    `create` 返回 `null` 是同一条判断。**注意这条只否掉了"整棵树"这个载荷，
- *    没有否掉"接受"这个动作本身**——动作记成一条 `accept`（见下）。
+ *  - **create 意图落画布的整棵树**（空画布 → 一整棵树）：整棵树都是"新增"，
+ *    那不是 diff，是把整棵树重念一遍。与 `stores/mindmap.ts::diffCandidate` 在没有
+ *    基线时返回 `null` 是同一条判断。**注意这条只否掉了"整棵树"这个载荷，
+ *    没有否掉"生成"这个动作本身**——动作记成一条 `generate`（见下）。
  *
- * ## 为什么必须有一条 `accept`：它是"一字未改"这个最强正样本的唯一落点
+ * ## 为什么必须有一条 `generate`：它是"一字未改"这个最强正样本的唯一落点
  *
- * `create` 意图接受候选时 diff 为 0 条，于是"生成完一字不改直接保存"在表里是 0 行，
- * 与"这个用户从没用过"完全不可区分。**缺的不是样本，是分母**：10 张图里 9 张一字
- * 未改、1 张改 10 处，只统计改动会得出"标题被普遍改短"的结论，然后去压生成侧的上限
- * ——而那 9 张本来合适的图在表里根本没出现过，偏差方向永远朝"生成质量更差"。
+ * 生成结果是**直接进画布**的（没有候选、没有「应用」这一步）。`create` 那次落地
+ * 的 diff 是 0 条，于是"生成完一字不改直接保存"在表里是 0 行，与"这个用户从没用过"
+ * 完全不可区分。**缺的不是样本，是分母**：10 张图里 9 张一字未改、1 张改 10 处，
+ * 只统计改动会得出"标题被普遍改短"的结论，然后去压生成侧的上限——而那 9 张本来
+ * 合适的图在表里根本没出现过，偏差方向永远朝"生成质量更差"。
  *
- * 所以每次"应用候选"（`create` / `expand` / `edit` 三条路）都记**一条** `accept`，
- * 不管改了几处；`changeCount` 就是这次接受带来的改动条数，`0` 表示一字未改。
+ * 所以每次生成落地都记**一条** `generate`，不管改了几处：
+ *
+ *  - `nodeCount` 是这次落进画布的那棵树有几个节点，**在生成完成那一刻定死**。
+ *    保存时再数就数错了——那时用户已经改过，数出来的是"改后的规模"，分母永久的偏。
+ *  - `runId` 让它与"这次生成带来的那批改动"对上：查"有没有对应 `run_id` 的改动
+ *    事件"就知道这次生成被改没被改，不需要前端把"改了几处"算好塞进来
+ *    （那是 `changeCount` 干过的事，现在不用了）。
+ *
+ * 后端统计口径（`app/mindmaps/edits.py::summary`）：
+ * 分母 `SUM(node_count) WHERE kind='generate'`，分子是该图上的节点改动条数，
+ * 零改动次数是"那个 `run_id` 下一条改动事件都没有"的 generate 行数。
  */
 import type { MindEdge, MindMapContent, MindNode } from '../api/types';
 import { charLength } from './edits';
 
-/** 谁改的。`user` 是手工编辑（改文字、加节点、删节点、连线），`agent` 是应用候选。 */
+/** 谁改的。`user` 是手工编辑（改文字、加节点、删节点、连线），`agent` 是生成落地。 */
 export type EditActor = 'user' | 'agent';
 
 /**
@@ -66,11 +76,16 @@ export type EditActor = 'user' | 'agent';
  * "用户在调样式上花了多少改动"本身是个信号（样式占比高说明生成侧的视觉默认值不对），
  * 混进 update 就再也拆不出来了。
  *
- * `accept` 不是"改动"，是**一次应用候选**：它没有节点、没有字段、没有层数，只有一个
- * `changeCount`。它和其余六种并列而不是另开一张表，因为它回答的是同一个问题的一
- * 另一半——"改了什么"要有"本来可以不改"作分母，否则 9 张一字未改的图不存在于表里。
+ * `generate` 不是"改动"，是**一次生成落到画布**：它没有节点、没有字段、没有层数，
+ * 只有 `nodeCount` 与 `runId`。它和其余六种并列而不是另开一张表，因为它回答的是
+ * 同一个问题的另一半——"改了什么"要有"本来可以不改"作分母。
+ *
+ * `accept` 是它的前身（候选层还在时"用户点了应用"）。**前端不再产生它**，保留在
+ * 联合类型里只是为了与后端 `EditKind` 逐字对齐：库里还有几千行历史，镜像少写一个
+ * 字面量，读老数据的人就会以为那些行是非法的。
  */
-export type EditKind = 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept';
+export type EditKind =
+  | 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept' | 'generate';
 
 /**
  * 改动落在哪个字段上。**只有 `kind` 为 `update` / `style` 的事件才有值。**
@@ -126,15 +141,19 @@ export interface EditEvent {
    */
   subtreeSize?: number;
   /**
-   * 这次接受带来的改动条数。只有 `kind === 'accept'` 有值，`0` = 一字未改。
+   * 这次生成落进画布的那棵树有几个节点。只有 `kind === 'generate'` 有值。
+   *
+   * **在生成完成那一刻算好并定死**：保存时才数会数到改后的树——一次"删掉一半再
+   * 保存"会把分母算成改后的规模，比例永久偏高，而分母存在的意义正是"模型给了
+   * 多少东西"。
    *
    * 它不进 `after`：`after` 的语义是"截断后的文本摘要"，把计数塞进去会让
    * `CAST(after AS INTEGER)` 对每一条文字摘要静默返回 0——一个看起来合理、
    * 实际全错的聚合，正是这张表最不能出的错。
    */
-  changeCount?: number;
+  nodeCount?: number;
 
-  /** 这次改动动的是哪个 run 的产物。只有应用候选那一步能对上，手工编辑留空。 */
+  /** 这次改动动的是哪个 run 的产物。生成落地与它带来的那批改动共用同一个 id。 */
   runId?: string;
   /** ISO 时刻。**同一次提交内所有事件共享同一个值**，它是"一次操作"的分组键。 */
   at: string;
@@ -377,29 +396,29 @@ export function diffEdits(
   return events;
 }
 
-/** `acceptEvent` 需要的东西：时刻与 run。actor 是固定的 `user`，见下。 */
-export interface AcceptOptions {
-  /** 与这次接受带来的那批改动**同一个** `at`（`GROUP BY at` 才能还原成一次操作）。 */
+/** `generateEvent` 需要的东西：时刻与 run。actor 固定 `agent`，见下。 */
+export interface GenerateOptions {
+  /** 与这次生成带来的那批改动**同一个** `at`（`GROUP BY at` 才能还原成一次操作）。 */
   at: string;
-  runId?: string;
+  runId: string;
 }
 
 /**
- * "应用候选"这条事件：每次接受记一条，`changeCount === 0` 表示一字未改。
+ * "这次生成落到画布"这条事件：每次生成记一条，`nodeCount` 是落进画布的节点数。
  *
- * **actor 固定 `user`**，而不是用这次 diff 的 `agent`：点「应用到画布」的是用户。
- * 两者说的是不同的事——`agent` 那批事件是"模型想要什么"，这一条是"用户同意了"。
- * 混成同一个 actor，`by_actor.user` 就再也分不清"用户亲手改的"与"用户点头接受的"。
+ * **actor 固定 `agent`**，而不是用这次差分的 actor：产出这棵树的是模型。同一批里
+ * 那些节点改动也是 `agent`（用户没动手），两类事件靠 `kind` 分开，不靠 actor——
+ * 混成同一个 kind，`by_kind` 就再也分不清"改了 3 处"和"生成了 1 次"。
  *
- * `runId` 带上：`create` 意图在此之前**一条 run 线索都没有**（整棵树不是 diff），
- * 于是"哪次生成被应用了"只有 `runs.applied_at` 一个地方记得，且只记得最后一次。
+ * `runId` 这里**必填**（`AcceptOptions` 里它是可选的）：没有 run_id 的 generate 行
+ * 不算"一字未改"，只能算"当时没记"，后端统计会把它从那个指标里排掉。
  */
-export function acceptEvent(changeCount: number, options: AcceptOptions): EditEvent {
+export function generateEvent(nodeCount: number, options: GenerateOptions): EditEvent {
   return {
-    actor: 'user',
-    kind: 'accept',
+    actor: 'agent',
+    kind: 'generate',
     at: options.at,
-    changeCount,
-    ...(options.runId ? { runId: options.runId } : {}),
+    nodeCount,
+    runId: options.runId,
   };
 }

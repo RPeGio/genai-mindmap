@@ -144,18 +144,20 @@ describe('画布节点真的画出继承来的颜色', () => {
   });
 });
 
-describe('候选与预览不着色', () => {
-  it('还没被应用的候选不画颜色：那是一份提案，不是作品', () => {
+describe('生成中的预览不着色', () => {
+  it('还在长的预览不画颜色：它还没进画布', () => {
     const store = useMindMapStore();
-    // 画布优先画 content，所以先清空它，逼渲染源落到候选上。
     store.newMap();
-    store.candidate = structuredClone(TREE);
+    // 预览是唯一"看得见但还没进画布"的树（候选层已经删掉了）。
+    store.agentPreview = {
+      label: '根', expandable: null,
+      children: [{ label: '甲', expandable: null, children: [] }],
+    };
 
     const byId = colors(store);
-    // 结构照样画出来（候选要看得见），但配色不画：弱化样式与配色会互相打架，
-    // "这是提案"这件事必须比"哪一支是什么色"更显眼。
+    // 结构照样画出来（预览要看得见），但配色不画：弱化样式与配色会互相打架，
+    // "这棵树还在长"这件事必须比"哪一支是什么色"更显眼。
     expect(byId.size).toBeGreaterThan(0);
-    expect(byId.get('a')).toBeUndefined();
-    expect(byId.get('a2')).toBeUndefined();
+    expect([...byId.values()].every(value => value === undefined)).toBe(true);
   });
 });

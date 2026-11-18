@@ -2,10 +2,10 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunResolved, runAgentStream, updateMindMap } from '../api/client';
+import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
-import { acceptEvent, diffEdits, EDIT_EVENT_LIMIT, type EditActor, type EditEvent } from '../mindmap/edit-log';
+import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { sourceInputError } from '../sources/input';
@@ -86,11 +86,12 @@ export function bodySource(node: MindNode): BodySource {
 }
 
 /**
- * 候选相对当前画布的一条改动。
+ * 一次生成相对生成前那条画布的一条改动。
  *
- * 存在的理由：`edit` / `expand` 意图的候选是"在当前树上的改动"，而**画布优先渲染
- * `content`**（用户的作品），候选节点在采纳之前根本不在画布上。没有这份清单，
- * 用户面对「候选已就绪」只能盲点「应用」——他不知道 agent 动了哪几个节点、动了什么。
+ * 存在的理由：生成**直接落画布**（没有候选确认这一步了），于是"刚才那 25 秒动了
+ * 什么"变成了必须补上的一件事——画布整棵树换了一遍，用户认得的那张图还在，但
+ * 哪几支被改了、哪几个节点没了，光看画布看不出来。没有这份清单，用户只能靠在
+ * 撤销栈里试一步来猜。
  */
 export interface CandidateChange {
   /**
@@ -120,7 +121,7 @@ export interface CandidateChange {
 }
 
 /**
- * 带上「在不在选区里」的改动条目（`store.candidateDiff` 的返回值）。
+ * 带上「在不在选区里」的改动条目（`store.generatedChanges` 的返回值）。
  *
  * 为什么不把 `inSelection` 直接塞进 `CandidateChange`：那两个纯函数
  * （`diffCandidate` / `diffEdges`）回答的是"两棵树哪里不一样"，它们**看不到**
@@ -129,10 +130,10 @@ export interface CandidateChange {
  */
 export interface ScopedChange extends CandidateChange {
   /**
-   * 是否落在「这次改图」带上去的选区里（见 `store.candidateSelection`）。
+   * 是否落在「这次生成」带上去的选区里（见 `store.generationSelection`）。
    *
    * 没有选区时恒为 `false`：那时"范围内/外"不成立，界面也不显示这个标记
-   * （`candidateSelection` 为空判断）。刻意用布尔而不是三态 `null`——清单每一行
+   * （`generationSelection` 为空判断）。刻意用布尔而不是三态 `null`——清单每一行
    * 都要渲染，三态会让每个读它的地方都写一遍 `=== false` 的分支。
    */
   inSelection: boolean;
@@ -176,16 +177,16 @@ function nodeFieldChanges(before: MindNode, after: MindNode): string[] {
 }
 
 /**
- * 当前画布与候选之间的差异；**没有可比基线时返回 `null`**（`create` 意图）。
+ * 两棵树之间的差异；**没有可比基线时返回 `null`**（画布本来是空的）。
  *
  * 为什么用"两份树对比"而不是"记录收到的 op 批次"：
  *
- *  - op 帧可能丢、可能乱序（`applyOpsToCandidate` 会主动丢弃对不上的批次），
- *    按 op 记账得到的是"我以为改了什么"，而对比得到的是"树到底哪里不一样"；
- *  - `resumeRun` 从服务端捡回候选时一条 op 帧都没有，那时只有对比能给出差异；
+ *  - op 帧可能丢、可能乱序（`applyOpsToDraft` 会主动丢弃对不上的批次），按 op
+ *    记账得到的是"我以为改了什么"，而对比得到的是"树到底哪里不一样"；
+ *  - `resumeRun` 从服务端捡回结果时一条 op 帧都没有，那时只有对比能给出差异；
  *  - 对比不依赖协议：后端将来加一种下发方式，这里一行都不用改。
  *
- * `create` 返回 `null` 而不是"全部节点都是新增"：一张 80 节点的图会得到 80 条
+ * 没有基线返回 `null` 而不是"全部节点都是新增"：一张 80 节点的图会得到 80 条
  * "新增"，那不是 diff，是把整棵树重念一遍。
  */
 export function diffCandidate(base: MindNode | null, next: MindNode): CandidateChange[] | null {
@@ -233,7 +234,7 @@ export function diffCandidate(base: MindNode | null, next: MindNode): CandidateC
  *
  * 与 `diffCandidate`（对比两份树）并列而不是合并进去：树对比走的是"前序遍历 +
  * 父 id"，边对比走的是"按 id 对齐的集合差"，两种算法的输入形状不同，硬塞进一个
- * 函数只会让两边都长出分支。调用方（`candidateDiff`）把两份结果拼起来。
+ * 函数只会让两边都长出分支。调用方（`commitGenerated`）把两份结果拼起来。
  *
  * `nameOf` 把节点 id 换成标题：清单上写「形式审查 → 付款（是）」比写两个 32 位
  * hex 有用得多，而边本身只有 id。
@@ -496,10 +497,11 @@ export interface MindNodeData {
   /** 这个节点有几条来源引用；画布角标用，0 或缺省都不显示角标 */
   refs?: number;
   /**
-   * 这一帧画的是还没进画布的树：`preview` 是生成中，`candidate` 是已就绪但未应用。
-   * 缺省表示它就在 `content` 里，也就是用户的作品。画布据此弱化样式。
+   * 这一帧画的是还没进画布的树：`preview` 是生成中（节点一个一个长出来）。
+   * 缺省表示它就在 `content` 里，也就是用户的作品——生成结果落地之后也在这一档，
+   * 因为它**已经是**画布上的内容了（只是还没保存）。画布据此弱化样式。
    */
-  draft?: 'preview' | 'candidate';
+  draft?: 'preview';
   /** 预览里模型明确标了「不用再展开」的节点，再弱一档；`null` 与 `true` 都不额外标记。 */
   previewLeaf?: boolean;
   /**
@@ -570,11 +572,13 @@ export type MindFlowNode = FlowNode<MindNodeData> & { selected: boolean };
 /**
  * 画布当前渲染的是哪棵树。
  *
- * 三级优先级：已应用的 `content` → 已就绪但未应用的 `candidate` → 生长中的
- * `agentPreview`。前两级之外的一切（保存、导出、撤销、编辑、采纳）仍然只认
- * `content`——渲染源只决定"画什么"，不决定"什么是用户的作品"。
+ * 两级：`content`（用户的作品，生成结果落地之后也在这里）→ 生长中的 `agentPreview`。
+ * 保存、导出、撤销、编辑全都只认 `content`——渲染源只决定"画什么"。
+ *
+ * **没有"候选"这一级了**：生成完成就把树装进 `content` 并标成未保存，不再有
+ * "看得见但不算你的"这个中间态。代价与补偿见 `commitGenerated`。
  */
-export type RenderKind = 'content' | 'candidate' | 'preview';
+export type RenderKind = 'content' | 'preview';
 
 interface RenderSource {
   root: MindNode;
@@ -690,15 +694,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * `pushHistory()` 设置、`collectEdits()` 消费并清空。抄引用而不是抄序列化：
    * `applyContent` 每次都是整体替换 `content.value`，旧树不会被后续修改带跑。
    *
-   * `content` 允许为 `null`：`create` 意图接受候选时画布本来是空的，那一步没有
-   * "改动之前那棵树"，但**仍然要记一条 `accept`**（否则"一字未改"在表里是 0 行，
-   * 与"从没用过"不可区分）。`accept` 为真只出现在 `acceptCandidate()` 的两条分支上。
+   * `content` 允许为 `null`：画布本来是空的时那一步没有"改动之前那棵树"，但差分
+   * 本身会返回空数组（整棵树都是新的，不是 diff）——那条判断在 `diffEdits` 里。
    */
   let editBase: {
     content: MindMapContent | null;
     actor: EditActor;
     runId?: string;
-    accept?: boolean;
   } | null = null;
 
   const saving = ref(false);
@@ -710,73 +712,95 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const clientRevision = ref(0);
 
-  /** agent 算出来的候选。它**不是** content：用户确认之前不写进画布。 */
-  const candidate = ref<MindMapContent | null>(null);
-  /** 候选产出时的 clientRevision，接受时用来判过时。 */
-  let candidateBaseRevision = 0;
+  /**
+   * 生成过程中的**工作副本**：op 批次与 `snapshot` 帧都拼在这上面。
+   *
+   * 它**不是** content，而且生命周期只有一轮运行：
+   *
+   *  - 生成期间不能直接改 `content`：`ops` 是一次几处的增量（`edit` 意图下模型可能
+   *    连调十几次），每条都落画布就等于把 25 秒的中间态全摊给用户看，撤销栈也会被
+   *    切成十几步半成品；
+   *  - 但它也**不是**"等用户点应用"的候选：`done` 帧一到就整树装进 `content`
+   *    （`commitGenerated`），中间没有任何确认动作。
+   *
+   * 所以它的对错只影响"这一轮生成有没有拼对"，不影响"用户的作品是什么"——那件事
+   * 到 `commitGenerated` 那一刻才发生，且可撤销。
+   */
+  const draft = ref<MindMapContent | null>(null);
 
   /**
-   * 候选产出时所在的导图会话号（见 `mapSession`）。
+   * 生成开始那一刻的画布引用。**只在一轮运行里有意义**，用于两件事：
+   *
+   *  1. `generatedChanges`：告诉用户"这次生成改了什么"，基线必须是生成前那棵树；
+   *  2. 版本冲突判定：完成时 `clientRevision` 变过，说明期间画布被改过（正常路径上
+   *     不可能——`busy` 把所有编辑入口都拦住了，但 `undo` / 将来新加的入口未必），
+   *     那时**不覆盖**，把两棵树都留着让用户选。
+   *
+   * 抄引用而不是深拷贝：`applyContent` 每次整体替换 `content.value`，旧树不会被
+   * 后续修改带跑（与 `editBase` 同一条理由）。
+   */
+  let generationBase: MindMapContent | null = null;
+  /** 生成开始时的 `clientRevision`，完成时用来判"期间画布被改过"。 */
+  let generationBaseRevision = 0;
+
+  /**
+   * 生成开始时所处的导图会话号（见 `mapSession`）。
    *
    * `clientRevision` 只在编辑时递增，切图（loadMap / newMap / preview）不碰它。
-   * 只看 revision 的话："生成候选 A → 打开另一张图 B → 点接受"会把 A 的内容
-   * 装进 B，还沿用 B 的 mapId 与 version，下次保存就把 A 写进 B 的记录。
+   * 只看 revision 的话："生成 A → 打开另一张图 B → 完成"会把 A 的内容装进 B，
+   * 还沿用 B 的 mapId 与 version，下次保存就把 A 写进 B 的记录。
    */
-  let candidateSession = 0;
+  let generationSession = 0;
 
   /**
-   * 候选是在哪种意图下产出的。
+   * 这一轮生成是在哪种意图下跑出来的。
    *
-   * 接受时要按它区分两件事：`create` 是一份新作品，不能继承上一张图的
+   * 落画布时要按它区分两件事：`create` 是一份新作品，不能继承上一张图的
    * `mapId` / `version` / 历史；`expand` / `edit` 改的就是当前这张图，身份必须留着。
    */
-  let candidateIntent: 'create' | 'expand' | 'edit' = 'create';
+  let generationIntent: 'create' | 'expand' | 'edit' = 'create';
 
   /**
    * 正在跑的这一轮是哪种意图（`agentRunning` 为假时只表示"上一次是什么"）。
    *
-   * 与 `candidateIntent` 分开：那个是候选的归属（接受时用），这个是**这一轮在做什么**
-   * （按钮文字用）。两者在候选就绪之后会分叉——候选已经产出、运行却还在收尾，
-   * 那时按钮该说的是"展开中…"，而候选的身份早就不变了。
+   * 与 `generationIntent` 分开不是冗余：那个是结果的归属（落画布时用），这个是
+   * **这一轮在做什么**（按钮文字用）。两者在生成完成之后会分叉——树已经进画布、
+   * 运行却还在收尾，那时按钮该说的是"展开中…"，而结果的归属早就不变了。
    */
   const runIntent = ref<'create' | 'expand' | 'edit'>('create');
 
   /**
    * 这一轮「改这张图」（`edit`）带上去的 `selected_ids`，原样快照。
    *
-   * 为什么要存一份而不是直接读 `selectedIds`：候选确认的整个过程中用户随时会改
-   * 选中（点一下清单里的一行就会跳转并选中）。读实时选区的话，diff 上那句
-   * "在不在你选中的范围内"会随着用户点来点去而变，而那说的其实是**另一个时刻**
-   * 的选区——用户没法靠它判断"这次改图动没动我圈的那三块"。
+   * 为什么要存一份而不是直接读 `selectedIds`：生成的整个过程中用户随时会改选中
+   * （点一下清单里的一行就会跳转并选中）。读实时选区的话，diff 上那句"在不在你
+   * 选中的范围内"会随着用户点来点去而变，而那说的其实是**另一个时刻**的选区。
    *
    * 只有 `edit` 会写它：`expand` 的选区是"要展开的那一个节点"，新节点按构造就
    * 落在它下面，"范围内/外"在那条路上没有信息量。
-   *
-   * 是 `ref` 而不是 `candidateIntent` 那样的普通 `let`：`candidateDiff` 要在它
-   * 变化时重算（选区在 `candidate` 之前就位，读 `candidate` 不会带来这次重算）。
    */
-  const candidateSelection = ref<string[]>([]);
+  const generationSelection = ref<string[]>([]);
 
   /**
-   * 候选树当前走到第几版 op。
+   * 生成中的工作副本当前走到第几版 op（见 `draft`）。
    *
    * 每批 op 的 `base_revision` 是后端在**它那棵树**上算的序号（0 起，一批加一），
-   * 这里记的是"我这份候选已经应用到这里"。两者对不上就说明中间漏了一批
+   * 这里记的是"我这份副本已经应用到这里"。两者对不上就说明中间漏了一批
    * （丢帧、乱序），在错位的树上继续套用比不套用更糟。
    *
    * 只放在 store 内部，不进返回对象：界面不需要读它，它只是消费端的一致性账本。
    */
-  let candidateRevision = 0;
+  let draftRevision = 0;
 
   /**
-   * 候选整棵作废时，把 op 版本账本一起归零。
+   * 工作副本整棵作废时，把 op 版本账本一起归零。
    *
    * 零是后端每一轮的新起点（`RunContext.revision` 从 0 起算）。漏掉这一步，
    * 下一轮的第一批 op 会因为 `base_revision=0` 对不上旧账本而被整批丢掉，
    * 表现出来就是"改了半天候选一点没动"。
    */
-  function resetCandidateOps() {
-    candidateRevision = 0;
+  function resetDraftOps() {
+    draftRevision = 0;
   }
 
   /** 给面板显示的工具进度与阶段。 */
@@ -785,39 +809,35 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const agentError = ref('');
 
   /**
-   * 这一轮 agent 产出的树是演示还是模型给的，取自 `done` 帧的 `mode`。
-   *
-   * `null` 表示"没说"（旧后端省略了这个字段），接受时退回 `'model'`——那是
-   * 这条通道一直以来的行为，不能因为多了个字段就让老后端的结果显示成未知。
-   * 而一旦帧里明确写了 `demo`，界面就必须说明白：占位树不能顶着"模型生成"。
-   */
-  const agentMode = ref<'demo' | 'model' | null>(null);
-
-  /**
-   * 上次跑完（或被中断）、但用户还没处理过的那次运行。
+   * 上次跑完（或被中断）、但**结果还没被保存**的那次运行。
    *
    * 这是"run 身份"落到界面上的唯一痕迹。此前 run 只活在一个 HTTP 连接的寿命里：
-   * 关掉页面，已经生成出来的候选跟着连接一起没了，用户回来什么都看不到。现在
+   * 关掉页面，已经生成出来的结果跟着连接一起没了，用户回来什么都看不到。现在
    * 服务端把它落进 `runs` 表，进页面时问一句"有没有我还没接住的结果"。
    *
    * 只是**一条提示**，不是弹窗：用户可能正在做别的事，打断他比让他知道这件事更烦。
+   * 与"候选待确认"的差别在于——生成结果当时已经进了画布、只是没保存；关掉页面
+   * 丢的是那份未保存的改动，不是"一份还没被采纳的提案"。
    */
   const resumableRun = ref<RunSummary | null>(null);
 
   /**
    * 这一次会话里已经明确表示"不要再问"了。
    *
-   * 丢弃是**本次会话**的决定：服务端那边同样会记 `dismissed_at`，但如果那次请求
-   * 没发出去（后端挂了），不该让同一句话立刻又冒出来——用户刚说完"不要"，界面
-   * 就当没听见，比不让捡回结果更伤。
+   * **只在本会话内静音，不写库**：`dismissed_at` 那一列已经删掉（没有"丢弃候选"
+   * 这个动作了），而后端每次进页面仍会返回这条——那是刻意的，因为它说的是事实：
+   * 你上次生成完没保存。下次开新会话再问一次不算骚扰。
    */
   let resumableSettled = false;
 
   /**
-   * 当前候选属于哪一次运行。应用/丢弃时用它上报，服务端据此分清"采纳过"与
-   * "嫌弃过"——两者都表示"别再提醒我"，但含义完全不同。
+   * 这次生成落进画布的那个 run，等保存成功后上报 `applied_at`。
+   *
+   * 从前它是"候选属于哪一次运行，应用/丢弃时上报"。现在只有一半留着：保存成功
+   * 才写时间戳，因为 `applied_at` 的语义已经变成"这份结果被存下来了"——它正是
+   * "下次进页面还要不要提醒"的判据。
    */
-  let activeRunId: string | null = null;
+  let pendingSaveRunId: string | null = null;
 
   /** 每次点击生成一个新的 run 身份。服务端只在这个 id 相同时才做幂等。 */
   function newRunId(): string {
@@ -844,16 +864,34 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 把上次那个候选载入**现有的**候选确认流程。
+   * 把上次那次生成的结果**直接装进画布**（并标成未保存）。
    *
-   * 落点与一次真跑结束时完全一样（`candidate` + 版本账本 + 意图），所以「应用」
-   * 「丢弃」、过时检查、整树校验一步都不少——不是另开一条"恢复"的旁路。
+   * 没有"确认"这一步：用户点「载入」就是明确要它，再让他点一次「应用」只是把
+   * 已经表达过的意图问第二遍。但**仍然走 `commitGenerated`**：撤销栈、`generate`
+   * 事件、身份重置、冲突判定一步都不少——不是另开一条"恢复"的旁路。
    */
   async function resumeRun(): Promise<void> {
     const target = resumableRun.value;
     if (!target) return;
+    // 进这一步之前的画布与版本：下面那趟请求在途时用户可能已经改了画布、或切了图，
+    // 两种都得判（判据与生成落地完全同一套，见 `commitGenerated`）。
+    const session = mapSession;
+    const baseRevision = clientRevision.value;
+    const base = content.value;
     try {
       const detail = await getRun(target.run_id);
+      if (detail.candidate) {
+        if (session !== mapSession) {
+          // 等网络这段时间用户切了图：这份结果属于上一张，装上去就是把 A 写进 B。
+          resumableRun.value = null;
+          status.value = '载入期间已经换了一张图，上次的结果没有装进来。';
+          return;
+        }
+        generationBase = base;
+        generationBaseRevision = baseRevision;
+        generationSession = session;
+        generationIntent = detail.intent;
+      }
       if (!detail.candidate) {
         resumableRun.value = null;
         status.value = '那次运行没有留下可用的内容。';
@@ -863,51 +901,44 @@ export const useMindMapStore = defineStore('mindmap', () => {
       agentWarnings.value = [];
       agentError.value = '';
       clearAgentPreview();
-      resetCandidateOps();
-      candidate.value = detail.candidate;
-      candidateBaseRevision = clientRevision.value;
-      candidateSession = mapSession;
-      candidateIntent = detail.intent;
-      // 捡回来的候选不知道当时圈了谁（`runs` 表存的是请求摘要，没有回读这条路），
+      resetDraftOps();
+      // 来历照原样带过来：占位树恢复成"模型生成"就是界面替它撒谎。
+      runIntent.value = detail.intent;
+      // 捡回来的结果不知道当时圈了谁（`runs` 表存的是请求摘要，没有回读这条路），
       // 所以范围标记一律按"没有选区"处理：宁可不说"范围内/外"，也不能拿此刻的
       // 选区去标一份几分钟前产出的改动——那会把用户引到错的地方去核对。
-      candidateSelection.value = [];
-      runIntent.value = detail.intent;
-      // 来历照原样带过来：占位树恢复成"模型生成"就是界面替它撒谎。
-      agentMode.value = detail.mode ?? null;
-      activeRunId = detail.run_id;
-      // 候选已经在面板上等着确认了，再留一条提示只会问两遍。
+      generationSelection.value = [];
       resumableRun.value = null;
-      status.value = '已载入上次生成的候选；确认后才会应用到画布。';
+      commitGenerated(detail.candidate, {
+        runId: detail.run_id,
+        intent: detail.intent,
+        mode: detail.mode ?? null,
+        // 载入时基线是**此刻**的画布：用户看到的"这次改了什么"必须是相对他现在
+        // 这张图算的，而不是相对那次运行开始时的某个已不存在的状态。
+        base,
+      });
     } catch (error) {
       resumableRun.value = null;
       status.value = error instanceof ApiError ? error.message : '读取上次的结果失败，请重试。';
     }
   }
 
-  /** 丢弃上次那份候选。服务端也记一笔，否则下次进页面还会问同一句。 */
-  async function dismissResumable(): Promise<void> {
-    const target = resumableRun.value;
+  /** 本会话内不再提这件事。**不写库**——理由见 `resumableSettled`。 */
+  function ignoreResumable(): void {
     resumableRun.value = null;
     resumableSettled = true;
-    if (!target) return;
-    status.value = '已丢弃上次的候选，画布没有变。';
-    try {
-      await markRunResolved(target.run_id, 'dismissed');
-    } catch {
-      // 上报失败不影响"已经不问"这件事：这只是记账，用户要的是别再被问。
-    }
+    status.value = '不再提示上次那次生成。它的结果还在服务端，刷新页面可以再看到。';
   }
 
   /**
-   * 上报候选的归宿（应用 / 丢弃）。失败不提示：写台账失败不该让用户以为
-   * 他没保存成功——那是两件事。
+   * 上报"这份结果被保存了"。失败不提示：写台账失败不该让用户以为他没保存成功
+   * ——那是两件事。
    */
-  function reportRunResolution(kind: 'applied' | 'dismissed'): void {
-    const id = activeRunId;
-    activeRunId = null;
+  function reportRunSaved(): void {
+    const id = pendingSaveRunId;
+    pendingSaveRunId = null;
     if (!id) return;
-    void markRunResolved(id, kind).catch(() => {});
+    void markRunSaved(id).catch(() => {});
   }
 
   /**
@@ -1183,18 +1214,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 「候选已就绪」这句的完整文案。
+   * 「生成完成」那句的完整文案。
    *
-   * 结果不完整时必须和全部成功区分开：只写「候选已就绪」，用户点接受之后
-   * 才发现某几支是空的。partial 与"只有诊断"分开说——「分支未完成」这种话
-   * 放在一棵只是有重复节点待合并的树上并不成立。
+   * 结果不完整时必须和全部成功区分开：只写「已落到画布」，用户改到一半才发现某几支
+   * 是空的，而那时画布已经是他的作品了。partial 与"只有诊断"分开说——「分支未完成」
+   * 这种话放在一棵只是有重复节点待合并的树上并不成立。
    */
-  function candidateStatus(base: string): string {
+  function finishStatus(base: string): string {
     if (agentWarnings.value.some(item => item.kind === 'partial')) {
-      return `${base}（部分分支未完成），确认后才会应用到画布。`;
+      return `${base}（部分分支未完成），可以直接改，也可以撤销回生成前。`;
     }
-    if (agentWarnings.value.length) return `${base}（有诊断提示），确认后才会应用到画布。`;
-    return `${base}，确认后才会应用到画布。`;
+    if (agentWarnings.value.length) return `${base}（有诊断提示），可以直接改，也可以撤销回生成前。`;
+    return `${base}，记得保存。`;
   }
 
   /** 保存撞上 409 时置位，由界面弹窗让用户选"重新加载 / 另存为新导图 / 取消"。 */
@@ -1209,28 +1240,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 画布该画哪棵树。
    *
-   * 三级优先级各有理由：
-   * 1. `content` 最优先。用户已经打开/生成了一张图时，让还没定稿的东西顶掉它，
-   *    看起来就是"我的图被改了"——而且失败或取消之后才发现内容消失过。
-   * 2. `candidate` 其次。`snapshot` 到达时预览会被整棵作废（那是必须的：不能再
-   *    挂着一棵没校验的树），如果这一级不存在，画布会在"预览→候选"之间空一帧，
-   *    退回到空态占位，用户还得点「应用」才看得见图。
-   * 3. `agentPreview` 垫底。节点一个一个到达，画布跟着长。
+   * 两级优先级，各有理由：
+   * 1. `content` 最优先。用户的作品（含刚生成落地的那棵树）永远是画布上那一个。
+   * 2. `agentPreview` 垫底。只有画布还是空的时候它才露面：节点一个一个到达，画布
+   *    跟着长——这是"生成中"唯一的视觉反馈。一旦生成完成、`content` 有了值，
+   *    预览就再也盖不住任何东西。
    *
-   * 注意候选只是"看得见"：`acceptCandidate()` 的校验一步都没少，候选照样要用户
-   * 点「应用」才会写进 `content`。渲染与采纳是两件事。
+   * **没有"候选"这一级了。** 从前 `candidate` 排在中间，让用户在点「应用」之前
+   * 先看见结果；现在生成完成即落地（`commitGenerated`），看得见的就是他的。
    */
   const renderSource = computed<RenderSource | null>(() => {
     if (content.value) {
       return {
         root: content.value.root, kind: 'content', expandable: NO_EXPANDABLE,
         edges: edgesOf(content.value),
-      };
-    }
-    if (candidate.value) {
-      return {
-        root: candidate.value.root, kind: 'candidate', expandable: NO_EXPANDABLE,
-        edges: edgesOf(candidate.value),
       };
     }
     if (agentPreview.value) {
@@ -1528,46 +1551,57 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const refIndex = computed(() => buildRefIndex(content.value?.root ?? null));
 
   /**
-   * 待确认候选相对画布的改动清单；`create` 意图（没有基线）为 `null`。
+   * **这次生成改了什么**：生成落地那一刻算好的一份静态快照；没有基线时为 `null`。
    *
-   * 只在"候选是当前树上的改动"时有意义，而那条判据就是 `candidateIntent`：
-   * `create` 的候选是一份新作品，谈差异无从谈起。`candidateIntent` 是个普通
-   * `let`（不参与响应式），但它只在 `candidate.value` 被赋值的同时变化，
-   * 所以把 `candidate` 读进来就能保证这个 computed 在该重算时重算。
+   * 为什么是 `ref` 而不是 `computed`：`computed` 要两份实时值（基线树 + 当前树），
+   * 而基线在落地之后就没人持有了——`content` 已经被换成新树，再拿它算 diff 只会得到
+   * 一份空清单。落地瞬间算一次并冻结下来的语义恰好就是用户要的那句话："刚才那 25
+   * 秒动了什么"。之后他改画布，这份记录**不该**跟着变——它记的是生成，不是编辑。
    *
-   * 每一条都带 `inSelection`：这次「改这张图」带着选区，diff 就必须说清
-   * "这处改动在你圈的范围里，还是跑到了范围外"。范围用的是**请求时**的选区
-   * （`candidateSelection`），不是此刻的选区（理由见那个 ref 的注释）。
+   * `null` 与空数组要分开：前者是"没有可比基线"（画布本来是空的，整棵树都是新的），
+   * 后者是"算出来了，一处都没改"。前者不该显示清单，后者要显示"这次什么都没改"。
    */
-  const candidateDiff = computed<ScopedChange[] | null>(() => {
-    const next = candidate.value;
-    if (!next) return null;
-    if (candidateIntent === 'create') return null;
-    const before = content.value;
-    const nodeChanges = diffCandidate(before?.root ?? null, next.root) ?? [];
-    // 边单独算一份再拼起来（理由见 `diffEdges`）。基线没有树时上面已经返回 null，
-    // 走到这里 `before` 一定存在。
-    const names = new Map(flatNodes.value.map(entry => [entry.node.id, displayTitle(entry.node)]));
-    const nameOf = (id: string) => names.get(id) ?? id;
-    const changes: CandidateChange[] = [
-      ...nodeChanges,
-      ...diffEdges(edgesOf(before), edgesOf(next), nameOf),
-    ];
-    const scope = selectionScope(before?.root ?? null, next.root, candidateSelection.value);
-    return changes.map(item => ({ ...item, inSelection: withinScope(item, scope) }));
-  });
+  const generatedChanges = ref<ScopedChange[] | null>(null);
 
   /**
-   * 画布上要**高亮**的节点 id：候选改动过、且在当前树里还存在的那些。
+   * 这次生成落进画布的规模：`nodes` 是节点数，`changes` 是改动条数（`null` = 无基线）。
    *
-   * 新增的节点没有 id 可高亮（它在 `content` 里根本不存在），删除的节点还在
-   * `content` 里所以能高亮——那正是"这个节点会消失，你看一眼再决定"。
+   * 面板读它说清"已落到画布（42 个节点，改了 6 处）"。前端这份只给人看；进统计的
+   * 那份 `node_count` 在同一时刻由 `generate` 事件带上去，两者必须是同一个数——所以
+   * 它们在同一次调用里算（`commitGenerated`）。
+   */
+  const generatedSummary = ref<{ nodes: number; changes: number | null } | null>(null);
+
+  /**
+   * 版本冲突时保留的第二棵树（连同它落地所需的元数据）。
    *
-   * `edge_*` 两种改动被排除：它们的 `id` 是**边 id**，与节点 id 是两套命名空间，
-   * 混进来只会让一个随机字符串去"高亮"某个可能同名的节点。
+   * 正常路径上永远是 `null`——生成期间 `busy` 把所有编辑入口都拦住了，画布不会变。
+   * 但它不是不可能：`undo` / `redo` 走的是 `restoreSnapshot`，绕过 `applyContent`；
+   * 将来新加的编辑入口也未必记得判 `busy`。所以完成时仍然比对 `clientRevision`，
+   * 变过就**不覆盖**，把两棵树都摆出来让用户选。
+   *
+   * 这是"删掉候选层"之后唯一保留的裁决界面，而它的性质与候选不同：候选挡在每一次
+   * 生成前面，它只在数据要丢的时候出现。
+   */
+  const conflictDraft = ref<{ next: MindMapContent; meta: GenerateMeta } | null>(null);
+
+  /**
+   * 最近一次落到画布的那棵树的**引用**（不是副本）。
+   *
+   * 只服务一个判断：`undoGenerate()` 能不能一步回到生成之前。用引用相等比比较整树
+   * 便宜，而且正好是那个语义——画布上还是生成的结果本身，说明撤销栈顶就是生成前
+   * 那棵树；用户改过之后引用变了，那时"撤销一步"只是退掉他自己的一次编辑。
+   */
+  let generatedContent: MindMapContent | null = null;
+
+  /**
+   * `generatedChanges` 里落在「这次生成带上去的选区」中的那些。
+   *
+   * 看的是**请求时**的选区（`generationSelection`），不是此刻的选区：用户点一下清单
+   * 里的一行就会改选中，读实时选区的话这份标记会自己漂走。
    */
   const changedNodeIds = computed<Set<string>>(() => {
-    const diff = candidateDiff.value;
+    const diff = generatedChanges.value;
     if (!diff) return new Set<string>();
     const nodeKinds = new Set<CandidateChange['kind']>(['removed', 'updated', 'moved']);
     return new Set(diff.filter(item => nodeKinds.has(item.kind)).map(item => item.id));
@@ -1627,21 +1661,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。
    *
    * `actor` 决定这次改动记到谁头上：默认 `user`（手工编辑，绝大多数调用点），
-   * `agent` 只有 `acceptCandidate()` 传（用户只点了一下「应用」，改动是模型算的）。
+   * `agent` 只有 `commitGenerated()` 传（用户没动手，改动是模型算的）。
    * 区分只能靠参数——`pushHistory()` 返回之后 `content.value` 已经是新树，那时候
    * 再想看出"谁改的"是不可能的。
-   *
-   * `accept` 只有 `acceptCandidate()` 传：它让 `collectEdits()` **无条件**多记一条
-   * `kind='accept'`，哪怕这次接受一处都没改。理由见 `mindmap/edit-log.ts` 文件头
-   * ——缺了它，那 9 张一字未改的图根本不在表里，统计只剩"改过的那些"，偏差永远朝
-   * "生成质量更差"。
    */
-  function pushHistory(actor: EditActor = 'user', runId?: string, accept = false) {
+  function pushHistory(actor: EditActor = 'user', runId?: string) {
     const current = content.value;
     if (!current) return;
     recordPast(JSON.stringify(current));
     future.value = [];
-    editBase = { content: current, actor, ...(runId ? { runId } : {}), accept };
+    editBase = { content: current, actor, ...(runId ? { runId } : {}) };
   }
 
   /** 还能撤销几步、占了多少字节：界面与测试都靠它确认字节上限真的生效。 */
@@ -1656,7 +1685,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 下一次保存会把它们写到当前这张图的 `map_id` 上——统计一旦串图，就再也分不开
    * "这张图被改得多"和"这个人改得多"。
    *
-   * `acceptCandidate()` 的 `create` 分支也走它：那是一份新作品，上一张图（如果
+   * `commitGenerated()` 的 `create` 分支也走它：那是一份新作品，上一张图（如果
    * 有）的账本同样到此为止。
    */
   function resetHistory() {
@@ -1673,53 +1702,44 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 与 `pushHistory()` 分成两步，是因为顺序不能换：diff 要"改之前"和"改之后"两份树，
    * 而 `pushHistory()` 执行时 `content.value` 还是旧值。
    *
+  /**
    * 一次提交内所有事件共享同一个 `at`：它是"这次操作产生了几条事件"的唯一分组依据
    * （一个字段一条事件，见 `edit-log.ts` 文件头）。
    *
-   * **应用候选时这一批的最后一定有一条 `accept`**（`base.accept`），`changeCount`
-   * 是本批改动条数。哪怕一条都没有，那条 `accept` 也照样落库——"一字未改"是最强的
-   * 正样本，跳过它等于把分母删掉。
+   * **应用/接受候选那条 `accept` 已经不在这里了**：候选层删掉之后没有"接受"这个
+   * 动作，分母改由 `kind='generate'` 承担，而它由 `commitGenerated()` 直接构造
+   * （那条路要 `node_count`，不属于"用户改了什么"这条差分）。
    *
    * 不在这里截断：截断发生在提交那一刻（`save()`），这样"超了多少条"能如实上报；
    * 在这里截掉的话，超出的部分连数都不知道。
    */
-  function collectEdits(after: MindMapContent | null) {
+  function collectEdits(after: MindMapContent | null, at = new Date().toISOString()) {
     const base = editBase;
     editBase = null;
     if (!base) return;
-    const at = new Date().toISOString();
     const events = diffEdits(base.content, after, {
       actor: base.actor,
       at,
       ...(base.runId ? { runId: base.runId } : {}),
     });
-    if (base.accept) {
-      // 排在这批最后：读起来像"这次接受的总结"，而不是"先接受、再改"。
-      events.push(acceptEvent(events.length, {
-        at,
-        ...(base.runId ? { runId: base.runId } : {}),
-      }));
-    }
     if (!events.length) return;
     pendingEdits.value = [...pendingEdits.value, ...events];
   }
 
   /**
-   * create 意图接受候选后的那一步撤销。
+   * create 意图落画布后的那一步撤销。
    *
    * 与 `pushHistory()` 只差一处：画布本来是空白时也要留下一步（`'null'` 就是
-   * JSON 里的空画布），否则用户点了「应用到画布」就再也退不回接受之前的样子。
+   * JSON 里的空画布），否则用户点了生成就再也退不回生成之前的样子——而那正是
+   * 删掉候选层之后唯一的后悔药。
    *
-   * **不给 `editBase.content` 填树**（本来就是空的），但 `accept` 置真：整棵树不是
-   * diff，所以本批改动是 0 条，而"接受"这个动作必须留一条 `accept` —— 它正是
-   * "生成完一字不改"的唯一证据（与 `diffCandidate` 对 `create` 返回 `null` 是同一条
-   * 判断，理由见 `edit-log.ts`）。
+   * 不设 `editBase`：整棵树不是 diff，`diffEdits(null, ...)` 本来就返回空数组；
+   * 那次生成由一条 `generate` 事件记账（见 `commitGenerated`）。
    */
-  function pushHistoryOrEmpty(runId?: string) {
+  function pushHistoryOrEmpty() {
     recordPast(snapshot() ?? 'null');
     // 树从这里长出新的分支了，重做栈必须失效。
     future.value = [];
-    editBase = { content: null, actor: 'user', ...(runId ? { runId } : {}), accept: true };
   }
 
   /** 选中的节点可能已被删掉：兜底清空，免得详情面板指向不存在的节点。 */
@@ -1752,13 +1772,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     history: boolean,
     actor: EditActor = 'user',
   ): boolean {
-    // 生成还在进行时禁止用户改动：done 帧会用完整结果整树替换，期间的编辑
-    // 必然被覆盖；撤销栈里也会混进生成中间态，撤销起来只剩半成品。
-    // 返回 false 让调用方提前退出，免得它接着把 status 改成「已修改」。
-    if (busy.value) {
-      status.value = '正在生成导图，完成之后才能编辑。';
-      return false;
-    }
+    // **生成期间不再禁止编辑。** 从前锁画布是为了"候选落地"那一步：它要用户点一下，
+    // 而那一刻必须比对版本。现在落地是自动的，锁住反而让"这 25 秒我顺手改个标题"
+    // 变成不可能——而那正是最自然的事。
+    //
+    // 代价由 `commitGenerated` 的冲突判定兜住：期间改过（`clientRevision` 变了）
+    // 就**不覆盖**，两棵树都留着让用户选。这里一个字都不用判。
     if (history) pushHistory(actor);
     content.value = next;
     dirty.value = true;
@@ -2035,20 +2054,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   function undo() {
-    if (busy.value) {
-      status.value = '正在生成导图，完成之后才能编辑。';
-      return;
-    }
     const snap = past.value.pop();
     if (!snap) return;
     pastBytes.value -= snapshotBytes(snap);
-    // 当前是空画布时也要压一步 `'null'`，否则「空 → 候选 → 撤销 → 重做 → 撤销」
+    // 当前是空画布时也要压一步 `'null'`，否则「空 → 生成 → 撤销 → 重做 → 撤销」
     // 的最后一步会丢掉：重做那一次不记历史，再撤销就没得可撤，回不到空白。
     future.value.push(snapshot() ?? 'null');
     restoreSnapshot(snap);
     dirty.value = true;
-    // 撤销改的就是画布本身，必须让「候选基于哪个版本算出来」的判断看见这一步。
-    // 不递增的话，用户撤销一步再点「应用到画布」，撤销白做、候选照样落地。
+    // 撤销改的就是画布本身，必须让"这份结果基于哪个版本算出来"的判断看见这一步。
+    // 不递增的话，生成期间用户撤销一步、生成结果照样把画布整棵盖掉——那正是
+    // `commitGenerated` 里那条 `clientRevision` 判据要拦下的情形。
     clientRevision.value += 1;
     ensureSelection();
     editingId.value = null;
@@ -2056,17 +2072,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   function redo() {
-    if (busy.value) {
-      status.value = '正在生成导图，完成之后才能编辑。';
-      return;
-    }
     const snap = future.value.pop();
     if (!snap) return;
     // 与 undo 对称：当前是空画布时把空画布压进撤销栈，这样重做之后仍能撤回空白。
     recordPast(snapshot() ?? 'null');
     restoreSnapshot(snap);
     dirty.value = true;
-    // 同 undo：重做同样把画布换成了另一棵树，候选再不成立。
+    // 同 undo：重做同样把画布换成了另一棵树，生成结果再不成立。
     clientRevision.value += 1;
     ensureSelection();
     editingId.value = null;
@@ -2087,10 +2099,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function loadMap(next: MindMapContent, record: { id: string; version: number; updated_at: string }) {
     cancel();
     mapSession += 1;
-    // 换了一张图，上一张图算出来的候选没有任何意义：留着它，一次误点就会把
-    // 那张图的内容装进这张图。
-    candidate.value = null;
-    resetCandidateOps();
+    // 换了一张图，上一轮生成的工作副本与"改了什么"没有任何意义：留着它，一次
+    // 误操作就会把那张图的内容装进这张图。
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
     saving.value = false;
     titleDraft.value = null;
     content.value = next;
@@ -2109,9 +2124,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function newMap() {
     cancel();
     mapSession += 1;
-    // 同上：新建之后旧候选不再属于画布上的任何一张图。
-    candidate.value = null;
-    resetCandidateOps();
+    // 同上：新建之后旧的工作副本不再属于画布上的任何一张图。
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
     saving.value = false;
     titleDraft.value = null;
     content.value = null;
@@ -2200,6 +2218,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 而请求体里发出去的只是点保存那一刻的树，刷新即丢。
       const changedDuringSave = content.value !== current;
       markSaved(record);
+      // 内容与事件都落库了 → 这次生成的结果算"存下来了"，服务端那条台账到此为止
+      // （下次进页面不再问"要不要捡回上次的结果"）。
+      reportRunSaved();
       if (changedDuringSave) {
         dirty.value = true;
         status.value = `已保存版本 ${record.version}，但保存期间又有修改，请再次保存。`;
@@ -2256,6 +2277,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const changedDuringSave = content.value !== current;
       markSaved(record);
       conflict.value = null;
+      reportRunSaved();
       if (changedDuringSave) {
         dirty.value = true;
         status.value = `已另存为新导图（版本 ${record.version}），但保存期间又有修改，请再次保存。`;
@@ -2400,9 +2422,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 会因为会话号没变而把它的 id 写进 mapId——画布上是新图、身份却是旧图，
     // 下次保存就把新内容 PUT 到旧记录上。
     mapSession += 1;
-    // 换图即作废旧候选（preview 同样会换掉整棵树）。
-    candidate.value = null;
-    resetCandidateOps();
+    // 换图即作废这一轮的工作副本与生成记录（preview 同样会换掉整棵树）。
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
     titleDraft.value = null;
     // 上一张图在途的保存到这里就作废了：它的 finally 因为会话不匹配不会
     // 清理 saving，这里必须自己复位，否则新图永远卡在"保存中"，点保存
@@ -2446,8 +2471,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 换图必须换会话号，否则上一张图在途的保存响应回来时会把它的 id 写进 mapId，
     // 而画布上是这张新导入的图——下次保存就把导入的内容 PUT 到旧记录上。
     mapSession += 1;
-    candidate.value = null;
-    resetCandidateOps();
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
     titleDraft.value = null;
     // 与 preview 同一条：上一张图在途的保存作废，saving 必须自己复位，否则新图
     // 永远卡在"保存中"。
@@ -2486,8 +2514,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 掐掉在途的 agent 运行。
    *
-   * 取消只是停止这一轮：画布上的 `content` 从来没被这一轮碰过（候选落地要用户
-   * 点「应用」），所以不需要回滚，清掉属于这一轮的中间态就够了。
+   * 取消就是**真正的"不要了"**：这一轮的结果从未进过画布（`draft` 只是工作副本，
+   * `commitGenerated` 才写 `content`），所以不需要回滚，清掉属于这一轮的中间态就够了。
+   * 这也是删掉候选层之后仍然保留的那半个保护——生成 25 秒里发现方向不对，点取消，
+   * 画布一点没变。
    * 换图场景（loadMap / newMap / preview）也走它，把旧流掐死。
    */  function cancel() {
     const active = controller;
@@ -2499,6 +2529,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentWarnings.value = [];
     // 取消/换图同理：长到一半的预览属于已经结束的那一次运行。
     clearAgentPreview();
+    // 工作副本同理：它属于被取消的那一轮，留着只会在下一轮开跑前短暂地
+    // 影响一次 ops 批次的基树判断。
+    draft.value = null;
+    resetDraftOps();
     stageText.value = '';
     // 这一轮已经结束，"等了多久"不再有意义：不清的话，静默超 10s 后点取消，
     // 界面会一边写"已取消。"、一边挂着"模型正在思考，已等 20 秒"。
@@ -2506,36 +2540,37 @@ export const useMindMapStore = defineStore('mindmap', () => {
     status.value = '已取消。';
   }
 
-  // ---- agent 运行与候选接受 ----
+  // ---- agent 运行与生成落地 ----
 
   /**
-   * 把一批 op 应用到候选上，返回是否应用成功。
+   * 把一批 op 应用到工作副本上，返回是否应用成功。
    *
-   * 只动 `candidate`，绝不写 `content`：采纳仍然要用户点「应用」。这是整条 agent
-   * 路径的核心约束，不因为帧是增量的就默认落地。
+   * 只动 `draft`，绝不写 `content`：`ops` 是一次几处的增量，`edit` 意图下模型可能
+   * 连调十几次，每条都落画布等于把 25 秒的中间态全摊给用户、撤销栈切成十几步半成品。
+   * 整树只在 `done` 那一刻进画布（`commitGenerated`），那一次是原子的、可撤销的。
    *
-   * 失败与乱序都**静默丢弃**：`done` 帧会带完整树覆盖候选，少应用一批不会丢数据；
-   * 而在这种时候弹一句"修改没能应用"，用户只会以为最终结果不可信。
+   * 失败与乱序都**静默丢弃**：`done` 帧会带完整树覆盖工作副本，少应用一批不会丢
+   * 数据；而在这种时候弹一句"修改没能应用"，用户只会以为最终结果不可信。
    */
-  function applyOpsToCandidate(batch: OpBatch): boolean {
-    // edit / expand 这两条路上后端不发 snapshot（候选从请求带过去的树起步），
-    // 所以候选要由画布那份树的副本兜底——`applyOps` 自己会克隆，不会改到 content。
+  function applyOpsToDraft(batch: OpBatch): boolean {
+    // edit / expand 这两条路上后端不发 snapshot（工作副本从请求带过去的树起步），
+    // 所以副本要由画布那份树兜底——`applyOps` 自己会克隆，不会改到 content。
     // 不兜底的话第一批 op 就没有落点，"打开旧图 → 让 AI 改"依旧一点反应都没有。
-    const base = candidate.value ?? (candidateIntent === 'create' ? null : content.value);
+    const base = draft.value ?? (generationIntent === 'create' ? null : content.value);
     if (!base) return false;
     // 对不上就是中间漏了一批：在错位的树上继续套用只会套出错位的结构。
-    if (batch.base_revision !== candidateRevision) {
-      previewDebug(`[agent] 丢弃 ops 批次：base_revision=${batch.base_revision}，当前 ${candidateRevision}`);
+    if (batch.base_revision !== draftRevision) {
+      previewDebug(`[agent] 丢弃 ops 批次：base_revision=${batch.base_revision}，当前 ${draftRevision}`);
       return false;
     }
     try {
-      candidate.value = applyOps(base, batch).content;
+      draft.value = applyOps(base, batch).content;
     } catch (error) {
       previewDebug(`[agent] 丢弃 ops 批次：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-    // 只有真正落进候选才算这一版完成，失败那批不能推进账本。
-    candidateRevision = batch.base_revision + 1;
+    // 只有真正落进副本才算这一版完成，失败那批不能推进账本。
+    draftRevision = batch.base_revision + 1;
     return true;
   }
 
@@ -2581,20 +2616,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentEvents.value = [];
     // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。
     agentWarnings.value = [];
-    // 同理，上一轮是演示还是模型，跟这一轮没关系；不清就会把上一轮的 demo
-    // 标记挂到这一轮的候选上。
-    agentMode.value = null;
-    candidate.value = null;
+    draft.value = null;
     // 新一轮的 op 从第 0 版重新开始，上一轮的账本留着只会把首批 op 判成乱序。
-    resetCandidateOps();
+    resetDraftOps();
     // 上一轮长到一半的预览同样不能留：它的节点属于上一次运行，混进这一轮的
     // 面板里，用户会以为新任务已经长出了这些分支。
     clearAgentPreview();
-    // 记下候选所依据的版本与所在的图：接受时用它判断期间有没有被改过、有没有换了图。
-    // 意图也要记：接受时得知道这份内容算「新作品」还是「改现有这张图」。
-    candidateBaseRevision = clientRevision.value;
-    candidateSession = mapSession;
-    candidateIntent = intent;
+    // 上一轮"改了什么"与上一轮的冲突裁决到此为止：新一轮有自己的基线。
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
+    // 记下这一轮所依据的画布与所在的图：完成时用它算"改了什么"、判版本冲突、判换了图。
+    // 意图也要记：落地时得知道这份内容算「新作品」还是「改现有这张图」。
+    generationBase = content.value;
+    generationBaseRevision = clientRevision.value;
+    generationSession = mapSession;
+    generationIntent = intent;
     // 选区按意图取：`expand` 只展开**一个**节点（后端开流前会 422 掉多选的请求），
     // `edit` 吃整个选区（用户圈了三个节点说「这几个合并成一个」，模型得知道是
     // 哪三个，否则只能从整棵树里猜）。`create` 没有选区。
@@ -2612,8 +2649,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // diff 的「范围内/外」按**请求时**的选区判，之后用户点来点去不会改写这份记录。
     // 只对 `edit` 记：`expand` 的选区是"要展开的那一个节点"，新节点按构造就落在
     // 它下面，每一行都标「范围内」只是噪音；`create` 没有选区。
-    candidateSelection.value = intent === 'edit' ? selectionIds : [];
-    runIntent.value = intent;
+    generationSelection.value = intent === 'edit' ? selectionIds : [];    runIntent.value = intent;
     // 展开的预览要有一条祖先链兜着（`node_grow` 的 path 是父节点的索引链）。
     // 生成不用：它的根帧自带 path=null，预览从中心主题开始长。
     if (intent === 'expand' && selectedId.value) {
@@ -2631,13 +2667,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 流只在 done / error 帧上才算有了明确结局；两者都没到就 EOF，说明连接被掐断了，
     // 不能当成正常结束——否则面板会停在「正在与模型协作…」，工具行永远显示「执行中…」。
     let settled = false;
+    // `done` 帧带来的来历（`demo` / `model`）。它只在**这次运行**里有意义，
+    // 所以是局部变量而不是 store 状态：落地那一步把结果写进 `content.mode`，
+    // 之后所有读者看的都是 `mode`（用户作品的来历），不是一个易失的中间值。
+    let doneMode: 'demo' | 'model' | null = null;
 
     try {
       // 每次点击一个新的身份：幂等只在"带同一个 run_id"时生效，而"点了两次生成"
       // 本来就是两次运行（按钮禁用与 busy 闸门管那个）。真正需要同一个 id 的场景
       // 是刷新重发、换标签页、客户端重试——那时服务端能认出这是同一次运行。
       const runId = newRunId();
-      activeRunId = runId;
       const body: AgentRunRequest = {
         goal: prompt,
         intent,
@@ -2707,48 +2746,55 @@ export const useMindMapStore = defineStore('mindmap', () => {
             const warnings = agentWarningsFrom(event.result_summary);
             if (warnings.length) {
               recordWarnings(warnings);
-              // 候选可能已经先到了（snapshot 与工具帧的先后不固定）。这时状态行
-              // 还写着"候选已就绪"，得跟着改，不能让两句文案在同一个面板上打架。
-              if (candidate.value && event.ok) status.value = candidateStatus('候选已就绪');
+              // snapshot 可能已经先到了（与工具帧的先后不固定）。这时状态行还写着
+              // "正在收尾"，得把"结果不完整"带上，不能让两句文案在同一个面板上打架。
+              if (draft.value && event.ok) status.value = finishStatus('模型给出了结果');
             }
             break;
           }
           case 'node_grow':
-            // 只进预览树。真正可采纳的内容在 snapshot / done 的 `content` 里，
-            // 两者可能不一致——把预览当候选，等于把一棵没校验过的树交给用户应用。
+            // 只进预览树。真正的结果在 snapshot / done 的 `content` 里：预览没经过
+            // 整树校验，某一路失败被裁掉、去重丢掉重复项，都会让它与最终结果不一致。
             growPreviewNode(event.path, event.label, event.expandable);
             break;
           case 'ops':
             // `edit` 意图的改动**只**以 op 批次下发（没有整树快照）。不接这一帧，
             // "打开旧图 → 让 AI 改 → 界面没反应"就是必然结果。
-            if (applyOpsToCandidate(event.batch)) {
-              status.value = `已应用 ${event.batch.ops.length} 条修改，确认后才会应用到画布。`;
+            if (applyOpsToDraft(event.batch)) {
+              status.value = `已应用 ${event.batch.ops.length} 条修改，生成完会一起落到画布。`;
             }
             break;
           case 'snapshot':
-            // 后端整树校验通过后先推一帧 snapshot：done 之前用户就该看得见候选长什么样。
-            // 完整候选一到，预览就没有存在意义了，整棵作废（含还等着挂的缓存）。
-            clearAgentPreview();
-            // 只放候选、不碰 content——没经用户确认的内容不许进画布。
-            candidate.value = event.content;
-            status.value = candidateStatus('候选已就绪');
+            // 后端整树校验通过后先推一帧 snapshot：`done` 之前先把结果记下来。
+            // 这一帧**不落地**——`done` 通常紧跟，两次落地会留下两步撤销、两条
+            // `generate` 事件，而用户只按了一次生成。
+            //
+            // **也不清预览**：画布此刻还是空的（`content` 为空才看得见预览），
+            // 清掉它就会空一帧——用户正盯着一棵长到一半的树，突然变成空态占位，
+            // 然后 `done` 又把整棵树塞进来。从前这一帧由候选层接住，候选层删掉
+            // 之后，接住它的是"预览再撑到 done"。
+            draft.value = event.content;
+            status.value = '正在收尾…';
             break;
           case 'done':
             settled = true;
-            // 这棵树的来历只有 done 帧说得准，落在这里等「接受」时再写进 mode。
+            // 这棵树的来历只有 done 帧说得准，落在这里捕获成 `doneMode`。
             // 后端 `exclude_none=True`，所以正常帧一定带值；缺字段只说明对面是
             // 没填 mode 的旧版本，记作"没说"，不能替它认成模型产出。
-            agentMode.value = event.mode ?? null;
+            doneMode = event.mode ?? null;
             // 终态已到，预览再留着只会让人以为还有节点在路上。
             clearAgentPreview();
-            if (event.content) {
-              // 只放进候选，不动 content：用户确认之前画布保持原样
-              candidate.value = event.content;
-              status.value = candidateStatus(
-                agentMode.value === 'demo' ? '演示导图已就绪（不是 AI 生成的）' : '模型给出了候选导图',
-              );
-            } else if (!candidate.value) {
-              // 已经收到过 snapshot 的候选就留着：这一帧只是没重复带内容。
+            if (event.content) draft.value = event.content;
+            if (draft.value) {
+              // **生成结果直接进画布**：没有确认这一步了。撤销栈、`generate` 事件、
+              // 身份重置、冲突判定全在 `commitGenerated` 里，一次做完。
+              commitGenerated(draft.value, {
+                runId,
+                intent,
+                mode: doneMode,
+                base: generationBase,
+              });
+            } else {
               status.value = '模型这次没有产出导图。';
             }
             break;
@@ -2836,105 +2882,209 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 把候选应用到画布。
-   *
-   * 四道校验缺一不可：候选属于当前这张图、有候选、没有未提交的输入、树没被改过。
-   * 少任何一条，用户手打了一半的标题、刚做的编辑，或另一张图的内容都会被候选
-   * 静默覆盖——那正是这次改造要解决的问题，不能在新路径上重演。
+   * 一次生成本次落地的元数据。`commitGenerated` 与冲突裁决共用它。
    */
-  function acceptCandidate(): 'applied' | 'stale' | 'invalid' {
-    // 换图判在"有没有候选"之前：切图会把 candidate 清成 null，但 candidateSession
-    // 还留着上一张图的号码。两者不等就说明这次候选属于另一张图，装上去等于把
-    // 那张图的内容写进当前记录。
-    if (candidateSession !== mapSession) {
-      candidate.value = null;
-      resetCandidateOps();
-      status.value = '候选是在另一张导图上生成的，已失效，请重新运行。';
+  interface GenerateMeta {
+    runId: string;
+    intent: 'create' | 'expand' | 'edit';
+    /** `done` 帧的来历；`null` = 对面没填，落地时退回 `model`。 */
+    mode: 'demo' | 'model' | null;
+    /** 生成开始那一刻的画布，用来算"这次改了什么"、并进改动事件。 */
+    base: MindMapContent | null;
+  }
+
+  /**
+   * **生成结果落到画布**。这是整条 agent 路径的终点，也是删掉候选层之后唯一的入口。
+   *
+   * 它做六件事，一次做完：
+   *
+   *  1. 整树校验——模型产出是外部数据，长度/引用/节点数都可能越界。拦在这里，
+   *     脏数据就不会先进画布、直到保存时才被后端 422 拒绝（那时用户已经改了半天）；
+   *  2. 判冲突——生成期间画布变过就**不覆盖**，把两棵树留着让用户选（`resolveConflict`）；
+   *  3. 压撤销栈——生成前那棵树进 `past`，于是"生成差了"可以一步退回去；
+   *  4. 记一条 `kind='generate'`（带 `node_count`，**在生成完成这一刻定死**）；
+   *  5. 把身份按意图处理——`create` 是一份新作品，不能继承上一张图的 `mapId`；
+   *  6. 算一次"这次改了什么"，冻结成 `generatedChanges`。
+   *
+   * 返回分类而不是布尔：调用方（面板/测试）要能区分"落地了""等用户裁决""数据不合法"。
+   */
+  function commitGenerated(next: MindMapContent, meta: GenerateMeta, force = false): 'applied' | 'conflict' | 'invalid' | 'stale' {
+    // 换了图：`clientRevision` 判不出这件事（切图不递增），只有会话号能。
+    // 装上去等于把上一张图的内容写进当前记录，还顶着它的 mapId。
+    if (generationSession !== mapSession) {
+      draft.value = null;
+      resetDraftOps();
+      conflictDraft.value = null;
+      status.value = '这次生成是在另一张导图上跑的，结果已丢弃，请重新运行。';
       return 'stale';
     }
-    if (!candidate.value) return 'invalid';
+    // 生成期间画布被改过（`undo` 或手工编辑）。**不覆盖**：用户那 25 秒里的编辑
+    // 不能被一次生成静默抹掉——两棵树都留着，让用户选（`resolveConflict`）。
+    if (!force && clientRevision.value !== generationBaseRevision) {
+      conflictDraft.value = { next, meta };
+      status.value = '生成期间你改过这张图。要保留哪个？';
+      return 'conflict';
+    }
     if (editingId.value !== null || titleDraft.value !== null) {
-      status.value = '请先提交或取消正在编辑的内容。';
-      return 'stale';
+      status.value = '请先提交或取消正在编辑的内容，再让模型改这张图。';
+      // 手打了一半的标题不能丢：同样走裁决，用户还能选"保留我的"。
+      conflictDraft.value = { next, meta };
+      return 'conflict';
     }
-    if (clientRevision.value !== candidateBaseRevision) {
-      status.value = '候选生成之后这张图被改过，已失效，请重新运行。';
-      return 'stale';
-    }
-    // 装进画布之前必须整树校验一次。候选是模型产出的外部数据，它的 label
-    // 长度、引用区间、节点数都可能越界；不在这里拦，脏数据会先进画布、
-    // 直到用户点保存才被后端 422 拒绝，而那时他已经在上面改了半天。
-    const invalid = validateDraft(candidate.value);
+    // 装进画布之前整树校验一次（理由见函数头第 1 条）。
+    const invalid = validateDraft(next);
     if (invalid) {
-      status.value = `候选不合法，已丢弃：${invalid}`;
-      candidate.value = null;
-      resetCandidateOps();
+      draft.value = null;
+      resetDraftOps();
+      conflictDraft.value = null;
+      status.value = `生成结果不合法，没有落进画布：${invalid}`;
       return 'invalid';
     }
-    // 到这里候选可以落地了。先按意图处理"这份内容是谁"：
-    // create 是一份新作品，绝不能继承上一张图的身份——否则接受之后点保存会走
+
+    // 身份：create 是一份新作品，绝不能继承上一张图的身份——否则落地之后点保存会走
     // PUT，把刚打开的那条旧记录整条覆盖掉。
-    if (candidateIntent === 'create') {
+    if (meta.intent === 'create') {
       mapId.value = null;
       version.value = 0;
       savedAt.value = null;
-      // 上一张图在途的保存响应回来时不能再把它的 id 写回 mapId（那是"新图挂旧身份"
-      // 的另一条路径），所以会话跟着换；saving 也自己复位——那一轮请求的 finally
-      // 会因为会话不匹配跳过清理，不复位就会永远卡在"保存中"。
+      // 上一张图在途的保存响应回来时不能再把它的 id 写回 mapId，所以会话跟着换；
+      // saving 也自己复位——那一轮请求的 finally 会因为会话不匹配跳过清理。
       mapSession += 1;
       saving.value = false;
       resetHistory();
-      // 新作品不接上一张图的历史：撤销栈里只留「接受之前」这一步。
-      // 这次接受仍要记一条 `accept`（`changeCount` 为 0：整棵树不是 diff）。
-      pushHistoryOrEmpty(activeRunId ?? undefined);
+      // 新作品不接上一张图的历史：撤销栈里只留「生成之前」这一步（画布本来是空的
+      // 就压 `'null'`，照样退得回去）。
+      pushHistoryOrEmpty();
     } else {
-      // 改的是现有这张图：身份、版本、历史都沿用，撤销回到改动前的那棵树。
+      // 改的是现有这张图：身份、版本、历史都沿用，撤销回到生成前的那棵树。
       //
-      // `actor` 必须是 `agent`：这条路上用户只点了一下「应用」，改动是模型算出来的。
-      // `runId` 顺手带上——统计里"agent 改了多少、其中几次是同一个 run 反复改"
-      // 只能靠它回答，而它过了 `reportRunResolution()` 就没了。
-      //
-      // 第三个参数 `accept` 置真：这一批最后一定跟着一条 `actor='user'` 的
-      // `kind='accept'`，哪怕 diff 为空（用户接受了"没有改动"的候选，那也是事实）。
-      pushHistory('agent', activeRunId ?? undefined, true);
+      // `actor` 必须是 `agent`：这条路上用户没动手，改动是模型算出来的。
+      // `runId` 带上——统计里"这次生成被改了几处"只能靠它把改动事件与
+      // `generate` 那条对上，而它过了 `reportRunSaved()` 就没了。
+      pushHistory('agent', meta.runId);
     }
-    content.value = candidate.value;
-    // 候选落地当下的 diff：`pushHistory` 已抄下改动前那棵树。
-    collectEdits(content.value);
-    candidate.value = null;
-    // 候选落地之后账本归零：这份内容已经进了 content，下一轮从第 0 版重来。
-    resetCandidateOps();
+    content.value = next;
+    // 改动与"这次生成"共享同一个 `at`：它是"一次操作产生了几条事件"的唯一分组
+    // 依据（`GROUP BY at`），两次取时刻会让同一次生成被读成两次操作。
+    const at = new Date().toISOString();
+    // 改动已经落地，这时候才比得出差：`pushHistory()` 抄下的那棵树 vs `next`。
+    collectEdits(next, at);
+    // 生成这条记录紧跟在它带来的那批改动之后：读起来像"改了这些…这是这次生成的规模"。
+    recordGeneration(next, meta.runId, at);
+
+    // 「这次改了什么」——**落地瞬间冻结**。基线是生成开始那一刻的画布，不是此刻的
+    // （此刻就是 next，比出来永远是空）。
+    if (meta.base) {
+      const nodeChanges = diffCandidate(meta.base.root, next.root) ?? [];
+      const names = new Map<string, string>();
+      for (const entry of flatten(next.root)) names.set(entry.node.id, displayTitle(entry.node));
+      const nameOf = (id: string) => names.get(id) ?? id;
+      const changes: CandidateChange[] = [
+        ...nodeChanges,
+        ...diffEdges(edgesOf(meta.base), edgesOf(next), nameOf),
+      ];
+      const scope = selectionScope(meta.base.root, next.root, generationSelection.value);
+      generatedChanges.value = changes.map(item => ({ ...item, inSelection: withinScope(item, scope) }));
+      generatedSummary.value = { nodes: countNodes(next.root), changes: changes.length };
+    } else {
+      // 画布本来是空的：整棵树都是新的，那不是 diff，是把整棵树重念一遍。
+      generatedChanges.value = null;
+      generatedSummary.value = { nodes: countNodes(next.root), changes: null };
+    }
+    generatedContent = next;
+
+    draft.value = null;
+    // 结果已经进了 content，下一轮从第 0 版重来。
+    resetDraftOps();
+    conflictDraft.value = null;
     // 来源标记跟着 done 帧走，不再一律写成「模型」：演示模式产出的是一棵占位树，
     // 给它贴"模型生成"的标签就是让界面替它撒谎。没说（旧后端）才退回 model。
-    mode.value = agentMode.value ?? 'model';
+    mode.value = meta.mode ?? 'model';
     dirty.value = true;
     clientRevision.value += 1;
     editingId.value = null;
-    // 告警说的是"这份候选缺了什么"，候选已落地就没有再挂着的理由；
-    // 留着它，用户会以为画布上这棵树还有问题等着处理。
-    agentWarnings.value = [];
+    // 告警**不清**：它说的是"这棵树缺了什么"，而树已经在画布上了——用户正需要知道
+    // 这件事。清掉就只剩一句"已落到画布"，而某几支是空的。
     ensureSelection();
-    status.value = mode.value === 'demo'
-      ? '已应用演示导图（固定结构，不是 AI 生成），记得保存。'
-      : '已应用模型的修改，记得保存。';
-    // 告诉服务端这次候选被采纳了：没有这一步，"done 但已应用"与"done 但没应用"
-    // 分不开，下次进页面还会问同一句。放在最后：上报失败不能影响已经落地的内容。
-    reportRunResolution('applied');
+    status.value = finishStatus(mode.value === 'demo'
+      ? '已落到画布（演示导图，固定结构，不是 AI 生成）'
+      : '模型的结果已落到画布');
+    // 等保存成功再上报 `applied_at`：它的语义是"这份结果被存下来了"，正是
+    // "下次进页面还要不要提醒"的判据（见 `runs.pending`）。
+    pendingSaveRunId = meta.runId;
     return 'applied';
   }
 
-  function discardCandidate(): void {
-    const had = candidate.value !== null;
-    candidate.value = null;
-    resetCandidateOps();
-    agentError.value = '';
-    agentWarnings.value = [];
-    status.value = had ? '已丢弃候选，画布未变。' : '没有待处理的候选。';
-    // 丢弃同样要落一笔：否则那张表分不清"用户还没看到"和"用户已经嫌弃过"。
-    // 只在**真有候选**时上报——没有候选却被记成"用户嫌弃过"，会把"关掉页面那
-    // 40 秒"刚捡回来的草稿永久地判死。
-    if (had) reportRunResolution('dismissed');
+  /**
+   * 生成那条事件：`kind='generate'` + `node_count` + `run_id`。
+   *
+   * **`node_count` 在这里定死**，一小时后的保存不再重算：用户改完之后树上的节点数
+   * 已经变了，那时数出来的是"改后的规模"，而分母要的是"模型交给你多少东西"。
+   *
+   * `at` 由调用方给（与同一批改动共享同一个值）：`GROUP BY at` 是"这次操作产生了
+   * 哪几条事件"的唯一分组依据，两次 `new Date()` 会在慢机器上差出几毫秒，把一次
+   * 生成拆成两次操作。
+   */
+  function recordGeneration(after: MindMapContent, runId: string, at: string) {
+    pendingEdits.value = [
+      ...pendingEdits.value,
+      generateEvent(countNodes(after.root), { at, runId }),
+    ];
   }
+
+  /**
+   * 冲突裁决：生成期间画布被改过，用户挑一棵。
+   *
+   * `generated` = 用模型的结果（他中途的编辑会被这次生成覆盖，但**仍可撤销**：
+   * 落地前压的那一步是"生成开始时的画布"，撤销能退回生成前，再撤销一步才到他的
+   * 中途编辑）；`mine` = 保留画布，生成结果丢掉。
+   *
+   * 这是删掉候选层之后唯一留下的"两棵树"界面，而它的性质与候选不同：候选挡在
+   * **每一次**生成前面，它只在数据要丢的时候出现。
+   */
+  function resolveConflict(choice: 'generated' | 'mine'): 'applied' | 'kept' | 'invalid' {
+    const pending = conflictDraft.value;
+    if (!pending) return 'kept';
+    if (choice === 'mine') {
+      conflictDraft.value = null;
+      draft.value = null;
+      resetDraftOps();
+      status.value = '已保留你的改动，这次生成的结果没有落到画布。';
+      return 'kept';
+    }
+    conflictDraft.value = null;
+    // `force`：用户已经明确选了"用生成的"，那条 revision 判据不该再拦一次
+    // （它刚刚正是拦下这次落地的原因）。
+    const result = commitGenerated(pending.next, pending.meta, true);
+    return result === 'applied' ? 'applied' : 'invalid';
+  }
+
+  /**
+   * 「回到生成之前」：一步退回上一次生成开始时的画布。
+   *
+   * 只在**画布还是生成结果本身**时可用（引用相等）。生成之后又改过就不提供了——
+   * 那时撤销一步只是退掉他自己的一次编辑，把它说成"回到生成前"是骗人；界面会
+   * 让他用普通撤销逐步退回。
+   */
+  function undoGenerate(): boolean {
+    if (content.value === null || content.value !== generatedContent) return false;
+    if (!canUndo.value) return false;
+    undo();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    generatedContent = null;
+    status.value = '已回到生成之前的画布。';
+    return true;
+  }
+
+  /**
+   * 「回到生成之前」现在可用吗。
+   *
+   * 判据只有一条：**画布上还是生成结果本身**（引用相等）。用户生成之后又改过，
+   * 这个快捷动作就该消失——那时"撤销一步"退掉的是他自己那次编辑，把它标成
+   * "回到生成前"是骗人。面板据此决定显示不显示那个按钮。
+   */
+  const canUndoGenerate = computed(() => content.value !== null && content.value === generatedContent);
 
   return {
     content,
@@ -2971,10 +3121,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
     selectedNode,
     selectedRefs,
     refIndex,
-    // 候选 diff：`edit` / `expand` 意图的确认界面靠它说清"改了哪几个节点"
-    candidateDiff,
+    // 这次生成改了什么：落地瞬间冻结的一份静态快照（`create` 意图无基线时为 null）
+    generatedChanges,
+    // 这次落地的规模与改动条数：面板用它说"已落到画布（42 个节点，改了 6 处）"
+    generatedSummary,
     // 这一轮请求带上去的选区：diff 的「范围内/外」按它判（不是按此刻的选区）
-    candidateSelection,
+    generationSelection,
+    // 版本冲突时保留的第二棵树：非空 = 正在等用户裁决
+    conflictDraft,
+    resolveConflict,
+    undoGenerate,
+    canUndoGenerate,
     changedNodeIds,
     focusTick,
     breadcrumb,
@@ -3020,7 +3177,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
     openMap,
     // agent 路径
     clientRevision,
-    candidate,
     agentPreview,
     agentPreviewScope,
     agentPreviewDropped,
@@ -3028,18 +3184,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentWarnings,
     agentRunning,
     agentError,
-    agentMode,
     runIntent,
     expanding,
     generating,
     runGeneration,
     expandSelected,
-    acceptCandidate,
-    discardCandidate,
     // 上次运行留下的结果（run 身份）
     resumableRun,
     probeResumableRun,
     resumeRun,
-    dismissResumable,
+    ignoreResumable,
   };
 });

@@ -571,25 +571,25 @@ export interface AgentRunRequest {
 /**
  * 运行台账里的一行（镜像后端 `agent.router.RunSummary`）。
  *
- * **不带候选正文**：那是一整棵树，20 条一起下发只为显示一句"上次生成完成了"。
+ * **不带结果正文**：那是一整棵树，20 条一起下发只为显示一句"上次生成还没保存"。
  * 真要那份内容时点「查看」，走 `GET /api/agent/runs/{run_id}`。
  *
  * 这一行是"运行身份"落到界面上的唯一痕迹：此前 run 只活在一个 HTTP 连接的
- * 寿命里，页面一关，已经跑出来的候选就跟着连接一起没了。
+ * 寿命里，页面一关，已经跑出来的结果就跟着连接一起没了。
  */
 export interface RunSummary {
   run_id: string;
   status: 'running' | 'done' | 'cancelled' | 'failed';
-  /** 原样回填：`create` 的候选落地时不能继承当前图的身份，`edit`/`expand` 要。 */
+  /** 原样回填：`create` 的结果落地时不能继承当前图的身份，`edit`/`expand` 要。 */
   intent: 'create' | 'expand' | 'edit';
   goal: string;
   created_at: string;
   updated_at: string;
+  /** 这份结果后来被保存了。空值 = 生成过、还没存下来，下次进页面会提醒一次。 */
   applied_at?: string | null;
-  dismissed_at?: string | null;
 }
 
-/** 单条运行的详情（镜像后端 `RunDetail`）：多出候选正文、失败原因与来历。 */
+/** 单条运行的详情（镜像后端 `RunDetail`）：多出结果正文、失败原因与来历。 */
 export interface RunDetail extends RunSummary {
   candidate?: MindMapContent | null;
   failure?: { code?: string; message?: string } | null;
@@ -743,7 +743,11 @@ export interface PrefSuggestion {
 /** 一条改动。`at` 与 `depth` 的语义见 `src/mindmap/edit-log.ts`。 */
 export interface EditEventPayload {
   actor: 'user' | 'agent';
-  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept';
+  /**
+   * `generate` 是"一次生成落到画布"（新数据）；`accept` 是它的前身（候选层还在时
+   * "用户点了应用"），只在历史行里出现。两字样都在，是因为库里既有老行也有新行。
+   */
+  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept' | 'generate';
   node_id?: string;
   field?: 'label' | 'title' | 'detail' | 'note' | 'color' | 'icon';
   /** 摘要，不是内容（`detail`/`note` 只存 `"1800字"` 这种长度）。 */
@@ -757,8 +761,14 @@ export interface EditEventPayload {
    * 单列成 `removed_subtree.size_unknown`，不会被当成 `1` 混进 `removed_depth`。
    */
   subtree_size?: number;
-  /** 这次 `accept` 带来的改动条数，`0` = 一字未改。只有 `kind='accept'` 有值。 */
+  /** 历史列（`kind='accept'` 才有）。新数据不写它：分母改由 `node_count` 承担。 */
   change_count?: number;
+  /**
+   * 这次生成落进画布的那棵树有几个节点。只有 `kind='generate'` 有值。
+   *
+   * **在生成完成那一刻算好**：保存时才数会数到用户改之后的树，分母永久偏高。
+   */
+  node_count?: number;
   run_id?: string;
   at: string;
 }
