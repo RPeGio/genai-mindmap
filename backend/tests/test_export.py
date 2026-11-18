@@ -562,6 +562,26 @@ class EdgeSuffixDelimiterTest(unittest.TestCase):
         self.assertEqual(self.suffix_of(None, "loop"), "2. 审查（回退）")
 
 
+class MarkdownEscapeTest(unittest.TestCase):
+    """`&` 必须先转义，否则往返会改掉用户写的字（codex 复审 P2-4）。"""
+
+    def test_ampersand_is_escaped_before_angle_brackets(self):
+        content = MindMapContent.model_validate({
+            "title": "t",
+            "root": {"id": "r", "label": "根", "detail": "原文 &lt;token&gt; 与 a<b",
+                     "children": []},
+        })
+        text = to_markdown(content)
+        self.assertIn("&amp;lt;token&amp;gt;", text)
+        self.assertIn("a&lt;b", text)
+        # 渲染器看到的是**原文**，不是把 `&lt;` 变成 `<` 之后的字
+        self.assertNotIn("> 原文 &lt;", text)
+
+    def test_plain_tree_without_specials_is_unchanged(self):
+        """没有 `&` / `<` / `>` 的图一个字节都没变（`ByteIdenticalTest` 的另一面）。"""
+        self.assertNotIn("&amp;", to_markdown(SAMPLE))
+
+
 class ByteIdenticalTest(unittest.TestCase):
     """三种既有格式的输出**逐字节**钉死。
 

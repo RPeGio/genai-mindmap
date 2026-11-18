@@ -1374,6 +1374,39 @@ class RoundTripLossTest(unittest.TestCase):
         self.assertEqual(restored.edges[0].label, "驳回（材料不全）")
 
 
+    # --- P2-4：HTML 实体守恒 --------------------------------------------
+
+    def test_html_entities_written_by_the_user_are_conserved(self):
+        """用户正文里写着的 `&lt;token&gt;` 往返一次还是那六个字符。
+
+        此前导出只转 `<`/`>`，不动 `&`；导入把 `&lt;` 还原成 `<`——用户写的字被
+        改了，而且没有告警。现在导出先转 `&`，导入按相反顺序还原。
+        """
+        original = MindMapContent.model_validate({
+            "title": "实体", "root": {
+                "id": "r", "label": "根",
+                "detail": "原文 &lt;token&gt; 与 &amp; 与 a<b",
+                "children": [{"id": "c", "label": "子", "detail": "&lt;div&gt;"}]},
+        })
+        restored = parse_text("ent.md", to_markdown(original)).content
+        self.assertEqual(restored.root.detail, "原文 &lt;token&gt; 与 &amp; 与 a<b")
+        self.assertEqual(restored.root.children[0].detail, "&lt;div&gt;")
+
+    def test_escaped_angle_brackets_still_come_back_as_brackets(self):
+        """另一半没有变：导出为 `<` 写的 `&lt;` 仍然还原成 `<`。"""
+        original = MindMapContent.model_validate({
+            "title": "泛型", "root": {"id": "r", "label": "Map<K,V>", "children": []}})
+        restored = parse_text("g.md", to_markdown(original)).content
+        self.assertEqual(restored.root.label, "Map<K,V>")
+
+    def test_entity_in_an_edge_label_survives(self):
+        original = MindMapContent.model_validate(build(
+            edges=[{"id": "e1", "source": "m1", "target": "t1",
+                    "label": "a<b & c"}]))
+        restored = parse_text("edge-ent.md", to_markdown(original)).content
+        self.assertEqual(restored.edges[0].label, "a<b & c")
+
+
 class FlowMarkdownTest(unittest.TestCase):
     """流程图 markdown 的两个细节：阶段根的**正文**、阶段内边的端点归属。"""
 

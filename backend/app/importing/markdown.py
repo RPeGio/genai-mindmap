@@ -47,10 +47,11 @@
      一份三级缩进大纲与一张只有两条原因的鱼骨图在文本上一模一样，猜错之后用户拿到
      的是一张"结构对、形状错"的图，而错误在画布上看起来完全正常。标记缺失/被删掉
      只是退回按树导入——有损，但可解释。
-  4. **`&lt;` / `&gt;` 反转义**。导出为了不让渲染器把 `<T>` 当标签吞掉而转义了
-     尖括号；导入不还原的话，往返一次标题就永久多了四个字母。
-     （`&amp;` 不在导出侧转义，所以这里也不处理——多做一步会把用户正文里本来
-     就写着的 `&lt;` 变成 `<`。）
+  4. **HTML 实体按导出时的相反顺序还原**。导出为了不让渲染器把 `<T>` 当标签吞掉，
+     把 `&` 写成 `&amp;`、`<` / `>` 写成 `&lt;` / `&gt;`（顺序就是这样：`&` 先）。
+     所以这里先还原 `&lt;` / `&gt;`，最后还原 `&amp;`。只还原尖括号不还原 `&`
+     时，用户正文里本来就写着的 `&lt;token&gt;` 往返一次会变成 `<token>`——
+     用户写的字被改了，还没有告警（codex 复审 P2-4）。
   5. **`- [x]` 这类待办语法映射成视觉字段**：`[x]` → 绿 + ✅（已完成），
      `[ ]` → 琥珀（待办）。这是唯一的"逆向映射"，且只认这两个确切写法；别的
      方括号前缀（`[1]`、`[注]`）原样留在标题里，不猜。
@@ -160,8 +161,20 @@ def _split_checkbox(text: str) -> tuple[str, str | None, str | None]:
 
 
 def _unescape(text: str) -> str:
-    """还原导出时转义的尖括号（只这两个，理由见模块 docstring 第 4 条）。"""
-    return text.replace("&lt;", "<").replace("&gt;", ">")
+    """还原导出时转义的 HTML 实体。**顺序与导出相反**：先尖括号，`&amp;` 最后。
+
+    Markdown 是 HTML 的一种，`&lt;` 在渲染时就是 `<`，所以导出把 `<` 写成 `&lt;`。
+    早先导出不转 `&`、这里只还原尖括号，于是用户正文里本来就写着的六个字符
+    `&lt;token&gt;` 往返一次变成 `<token>`——用户写的字被改了，还没有告警
+    （codex 复审 P2-4）。
+
+    现在导出先转 `&`（`&lt;` → `&amp;lt;`），这里按相反顺序还原，往返守恒。
+
+    顺序不能反：先还原 `&amp;` 会把 `&amp;lt;` 变成 `&lt;`，再还原 `&lt;`
+    又把它变回 `<`——那是原来那个缺陷，只是晚一步发生。
+    """
+    return (text.replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&amp;", "&"))
 
 
 def _label_of(text: str) -> tuple[str, str | None, str | None]:
@@ -370,7 +383,10 @@ def _parse_tree(text: str) -> RawMap:
         if section is not None:
             item = _ITEM.match(line)
             if item:
-                edge_texts.append(item.group("text"))
+                # 反转义在**收集这一层**做：端点与标签都在这一行里，留到 `edge_of`
+                # 之后再做就得把两个字段各还原一次（标签里的 `&amp;` 与端点里的
+                # 会漏掉一处）。
+                edge_texts.append(_unescape(item.group("text")))
             continue
         if heading:
             body = _unescape(heading.group("text").strip())
@@ -632,7 +648,7 @@ def _parse_flow(text: str) -> RawMap | None:
                 # 树那一路的 `## 附加关系`（没有后缀）在这里当阶段之间的清单：
                 # 流程图只有两层边，一层都没标后缀时按主轴读是最不容易错的选择。
                 target = inner_edge_texts if section == "inner" else stage_edge_texts
-                target.append(item.group("text"))
+                target.append(_unescape(item.group("text")))
             continue
         if heading:
             body = _unescape(heading.group("text").strip())

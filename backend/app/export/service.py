@@ -204,8 +204,16 @@ def _escape_markdown(text: str) -> str:
 
     尖括号不转义会被渲染器当成 HTML 标签——`List<T>` 里的 `<T>` 直接消失，
     节点文字就残了。节点总在 `- ` 之后，不占行首，所以 `#` 和 `>` 不用管。
+
+    **`&` 也必须转，而且必须是第一个转的。** Markdown 是 HTML 的一种：渲染时
+    `&lt;` 就是 `<`。所以只转尖括号时，用户正文里本来写着的六个字符 `&lt;token&gt;`
+    导出后一个字节没变，导入侧却把它还原成 `<token>`——用户写的字被改了，还没有
+    任何告警（codex 复审 P2-4）。先写 `&amp;` 之后，`&lt;` 变成 `&amp;lt;`，
+    导入侧按**相反顺序**还原（`importing/markdown.py::_unescape`：先 `&lt;`/`&gt;`，
+    `&amp;` 最后），往返就守恒了。
     """
-    return _one_line(text).replace("<", "&lt;").replace(">", "&gt;")
+    return (_one_line(text).replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _markdown_quote(detail: str | None, pad: str) -> list[str]:
