@@ -431,7 +431,24 @@ class Node(BaseModel):
     #
     # 默认 `None` 是旧图零迁移的老规矩：库里那些从没被问过"你是什么角色"的节点
     # 一律当作普通步骤，行为与加这个字段之前逐字节相同。
-    role: Literal["step", "decision", "start", "end"] | None = None
+    #
+    # 六个取值 = 标准流程图的六个图框。加值域本身**不需要迁移**：`Literal` 只扩大
+    # 可写集合，读旧数据那条路一个字节都没变（旧值全部仍在集合里，`None` 仍是
+    # 普通步骤）。
+    #
+    #   - `step`     ：矩形，处理 / 步骤（`None` 与它同义）
+    #   - `decision` ：菱形，判定（有两条以上出口）
+    #   - `start`    ：胶囊，起点
+    #   - `end`      ：胶囊，终点
+    #   - `data`     ：平行四边形，**输入 / 输出**（读到了一个值、交出了一份材料）
+    #   - `database` ：圆柱，**存储**（数据落在某处 / 从某处取出）
+    #
+    # 为什么只补这两个、不把文档 / 六边形 / 双竖线 / 梯形一起补：判定"画哪种框"
+    # 的这件事必须由模型说，而它只在**图上真出现**时才说得准。输入输出与存储
+    # 几乎每张流程图上都有（"从哪读、写到哪"），其余几种的出现频率低一个数量级，
+    # 多说一句只会把 `role` 这一段变长、把 `decision` 的注意力摊薄——那一段的
+    # 实测代价见 `tools._FLOW_BODY` 的注释（写在 system 里时一个 decision 都没标）。
+    role: Literal["step", "decision", "start", "end", "data", "database"] | None = None
     source_refs: list[SourceRef] = Field(default_factory=list, max_length=20)
     pos: Position | None = None
 

@@ -60,7 +60,7 @@ export interface MindNode {
    */
   collapsed?: boolean;
   /**
-   * 这个节点在图里扮演什么：普通步骤 / 判定 / 起点 / 终点。
+   * 这个节点在图里扮演什么：普通步骤 / 判定 / 起点 / 终点 / 输入输出 / 存储。
    *
    * 与 `MindEdge.kind` 是同一条分工的两半——**边**有语义类型（`flow`/`branch`/`loop`），
    * 节点侧的对偶就是这个字段。流程图里判定节点要画菱形，否则「是/否」两个出口
@@ -72,7 +72,7 @@ export interface MindNode {
    *
    * 缺省 `null` = 普通步骤，与加这个字段之前的渲染逐像素相同。
    */
-  role?: 'step' | 'decision' | 'start' | 'end' | null;
+  role?: 'step' | 'decision' | 'start' | 'end' | 'data' | 'database' | null;
   style?: NodeStyle | null;
   pos?: NodePosition | null;
   /**

@@ -3058,7 +3058,9 @@
                   "step",
                   "decision",
                   "start",
-                  "end"
+                  "end",
+                  "data",
+                  "database"
                 ]
               },
               {
@@ -3206,7 +3208,9 @@
                   "step",
                   "decision",
                   "start",
-                  "end"
+                  "end",
+                  "data",
+                  "database"
                 ]
               },
               {

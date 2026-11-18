@@ -1446,7 +1446,7 @@ export interface components {
             icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
             /** Role */
-            role?: ("step" | "decision" | "start" | "end") | null;
+            role?: ("step" | "decision" | "start" | "end" | "data" | "database") | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;
@@ -1480,7 +1480,7 @@ export interface components {
             icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
             /** Role */
-            role?: ("step" | "decision" | "start" | "end") | null;
+            role?: ("step" | "decision" | "start" | "end" | "data" | "database") | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;
