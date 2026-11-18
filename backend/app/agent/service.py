@@ -446,17 +446,24 @@ def _no_progress_stop(
     usage_total: dict[str, Any],
     tool_calls: int,
     no_progress: int,
+    *,
+    model: str | None = None,
+    reasoning: str = "",
 ) -> DoneEvent | ErrorEvent:
     """连续无进展到硬阈值：收尾。
 
     与 `_budget_stop` 同一条规矩：已经有候选就当作完成（那棵树是能用的，报成失败
     只会让用户不知道该不该用），一份都没有才报错。
+
+    `model` / `reasoning` 也要带上：这一帧和"模型自己收尾"那一条在界面上是同一种
+    成功（都落进了画布），少两字段就会出现"同样是生成成功，一次看得到模型名与
+    思考过程，另一次什么都没有"——而用户完全不知道差别来自哪种收尾。
     """
     message = (f"连续 {no_progress} 次工具调用没有改动导图，模型在原地打转，已停止。")
     _log_failure(ctx, tool_calls, code="no_progress", message=message)
     if ctx.candidate is not None:
         return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
-                         mode="model")
+                         mode="model", model=model, reasoning=_reasoning_text(reasoning))
     return ErrorEvent(seq=next(seq), code="no_progress", message=message,
                       limit="no_progress")
 
@@ -584,6 +591,9 @@ def _budget_stop(
     limit: str,
     tool_calls: int,
     call: ToolCall | None = None,
+    *,
+    model: str | None = None,
+    reasoning: str = "",
 ) -> DoneEvent | ErrorEvent:
     """预算用尽时的收尾帧：树上已经有东西就当作完成，空树才算失败。
 
@@ -594,6 +604,12 @@ def _budget_stop(
 
     真的一棵树都没有（第一轮就没额度、工具失败前没产出）时仍然报错，
     那种情况下用户确实什么都没拿到。
+
+    `model` / `reasoning` 是**成功分支**必须带的两个字段（与模型自己收尾那一帧同形）：
+    预算耗尽只是"没继续花钱"，不代表这一次的产出不该被当作一次正常完成。少了它们，
+    "预算到点交付"与"模型主动交付"在界面上长得不一样，而用户看不出为什么。
+    `reasoning` 取**最后一次模型响应**的思考过程——那是这一轮真正决定"可以收尾了"
+    的那次思考，前面的轮次属于过程。
     """
     message = _budget_message(ctx, limit, tool_calls)
     _log_failure(
@@ -601,7 +617,7 @@ def _budget_stop(
     )
     if ctx.candidate is not None:
         return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
-                         mode="model")
+                         mode="model", model=model, reasoning=_reasoning_text(reasoning))
     return ErrorEvent(
         seq=next(seq), code="budget_exhausted",
         message=message, limit=limit,
@@ -991,6 +1007,14 @@ async def _loop(
     nudges = 0
     usage_total: dict[str, Any] = {}
     last_call: ToolCall | None = None
+    # 收尾帧要带的两个字段。写成循环里的局部变量而不是在收尾那一刻再算：
+    #   - `model_name` 是 provider 在**发请求那一刻**决定的（配置缺失时还有回退），
+    #     预算/空转这两条收尾路径上没有"当前 provider"可问，只能一路带着；
+    #   - `last_reasoning` 取**最后一次**模型响应的思考过程。预算耗尽与空转结束都是
+    #     "这一轮跑完了、可以交付了"，与模型自己收尾的 done 帧同形，少了它就会出现
+    #     "同样是成功，一次有思考过程一次没有"，而用户不知道差别来自哪种收尾。
+    model_name: str | None = None
+    last_reasoning = ""
     # 防线二的状态：树的内容指纹 + 连续多少次调用没让它变。
     #
     # 初值在**进入循环之前**取，而不是在第一轮之后：`request.snapshot` 是用户
@@ -1007,13 +1031,17 @@ async def _loop(
     while True:
         limit = _budget_limit(budget, tool_calls, started)
         if limit is not None:
-            yield _budget_stop(ctx, seq, usage_total, limit, tool_calls, last_call)
+            yield _budget_stop(
+                ctx, seq, usage_total, limit, tool_calls, last_call,
+                model=model_name, reasoning=last_reasoning)
             return
 
         # 先占额度、再发请求。反过来做（调用成功后才记账）时，一旦工具内部
         # 也要调模型，额度会在工具执行期间被用掉而循环还不知道。
         if not ctx.reserve_model_call():
-            yield _budget_stop(ctx, seq, usage_total, "max_model_calls", tool_calls, last_call)
+            yield _budget_stop(
+                ctx, seq, usage_total, "max_model_calls", tool_calls, last_call,
+                model=model_name, reasoning=last_reasoning)
             return
 
         # 每轮刷新大纲：模型必须看到上一轮产出节点的真实 id，否则它无法精确改
@@ -1040,7 +1068,9 @@ async def _loop(
             # 必须原样抛出：吞掉它会让"用户点了取消"变成一次正常结束
             raise
         except (asyncio.TimeoutError, TimeoutError):
-            yield _budget_stop(ctx, seq, usage_total, "max_seconds", tool_calls)
+            yield _budget_stop(
+                ctx, seq, usage_total, "max_seconds", tool_calls,
+                model=model_name, reasoning=last_reasoning)
             return
         except GenerationError as exc:
             _log_failure(ctx, tool_calls, code="generation_failed", message=str(exc))
@@ -1055,6 +1085,9 @@ async def _loop(
 
         messages.append(completion.message)
         usage_total = _merge_usage(usage_total, completion.usage)
+        # 每一轮都覆盖：收尾帧要的是**最后一次**响应，不是第一次。
+        model_name = getattr(active_provider, "model_name", None)
+        last_reasoning = str(completion.message.get("reasoning_content") or "").strip()
 
         if not completion.tool_calls:
             # 收尾前的一次性提醒：模型**自己**刚查出还有几支没展开，却直接收尾了。
@@ -1111,7 +1144,9 @@ async def _loop(
                     # 要看的东西，藏起来等于那个开关白勾了。截断上限见
                     # `REASONING_TEXT_LIMIT`（不是 `MODEL_TEXT_LIMIT`）。
                     reasoning=_reasoning_text(reasoning),
-                    model=getattr(active_provider, "model_name", None),
+                    # 与两条收尾路径（预算耗尽 / 空转停止）同一个来源：`model_name`
+                    # 是这一轮 provider 真正发出去的名字。
+                    model=model_name,
                 )
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
@@ -1266,7 +1301,9 @@ async def _loop(
             if no_progress == NO_PROGRESS_WARN:
                 yield _no_progress_frame(ctx, seq, no_progress, tool_calls)
             if no_progress >= NO_PROGRESS_ABORT:
-                yield _no_progress_stop(ctx, seq, usage_total, tool_calls, no_progress)
+                yield _no_progress_stop(
+                    ctx, seq, usage_total, tool_calls, no_progress,
+                    model=model_name, reasoning=last_reasoning)
                 return
 
             # 候选树从"没有"变成"有"（只可能是 mindmap_generate_deep 成功）时补一帧

@@ -89,6 +89,14 @@ def connect() -> sqlite3.Connection:
         applied_at   TEXT
     )""")
     _drop_columns(conn, "runs", ["dismissed_at"])
+    # 收尾那两个字段（`model` / `reasoning`）后来才加：`CREATE TABLE IF NOT EXISTS`
+    # 不会给已有的表补列，而线上那张表已经有行。缺列时 `runs.finish()` 的 UPDATE
+    # 会抛 `no such column`，被它自己的日志吞掉——**每次运行的终态都不落库**，
+    # 而 `pending()` 只是少返回几条，看着像"没人生成过"。
+    #
+    # 两列都可空：老行上是 NULL，意思是"当时没记"（那时 done 帧也没有这两个字段），
+    # 比编一个空串诚实——重放时据此决定"这条帧不带 model/reasoning"。
+    _ensure_columns(conn, "runs", {"model": "TEXT", "reasoning": "TEXT"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
     # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
     # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该

@@ -142,6 +142,11 @@ async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
     只为得到同一棵树，是这张表要消灭的第一件事。`mode` 也照原样回填——占位树
     被重放成 `mode=model` 就是界面替它撒谎。
 
+    `model` / `reasoning` 同样回填（`runs.finish()` 落的那两列）。重放的价值是
+    "同一个 run_id 拿到的东西与第一次一样"，缺了它们，用户重连之后看到的那条
+    结果既不说用的哪个模型、也没有思考过程——"重放"就变成了"重放了一部分"。
+    老行上这两列是 NULL，`DoneEvent` 里整条字段不存在，与"没说"同义。
+
     `done` 但没有结果的 run 同样重放（内容是空）：它在服务端已经是一次有结论的
     运行，重跑一次并不比"如实说没产出"更可能成功。用户真想重试时，前端每次点击
     都会生成新的 run_id，走的是另外一条路。
@@ -152,9 +157,13 @@ async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
         seq += 1
         yield encode_event(SnapshotEvent(seq=seq, content=record.candidate))
         seq += 1
-        yield encode_event(DoneEvent(seq=seq, content=record.candidate, mode=mode))
+        yield encode_event(DoneEvent(
+            seq=seq, content=record.candidate, mode=mode,
+            model=record.model, reasoning=record.reasoning or ""))
     else:
-        yield encode_event(DoneEvent(seq=1, content=None, mode=mode))
+        yield encode_event(DoneEvent(
+            seq=1, content=None, mode=mode,
+            model=record.model, reasoning=record.reasoning or ""))
     yield DONE_FRAME
 
 
@@ -182,6 +191,11 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     resolved = runs.STATUS_CANCELLED
     failure: dict[str, Any] | None = None
     mode: str | None = None
+    # `done` 帧上那两个"这次走了哪条路"的字段。终态落库时要一起写：不写的话，
+    # 同一个 run_id 第二次投递（`_replay`）拿到的帧就少了 model/reasoning，
+    # 而第一次是有的——同一个 run 两种结果，用户会以为重放丢了东西。
+    model: str | None = None
+    reasoning: str | None = None
     # 候选的两个来源，按可信度排：`ctx` 是权威（含 edit/expand 那些只走 op 批次的
     # 改动），`observed` 是兜底（只在 `run()` 的收尾回调没能执行时才有用，比如
     # 任务被硬取消导致内层生成器没能跑完 finally）。多这一层不重复：一个来源是
@@ -219,6 +233,10 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
                 if isinstance(event, DoneEvent):
                     resolved = runs.STATUS_DONE
                     mode = event.mode
+                    model = event.model
+                    # 空串按"没说"落库：`runs.finish()` 用 COALESCE，写成空串会把
+                    # 上一轮已经记下的思考过程盖成空。
+                    reasoning = event.reasoning or None
                     captured["observed"] = event.content
                 elif isinstance(event, ErrorEvent):
                     resolved = runs.STATUS_FAILED
@@ -250,7 +268,8 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         # 落库失败不该把一条已经跑完的流变成断开的连接：这是收尾，不是结果。
         # 拦下它并留下日志，用户至少还能从 done 帧拿到候选。
         try:
-            runs.finish(run_id, resolved, candidate=candidate, failure=failure, mode=mode)
+            runs.finish(run_id, resolved, candidate=candidate, failure=failure, mode=mode,
+                        model=model, reasoning=reasoning)
         except Exception:  # noqa: BLE001 — 见上
             logger.exception("run %s 的终态没有落库", run_id)
     if finished:
