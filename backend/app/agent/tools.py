@@ -351,8 +351,15 @@ def library_available() -> bool:
     两个条件合成一个函数，是因为三处调用点（`_rag`、`build_registry`、
     `_intent_rule`）问的是同一个问题。分头写 `enabled() and count()` 的结果是
     三处各漏一次，而漏一次的表现是"模型看到了工具但查不到东西"或者反过来。
+
+    **`drop_external` 必须传**：用户关掉联网检索之后，库里往往只剩下外部检索
+    入库的那批（整个库就是它们堆起来的），剔掉之后库是空的。不传的话
+    `rag_query` 仍然会被注册，模型照着调、拿到 `no_sources`、再试一次、撞上
+    "累计失败 2 次"的闸——整轮运行直接停掉，用户看到的是"生成失败"，而真相是
+    "这里没有任何可检索的东西，那个工具本就不该出现在清单里"。
     """
-    return library_search_enabled() and library_source_count() > 0
+    return (library_search_enabled()
+            and library_source_count(drop_external=library_drop_external()) > 0)
 
 
 # ---------------------------------------------------------------- 外部知识检索开关
