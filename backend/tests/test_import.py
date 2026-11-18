@@ -1291,6 +1291,42 @@ class ShapeJudgeTest(unittest.TestCase):
         self.assertIn("edges_dropped", codes(result.warnings))
 
 
+class RoundTripLossTest(unittest.TestCase):
+    """codex 复审第 2–5 项：几条"导出写了、导入读不回来"的路。
+
+    每一条都是**用户给的文件往返一次之后少了一点东西**，而其中有几条当时是
+    静默的（不报警）。判据统一是"从本仓库导出 → 导入 → 字段相等"。
+    """
+
+    # --- P2-2：骨的 category 与骨根 note --------------------------------
+
+    def test_bone_category_and_note_survive_markdown(self):
+        """`category=People` / `label=Staff` / 另有 `note`：三个字段各归各位。
+
+        此前文字槽里只有 `label`，于是 `category` 退回 `Staff`、`note` 整段消失，
+        **而且没有任何告警**——用户不会知道正文去哪了。
+        """
+        original = FishboneContent.model_validate({
+            "title": "交付延期", "problem": "为什么三次交付都延期",
+            "bones": [{"category": "People", "root": {
+                "id": "b1", "label": "Staff", "note": "两位主程同时不在",
+                "detail": "骨的生成说明",
+                "children": [{"id": "c1", "label": "休假"}]}}],
+        })
+        restored = parse_text("fb.md", to_markdown(original)).content
+        self.assertIsInstance(restored, FishboneContent)
+        bone = restored.bones[0]
+        self.assertEqual(bone.category, "People")
+        self.assertEqual(bone.root.label, "Staff")
+        self.assertEqual(bone.root.note, "两位主程同时不在")
+        self.assertEqual(bone.root.detail, "骨的生成说明")
+
+    def test_bone_without_extra_fields_still_takes_category_from_the_line(self):
+        """没有注释行的文件（手写大纲、上一版导出）行为不变：类别取骨行那行字。"""
+        restored = parse_text("old.md", to_markdown(sample_fishbone())).content
+        self.assertEqual([bone.category for bone in restored.bones], ["人", "机", "料"])
+
+
 class FlowMarkdownTest(unittest.TestCase):
     """流程图 markdown 的两个细节：阶段根的**正文**、阶段内边的端点归属。"""
 

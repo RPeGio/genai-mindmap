@@ -74,6 +74,7 @@ from xml.sax.saxutils import escape, quoteattr
 from app.contracts.mindmap import (
     DIAGRAM_LABELS,
     Edge,
+    FishboneBone,
     FishboneContent,
     FlowContent,
     FlowStage,
@@ -409,26 +410,32 @@ def _opml_tree(content: MindMapContent) -> str:
 # 所以这三种格式对它来说只有"骨架"一件事：`problem` 是鱼头，六根骨是类别，骨下面挂
 # 原因。形状与树不同（没有 `root`），所以不能走树那三个实现。
 
-def _fishbone_lines(content: FishboneContent) -> list[tuple[int, str, str | None]]:
-    """鱼骨图 → `(层号, 文字, 详情)`：0 是鱼头，1 是骨，2 起是骨下面的原因。
+def _fishbone_lines(
+    content: FishboneContent,
+) -> list[tuple[int, str, str | None, FishboneBone | None]]:
+    """鱼骨图 → `(层号, 文字, 详情, 骨)`：0 是鱼头，1 是骨，2 起是骨下面的原因。
 
     鱼头用 `problem ?? title`：`title` 是文件名（"报销慢的原因分析"），`problem` 才是
     这张图的论点（"为什么报销要 11 天"）。导出给别人看时，后者才是那句话。
 
     第三项是节点的 `detail`。鱼头那一行永远是 `None`：主骨上那句话是 `problem`
     ——一个字符串字段，它下面没有节点，也就没有详情可带。骨带的是**骨根节点**的
-    `detail`（`bone.root.detail`），而 `bone.category` 不进这一份行表：画在骨上的
-    那行字是 `root.label`，类别是数据的分类（两者通常相同，见 `_markdown_fishbone`）。
+    `detail`（`bone.root.detail`）。
+
+    第四项只有骨那一层非空。**`category` 与骨根的 `note` 不在这个行表里**：
+    它们不是"画在骨上那行字"（那是 `root.label`），而是同一根骨上另外两个字段
+    ——markdown 把它们写进骨行下面一行 HTML 注释（`_markdown_bone_comment`），
+    opml / puml 的调用方忽略这一项。
     """
     head = content.problem.strip() or content.title
-    out: list[tuple[int, str, str | None]] = [(0, head, None)]
+    out: list[tuple[int, str, str | None, FishboneBone | None]] = [(0, head, None, None)]
     for bone in content.bones:
         label = bone.root.label.strip() or bone.category
-        out.append((1, label, bone.root.detail))
+        out.append((1, label, bone.root.detail, bone))
         stack = [(child, 2) for child in reversed(bone.root.children)]
         while stack:
             node, depth = stack.pop()
-            out.append((depth, _node_text(node), node.detail))
+            out.append((depth, _node_text(node), node.detail, None))
             stack.extend((child, depth + 1) for child in reversed(node.children))
     return out
 
@@ -440,11 +447,43 @@ def _puml_fishbone(content: FishboneContent) -> str:
         f"' 图型：{DIAGRAM_LABELS.get(content.diagram_type, content.diagram_type)}"
         f"（{content.diagram_type}）",
     ]
-    for depth, text, detail in _fishbone_lines(content):
+    for depth, text, detail, _bone in _fishbone_lines(content):
         lines.append(f"{_depth_marks(depth + 1)} {_sanitize(text)}")
         lines += _puml_note(detail)
     lines.append("@endmindmap")
     return "\n".join(lines) + "\n"
+
+
+def _markdown_bone_comment(bone: FishboneBone) -> str | None:
+    """一根骨的 `category` 与骨根 `note` 在 Markdown 里的落点：一行 HTML 注释。
+
+    为什么必须另开一个通道：`_fishbone_lines` 那一行的文字槽装的是 `root.label`
+    （画在骨上的那行字），而 `category` 与 `root.note` 是同一根骨上**另外两个字段**。
+    此前这两个字段在 markdown 里没有任何落点——一份 `category=People`、
+    `label=Staff`、另有 `note` 的骨，往返之后变成 `category=Staff`、正文消失，
+    **而且没有告警**（codex 复审 P2-2）。数据丢失且不报警比丢得明明白白更糟。
+
+    为什么是 HTML 注释：它渲染不可见（`shape_marker` 同理，读者看到的还是大纲），
+    是标准语法，且不会被 `- ` 行、`>` 行、heading 任一条解析规则误认。位置在
+    **骨行下面、与 `detail` 的引用块同缩进**：先注释后引用块，读起来是"这一项的
+    元数据、然后是这一项的说明"。
+
+    为什么是 JSON：值里有空格、冒号、中文引号都不需要再定一份转义规则，
+    `json.loads` 就是唯一实现（导出的 `to_json` 也用它）。`>` 写成 `\\u003e`
+    ——JSON 里两种写法等价，但注释里一旦出现 `-->` 就提前结束，后半行会变成
+    正文，Markdown 结构当场断掉。
+
+    **没有 category / note 的骨返回 None**，所以既有输出一个字节都没变。
+    """
+    payload: dict[str, str] = {}
+    if bone.category and bone.category != bone.root.label.strip():
+        payload["category"] = bone.category
+    if bone.root.note:
+        payload["note"] = bone.root.note
+    if not payload:
+        return None
+    body = json.dumps(payload, ensure_ascii=False, separators=(", ", ": "))
+    return f"<!-- genai-mindmap: bone {body.replace('>', chr(92) + 'u003e')} -->"
 
 
 def _markdown_fishbone(content: FishboneContent) -> str:
@@ -466,16 +505,24 @@ def _markdown_fishbone(content: FishboneContent) -> str:
     用户手改成 Tab 的文件读出来是同一棵树。
 
     第二行是形状标记（见 `shape_marker`）：缩进能表达"谁挂在谁下面"，表达不了
-    "这几条是骨"。标记让导入侧不必猜。
+    "这几条是骨"。标记让导入侧不必猜。骨的 `category` / `note` 走骨行下面那行
+    注释（`_markdown_bone_comment`）。
     """
     lines: list[str] = [
         f"# {_escape_markdown(content.title)}",
         shape_marker(content.diagram_type),
         "",
     ]
-    for depth, text, detail in _fishbone_lines(content):
+    for depth, text, detail, bone in _fishbone_lines(content):
         pad = "    " * depth
         lines.append(f"{pad}- {_escape_markdown(text)}")
+        if bone is not None:
+            comment = _markdown_bone_comment(bone)
+            if comment is not None:
+                # 与引用块同缩进（`pad + "  "`）：缩进到 `- ` 之后的那一层，
+                # 渲染时仍在这一项内部；再深一格（`pad + "    "`）会被
+                # Python-Markdown 当成缩进代码块，`>` 变成字面文本。
+                lines.append(f"{pad}  {comment}")
         lines += _markdown_quote(detail, pad + "  ")
     return "\n".join(lines) + "\n"
 
@@ -490,7 +537,7 @@ def _opml_fishbone(content: FishboneContent) -> str:
     rows = _fishbone_lines(content)
     head: dict = {"text": rows[0][1], "note": rows[0][2], "children": []}
     stack: list[tuple[dict, int]] = [(head, 0)]
-    for depth, text, detail in rows[1:]:
+    for depth, text, detail, _bone in rows[1:]:
         while len(stack) > 1 and stack[-1][1] >= depth:
             stack.pop()
         item: dict = {"text": text, "note": detail, "children": []}

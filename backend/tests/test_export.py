@@ -470,6 +470,56 @@ class FishboneIndentationTest(unittest.TestCase):
             self.assertGreater(len(bone) - len(bone.lstrip()), len(head) - len(head.lstrip()))
 
 
+class FishboneBoneFieldsTest(unittest.TestCase):
+    """骨的 `category` 与骨根 `note` **不能静默丢失**（codex 复审 P2-2）。
+
+    这两个字段在 markdown 里没有文字槽：骨那一行装的是 `root.label`（画在骨上的
+    那行字）。此前一次往返会把 `category=People`、`label=Staff`、另有 `note` 的骨
+    变成 `category=Staff`、正文消失，**而且没有任何告警**——数据丢了还说不清。
+
+    落点是骨行下面一行 HTML 注释（`export._markdown_bone_comment`）：渲染不可见、
+    是标准语法、不会被 `- ` / `>` / heading 任一条解析规则误认。
+    """
+
+    def content(self, **bone_overrides):
+        from app.contracts.mindmap import FishboneContent
+        root = {"id": "b1", "label": "Staff", "children": [{"id": "c1", "label": "休假"}]}
+        root.update(bone_overrides.pop("root", {}))
+        bone = {"category": "People", "root": root}
+        bone.update(bone_overrides)
+        return FishboneContent.model_validate({
+            "title": "交付延期", "problem": "为什么延期", "bones": [bone]})
+
+    def test_category_and_note_are_written_where_import_can_read_them(self):
+        lines = to_markdown(self.content(root={"note": "两位主程同时不在"})).splitlines()
+        self.assertIn("    - Staff", lines)
+        self.assertEqual(
+            lines[lines.index("    - Staff") + 1],
+            '      <!-- genai-mindmap: bone {"category": "People", '
+            '"note": "两位主程同时不在"} -->')
+
+    def test_bone_without_extra_fields_writes_no_comment(self):
+        """`category` 与 `label` 相同、`note` 为空：输出里一行注释都不多。
+
+        这不是省字节，是**不给既有文件制造噪声**：往返路径上格式多一行之后，
+        用户下一次 `git diff` 会看到一份与上次不同的导出。
+        """
+        text = to_markdown(self.content(root={"label": "People"}))
+        self.assertNotIn("genai-mindmap: bone", text)
+
+    def test_comment_value_cannot_end_the_comment_early(self):
+        """注释里出现 `-->` 会提前收尾，后半行变成正文、结构当场断掉。
+
+        所以值里的 `>` 写成 JSON 的 `\\u003e`（两种写法在 JSON 里等价），
+        `json.loads` 还原之后仍是 `>`。
+        """
+        text = to_markdown(self.content(root={"note": "先 A --> B"}))
+        self.assertNotIn("--> B", text.split("genai-mindmap: bone")[1].split("\n")[0])
+        payload = text.split("genai-mindmap: bone ")[1].split(" -->")[0]
+        self.assertEqual(json.loads(payload),
+                         {"category": "People", "note": "先 A --> B"})
+
+
 class ByteIdenticalTest(unittest.TestCase):
     """三种既有格式的输出**逐字节**钉死。
 

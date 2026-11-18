@@ -29,7 +29,7 @@
     ### 1. 提交                   ← 阶段（序号由导出写的，导入时剥掉）
     - 填单
 
-六条规则，都是为了"导出改一改还能导回来"：
+七条规则，都是为了"导出改一改还能导回来"：
 
   1. **层级靠缩进栈，不靠固定的倍数。** 导出对鱼骨与流程写 **4 个空格**（2 个只有
      CommonMark 认，Python-Markdown 按 `tab_length=4` 判层级，会把骨读到鱼头那一级
@@ -58,9 +58,15 @@
      （`export._markdown_quote`），导入把它读回 `detail` 而不是塞进标题：那一行
      标题已经装了 `note or label`，再并进 142 字的说明，大纲就没法扫读了。
      引用块归属于**它上面那个节点**（不看缩进），所以用户重排缩进也不会挂错。
+  7. **骨的 `category` 与骨根 `note` 在骨行下面一行注释里**
+     （`<!-- genai-mindmap: bone {"category": …, "note": …} -->`，见
+     `export._markdown_bone_comment`）。这两个字段在文字槽里没有位置——那一行写的
+     是 `root.label`——此前它们**静默丢失**（codex 复审 P2-2）。注释里的值是 JSON，
+     所以引号、空格、换行都不用另定一套转义。
 """
 from __future__ import annotations
 
+import json
 import re
 
 from app.export.service import (
@@ -91,6 +97,12 @@ _FENCE = re.compile(r"^\s{0,3}(?:```|~~~)")
 # 只认我们自己那一行，别人写的注释不当成形状声明。
 _SHAPE_MARKER = re.compile(
     r"^\s*<!--\s*genai-mindmap:\s*shape=(?P<shape>[a-z]+)\s*-->\s*$")
+
+# 骨行下面那行元数据注释（`export._markdown_bone_comment`）：`category` 与骨根
+# `note`。值是 JSON，所以这里也按 JSON 读——导出把值里的 `>` 写成了 `\u003e`，
+# 那是为了不让注释提前结束，读回来还是一个 `>`。
+_BONE_META = re.compile(
+    r"^\s*<!--\s*genai-mindmap:\s*bone\s+(?P<payload>\{.*\})\s*-->\s*$")
 
 # 三个边清单小节的标题 → 是哪一层。列表按**长的在前**排：`附加关系` 是另外两个的
 # 前缀，交替分支短的排前面时靠 `$` 回溯也能对上，但写清楚顺序就不依赖这条推理。
@@ -402,11 +414,33 @@ def _parse_tree(text: str) -> RawMap:
                   over_hard_cap=over_cap)
 
 
+def _bone_payload(text: str) -> dict[str, str]:
+    """骨注释里的 JSON → `{category, note}`。坏 JSON 当作没有（不猜、不报错）。
+
+    只取这两个键：注释是导出写的，但它躺在**用户可编辑**的文件里，多出来的键
+    没有落点，硬吞进 `RawNode` 的某个字段等于让文件决定语义。
+    """
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {key: value for key, value in payload.items()
+            if key in ("category", "note")
+            and isinstance(value, str) and value.strip()}
+
+
 def _parse_fishbone(text: str) -> RawMap | None:
     """鱼骨图 markdown → `RawMap(shape="fishbone")`。没有列表项时返回 None。
 
     形状在文件里就是缩进：**第一个**列表项是主骨上那句话，它的直接子项是骨，骨下面
     的原因照旧挂。所以这里不需要另写一套结构解析——`_attach` 就是全部。
+
+    骨行下面那行 `<!-- genai-mindmap: bone {…} -->` 补上两个没有文字槽的字段：
+    `category`（数据的分类）与骨根的 `note`（用户备注）。此前它们静默丢失
+    （codex 复审 P2-2）——一份 `category=People`、`label=Staff` 的骨导回来变成
+    `category=Staff`，正文消失且无告警。
     """
     title: str | None = None
     head: RawNode | None = None
@@ -417,6 +451,10 @@ def _parse_fishbone(text: str) -> RawMap | None:
     in_fence = False
     over_cap = False
     owner: RawNode | None = None
+    #: 骨节点 → 那行注释里的 `{category, note}`。键是对象本身（`id()`）：注释挂在
+    #: 它上面那个节点身上，而节点在 `head.children` 里活到函数末尾，不会被回收后
+    #: 让 id 复用。
+    bone_meta: dict[int, dict[str, str]] = {}
 
     for line in text.splitlines():
         if _FENCE.match(line):
@@ -425,6 +463,12 @@ def _parse_fishbone(text: str) -> RawMap | None:
         if in_fence or not line.strip():
             continue
         if _SHAPE_MARKER.match(line):
+            continue
+        meta = _BONE_META.match(line)
+        if meta:
+            payload = _bone_payload(meta.group("payload"))
+            if payload and owner is not None:
+                bone_meta[id(owner)] = payload
             continue
         header = _EDGES_HEADER.match(line)
         if header:
@@ -477,7 +521,14 @@ def _parse_fishbone(text: str) -> RawMap | None:
     # 直接子项。**`problem` 就是主骨那句话**：它在契约里是一个字符串字段，所以
     # 主骨这个节点本身不会留在结果里——它的 `detail`（如果有）随之丢掉。
     head.children.extend(containers)
-    bones = [RawBone(root=child, category=child.label) for child in head.children]
+    bones: list[RawBone] = []
+    for child in head.children:
+        meta = bone_meta.get(id(child), {})
+        if meta.get("note") and child.note is None:
+            child.note = meta["note"]
+        # `category` 缺省取骨行那行字：那正是"只有 label 时的类别"，与加注释之前
+        # 的行为逐字段相同。
+        bones.append(RawBone(root=child, category=meta.get("category") or child.label))
 
     hints: list[tuple[str, str]] = []
     if not bones:
