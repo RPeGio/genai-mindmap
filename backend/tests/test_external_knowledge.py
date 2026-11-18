@@ -38,6 +38,7 @@ from app.agent.contracts import AgentRunRequest, RunBudget, RunContext
 from app.contracts.source import Source, SourceKind, SourceMetadata, safe_http_url
 from app.knowledge import external
 from app.knowledge import library
+from app.prefs import service as prefs
 
 # 真实响应的形状（2026-11 实测所得，正文截短）：`formatversion=2` 的 `pages` 是
 # 列表，条目里带 `fullurl` 与 `extract`。
@@ -915,6 +916,41 @@ def test_default_is_on_and_explicit_zero_still_turns_it_off(monkeypatch):
     for on in ("1", "on", "TRUE", "yes"):
         monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, on)
         assert agent_tools.external_knowledge_enabled() is True, on
+
+
+def test_deployment_switch_wins_over_the_user_pref(monkeypatch):
+    """环境变量与用户偏好是**与**关系，而且环境变量优先。
+
+    这一条钉的是优先级本身，因为它是这次改动唯一可能"看起来生效、其实没生效"的
+    地方：用户在界面上把开关打开、运维在环境变量里关着时，行为必须是"仍然不联网"。
+    反过来（先看偏好）用户会得到"我明明开了它却一次都不联网"，而界面上那个勾显示
+    着"开"——从任何一处都解释不通。
+    """
+    monkeypatch.delenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, raising=False)
+    # 起点：环境变量缺省（默认开）+ 库里没有这条偏好
+    assert agent_tools.external_knowledge_enabled() is True
+    assert agent_tools.external_knowledge_off_reason() == ""
+
+    # 用户在界面上关掉
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "false")
+    assert agent_tools.external_knowledge_enabled() is False
+    assert agent_tools.external_knowledge_off_reason() == "user"
+
+    # 用户在界面上打开 → 恢复
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "true")
+    assert agent_tools.external_knowledge_enabled() is True
+    assert agent_tools.external_knowledge_off_reason() == ""
+
+    # 部署方关掉：用户偏好改不动它（哪怕界面上写着"开"）
+    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "0")
+    assert agent_tools.external_knowledge_enabled() is False
+    assert agent_tools.external_knowledge_off_reason() == "deploy"
+
+    # 反过来也一样：用户关、部署方开 → 关（用户说不联网就是不联网）
+    monkeypatch.setenv(agent_tools.EXTERNAL_KNOWLEDGE_ENV, "1")
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "false")
+    assert agent_tools.external_knowledge_enabled() is False
+    assert agent_tools.external_knowledge_off_reason() == "user"
 
 
 

@@ -7,7 +7,8 @@
 
 设计约束：
   - 每一步都要记录来源与依据，不只是结果
-  - 代理产出的是候选，用户确认后才写进导图（与 F15/F16 同一条原则）
+  - 生成完成即落画布，没有"用户确认后才写进导图"这一步（候选层删于 `acfdb5b`：
+    落地不再需要一次人工复核，撤销栈与「回到生成之前」接替了它）
 """
 from __future__ import annotations
 
@@ -101,7 +102,7 @@ def plan(goal: str) -> AgentPlan:
     """把目标拆成阶段。
 
     TODO(F02)：用模型做阶段划分，并为每个阶段生成"需要哪些输入"，
-    再逐阶段调用本文件的 run()，最后把各阶段的候选合并成一棵树。
+    再逐阶段调用本文件的 run()，最后把各阶段产出的树合并成一棵。
     现在返回固定阶段，只用来固定接口形状与前端交互顺序。
     """
     return AgentPlan(goal=goal, stages=list(DEFAULT_STAGES), implemented=False)
@@ -538,11 +539,11 @@ def _budget_message(ctx: RunContext, limit: str, tool_calls: int) -> str:
 
     `max_seconds` 从 120 提到 600 之后，它是一条**只在长循环上**才撞到的上限，
     而撞上它的那一刻恰恰是最需要解释的时候：用户等了十分钟，看到的如果只是
-    「这次运行超过了时间上限」，他无从判断"我的图改完没有""该不该点应用"。
+    「这次运行超过了时间上限」，他无从判断"我的图改完没有""这一版能不能用"。
     预算的作用是限制继续花钱，不是把已经做了一半的事说成一句没有下文的错误。
 
     次数上限那两条不加进度：`max_model_calls` / `max_tool_calls` 停在**某一轮
-    的开头**，此时候选内容与上一帧 tool_end 完全一致，多写一句只是重复。
+    的开头**，此时树的内容与上一帧 tool_end 完全一致，多写一句只是重复。
 
     这里**不**谎报"还剩几处没做"：模型这一轮还没发出的调用不在任何地方，编一个
     数字比不说更糟。能诚实说的是"用掉多少、做到哪、之后的没执行"。
@@ -551,9 +552,9 @@ def _budget_message(ctx: RunContext, limit: str, tool_calls: int) -> str:
     if limit != "max_seconds":
         return base
     nodes = _count_nodes(ctx.candidate.root) if ctx.candidate is not None else 0
-    done = f"，树上是 {nodes} 个节点" if ctx.candidate is not None else "，还没产出候选"
+    done = f"，树上是 {nodes} 个节点" if ctx.candidate is not None else "，还没产出导图"
     return (f"{base}（已执行 {tool_calls} 次工具调用{done}）。"
-            "这之前的改动都在候选里，之后的没有执行——把目标拆小一点再跑一次，"
+            "这之前的改动都已进树里，之后的没有执行——把目标拆小一点再跑一次，"
             "或者调大 max_seconds。")
 
 
@@ -565,14 +566,14 @@ def _budget_stop(
     tool_calls: int,
     call: ToolCall | None = None,
 ) -> DoneEvent | ErrorEvent:
-    """预算用尽时的收尾帧：已经有候选就当作完成，没有才算失败。
+    """预算用尽时的收尾帧：树上已经有东西就当作完成，空树才算失败。
 
-    深层生成会在额度不足时提前停止展开并记一条诊断，所以走到这里时候选通常
-    已经是一棵能用的树。这时再报「模型调用次数已用完」，用户看到的是候选和
-    一条错误同时出现，不知道该不该用那份候选——预算的作用是限制继续花钱，
+    深层生成会在额度不足时提前停止展开并记一条诊断，所以走到这里时通常
+    已经是一棵能用的树。这时再报「模型调用次数已用完」，用户看到的是刚长出来的
+    结果和一条错误同时出现，不知道该不该用那一版——预算的作用是限制继续花钱，
     不是把已经产出的结果报成失败。
 
-    真的一份候选都没有（第一轮就没额度、工具失败前没产出）时仍然报错，
+    真的一棵树都没有（第一轮就没额度、工具失败前没产出）时仍然报错，
     那种情况下用户确实什么都没拿到。
     """
     message = _budget_message(ctx, limit, tool_calls)

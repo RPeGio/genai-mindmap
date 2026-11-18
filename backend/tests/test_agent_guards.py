@@ -420,7 +420,7 @@ def test_seconds_timeout_message_carries_the_progress():
 
     assert "已执行 37 次工具调用" in message
     assert f"树上是 {NODE_COUNT} 个节点" in message
-    assert "候选" in message
+    assert "这之前的改动都已进树里" in message
 
 
 def test_count_budgets_keep_their_short_message():

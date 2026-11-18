@@ -408,6 +408,11 @@ EXTERNAL_HIT_LIMIT = external_knowledge.DEFAULT_LIMIT
 # 用例断言里；给人看的那句话在 `detail`（"正在检索外部资料…"），改文案不该动它。
 EXTERNAL_SEARCH_STAGE = "external_search"
 
+# 用户在界面上关掉联网检索时那句话的措辞。刻意**不复用**"没有搜到外部资料"：那句
+# 说的是"试过了，没结果"，用户看完会去换一个更常见的主题词重试；而这里他该做的是
+# 把开关打开——照着错的动作重试一百次，结果一模一样。
+EXTERNAL_OFF_NOTE = "你在设置里关掉了联网检索"
+
 # 第三段（只写 detail）的 `stage` 帧标识。它存在的理由与外部检索那一对同源：这一段
 # 实测要 24–46 秒，而**界面上一个节点都不长**（`node_grow` 属于结构那一次）——用户
 # 看到的是"树长完了，然后卡住半分钟"。帧形状与外部检索完全一样（开始一帧没有
@@ -435,6 +440,35 @@ DETAIL_STAGE = "detail"
 SHORT_MATERIAL_CHARS = LEAF_MAX_CHARS
 
 
+def external_knowledge_off_reason() -> str:
+    """这次为什么没走外部检索：`"deploy"` / `"user"` / `""`（开着）。
+
+    **两个条件是与关系，次序写死在这里，全仓只有这一处**：
+
+      1. 部署方的环境变量（`MINDMAP_EXTERNAL_KNOWLEDGE`，默认 `1`）关着 → 永远关。
+         运维把它置 0 只有一种意思："这台机器上不了网"——那是一个**事实**，不是
+         一个界面上某个勾能推翻的偏好；
+      2. 环境变量开着 → 看用户偏好（`user_prefs.external_search.enabled`，默认开）。
+
+    必须这一处、且必须先判环境变量。反过来（先看偏好）在"运维关了、用户在界面上
+    打开了"时会让用户得到"我明明开了、它却一次都不联网"，而界面那个勾显示着"开"
+    ——一个从任何一处都解释不通的状态。而"环境变量开、偏好关"没有歧义：那是用户
+    自己要的，界面也如实显示着"关"。
+
+    返回原因而不是只返回布尔值：这句话要进 `content`，而"部署方关了（你改也没用）"
+    与"你在偏好里关了（你可以去打开）"是两句必须分开的话——把它们说成同一句，
+    用户会照着错的那条去改。
+    """
+    allowed_by_deploy = (
+        os.getenv(EXTERNAL_KNOWLEDGE_ENV, EXTERNAL_KNOWLEDGE_DEFAULT)
+        .strip().lower() in EXTERNAL_KNOWLEDGE_TRUTHY)
+    if not allowed_by_deploy:
+        return "deploy"
+    if not prefs.external_search_enabled():
+        return "user"
+    return ""
+
+
 def external_knowledge_enabled() -> bool:
     """外部知识检索是否打开。**默认开**，显式写 `0/off/no` 等才算关。
 
@@ -453,9 +487,14 @@ def external_knowledge_enabled() -> bool:
 
     显式关掉时整条外部分支被跳过，行为与 `dceae7e` 逐字节相同——那是"这台机器
     上不了网"时唯一该做的事。
+
+    **还有第二道闸**：环境变量开着时，用户可以在「我的偏好」里把
+    `external_search.enabled` 设成 `false`，于是界面上真的关得掉。优先级写死在
+    `external_knowledge_off_reason()` 里（部署方优先），理由也写在那里；这个函数
+    只是它的布尔形态——两处不要各写一遍判定，那正是"运维关了、界面上却显示开"
+    这种状态的来源。
     """
-    return (os.getenv(EXTERNAL_KNOWLEDGE_ENV, EXTERNAL_KNOWLEDGE_DEFAULT)
-            .strip().lower() in EXTERNAL_KNOWLEDGE_TRUTHY)
+    return not external_knowledge_off_reason()
 
 
 # `source_name` → `SourceKind`。表而不是三元表达式：加一个新源时只能改这里一处，
@@ -4360,6 +4399,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         diagnostics = [item for item in diagnostics if item.code != "UNSOURCED_NODE"]
     external_empty = external is not None and not external.sources
     external_used = external is not None and bool(external.sources)
+    # 第三种：闸门关着，这次压根没出去搜。判据是"没有材料 且 外部分支没跑过"——
+    # `_intake` 里只有一种情况会同时满足：`not sources` 为真却没进那个 `if`，
+    # 也就是 `external_knowledge_enabled()` 是假。
+    #
+    # **只认"用户在界面上关的"这一种原因**。部署方关掉（环境变量）时这里一律为
+    # False，行为与加这个开关之前逐字节相同：那种情况下这台机器上不了网是一个事实，
+    # 每次生成都多一句"联网检索被部署方关掉了"是噪音，用户也没有任何动作可以做。
+    # 而用户自己关的时候，沉默就变成了谎话——他会以为搜了但没搜到。
+    external_off = bool(external is None and not sources
+                        and external_knowledge_off_reason() == "user")
 
     ctx.candidate = content
     ctx.revision += 1
@@ -4417,7 +4466,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         elif external is not None:
             short_note += "，只用模型自己的知识（没有搜到外部资料）。"
         else:
-            short_note += "，只用模型自己的知识（外部检索未开启）。"
+            # 到这一支时 `external is None` 只可能是闸门关着：材料被判成"太短"之后
+            # `sources` 为空，闸门开着就一定会去搜一次。于是"谁关的"决定这句话——
+            # 用户自己关的要说出来（他能去打开），部署方关的保持原样。
+            short_note += (
+                "，只用模型自己的知识"
+                f"（{EXTERNAL_OFF_NOTE if external_off else '外部检索未开启'}）。")
         lead.append(Diagnostic(
             level=DiagnosticLevel.warn, code="MATERIAL_TOO_SHORT",
             message=(
@@ -4446,7 +4500,20 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 "当作参考资料看即可。"
             )
     external_note = None
-    if external_empty:
+    if external_off:
+        # 与下面那一支**不是同一个 code**：`GENERATION_WITHOUT_EXTERNAL` 的语义是
+        # "试过了，一条都没拿到"（可以换个时间重试）；这一支是"根本没试"（重试一百
+        # 次也一样，除非去把开关打开）。遥测按 code 聚合，混成一个码会让"外部源
+        # 挂了"与"用户关了开关"在报表里再也分不开。
+        external_note = EXTERNAL_OFF_NOTE
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="EXTERNAL_SEARCH_DISABLED",
+            message=(
+                f"{external_note}：这张图只基于主题「{args.topic}」生成，"
+                "没有外部资料依据，节点上也不会有指向原文的引用"
+            ),
+        ))
+    elif external_empty:
         external_note = (f"外部检索出错（{external.failure}）" if external.failure
                          else "没有搜到外部资料")
         diagnostics.append(Diagnostic(
@@ -4471,10 +4538,21 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "不含任何材料依据；要一张有依据的图，请换一个更贴近材料内容的说法后重试。"
         )
     if external_note and not short_note:
-        summary += (
-            f"{external_note}，这张图只基于主题「{args.topic}」生成，"
-            "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
-        )
+        if external_off:
+            # 关着的时候**不能照抄下面那句**："换一个更常见的主题词后重试"在这个
+            # 情况下是错的动作——重试一百次也不会联网。这里给的是唯一有效的那个：
+            # 去把开关打开。句子里同时点出"这次没有去外面搜资料"，因为它的缺失
+            # 正是用户看不出差别的地方（没有引用会被读成"搜了但没搜到"）。
+            summary += (
+                f"{external_note}，这次没有去外面搜资料，这张图只基于主题"
+                f"「{args.topic}」生成，节点上不会有引用；"
+                "把画布右上角的「联网检索」勾上再生成一次，就会有能点回原文的引用。"
+            )
+        else:
+            summary += (
+                f"{external_note}，这张图只基于主题「{args.topic}」生成，"
+                "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
+            )
     if external_used_note:
         summary += external_used_note
     if evidence_unused:
@@ -7684,9 +7762,9 @@ def _outside_selection(
       3. 老前端把上一版的 `selected_ids` 带过来，那些 id 在当前树里查不到，
          静态算出的范围是空集，于是**每一条**改动都被判成越界。
 
-    代价也不像当初担心的那样大：改动只落**候选**（`ctx.candidate`），用户点
-    「应用」才进画布，画布上还有撤销。这一层真正需要的是"让用户与模型都看见
-    这次动到了选区之外"，而不是"拒绝执行"。
+    代价也不像当初担心的那样大：改动只落这一轮的工作树（`ctx.candidate`），`done`
+    那一刻才整树落画布（候选层删于 `acfdb5b`，中间没有人工复核点了），画布上还有
+    撤销。这一层真正需要的是"让用户与模型都看见这次动到了选区之外"，而不是"拒绝执行"。
 
     返回的顺序与去重都保留（同一批里同一个 id 出现两次是常见形态：先 update 再
     move 它），提示里重复列同一个节点只会让那句话变长而没有新信息。
@@ -7728,7 +7806,7 @@ def _scope_note(
 def _commit_drafts(
     ctx: RunContext, content: MindMapContent, drafts: list[dict[str, Any]],
 ) -> tuple[MindMapContent, OpBatch, dict[str, str]] | ToolResult:
-    """把一批草案落成候选树：规范化 id → 建批次 → 原子执行 → 记账。
+    """把一批草案落成工作树 `ctx.candidate`：规范化 id → 建批次 → 原子执行 → 记账。
 
     **五个写工具共用这一条路**（`mindmap_edit` 与四个细粒度工具）。抽出来不是
     为了少写几行，而是为了让"原子"这个词只有一个实现：任何一条 op 失败，`apply_ops`
@@ -8004,8 +8082,9 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
       3. **拒绝不可行**。要先删子节点，模型就得知道子树有多大——它没有"看子树"
          的工具，只能从上下文里已有的部分猜，猜错就进入"删了一半、报错、再试"
          的循环，每次都是真实计费。
-      4. **删错了能恢复**。这里有三层：整批原子（失败一个都不落）、候选不落地
-         （用户点「应用」才进画布）、画布撤销栈（前端 50 步）。返回值里还带
+      4. **删错了能恢复**。这里有三层：整批原子（失败一个都不落）、`done` 之前
+         不落画布（整棵树一次性替换，不会停在删了一半的中间态）、画布撤销栈
+         （前端 50 步）。返回值里还带
          `removed_nodes`（标题列表），模型可以照着重建。
 
     根节点不可删：删了就没有导图了。这一条与 `_apply_remove` 一致，只是这里提前

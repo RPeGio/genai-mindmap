@@ -12,7 +12,7 @@ const store = useMindMapStore();
 const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
   useVueFlow();
 
-// 预览与候选节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
+// 预览节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
 // 画布这边不必自己判断来源，点不中就是点不中。
 //
 // 按住 Ctrl / Cmd / Shift 点是**追加选区**：「改这张图」吃的是整个选区（用户圈三个

@@ -173,6 +173,34 @@ def test_unknown_key_is_rejected():
     assert caught.value.code == "pref_key_unknown"
 
 
+def test_external_search_is_a_two_valued_switch_that_defaults_on():
+    """"没材料时要不要联网搜"是一条 B 类偏好：两个值、默认开、能存能删。
+
+    默认开必须钉住，而且理由不止"与后端一致"：不设这条偏好的人绝大多数根本没打开
+    过面板，默认值写成"关"等于替他们做了一个他们从没表达过的决定。
+    """
+    assert service._ALLOWED[service.EXTERNAL_SEARCH_KEY] == ("true", "false")
+    # 库里没有这一行 = 允许联网（与 `tools.EXTERNAL_KNOWLEDGE_DEFAULT` 同一个方向）
+    assert service.external_search_enabled() is True
+
+    service.set(service.EXTERNAL_SEARCH_KEY, "false")
+    assert service.external_search_enabled() is False
+    # 面板上显示的是人话，不是 true / false
+    assert service._label(service.EXTERNAL_SEARCH_KEY, "false") == "没材料时不联网，直接生成"
+
+    service.set(service.EXTERNAL_SEARCH_KEY, "true")
+    assert service.external_search_enabled() is True
+    assert service._label(service.EXTERNAL_SEARCH_KEY, "true") == "没材料时先联网搜资料"
+
+    with pytest.raises(service.PrefError) as caught:
+        service.set(service.EXTERNAL_SEARCH_KEY, "maybe")
+    assert caught.value.code == "pref_value_invalid"
+
+    # 删掉就回到默认（开）：与"没设过"完全等价，不需要第三条状态
+    assert service.delete(service.EXTERNAL_SEARCH_KEY) is True
+    assert service.external_search_enabled() is True
+
+
 # ---------------------------------------------------------------- C 类上限
 
 

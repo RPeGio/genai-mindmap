@@ -355,6 +355,9 @@ class RunContext:
     """
 
     request: "AgentRunRequest"
+    # 这一轮正在长的那棵树。**名字是历史遗留**：候选层删掉（`acfdb5b`）之后，
+    # 它不再"等用户点应用"，`done` 帧一到就整树交给前端落进画布（前端标成未保存）。
+    # 改名成本高、收益低，所以字段名留着，读它时按"生成中的工作树"理解。
     candidate: MindMapContent | None = None
     revision: int = 0
     batches: list[OpBatch] = field(default_factory=list)
@@ -758,7 +761,7 @@ class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
     content: MindMapContent | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
-    # 这棵树是怎么来的，前端接受候选时要照它标记来源，不能一律写成"模型生成"。
+    # 这棵树是怎么来的，前端落地时要照它标记来源，不能一律写成"模型生成"。
     # 缺省 None 而不是 "model"：没填的帧就是"没说"，把它默认成模型产出会让
     # 占位树继续冒充满分答案——缺省值只该表示未知。
     mode: Literal["demo", "model"] | None = None

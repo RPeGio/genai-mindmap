@@ -6,7 +6,7 @@ import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
 import ImportMindmap from './components/ImportMindmap.vue';
 import SourceInputs from './components/SourceInputs.vue';
-import { SOURCE_LABELS, materialTitle } from './sources/input';
+import { SOURCE_LABELS, SHORT_MATERIAL_CHARS, materialTitle, mergedCharCount } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
 import type { LibraryEntry, LibrarySource } from './api/types';
 import type { SampleMap } from './dev/samples';
@@ -14,7 +14,7 @@ import type { DemoPreset } from './demo/presets';
 import { displayBody, bodySource, INITIAL_STATUS, useMindMapStore } from './stores/mindmap';
 import { useSourcesStore } from './stores/sources';
 import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from './stores/options';
-import { DIAGRAM_PREF_KEY, THINKING_PREF_KEY, usePrefsStore } from './stores/prefs';
+import { DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY, usePrefsStore } from './stores/prefs';
 import PrefsPanel from './components/PrefsPanel.vue';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
@@ -263,8 +263,8 @@ watch(() => selected.value?.node.id ?? null, () => {
  *     （灰着不解释，用户只会以为功能坏了）；
  *   - 正在展开：转成「展开中…」，同时禁用——重复点击会发两次请求，而第二次
  *     会被 `runGeneration` 的闸门静默丢掉，看起来像"点了没反应"；
- *   - 正在生成 / 编辑：互斥。两轮 agent 运行重叠时后到的那个会清掉前一个的预览
- *     与候选，用户看到的是"之前的进度消失了"。
+ *   - 正在生成 / 编辑：互斥。两轮 agent 运行重叠时后到的那个会清掉前一个的预览，
+ *     用户看到的是"之前的进度消失了"。
  *
  * `unknown` **不禁用**：那正是"旧图，或者上次被额度截断"的情况，按钮可点才有
  * 意义——把不确定当成"到头了"，唯一能继续长的地方就灰掉了。旧图没有这个字段
@@ -275,11 +275,11 @@ const expandState = computed(() => {
   if (!node) return { disabled: true, label: '展开这一支', hint: '' };
   const done = node.expandable === 'no';
   const busyElsewhere = store.agentRunning || store.busy;
-  let hint = '让模型给这个节点补 2–4 个子节点；结果先落候选，确认后才进画布。';
+  let hint = '让模型给这个节点补 2–4 个子节点；结果直接落画布，标成未保存。';
   if (done) {
     hint = '已经到底了：模型说过这个节点没有更细的内容可展开。';
   } else if (store.expanding) {
-    hint = '正在展开这一支，新节点会先出现在候选里。';
+    hint = '正在展开这一支，新节点会边生成边长在画布上。';
   } else if (store.generating) {
     hint = '正在生成，先等这一次跑完再展开。';
   } else if (node.expandable !== 'yes') {
@@ -309,7 +309,7 @@ function expandBranch() {
  * 「展开这一支」不并入这里：那是快捷动作，不是文字输入。
  *
  * 后端 `edit` 意图给的是四个细粒度工具 + 批量 `mindmap_edit`，`create` 只有分片
- * 生成；两条路的改动都只落在候选上，用户点「应用」才进画布。
+ * 生成；两条路的改动都在 `done` 那一刻直接落画布（`commitGenerated`），没有确认步骤。
  */
 const options = useGenerationOptions();
 const prefs = usePrefsStore();
@@ -408,6 +408,69 @@ const canSubmit = computed(() => {
   return !materialProblem.value && !sources.recording;
 });
 
+// ---------------------------------------------------------------- 联网检索开关
+//
+// 这是**第一个真正在界面上可控的生成行为开关**（图型与拆解方式只是给模型的参数，
+// 关不掉任何一步）。三件事必须同时说清，否则它会变成一个"看起来能关、其实不知道
+// 关了什么"的控件：
+//
+//   1. 它只在**没有材料**时有意义：有材料时后端根本不走外部检索（`_intake` 里
+//      "有材料"与"闸门关着"是同一条短路的两个原因），所以要置灰并说明原因，
+//      而不是让用户勾来勾去发现没反应；
+//   2. 材料**太短**时它仍然有意义——那种材料会被降级成"主题提示"，后端照样会
+//      联网补依据（`SHORT_MATERIAL_CHARS`）。所以判据是字数，不是"有没有材料"；
+//   3. 它写的是**偏好**，勾一下就落库：下一次生成、下一次打开页面都跟着变。这是
+//      "设置"，不是"这一次的选项"——后者会逼用户每次重新点一遍。
+
+/** 材料够长到"这次一定不走外部检索"没有。够长时那个勾置灰。 */
+const materialLongEnough = computed(
+  () => mergedCharCount(sources.readySources) >= SHORT_MATERIAL_CHARS,
+);
+
+/** 这个开关这次真的会起作用：新建、且材料不够长。 */
+const externalSearchApplies = computed(
+  () => intentState.value === 'create' && !materialLongEnough.value,
+);
+
+const externalSearchHint = computed(() => {
+  if (materialLongEnough.value) {
+    // 置灰的原因必须写出来。灰着不解释，用户只会以为功能坏了。
+    return '这次带材料，不走联网检索';
+  }
+  return prefs.externalSearchEnabled
+    ? '没材料时先联网搜一轮资料，命中会变成能点回原文的引用（约 4 秒）'
+    : '已关闭：没材料时直接按主题生成，节点上不会有引用';
+});
+
+/**
+ * 勾选即落库。写失败时把勾**拨回去**：`:checked` 绑的是 store，而 store 没变就等于
+ * 绑定的值没变、Vue 不会重渲染这个 prop——不手动复原的话，界面上显示"已关闭"、
+ * 后端还是"开"，下一次生成照样联网。这类"界面说了不算"的开关比没有更危险。
+ */
+async function toggleExternalSearch(next: boolean, event: Event): Promise<void> {
+  if (await prefs.save(EXTERNAL_SEARCH_PREF_KEY, next ? 'true' : 'false')) return;
+  (event.target as HTMLInputElement).checked = prefs.externalSearchEnabled;
+}
+
+/**
+ * 这一次运行**实际带着哪些偏好**。
+ *
+ * 两个下拉那条路（`options.appliedKeys`）记的是"界面上的值来自偏好预填"；联网检索
+ * 这一条不同——界面上那个勾**就是**偏好本身，不存在"这次与偏好不一样"的可能。
+ * 所以只要库里真有这条、且这一次真会用到它，就如实记一笔，让「我的偏好」里的
+ * "上次生效"能亮起来（那条正是这张表是不是死表的探测器）。
+ *
+ * 两种不记：库里没有这条（默认开，没有条目可报）、这次带够长的材料（外部检索这条
+ * 路根本没走，说它"生效"了是假话）。
+ */
+function appliedKeys(): string[] {
+  const keys = options.appliedKeys();
+  if (externalSearchApplies.value && prefs.value(EXTERNAL_SEARCH_PREF_KEY) !== null) {
+    keys.push(`${EXTERNAL_SEARCH_PREF_KEY}=${prefs.externalSearchEnabled ? 'true' : 'false'}`);
+  }
+  return keys;
+}
+
 /** 这一次点下去会发哪个意图。按钮文案与「正在进行的是不是这一次」都按它判。 */
 const wantedIntent = computed<'create' | 'edit'>(
   () => (intentState.value === 'create' ? 'create' : 'edit'),
@@ -484,10 +547,10 @@ async function submitIntent() {
   if (!canSubmit.value) return;
   const goal = submitGoal.value;
   if (!goal) return;
-  // 这里**不问**"要不要丢掉未保存的修改"：`edit` 只产出候选，画布上的东西在用户
-  // 点「应用」之前一个字都不变；`create` 的前提就是当前没有图（有图时这个框走
-  // edit），而 `newMap` 已经把 dirty 清零了。合并前左侧那个按钮每次都问一句，
-  // 问的却是一件不会发生的事。
+  // 这里**不问**"要不要丢掉未保存的修改"：`create` 的前提就是当前没有图（有图时
+  // 这个框走 edit），而 `newMap` 已经把 dirty 清零了；`edit` 的结果在 `done` 那一刻
+  // 才整树落画布（`commitGenerated`），落之前画布一个字都不变。合并前左侧那个按钮
+  // 每次都问一句，问的却是一件不会发生的事。
   // 选区随状态**显式**带上：徽标说「已选 3 个」时，请求里就正好是这三个。
   // `create` 传空数组而不是省略——这个入口从不偷带画布上圈的东西。
   const selection = intentState.value === 'create' ? [] : [...store.selectedIds];
@@ -504,7 +567,7 @@ async function submitIntent() {
     // `prefs_applied` 由这里标：只有前端知道"下拉里这个值是偏好预填的、用户没动过"。
     // 后端开流前不会把偏好塞进 `diagram_type`——那会让"用户没说"与"用户选了"再也
     // 分不开，而事后排查"这次为什么不一样"全靠这两个值分得清。
-    { selection, prefsApplied: options.appliedKeys() },
+    { selection, prefsApplied: appliedKeys() },
   );
 }
 
@@ -1178,6 +1241,33 @@ async function copyBody() {
                 以后都这样
               </label>
             </div>
+            <!--
+              联网检索：与上面两个下拉不同，它不是一个"这次怎么拆"的参数，而是一个
+              真的会改变那条链路的开关（关着时一次外网往返都不发）。所以它没有
+              「以后都这样」——勾它本身就是"以后都这样"，直接写进偏好。
+
+              有材料且够长时置灰并写明原因：那时候后端根本不走外部检索，勾来勾去
+              不会有任何变化，而灰着不解释比摆着不解释更糟。
+            -->
+            <div class="flex items-center justify-between gap-2 text-[11px]">
+              <label
+                class="flex shrink-0 items-center gap-1"
+                :class="externalSearchApplies ? 'text-slate-500' : 'text-slate-400'"
+              >
+                <input
+                  type="checkbox"
+                  :checked="prefs.externalSearchEnabled"
+                  :disabled="runBlocked || !externalSearchApplies || prefs.saving === EXTERNAL_SEARCH_PREF_KEY"
+                  data-test="external-search"
+                  @change="toggleExternalSearch(($event.target as HTMLInputElement).checked, $event)"
+                />
+                联网检索
+              </label>
+              <p
+                class="text-right leading-tight text-slate-400"
+                data-test="external-search-hint"
+              >{{ externalSearchHint }}</p>
+            </div>
           </template>
           <p
             class="text-[11px] leading-tight"
@@ -1254,7 +1344,7 @@ async function copyBody() {
           <!--
             按需展开：初次只出 4 层，往下的内容由用户点哪个节点就展开哪个。
             走的是与生成同一条 `/api/agent/runs/stream`（intent=expand），
-            结果同样是**候选**——确认与版本检查一步都没少。
+            结果同样直接落画布——版本检查与冲突裁决一步都没少。
           -->
           <section class="flex flex-col gap-1" aria-label="展开这一支">
             <button

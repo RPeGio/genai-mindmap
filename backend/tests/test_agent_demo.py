@@ -97,7 +97,7 @@ class DemoModeTest(unittest.TestCase):
     def test_done_frame_declares_demo_mode(self):
         """done 帧必须说明这棵树是占位树。
 
-        前端接受候选时会照这个字段标来源；没有它就只能一律写"模型生成"，
+        前端落地时会照这个字段标来源；没有它就只能一律写"模型生成"，
         一张没经过模型的图会被冒充满分答案。缺省 None 表示"没说"，永远不该
         被理解成 model。
         """

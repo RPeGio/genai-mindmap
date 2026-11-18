@@ -192,12 +192,12 @@ describe('侧栏改样式', () => {
   });
 });
 
-describe('候选确认能看到改动', () => {
+describe('生成落地后能看到改动', () => {
   /**
-   * 跑一次 edit 意图，拿到候选（`done` 帧直接给修改后的整棵树）。
+   * 跑一次 edit 意图，拿到那一轮的树（`done` 帧直接给修改后的整棵树）。
    *
    * 返回**这一个** pinia：面板必须挂在同一个 store 实例上，否则它看到的是
-   * 另一个空的 store（候选为 null，diff 永远不出现），而用例会以"元素找不到"
+   * 另一个空的 store（没有改动清单，diff 永远不出现），而用例会以"元素找不到"
    * 的形式失败——那种失败看起来像组件写错了。
    */
   async function runEdit(): Promise<{ store: ReturnType<typeof useMindMapStore>; pinia: Pinia }> {

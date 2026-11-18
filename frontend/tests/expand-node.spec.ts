@@ -121,7 +121,7 @@ afterEach(() => {
 });
 
 describe('展开按钮的三态', () => {
-  it('能展开的节点：按钮可点，说明写清结果先落候选', async () => {
+  it('能展开的节点：按钮可点，说明写清结果直接落画布', async () => {
     const wrapper = mountApp();
     openAndSelect('risk');
     await wrapper.vm.$nextTick();
@@ -129,7 +129,7 @@ describe('展开按钮的三态', () => {
     const button = expandButton(wrapper);
     expect(button.text()).toBe('展开这一支');
     expect(button.attributes('disabled')).toBeUndefined();
-    expect(wrapper.find(EXPAND_SECTION).text()).toContain('确认后才进画布');
+    expect(wrapper.find(EXPAND_SECTION).text()).toContain('直接落画布');
   });
 
   it('expandable=no：按钮禁用，并说明已经到底了', async () => {
@@ -266,8 +266,8 @@ describe('展开中与生成中互斥', () => {
   });
 });
 
-describe('候选 → 确认 → 应用', () => {
-  it('ops 批次落进候选，点应用后新节点挂在被展开的节点下', async () => {
+describe('预览 → 落地', () => {
+  it('ops 批次落进工作树，done 落地后新节点挂在被展开的节点下', async () => {
     const batch = {
       batch_id: 'b1-0',
       base_revision: 0,

@@ -17,6 +17,16 @@ export const MAX_SOURCES = 50;
  * 一直留着，于是一篇正常论文在界面上就生成不了。
  */
 export const MAX_INPUT_CHARS = 300000;
+/**
+ * 材料总字数低于这个数时，后端**不把它当语料**：改为"主题提示 + 联网检索（或纯
+ * 模型知识）"。理由在后端 `tools.SHORT_MATERIAL_CHARS` 那段（300 = 一条引用的
+ * 字段上限：整份材料塞得进一条引用时，引用不再"指向某处"）。
+ *
+ * 前端镜像这个数的唯一用途是**判断那个"联网检索"开关还灵不灵**：材料够长时这次
+ * 一定不走外部检索，勾了也没用，界面得如实置灰而不是让用户以为它坏了。它只影响
+ * 一句提示，判定权威始终在后端——两边分叉时表现为"提示不准"，不会表现为"生成错了"。
+ */
+export const SHORT_MATERIAL_CHARS = 300;
 export const FILE_ACCEPT = '.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.html,.htm,.md,.asciidoc,.adoc,.wav,.png,.jpg,.jpeg,.webp,.gif,.bmp';
 
 export const SOURCE_LABELS: Record<SourceKind, string> = {

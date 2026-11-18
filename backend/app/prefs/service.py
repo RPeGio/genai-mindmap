@@ -63,6 +63,19 @@ THINKING_KEY = "thinking_model.default"
 #: B 类：生成时要不要给一级分支 emoji。
 ICON_KEY = "icon.enabled"
 
+#: B 类：生成前要不要先去外部（中文维基 / OpenAlex / Crossref / arXiv / 快懂百科）
+#: 搜一轮资料，把命中转成 `Source` 再走 RAG 链（`agent/tools.external_knowledge_enabled`
+#: 是唯一的读点）。
+#:
+#: **为什么是偏好而不是请求字段**：它描述的是"这个人愿意为每一次生成多等 4 秒、换
+#: 看得见的出处吗"，是一个跨请求的稳定事实；做成请求字段的话，用户每点一次生成都要
+#: 重新回答同一个问题。偏好还有一个额外的好处——它落在 `user_prefs` 里，面板能改、
+#: 能删，"上次生效"那个死表探测器顺带就有了。
+#:
+#: **它只是半个开关**：部署方在环境变量里关掉时（`MINDMAP_EXTERNAL_KNOWLEDGE=0`），
+#: 这条偏好改不动任何东西。两个条件是与关系，判定写死在一个函数里。
+EXTERNAL_SEARCH_KEY = "external_search.enabled"
+
 #: C 类前缀。`note.1` / `note.2` …… 是自由文本备注，**唯一进 prompt 的东西**。
 NOTE_PREFIX = "note."
 
@@ -178,11 +191,12 @@ def _literal_strings(annotation: object) -> tuple[str, ...]:
 
 _FIELDS = AgentRunRequest.model_fields
 
-#: A / B 类的值域。前两条**来自契约本身**，第三条是这个开关自己的两个状态。
+#: A / B 类的值域。前两条**来自契约本身**，后两条是这个开关自己的两个状态。
 _ALLOWED: dict[str, tuple[str, ...]] = {
     DIAGRAM_KEY: _literal_strings(_FIELDS["diagram_type"].annotation),
     THINKING_KEY: _literal_strings(_FIELDS["thinking_model"].annotation),
     ICON_KEY: ("true", "false"),
+    EXTERNAL_SEARCH_KEY: ("true", "false"),
 }
 
 #: 建议能从 `runs.request` 统计出来的字段：(偏好键, 请求字段)。
@@ -200,6 +214,10 @@ def _label(key: str, value: str) -> str:
         return THINKING_MODELS.get(value, {}).get("label", value)
     if key == ICON_KEY:
         return "给节点配图标" if value == "true" else "不给节点配图标"
+    if key == EXTERNAL_SEARCH_KEY:
+        # 措辞刻意说"联网"而不是"外部知识"：用户能判断的是"要不要上网"，"外部
+        # 知识"听起来像一个内部功能的开关。
+        return "没材料时先联网搜资料" if value == "true" else "没材料时不联网，直接生成"
     return value
 
 
@@ -434,6 +452,22 @@ def icons_enabled() -> bool:
     return row is None or row.value != "false"
 
 
+def external_search_enabled() -> bool:
+    """用户这一侧允不允许生成时去联网搜资料。没有这条偏好 = 允许（默认开）。
+
+    **只回答用户那一半**。"部署方在环境变量里关了没有"是另一个问题，由
+    `agent/tools.external_knowledge_enabled()` 把两半合起来——那里是唯一该做
+    与运算的地方（合在一处，才可能被测到、也才可能只有一种先后次序）。
+    这个函数本身刻意不知道环境变量：让它在读的时候顺手判一次优先级，就会出现
+    两个真相，而"运维关了、用户开了"这种组合恰好是最难靠日志看出来的。
+
+    默认开而不是默认关：不设这条偏好的人绝大多数根本没打开过面板，把默认值定成
+    "关"等于替他们做了那个决定——而他们从来没表达过"不想联网"。
+    """
+    row = get(EXTERNAL_SEARCH_KEY)
+    return row is None or row.value != "false"
+
+
 def _recent_choices(field: str, limit: int) -> list[str]:
     """`runs.request[field]` 最近的若干个**非空**值，新的在前。
 
@@ -554,6 +588,7 @@ def prompt_notes() -> tuple[str, int]:
 
 __all__ = [
     "DIAGRAM_KEY",
+    "EXTERNAL_SEARCH_KEY",
     "ICON_KEY",
     "MAX_NOTES",
     "MAX_NOTE_CHARS",
@@ -568,6 +603,7 @@ __all__ = [
     "THINKING_KEY",
     "clear",
     "delete",
+    "external_search_enabled",
     "get",
     "icons_enabled",
     "list_all",

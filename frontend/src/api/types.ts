@@ -525,7 +525,7 @@ export interface AgentRunRequest {
    *
    * 幂等只在"带同一个 run_id"时生效。所以它的价值不是防"重复点击"（那是按钮禁用
    * 与 `busy` 闸门的事），而是让服务端能认出"这是同一次运行又投递了一遍"：
-   * 正在跑 → 409 而不是再花一份钱；已经跑完 → 直接把候选重放回来。
+   * 正在跑 → 409 而不是再花一份钱；已经跑完 → 直接把上次产出的那棵树重放回来。
    */
   run_id?: string | null;
   /**
@@ -688,7 +688,7 @@ export type AgentEvent =
  * 一条偏好（镜像后端 `prefs.service.Pref`）。
  *
  * 三层记忆里唯一缺的那一层——**跨请求、关于这个人的稳定事实**。会话那层是
- * `RunSummary`/候选树，工作区那层是 `MindMapContent` 本身。
+ * `runs` 里存的那棵树，工作区那层是 `MindMapContent` 本身。
  */
 export interface Pref {
   /** 键即主键：同一件事只能有一条。`diagram_type.default` / `note.1` …… */
@@ -819,8 +819,8 @@ export interface EditSummary {
 /**
  * 跨图的链路健康检查（`GET /mindmaps/edits/health`）。
  *
- * 判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**——每次应用候选都记
- * 一条 `accept`，连一字未改也记。所以"昨日有保存、昨日零事件"只能是链路断了
+ * 判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**——每次生成落画布都记
+ * 一条 `generate`，连一字未改也记。所以"昨日有保存、昨日零事件"只能是链路断了
  * （前端在发、后端在丢）。这正是那张表能静默坏上 40 分钟的原因：它没有死表探测器。
  */
 export interface EditHealth {

@@ -195,7 +195,7 @@ describe('diffEdits：改了什么', () => {
   });
 
   it('空画布 → 一整棵树不产生事件', () => {
-    // create 意图接受候选：整棵树都是"新增"，那不是 diff，是把整棵树重念一遍。
+    // create 意图整树落地：整棵树都是"新增"，那不是 diff，是把整棵树重念一遍。
     expect(diffEdits(null, tree(), { actor: 'agent', at: AT })).toEqual([]);
   });
 

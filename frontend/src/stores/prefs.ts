@@ -7,7 +7,7 @@ import type { Pref, PrefSuggestion } from '../api/types';
 /**
  * 用户偏好（跨请求、关于这个人的稳定事实）。
  *
- * 三层记忆里唯一缺的那一层：会话那层是 `runs` + 候选树，工作区那层就是
+ * 三层记忆里唯一缺的那一层：会话那层是 `runs` 里那棵树，工作区那层就是
  * `MindMapContent` 本身。这两层早就实现了，只是不叫这个名字——所以这里不造
  * 一个"统一记忆"的抽象，只补真正没有的那一层。
  *
@@ -24,8 +24,23 @@ import type { Pref, PrefSuggestion } from '../api/types';
 export const DIAGRAM_PREF_KEY = 'diagram_type.default';
 export const THINKING_PREF_KEY = 'thinking_model.default';
 export const ICON_PREF_KEY = 'icon.enabled';
+/**
+ * 没材料时要不要先联网搜一轮资料（后端 `tools.external_knowledge_enabled` 是唯一
+ * 读点）。存成**偏好**而不是请求字段：它是"这个人愿不愿意为每次生成多等几秒换
+ * 看得见的出处"，跨请求稳定；做成请求字段的话，用户每点一次生成都要重新回答一遍。
+ *
+ * 它只是半个开关：部署方在环境变量里关掉时（`MINDMAP_EXTERNAL_KNOWLEDGE=0`），
+ * 这条偏好改不动任何东西——优先级钉在后端一个函数里。
+ */
+export const EXTERNAL_SEARCH_PREF_KEY = 'external_search.enabled';
 /** C 类自由文本备注的前缀。只有这一类会进提示词。 */
 export const NOTE_PREFIX = 'note.';
+
+/**
+ * 值域是 `true` / `false` 的偏好。面板给它们画勾选框，而不是让人手打这两个单词：
+ * 一个开关用文本框编辑，用户只能靠"上次生效"去猜自己有没有打错。
+ */
+export const BOOLEAN_PREF_KEYS: readonly string[] = [ICON_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY];
 
 /** 备注的条数上限，与后端 `service.MAX_NOTES` 同值。这里只用来**先拦一步**并
  *  显示"还剩几条"；权威判定在后端，超了会返回 `pref_limit_exceeded`。 */
@@ -51,6 +66,9 @@ export function nextNoteKey(keys: Iterable<string>): string {
  */
 export function prefValueLabel(key: string, value: string): string {
   if (key === ICON_PREF_KEY) return value === 'true' ? '给节点配图标' : '不给节点配图标';
+  if (key === EXTERNAL_SEARCH_PREF_KEY) {
+    return value === 'true' ? '没材料时先联网搜资料' : '没材料时不联网，直接生成';
+  }
   return value;
 }
 
@@ -118,6 +136,15 @@ export const usePrefsStore = defineStore('prefs', () => {
   function value(key: string): string | null {
     return byKey.value[key]?.value ?? null;
   }
+
+  /**
+   * 联网检索开着没有。**没有这条偏好 = 开**，与后端的默认值一致。
+   *
+   * 判 `!== 'false'` 而不是 `=== 'true'`：默认开这件事只在一个地方定义（后端），
+   * 这里判"不是明确关"，两种状态的映射只有一处会错。
+   */
+  const externalSearchEnabled = computed(() => value(EXTERNAL_SEARCH_PREF_KEY) !== 'false');
+
   /** 拉全部偏好与建议。**用 `Promise.allSettled`**：建议挂了不该让面板整块空。 */
   async function load(): Promise<void> {
     loading.value = true;
@@ -196,6 +223,7 @@ export const usePrefsStore = defineStore('prefs', () => {
     loading,
     saving,
     error,
+    externalSearchEnabled,
     load,
     save,
     remove,

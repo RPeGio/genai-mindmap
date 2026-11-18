@@ -288,10 +288,10 @@ export function diffEdges(
  *
  * 两棵都要算，各自补上另一种算法看不见的那一半：
  *
- *  - **候选树**：在选中节点下面新增的节点 id 在基线树里根本不存在，只在基线算
+ *  - **生成后的树**：在选中节点下面新增的节点 id 在基线里根本不存在，只在基线算
  *    的话，最典型的"选一支、让它展开出三个子节点"会整片被标成范围外；
- *  - **基线树**：被删掉的节点在候选树里已经不存在，只在候选算的话，"把选中的
- *    这一支删掉"本身会被标成范围外——那正是用户圈它的原因。
+ *  - **基线树**：被删掉的节点在生成后的树里已经不存在，只在生成后算的话，"把选中
+ *    的这一支删掉"本身会被标成范围外——那正是用户圈它的原因。
  *
  * 空选区返回空集（`withinScope` 据此一律判 false，界面也不显示这个标记）。
  */
@@ -455,7 +455,7 @@ function agentWarningsFrom(summary?: Record<string, unknown>): AgentWarning[] {
     out.push({
       kind: 'partial',
       code: 'PARTIAL',
-      message: '有分支没能生成完整，候选可能缺内容。',
+      message: '有分支没能生成完整，结果可能缺内容。',
     });
   }
   const raw = summary.diagnostics;
@@ -512,11 +512,12 @@ export interface MindNodeData {
   /** 图标（目前是 emoji）。画在 label 前面。 */
   icon?: string;
   /**
-   * 这个节点在待确认的候选里被改过（新增除外——新增的节点在画布上还没有位置）。
+   * 这个节点在**这次生成的改动清单**里被点名（新增除外——新增的节点在画布上还没
+   * 有位置）。
    *
-   * 只对 `edit` / `expand` 意图有意义：那两个意图的候选是"在当前树上的改动"，
-   * 而画布优先渲染 `content`（用户的作品），所以必须另给一个视觉标记，否则
-   * 用户点了「应用」才发现哪里变了。
+   * 只对 `edit` / `expand` 意图有意义：那两个意图是"在当前树上改几处"，落地后画布
+   * 与生成前几乎一模一样，不给一个视觉标记，用户只能靠撤销栈试一步才知道哪几处
+   * 被动过。清单在 `commitGenerated` 里冻结一次（`generatedChanges`）。
    */
   changed?: boolean;
 }
@@ -706,9 +707,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const saving = ref(false);
 
   /**
-   * 每次已提交的编辑都递增。agent 的接受动作靠它判断"候选是不是基于一棵已经
-   * 被改过的树算出来的"——用 revision 比比较整树引用更便宜，也比比 dirty 更准
-   * （dirty 只说明"有改动"，不说明"改动发生在候选生成之后"）。
+   * 每次已提交的编辑都递增。生成落地时靠它判断"这棵树是不是基于一棵已经被改过的
+   * 画布算出来的"——用 revision 比比较整树引用更便宜，也比比 dirty 更准
+   * （dirty 只说明"有改动"，不说明"改动发生在生成开始之后"）。
    */
   const clientRevision = ref(0);
 
@@ -720,7 +721,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *  - 生成期间不能直接改 `content`：`ops` 是一次几处的增量（`edit` 意图下模型可能
    *    连调十几次），每条都落画布就等于把 25 秒的中间态全摊给用户看，撤销栈也会被
    *    切成十几步半成品；
-   *  - 但它也**不是**"等用户点应用"的候选：`done` 帧一到就整树装进 `content`
+   *  - 但它也**不是**用户看到的那棵树：`done` 帧一到就整树装进 `content`
    *    （`commitGenerated`），中间没有任何确认动作。
    *
    * 所以它的对错只影响"这一轮生成有没有拼对"，不影响"用户的作品是什么"——那件事
@@ -797,7 +798,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *
    * 零是后端每一轮的新起点（`RunContext.revision` 从 0 起算）。漏掉这一步，
    * 下一轮的第一批 op 会因为 `base_revision=0` 对不上旧账本而被整批丢掉，
-   * 表现出来就是"改了半天候选一点没动"。
+   * 表现出来就是"改了半天画布一点没动"。
    */
   function resetDraftOps() {
     draftRevision = 0;
@@ -816,8 +817,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 服务端把它落进 `runs` 表，进页面时问一句"有没有我还没接住的结果"。
    *
    * 只是**一条提示**，不是弹窗：用户可能正在做别的事，打断他比让他知道这件事更烦。
-   * 与"候选待确认"的差别在于——生成结果当时已经进了画布、只是没保存；关掉页面
-   * 丢的是那份未保存的改动，不是"一份还没被采纳的提案"。
+   * 它提醒的是一份**已经进了画布、但没保存**的改动：关掉页面丢的是那份未保存的
+   * 结果，不是"一份还没被采纳的提案"——生成落地那一刻它就是用户的了。
    */
   const resumableRun = ref<RunSummary | null>(null);
 
@@ -944,7 +945,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 本轮运行里"结果不完整"的证据：部分完成标记 + 每条诊断。
    *
-   * 面板在候选上方按琥珀色列出，`status` 也会因此改成「部分分支未完成」。
+   * 面板在结果摘要上方按琥珀色列出，`status` 也会因此改成「部分分支未完成」。
    * 只认 `ok` 的时候，这三条信息一条都没地方落。
    */
   const agentWarnings = ref<AgentWarning[]>([]);
@@ -952,9 +953,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 生成过程中正在长出来的预览树。
    *
-   * 与 `candidate` 分开存，不共用一份状态：预览没有经过整树校验，也不保证和
-   * 最终候选一致（某一路失败被裁掉、去重丢掉重复项，都会让预览多出几个节点）。
-   * 一旦让它顶替 `candidate`，用户点「应用到画布」就会把半成品装进画布。
+   * 与 `draft` 分开存，不共用一份状态：预览没有经过整树校验，也不保证和最终结果
+   * 一致（某一路失败被裁掉、去重丢掉重复项，都会让预览多出几个节点）。一旦让它
+   * 顶替 `draft`，`done` 就会把半成品直接装进画布——候选层删掉（`acfdb5b`）之后
+   * 落地不再有"用户点一下"这个复核点，混进去就再也拦不住。
    */
   const agentPreview = ref<PreviewNode | null>(null);
 
@@ -1333,7 +1335,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const current = layout.value;
     const source = renderSource.value;
     if (!current || !source) return [];
-    // 只有已应用的树才可编辑：候选与预览都能画出来，但点不动、改不了。
+    // 只有 `content` 可编辑：预览也能画出来，但点不动、改不了。
     const editable = source.kind === 'content';
 
     const parentOf = new Map<string, string | null>();
@@ -1398,12 +1400,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
         type: 'mind',
         draggable: false,
         connectable: false,
-        // 预览与候选都不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
+        // 预览不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
         // 空内容说话，expand 请求也会把后端不认识的 id 发回去。
         selectable: editable,
         // 选中态由 store 说了算。只在点击时靠 Vue Flow 自己切换的话，代码里改选中
         // （加节点、删节点后跳到父节点）画布上看不出来，用户会以为还停在原来那个节点上。
-        // 不可编辑时一律不显示选中：残留的 selectedId 可能正好撞上候选里的同名 id。
+        // 不可编辑时一律不显示选中：残留的 selectedId 可能正好撞上预览里的同名 id。
         //
         // 多个节点一起高亮而不是只高亮主选区：「改这张图」吃的是整个选区，
         // 只亮一个的话，用户圈完三个节点看不出另外两个算不算数。
@@ -1423,12 +1425,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
           refs: node.source_refs?.length ?? 0,
           draft: source.kind === 'content' ? undefined : source.kind,
           previewLeaf: source.kind === 'preview' && source.expandable.get(node.id) === false,
-          // 视觉元素原样带过去：只有已应用的那棵树才画（候选/预览用弱化样式，
-          // 它们的颜色会让"这是一份提案"这件事变得模糊）。
+          // 视觉元素原样带过去：只有 `content` 那棵树才画（预览用弱化样式，
+          // 它的颜色会让"这是还在长的东西"这件事变得模糊）。
           // 颜色取**继承**的结果：自身没有就沿用最近的有色祖先（见上面那段）。
           color: editable ? inheritedColor.get(node.id) : undefined,
           icon: editable ? node.icon ?? undefined : undefined,
-          // 高亮只在"画布上这棵树 + 有候选"时成立，所以它天然只对 content 生效。
+          // 高亮只在"画布上这棵树 + 有一份生成改动清单"时成立，所以它天然只对 content 生效。
           changed: changedNodeIds.value.has(node.id),
         },
       } satisfies MindFlowNode;
@@ -1488,8 +1490,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 详情面板要显示的节点。
    *
-   * 必须落在 `content` 里：画布上可能正画着候选或预览（`flatNodes` 跟着渲染源走），
-   * 而面板上的「改文字 / 加子节点 / 删除」全都写 `content`。没有已应用的树就没有
+   * 必须落在 `content` 里：画布上可能正画着预览（`flatNodes` 跟着渲染源走），
+   * 而面板上的「改文字 / 加子节点 / 删除」全都写 `content`。没有 `content` 就没有
    * 可编辑的节点，否则面板会摆出一排点了没反应的按钮。
    */
   /**
@@ -1524,7 +1526,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 已应用内容里的**全部**附加边。
    *
    * 只读 `content` 而不是 `renderSource`：侧栏的「附加关系」区块要能删边、要能
-   * 显示"这条线的端点是谁"，而候选/预览里的边在用户点「应用」之前并不是他的作品。
+   * 显示"这条线的端点是谁"，而预览里的边还不是任何人的作品（它是生成中的临时树）。
    * 画布那条路（`edges` computed）才跟着 `renderSource` 走。
    */
   const contentEdges = computed<MindEdge[]>(() => edgesOf(content.value));
@@ -1545,7 +1547,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 来源的反向索引。
    *
-   * 只从 `content` 算：画布上可能正画着候选或预览节点，把它们算进引用统计会让
+   * 只从 `content` 算：画布上可能正画着预览节点，把它们算进引用统计会让
    * 左侧说"被 5 个节点引用"、而其中 3 个根本不在导图里。
    */
   const refIndex = computed(() => buildRefIndex(content.value?.root ?? null));
@@ -1753,7 +1755,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 把一步历史快照装回画布。
    *
-   * 快照可能是字符串 `'null'`——接受候选之前画布是空的时候，`pushHistoryOrEmpty()`
+   * 快照可能是字符串 `'null'`——生成落进一张空画布的时候，`pushHistoryOrEmpty()`
    * 压的就是它。`JSON.parse('null')` 得到 null，正好是 `MindMapContent | null`
    * 的另一半；但选中与编辑态还指着已经不存在的旧节点，必须一起清掉，
    * 否则详情面板和编辑框会继续对着空白画布说话。
@@ -1986,9 +1988,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    // id 不在树上（预览的派生 id、候选的 id 都会走到这里）就直接退出。
+    // id 不在树上（预览的派生 id 会走到这里）就直接退出。
     // 交给 removeNode 的话它只会原样返回整棵树，而 applyContent 照样记一步历史、
-    // 递增 clientRevision——用户什么都没删，撤销栈和候选的新鲜度却被改脏了。
+    // 递增 clientRevision——用户什么都没删，撤销栈与生成冲突判定的账本却被改脏了。
     if (!findNode(content.value.root, id)) return;
 
     const parent = findParent(content.value.root, id);
@@ -2345,7 +2347,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 选中一个节点（清掉多选）。
    *
-   * 只接受 `content` 里真实存在的节点。预览的派生 id 和候选的 id 都还没进画布：
+   * 只接受 `content` 里真实存在的节点。预览的派生 id 还没进画布：
    * 选中它们会让右侧详情面板、面包屑，以及 `expand` 请求里的 `selected_ids` 一起
    * 对着一个不存在的节点说话。画布那边同样给这些节点设了 `selectable: false`，
    * 这里是不依赖渲染层的最后一道。
@@ -2710,7 +2712,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
       await runAgentStream(body, event => {
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，
-        // 否则旧回调会把新请求刚设好的 stageText / status / candidate 覆盖掉。
+        // 否则旧回调会把新请求刚设好的 stageText / status / 预览覆盖掉。
         if (controller !== ctrl) return;
         // 心跳不进 `agentEvents`：它只驱动状态行的"已等 N 秒"，面板里没有任何地方
         // 读它。而每帧都整数组复制是 O(n²)——长静默会累积几十帧，没必要为纯保活
@@ -2840,7 +2842,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 这一轮是不是"在生成"（新建 / 编辑也算），用来与展开互斥。
    *
    * 展开与生成互斥不是保守，是必要的：`runGeneration` 一进来就 `clearAgentPreview`
-   * 并换掉 `controller`，两轮流重叠时后到的那个会把前一个刚长出来的预览与候选一起
+   * 并换掉 `controller`，两轮流重叠时后到的那个会把前一个刚长出来的预览一起
    * 作废——用户看到的是"点了一下，之前的进度消失了"。
    */
   const generating = computed(() => agentRunning.value && runIntent.value !== 'expand');
@@ -2848,7 +2850,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 展开当前选中的节点：走同一个 `/agent/runs/stream`，只是意图换成 `expand`。
    *
-   * 与生成的差别只有三处，其余全部复用（候选、op 帧、版本检查、接受/丢弃都还是
+   * 与生成的差别只有三处，其余全部复用（op 帧、版本检查、落地与冲突裁决都还是
    * 那一条路）：
    *
    *  1. `goal` 写的是"展开哪个节点"，而不是用户的主题；

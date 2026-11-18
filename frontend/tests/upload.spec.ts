@@ -342,9 +342,9 @@ describe('多来源输入界面', () => {
     expect(submitButton(wrapper).attributes('disabled')).toBeUndefined();
   });
 
-  it('改图不弹「要不要丢弃未保存的修改」：这一轮只产出候选', async () => {
+  it('改图不弹「要不要丢弃未保存的修改」', async () => {
     // 合并前左侧那个按钮每次生成都问一句，问的却是一件不会发生的事——`edit` 的
-    // 改动落在候选上，用户点「应用」之前画布一个字都不变。
+    // 改动在 `done` 那一刻才整树落画布，落之前画布一个字都不变。
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
     stubFetch(() => jsonResponse({ source: source() }));
     const { wrapper, store, sources } = mountApp();

@@ -59,7 +59,7 @@ function mapRecord(id: string, payload: MindMapContent) {
   return { id, version: 3, content: payload, updated_at: '2024-01-01T00:00:00Z' };
 }
 
-/** 先把一张有 id 的导图打开，供"接受候选之后身份怎么变"的用例起手。 */
+/** 先把一张有 id 的导图打开，供"生成落地之后身份怎么变"的用例起手。 */
 async function openExisting(id: string) {
   vi.stubGlobal('fetch', vi.fn(async () => jsonReply(mapRecord(id, content('原图')))));
   const store = useMindMapStore();

@@ -78,7 +78,7 @@ flowchart TD
 | 正文编辑 | 随保存一起发（`note`） | **已接入**：详情面板的 textarea 编辑 `node.note`（≤2000 字，Esc 放弃），失焦或 Ctrl+S 提交；画布与导出都取 `note or label`，朝向（`layout` / `theme.direction`）也随保存与打开往返 |
 | 知识库入口 | `GET /api/knowledge/library` / `.../{source_id}` | **已接入**：顶栏"知识库"抽屉列出库里材料、每份"被几张导图引用"、点开看正文前 4000 字；材料在**生成时**才入库，入库后的持久 id 由 `sources` 帧回传、前端就地换（`sources.remap`），所以保存的导图与节点引用重开仍对得上 |
 
-实时进度只有 agent 那一套：`stage` / `tool_start` / `tool_end` 帧边跑边下发，`snapshot` / `ops` 到的是候选，`done` 才算这一轮有了终态。`/api/agent/tasks` 的阶段列表是固定文案，不能当进度用。
+实时进度只有 agent 那一套：`stage` / `tool_start` / `tool_end` 帧边跑边下发，`snapshot` / `ops` 落的是这一轮的工作树（`draft`，不碰画布），`done` 才算这一轮有了终态——那一刻整树换进画布。`/api/agent/tasks` 的阶段列表是固定文案，不能当进度用。
 
 ## 6 还没搭的部分
 

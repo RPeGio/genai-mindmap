@@ -116,7 +116,7 @@ frontend/
     sources/input.ts   来源收集常量与校验（格式白名单、字数与大小上限）
     audio/             浏览器录音（16kHz WAV）与 WAV 头处理
     components/        AgentPanel / RecordButton / SourceInputs
-    stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 候选
+    stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 生成落地
     stores/sources.ts  Pinia：来源列表
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
   tests/               426 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 展开）
@@ -138,7 +138,7 @@ START_HERE.md          原始的骨架说明
 
 ## 4 现在到底有什么
 
-**能用的**：文本生成导图（demo 或真实模型，走 agent 的分片生成 `mindmap_generate_deep`——骨架 + 按支检索 + 并发展开；整树一次成型的旧路已删除，见 `docs/ONE-PATH.md`）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 候选确认，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）。
+**能用的**：文本生成导图（demo 或真实模型，走 agent 的分片生成 `mindmap_generate_deep`——骨架 + 按支检索 + 并发展开；整树一次成型的旧路已删除，见 `docs/ONE-PATH.md`）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 生成即落画布，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）。
 
 **是桩的**：知识检索（返回空 + `implemented:false`）、`POST /api/agent/tasks`（返回固定四阶段，不产生导图；真正的 agent 走 `/agent/runs/stream`）。
 
@@ -168,7 +168,7 @@ START_HERE.md          原始的骨架说明
 GET  /api/health
 
 生成（唯一入口）
-POST /api/agent/runs/stream        目标 + 来源 + 当前树 → SSE v2 事件与候选
+POST /api/agent/runs/stream        目标 + 来源 + 当前树 → SSE v2 事件与生成结果
 
 输入（多来源）
 POST /api/ingestion/text           文本 → Source
@@ -218,9 +218,9 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 **二、保存是乐观锁。** `PUT /api/mindmaps/{id}` 必须带上读到的 `version`，服务端版本号变了就返回 409，前端要提示用户重新打开，不能强行覆盖。
 
-**三、生成接口不自动保存。** `POST /api/agent/runs/stream` 只把结果放进候选副本，用户点接受后画布才变，落库仍要显式保存。
+**三、生成接口不自动保存。** `POST /api/agent/runs/stream` 在 `done` 那一刻把整棵树直接装进画布（不落库、也不需要你点确认），落库仍要显式保存。要退回去用「回到生成之前」或撤销。
 
-**四、AI 产出是候选。** 结构诊断和建议都不会自动改用户的导图，必须用户确认。手工编辑不能被生成结果覆盖。
+**四、AI 生成的树算你的作品，但只在本地。** 生成结果直接进画布、标成未保存，错了靠撤销栈与「回到生成之前」；生成期间你照常能改画布。结构诊断与优化建议仍然只读、不自动改树。
 
 ---
 

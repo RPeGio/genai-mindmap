@@ -116,8 +116,8 @@
 
 `done` 之后这行冻结：一条迟到的取消不许把已经交付的结果改写成 `cancelled`。SSE 因此从"run 本身"降级成"这一行的一次观察窗口"，帧格式一个字节都没改。
 
-**运行结束（含被取消）时草稿落库。** 这是"关掉页面那 40 秒白花"的解：abort 会让 uvicorn 关掉生成器、`aclosing` 触发 `task.cancel()`，工具里的模型请求被取消且已经花掉的调用不回滚——原先 `ctx.candidate` 只活内存，用户回来什么都看不到。现在 `_frames` 的 `finally` 里写一次（正常 → `done`，异常 → `failed` + `failure`，什么都没发出去就断了 → `cancelled`，**只要候选非空就写**）。前端进页面时问一次 `GET /api/agent/runs`，有残留就在侧栏提示一句（不是弹窗），点「查看」把它载入现有的候选确认流程，点「丢弃」记一笔 `dismissed_at`。
-信封只有 `{seq, type, ...}`：`seq` 由服务端补齐，没有 `v` / `runId` / revision 字段（轮次与候选版本在各事件自己的 payload 里）。产物是 `ops` 操作批次或整树 `snapshot` 而不是"增量节点上屏"；`node_grow` 只作深层生成的预览帧、收到 `snapshot` 即作废，前端把它挂在候选副本上，用户点接受才落到画布。`MINDMAP_LLM_MODE=demo` 也作用于 agent：`run()` 入口直接发 `stage` / `snapshot` / `done` 三帧（`done.mode=demo`），不调用模型，因此演示模式下没有 `tool_start` / `ops` / `node_grow` 帧。协议见 `docs/AGENT_STREAM_PROTOCOL.md`，设计背景见 `docs/AGENT_PLAN.md`。
+**运行结束（含被取消）时草稿落库。** 这是"关掉页面那 40 秒白花"的解：abort 会让 uvicorn 关掉生成器、`aclosing` 触发 `task.cancel()`，工具里的模型请求被取消且已经花掉的调用不回滚——原先 `ctx.candidate` 只活内存，用户回来什么都看不到。现在 `_frames` 的 `finally` 里写一次（正常 → `done`，异常 → `failed` + `failure`，什么都没发出去就断了 → `cancelled`，**只要树非空就写**）。前端进页面时问一次 `GET /api/agent/runs`，有残留就在侧栏提示一句（不是弹窗）：点「查看」把那份结果直接装进画布（与生成落地走同一条 `commitGenerated`），点「丢弃」只在本会话内静音——`dismissed_at` 那一列已随候选层删除（`acfdb5b`），没有"丢弃"这个写库动作了。
+信封只有 `{seq, type, ...}`：`seq` 由服务端补齐，没有 `v` / `runId` / revision 字段（轮次与树的版本在各事件自己的 payload 里）。产物是 `ops` 操作批次或整树 `snapshot` 而不是"增量节点上屏"；`node_grow` 只作深层生成的预览帧、收到 `snapshot` 即作废，前端把它单独挂在 `agentPreview` 上（不混进 `draft`），`done` 一到才整树落画布——没有"用户点接受"这一步。`MINDMAP_LLM_MODE=demo` 也作用于 agent：`run()` 入口直接发 `stage` / `snapshot` / `done` 三帧（`done.mode=demo`），不调用模型，因此演示模式下没有 `tool_start` / `ops` / `node_grow` 帧。协议见 `docs/AGENT_STREAM_PROTOCOL.md`，设计背景见 `docs/AGENT_PLAN.md`。
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。`/api/agent/tasks` 仍返回固定阶段列表，那是桩，不反映真实进度。
 
@@ -144,7 +144,7 @@
 | 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。当前只有 agent 这一条 SSE 流，没有持久任务。 |
 | 优化 | 已有 `/api/optimization/suggest`，持久化和应用接口待确定 | 未来补齐矛盾、缺失、重组、跨节点关系候选及依据，不直接覆盖。 |
 | 知识库 | 已落地只读入口 `GET /api/knowledge/library` 与 `.../library/{id}`；写入侧只有"生成时入库" | 材料列表、被引用次数、正文预览可用；检索（`POST /api/knowledge/search`）仍是桩，检索真正参与生成要等记忆模块。 |
-| AI 代理 | `POST /api/agent/runs/stream`、`GET /api/agent/runs` 系列已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环、候选确认、"运行结束后落草稿"（`runs` 表，SQLite）与用户偏好（`user_prefs`）已可用；任务化长跑、`runs` 的跨进程/跨机存储（现为本地 SQLite，多 worker 共享同一文件）与多角色仍待设计。 |
+| AI 代理 | `POST /api/agent/runs/stream`、`GET /api/agent/runs` 系列已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环、生成即落画布、"运行结束后落草稿"（`runs` 表，SQLite）与用户偏好（`user_prefs`）已可用；任务化长跑、`runs` 的跨进程/跨机存储（现为本地 SQLite，多 worker 共享同一文件）与多角色仍待设计。 |
 | 协作 | 房间授权接口 + Yjs WebSocket | 房间鉴权、实时同步、在线状态、恢复；最终协议由协作负责人完成设计。 |
 | 更多导出 | `/api/export/puml`、`/markdown`、`/opml` 均已实现；图像导出待开发 | PNG/SVG 渲染要额外依赖，优先用浏览器端截图或交给 PlantUML 服务。 |
 

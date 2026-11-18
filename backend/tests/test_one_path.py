@@ -43,6 +43,7 @@ from app.contracts.source import Source, SourceKind
 from app.generation import service as generation_service
 from app.knowledge import external as external_knowledge_module
 from app.knowledge import library
+from app.prefs import service as prefs
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 
@@ -537,3 +538,61 @@ def test_external_switch_off_keeps_the_data_keyset(monkeypatch):
     assert forbidden == []
     assert "external" not in result.data
     assert "material" not in result.data
+
+
+def test_user_switch_off_skips_the_search_and_says_so(monkeypatch):
+    """用户在界面上关掉联网检索：一次外部请求都不发，而 `content` 必须说出来。
+
+    这一条钉的是**可感知的差异**。关掉之后用户拿到的是一棵没有引用的树——与"搜了
+    但一条都没搜到"长得一模一样。如果 `content` 不点明，他只会得出后一个结论
+    （那句旧话术还在，见 `test_external_empty_says_it_found_nothing`），然后去换一个
+    更常见的主题词重试；而正确的动作是去把开关打开。
+    """
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")     # 部署方允许
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "false")       # 用户在界面上关掉
+    forbidden: list[str] = []
+    monkeypatch.setattr(
+        external_knowledge, "search_external",
+        lambda *args, **kwargs: forbidden.append("called") or [])
+
+    result = _run(_ctx(), _tree_chat())
+
+    assert result.ok, result.content
+    assert forbidden == [], "开关关着时不该发外部请求"
+    # 诊断码分开：那条旧码的语义是"试过了没拿到"（可以重试），这条是"根本没试"
+    assert "EXTERNAL_SEARCH_DISABLED" in _codes(result)
+    assert "GENERATION_WITHOUT_EXTERNAL" not in _codes(result)
+    assert "你在设置里关掉了联网检索" in result.content
+    assert "这次没有去外面搜资料" in result.content
+    # 两件事都不能出现："没搜到"的结论、以及关着时无效的那条建议
+    assert "没有搜到外部资料" not in result.content
+    assert "换一个更常见的主题词" not in result.content
+    # 有效动作写出来了：去哪把开关打开
+    assert "把画布右上角的「联网检索」勾上" in result.content
+    # 键集不变：不多出 `external`（与闸门关着时逐字节相同的那条约定）
+    assert "external" not in result.data
+    assert result.data["retrieval"]["mode"] == "off"
+
+
+def test_turning_it_back_on_restores_the_search(monkeypatch):
+    """对照组：同一条链路，偏好是 `true` 时外部检索照跑，引用真的落回树上。
+
+    "关掉有差别"这句话只有在打开时确实不同时才成立；少了这一条，上面那条断言只能
+    证明"某一次生成没有引用"，证不出是因为开关。
+    """
+    monkeypatch.setenv(EXTERNAL_KNOWLEDGE_ENV, "1")
+    prefs.set(prefs.EXTERNAL_SEARCH_KEY, "true")
+    hit = _hit(Source(kind=SourceKind.web, status="parsed", text=EXTERNAL_TEXT))
+    asked: list[str] = []
+    monkeypatch.setattr(
+        external_knowledge, "search_external",
+        lambda query, *, limit: asked.append(query) or [hit])
+
+    ctx = _ctx()
+    result = _run(ctx, _tree_chat())
+
+    assert result.ok, result.content
+    assert asked == [TOPIC]
+    assert "EXTERNAL_SEARCH_DISABLED" not in _codes(result)
+    assert result.data["external"]["sources"] == 1
+    assert _all_refs(ctx.candidate.root), "开着时引用应当活到候选树上"

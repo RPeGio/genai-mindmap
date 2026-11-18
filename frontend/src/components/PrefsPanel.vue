@@ -2,7 +2,9 @@
 import { computed, onMounted, ref } from 'vue';
 
 import {
+  BOOLEAN_PREF_KEYS,
   DIAGRAM_PREF_KEY,
+  EXTERNAL_SEARCH_PREF_KEY,
   ICON_PREF_KEY,
   MAX_NOTES,
   NOTE_PREFIX,
@@ -38,6 +40,7 @@ const PREF_KEY_LABELS: Record<string, string> = {
   [DIAGRAM_PREF_KEY]: '默认图型',
   [THINKING_PREF_KEY]: '默认拆解方式',
   [ICON_PREF_KEY]: '节点图标',
+  [EXTERNAL_SEARCH_PREF_KEY]: '联网检索',
 };
 
 /** 正在编辑的键；空串＝没有在编辑。 */
@@ -53,6 +56,21 @@ const canAddNote = computed(() => notes.value.length < MAX_NOTES);
 function keyLabel(key: string): string {
   if (key.startsWith(NOTE_PREFIX)) return '内容风格备注';
   return PREF_KEY_LABELS[key] ?? key;
+}
+
+/** 值域是 `true` / `false` 的偏好：面板画勾选框，不让人手打这两个单词。 */
+function isBooleanKey(key: string): boolean {
+  return BOOLEAN_PREF_KEYS.includes(key);
+}
+
+/**
+ * 勾选框 = 写一条偏好。写不进去（接口挂了）时把勾拨回原样：`:checked` 绑的是
+ * `item.value`，store 没变 Vue 就不会重渲染这个 prop，不手动复原的话界面上会留下
+ * 一个"看起来已经改了、其实没改"的状态，而 `prefs.error` 那一行未必就在手边。
+ */
+async function toggleBoolean(key: string, current: string, event: Event): Promise<void> {
+  if (await prefs.save(key, current === 'true' ? 'false' : 'true')) return;
+  (event.target as HTMLInputElement).checked = current === 'true';
 }
 
 function startEdit(key: string, value: string): void {
@@ -194,6 +212,24 @@ onMounted(() => {
               <p v-else class="mt-0.5 break-words text-slate-900">
                 {{ prefValueLabel(item.key, item.value) }}
               </p>
+              <!--
+                布尔型偏好用一个勾选框，而不是让它和备注共用那个文本框：一个开关
+                用文本框编辑，用户只能靠"上次生效"去猜自己有没有打错 `fasle`。
+                打错时后端会 400（值域只认 true/false），但那已经是一次失败。
+              -->
+              <label
+                v-if="isBooleanKey(item.key) && editing !== item.key"
+                class="mt-1 flex w-fit items-center gap-1 text-slate-600"
+              >
+                <input
+                  type="checkbox"
+                  :checked="item.value === 'true'"
+                  :disabled="prefs.saving === item.key"
+                  :data-test="`pref-toggle-${item.key}`"
+                  @change="toggleBoolean(item.key, item.value, $event)"
+                />
+                {{ item.value === 'true' ? '已开启' : '已关闭' }}
+              </label>
               <p class="mt-0.5 text-slate-400">
                 {{ prefSourceLabel(item.source) }}
                 <!--
@@ -211,7 +247,9 @@ onMounted(() => {
               </p>
             </div>
             <div class="flex shrink-0 flex-col items-end gap-1">
+              <!-- 布尔型没有"改"：值域只有两个，勾选框就是全部编辑面。 -->
               <button
+                v-if="!isBooleanKey(item.key)"
                 type="button"
                 class="text-slate-500 hover:text-slate-900"
                 :data-test="`pref-edit-btn-${item.key}`"
