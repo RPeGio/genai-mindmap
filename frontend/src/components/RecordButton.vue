@@ -105,6 +105,12 @@ onBeforeUnmount(() => {
   stopTicker();
   recording?.cancel();
   recording = null;
+  state.value = 'idle';
+  // 与 `VoicePress` 同一条规矩：`sources.recording` 是生成入口的闸门之一
+  // （`ChatDock.canSubmit` 读它），组件卸载时漏掉这一句，那条标志就永远为真。
+  // 这个组件住在材料面板里，而材料面板在生成态会被整个卸载——录音中点节点工具条的
+  // 「展开」（那条路不检查 `recording`）正好能撞上它。
+  emit('active', false);
 });
 </script>
 
