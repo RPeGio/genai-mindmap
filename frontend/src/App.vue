@@ -17,6 +17,7 @@ import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } fr
 import { DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY, usePrefsStore } from './stores/prefs';
 import PrefsPanel from './components/PrefsPanel.vue';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
+import { agentDetailVisible, runResultLine } from './mindmap/run-status';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
 import type { DiagramContent, DiagramTypeChoice, EdgeKind } from './api/types';
 import { containerNoun, kindOf, topBranchesOf } from './mindmap/shape';
@@ -24,23 +25,17 @@ import { containerNoun, kindOf, topBranchesOf } from './mindmap/shape';
 const store = useMindMapStore();
 
 /**
- * 状态行第二行：正常时是阶段文案，长静默时换成「模型正在思考」。
+ * 静默多久之后把阶段文案换成「模型正在思考」。
  *
  * 后端只在静默达到 10 秒才发心跳，所以 `waitedMs >= 10` 基本等价于"已经静默 10 秒"。
  * 阈值再写一遍是为了前端自己也站得住：万一别处的实现改成更密的保活帧，这里不会
  * 1 秒就把阶段文案顶掉。
  *
- * 两句话不并存：静默超阈值时阶段文案被**替换**，不是叠在一起——那会让人以为
- * 两件事同时在发生。
+ * 这两句话的渲染点在画布底部那条状态行（`statusText`）——原来它在生成框里另起一行，
+ * 而生成框本来就够挤了。规则不变：静默超阈值时阶段文案被**替换**，不是叠在一起，
+ * 那会让人以为两件事同时在发生。
  */
 const SILENT_HINT_SECONDS = 10;
-const stageLine = computed(() => {
-  if (!store.busy) return '';
-  if (store.waitedMs >= SILENT_HINT_SECONDS) {
-    return `模型正在思考，已等 ${store.waitedMs} 秒`;
-  }
-  return store.stageText;
-});
 const sources = useSourcesStore();
 
 /**
@@ -939,6 +934,18 @@ function onKeydown(event: KeyboardEvent) {
     }
     if (event.key === 'Tab' && trapLibraryFocus(event)) return;
   }
+  // 偏好浮层盖在右上角，Esc 关它是这类浮层的默认预期（它不带遮罩，也没有确定按钮）。
+  if (prefsOpen.value && event.key === 'Escape') {
+    event.preventDefault();
+    prefsOpen.value = false;
+    return;
+  }
+  // 右抽屉是覆盖层，不是模态：画布仍然可点，所以只见 Esc 这一条"退出"手势要接住。
+  if (sideOpen.value && event.key === 'Escape') {
+    event.preventDefault();
+    closeSide();
+    return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     saveNow();
@@ -958,6 +965,9 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onMounted(() => {
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('beforeunload', onBeforeUnload);
+  // 顶栏的偏好浮层点外面要关。必须挂捕获阶段：Vue Flow 的 pane 在 mousedown 里
+  // 吞掉了冒泡（d3-zoom 的常规做法），不捕获的话点画布关不掉它。
+  document.addEventListener('pointerdown', onDocumentPointerDown, true);
   // 启动即拉偏好：生成面板的两个下拉要在用户动手之前就填好，否则第一次生成总是
   // "没带偏好"的那一次——而那正是最该被记住偏好的那一次。
   void prefs.load();
@@ -983,6 +993,9 @@ async function loadVersion() {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('beforeunload', onBeforeUnload);
+  document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+  // 计时器必须跟着组件走：它是**展示**用的，没有组件可展示时继续跑只是泄漏。
+  stopElapsed();
   if (noticeTimer) clearTimeout(noticeTimer);
 });
 
@@ -1013,6 +1026,272 @@ async function copyBody() {
     copied.value = '';
   }, 2000);
 }
+
+// ---------------------------------------------------- 侧栏收窄与底部状态行
+//
+// 右栏原来是常驻 320px 的 flex 兄弟节点，它和左侧材料区一起把画布夹在中间，而画布
+// 上还压着一个 400px 的生成框。可那块宽度上的四样东西使用频率完全不同——偏好一次
+// 设置、节点详情按需、原文本来就是抽屉、模型协作只在生成那几十秒里才有意义。所以：
+//
+//   - 常驻宽度只留**一行**（画布底部）：进度 / 结果 / 异常；
+//   - 偏好进顶栏齿轮的浮层；
+//   - 节点详情与改动明细进**覆盖式**右抽屉（沿用原文抽屉那套 `fixed inset-y-0 right-0`）。
+//
+// **抽屉开合不改画布容器尺寸**：它是 `fixed` 覆盖层，不是参与 flex 布局的兄弟节点。
+// 这一点是刻意的——画布变宽不会自动 `fitView`（适配只在初始化、节点数/方向变化时
+// 按条件触发），所以"推挤式"的抽屉恰逢生成时，反而会在节点增长那一刻把视图拽一下。
+
+/** 右抽屉开着没有。默认关：画布默认拿到全部剩余宽度。 */
+const sideOpen = ref(false);
+
+/**
+ * 抽屉里「本次生成明细」那一块展开没有。
+ *
+ * 默认折叠：抽屉打开时用户多半是来看节点详情的，改动清单挡在上面就成了新的遮挡。
+ * 状态行上的「明细」按钮是它的快捷入口——那里点一下，抽屉打开并且这一块展开。
+ */
+const agentDetailOpen = ref(false);
+
+/** 顶栏齿轮浮层。 */
+const prefsOpen = ref(false);
+/** 齿轮 + 浮层的外壳：点外面要关，所以得知道边界在哪。 */
+const prefsWrap = ref<HTMLElement | null>(null);
+
+/** 待确认的建议条数：齿轮右上角那个数字，也是"收起来了但没静默"的证据。 */
+const prefsSuggestCount = computed(() => prefs.suggestions.length);
+
+/** 齿轮的 title：把"为什么这里有个角标"写出来，而不是让用户去猜。 */
+const prefsTitle = computed(() => {
+  const bits = ['偏好：默认图型、拆解方式、内容风格备注'];
+  if (prefsSuggestCount.value) bits.push(`${prefsSuggestCount.value} 条建议待确认`);
+  if (prefs.error) bits.push(`上次操作失败：${prefs.error}`);
+  return bits.join('；');
+});
+
+function toggleSide(): void {
+  sideOpen.value = !sideOpen.value;
+}
+
+function closeSide(): void {
+  sideOpen.value = false;
+}
+
+/** 状态行上的「明细」：抽屉打开并直接展开明细，省掉两次点击。 */
+function openAgentDetail(): void {
+  agentDetailOpen.value = true;
+  sideOpen.value = true;
+}
+
+function togglePrefs(): void {
+  prefsOpen.value = !prefsOpen.value;
+}
+
+/**
+ * 点浮层外面关掉它。
+ *
+ * 两个细节都是踩出来的：
+ *   · 用 `pointerdown` 而不是 `click`：抽屉里的按钮若在 pointerdown 之后就改变了 DOM，
+ *     click 可能落在别的元素上，那样"点一下别处"会变成一次没头没尾的重开；
+ *   · 挂在**捕获阶段**：Vue Flow 的 pane 在 `mousedown` 里做了 `stopImmediatePropagation`
+ *     （d3-zoom 的常规做法），冒泡阶段根本收不到——不捕获的话，点画布关不掉浮层。
+ */
+function onDocumentPointerDown(event: PointerEvent): void {
+  if (!prefsOpen.value) return;
+  const box = prefsWrap.value;
+  if (box && event.target instanceof Node && box.contains(event.target)) return;
+  prefsOpen.value = false;
+}
+
+/**
+ * 偏好写失败要主动说一句。
+ *
+ * 面板收进顶栏之后，"保存失败"那一行不再常驻——不主动提示的话，用户点了个勾、
+ * 勾自己弹回原样、然后什么都没有发生。「偏好建议与保存错误要有提醒」就是这条。
+ */
+watch(() => prefs.error, message => {
+  if (message) flash('error', message);
+});
+
+// ---- 画布底部那一条：进度 / 结果 / 异常 -------------------------------------
+//
+// 评审的结论：这一块**只需要一行**。四块内容里只有它每次生成都该被看见——进行中它
+// 是进度，落地后它是结果，出事时它是异常。明细（改动清单、诊断逐条、预览）点开才看。
+
+/** 状态行的一枚按钮。`run` 直接是函数，模板里 `@click="action.run"`，不必再套一层。 */
+interface StatusAction {
+  key: string;
+  label: string;
+  test: string;
+  run: () => void;
+}
+
+type StatusKind = 'running' | 'error' | 'warn' | 'ok' | 'conflict' | 'info';
+
+/** 部分完成：后端在 ok 的同时给出来的，界面只认 ok 就永远看不见它。 */
+const agentPartial = computed(
+  () => store.agentWarnings.find(item => item.kind === 'partial') ?? null,
+);
+
+/**
+ * 这一行现在在说什么。**优先级从上到下**，同一时刻只说一件。
+ *
+ * 冲突排第一：它要用户在两个都会丢东西的选择里做决定，压住它就是丢数据。
+ * 运行中排第二：进度要压过上一次的结果。异常排第三：失败不能因为"上次成功过"就不显示。
+ */
+const statusKind = computed<StatusKind | null>(() => {
+  if (store.conflictDraft) return 'conflict';
+  if (store.busy || store.agentRunning) return 'running';
+  if (store.agentError) return 'error';
+  if (agentPartial.value) return 'warn';
+  if (store.generatedSummary) return 'ok';
+  if (store.resumableRun) return 'info';
+  return null;
+});
+
+/** 这一轮在做什么。三个意图各有一个动词，混用会把"我在改图"看成"它在重生成"。 */
+const runningVerb = computed(() => {
+  if (store.runIntent === 'expand') return '正在展开这一支';
+  if (store.runIntent === 'edit') return '正在改这张图';
+  return '正在生成';
+});
+
+/**
+ * 已经跑了多少秒。**只用于状态行**，不写进 store：它是纯展示计时器，放进 store
+ * 会让每一下心跳都触发一轮与数据无关的重算。
+ */
+const elapsedSec = ref(0);
+let elapsedTimer: ReturnType<typeof setInterval> | null = null;
+
+function stopElapsed(): void {
+  if (elapsedTimer) clearInterval(elapsedTimer);
+  elapsedTimer = null;
+  elapsedSec.value = 0;
+}
+
+watch(
+  () => store.busy || store.agentRunning,
+  running => {
+    if (!running) {
+      stopElapsed();
+      return;
+    }
+    if (elapsedTimer) return;
+    // 从**现在**开始算：`waitedMs` 是"多久没收到帧"，与总耗时不是一回事，
+    // 拿它当时长会让一个每秒都有帧的正常生成永远显示 0 秒。
+    elapsedSec.value = 0;
+    elapsedTimer = setInterval(() => { elapsedSec.value += 1; }, 1000);
+  },
+  { immediate: true },
+);
+
+/**
+ * 状态行正文。
+ *
+ * 静默超过 10 秒就换成「模型正在思考」并**替换**阶段文案，不叠在一起——两句话并排
+ * 会让人以为两件事同时在发生。这条规则与原来生成框里那行完全一致，只是搬到了这里。
+ */
+const statusText = computed(() => {
+  switch (statusKind.value) {
+    case 'conflict':
+      return '生成期间你改过这张图：两棵树都还在，选一个';
+    case 'running': {
+      const parts = [runningVerb.value];
+      if (store.waitedMs >= SILENT_HINT_SECONDS) {
+        parts.push(`模型正在思考，已等 ${store.waitedMs} 秒`);
+      } else {
+        if (store.stageText) parts.push(store.stageText);
+        if (elapsedSec.value > 0) parts.push(`${elapsedSec.value} 秒`);
+      }
+      return parts.join(' · ');
+    }
+    case 'error':
+      return `生成失败：${store.agentError}`;
+    case 'warn':
+      // 部分完成**不是失败**：树已经落画布了，只是某几支是空的。措辞必须分开。
+      return `部分完成：${agentPartial.value?.message ?? '有几支没能生成'}`;
+    case 'ok': {
+      const summary = store.generatedSummary;
+      if (!summary) return '';
+      return `${runResultLine(summary)} · 还没保存`;
+    }
+    case 'info':
+      return resumableText.value;
+    default:
+      return '';
+  }
+});
+
+/**
+ * 状态行上的按钮。
+ *
+ * 规则：**能当场处理完的放在这一行**，其余交给「明细」。冲突的两个裁决（原来在右栏
+ * 面板里）必须留在这里——它是要用户立刻做决定的事，藏进抽屉等于把一次数据丢失的
+ * 裁决变成一次遗忘。
+ */
+const statusActions = computed<StatusAction[]>(() => {
+  switch (statusKind.value) {
+    case 'conflict':
+      return [
+        { key: 'use', label: '用模型的结果', test: 'run-status-use',
+          run: () => store.resolveConflict('generated') },
+        { key: 'keep', label: '保留我的', test: 'run-status-keep',
+          run: () => store.resolveConflict('mine') },
+      ];
+    case 'running':
+      return [
+        { key: 'cancel', label: '取消', test: 'run-status-cancel', run: () => store.cancel() },
+      ];
+    case 'ok':
+      // 只在"画布还是生成结果"时给：否则那个按钮点下去没有任何可退的东西。
+      return store.canUndoGenerate
+        ? [{ key: 'undo', label: '回到生成之前', test: 'run-status-undo',
+            run: () => store.undoGenerate() }]
+        : [];
+    case 'info':
+      return [
+        { key: 'load', label: '载入', test: 'run-status-load', run: () => store.resumeRun() },
+        { key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() },
+      ];
+    default:
+      return [];
+  }
+});
+
+/** 异常那三种要给足视觉重量：一行小字读不出"出事了"。 */
+const statusTone = computed(() => {
+  switch (statusKind.value) {
+    case 'error':
+      return 'border-rose-300 bg-rose-50 text-rose-900 ring-1 ring-rose-200';
+    case 'warn':
+    case 'conflict':
+      return 'border-amber-300 bg-amber-50 text-amber-900 ring-1 ring-amber-200';
+    case 'ok':
+      return 'border-emerald-200 bg-white text-slate-700';
+    case 'info':
+      return 'border-sky-200 bg-sky-50 text-sky-900';
+    default:
+      return 'border-slate-200 bg-white text-slate-700';
+  }
+});
+
+const statusDot = computed(() => {
+  switch (statusKind.value) {
+    case 'running': return 'bg-sky-500';
+    case 'error': return 'bg-rose-500';
+    case 'warn':
+    case 'conflict': return 'bg-amber-500';
+    case 'ok': return 'bg-emerald-500';
+    default: return 'bg-sky-400';
+  }
+});
+
+/** 「明细」只在真有明细可看时出现；「上次的运行结果」那两个按钮本身就是全部内容。 */
+const showDetailAction = computed(
+  () => statusKind.value !== null && statusKind.value !== 'info',
+);
+
+/** 抽屉里有没有东西可展开（判据与 `AgentPanel` 共用，见 `mindmap/run-status.ts`）。 */
+const agentHasDetail = computed(() => agentDetailVisible(store));
 </script>
 
 <template>
@@ -1122,10 +1401,112 @@ async function copyBody() {
           <span v-else>未生成</span>
           <span class="ml-3">{{ store.nodeCount }} 个节点</span>
         </p>
+
+        <!--
+          右侧两块内容原来常驻在 320px 的右栏里，现在收进顶栏：
+            · 齿轮 → 偏好浮层（一次设置的东西不该天天占着画布宽度）；
+            · 面板 → 覆盖式详情抽屉（节点详情 + 本次生成的明细）。
+
+          齿轮上的角标是"收起来了但没静默"的证据：有待确认的建议就显示数字，刚失败过
+          一次就变成红点，`title` 里写着原因。这是「偏好建议与保存错误要有提醒」那一条
+          在"偏好已经不在屏幕上"之后的落地方式。
+        -->
+        <div ref="prefsWrap" class="relative">
+          <button
+            type="button"
+            data-test="prefs-toggle"
+            class="relative rounded-md border p-1.5"
+            :class="prefsOpen ? 'border-slate-900 bg-slate-100 text-slate-900' : 'border-slate-300 text-slate-600 hover:bg-slate-50'"
+            :aria-expanded="prefsOpen"
+            aria-controls="prefs-popover"
+            aria-label="偏好"
+            :title="prefsTitle"
+            @click="togglePrefs"
+          >
+            <!-- 齿轮：外圈虚线 + 内圈实线。不引图标库——为一个图标加依赖不划算，
+                 而这条虚线环在 16px 下能读出"齿"。 -->
+            <svg
+              class="h-4 w-4"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="8" stroke-dasharray="2.2 3.1" />
+              <circle cx="12" cy="12" r="3.2" />
+            </svg>
+            <span
+              v-if="prefsSuggestCount"
+              data-test="prefs-badge"
+              class="absolute -right-1.5 -top-1.5 min-w-[15px] rounded-full bg-sky-600 px-1 text-center text-[10px] leading-[15px] text-white"
+            >{{ prefsSuggestCount }}</span>
+            <span
+              v-else-if="prefs.error"
+              data-test="prefs-badge-error"
+              class="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-rose-500"
+              aria-hidden="true"
+            />
+          </button>
+
+          <!-- 浮层：绝对定位挂在齿轮下面。它不参与任何布局，关掉时 `v-show` 只改
+               display——所以面板里的内容与测试里的定位都还在，只是看不见。
+
+               `max-h` 不能省：偏好条目攒起来之后（8 条备注 + 若干键），不限高的浮层
+               会顶出视口底部，最下面那条「加一条备注」就再也点不到。 -->
+          <div
+            v-show="prefsOpen"
+            id="prefs-popover"
+            data-test="prefs-popover"
+            class="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-5rem)] w-[380px] max-w-[calc(100vw-2rem)] overflow-y-auto rounded-lg border border-slate-200 bg-white p-2 shadow-2xl"
+          >
+            <div class="flex items-center justify-between px-1 pb-1">
+              <p class="text-xs font-semibold text-slate-700">偏好</p>
+              <button
+                type="button"
+                data-test="prefs-popover-close"
+                class="text-[11px] text-slate-500 hover:text-slate-900"
+                title="关闭（Esc）"
+                @click="prefsOpen = false"
+              >关闭</button>
+            </div>
+            <PrefsPanel />
+          </div>
+        </div>
+
+        <button
+          type="button"
+          data-test="side-toggle"
+          class="rounded-md border p-1.5"
+          :class="sideOpen
+            ? 'border-slate-900 bg-slate-900 text-white'
+            : selected
+              ? 'border-sky-300 bg-sky-50 text-sky-700'
+              : 'border-slate-300 text-slate-600 hover:bg-slate-50'"
+          :aria-expanded="sideOpen"
+          aria-controls="side-panel"
+          :aria-label="selected ? `节点详情：${selected.node.label.trim()}` : '节点详情与本次改动'"
+          :title="selected ? `节点详情：${selected.node.label.trim()}（有选中节点时高亮）` : '节点详情与本次改动'"
+          @click="toggleSide"
+        >
+          <!-- 面板轮廓：一个矩形加一条竖分隔线，读作"右侧栏"。
+               选中节点时按钮变天蓝——不自动弹抽屉（那会更挡），但入口自己会亮。 -->
+          <svg
+            class="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            aria-hidden="true"
+          >
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <path d="M15 4v16" />
+          </svg>
+        </button>
       </div>
     </header>
 
-    <main class="flex min-h-0 flex-1">
+    <main class="relative flex min-h-0 flex-1">
       <section class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-white p-4">
         <div class="flex flex-col gap-1">
           <label for="title" class="text-xs font-medium text-slate-600">
@@ -1325,50 +1706,125 @@ async function copyBody() {
             :disabled="!canSubmit"
             @click="submitIntent"
           >{{ intentButton }}</button>
-          <p v-if="showStatus" role="status" class="text-[11px] leading-tight text-slate-500">{{ store.status }}</p>
-          <p v-if="stageLine" class="text-[11px] leading-tight text-slate-400">{{ stageLine }}</p>
+          <!-- 阶段文案（"正在定框架"之类）搬到了画布底部那条状态行。这里那行反而要
+               在**生成中藏起来**：`store.status` 在此期间写的是"正在与模型协作…"，
+               和状态行说的是同一件事，两行并排只会互相削弱。
+               其它状态（已保存、已打开、失败原因）都留着——那是状态行不覆盖的信息，
+               而且 `role="status"` 的读屏播报只该有这一个来源。 -->
+          <p
+            v-if="showStatus && statusKind !== 'running'"
+            role="status"
+            class="text-[11px] leading-tight text-slate-500"
+          >{{ store.status }}</p>
         </div>
         <MindMapCanvas />
+
+        <!--
+          画布底部那一条：**常驻，但只有一行**。
+
+          这是评审里唯一"每次生成都该被看见"的东西：进行中它是进度，落地后它是结果，
+          出事时它是异常（失败 / 部分完成 / 冲突）。明细（改动清单、诊断逐条、预览）
+          在抽屉里，点「明细」直接展开到那一块。
+
+          三点是刻意的：
+            · **绝对定位、覆盖在画布上**——出现和消失都不会让画布容器重算尺寸，
+              也就不会在生成过程中把视图拽一下；
+            · **没有 `role="status"`**——生成框里那行 `store.status` 已经占了那个
+              role（`getByRole('status')` 只能有一个），这里用 `aria-live` 表达
+              "这是会变的文字"就够了；
+            · 外面再包一层 `justify-center`：抽屉打开时右边留出 360px，于是这一行
+              仍然居中在**看得见的那块画布**上，而不是被抽屉切掉半截。
+        -->
+        <div
+          class="pointer-events-none absolute inset-x-4 bottom-3 z-20 flex justify-center"
+          :class="sideOpen ? 'md:pr-[360px]' : ''"
+        >
+          <div
+            v-if="statusKind"
+            data-test="run-status"
+            aria-live="polite"
+            :aria-label="statusKind === 'info' ? '上次的运行结果' : undefined"
+            class="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border bg-white px-3 py-1.5 text-xs shadow-lg"
+            :class="statusTone"
+          >
+            <span class="h-2 w-2 shrink-0 rounded-full" :class="statusDot" aria-hidden="true" />
+            <span
+              class="min-w-0 flex-1 truncate font-medium"
+              :title="statusText"
+              data-test="run-status-text"
+            >{{ statusText }}</span>
+            <button
+              v-for="action in statusActions"
+              :key="action.key"
+              type="button"
+              :data-test="action.test"
+              class="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-0.5 text-xs hover:bg-slate-50"
+              @click="action.run()"
+            >{{ action.label }}</button>
+            <button
+              v-if="showDetailAction"
+              type="button"
+              data-test="run-status-detail"
+              class="shrink-0 rounded-md px-2 py-0.5 text-xs underline decoration-dotted underline-offset-2 hover:bg-white/60"
+              title="打开右侧抽屉：改动清单、诊断逐条、生成中的预览"
+              @click="openAgentDetail"
+            >明细</button>
+          </div>
+        </div>
       </section>
 
-      <aside class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l border-slate-200 bg-white p-4">
-        <!--
-          偏好面板摆在最上面：它是"系统记住了什么"的唯一可见位置，而一条写进去却
-          从不被读的记忆等于没写。摆在最下面的话，用户要滚过节点详情才看得到，
-          那就是实际上不存在。
-        -->
-        <PrefsPanel />
-        <!--
-          上次运行留下的结果。**只是一条提示，不是弹窗**：用户可能正在做别的事，
-          打断他比让他知道这件事更烦。点「载入」把上次那棵树直接装回画布（撤销栈、
-          `generate` 事件、身份重置、冲突判定一步都不少），点「不用了」只是这次
-          会话不再提——它仍然是真的，下次开新会话会再问一次。
-        -->
-        <section
-          v-if="store.resumableRun"
-          aria-label="上次的运行结果"
-          class="rounded-md border border-sky-200 bg-sky-50 p-2 text-xs"
-        >
-          <p class="break-words leading-relaxed text-slate-700">{{ resumableText }}</p>
-          <div class="mt-1.5 flex gap-2">
-            <button
-              type="button"
-              class="rounded-md border border-sky-300 bg-white px-2 py-1 text-sky-800 hover:bg-sky-100"
-              @click="store.resumeRun()"
-            >
-              载入
-            </button>
-            <button
-              type="button"
-              class="rounded-md border border-slate-300 bg-white px-2 py-1 text-slate-600 hover:bg-slate-50"
-              @click="store.ignoreResumable()"
-            >
-              不用了
-            </button>
-          </div>
-        </section>
-        <AgentPanel />
-        <template v-if="selected">
+      <!--
+        右抽屉：**覆盖式**，不参与主区的 flex 布局。
+
+        它取代了原来那个常驻 320px 的右栏。四块内容没有变少，只是改成了"要看的时候
+        才占屏幕"，而且占的是盖在画布上的那一层——**画布宽度一点都没变**。
+
+        刻意不设 `role="dialog"` / `aria-modal`：它不是模态。画布仍然可点、可拖、可以
+        继续选节点（选完这里的详情跟着变），这正是"覆盖而不是推挤"的好处，也是它与
+        原文抽屉、知识库抽屉的区别——那两个是"看图之外的另一件事"。
+
+        `absolute` 挂着而不是 `fixed`：它相对的是 `<main>`，于是**不盖住顶栏**——
+        那个开关按钮必须始终点得到（"点开、再点收起"，不能被自己打开的东西挡住）。
+      -->
+      <aside
+        v-show="sideOpen"
+        id="side-panel"
+        data-test="side-panel"
+        aria-label="节点详情与本次改动"
+        class="absolute inset-y-0 right-0 z-30 flex w-[360px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl"
+      >
+        <div class="flex items-center justify-between border-b border-slate-200 px-4 py-2">
+          <p class="text-xs font-semibold text-slate-700">节点详情与本次改动</p>
+          <button
+            type="button"
+            data-test="side-close"
+            class="text-xs text-slate-500 hover:text-slate-900"
+            title="关闭（Esc）"
+            @click="closeSide"
+          >关闭</button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+          <!--
+            本次生成的明细（工具进度、改动清单、诊断、预览、冲突裁决）。
+
+            默认折叠：打开抽屉时多半是来看节点详情的，一份改动清单挡在上面就成了新的
+            遮挡。状态行上的「明细」按钮会把它撑开——那里是"我关心这次改了什么"的入口。
+          -->
+          <details
+            v-if="agentHasDetail"
+            :open="agentDetailOpen"
+            data-test="agent-detail"
+            class="text-xs"
+            @toggle="agentDetailOpen = ($event.target as HTMLDetailsElement).open"
+          >
+            <summary class="cursor-pointer rounded-md border border-slate-200 bg-slate-50 px-2 py-1 font-medium text-slate-600">
+              本次生成明细
+            </summary>
+            <div class="mt-2"><AgentPanel /></div>
+          </details>
+
+          <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
           <!-- 标题：与画布上那颗节点是同一段文字（双击节点改的就是它） -->
           <h2 class="text-sm font-semibold">
@@ -1448,7 +1904,9 @@ async function copyBody() {
             </p>
           </section>
 
-          <label class="flex flex-1 flex-col gap-1">
+          <!-- 备注框不再用 `flex-1` 争抢高度：抽屉的滚动容器里没有"剩余高度"可分，
+               那会让滚动区忽高忽低；固定 `min-h-24` + 可拖拽更可预测。 -->
+          <label class="flex flex-col gap-1">
             <span class="text-xs text-slate-400">
               我的备注 {{ noteLength }} / 2000
               <span v-if="!(selected.node.note ?? '').trim()">· 现在是空的，不影响详情与导出</span>
@@ -1682,7 +2140,9 @@ async function copyBody() {
             点击画布上的任意节点查看完整内容与它所在的层级路径；双击节点可以直接改文字。
           </p>
         </template>
-        <details v-if="store.content?.source_usage?.length" class="mt-auto border-t border-slate-200 pt-3 text-xs text-slate-600" open>
+        <!-- 本图来源：整图口径的来源清单，与各节点自己的引用互为对照。
+             它留在抽屉最底部——它属于"这张图整体"的信息，与节点详情不同层级。 -->
+        <details v-if="store.content?.source_usage?.length" class="border-t border-slate-200 pt-3 text-xs text-slate-600" open>
           <summary class="cursor-pointer font-medium">本图来源（{{ store.content.source_usage.length }}）</summary>
           <ul class="mt-2 flex flex-col gap-2">
             <li v-for="(source, index) in store.content.source_usage" :key="source.source_id" class="break-words">
@@ -1696,6 +2156,7 @@ async function copyBody() {
           </ul>
           <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源（整图口径），具体出处见各节点的引用；原文未随导图保存。</p>
         </details>
+        </div>
       </aside>
     </main>
 

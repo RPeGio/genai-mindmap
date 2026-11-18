@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
+import { agentDetailVisible, runResultLine } from '../mindmap/run-status';
 import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
 
 /**
@@ -12,13 +13,11 @@ import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } 
  */
 const store = useMindMapStore();
 
-const visible = computed(() =>
-  store.agentRunning
-  || store.generatedSummary !== null
-  || store.conflictDraft !== null
-  || store.agentEvents.length > 0
-  || !!store.agentError,
-);
+/**
+ * 可见性判据在 `mindmap/run-status.ts` 里：画布底部那条状态行要判断"有没有明细可看"，
+ * 判断依据必须与这里一致（一边说有、另一边打开是空的，是界面坏了的形状）。
+ */
+const visible = computed(() => agentDetailVisible(store));
 
 /** 毫秒 → 「4.3 秒」。把 4341ms 直接摆给用户看是工程口吻。 */
 function seconds(ms: number): string {
@@ -151,14 +150,9 @@ const previewTitle = computed(() => {
  *
  * 三个信息缺一不可：`nodes` 是这次落进画布的规模，`changes` 是改了几处（`null` 表示
  * 画布本来是空的，整棵树都是新的——那时说"改了 0 处"是误导），外加"还没保存"。
+ * 文案本体在 `runResultLine`：状态行上那句必须是同一句。
  */
-const resultLine = computed(() => {
-  const summary = store.generatedSummary;
-  if (!summary) return '';
-  const shape = `已落到画布 · ${summary.nodes} 个节点`;
-  if (summary.changes === null) return `${shape}（整张新图）`;
-  return summary.changes === 0 ? `${shape} · 一处都没改` : `${shape} · 改了 ${summary.changes} 处`;
-});
+const resultLine = computed(() => (store.generatedSummary ? runResultLine(store.generatedSummary) : ''));
 
 /**
  * 这次生成改了什么。
