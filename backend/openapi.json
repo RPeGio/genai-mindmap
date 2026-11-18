@@ -1297,9 +1297,16 @@
                 "$ref": "#/components/schemas/MindMapContent-Input"
               },
               {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Snapshot"
           },
           "selected_ids": {
             "items": {

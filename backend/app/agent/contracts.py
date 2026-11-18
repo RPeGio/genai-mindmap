@@ -16,7 +16,7 @@ from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, Proto
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from app.contracts.diagnostic import Diagnostic
-from app.contracts.mindmap import DiagramContent, DiagramKind, MindMapContent
+from app.contracts.mindmap import DiagramContent, DiagramKind
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
 from app.optimization.source_refs import EvidenceSpan
@@ -532,7 +532,7 @@ MAX_SOURCES = 50
 class AgentRunRequest(BaseModel):
     """一次 agent 运行。
 
-    `snapshot` 是前端当前的树。服务端**不**从数据库重读——用户可能有一堆没保存
+    `snapshot` 是前端当前的图。服务端**不**从数据库重读——用户可能有一堆没保存
     的编辑，重读数据库等于把它们丢掉。
     """
 
@@ -591,7 +591,22 @@ class AgentRunRequest(BaseModel):
     # 少了它，一条偏好写进去之后没有任何办法证明它影响过任何一次生成——那正是
     # "心里记着"与"真的在起作用"的区别。
     prefs_applied: list[str] = Field(default_factory=list, max_length=50)
-    snapshot: MindMapContent | None = None
+    # 这张图**现在长什么样**：`expand` / `edit` 的输入，也是服务端唯一的形状来源。
+    #
+    # 三种图型共用这一份（`DiagramContent` 联合），与同一轮 `snapshot` / `done` 事件
+    # 的类型一致。收窄成 `MindMapContent` 时的后果是可复现的：鱼骨图与流程图发
+    # `expand` / `edit` 必然 422，而后端为它们写的 `_expand` / `_apply_ops_any`
+    # （按骨 / 阶段分片执行）对前端**不可达**——那两条路有实现、有用例，却没有人
+    # 能走到。
+    #
+    # 判别靠形状（`DiagramContent` 的 `union_mode="left_to_right"`，见
+    # `mindmap.DiagramContent` 的注释），不靠 `diagram_type`：库里与前端手里有一批
+    # "自述是鱼骨、形状是树"的旧记录，收窄会在它们下一次保存时 422。
+    #
+    # 三种形状以外的 payload 由 `snapshot_is_a_known_shape` 拦在 Pydantic 之前
+    # 并给人话——联合类型的默认报错是一棵 `anyOf` 错误树，用户从里面读不出
+    # "我该改什么"。
+    snapshot: DiagramContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)
     budget: RunBudget = Field(default_factory=RunBudget)
@@ -635,6 +650,38 @@ class AgentRunRequest(BaseModel):
     #
     # 另两处 token 预检（`provider.complete_tools` 与 `generation.chat_async`）量的
     # 是**实际要发出去的消息**，不是材料体积：那些消息里没有正文，自然不会被它们拦。
+
+    @model_validator(mode="before")
+    @classmethod
+    def snapshot_is_a_known_shape(cls, data: Any) -> Any:
+        """`snapshot` 必须长得像三种图型之一，否则在 Pydantic 之前给一句人话。
+
+        为什么要有这一条：`snapshot` 是 `DiagramContent`（三个成员的联合），而
+        pydantic 对一个"哪个成员都不匹配"的 payload 会报一棵 `anyOf` 错误树——
+        三层 `loc`、每层一句"field required"，用户从里面读不出"我该改什么"。
+        这一条把最常见的那一类（**根本不是导图**，或者键名全错）提前拦成一句话。
+
+        判据是**形状**而不是 `diagram_type`（与 `DiagramContent` 的判别同一条规矩）：
+        树有 `root`，鱼骨有 `problem` + `bones`，流程有 `stages`。三个键都没出现时
+        这份 payload 一定不是导图，不必让联合类型去试。
+
+        不判得更细（比如"有 root 但 root 里没有 label"）：那些错**应该**由契约逐字段
+        报出来，它们的报错文案本来就能读。这里只兜"完全认不出形状"这一档。
+        """
+        if not isinstance(data, dict):
+            return data
+        snapshot = data.get("snapshot")
+        # 只判"原始 dict"这一档：已经是模型实例时（内部调用、用例直接把
+        # `FlowContent` 传进来）它一定合法；是别的类型时该由字段校验报"类型不对"，
+        # 这里替它报"形状不对"只会把用户引到错的方向。
+        if not isinstance(snapshot, dict) or not snapshot:
+            return data
+        if {"root", "problem", "stages"} & set(snapshot):
+            return data
+        raise ValueError(
+            "snapshot 看起来不是一份导图：三种图型分别需要 "
+            "root（思维导图）/ problem + bones（鱼骨图）/ stages（流程图）"
+            "其中之一。请确认发的是当前这张图的内容，而不是别的对象。")
 
 
 # ---------------------------------------------------------------- 事件流

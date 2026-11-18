@@ -630,7 +630,8 @@ export interface components {
             diagram_type?: ("tree" | "flowchart" | "fishbone") | null;
             /** Prefs Applied */
             prefs_applied?: string[];
-            snapshot?: components["schemas"]["MindMapContent-Input"] | null;
+            /** Snapshot */
+            snapshot?: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"] | null;
             /** Selected Ids */
             selected_ids?: string[];
             /** Sources */

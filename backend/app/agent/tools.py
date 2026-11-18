@@ -8587,6 +8587,18 @@ def _apply_ops_any(content: DiagramContent, batch: OpBatch) -> DiagramContent:
     if isinstance(content, MindMapContent):
         return apply_ops(content, batch)
 
+    edge_op_index = next(
+        (index for index, op in enumerate(batch.ops)
+         if op.op in ("add_edge", "remove_edge")), None)
+    if edge_op_index is not None:
+        raise OpError(
+            "edges_not_supported", f"ops.{edge_op_index}",
+            "这张图不是思维导图：鱼骨图没有附加边，流程图的边分成**阶段之间**"
+            "（端点用阶段 id）与**阶段内部**（端点用该阶段的节点 id）两层。"
+            "这一次没有改动任何一个节点——要改流程的连线，请用 add_edge 之外的"
+            "路径或重新生成。",
+        )
+
     holders = _holders_of(content, _op_target_ids(batch))
     if not holders:
         raise OpError(
@@ -9097,6 +9109,20 @@ def _check_kind_arg(value: str | None) -> str | None:
     return key
 
 
+def _fail_edges_not_supported() -> ToolResult:
+    """`add_edge` / `remove_edge` 落在非树结构上的**同一句**人话。
+
+    抽出来是因为两条工具必须说同一件事：两处各写一份文案，改一处忘一处时，用户
+    会从"加边"和"删边"两个入口得到互相矛盾的说明。措辞的判据见 `_add_edge`。
+    """
+    return _fail(
+        "edges_not_supported",
+        "这张图不是思维导图：鱼骨图没有附加边（六根骨的关系全部由层级表达）；"
+        "流程图的边分成**阶段之间**（端点用阶段 id）与**阶段内部**（端点用该阶段"
+        "的节点 id）两层，这两层还没有工具入口。这一次没有任何内容被改动。",
+    )
+
+
 def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     """在**两个已有节点**之间连一条附加边。
 
@@ -9112,12 +9138,7 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
     if not isinstance(content, MindMapContent):
-        return _fail(
-            "edges_not_supported",
-            "这张图不是思维导图：鱼骨图没有附加边（六根骨的关系全部由层级表达），"
-            "流程图的跳转连的是**阶段**而不是节点。"
-            "这两套语义还没有工具入口——要改流程的阶段跳转，请重新生成一次。",
-        )
+        return _fail_edges_not_supported()
 
     scope_note, outside = _scope_note(content, ctx, [args.source, args.target])
 
@@ -9188,12 +9209,7 @@ def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
     if isinstance(content, ToolResult):
         return content
     if not isinstance(content, MindMapContent):
-        return _fail(
-            "edges_not_supported",
-            "这张图不是思维导图：鱼骨图没有附加边（六根骨的关系全部由层级表达），"
-            "流程图的跳转连的是**阶段**而不是节点。"
-            "这两套语义还没有工具入口——要改流程的阶段跳转，请重新生成一次。",
-        )
+        return _fail_edges_not_supported()
 
     edge = next((item for item in content.edges if item.id == args.edge_id), None)
     if edge is None:
