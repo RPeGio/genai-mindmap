@@ -129,12 +129,59 @@ const cellClass = computed(() => {
     // `font-medium` 仍然要保留——它是文字重量，不是框的画法。
     return ['mind-diamond flex items-center justify-center', tone.value === 'selected' || tone.value === 'root' ? 'font-medium' : ''];
   }
+  if (shape.value === 'parallelogram' || shape.value === 'cylinder') {
+    // 新两种形状同理不挂 `TONE_CLASS`：平行四边形被 `clip-path` 裁掉 border/ring，
+    // 圆柱的框是 SVG 的 stroke——挂上去两边都会打架（白底与描边各画一套）。
+    // 档次改由 `data-shape-tone` 交给 styles.css（与菱形 `data-diamond-tone` 同一个思路）。
+    return [
+      shape.value === 'parallelogram' ? 'mind-parallelogram' : 'mind-cylinder',
+      'flex items-center justify-center text-center text-sm leading-tight',
+      tone.value === 'selected' || tone.value === 'root' ? 'font-medium' : '',
+    ];
+  }
   const geometry = shape.value === 'pill' ? 'rounded-full px-4' : 'h-12 w-[180px] rounded-md px-3';
   const toneClass = shape.value === 'pill' && tone.value === 'default'
     ? pillToneClass(props.data.role)
     : TONE_CLASS[tone.value];
   return ['flex items-center justify-center border text-center text-sm leading-tight', geometry, toneClass];
 });
+
+/**
+ * 圆柱的轮廓路径（`viewBox="0 0 100 100"`，随外接框非均匀拉伸）。
+ *
+ * 为什么是 SVG 而不是 `border-radius: 50% / 12%`：那条 CSS 技巧能画出"上下都是弧、
+ * 两侧竖直"的**轮廓**，但画不出圆柱那件小事——**顶面椭圆的下半弧**。没有那道弧，
+ * 看着就是一个压扁的药丸，读者不会把它读成"存数据的那个框"。用纯 CSS 补那道弧
+ * 要再叠一个绝对定位的椭圆元素，它的曲率与轮廓不是同一条（描边加粗时走形），
+ * 而 SVG 里两条弧就是两条 path，共用同一个 `ry`，永远不会错开。
+ *
+ * 椭圆半高 `e = 10`（viewBox 单位）：实际是 `68 × 10% = 6.8px`，椭圆总高 13.6px。
+ * 那个数不是随手取的，见 `layout/flow.ts::DATABASE_SIZE` 里的可用高度算术。
+ * 弧用三次贝塞尔近似（`k = 0.5523`），不用 `A` 命令：`A` 在非均匀缩放下各浏览器
+ * 对椭圆变换的处理有出入，贝塞尔的两个控制点是死数，扩到任何尺寸都一样。
+ */
+const CYL_E = 10;
+const CYL_K = 0.5523;
+const cylRy = CYL_E;
+/** 四分之一弧的控制点水平偏移：`k · rx`，`rx = 50`。 */
+const cylCx = CYL_K * 50;
+const CYL_BODY = [
+  `M 0,${cylRy}`,
+  // 顶面上弧：左点 → 顶点 → 右点
+  `C 0,${cylRy - CYL_K * cylRy} ${50 - cylCx},0 50,0`,
+  `C ${50 + cylCx},0 100,${cylRy - CYL_K * cylRy} 100,${cylRy}`,
+  // 右侧竖直边 + 底面下弧
+  `L 100,${100 - cylRy}`,
+  `C 100,${100 - cylRy + CYL_K * cylRy} ${50 + cylCx},100 50,100`,
+  `C ${50 - cylCx},100 0,${100 - cylRy + CYL_K * cylRy} 0,${100 - cylRy}`,
+  'Z',
+].join(' ');
+/** 顶面椭圆的下半弧：圆柱的"盖沿"，缺了它只是个药丸。 */
+const CYL_LID = [
+  `M 0,${cylRy}`,
+  `C 0,${cylRy + CYL_K * cylRy} ${50 - cylCx},${2 * cylRy} 50,${2 * cylRy}`,
+  `C ${50 + cylCx},${2 * cylRy} 100,${cylRy + CYL_K * cylRy} 100,${cylRy}`,
+].join(' ');
 
 /**
  * 语义色：键挂在 `data-node-color` 上，**色值交给 CSS**（`styles.css` 里的
@@ -266,6 +313,7 @@ onBeforeUnmount(() => clearTimeout(timer));
       :data-node-depth="colorAttrs['data-node-depth']"
       :data-node-shape="shape"
       :data-diamond-tone="shape === 'diamond' ? tone : undefined"
+      :data-shape-tone="shape === 'parallelogram' || shape === 'cylinder' ? tone : undefined"
       tabindex="0"
     >
       <!--
@@ -280,6 +328,34 @@ onBeforeUnmount(() => clearTimeout(timer));
         <span class="diamond-layer diamond-stroke" aria-hidden="true" />
         <span class="diamond-layer diamond-fill" aria-hidden="true" />
       </template>
+
+      <!--
+        平行四边形与菱形**同一套三层结构**（原因也一样：`clip-path` 会裁掉 border /
+        ring / box-shadow），差别只有那一条 `polygon` 的四个点。光晕仍然靠外扩同形状
+        的一层画，所以悬停 / 改动 / 选中三态不需要各写一份结构。
+      -->
+      <template v-else-if="shape === 'parallelogram'">
+        <span class="parallelogram-layer parallelogram-glow" aria-hidden="true" />
+        <span class="parallelogram-layer parallelogram-stroke" aria-hidden="true" />
+        <span class="parallelogram-layer parallelogram-fill" aria-hidden="true" />
+      </template>
+
+      <!--
+        圆柱用 SVG 画：轮廓 + 顶面椭圆的下半弧。`preserveAspectRatio="none"` 让它
+        跟着外接框拉伸（220×68），`vector-effect: non-scaling-stroke` 让描边宽度在
+        非均匀缩放下仍然是 1.5px。描边、填充、光晕都由 CSS 变量驱动（见 styles.css
+        的 `.mind-cylinder`），三态因此只改变量、不换结构。
+      -->
+      <svg
+        v-else-if="shape === 'cylinder'"
+        class="cylinder-svg"
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+        aria-hidden="true"
+      >
+        <path class="cylinder-body" :d="CYL_BODY" />
+        <path class="cylinder-lid" :d="CYL_LID" />
+      </svg>
 
       <input
         v-if="editing"

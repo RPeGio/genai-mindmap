@@ -116,7 +116,7 @@ export function isFlow(content: DiagramContent): content is FlowContent {
 export type NodeRole = NonNullable<MindNode['role']>;
 
 /** 画布上这个节点该长什么样。缺省 `rect` 就是加形状之前的样子。 */
-export type NodeShape = 'rect' | 'diamond' | 'pill';
+export type NodeShape = 'rect' | 'diamond' | 'pill' | 'parallelogram' | 'cylinder';
 
 /**
  * `role` → 画布形状。**只有流程图会走到这里**（判据在 `stores/mindmap.ts`：布局
@@ -126,10 +126,16 @@ export type NodeShape = 'rect' | 'diamond' | 'pill';
  * 判定画菱形是教科书约定：菱形本身就说明"这里有两条以上的出口"。`start` / `end`
  * 画成胶囊（大圆角），但不画菱形——它们是**端点**，不是分叉点，两者在流程图上
  * 共用一种形状会让读图的人以为起点也要选一条路走。
+ *
+ * `data` 是平行四边形、`database` 是圆柱：这两个是"数据流"那一族，与"干活"那一族
+ * （矩形 / 菱形 / 胶囊）在轮廓上就能分开——斜边和圆柱的顶面弧线都是**一眼可辨**
+ * 的方向性特征，不像"再圆一点的矩形"那种要靠比较才看得出来。
  */
 export function nodeShapeOf(role: NodeRole | null | undefined): NodeShape {
   if (role === 'decision') return 'diamond';
   if (role === 'start' || role === 'end') return 'pill';
+  if (role === 'data') return 'parallelogram';
+  if (role === 'database') return 'cylinder';
   return 'rect';
 }
 

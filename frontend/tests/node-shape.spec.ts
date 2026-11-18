@@ -3,7 +3,14 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { FlowContent, MindMapContent, MindNode } from '../src/api/types';
-import { DECISION_SHAPE_NOTE, DECISION_SIZE, flowNodeSize, layoutFlow } from '../src/canvas/layout/flow';
+import {
+  DATA_SIZE,
+  DATABASE_SIZE,
+  DECISION_SHAPE_NOTE,
+  DECISION_SIZE,
+  flowNodeSize,
+  layoutFlow,
+} from '../src/canvas/layout/flow';
 import { NODE_SIZE } from '../src/canvas/layout/tidy';
 import { layoutDiagram } from '../src/canvas/layout';
 import MindNodeComponent from '../src/canvas/MindNode.vue';
@@ -55,8 +62,34 @@ function flowContent(): FlowContent {
   };
 }
 
-function treeContent(): MindMapContent {
+/**
+ * 一张带"读库 / 写库 / 录入"的流程图：数据形状（平行四边形）+ 存储形状（圆柱）
+ * 与普通步骤并排，用来验证三件事——形状、外接框、以及普通步骤没被带跑。
+ */
+function dataFlowContent(): FlowContent {
   return {
+    title: '报销审批',
+    diagram_type: 'flowchart',
+    stages: [
+      {
+        id: 's1',
+        root: {
+          id: 'a', label: '提交申请', role: 'start',
+          children: [
+            // 标题故意用满 16 字的两行标题：斜边与椭圆要是算错了宽度，这里第一个裁。
+            leaf('in', '录入报销单与发票金额共十六个字', 'data'),
+            leaf('db', '写入审批台账并归档原始凭证', 'database'),
+            leaf('plain', '核对预算余额'),
+          ],
+        },
+      },
+      { id: 's2', root: { id: 'b', label: '付款', role: 'end', children: [] } },
+    ],
+    edges: [{ id: 'stage', source: 's1', target: 's2', kind: 'flow' }],
+  };
+}
+
+function treeContent(): MindMapContent {  return {
     title: '树',
     root: {
       id: 'r', label: '根',
@@ -77,6 +110,42 @@ describe('role → 外接框', () => {
     for (const role of roles) {
       expect(flowNodeSize(role)).toBe(NODE_SIZE);
     }
+  });
+
+  it('data 比 NODE_SIZE 宽、database 比它高（两种新形状各有各的外接框）', () => {
+    expect(flowNodeSize('data')).toBe(DATA_SIZE);
+    expect(flowNodeSize('database')).toBe(DATABASE_SIZE);
+    // 平行四边形：斜边吃掉左右各 20%，所以宽度必须比矩形大（算术见断言下一条）。
+    expect(DATA_SIZE.width).toBeGreaterThan(NODE_SIZE.width);
+    expect(DATA_SIZE.height).toBe(NODE_SIZE.height);
+    // 圆柱：上下两个椭圆吃掉高度，所以它必须比矩形高。
+    expect(DATABASE_SIZE.height).toBeGreaterThan(NODE_SIZE.height);
+    expect(DATABASE_SIZE.width).toBeGreaterThan(NODE_SIZE.width);
+  });
+
+  it('平行四边形与圆柱的可用文字区都够放 16 字的两行标题', () => {
+    const LINES = 2;
+    const LINE_HEIGHT = 17.5;          // `leading-tight` 下的行高（14px 字号）
+    const textHeight = LINES * LINE_HEIGHT;
+
+    // 平行四边形：`polygon(20% 0, 100% 0, 80% 100%, 0 100%)` 下，居中文字块的
+    // 可用宽度 = `W·(0.8 − 0.2·h/H)`（推导见 `flow.ts::DATA_SIZE`）。
+    const paraWidth = (size: { width: number; height: number }) =>
+      size.width * (0.8 - 0.2 * (textHeight / size.height));
+    // 每行能放几个汉字（`text-sm` 下一个汉字约 14px）。16 字的两行标题 = 8 字/行。
+    const perLine = (size: { width: number; height: number }) => paraWidth(size) / 14;
+    expect(perLine(DATA_SIZE)).toBeGreaterThanOrEqual(10);
+    // 同样两行字放在 180×48 的平行四边形里只剩 8.4 字/行：**刚好卡住、一点余量都
+    // 没有**（中文换行不按字切，标点带避头尾，实际会裁）。这正是它要比 `NODE_SIZE`
+    // 宽的理由，不是审美偏好。
+    expect(perLine(NODE_SIZE)).toBeLessThan(9);
+
+    // 圆柱：文字只能落在两个椭圆之间的矩形带里，可用高度 = `H·(1 − 0.4)`（椭圆
+    // 半高取 H 的 10%，见 `styles.css::.mind-cylinder`）。
+    const bandHeight = (size: { width: number; height: number }) => size.height * 0.6;
+    expect(bandHeight(DATABASE_SIZE)).toBeGreaterThan(textHeight);
+    // 反过来：220×48 的圆柱只剩 28.8px，装不下 35px 的两行。
+    expect(bandHeight(NODE_SIZE)).toBeLessThan(textHeight);
   });
 
   it('NODE_SIZE 一个字都没动（树与鱼骨的布局常量）', () => {
@@ -175,6 +244,15 @@ describe('nodeShapeOf：形状只认 role', () => {
     expect(nodeShapeOf(undefined)).toBe('rect');
   });
 
+  it('data 是平行四边形、database 是圆柱（画布上的形状名与 role 一一对上）', () => {
+    expect(nodeShapeOf('data')).toBe('parallelogram');
+    expect(nodeShapeOf('database')).toBe('cylinder');
+    // 数据形状不能退回矩形：那样"这一步在存数据"就完全看不出来了，而它们正是
+    // 补这两个角色的全部理由。
+    expect(nodeShapeOf('data')).not.toBe('rect');
+    expect(nodeShapeOf('database')).not.toBe('rect');
+  });
+
   it('起点/终点不是菱形：它们没有分叉，画成菱形会读成"这里要选一条路"', () => {
     expect(nodeShapeOf('start')).not.toBe('diamond');
     expect(nodeShapeOf('end')).not.toBe('diamond');
@@ -222,6 +300,34 @@ describe('画布：流程图里 role 真的变成形状', () => {
     expect(byId.get('a2')!.shape).toBe('rect');
   });
 
+  it('数据节点拿到平行四边形 / 圆柱与各自的外接框，位置按新框居中', () => {
+    const content = dataFlowContent();
+    const store = useMindMapStore();
+    store.preview(content, 'right');
+    const byId = new Map(store.nodes.map(item => [item.id, item]));
+    expect(byId.get('in')!.data!.shape).toBe('parallelogram');
+    expect(byId.get('in')!.data!.size).toEqual(DATA_SIZE);
+    expect(byId.get('db')!.data!.shape).toBe('cylinder');
+    expect(byId.get('db')!.data!.size).toEqual(DATABASE_SIZE);
+
+    // 位置是左上角 = 中心 − 半个**自己那个**外接框。用 `NODE_SIZE` 算会偏
+    // (220−180)/2 = 20px（横向）与 (68−48)/2 = 10px（纵向），而连线按中心画
+    // ——表现是"线从节点外面擦过去"。
+    const layout = layoutDiagram({
+      root: canvasTreeOf(content).root,
+      edges: canvasStageEdgesOf(content),
+      diagramType: 'flowchart',
+    });
+    for (const [id, size] of [['in', DATA_SIZE], ['db', DATABASE_SIZE]] as const) {
+      const center = layout.positions.get(id)!;
+      expect(byId.get(id)!.position.x).toBeCloseTo(center.x - size.width / 2, 9);
+      expect(byId.get(id)!.position.y).toBeCloseTo(center.y - size.height / 2, 9);
+    }
+    // 同一张图里的普通步骤仍然是 180×48。
+    expect(byId.get('plain')!.data!.shape).toBe('rect');
+    expect(byId.get('plain')!.data!.size).toEqual(NODE_SIZE);
+  });
+
   it('合成根（图标题）不带 role：形状只认内容里的 role', () => {
     const tree = canvasTreeOf(flowContent());
     expect(tree.root.id).toBe(CANVAS_ROOT_ID);
@@ -264,7 +370,7 @@ describe('画布：流程图里 role 真的变成形状', () => {
   });
 });
 
-describe('MindNode：三种形状的 DOM', () => {
+describe('MindNode：五种形状的 DOM', () => {
   function data(over: Partial<MindNodeData> = {}): MindNodeData {
     return {
       label: '材料齐全吗', body: '材料齐全吗', fullLabel: '材料齐全吗',
@@ -276,8 +382,7 @@ describe('MindNode：三种形状的 DOM', () => {
     return mount(MindNodeComponent, { props: { id: 'n', data: data(over) } });
   }
 
-  it('菱形节点挂三层 clip-path 背景，文字仍在原来那个 span 里', () => {
-    const wrapper = mountNode({ shape: 'diamond', size: DECISION_SIZE, role: 'decision' });
+  it('菱形节点挂三层 clip-path 背景，文字仍在原来那个 span 里', () => {    const wrapper = mountNode({ shape: 'diamond', size: DECISION_SIZE, role: 'decision' });
     const cell = wrapper.find('[data-node-shape="diamond"]');
     expect(cell.exists()).toBe(true);
     expect(cell.findAll('.diamond-layer')).toHaveLength(3);
@@ -353,5 +458,72 @@ describe('MindNode：三种形状的 DOM', () => {
     expect(cell.find('input').exists()).toBe(true);
     // 引用角标挂在**外层**容器上（`relative`），所以在菱形之外、不会被裁。
     expect(wrapper.find('[title="2 处来源引用"]').exists()).toBe(true);
+  });
+
+  it('平行四边形：三层同形背景 + 自己的外接框 + 文字仍是框的直接子元素', () => {
+    const wrapper = mountNode({ shape: 'parallelogram', size: DATA_SIZE, role: 'data' });
+    const cell = wrapper.find('[data-node-shape="parallelogram"]');
+    expect(cell.exists()).toBe(true);
+    expect(cell.classes()).toContain('mind-parallelogram');
+    // 与菱形同一套三层结构：`clip-path` 会把 border / ring / box-shadow 一起裁掉。
+    expect(cell.findAll('.parallelogram-layer')).toHaveLength(3);
+    expect(cell.find('.parallelogram-glow').exists()).toBe(true);
+    expect(cell.find('.parallelogram-stroke').exists()).toBe(true);
+    expect(cell.find('.parallelogram-fill').exists()).toBe(true);
+    // 文字没被搬进别的层，也没挂 `TONE_CLASS` 的 border/bg（那些会被裁掉）。
+    const text = cell.find('.line-clamp-2');
+    expect((text.element as HTMLElement).parentElement).toBe(cell.element);
+    expect(cell.classes()).not.toContain('border');
+    expect(cell.classes()).not.toContain('bg-white');
+    // 外接框是 DATA_SIZE。
+    expect((cell.element as HTMLElement).style.width).toBe(`${DATA_SIZE.width}px`);
+    expect((cell.element as HTMLElement).style.height).toBe(`${DATA_SIZE.height}px`);
+  });
+
+  it('圆柱：SVG 两条 path（轮廓 + 顶面下弧）+ 自己的外接框', () => {
+    const wrapper = mountNode({ shape: 'cylinder', size: DATABASE_SIZE, role: 'database' });
+    const cell = wrapper.find('[data-node-shape="cylinder"]');
+    expect(cell.exists()).toBe(true);
+    expect(cell.classes()).toContain('mind-cylinder');
+    // 轮廓与盖沿是两条独立 path：只有轮廓时那是一个压扁的药丸，读不出"存储"。
+    const svg = cell.find('svg.cylinder-svg');
+    expect(svg.exists()).toBe(true);
+    expect(svg.find('path.cylinder-body').exists()).toBe(true);
+    expect(svg.find('path.cylinder-lid').exists()).toBe(true);
+    // `preserveAspectRatio="none"` 是随外接框拉伸的前提。
+    expect(svg.attributes('preserveAspectRatio')).toBe('none');
+    // 两条 path 的 `d` 都不是空的（贝塞尔近似椭圆，不用 A 命令）。
+    expect((svg.find('path.cylinder-body').element as SVGPathElement)
+      .getAttribute('d')).toContain('C');
+    const text = cell.find('.line-clamp-2');
+    expect((text.element as HTMLElement).parentElement).toBe(cell.element);
+    expect((cell.element as HTMLElement).style.height).toBe(`${DATABASE_SIZE.height}px`);
+  });
+
+  it('三态在平行四边形与圆柱上都找得到（改的是变量，不是结构）', () => {
+    const tones = [
+      { over: {}, tone: 'default' },
+      { over: { selected: true } as Partial<MindNodeData>, tone: 'selected' },
+      { over: { changed: true }, tone: 'changed' },
+      { over: { draft: 'preview' as const }, tone: 'preview' },
+    ];
+    for (const shape of ['parallelogram', 'cylinder'] as const) {
+      for (const { over, tone } of tones) {
+        const wrapper = mount(MindNodeComponent, {
+          props: {
+            id: 'n',
+            data: data({ shape, size: DATA_SIZE, ...over }),
+            selected: Boolean((over as { selected?: boolean }).selected),
+          },
+        });
+        const cell = wrapper.find(`[data-node-shape="${shape}"]`);
+        expect(cell.attributes('data-shape-tone')).toBe(tone);
+        // 描边层 / 轮廓 path 在每种 tone 下都必须存在——它们是唯一的框。
+        const stroke = shape === 'parallelogram'
+          ? cell.find('.parallelogram-stroke')
+          : cell.find('path.cylinder-body');
+        expect(stroke.exists()).toBe(true);
+      }
+    }
   });
 });

@@ -247,3 +247,205 @@ body {
   }
 }
 
+
+/*
+ * 平行四边形的输入 / 输出节点（`MindNode.vue` 的 `data-node-shape="parallelogram"`）。
+ *
+ * 与菱形**同一个思路**：`clip-path` 会把 `border` / `border-radius` / `ring` /
+ * `box-shadow` 一起裁掉，所以框本身由三层同形状的路径叠出来（外环光晕、描边、
+ * 填充），三态只改变量、不换结构。差别只有那条 `polygon`：
+ *
+ *     polygon(20% 0%, 100% 0%, 80% 100%, 0% 100%)
+ *
+ * 斜边吃掉左右各 20% 的宽度，所以文字可用宽度必须重新算过，见
+ * `canvas/layout/flow.ts::DATA_SIZE`：220×48 时两行文字的可用宽度是
+ * `220 × (0.8 − 0.2×35/48) ≈ 143.9px`，这里取 64%（≈140.8px）留一档余量。
+ *
+ * ## 句柄与斜边
+ *
+ * 菱形的四个顶点正好落在外接框四条边的中点，所以连线天然从顶点进出。平行四边形
+ * 不是：它左右两条斜边的中点在 `x = 10%` / `90%`，而句柄在 `0%` / `100%`。上下
+ * 两个句柄仍然落在顶边（`x∈[20%,100%]`）与底边（`x∈[0%,80%]`）的实体内，而流程图
+ * 是 `rankdir: TB` 的（`layout/flow.ts` 报 `direction: 'down'`），父子线走上下句柄
+ * ——左右句柄只在跨阶段的回退边里出现，那一点点间隙不值得为它改 Vue Flow 的句柄
+ * 定位（改错了会让所有形状的连线一起偏）。
+ */
+.mind-parallelogram {
+  --shape-stroke: #cbd5e1;
+  --shape-fill: var(--mind-color-surface);
+  --shape-inset: 2px;
+  --shape-glow: transparent;
+  --shape-glow-spread: 0px;
+  --shape-text: #334155;
+  position: relative;
+  isolation: isolate;
+  text-align: center;
+}
+
+.mind-parallelogram .parallelogram-layer {
+  position: absolute;
+  clip-path: polygon(20% 0%, 100% 0%, 80% 100%, 0% 100%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.mind-parallelogram .parallelogram-glow {
+  inset: calc(-1 * var(--shape-glow-spread));
+  background: var(--shape-glow);
+  transition: inset 120ms ease-out;
+}
+
+.mind-parallelogram .parallelogram-stroke {
+  inset: 0;
+  background: var(--shape-stroke);
+}
+
+.mind-parallelogram .parallelogram-fill {
+  inset: var(--shape-inset);
+  background: var(--shape-fill);
+}
+
+.mind-parallelogram > .line-clamp-2,
+.mind-parallelogram > input {
+  position: relative;
+  z-index: 1;
+  max-width: 64%;
+  margin-inline: auto;
+  color: var(--shape-text);
+}
+
+/*
+ * 圆柱（数据库 / 存储）。轮廓与顶面弧线是**两条 SVG path**，不是 CSS 圆角：
+ * `border-radius: 50% / 12%` 能画出"上下是弧、两侧竖直"的轮廓，但画不出顶面椭圆
+ * 的下半弧——没有那道弧，它看起来只是个压扁的药丸，读者不会读成"存数据的框"。
+ *
+ * 三层语义与菱形一致，只是实现换了：
+ *   - 描边 = `stroke`（不再是"外框当描边色"），所以**加粗描边不需要 `inset`**；
+ *   - 光晕  = `filter: drop-shadow()`，它跟着形状轮廓走，而且**不会**被裁掉
+ *            （菱形那边 `box-shadow` 会被 `clip-path` 吃掉，这里没有这个问题）；
+ *   - 三态  = 只改 `--shape-stroke` / `--shape-width` / `--shape-glow`。
+ *
+ * `vector-effect: non-scaling-stroke` 是必须的：`viewBox="0 0 100 100"` 被拉伸到
+ * 220×68，不加这一条时描边在横向与纵向会得到两个不同的像素宽度（左右 1.5px、
+ * 上下 0.46px），上下两条边看着像没画。
+ */
+.mind-cylinder {
+  --shape-stroke: #cbd5e1;
+  --shape-fill: var(--mind-color-surface);
+  --shape-width: 1.5px;
+  --shape-glow: transparent;
+  --shape-glow-blur: 0px;
+  --shape-text: #334155;
+  position: relative;
+  isolation: isolate;
+  text-align: center;
+}
+
+.mind-cylinder .cylinder-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
+  overflow: visible;
+  /* 光晕挂在 **SVG 上**，不是挂在这个盒子上：`filter` 会把影子一起投给所有后代，
+     挂在盒子上时连标题文字都会带一圈琥珀色。 */
+  filter: drop-shadow(0 0 var(--shape-glow-blur) var(--shape-glow));
+  transition: filter 120ms ease-out;
+}
+
+.mind-cylinder .cylinder-body {
+  fill: var(--shape-fill);
+  stroke: var(--shape-stroke);
+  stroke-width: var(--shape-width);
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+/* 顶面椭圆的下半弧：圆柱的"盖沿"。它比轮廓细一点——那条线是**内部折线**，
+   与轮廓同粗细会让顶面看起来是两张纸叠在一起。 */
+.mind-cylinder .cylinder-lid {
+  fill: none;
+  stroke: var(--shape-stroke);
+  stroke-width: var(--shape-width);
+  vector-effect: non-scaling-stroke;
+  opacity: 0.75;
+}
+
+/* 文字落在两个椭圆之间的矩形带里。78% 的理由见 `flow.ts::DATABASE_SIZE`：
+   220 × 78% ≈ 171.6px（约 12 字/行），而且这个宽度在顶弧下沿处仍然安全。 */
+.mind-cylinder > .line-clamp-2,
+.mind-cylinder > input {
+  position: relative;
+  z-index: 1;
+  max-width: 78%;
+  margin-inline: auto;
+  color: var(--shape-text);
+}
+
+/* 语义色染描边（**不染填充**，理由与菱形一致：框里要写字，淡底由 tone 决定过）。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-node-color] {
+  --shape-stroke: var(--mind-node-accent);
+}
+
+/* 深度 0 = 根 / 流程图顶端：实心深底，与矩形、菱形同一套语言。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="root"] {
+  --shape-stroke: #0f172a;
+  --shape-fill: #0f172a;
+  --shape-text: #ffffff;
+}
+
+/* 预览草稿：`clip-path` / SVG 都没有 `stroke-dasharray` 的直接等价物（可以有，
+   但虚线框在预览里与矩形的 `border-dashed` 不同源），所以与菱形一样用"更淡的
+   描边 + 更透的整体"。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="preview"] {
+  --shape-stroke: #cbd5e1;
+  opacity: 0.6;
+}
+
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="preview-leaf"] {
+  --shape-stroke: #e2e8f0;
+  opacity: 0.4;
+}
+
+/* 选中：描边变深、变粗。平行四边形的"变粗"是 `--shape-inset` 变小（环变厚），
+   圆柱的是 `--shape-width` 变大——同一个语义，两种实现各用自己那套。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="selected"] {
+  --shape-stroke: #0f172a;
+  --shape-inset: 3px;
+  --shape-width: 2.5px;
+}
+
+/* 改动过的节点：琥珀色描边 + 一圈琥珀光晕（菱形那边是外扩层，这里用 drop-shadow）。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="changed"] {
+  --shape-stroke: #d97706;
+  --shape-glow: rgba(251, 191, 36, 0.55);
+  --shape-glow-spread: 5px;
+  --shape-glow-blur: 5px;
+}
+
+/* 悬停：只加光晕、不换描边色——换色会和选中 / 改动的颜色打架，而悬停是临时状态。 */
+:is(.mind-parallelogram, .mind-cylinder):hover {
+  --shape-glow: rgba(100, 116, 139, 0.35);
+  --shape-glow-spread: 4px;
+  --shape-glow-blur: 4px;
+}
+
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="changed"]:hover {
+  --shape-glow: rgba(251, 191, 36, 0.75);
+  --shape-glow-spread: 6px;
+  --shape-glow-blur: 6px;
+}
+
+/* 暗色主题：描边跟着底色走，否则白底一换，浅描边就消失了。 */
+@media (prefers-color-scheme: dark) {
+  :is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="root"] {
+    --shape-stroke: #e2e8f0;
+    --shape-fill: #0f172a;
+  }
+
+  :is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="selected"] {
+    --shape-stroke: #e2e8f0;
+  }
+}

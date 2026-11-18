@@ -55,9 +55,62 @@ export interface NodeSize {
  */
 export const DECISION_SIZE = { width: 220, height: 110 } as const;
 
-/** role → 外接框。除判定节点之外一律是 `NODE_SIZE`（= 与加菱形之前逐像素相同）。 */
+/**
+ * `role="data"`（平行四边形）的外接框。**只有流程图用，`NODE_SIZE` 一个字都不动。**
+ *
+ * 平行四边形是**斜边吃掉左右各 20%** 的形状，所以它比矩形更费宽度。算术（斜边
+ * 取 `polygon(20% 0, 100% 0, 80% 100%, 0 100%)`，于是左边界 = `0.2W·(1 − y/H)`、
+ * 右边界 = `W·(1 − 0.2·y/H)`）：
+ *
+ *   文字块高 `h`（两行 `leading-tight` ≈ 35px）垂直居中，占 `y ∈ [(H−h)/2, (H+h)/2]`。
+ *   左边界随 y **递减**，所以最紧的位置在文字块**顶边**：`w/2 ≤ 0.5W − 0.2W·(1 − y₁/H)`；
+ *   右边界同样递减，最紧的位置在**底边**：`w/2 ≤ W·(1 − 0.2·y₂/H) − 0.5W`。
+ *   两式化简后相等（因为文字块居中），可用宽度
+ *
+ *       `w ≤ W·(0.8 − 0.2·h/H)`
+ *
+ *   把 `W = 180`（`NODE_SIZE`）、`H = 48`、`h = 35` 代进去只有 **117.8px**——约
+ *   8.4 个汉字/行，两行放得下 16 字上限**但一点余量都没有**（换行不按字切，实际
+ *   会裁）。这就是它必须比 `NODE_SIZE` 宽的理由，不是审美。
+ *
+ * 220×48：`w ≤ 220 × (0.8 − 0.2×35/48) ≈ 143.9px`（约 10.3 字/行，两行 20 字，
+ * 对 16 字上限有一档余量）。宽度与 `DECISION_SIZE` 一致（流程图上的大框同宽，
+ * 视觉整齐），高度**故意留在 48**：平行四边形不吃垂直空间，dagre 的层间距
+ * （`RANKSEP`）因此与加形状之前完全一样。
+ */
+export const DATA_SIZE = { width: 220, height: 48 } as const;
+
+/**
+ * `role="database"`（圆柱）的外接框。**只有流程图用，`NODE_SIZE` 一个字都不动。**
+ *
+ * 圆柱的顶/底是两个椭圆弧，各占 `2e` 的视觉高度（`e` = 椭圆半高，`styles.css`
+ * 里取 `H` 的 10%）。文字块只能落在两个椭圆之间的那段矩形带里：
+ *
+ *       `可用高度 = H − 2·(2e) = H·(1 − 0.4)`
+ *
+ * 220×48 的话只剩 **28.8px < 35px**（两行文字）——当场裁字。所以高度必须加：
+ *
+ * 220×68：`可用高度 = 68 × 0.6 = 40.8px`，两行 35px 上下各余 2.9px；宽度方向
+ * 两侧是竖直的，文字可以放到 78%（`220 × 0.78 = 171.6px`，约 12 字/行），
+ * 而且那个宽度在顶弧下沿处仍然安全（弧在 `x = 0.5W ± 0.39W` 处只到 `y ≈ 11px`，
+ * 文字块顶边在 `y = 16.5px`）。
+ *
+ * 68 而不是 64：64 时上下余量只剩 1.7px，字号的任何一点浮动都会压到弧线上。
+ */
+export const DATABASE_SIZE = { width: 220, height: 68 } as const;
+
+/**
+ * role → 外接框。除三种非矩形之外一律是 `NODE_SIZE`（= 与加形状之前逐像素相同）。
+ *
+ * `NODE_SIZE` 是布局与渲染共读的一份尺寸（`tidy.ts` 导出，树与鱼骨都在读），
+ * 所以新形状一律在这里给**自己的一份**，通过 `layoutFlow` 的 `sizes` 出参交给
+ * 渲染层。树与鱼骨仍然只读 `NODE_SIZE`，逐像素不变。
+ */
 export function flowNodeSize(role: MindNode['role']): NodeSize {
-  return role === 'decision' ? DECISION_SIZE : NODE_SIZE;
+  if (role === 'decision') return DECISION_SIZE;
+  if (role === 'data') return DATA_SIZE;
+  if (role === 'database') return DATABASE_SIZE;
+  return NODE_SIZE;
 }
 
 export interface FlowLayout extends LayoutResult {
