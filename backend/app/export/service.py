@@ -441,7 +441,12 @@ def _puml_fishbone(content: FishboneContent) -> str:
 
 
 def _markdown_fishbone(content: FishboneContent) -> str:
-    """鱼骨图 → Markdown 大纲。骨用一级列表，原因按缩进分层。
+    """鱼骨图 → Markdown 大纲。骨是鱼头的**子项**，原因再按缩进分层。
+
+    骨与原因必须是**两级不同的缩进**（`  - 人` / `    - 审批的人不在`）。此前两者
+    都写成顶格列表项（`- 人` 与 `    - 原因` 之间只差原因的缩进），普通 Markdown
+    阅读器把鱼头与六根骨画成**同一级**的七个要点——读起来不是"一条鱼"，是"七条
+    并列笔记"。缩进一改，层级就是阅读器自己算出来的，不依赖谁去数。
 
     第二行是形状标记（见 `shape_marker`）：缩进能表达"谁挂在谁下面"，表达不了
     "这几条是骨"。标记让导入侧不必猜。
@@ -452,13 +457,9 @@ def _markdown_fishbone(content: FishboneContent) -> str:
         "",
     ]
     for depth, text, detail in _fishbone_lines(content):
-        if depth == 0:
-            lines.append(f"- {_escape_markdown(text)}")
-            lines += _markdown_quote(detail, "  ")
-        else:
-            pad = "  " * (depth - 1)
-            lines.append(f"{pad}- {_escape_markdown(text)}")
-            lines += _markdown_quote(detail, pad + "  ")
+        pad = "  " * depth
+        lines.append(f"{pad}- {_escape_markdown(text)}")
+        lines += _markdown_quote(detail, pad + "  ")
     return "\n".join(lines) + "\n"
 
 

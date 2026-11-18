@@ -406,6 +406,52 @@ class DetailExportTest(unittest.TestCase):
         self.assertIn('_note="两位主程同时不在"', to_opml(fishbone))
 
 
+class FishboneIndentationTest(unittest.TestCase):
+    """P2-⑦：鱼头、骨、原因必须是三级不同的缩进。
+
+    早先骨与鱼头都是顶格列表项（`- 为什么…` 与 `- 人`），普通 Markdown 阅读器把
+    它们画成**同一级**的七个要点——读起来不是"一条鱼"，是"七条并列笔记"。
+    """
+
+    def content(self):
+        from app.contracts.mindmap import FishboneContent
+        return FishboneContent.model_validate({
+            "title": "报销慢的原因分析",
+            "problem": "为什么报销要 11 天",
+            "bones": [
+                {"category": "人", "root": {"id": "b1", "label": "人", "children": [
+                    {"id": "c1", "label": "审批的人不在"},
+                    {"id": "c2", "label": "交接不完整", "children": [
+                        {"id": "c21", "label": "没写清谁接手"}]},
+                ]}},
+                {"category": "机", "root": {"id": "b2", "label": "机"}},
+            ],
+        })
+
+    def test_head_bone_and_cause_are_three_levels(self):
+        lines = [line for line in to_markdown(self.content()).splitlines()
+                 if line.strip() and not line.startswith(("#", "<!--"))]
+        self.assertEqual(lines, [
+            "- 为什么报销要 11 天",
+            "  - 人",
+            "    - 审批的人不在",
+            "    - 交接不完整",
+            "      - 没写清谁接手",
+            "  - 机",
+        ])
+
+    def test_every_bone_is_deeper_than_the_head(self):
+        """判据是**每根骨都比鱼头深**，不是"有这么几行"：漏了缩进时上一行对比的
+        结果就是那句"七个同级要点"。"""
+        lines = [line for line in to_markdown(self.content()).splitlines()
+                 if line.strip() and not line.startswith(("#", "<!--"))]
+        head = next(line for line in lines if "为什么报销要 11 天" in line)
+        bones = [line for line in lines if line.strip().endswith(("- 人", "- 机"))]
+        self.assertTrue(bones)
+        for bone in bones:
+            self.assertGreater(len(bone) - len(bone.lstrip()), len(head) - len(head.lstrip()))
+
+
 class ByteIdenticalTest(unittest.TestCase):
     """三种既有格式的输出**逐字节**钉死。
 
