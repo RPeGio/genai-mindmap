@@ -55,18 +55,24 @@ from app.agent.ops import (
     normalize_ops,
 )
 from app.agent.stream_items import StreamItem, closed_items
+from app.agent import shapes  # 三种图型的结构适配（遍历 / 定位 / 出口转换）
 from app.contracts import mindmap as mindmap_contract
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import (
     EDGE_KINDS,
+    FISHBONE_CATEGORIES,
     GENERATED_LABEL_MAX_CHARS,
     MAX_EDGE_LABEL_CHARS,
     MAX_EDGES,
+    MAX_FISHBONE_BONES,
+    MAX_FISHBONE_PROBLEM_CHARS,
     MAX_NODE_DETAIL_CHARS,
     MAX_NODE_ICON_CHARS,
     MAX_TREE_NODES,
     NODE_COLORS,
+    DiagramContent,
     Edge,
+    FishboneContent,
     MindMapContent,
     Node,
     clip_label,
@@ -1163,6 +1169,28 @@ def _skeleton_branches(raw: Any) -> list[_SkeletonBranch]:
 def _skeleton_titles(raw: Any) -> list[str]:
     """只要标题时的便捷入口（诊断、用例与旧调用方读它）。"""
     return [branch.label for branch in _skeleton_branches(raw)]
+
+
+def _skeleton_problem(raw: Any) -> str | None:
+    """鱼骨图骨架里的 `problem`：主骨上那句「为什么 X 会 Y」。
+
+    只接受**字符串**，折空白后按 `MAX_FISHBONE_PROBLEM_CHARS` 截断；其余一律
+    `None`。不在这里判"像不像一句主骨陈述"——那是实测要回答的问题（`docs/` 里
+    那份对比表），而代码在生成路径上做语义判断的后果是："模型写得不够好"被报成
+    "这次生成失败"。
+
+    `None` 与"空串"对调用方是同一件事：这一版没有论点。兜底与诊断在 `_generate`
+    的出口那一段（`_fishbone_problem`），因为那里才知道 title 是什么。
+    """
+    if not isinstance(raw, dict):
+        return None
+    text = raw.get("problem")
+    if not isinstance(text, str):
+        return None
+    folded = " ".join(text.split())
+    if not folded:
+        return None
+    return folded[:MAX_FISHBONE_PROBLEM_CHARS]
 
 
 @dataclass(frozen=True)
@@ -2431,25 +2459,44 @@ FLOW_PLAN_PROMPT = (
 # 换一套分类，画出来就不再是鱼骨图。代码侧只做"忽略 edges"，不做"校验是不是
 # 正好这六条"——模型偶尔多给一条（比如把"测"拆成"测量"与"测试"）不该判失败，
 # 而少给一条时用户自己加更便宜。
+#
+# 骨架**还要产出主骨上那句话**（`problem`）。它是鱼骨图与思维导图最实质的一处
+# 差别：鱼头写的是一个"为什么会这样"的问题，六根骨回答它；而 `title` 是文件名
+# （"报销慢的原因分析"）。不要求模型写这一句时，产物里没有任何地方能放它，
+# 画布上的鱼头只能复读标题——那正是这一版要消灭的形状。
 FISHBONE_PLAN_PROMPT = (
     "你在为一张**鱼骨图（因果分析）**只定骨架，不写任何子要点。"
     "只返回一个 JSON 对象，不要代码围栏，格式为 "
-    '{"branches":[{"label":"人","color":"blue","icon":"👤"},'
+    '{"problem":"为什么新员工要三个月才独立上岗",'
+    '"branches":[{"label":"人","color":"blue","icon":"👤"},'
     '{"label":"机","color":"teal","icon":"⚙️"},'
     '{"label":"料","color":"amber","icon":"📦"},'
     '{"label":"法","color":"purple","icon":"📐"},'
     '{"label":"环","color":"green","icon":"🌐"},'
     '{"label":"测","color":"red","icon":"📏"}]}。'
+    # problem 的三条硬规矩，每条都对应一种真实会写歪的形态：复读标题（等于没有
+    # 论点）、写成名词短语（"报销慢的原因"没有"为什么"）、写成一句分析结论
+    # （"因为审批链太长"把答案写进了问题里，六根骨就没得分析了）。
+    "problem 是**主骨上那一句**：一个「为什么 X 会 Y」的疑问句，40 字以内，不带句号。"
+    "它不是主题的重写——主题是这张图叫什么（用于文件名），problem 是这张图要回答的"
+    "那个问题；**不要复读主题**。也不要写成一句结论或原因（「因为审批链太长」是答案，"
+    "不是问题），不要写成名词短语（「报销慢的原因」缺了「为什么」）。"
     "一级分支**必须正好是这六个类别**，顺序也照这个：人 / 机 / 料 / 法 / 环 / 测，"
     "每条不超过一个字到两个字，不要改写成别的话题分类。"
     "**不要输出 edges**：鱼骨图的关系全部由层级表达，多画线只会把图弄乱。"
     f"color 只能取 {' / '.join(NODE_COLORS)} 之一；"
     f"icon 是**一个** emoji，不超过 {MAX_NODE_ICON_CHARS} 个字符。"
     "✅ 正确："
-    '{"branches":[{"label":"人","color":"blue"},{"label":"机","color":"teal"}]}'
+    '{"problem":"为什么设备故障停机时间一直降不下来",'
+    '"branches":[{"label":"人","color":"blue"},{"label":"机","color":"teal"}]}'
     "❌ 错误："
-    '{"branches":[{"label":"人员管理"},{"label":"设备维护"}]}'
-    "（改成了话题分类，不是固定类别）"
+    '{"problem":"设备故障停机分析",'
+    '"branches":[{"label":"人员管理"},{"label":"设备维护"}]}'
+    "（problem 写成了名词短语，一级分支改成了话题分类，都不是固定类别）"
+    "❌ 错误："
+    '{"problem":"因为保养计划执行不到位",'
+    '"branches":[{"label":"人"},{"label":"机"}]}'
+    "（problem 写成了原因/结论；六类也只给了两类，六类缺一不可）"
 )
 
 # 骨架提示词里那段"材料自带的章节"的表头。测试用它断言"目录拼进去了没有"，
@@ -2556,7 +2603,10 @@ def _plan_ask(
             "这次是流程图：一级分支按**执行先后**排列，每条是一个流程阶段；"
             "有判断出口或回退时，用 edges 补上（source/target 写序号或 \"root\"）。")
     elif diagram_type == "fishbone":
-        parts.append("这次是鱼骨图：一级分支固定为人 / 机 / 料 / 法 / 环 / 测 六条，不要输出 edges。")
+        parts.append(
+            "这次是鱼骨图：一级分支固定为人 / 机 / 料 / 法 / 环 / 测 六条，不要输出 edges；"
+            "同时给出 problem——**主骨上那一句**「为什么 X 会 Y」，40 字以内，"
+            "不要复读主题，也不要写成原因或名词短语。")
     return "\n".join(parts)
 
 
@@ -2732,6 +2782,27 @@ _GROUPED_ROOT_RULE = (
     "分支下面只写一层要点，不要再往下拆。"
 )
 GROUPED_TREE_RULES = _GROUPED_ROOT_RULE + _SKELETON_BODY
+
+# ---- 鱼骨图的结构规则 ---------------------------------------------------------
+#
+# 鱼骨图上"骨下面挂的是什么"有唯一正确的答案：**原因**。模型最常见的写歪方式是把
+# 它写成"这一类东西的介绍"（「人：指操作者」），那样六根骨就退化成了六个词条，
+# 而鱼骨图要回答的是"为什么主骨上那个问题会发生"。这一段就是为这件事写的。
+#
+# `role` 明确不要：鱼骨图没有判定节点，`Node.role` 在这套结构里不参与任何判定
+# （见 `Node.role` 的注释与 `docs/CONTRACT_V2.md`）。
+_FISHBONE_ROOT_RULE = (
+    "\n这次的一级分支已经定好了，就是 user 消息里列出的那六个**类别**："
+    "根节点下必须恰好是这六个类别，顺序、名称都不改，不增不减。"
+)
+_FISHBONE_BODY = (
+    "每个类别下面写的不是「这一类是什么」的介绍，而是**属于这一类的原因**："
+    "一句话说清什么导致了主骨上那个问题（例如「新员工手册只有 PDF，找不到操作步骤」），"
+    "不要写建议、不要写定义、不要写现象。每个类别 2–4 条，按影响大小排列。\n"
+    "**不要给节点写 role**：鱼骨图没有判定节点。\n"
+    + _SKELETON_BODY
+)
+FISHBONE_TREE_RULES = _FISHBONE_ROOT_RULE + _FISHBONE_BODY
 
 
 def _group_plan_rules(sections: int) -> str:
@@ -4085,6 +4156,121 @@ def _raw_ref_count(raw: Any) -> int:
     return total
 
 
+def _fishbone_problem(
+    raw_plan: Any, title: str, diagnostics: list[Diagnostic],
+) -> str:
+    """鱼骨图主骨上那一句：模型给了就用它的，没给就用标题兜底——两种情况都说出来。
+
+    兜底不是"把字段凑满"：`FishboneContent.problem` 是 `min_length=1` 的必填项，
+    没有它整张图存不进去；用主题占位至少让用户看见鱼头里写的是什么，同时
+    `FISHBONE_PROBLEM_MISSING` 明说那不是模型写的。反过来凭空造一句"为什么会这样"
+    等于替它编一个论点，那比缺一句话严重得多。
+
+    **复读标题**单独一条诊断：实测最常见的失败形态就是 `problem` 原样照抄主题
+    （甚至在"为什么"三个字前面接上主题）。它不判失败（用户可能真的就想这么命题），
+    但必须可见——一张鱼头写着主题的鱼骨图，读图的人看不出这张图在回答什么。
+    """
+    problem = _skeleton_problem(raw_plan)
+    if problem is None:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="FISHBONE_PROBLEM_MISSING",
+            message=(
+                "模型没有给出主骨上那句话（problem），鱼头这次用主题占位："
+                "「" + title + "」。这张图因此少了一个明确的论点——"
+                "六根骨列举的是原因的类别，读图的人不知道它们在回答什么问题"
+            ),
+        ))
+        return title
+    if _skeleton_key(problem) == _skeleton_key(title):
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="FISHBONE_PROBLEM_ECHOES_TITLE",
+            message=(
+                f"主骨上的那句话与主题完全相同（「{problem}」）：鱼头通常写的是"
+                "「为什么 X 会 Y」这样的疑问句，而不是这张图的名字"
+            ),
+        ))
+    return problem
+
+
+def _fishbone_shape_diagnostics(
+    content: FishboneContent, diagnostics: list[Diagnostic],
+) -> None:
+    """六类齐不齐——**warn，不判失败**。
+
+    `FISHBONE_CATEGORIES` 是推荐词表而不是契约白名单（见那个常量的注释）：模型写
+    "人员"而不是"人"时硬绑的表现是整张图 422，而用户宁可要一张类别名不太标准但
+    内容对的鱼骨图。所以这里只数"少了哪些"，缺的几根在画布上确实是空的。
+    """
+    got = {_skeleton_key(bone.category) for bone in content.bones}
+    missing = [name for name in FISHBONE_CATEGORIES if _skeleton_key(name) not in got]
+    if not missing:
+        return
+    diagnostics.append(Diagnostic(
+        level=DiagnosticLevel.warn, code="FISHBONE_CATEGORIES_INCOMPLETE",
+        message=(
+            f"5M1E 的六类里少了 {'、'.join(missing)}（这次实际是 "
+            f"{'、'.join(bone.category for bone in content.bones)}）："
+            f"鱼骨图的一级分支固定是 {'/'.join(FISHBONE_CATEGORIES)}，"
+            "缺的那几根在画布上是空的，原因的覆盖面因此不完整"
+        ),
+    ))
+
+
+def _top_level_rows(content: DiagramContent) -> list[dict[str, Any]]:
+    """`data["branches"]` 的行：画布最外那一层（一级分支 / 六根骨 / 各阶段）。
+
+    键名与形状刻意不变（`id` / `label` / `points`）：读它的脚本与前端不该为了
+    一个图型改一次读法。`points` 在鱼骨里是"这根骨下有几条原因"，在流程里是
+    "这个阶段里有几个步骤"，两者都是"这一层下面挂了多少内容"。
+
+    `id` 的取值跟着**这一层自己的命名空间**：树与鱼骨给节点 id（骨就是那个
+    `Node`），流程给**阶段 id**（`s_…`）——阶段 id 才是 `FlowContent.edges` 的
+    端点，给节点 id 会让读它的人去连一条连不上的线。
+    """
+    if isinstance(content, FishboneContent):
+        return [
+            {"id": bone.root.id, "label": bone.category,
+             "points": len(bone.root.children)}
+            for bone in content.bones
+        ]
+    return [
+        {"id": child.id, "label": child.label, "points": len(child.children)}
+        for child in content.root.children
+    ]
+
+
+def _shape_output(
+    content: MindMapContent, *, diagram_type: str, raw_plan: Any,
+    diagnostics: list[Diagnostic],
+) -> DiagramContent:
+    """生成出口：把内部那棵树折成请求的图型；`tree` 原样返回。
+
+    为什么折叠放在收尾的**最后一步**，而不是建树的那一刻：`_fill_details`、
+    `_stamp_expandable`、`check()`、`annotate_nli()`、`_cross_branch_duplicates`
+    全部按"一棵树"工作（它们读 `root` / `children` / 层深）。早折一步，每一个都得
+    写第二份实现；而它们的效果**只看节点本身**，与节点挂在哪一层容器里无关——
+    最后一次折叠因此是无损的。
+
+    `tree` 这条分支一个字节都不动：不做 `model_copy`、不加 `diagram_type`（那本来
+    就是默认值）。`tests/test_edges.py::TestTreeIsByteIdentical` 用旧模块钉着它。
+    """
+    if diagram_type == "fishbone":
+        problem = _fishbone_problem(raw_plan, content.title, diagnostics)
+        shaped, extras = shapes.to_fishbone(content, problem=problem)
+        if extras:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="FISHBONE_EXTRA_BRANCH",
+                message=(
+                    f"一级分支比六类多了 {extras} 条，已并入最后一根骨"
+                    f"（「{shaped.bones[-1].category}」）：鱼骨图最多 "
+                    f"{MAX_FISHBONE_BONES} 根骨，多出来的内容不丢，但位置按规则摆"
+                ),
+            ))
+        _fishbone_shape_diagnostics(shaped, diagnostics)
+        return shaped
+    return content.model_copy(update={"diagram_type": diagram_type})
+
+
 async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     """整树生成：**骨架一次、每支检索一次、结构一次、只写说明一到两次**。
 
@@ -4327,7 +4513,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 形状规则按**实际形态**选（不是按"问没问过分组"）：问了但回来只有 8 支时
     # `_skeleton_plan` 已经压平，这里也必须用扁平那份规则，否则 system 要求根下挂
     # 分组、user 里列的却是八条分支，模型只能二选一地写错。
-    shape_rules = GROUPED_TREE_RULES if plan.grouped else SKELETON_TREE_RULES
+    #
+    # 图型也在这里分叉：流程图与鱼骨的"一级分支"分别是阶段与类别，它们的根规则
+    # 与树不同（阶段要在阶段内部说出谁是判定，类别下面要写原因而不是词条定义）。
+    # 三份规则共用 `_SKELETON_BODY`（不跨支重复 / 这一轮不写 detail），差别只在
+    # 根规则与那一段专属说明。
+    shape_rules = (
+        GROUPED_TREE_RULES if plan.grouped
+        else FISHBONE_TREE_RULES if diagram_type == "fishbone"
+        else SKELETON_TREE_RULES
+    )
     if sources and sections:
         system = (DETAIL_PROMPT + thinking + shape_rules
                   + BRANCHED_EVIDENCE_RULES + external_rules)
@@ -4410,13 +4605,6 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     content, edge_diagnostics = _apply_skeleton(
         content, plan, raw_plan, diagram_type=diagram_type)
     diagnostics.extend(edge_diagnostics)
-    if diagram_type != "tree":
-        # 产物自己声明"我是什么图型"。`validate_generated_content` 只会按模型输出的
-        # `{"title","root"}` 建树，图型不在模型输出里——不加这一行，一张六支的
-        # 鱼骨图与一张六支的思维导图在树上完全一样，而"要不要摆附加关系区块、
-        # 导出文件头怎么写"两件事都只能靠这个字段（与 `_generate_deep` 的建树段
-        # 同一个决定）。
-        content = content.model_copy(update={"diagram_type": diagram_type})
 
     # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------
     #
@@ -4482,10 +4670,19 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     external_off = bool(external is None and not sources
                         and external_knowledge_off_reason() == "user")
 
+    # ---- 出口：把内部那棵树折成请求的图型 ---------------------------------------
+    #
+    # 这是"三条生成路径各产出自己的结构"落地的地方，也是整条流水线上唯一认识
+    # `FishboneContent` / `FlowContent` 的一行。上面全部步骤都在树上跑（理由见
+    # `_shape_output`），换形状只发生在交出产物之前这一刻。
+    content = _shape_output(
+        content, diagram_type=diagram_type, raw_plan=raw_plan,
+        diagnostics=diagnostics)
+
     ctx.candidate = content
     ctx.revision += 1
-    count = _count_nodes(content.root)
-    kept_refs = _count_refs(content.root)
+    count = shapes.count_nodes(content)
+    kept_refs = shapes.count_refs(content)
 
     # 证据拼进了 prompt、树上却一条引用都没留下：`rag` 形态下唯一没有信号的失败面
     # ——"把证据给了模型"与"模型用了证据"在产出上长得不一样，而失败的样子却与
@@ -4650,7 +4847,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         )
 
     data: dict[str, Any] = {
-        "root_id": content.root.id,
+        # 中心主题的 id。鱼骨与流程的产物里**没有中心主题**（主骨是 `problem`、
+        # 主干是阶段序列），所以它们是 None——编一个"最外层的那个节点"来填这个
+        # 字段，会让读它的脚本把一根骨当成树的根。
+        "root_id": content.root.id if isinstance(content, MindMapContent) else None,
         "node_count": count,
         "revision": ctx.revision,
         # 要展开的方面数：两级时是二十节（二级），扁平时就是一级分支。用户看到的
@@ -4671,10 +4871,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 根下挂的东西：**不分两级时就是一级分支**，两级时是分组（`points` 因此是
         # "这一组下有几支"）。键名不变是刻意的——读这个字段的前端与脚本不该为了
         # 多一层而改一遍读法。
-        "branches": [
-            {"id": child.id, "label": child.label, "points": len(child.children)}
-            for child in content.root.children
-        ],
+        "branches": _top_level_rows(content),
         "retrieval": {
             "mode": "branch" if sources else "off",
             "top_k": DEEP_BRANCH_TOP_K,
@@ -4709,7 +4906,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "floor": DETAIL_FILL_FLOOR,
             # 分组节点不算"说明偏短"：它们**本来就不该有说明**（`skip_ids`），
             # 把它们数进来会让两级这一版的 `short_nodes` 恒比扁平多 5，读起来像退化。
-            "short_nodes": sum(1 for node in _iter_nodes(content.root)
+            "short_nodes": sum(1 for node in shapes.iter_nodes(content)
                                if node.id not in set(group_ids)
                                and _needs_detail(node)),
         },
@@ -4754,10 +4951,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if diagram_type != "tree":
         # 图型与附加边：`diagram_type` 是**输入**，`edges` 是**产出**。"选了流程图
         # 但一条边都没画出来"与"选了思维导图"在树上长得一样，而前者是要去补的动作。
+        #
+        # 边数按**产物**数：鱼骨图没有 `edges` 字段（它的关系全由层级表达），
+        # 报 0 比让 `AttributeError` 落到工具结果里准确得多。
         data["diagram"] = {
             "type": diagram_type,
             "source": source_of_diagram,
-            "edges": len(content.edges),
+            "edges": len(content.edges) if not isinstance(content, FishboneContent) else 0,
         }
     return ToolResult(ok=True, content=summary, data=data)
 

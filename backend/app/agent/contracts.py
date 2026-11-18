@@ -16,7 +16,7 @@ from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, Proto
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from app.contracts.diagnostic import Diagnostic
-from app.contracts.mindmap import DiagramKind, MindMapContent
+from app.contracts.mindmap import DiagramContent, DiagramKind, MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
 from app.optimization.source_refs import EvidenceSpan
@@ -358,7 +358,7 @@ class RunContext:
     # 这一轮正在长的那棵树。**名字是历史遗留**：候选层删掉（`acfdb5b`）之后，
     # 它不再"等用户点应用"，`done` 帧一到就整树交给前端落进画布（前端标成未保存）。
     # 改名成本高、收益低，所以字段名留着，读它时按"生成中的工作树"理解。
-    candidate: MindMapContent | None = None
+    candidate: DiagramContent | None = None
     revision: int = 0
     batches: list[OpBatch] = field(default_factory=list)
     sources_by_id: dict[str, Source] = field(default_factory=dict)
@@ -689,7 +689,10 @@ class OpsEvent(_EventBase):
 
 class SnapshotEvent(_EventBase):
     type: Literal["snapshot"] = "snapshot"
-    content: MindMapContent
+    # 三种形状的联合：鱼骨图与流程图现在是**真的**产出（见 `contracts.mindmap`
+    # 的 `DiagramContent`），这一帧要是只收树，一次成功的鱼骨生成会在发事件时
+    # 变成一个 500——而工具那边什么都没做错。
+    content: DiagramContent
 
 
 class NodeGrowEvent(_EventBase):
@@ -759,7 +762,7 @@ class HeartbeatEvent(_EventBase):
 
 class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
-    content: MindMapContent | None = None
+    content: DiagramContent | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
     # 这棵树是怎么来的，前端落地时要照它标记来源，不能一律写成"模型生成"。
     # 缺省 None 而不是 "model"：没填的帧就是"没说"，把它默认成模型产出会让

@@ -43,18 +43,16 @@ from app.agent.contracts import (
     ToolStartEvent,
     ToolEndEvent,
 )
-from app.agent import diagram_intent
+from app.agent import diagram_intent, shapes
 from app.agent.provider import default_provider
 from app.agent.tools import (
     ToolRegistry,
-    _count_nodes,
-    _node_path,
     _path_text,
     build_registry,
     library_available,
 )
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
-from app.contracts.mindmap import MindMapContent
+from app.contracts.mindmap import DiagramContent
 from app.generation.service import (
     GenerationError,
     _demo_content,
@@ -165,7 +163,7 @@ SELECTION_RULE = (
 )
 
 
-def selection_text(request: AgentRunRequest, content: MindMapContent | None) -> str:
+def selection_text(request: AgentRunRequest, content: DiagramContent | None) -> str:
     """把"用户选中了哪些节点"渲染成 system 里的一段；没有选中时返回**空串**。
 
     空串而不是"用户选中了：\\n（无）"：一个空的小标题会让模型以为"用户选了 0 个
@@ -186,7 +184,7 @@ def selection_text(request: AgentRunRequest, content: MindMapContent | None) -> 
     for node_id in request.selected_ids:
         # 路径与展开共用同一份实现（`tools._node_path` / `_path_text`）：
         # "从根到这里的标题链"只该有一种写法，否则同一次运行里模型会看到两种格式。
-        chain = _node_path(content.root, node_id)
+        chain = shapes.path_to(content, node_id)
         if chain is None:
             continue
         lines.append(f"- [{chain[-1].id}] {chain[-1].label.strip()}｜路径：{_path_text(chain)}")
@@ -195,23 +193,22 @@ def selection_text(request: AgentRunRequest, content: MindMapContent | None) -> 
     return "\n".join([SELECTION_HEADER, *lines, SELECTION_RULE])
 
 
-def outline_text(content: MindMapContent | None, limit: int = 200) -> str:
-    """把树压成带 id 的大纲，让模型能引用具体节点。
+def outline_text(content: DiagramContent | None, limit: int = 200) -> str:
+    """把图压成带 id 的大纲，让模型能引用具体节点。
 
     没有 id 的大纲模型就只能靠文字猜"改哪一个"，而文字是会被它自己改写的。
+
+    三套结构共用这一份：`shapes.walk_depths` 让每棵并列子树（鱼的六根骨、流程
+    的若干阶段）各从第 1 层起算——大纲里的缩进因此仍然是"这一支自己的深度"，
+    与画布上那一列一致。树只有一棵，缩进与改动之前逐字节相同。
     """
     if content is None:
         return "（当前没有导图）"
     lines: list[str] = []
-
-    def walk(node, depth: int) -> None:
+    for node, depth in shapes.walk_depths(content):
         if len(lines) >= limit:
-            return
-        lines.append("  " * depth + f"[{node.id}] {node.label}")
-        for child in node.children:
-            walk(child, depth + 1)
-
-    walk(content.root, 0)
+            break
+        lines.append("  " * (depth - 1) + f"[{node.id}] {node.label}")
     if len(lines) >= limit:
         lines.append(f"……（只列前 {limit} 个节点）")
     return "\n".join(lines)
@@ -260,7 +257,7 @@ def _notes_text() -> str:
     return text
 
 
-def _system_text(request: AgentRunRequest, content: MindMapContent | None) -> str:
+def _system_text(request: AgentRunRequest, content: DiagramContent | None) -> str:
     """这次运行要下发的 system。
 
     五段的顺序有讲究，不能随手调：
@@ -551,7 +548,7 @@ def _budget_message(ctx: RunContext, limit: str, tool_calls: int) -> str:
     base = _BUDGET_HINT[limit]
     if limit != "max_seconds":
         return base
-    nodes = _count_nodes(ctx.candidate.root) if ctx.candidate is not None else 0
+    nodes = shapes.count_nodes(ctx.candidate) if ctx.candidate is not None else 0
     done = f"，树上是 {nodes} 个节点" if ctx.candidate is not None else "，还没产出导图"
     return (f"{base}（已执行 {tool_calls} 次工具调用{done}）。"
             "这之前的改动都已进树里，之后的没有执行——把目标拆小一点再跑一次，"
@@ -856,7 +853,7 @@ async def run(
     *,
     provider: ToolProvider | None = None,
     tools: ToolRegistry | None = None,
-    on_close: Callable[[MindMapContent | None], None] | None = None,
+    on_close: Callable[[DiagramContent | None], None] | None = None,
     first_seq: int = 1,
 ) -> AsyncIterator[AgentEvent]:
     """跑一次多轮工具循环，边跑边发事件。

@@ -32,7 +32,9 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from app.contracts.mindmap import MindMapContent
+from pydantic import TypeAdapter
+
+from app.contracts.mindmap import DiagramContent
 from app.mindmaps import repository
 
 STATUS_RUNNING = "running"
@@ -64,7 +66,7 @@ class RunRecord:
     run_id: str
     status: str
     request: dict[str, Any]
-    candidate: MindMapContent | None
+    candidate: DiagramContent | None
     failure: dict[str, Any] | None
     created_at: str
     updated_at: str
@@ -104,7 +106,13 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _dump_candidate(candidate: MindMapContent | None) -> str | None:
+#: 读库时用的一份联合解析器：形状判别在契约层（`DiagramContent` 的注释），
+#: 这里只负责"读得回来"。用 `TypeAdapter` 而不是某个成员类，是因为库里现在真的
+#: 会同时有 `root` / `bones` / `stages` 三种形状的记录。
+_CONTENT_ADAPTER: TypeAdapter[DiagramContent] = TypeAdapter(DiagramContent)
+
+
+def _dump_candidate(candidate: DiagramContent | None) -> str | None:
     return None if candidate is None else candidate.model_dump_json()
 
 
@@ -121,10 +129,13 @@ def _loads(text: str | None) -> Any:
 
 def _record(row: sqlite3.Row) -> RunRecord:
     raw_candidate = _loads(row["candidate"])
-    candidate: MindMapContent | None = None
+    candidate: DiagramContent | None = None
     if isinstance(raw_candidate, dict):
         try:
-            candidate = MindMapContent.model_validate(raw_candidate)
+            # 三套结构共用一份联合类型：形状判别在契约层（`DiagramContent` 的
+            # 注释），这里只负责"读得回来"。用 `TypeAdapter` 而不是某个成员类，
+            # 是因为库里现在真的会有 `bones` / `stages` 两种形状的记录。
+            candidate = _CONTENT_ADAPTER.validate_python(raw_candidate)
         except ValueError:
             candidate = None
     request = _loads(row["request"])
@@ -186,7 +197,7 @@ def finish(
     run_id: str,
     status: str,
     *,
-    candidate: MindMapContent | None = None,
+    candidate: DiagramContent | None = None,
     failure: dict[str, Any] | None = None,
     mode: str | None = None,
 ) -> bool:

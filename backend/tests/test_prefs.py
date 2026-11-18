@@ -587,7 +587,10 @@ def _acceptance_generate(run_id: str, body: dict[str, Any]) -> dict:
     async def fake_chat(system: str, user: str, *, max_tokens: int | None = None,
                         on_delta: Any = None) -> dict:
         if system.startswith(FISHBONE_PLAN_PROMPT):
-            return {"branches": ["人", "机", "料", "法", "环", "测"]}
+            # 鱼骨的骨架现在还带一句主骨陈述（`problem`）：产物是 `FishboneContent`，
+            # 那一句直接落进 `problem` 字段，不再只是一句"分了六个类"。
+            return {"problem": "为什么机器学习项目总在上线前卡住",
+                    "branches": ["人", "机", "料", "法", "环", "测"]}
         if system.startswith(PLAN_PROMPT):
             return {"branches": ["甲", "乙", "丙"]}
         return _whole_tree(user)
@@ -648,10 +651,13 @@ def test_acceptance_a_stored_pref_changes_the_product():
         "prefs_applied": [f"diagram_type.default={prefill}"],
     })
 
-    # 3. 产物确实是鱼骨图（一级分支固定六类），不是默认的思维导图
+    # 3. 产物确实是鱼骨图：**形状**是 `bones`（不再是一棵标着 fishbone 的树），
+    #    六根骨是骨架给的六个类别，主骨那句话来自骨架的 `problem`。
     assert product["diagram_type"] == "fishbone"
-    assert [child["label"] for child in product["root"]["children"]] == [
+    assert [bone["category"] for bone in product["bones"]] == [
         "人", "机", "料", "法", "环", "测"]
+    assert product["problem"] == "为什么机器学习项目总在上线前卡住"
+    assert "root" not in product, "鱼骨图的产物里没有中心主题这个位置"
 
     # 4. 台账里留下了"这次生效了哪条偏好"
     stored = runs.get("run-acceptance")
