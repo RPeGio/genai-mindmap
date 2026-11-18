@@ -536,15 +536,17 @@ def _validate_relations(relations: Sequence[Relation], node_ids: set[str]) -> No
 
 def _validate_edges(
     edges: Sequence[Edge], node_ids: set[str], *, what: str = "节点",
+    where: str = "导图中",
 ) -> None:
     """附加边的三条硬约束：条数上限、id 唯一、端点存在且不是自环。
 
     与 `relations` 的差别在**硬拒的边界**：条数用的是 `MAX_EDGES_LIMIT`（承载能力）
     而不是 `MAX_EDGES`（产品口径）——后者只报 warn，理由见 `MAX_EDGES` 的注释。
 
-    `what` 只影响错误文案里的名词：树里端点是**节点**，流程里端点是**阶段**
-    （`FlowContent.edges` 是阶段之间的跳转）。判据一模一样，所以只有一份实现；
-    但把"阶段 s1 不在导图中"说成"节点 s1"，排查时会去树里找一个根本不在树里的 id。
+    `what` / `where` 只影响错误文案：树里端点是**节点**（"不在导图中"），流程的
+    `FlowContent.edges` 端点是**阶段**，而 `FlowStage.edges` 端点是**该阶段内的
+    节点**（"不在阶段 s_1 里"）。判据一模一样，所以只有一份实现；但把"阶段 s1 不在
+    导图中"说成"节点 s1"，排查时会去树里找一个根本不在树里的 id。
     """
     if len(edges) > MAX_EDGES_LIMIT:
         raise ValueError(f"附加边最多 {MAX_EDGES_LIMIT} 条")
@@ -560,9 +562,9 @@ def _validate_edges(
         # 生成路径会在构造之前先把这种边滤掉并报 `EDGE_DANGLING`（见
         # `app/mindmaps/edges.py::clean_edges`），两条路都不让脏边活下来。
         if edge.source not in node_ids:
-            raise ValueError(f"边 {edge.id} 的起点{what} {edge.source} 不在导图中")
+            raise ValueError(f"边 {edge.id} 的起点{what} {edge.source} 不在{where}")
         if edge.target not in node_ids:
-            raise ValueError(f"边 {edge.id} 的终点{what} {edge.target} 不在导图中")
+            raise ValueError(f"边 {edge.id} 的终点{what} {edge.target} 不在{where}")
         # 自环画不出来——它只会渲染成一个点，用户看不出那里有一条线，
         # 却会因为"边数 +1"而困惑。而"节点到自己"这件事在图上没有语义。
         if edge.source == edge.target:
@@ -763,22 +765,58 @@ class FishboneContent(ContentBase):
 
 
 class FlowStage(BaseModel):
-    """流程里的一个阶段：一个 id + 一棵步骤树。
+    """流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。
 
     `root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——
     `Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，
     而第一层"步骤"与第 N 层"步骤"在数据里本来就该是同一个东西。`steps` 就是
     `root.children`。
 
+    ## 两个数组、两个命名空间（这一节是这个结构最容易串的地方）
+
+    模块里有**两处** `edges`，端点属于**两个互不相通的命名空间**：
+
+      - `FlowContent.edges` —— **阶段之间**的跳转（提交 → 审查、付款 → 提交驳回）。
+        端点必须是**阶段 id**（`stages[i].id`），拿一个真实存在的步骤 id 当端点会被
+        硬拒（`test_edge_endpoints_are_stages_not_nodes` 钉着）。它画出来是画布上的
+        那根**主轴**。
+      - `FlowStage.edges`（就是本字段）—— **这个阶段内部**的边：判定节点的「是 / 否」
+        两条出边、以及步骤之间的顺序跳转。端点必须是**该阶段自己的节点 id**，
+        拿另一个阶段的节点、或者拿阶段 id，都会被硬拒。它画出来是阶段内部的一条
+        **细线**。
+
+    为什么必须分成两个数组（而不是给端点加 `stage:` / `node:` 前缀，把边都塞进
+    `FlowContent.edges`）：命名空间靠**位置**隔离时，校验是"每条边的两个端点都在
+    这个集合里"——一次集合查表，且它天然排除了"阶段内的边连到另一个阶段"这种错；
+    前缀方案要把每个端点都解析一遍，还会给 id 引入一个转义问题（节点 id 允许任意
+    字符，写 `node:x` 的节点 id 和"前缀表示法"就分不开了）。代价是消费者要遍历
+    `stages[i].edges`——而它本来就要遍历 `stages[i].root`。
+
+    为什么要有这个字段（阶段 1 契约的真实空洞）：`role="decision"` 的节点在阶段
+    **内部**，而原来的 `FlowContent.edges` 端点只有阶段 → 模型标出来的判定节点，
+    它的两条「是 / 否」出边**无处可写**。实测一份流程图 5 个判定节点、`branch_edges`
+    恒为 0：不是模型没标，是契约没有位置。
+
     `id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点
-    引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并
-    是因为合并之后"这条边连的是阶段还是步骤"要靠形状猜，而两者在画布上画出来的
-    东西完全不同（一条主轴 vs 一条细线）。
+    引用（那是阶段之间的跳转），节点 id 只被 `relations` 与这两个阶段内数组引用。
+    不合并是因为合并之后"这条边连的是阶段还是步骤"要靠形状猜，而两者在画布上画
+    出来的东西完全不同（一条主轴 vs 一条细线）。
     """
 
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=100)
     root: Node
+    # 阶段内的边。**默认空列表**，旧记录缺这个键时 Pydantic 直接补一个空列表——
+    # 与 `MindMapContent.edges` / `FlowContent.edges` 同一条"旧图零迁移"规矩：
+    # 不改库、不升 `schema_version`，旧流程图读进来就是"阶段内没有附加边"的图，
+    # 而它在加这个字段之前画出来正好也是那样。
+    edges: list[Edge] = Field(default_factory=list)
+
+    @field_validator("edges")
+    @classmethod
+    def dedupe_edges(cls, value: list[Edge]) -> list[Edge]:
+        """去重的判据见模块级 `_dedupe_edges`；另外两处 `edges` 共用同一份。"""
+        return _dedupe_edges(value)
 
 
 class FlowContent(ContentBase):
@@ -789,11 +827,12 @@ class FlowContent(ContentBase):
       - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步
         还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让"这是阶段"与
         "这是阶段里的第一步"在数据里长得一样。
-      - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`
-        刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的
-        `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`
-        表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个
-        "第三种命名空间"。
+      - **这里这个 `edges` 只装阶段之间的跳转**，端点命名空间是**阶段 id**。这与
+        `MindMapContent.edges` 刚好相反，也是同一个 `Edge` 类型在两处的唯一区别
+        （见 `_validate_edges` 的 `what` / `where` 参数）。阶段**内部**的边（判定
+        节点的两条出边、步骤之间的顺序跳转）在 `FlowStage.edges` 里，端点命名空间
+        是那个阶段自己的节点 id——两处是**两个数组、两个命名空间**，见
+        `FlowStage` 的 docstring。
       - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。
         `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。
     """
@@ -820,13 +859,32 @@ class FlowContent(ContentBase):
         # 阶段内部的节点 id 仍然必须全局唯一（前端按 id 建索引，两个阶段各有一个
         # `step1` 时点一下会跳到另一个阶段里），节点总数也按全部阶段合计算。
         node_ids: set[str] = set()
+        # 阶段内的边逐阶段校验（端点必须是**这个阶段自己的**节点），所以每轮要把
+        # 这一阶段新收进来的 id 单独拿出来。`_scan_tree` 复用同一个 `seen`，差值
+        # 就是它这一次真正加的那些——比再遍历一遍子树便宜，也不会与那趟遍历
+        # 用两套口径算"哪些节点属于这个阶段"。
+        stage_edges: list[tuple[str, list[Edge], set[str]]] = []
         for stage in self.stages:
             if stage.id in stage_ids:
                 raise ValueError(f"阶段 ID 必须唯一，重复的是 {stage.id}")
             stage_ids.add(stage.id)
+            before = set(node_ids)
             _scan_tree(stage.root, source_ids, node_ids)
+            stage_edges.append((stage.id, stage.edges, node_ids - before))
+        # 边 id 在**两处数组之间**也必须唯一。`_validate_edges` 各自按自己的数组判
+        # 唯一性，两批合起来重名它看不见；而前端与树那边一样按 id 建索引，重名的
+        # 两条边里有一条会永远画不出来（或者连到另一条的位置上）。
+        edge_ids: set[str] = set()
+        for edge in (*self.edges, *(item for _, edges, _ in stage_edges for item in edges)):
+            if edge.id in edge_ids:
+                raise ValueError(f"边 ID 必须唯一，重复的是 {edge.id}")
+            edge_ids.add(edge.id)
         # 边端点查的是**阶段** id（见类注释），所以把它自己的命名空间传进去。
         _validate_edges(self.edges, stage_ids, what="阶段")
+        for stage_id, edges, own_ids in stage_edges:
+            # `where` 带上阶段名：一份流程图里有二十个"节点 x 不在…"，不说是哪个
+            # 阶段时用户无法判断是自己连错了还是模型写错了。
+            _validate_edges(edges, own_ids, where=f"阶段 {stage_id} 里")
         _validate_relations(self.relations, node_ids)
         return self
 

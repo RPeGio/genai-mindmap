@@ -216,6 +216,128 @@ class TestFlowShape:
         assert [edge.id for edge in parsed.edges] == ["e1"]
 
 
+class TestFlowStageEdges:
+    """阶段**内部**的附加边：判定节点的「是 / 否」两条出边写在这里。
+
+    这一组用例存在的理由是一次实测：契约里 `FlowContent.edges` 的端点是**阶段 id**，
+    而 `role="decision"` 的节点在阶段**内部**——模型标了 5 个判定节点，产出里
+    `branch_edges` 恒为 0，因为那两条出边在两个命名空间里都没有位置。
+
+    所以这一组钉的不是"一个字段存在"，是**两个命名空间的隔离边界**：
+    `FlowStage.edges` 的端点只能在这个阶段里，`FlowContent.edges` 的端点只能是阶段。
+    """
+
+    def test_decision_has_two_labelled_out_edges(self):
+        """一个判定节点的「是 / 否」两条出边，落在它自己的阶段里。"""
+        parsed = FlowContent.model_validate({
+            "title": "注册流程",
+            "stages": [
+                {
+                    "id": "s_1",
+                    "root": node("a", "提交", [
+                        node("check", "信息完整吗", role="decision"),
+                        node("pass", "进入审查"),
+                        node("fix", "补正资料"),
+                    ]),
+                    "edges": [
+                        {"id": "b1", "source": "check", "target": "pass",
+                         "label": "是", "kind": "branch"},
+                        {"id": "b2", "source": "check", "target": "fix",
+                         "label": "否", "kind": "branch"},
+                    ],
+                },
+            ],
+        })
+        assert [(edge.source, edge.target, edge.label)
+                for edge in parsed.stages[0].edges] == [
+            ("check", "pass", "是"), ("check", "fix", "否")]
+        assert all(edge.kind == "branch" for edge in parsed.stages[0].edges)
+
+    def test_stage_edges_default_to_empty(self):
+        """缺这个键的旧流程图读进来是"阶段内没有附加边"——零迁移。"""
+        parsed = FlowContent.model_validate(flow())
+        assert [stage.edges for stage in parsed.stages] == [[], [], []]
+
+    def test_endpoint_must_belong_to_that_stage(self):
+        """拿另一个阶段的节点 id 当端点要拒：这是两个 `edges` 最容易串的地方。"""
+        with pytest.raises(ValidationError) as caught:
+            FlowContent.model_validate({
+                "title": "流",
+                "stages": [
+                    {"id": "s_1", "root": node("a", "提交", [node("a1")]),
+                     "edges": [{"id": "b1", "source": "a1", "target": "b1run"}]},
+                    {"id": "s_2", "root": node("b", "审查", [node("b1run")])},
+                ],
+            })
+        assert "不在阶段 s_1 里" in str(caught.value)
+
+    def test_endpoint_may_not_be_a_stage_id(self):
+        """阶段 id 不算阶段内的节点 id：两个命名空间互不通用，否则画布会找错对象。"""
+        with pytest.raises(ValidationError) as caught:
+            FlowContent.model_validate({
+                "title": "流",
+                "stages": [
+                    {"id": "s_1", "root": node("a", "提交"),
+                     "edges": [{"id": "b1", "source": "a", "target": "s_2"}]},
+                    {"id": "s_2", "root": node("b", "审查")},
+                ],
+            })
+        assert "不在阶段 s_1 里" in str(caught.value)
+
+    def test_self_loop_inside_a_stage_is_rejected(self):
+        with pytest.raises(ValidationError) as caught:
+            FlowContent.model_validate({
+                "title": "流",
+                "stages": [{"id": "s_1", "root": node("a", "提交"),
+                            "edges": [{"id": "b1", "source": "a", "target": "a"}]}],
+            })
+        assert "自环" in str(caught.value)
+
+    def test_duplicate_edges_inside_a_stage_are_deduped(self):
+        """去重口径与另外两处 `edges` 完全一致：`(source, target, label)`。"""
+        parsed = FlowContent.model_validate({
+            "title": "流",
+            "stages": [{
+                "id": "s_1", "root": node("a", "提交", [node("b")]),
+                "edges": [
+                    {"id": "b1", "source": "a", "target": "b", "label": "是"},
+                    {"id": "b2", "source": "a", "target": "b", "label": "是"},
+                    # 同一对端点、不同 label：这两条是不同的分支说明，都要留。
+                    {"id": "b3", "source": "a", "target": "b", "label": "否"},
+                ],
+            }],
+        })
+        assert [edge.id for edge in parsed.stages[0].edges] == ["b1", "b3"]
+
+    def test_edge_ids_are_unique_across_both_arrays(self):
+        """阶段间与阶段内的边共用一份 id 空间：前端按 id 建索引，重名会丢一条。"""
+        with pytest.raises(ValidationError) as caught:
+            FlowContent.model_validate({
+                "title": "流",
+                "stages": [
+                    {"id": "s_1", "root": node("a", "提交", [node("a1")]),
+                     "edges": [{"id": "e1", "source": "a1", "target": "a"}]},
+                    {"id": "s_2", "root": node("b", "审查")},
+                ],
+                "edges": [{"id": "e1", "source": "s_1", "target": "s_2"}],
+            })
+        assert "边 ID 必须唯一" in str(caught.value)
+
+    def test_stage_edges_do_not_leak_into_the_union(self):
+        """带阶段内边的流程图仍然是**流程**，不会被判别成树（`extra="forbid"` 守着）。"""
+        parsed = SaveRequest.model_validate({
+            "content": {
+                "title": "流",
+                "stages": [{
+                    "id": "s_1", "root": node("a", "提交", [node("b")]),
+                    "edges": [{"id": "b1", "source": "a", "target": "b", "kind": "flow"}],
+                }],
+            },
+        }).content
+        assert isinstance(parsed, FlowContent)
+        assert parsed.stages[0].edges[0].kind == "flow"
+
+
 class TestFlowValidation:
     def test_stage_ids_must_be_unique(self):
         with pytest.raises(ValidationError) as caught:

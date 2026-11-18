@@ -1327,7 +1327,7 @@
           "goal"
         ],
         "title": "AgentRunRequest",
-        "description": "一次 agent 运行。\n\n`snapshot` 是前端当前的树。服务端**不**从数据库重读——用户可能有一堆没保存\n的编辑，重读数据库等于把它们丢掉。"
+        "description": "一次 agent 运行。\n\n`snapshot` 是前端当前的图。服务端**不**从数据库重读——用户可能有一堆没保存\n的编辑，重读数据库等于把它们丢掉。"
       },
       "AgentTaskRequest": {
         "properties": {
@@ -2377,7 +2377,7 @@
           "stages"
         ],
         "title": "FlowContent",
-        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`\n    刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的\n    `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`\n    表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个\n    \"第三种命名空间\"。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
+        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - **这里这个 `edges` 只装阶段之间的跳转**，端点命名空间是**阶段 id**。这与\n    `MindMapContent.edges` 刚好相反，也是同一个 `Edge` 类型在两处的唯一区别\n    （见 `_validate_edges` 的 `what` / `where` 参数）。阶段**内部**的边（判定\n    节点的两条出边、步骤之间的顺序跳转）在 `FlowStage.edges` 里，端点命名空间\n    是那个阶段自己的节点 id——两处是**两个数组、两个命名空间**，见\n    `FlowStage` 的 docstring。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
       },
       "FlowContent-Output": {
         "properties": {
@@ -2442,7 +2442,7 @@
           "stages"
         ],
         "title": "FlowContent",
-        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - `edges` 的端点命名空间是**阶段 id**，不是节点 id。这与 `MindMapContent.edges`\n    刚好相反，也是同一个 `Edge` 类型在两处的唯一区别（见 `_validate_edges` 的\n    `what` 参数）。阶段内部的步骤之间暂不支持附加边：主干顺序由 `root.children`\n    表达，条件分支暂时由阶段本身承担——真需要时再加，不在这一版里编一个\n    \"第三种命名空间\"。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
+        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - **这里这个 `edges` 只装阶段之间的跳转**，端点命名空间是**阶段 id**。这与\n    `MindMapContent.edges` 刚好相反，也是同一个 `Edge` 类型在两处的唯一区别\n    （见 `_validate_edges` 的 `what` / `where` 参数）。阶段**内部**的边（判定\n    节点的两条出边、步骤之间的顺序跳转）在 `FlowStage.edges` 里，端点命名空间\n    是那个阶段自己的节点 id——两处是**两个数组、两个命名空间**，见\n    `FlowStage` 的 docstring。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
       },
       "FlowStage-Input": {
         "properties": {
@@ -2454,6 +2454,13 @@
           },
           "root": {
             "$ref": "#/components/schemas/Node-Input"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
           }
         },
         "additionalProperties": false,
@@ -2463,7 +2470,7 @@
           "root"
         ],
         "title": "FlowStage",
-        "description": "流程里的一个阶段：一个 id + 一棵步骤树。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并\n是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画出来的\n东西完全不同（一条主轴 vs 一条细线）。"
+        "description": "流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n## 两个数组、两个命名空间（这一节是这个结构最容易串的地方）\n\n模块里有**两处** `edges`，端点属于**两个互不相通的命名空间**：\n\n  - `FlowContent.edges` —— **阶段之间**的跳转（提交 → 审查、付款 → 提交驳回）。\n    端点必须是**阶段 id**（`stages[i].id`），拿一个真实存在的步骤 id 当端点会被\n    硬拒（`test_edge_endpoints_are_stages_not_nodes` 钉着）。它画出来是画布上的\n    那根**主轴**。\n  - `FlowStage.edges`（就是本字段）—— **这个阶段内部**的边：判定节点的「是 / 否」\n    两条出边、以及步骤之间的顺序跳转。端点必须是**该阶段自己的节点 id**，\n    拿另一个阶段的节点、或者拿阶段 id，都会被硬拒。它画出来是阶段内部的一条\n    **细线**。\n\n为什么必须分成两个数组（而不是给端点加 `stage:` / `node:` 前缀，把边都塞进\n`FlowContent.edges`）：命名空间靠**位置**隔离时，校验是\"每条边的两个端点都在\n这个集合里\"——一次集合查表，且它天然排除了\"阶段内的边连到另一个阶段\"这种错；\n前缀方案要把每个端点都解析一遍，还会给 id 引入一个转义问题（节点 id 允许任意\n字符，写 `node:x` 的节点 id 和\"前缀表示法\"就分不开了）。代价是消费者要遍历\n`stages[i].edges`——而它本来就要遍历 `stages[i].root`。\n\n为什么要有这个字段（阶段 1 契约的真实空洞）：`role=\"decision\"` 的节点在阶段\n**内部**，而原来的 `FlowContent.edges` 端点只有阶段 → 模型标出来的判定节点，\n它的两条「是 / 否」出边**无处可写**。实测一份流程图 5 个判定节点、`branch_edges`\n恒为 0：不是模型没标，是契约没有位置。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与这两个阶段内数组引用。\n不合并是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画\n出来的东西完全不同（一条主轴 vs 一条细线）。"
       },
       "FlowStage-Output": {
         "properties": {
@@ -2475,6 +2482,13 @@
           },
           "root": {
             "$ref": "#/components/schemas/Node-Output"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
           }
         },
         "additionalProperties": false,
@@ -2484,7 +2498,7 @@
           "root"
         ],
         "title": "FlowStage",
-        "description": "流程里的一个阶段：一个 id + 一棵步骤树。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与阶段内部的树引用。不合并\n是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画出来的\n东西完全不同（一条主轴 vs 一条细线）。"
+        "description": "流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n## 两个数组、两个命名空间（这一节是这个结构最容易串的地方）\n\n模块里有**两处** `edges`，端点属于**两个互不相通的命名空间**：\n\n  - `FlowContent.edges` —— **阶段之间**的跳转（提交 → 审查、付款 → 提交驳回）。\n    端点必须是**阶段 id**（`stages[i].id`），拿一个真实存在的步骤 id 当端点会被\n    硬拒（`test_edge_endpoints_are_stages_not_nodes` 钉着）。它画出来是画布上的\n    那根**主轴**。\n  - `FlowStage.edges`（就是本字段）—— **这个阶段内部**的边：判定节点的「是 / 否」\n    两条出边、以及步骤之间的顺序跳转。端点必须是**该阶段自己的节点 id**，\n    拿另一个阶段的节点、或者拿阶段 id，都会被硬拒。它画出来是阶段内部的一条\n    **细线**。\n\n为什么必须分成两个数组（而不是给端点加 `stage:` / `node:` 前缀，把边都塞进\n`FlowContent.edges`）：命名空间靠**位置**隔离时，校验是\"每条边的两个端点都在\n这个集合里\"——一次集合查表，且它天然排除了\"阶段内的边连到另一个阶段\"这种错；\n前缀方案要把每个端点都解析一遍，还会给 id 引入一个转义问题（节点 id 允许任意\n字符，写 `node:x` 的节点 id 和\"前缀表示法\"就分不开了）。代价是消费者要遍历\n`stages[i].edges`——而它本来就要遍历 `stages[i].root`。\n\n为什么要有这个字段（阶段 1 契约的真实空洞）：`role=\"decision\"` 的节点在阶段\n**内部**，而原来的 `FlowContent.edges` 端点只有阶段 → 模型标出来的判定节点，\n它的两条「是 / 否」出边**无处可写**。实测一份流程图 5 个判定节点、`branch_edges`\n恒为 0：不是模型没标，是契约没有位置。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与这两个阶段内数组引用。\n不合并是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画\n出来的东西完全不同（一条主轴 vs 一条细线）。"
       },
       "HTTPValidationError": {
         "properties": {
