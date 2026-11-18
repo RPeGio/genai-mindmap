@@ -272,6 +272,84 @@ describe('删节点连带删边（两张表都清）', () => {
   });
 });
 
+/**
+ * 200 这条上限的**口径**：每个数组各自算（不是各阶段合计）。
+ *
+ * 后端两处都是"只看这条边要落进的那个数组"——`ops._apply_add_flow_edge` 的
+ * `len(sibling)`、契约 `FlowContent.validate_flow` 逐阶段调的 `_validate_edges`。
+ * 前端却拿 `stageInnerEdgesOf()` 的**摊平结果**判 200，于是两个阶段各有 100 条时
+ * 它把一条本该允许的边拦下来，而同样的动作经 `apply_flow_edge_ops` 能成功。
+ * 下面三条分别钉住"两端都允许 / 满的那个才拒绝 / 额度不共享"。
+ */
+const innerEdges = (source: string, target: string, count: number, prefix: string) =>
+  Array.from({ length: count }, (_, index) => ({
+    id: `e_${prefix}${index}`,
+    source,
+    target,
+    label: `第${index}条`,
+    kind: 'flow' as const,
+  }));
+
+/** 两个阶段，各自装满 `countPerStage` 条阶段内边（端点互不相同，便于分别计数）。 */
+const stagesWithInner = (countPerStage: number): FlowContent => ({
+  title: '两个阶段',
+  diagram_type: 'flowchart',
+  stages: [
+    {
+      id: 's_1',
+      root: node('n1', '甲阶段', [node('n11', '填表'), node('n12', '补材料')]),
+      edges: innerEdges('n11', 'n12', countPerStage, 'a'),
+    },
+    {
+      id: 's_2',
+      root: node('n2', '乙阶段', [node('n21', '打款'), node('n22', '记账')]),
+      edges: innerEdges('n21', 'n22', countPerStage, 'b'),
+    },
+  ],
+  edges: [{ id: 'e_1', source: 's_1', target: 's_2', kind: 'flow' }],
+});
+
+describe('阶段内边的上限：按每个阶段各自算', () => {
+  it('两个阶段各有 100 条时还能再加一条（合计 200，正是旧判据看到的数）', () => {
+    const store = useMindMapStore();
+    store.preview(stagesWithInner(100), 'down');
+    expect(store.contentInnerEdges).toHaveLength(200);
+
+    expect(store.connectNodes('n11', 'n12', '新的一条')).toBe(true);
+
+    const content = store.content as unknown as FlowContent;
+    expect(content.stages[0]!.edges).toHaveLength(101);
+    expect(content.stages[1]!.edges).toHaveLength(100);
+  });
+
+  it('单个阶段到 201 条才拒绝，文案指向"这个阶段"', () => {
+    const store = useMindMapStore();
+    store.preview(stagesWithInner(200), 'down');
+
+    expect(store.connectNodes('n11', 'n12', '第201条')).toBe(false);
+    expect(store.status).toContain('这个阶段内部最多 200 条');
+  });
+
+  it('一个阶段满了，另一个阶段的额度不受影响', () => {
+    const content = stagesWithInner(0);
+    content.stages[0]!.edges = innerEdges('n11', 'n12', 200, 'a');
+    const store = useMindMapStore();
+    store.preview(content, 'down');
+
+    expect(store.connectNodes('n21', 'n22', '乙阶段第一条')).toBe(true);
+    expect((store.content as unknown as FlowContent).stages[1]!.edges).toHaveLength(1);
+  });
+
+  it('跨阶段的额度仍按 content.edges 单独算（阶段内再多也不吃它）', () => {
+    const store = useMindMapStore();
+    store.preview(stagesWithInner(200), 'down');
+    expect(store.contentInnerEdges).toHaveLength(400);
+
+    expect(store.connectNodes('n11', 'n22', '跳过')).toBe(true);
+    expect((store.content as unknown as FlowContent).edges).toHaveLength(2);
+  });
+});
+
 describe('校验：阶段内边按该阶段自己的节点命名空间查', () => {
   it('端点落在别的阶段 → 拦在保存之前', () => {
     const content = flow(true);

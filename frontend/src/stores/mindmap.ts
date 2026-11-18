@@ -21,6 +21,7 @@ import {
   findParentIn,
   iterNodesIn,
   isContainerRoot,
+  isFlow,
   isTree,
   kindOf,
   nodeShapeOf,
@@ -692,6 +693,22 @@ interface RenderSource {
 
 /** 共用的空表：非预览来源不需要这份映射，别每次重算都新建一个。 */
 const NO_EXPANDABLE = new Map<string, boolean | null>();
+
+/**
+ * 某个阶段**自己**的附加边条数（`stages[i].edges.length`）。
+ *
+ * 上限判据必须落在这个数上，而不是 `stageInnerEdgesOf()` 的摊平结果：后者是全部
+ * 阶段的合计，用它判 200 等于"所有阶段共享一份额度"，与后端"每个数组各判 200"
+ * 的口径正好相反（`ops._apply_add_flow_edge` 的 `len(sibling)`、契约
+ * `FlowContent.validate_flow` 逐阶段调的 `_validate_edges`）。
+ *
+ * `stageId` 为 `null`（不是流程图）时返回 0：调用方只在"两端点同属一个阶段"时用它，
+ * 那时 `stageId` 必定非空，这里只是把类型收窄成一个可判的空值。
+ */
+function innerEdgeCount(content: DiagramContent, stageId: string | null): number {
+  if (!stageId || !isFlow(content)) return 0;
+  return content.stages.find(stage => stage.id === stageId)?.edges?.length ?? 0;
+}
 
 function flatten(root: MindNode): FlatNode[] {
   const out: FlatNode[] = [];
@@ -2335,13 +2352,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
       status.value = '端点节点不存在';
       return false;
     }
-    // 上限**两类各算 200**（不是合计）。判据与契约一致：`_validate_edges` 是按
-    // 数组各自调用的，`edge_diagnostics` 也是按各自的清单报 `EDGE_LIMIT`；把两批
-    // 加在一起算，一条吵闹的阶段会先把阶段之间的额度吃光，而两者在画布上的规模
-    // 本来就不成比例（一个阶段的判定出边天然只有个位数）。
-    const sameStage = stageOfNode(content.value, source) !== null
-      && stageOfNode(content.value, source) === stageOfNode(content.value, target);
-    const used = sameStage ? contentInnerEdges.value.length : contentEdges.value.length;
+    // 上限**按每个数组各自算 200**（不是合计，也不是"两类各算"）。判据与契约逐条
+    // 对应：`_validate_edges` 是**按数组各自**调用的（`FlowStage.edges` 逐阶段一次），
+    // 后端 `ops._apply_add_flow_edge` 也只看 `len(sibling)`——它数的是"这条边要落进的
+    // 那个数组"，而不是全部阶段的内部边之和。
+    //
+    // 拿 `contentInnerEdges.length`（全部阶段合计数）当判据是错的：两个阶段各有 100
+    // 条时它等于 200，于是前端把一条本该允许的边拦下来，而同样的动作走后端
+    // （`apply_flow_edge_ops`）能成功——用户看到的是"这个阶段内部最多 200 条"，
+    // 但这个阶段其实只有 100 条。
+    const sourceStage = stageOfNode(content.value, source);
+    const sameStage = sourceStage !== null && sourceStage === stageOfNode(content.value, target);
+    const used = sameStage
+      ? innerEdgeCount(content.value, sourceStage)
+      : contentEdges.value.length;
     if (used >= LIMITS.edges) {
       status.value = sameStage
         ? `这个阶段内部最多 ${LIMITS.edges} 条附加关系，请先删掉一些`
