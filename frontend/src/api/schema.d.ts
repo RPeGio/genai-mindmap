@@ -637,6 +637,11 @@ export interface components {
             /** Sources */
             sources?: components["schemas"]["Source"][];
             budget?: components["schemas"]["RunBudget"];
+            /**
+             * Deep Thinking
+             * @default false
+             */
+            deep_thinking: boolean;
         };
         /** AgentTaskRequest */
         AgentTaskRequest: {

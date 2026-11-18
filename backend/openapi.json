@@ -1326,6 +1326,11 @@
           },
           "budget": {
             "$ref": "#/components/schemas/RunBudget"
+          },
+          "deep_thinking": {
+            "type": "boolean",
+            "title": "Deep Thinking",
+            "default": false
           }
         },
         "additionalProperties": false,

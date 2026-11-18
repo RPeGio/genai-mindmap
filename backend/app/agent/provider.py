@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import httpx
@@ -48,6 +49,35 @@ _TIMEOUT_SECONDS = 600.0
 _MAX_TOKENS_CAP = 65536
 
 
+# 「深度思考」那一次要用的模型名。两个模型在同一个 endpoint 上，差别只有这个名字
+# （`api.deepseek.com/chat/completions` 同时收 `deepseek-chat` 与 `deepseek-reasoner`）。
+#
+# 三档取值，顺序就是优先级：
+#
+#   1. `MINDMAP_LLM_MODEL_DEEP`（显式配置）——换供应商时唯一该改的地方；
+#   2. 什么都没配、但端点/模型名里带 `deepseek` → `deepseek-reasoner`；
+#   3. 否则**沿用原模型名**。
+#
+# 第 3 档是本节最要紧的一条：不能"猜一个推理模型名"往别人的端点上发。那会得到
+# 一个 400/404，而错误文案只能读成"模型服务出错"——用户不知道是自己没配
+# `MINDMAP_LLM_MODEL_DEEP`。宁可这一次退化成普通模型（界面上如实显示发出去的名字），
+# 也不要整条链路报废。
+DEEP_MODEL_ENV = "MINDMAP_LLM_MODEL_DEEP"
+DEEP_MODEL_FALLBACK = "deepseek-reasoner"
+
+
+def _model_for(base: str, model: str, deep_thinking: bool) -> str:
+    """这一次真正要发出去的模型名。纯函数，便于单独测。"""
+    if not deep_thinking:
+        return model
+    explicit = os.getenv(DEEP_MODEL_ENV, "").strip()
+    if explicit:
+        return explicit
+    if "deepseek" in base.lower() or "deepseek" in model.lower():
+        return DEEP_MODEL_FALLBACK
+    return model
+
+
 def _estimate_request_tokens(
     messages: list[dict[str, Any]], tools: list[dict[str, Any]],
 ) -> int:
@@ -74,7 +104,20 @@ def _estimate_request_tokens(
 
 
 class OpenAICompatibleProvider:
-    """走 OpenAI 兼容的 /chat/completions，带 tools 字段。"""
+    """走 OpenAI 兼容的 `/chat/completions`，带 tools 字段。
+
+    `deep_thinking` 是**实例**属性而不是 `complete_tools` 的参数：接口
+    （`contracts.ToolProvider`）保持原样，测试里那些按脚本回放的假 provider 一行都不用改，
+    真正要变的只有"这一次往上游发哪个 model 名"这一件事。一次运行一个 provider 实例
+    （`service._loop` 里按请求构造），所以它天然是"这一次"的语义。
+    """
+
+    def __init__(self, *, deep_thinking: bool = False) -> None:
+        self.deep_thinking = deep_thinking
+        # 上一次真正发出去的模型名。`_loop` 收尾时把它挂进 `done` 帧，
+        # 界面上"这次到底用了哪个模型"就有据可查——否则勾了「深度思考」而配置里
+        # 没给对名字时，用户只能看到一张图，看不出它走的哪条路。
+        self.model_name: str | None = None
 
     async def complete_tools(
         self,
@@ -84,6 +127,8 @@ class OpenAICompatibleProvider:
         budget: RunBudget,
     ) -> Completion:
         base, key, model = _config()
+        model = _model_for(base, model, self.deep_thinking)
+        self.model_name = model
         # 输入侧的物理边界。放在发请求之前：装不下的请求只会拿回一个 400，
         # 而 400 在事件流里只能被读成"模型服务出错"，用户无从知道该精简材料。
         used = _estimate_request_tokens(messages, tools)
@@ -176,5 +221,6 @@ def _parse_completion(buffer: bytearray) -> Completion:
     )
 
 
-def default_provider() -> OpenAICompatibleProvider:
-    return OpenAICompatibleProvider()
+def default_provider(*, deep_thinking: bool = False) -> OpenAICompatibleProvider:
+    """这一次运行要用的 provider。`deep_thinking` 缺省 `False`，与加它之前同一个调用。"""
+    return OpenAICompatibleProvider(deep_thinking=deep_thinking)

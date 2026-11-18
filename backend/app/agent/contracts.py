@@ -610,6 +610,19 @@ class AgentRunRequest(BaseModel):
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)
     budget: RunBudget = Field(default_factory=RunBudget)
+    # 「这一次」要不要走推理模型（界面上那枚「深度思考」按钮）。
+    #
+    # 它是**这一次运行的开关，不是设置**：同一个用户会在"随便出一张图"和"这段逻辑
+    # 要拆准"之间来回切，写进偏好就把一次性的选择变成了永久状态。所以它不落库、
+    # 不进 `prefs_applied`，只活在这一次请求里。
+    #
+    # 缺省 `False` 与加这个字段之前逐字节相同：老前端不带，发出去的 model 名照旧
+    # 是 `MINDMAP_LLM_MODEL`。
+    #
+    # 它**不改任何生成链路**：三段式、两级骨架、每支检索全都不看这个字段。它只
+    # 决定 `provider.OpenAICompatibleProvider` 往上游发的 `model` 是哪一个
+    # （见 `provider._model_for`）——两个模型同一个 endpoint，差别只有名字。
+    deep_thinking: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -822,7 +835,20 @@ class DoneEvent(_EventBase):
     # 可能让它消失）。把原话挂在这一帧上，页面上就能直接看到它到底说了什么。
     # 有产出时不填：那属于正常结果，不需要把整篇输出塞进事件流。
     text: str = ""
+    # 模型这一轮的思考过程（`reasoning_content`）。与 `text` 不同，它**成功时也填**：
+    # 走推理模型（`deep_thinking=True` → `deepseek-reasoner`）时，思考过程是用户
+    # 主动要看的东西——界面上那个折叠面板就是为它做的，成功时反而藏起来等于这个
+    # 开关白勾了。
+    #
+    # 上限见 `service.REASONING_TEXT_LIMIT`（远大于实测的 3000–8000 字，等于"不截"）。
     reasoning: str = ""
+    # 这一轮真正发出去的模型名（`deepseek-chat` / `deepseek-reasoner` / 配置里的任意值）。
+    #
+    # 由 `_loop` 从 provider 上读，不另存一份：模型名是 provider 在**发请求那一刻**
+    # 决定的（配置缺失时还有回退），循环层再算一次就是两处真相。取不到（演示模式、
+    # 测试里按脚本回放的假 provider）时是 None，帧里整条不存在——"没说"不该长得
+    # 像"说了 chat"。
+    model: str | None = None
 
 
 class ErrorEvent(_EventBase):

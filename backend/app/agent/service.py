@@ -322,6 +322,28 @@ def _clip(text: str, limit: int = MODEL_TEXT_LIMIT) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+# 思考过程推给界面的上限。**不是** `MODEL_TEXT_LIMIT`：那 4000 字是"排障摘要"的
+# 口径，而 reasoner 的思考过程实测就是 3000–8000 字，用它去截等于每次都截掉一半。
+#
+# 20000 这个数怎么来的：它比实测上界还宽一倍多，够覆盖"想得很长"的那几次；同时
+# 它离"把一帧撑到几 MB"很远——中文在 SSE 里按 UTF-8 原样发（`ensure_ascii=False`），
+# 20000 汉字约 60KB 一帧。实测（`.visioncheck` 那条 mock 上游链路）8000 字 reasoning
+# 的 done 帧是 24KB 量级，前端 `postSse` 按 `\n\n` 切帧、不设单帧长度上限，nginx 那边
+# 配的是 900 秒长连接——一帧几十 KB 不触发任何一层。
+#
+# 留这条上限不是为了"截"，是为了防跑飞：模型吐 200 万字符时不能把它整段塞进
+# 事件流（也塞不进 `_MAX_RESPONSE_BYTES` 之外的地方）。截断时补一句说明，
+# 让"少了一段"这件事在界面上是看得见的。
+REASONING_TEXT_LIMIT = 20000
+
+
+def _reasoning_text(text: str) -> str:
+    """思考过程原样推给前端，只挡"跑飞"那一档。"""
+    if len(text) <= REASONING_TEXT_LIMIT:
+        return text
+    return text[:REASONING_TEXT_LIMIT] + f"…（思考过程过长，已截断，原文 {len(text)} 字）"
+
+
 def _dedupe_key(call: ToolCall) -> str:
     """同工具同参数的指纹。
 
@@ -949,7 +971,7 @@ async def _loop(
         yield DoneEvent(seq=next(demo_seq), content=demo, usage={}, mode="demo")
         return
 
-    active_provider = provider or default_provider()
+    active_provider = provider or default_provider(deep_thinking=request.deep_thinking)
     # 意图决定模型看得到哪些工具：expand 下根本没有 mindmap_edit，
     # 它也就不会去试"删掉另一个分支"。
     #
@@ -1085,7 +1107,11 @@ async def _loop(
                     # 没产出时把原话带上：页面上直接能看到模型说了什么，排障不用
                     # 登服务器翻 journalctl。有产出就不填，那是正常结果。
                     text="" if ctx.candidate is not None else _clip(said),
-                    reasoning="" if ctx.candidate is not None else _clip(reasoning),
+                    # 思考过程**成功时也留**：走 reasoner 时它正是用户勾「深度思考」
+                    # 要看的东西，藏起来等于那个开关白勾了。截断上限见
+                    # `REASONING_TEXT_LIMIT`（不是 `MODEL_TEXT_LIMIT`）。
+                    reasoning=_reasoning_text(reasoning),
+                    model=getattr(active_provider, "model_name", None),
                 )
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
