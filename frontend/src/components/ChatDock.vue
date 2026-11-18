@@ -582,6 +582,19 @@ function openComposer(prefill?: string): void {
   });
 }
 
+/**
+ * 取走"还没发出去的那句话"并清空输入框；返回它（空串表示本来就空）。
+ *
+ * 「新对话」用它做两件事：把草稿一起清掉（否则点了 + 之后输入框里还留着上一轮的
+ * 半句话，用户会以为新对话没生效），以及把这段文字交给撤销按钮——清掉的东西必须
+ * 能原样放回来。
+ */
+function takeDraft(): string {
+  const draft = intentText.value;
+  intentText.value = '';
+  return draft;
+}
+
 function closeMaterial(): void {
   materialOpen.value = false;
 }
@@ -627,7 +640,9 @@ function guardUnload(event: BeforeUnloadEvent): void {
 
 onMounted(() => window.addEventListener('beforeunload', guardUnload));
 
-defineExpose({ openComposer, openMaterial, closeMaterial, focusInput: () => openComposer() });
+defineExpose({
+  openComposer, openMaterial, closeMaterial, focusInput: () => openComposer(), takeDraft,
+});
 </script>
 
 <template>

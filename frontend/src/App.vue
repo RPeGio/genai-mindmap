@@ -48,8 +48,16 @@ const copied = ref('');
  * 导出的结果原来只写进左侧来源面板的 `store.status` 小字里，位置在折叠区下方，
  * 失败时看上去就是"点了没反应"（用户实测：控制台 422，界面无提示）。成功和失败
  * 都要能一眼看到，所以单独开一条浮层，四秒后自动消失。
+ *
+ * `action` 是给"刚清掉的东西"用的撤销入口（「新对话」清材料那一句）：只写"已清空
+ * 3 份材料"而不给回去的路，等于让用户确认一次损失再目送它消失。带动作的提示停
+ * 8 秒——比纯通知久，因为他可能正在读那句"清掉了什么"。
  */
-const notice = ref<{ kind: 'ok' | 'error'; text: string } | null>(null);
+const notice = ref<{
+  kind: 'ok' | 'error';
+  text: string;
+  action?: { label: string; run: () => void };
+} | null>(null);
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 后端自报的版本号（线上是 tag，本机是 dev）；拉不到就是空串。 */
@@ -63,13 +71,18 @@ const versionLabel = computed(() => {
   return /^v/i.test(raw) ? raw : `v${raw}`;
 });
 
-function flash(kind: 'ok' | 'error', text: string): void {
+function flash(
+  kind: 'ok' | 'error',
+  text: string,
+  action?: { label: string; run: () => void },
+): void {
   if (noticeTimer) clearTimeout(noticeTimer);
-  notice.value = { kind, text };
+  notice.value = { kind, text, action };
+  const ms = action ? 8000 : kind === 'error' ? 6000 : 3000;
   noticeTimer = setTimeout(() => {
     notice.value = null;
     noticeTimer = null;
-  }, kind === 'error' ? 6000 : 3000);
+  }, ms);
 }
 
 // 开发期示例选择器：只在 dev 服务器下加载，生产构建里这段会被整体去掉。
@@ -827,7 +840,11 @@ const modeTone = computed(() => {
 });
 
 /** 底部对话框：叫回它、预填一句话（选中节点点「改」走这条）。 */
-const dock = ref<{ openComposer: (prefill?: string) => void; openMaterial: () => void } | null>(null);
+const dock = ref<{
+  openComposer: (prefill?: string) => void;
+  openMaterial: () => void;
+  takeDraft: () => string;
+} | null>(null);
 
 function onNodeEdit(label: string): void {
   dock.value?.openComposer(`关于「${label}」…`);
@@ -904,15 +921,44 @@ watch(
 /**
  * `+`：新的一轮。
  *
- * 三件事同时发生，缺一件都会让"新对话"看起来没生效：清空画布（`newMap`）、清空时间线、
- * 把对话框叫回来放在输入位置。
+ * 四件事同时发生，缺一件都会让"新对话"看起来没生效：清空画布（`newMap`）、清空
+ * 时间线、把材料与草稿一起清掉、把对话框叫回来放在输入位置。
+ *
+ * **材料为什么要清**：它和主题句一样属于"这一轮的工作台"。留着它的后果不是"多带
+ * 几份材料"，而是下一次生成会拿上一轮的材料当依据——用户点的是"新对话"，画布空着、
+ * 时间线空着，只有材料在暗处延续，他没有任何办法看出来。
+ *
+ * 但材料可能是刚传完、刚解析好几份文件，所以清之前留一句**带撤销**的提示：
+ * 只写"已清空 3 份材料"而不给回去的路，等于让用户确认一次损失再目送它消失。
  */
 function newConversation(): void {
   if (!confirmDiscard('开一个新对话')) return;
+  const materials = sources.items.length;
+  const hasMaterialDraft = !!sources.draftText.trim();
+  // 先取走输入框里的那句话：`clear()` 之前要先知道它有没有内容，撤销时要原样放回。
+  const typed = dock.value?.takeDraft() ?? '';
+  // 材料与粘贴框正文是一份整体（含 `files`，失败条目靠它才能重试），一次快照。
+  const stash = materials || hasMaterialDraft ? sources.snapshot() : null;
+
+  sources.clear();
+  sources.draftText = '';
   store.newMap();
   chat.clear();
   historyOpen.value = false;
   dock.value?.openComposer();
+
+  const what: string[] = [];
+  if (materials) what.push(`${materials} 份材料`);
+  if (hasMaterialDraft) what.push('粘贴框里没添加的正文');
+  if (typed.trim()) what.push('没发出去的那句话');
+  if (!what.length) return;
+  flash('ok', `已清空 ${what.join('、')}`, {
+    label: '撤销',
+    run: () => {
+      if (stash) sources.restore(stash);
+      if (typed) dock.value?.openComposer(typed);
+    },
+  });
 }
 
 /** 抽屉里选一个导出格式：先把值写回，再走原来那条导出。 */
@@ -1443,15 +1489,23 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
       </aside>
     </main>
 
-    <!-- 导出等一次性操作的结果浮层；错误停 6 秒，成功 3 秒。 -->
+    <!-- 导出等一次性操作的结果浮层；错误停 6 秒，成功 3 秒，带撤销的那条 8 秒。 -->
     <div
       v-if="notice"
-      class="fixed bottom-6 left-1/2 z-50 max-w-[90vw] -translate-x-1/2 rounded-md px-4 py-2 text-sm shadow-lg"
+      data-test="notice"
+      class="fixed bottom-6 left-1/2 z-50 flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-md px-4 py-2 text-sm shadow-lg"
       :class="notice.kind === 'error' ? 'bg-rose-600 text-white' : 'bg-slate-900 text-white'"
       :role="notice.kind === 'error' ? 'alert' : 'status'"
       aria-live="polite"
     >
-      {{ notice.text }}
+      <span class="min-w-0">{{ notice.text }}</span>
+      <button
+        v-if="notice.action"
+        type="button"
+        data-test="notice-action"
+        class="shrink-0 rounded border border-white/40 px-2 py-0.5 text-xs hover:bg-white/10"
+        @click="notice.action?.run(); notice = null"
+      >{{ notice.action.label }}</button>
     </div>
 
     <!--

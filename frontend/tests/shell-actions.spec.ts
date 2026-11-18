@@ -1,9 +1,10 @@
-﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
 import type { MindMapContent } from '../src/api/types';
+import { textSource } from '../src/sources/input';
 import { useChatStore } from '../src/stores/chat';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
@@ -126,6 +127,64 @@ describe('瘦顶栏', () => {
     expect(store.content).toBeNull();
     expect(chat.messages).toHaveLength(0);
     expect(wrapper.get('[data-test="chat-dock"]').attributes('data-faded')).toBe('false');
+  });
+
+  it('`+` 把材料、粘贴框草稿与没发出去的那句话一起清掉，并说明清掉了什么', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    store.preview(TREE, 'right');
+    sources.items = [{
+      key: 's1', id: 'doc-1', label: '材料.pdf', kind: 'document', state: 'ready',
+      source: { ...textSource('材料正文'), id: 'doc-1', kind: 'document', filename: '材料.pdf' },
+      error: '', seconds: 0,
+    }];
+    sources.draftText = '粘贴框里的草稿';
+    await wrapper.get('textarea#intent').setValue('还没发出去的那句话');
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[data-test="new-run"]').trigger('click');
+    await flushPromises();
+
+    // "新对话"的语义是干净开始：画布、时间线、材料、两处草稿都不留。
+    expect(sources.items).toHaveLength(0);
+    expect(sources.draftText).toBe('');
+    expect((wrapper.get('textarea#intent').element as HTMLTextAreaElement).value).toBe('');
+    // 但清掉了什么必须说出来，而且要留回去的路。
+    const notice = wrapper.get('[data-test="notice"]');
+    expect(notice.text()).toContain('已清空 1 份材料');
+    expect(notice.text()).toContain('粘贴框里没添加的正文');
+    expect(notice.text()).toContain('没发出去的那句话');
+    expect(wrapper.find('[data-test="notice-action"]').exists()).toBe(true);
+  });
+
+  it('撤销把刚清掉的材料与两处草稿原样放回来', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    store.preview(TREE, 'right');
+    const material = {
+      key: 's1', id: 'doc-1', label: '材料.pdf', kind: 'document' as const, state: 'ready' as const,
+      source: { ...textSource('材料正文'), id: 'doc-1', kind: 'document' as const, filename: '材料.pdf' },
+      error: '', seconds: 0,
+    };
+    sources.items = [material];
+    sources.draftText = '粘贴框里的草稿';
+    await wrapper.get('textarea#intent').setValue('还没发出去的那句话');
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[data-test="new-run"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="notice-action"]').trigger('click');
+    await flushPromises();
+
+    expect(sources.items.map(item => item.id)).toEqual(['doc-1']);
+    expect(sources.draftText).toBe('粘贴框里的草稿');
+    expect((wrapper.get('textarea#intent').element as HTMLTextAreaElement).value).toBe('还没发出去的那句话');
+    // 撤销之后那句提示不该还挂着（它说的是"已经清空"，而东西已经回来了）。
+    expect(wrapper.find('[data-test="notice"]').exists()).toBe(false);
   });
 });
 

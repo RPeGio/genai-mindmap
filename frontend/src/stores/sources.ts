@@ -27,6 +27,18 @@ export interface SourceItem {
 type Lane = 'document' | 'media';
 
 /**
+ * 「清空」之前的一份可撤销快照（`snapshot()` / `restore()`）。
+ *
+ * 只给「新对话」用：那个动作会把材料清干净，而材料可能是用户传了十几分钟、
+ * 刚解析完还没生成过的东西。带文件的条目要靠 `files` 才能重试，所以连它一起留。
+ */
+export interface SourcesSnapshot {
+  items: SourceItem[];
+  draftText: string;
+  files: Array<[string, File]>;
+}
+
+/**
  * 文档泳道并发度 1，保持串行。
  *
  * 文档走 Docling / pymupdf，是本地 CPU 且 Docling 内部有进程级单例锁，
@@ -265,6 +277,38 @@ export const useSourcesStore = defineStore('sources', () => {
     }
   }
 
+  /**
+   * 一次可回滚的清空：把"清掉的东西"整体留一份，供「撤销」还原。
+   *
+   * `files` 也要一起留：没有它，还原回来的失败条目点「重试」会找不到文件而静静停在
+   * `queued`（`parseItem` 的第一行就 return），用户看到的是"重试没反应"。
+   *
+   * 还原时把 `queued` / `parsing` 重新丢给泳道跑一遍：清空那一刻正在解析的条目，
+   * 它的 `AbortController` 已经随着 `clear()` 被 abort 且从 `active` 里删掉，
+   * 直接放回列表会停在 `parsing` 一秒钟都不会动。
+   */
+  function snapshot(): SourcesSnapshot {
+    return {
+      items: [...items.value],
+      draftText: draftText.value,
+      files: [...files.entries()],
+    };
+  }
+
+  function restore(saved: SourcesSnapshot): void {
+    active.forEach(controller => controller.abort());
+    active.clear();
+    files.clear();
+    for (const [key, file] of saved.files) files.set(key, file);
+    items.value = saved.items.map(item =>
+      item.state === 'queued' || item.state === 'parsing'
+        ? { ...item, state: 'queued' as const, seconds: 0 }
+        : item);
+    draftText.value = saved.draftText;
+    error.value = '';
+    void drain();
+  }
+
   function remove(key: string): void {
     active.get(key)?.abort();
     files.delete(key);
@@ -288,5 +332,6 @@ export const useSourcesStore = defineStore('sources', () => {
     items, error, parsing, recording, readySources, problem, materialProblem,
     draftText,
     addText, addDraft, addFiles, retry, remove, clear, remap,
+    snapshot, restore,
   };
 });
