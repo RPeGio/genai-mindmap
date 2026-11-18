@@ -1239,7 +1239,8 @@ export interface components {
         };
         /** ImportResponse */
         ImportResponse: {
-            content: components["schemas"]["MindMapContent-Output"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Output"] | components["schemas"]["FishboneContent-Output"] | components["schemas"]["FlowContent-Output"];
             /** Warnings */
             warnings: components["schemas"]["ImportWarningPayload"][];
             /** Source Format */

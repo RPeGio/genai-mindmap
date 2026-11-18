@@ -26,7 +26,7 @@ from io import BytesIO
 
 from fastapi.testclient import TestClient
 
-from app.contracts.mindmap import MindMapContent
+from app.contracts.mindmap import FishboneContent, FlowContent, MindMapContent
 from app.export.service import to_json, to_markdown, to_opml, to_puml
 from app.importing.detect import detect_format
 from app.importing.errors import ParseFailure, UnsupportedFormat
@@ -782,6 +782,498 @@ class HardeningTest(unittest.TestCase):
         result = parse_text("huge.puml", text)
         self.assertIn("hard_cap", codes(result.warnings))
         self.assertEqual(len(result.content.root.children), 50)
+
+
+# ---------------------------------------------------------------- 三种图型
+
+
+def walk(node):
+    """前序遍历一棵子树（父在子前）。"""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(current.children)
+
+
+def label_maps(content) -> tuple[dict[str, str], dict[str, str]]:
+    """`(节点 id → 标题, 阶段 id → 阶段标题)` 两张翻译表。"""
+    labels: dict[str, str] = {}
+    stages: dict[str, str] = {}
+    if isinstance(content, MindMapContent):
+        roots = [content.root]
+    elif isinstance(content, FishboneContent):
+        roots = [bone.root for bone in content.bones]
+    else:
+        roots = [stage.root for stage in content.stages]
+        for stage in content.stages:
+            stages[stage.id] = stage.root.label
+    for root in roots:
+        for node in walk(root):
+            labels[node.id] = node.label
+    return labels, stages
+
+
+def canonical(content) -> dict:
+    """一份内容压成"与 id 无关"的规范形——"逐字段相等"的可实现定义。
+
+    导入**一定**重新生成 id（`normalize` 的第 ① 条：外部 id 与库里碰撞的后果是
+    "引用了另一个节点"这种完全静默的错）。所以"导出 → 导入 → 逐字段相等"只能
+    定义成：**除了 id 之外全相等，边的端点按它指向的节点标题比较**。
+
+    去掉的只有三样，每一样都有明确理由：
+      - `id`（节点 / 边 / 关系 / 阶段）：重新生成，见上；
+      - `source_refs` / `source_usage`：**故意**清空（`normalize` 的第 ⑤ 条），
+        单独有用例断言它们确实是空的；
+      - 边的 `id` 之外一个字段都不去——`label` / `kind` 都在，因为"判定节点的
+        是/否两个出口丢了"正是这条路径最容易犯的错。
+    """
+    labels, stages = label_maps(content)
+    dump = content.model_dump(mode="json")
+
+    def endpoint(value: str) -> str:
+        return labels.get(value) or stages.get(value) or value
+
+    def node_dump(node: dict) -> dict:
+        out = {k: v for k, v in node.items() if k not in ("id", "source_refs")}
+        out["children"] = [node_dump(child) for child in out["children"]]
+        return out
+
+    def edge_dump(edge: dict) -> dict:
+        return {
+            "source": endpoint(edge["source"]),
+            "target": endpoint(edge["target"]),
+            "label": edge.get("label"),
+            "kind": edge.get("kind"),
+        }
+
+    out: dict = {
+        "title": dump["title"],
+        "theme": dump["theme"],
+        "relations": [
+            {
+                "source": endpoint(item["source"]),
+                "target": endpoint(item["target"]),
+                "type": item["type"],
+                "label": item["label"],
+                "evidence": item["evidence"],
+                "provenance": item["provenance"],
+            }
+            for item in dump["relations"]
+        ],
+    }
+    if "root" in dump:
+        out["shape"] = "tree"
+        out["root"] = node_dump(dump["root"])
+        out["layout"] = dump["layout"]
+        out["diagram_type"] = dump["diagram_type"]
+        out["edges"] = [edge_dump(edge) for edge in dump["edges"]]
+    elif "bones" in dump:
+        out["shape"] = "fishbone"
+        out["problem"] = dump["problem"]
+        out["bones"] = [
+            {
+                "category": bone["category"],
+                "color": bone["color"],
+                "icon": bone["icon"],
+                "root": node_dump(bone["root"]),
+            }
+            for bone in dump["bones"]
+        ]
+    else:
+        out["shape"] = "flowchart"
+        out["stages"] = [
+            {"root": node_dump(stage["root"]),
+             "edges": [edge_dump(edge) for edge in stage["edges"]]}
+            for stage in dump["stages"]
+        ]
+        out["edges"] = [edge_dump(edge) for edge in dump["edges"]]
+    return out
+
+
+def sample_fishbone() -> FishboneContent:
+    """一张有代表性的鱼骨图：六根骨里只写三根、带视觉元素、带关系与引用。"""
+    return FishboneContent.model_validate({
+        "title": "交付延期分析",
+        "problem": "为什么三次交付都延期",
+        "theme": {"preset": "forest", "direction": "both", "accent": "#1e40af"},
+        "source_usage": [{"source_id": "src-1", "kind": "text",
+                          "filename": "复盘会.txt", "char_count": 1200}],
+        "bones": [
+            {"category": "人", "color": "red", "icon": "👥", "root": {
+                "id": "b_people", "label": "人", "color": "red", "children": [
+                    {"id": "b_people_1", "label": "关键人休假", "note": "九月两周",
+                     "detail": "两位主程同时不在", "role": "step", "icon": "🌴",
+                     "expandable": "no", "collapsed": True,
+                     "source_refs": [{"source_id": "src-1", "start": 0, "end": 4,
+                                      "quote": "休假"}]},
+                    {"id": "b_people_2", "label": "交接不完整"},
+                ]}},
+            {"category": "机", "root": {
+                "id": "b_machine", "label": "机", "children": [
+                    {"id": "b_machine_1", "label": "构建机排队"},
+                ]}},
+            {"category": "料", "root": {"id": "b_material", "label": "料"}},
+        ],
+        "relations": [
+            {"id": "rel-1", "source": "b_people_2", "target": "b_machine_1",
+             "type": "cause", "label": "导致", "evidence": "复盘会第 3 段",
+             "provenance": "ai"},
+        ],
+    })
+
+
+def sample_flow() -> FlowContent:
+    """一张有代表性的流程图：三个阶段、阶段间三种边（含回退）、阶段内判定出边。"""
+    return FlowContent.model_validate({
+        "title": "报销流程",
+        "theme": {"preset": "slate"},
+        "stages": [
+            {"id": "s_1", "root": {
+                "id": "n_submit", "label": "提交", "role": "start", "children": [
+                    {"id": "n_fill", "label": "填单", "role": "step"},
+                    {"id": "n_attach", "label": "上传发票", "icon": "🧾"},
+                ]}},
+            {"id": "s_2", "root": {
+                "id": "n_review", "label": "审查", "role": "decision", "children": [
+                    {"id": "n_form", "label": "形式审查"},
+                    {"id": "n_substance", "label": "实质审查",
+                     "color": "amber", "expandable": "yes"},
+                ]},
+             "edges": [
+                 {"id": "in-1", "source": "n_review", "target": "n_form",
+                  "label": "是", "kind": "branch"},
+                 {"id": "in-2", "source": "n_review", "target": "n_substance",
+                  "label": "否", "kind": "branch"},
+             ]},
+            {"id": "s_3", "root": {"id": "n_pay", "label": "付款", "role": "end"}},
+        ],
+        "edges": [
+            {"id": "out-1", "source": "s_1", "target": "s_2", "kind": "flow"},
+            {"id": "out-2", "source": "s_2", "target": "s_3", "label": "通过",
+             "kind": "branch"},
+            {"id": "out-3", "source": "s_3", "target": "s_1", "label": "驳回",
+             "kind": "loop"},
+        ],
+        "relations": [
+            {"id": "rel-f", "source": "n_attach", "target": "n_pay",
+             "type": "depends", "label": "凭证"},
+        ],
+    })
+
+
+class ThreeShapeRoundTripTest(unittest.TestCase):
+    """"导出 → 导入"在**三种图型**上都成立：除 id 与被清空的引用外逐字段相等。
+
+    这是这次改动的核心判据。它钉住的是一件很容易蒙混过关的事：一份鱼骨图导回来
+    如果变成树，`content.title` 还在、节点文字也都在，**看起来导入成功了**——只有
+    `bones` / `problem` 没了。所以这三条用例比的不是"文字还在不在"，是完整 dump。
+    """
+
+    def roundtrip(self, content, name: str = "map.json"):
+        result = parse_text(name, to_json(content))
+        self.assertEqual(result.source_format, "json")
+        return result.content
+
+    def test_tree_roundtrip_is_field_by_field(self):
+        original = MindMapContent.model_validate(build(
+            diagram_type="flowchart",
+            theme={"preset": "slate", "direction": "left", "font": "serif"},
+            edges=[{"id": "e1", "source": "m1", "target": "t1", "label": "是",
+                    "kind": "branch"}],
+            relations=[{"id": "r1", "source": "m1", "target": "t1", "type": "ref",
+                        "label": "参见", "provenance": "user"}],
+            root={
+                "id": "root", "label": "产品", "note": "根备注", "detail": "根详情",
+                "color": "blue", "icon": "🎯", "role": "start",
+                "children": [
+                    {"id": "m", "label": "市场", "color": "green", "icon": "🚀",
+                     "collapsed": True, "expandable": "no",
+                     "style": {"bold": True, "shape": "pill", "color": "#112233"},
+                     "children": [{"id": "m1", "label": "竞品调研"}]},
+                    {"id": "t", "label": "技术", "children": [{"id": "t1", "label": "架构设计"}]},
+                ],
+            },
+        ))
+        restored = self.roundtrip(original)
+        self.assertEqual(canonical(restored), canonical(original))
+        self.assertEqual(restored.source_usage, [])
+        self.assertEqual(restored.root.source_refs, [])
+
+    def test_fishbone_roundtrip_is_field_by_field(self):
+        original = sample_fishbone()
+        restored = self.roundtrip(original, "fishbone.json")
+        self.assertIsInstance(restored, FishboneContent)
+        self.assertEqual(canonical(restored), canonical(original))
+
+    def test_flow_roundtrip_is_field_by_field(self):
+        original = sample_flow()
+        restored = self.roundtrip(original, "flow.json")
+        self.assertIsInstance(restored, FlowContent)
+        self.assertEqual(canonical(restored), canonical(original))
+
+    def test_fishbone_keeps_bones_problem_and_visuals(self):
+        original = sample_fishbone()
+        restored = self.roundtrip(original, "fishbone.json")
+        self.assertEqual(restored.problem, original.problem)
+        self.assertEqual([bone.category for bone in restored.bones], ["人", "机", "料"])
+        self.assertEqual(restored.bones[0].color, "red")
+        self.assertEqual(restored.bones[0].icon, "👥")
+        # 骨下面的原因一条不少，视觉字段也都在
+        causes = restored.bones[0].root.children
+        self.assertEqual([cause.label for cause in causes], ["关键人休假", "交接不完整"])
+        self.assertEqual(causes[0].icon, "🌴")
+        self.assertEqual(causes[0].note, "九月两周")
+        self.assertEqual(causes[0].role, "step")
+        self.assertEqual(causes[0].expandable, "no")
+        self.assertTrue(causes[0].collapsed)
+
+    def test_flow_keeps_stages_both_edge_layers_and_roles(self):
+        """流程图的四个关键物：阶段、阶段间边、阶段内边、`role`。
+
+        `role` 是「判定节点画菱形」的唯一依据；`stages[i].edges` 是「是 / 否」两个
+        出口的唯一位置。少了任何一个，图能打开、能保存，但画出来已经不是流程图。
+        """
+        restored = self.roundtrip(sample_flow(), "flow.json")
+        self.assertEqual([stage.root.label for stage in restored.stages],
+                         ["提交", "审查", "付款"])
+        # 阶段间：三条，含一条回退
+        self.assertEqual(len(restored.edges), 3)
+        kinds = {edge.kind for edge in restored.edges}
+        self.assertEqual(kinds, {"flow", "branch", "loop"})
+        # 阶段内：两条判定出边，端点在**这个阶段自己**的节点里
+        review = restored.stages[1]
+        self.assertEqual(len(review.edges), 2)
+        local_ids = {node.id for node in walk(review.root)}
+        for edge in review.edges:
+            self.assertIn(edge.source, local_ids)
+            self.assertIn(edge.target, local_ids)
+        self.assertEqual({edge.label for edge in review.edges}, {"是", "否"})
+        # role
+        self.assertEqual(restored.stages[0].root.role, "start")
+        self.assertEqual(restored.stages[1].root.role, "decision")
+        self.assertEqual(restored.stages[2].root.role, "end")
+        self.assertIsNone(restored.stages[0].root.children[1].role)
+
+    def test_relations_keep_their_provenance(self):
+        """`provenance` 是**内容**（"这条关系是谁连的"），不是导入元数据。
+
+        以前一律盖成 `import`：对外部格式是对的（它们没有这个字段），对自家 JSON
+        就是丢字段——而"导出再导入必须一样"正是这条路存在的理由。
+        """
+        restored = self.roundtrip(sample_fishbone(), "fishbone.json")
+        self.assertEqual([item.provenance for item in restored.relations], ["ai"])
+
+    def test_ids_are_regenerated_in_all_three_shapes(self):
+        for original in (sample_fishbone(), sample_flow()):
+            restored = self.roundtrip(original)
+            before = set(label_maps(original)[0]) | set(label_maps(original)[1])
+            after = set(label_maps(restored)[0]) | set(label_maps(restored)[1])
+            self.assertEqual(before & after, set(), "导出的 id 不该原样出现在导入结果里")
+
+    def test_refs_are_cleared_in_all_three_shapes(self):
+        """三种形状都要清引用。鱼骨这份样例带着 1 处引用 + 1 条来源摘要。"""
+        result = parse_text("x.json", to_json(sample_fishbone()))
+        self.assertEqual(result.content.source_usage, [])
+        for node in _all_nodes(result.content):
+            self.assertEqual(node.source_refs, [])
+        self.assertIn("source_refs_cleared", codes(result.warnings))
+
+    def test_flow_without_refs_reports_no_ref_warning(self):
+        """没有引用的图不该出现"引用已清空"——那条告警是给"确实清过东西"的图。"""
+        self.assertNotIn("source_refs_cleared",
+                         codes(parse_text("x.json", to_json(sample_flow())).warnings))
+
+
+def _all_nodes(content):
+    if isinstance(content, MindMapContent):
+        roots = [content.root]
+    elif isinstance(content, FishboneContent):
+        roots = [bone.root for bone in content.bones]
+    else:
+        roots = [stage.root for stage in content.stages]
+    for root in roots:
+        yield from walk(root)
+
+
+class ShapeJudgeTest(unittest.TestCase):
+    """判据：**只有本仓库的 JSON 认完整结构**，其余五种格式一律只产树。"""
+
+    def test_markdown_fishbone_comes_back_as_a_tree(self):
+        """鱼骨图导成 markdown 再导回来**是树**——这是有损的，且必须如实钉住。
+
+        这条用例的存在意义不是"验证一个 bug"，而是把"闭环只在 JSON 上成立"这句话
+        变成红灯：哪天有人改了 markdown 的导出/导入让鱼骨能保住形状，这条用例会
+        先红，然后他得去 `docs/IMPORT.md` 把"有损"那段改掉，而不是让文档与代码
+        各说各话。
+        """
+        original = sample_fishbone()
+        restored = parse_text("fishbone.md", to_markdown(original)).content
+        self.assertIsInstance(restored, MindMapContent)
+        # 文字没丢：六类骨与原因都在树里
+        self.assertEqual(restored.root.label, "为什么三次交付都延期")
+        self.assertEqual([child.label for child in restored.root.children], ["人", "机", "料"])
+
+    def test_flow_markdown_comes_back_as_a_tree(self):
+        """流程图的 markdown 往返：变成树，**而且阶段名整段丢掉**。
+
+        丢的原因不是流程特有的是：markdown 解析器只把**第一个** `#` 标题当导图标题，
+        后面任何级别的 heading 都被跳过（`markdown.py::parse` 里那一句 `continue`）。
+        树的导出只用一个 `# 标题`，所以树这条路不受影响；鱼骨与流程的导出用
+        `## 人` / `### 1. 提交` 当容器，那些行在导入侧就没有落点。
+
+        这条用例把"有损在哪"钉成事实，`docs/IMPORT.md` 的格式矩阵照它写。
+        """
+        restored = parse_text("flow.md", to_markdown(sample_flow())).content
+        self.assertIsInstance(restored, MindMapContent)
+        self.assertEqual(restored.title, "报销流程")
+        # 阶段名（`### 1. 提交`）没有落点，第一个列表项成了根
+        labels = {node.label for node in _all_nodes(restored)}
+        self.assertNotIn("提交", labels)
+        self.assertNotIn("审查", labels)
+        self.assertIn("填单", labels)
+
+    def test_empty_bones_is_a_legal_fishbone(self):
+        """只有主骨的草稿是合法的：`bones: []` 不该被当成"不是鱼骨图"。"""
+        content = FishboneContent.model_validate(
+            {"title": "草稿", "problem": "为什么慢", "bones": []})
+        restored = parse_text("draft.json", to_json(content)).content
+        self.assertIsInstance(restored, FishboneContent)
+        self.assertEqual(restored.bones, [])
+
+    def test_problem_falls_back_to_title_when_missing(self):
+        result = parse_text("noproblem.json", json.dumps(
+            {"title": "为什么慢", "bones": []}, ensure_ascii=False))
+        self.assertEqual(result.content.problem, "为什么慢")
+        self.assertIn("fields_dropped", codes(result.warnings))
+
+    def test_duplicate_bone_categories_get_numbers(self):
+        """骨的类别必须唯一（契约硬拒）。重复的加序号，而不是丢掉那根骨。"""
+        body = {
+            "problem": "为什么慢",
+            "bones": [
+                {"category": "人", "root": {"label": "人"}},
+                {"category": "人", "root": {"label": "人也算", "children": [
+                    {"label": "第二个原因"}]}},
+            ],
+        }
+        result = parse_text("dup.json", json.dumps(body, ensure_ascii=False))
+        self.assertEqual([bone.category for bone in result.content.bones],
+                         ["人", "人（2）"])
+        self.assertEqual(len(result.content.bones[1].root.children), 1)
+        self.assertIn("category_duplicate", codes(result.warnings))
+
+    def test_too_many_bones_are_truncated_with_a_warning(self):
+        bones = [{"category": f"类{i}", "root": {"label": f"骨{i}"}} for i in range(8)]
+        result = parse_text("bones.json", json.dumps(
+            {"problem": "为什么慢", "bones": bones}, ensure_ascii=False))
+        self.assertEqual(len(result.content.bones), 6)
+        self.assertIn("truncated_bones", codes(result.warnings))
+
+    def test_empty_stages_is_unsupported(self):
+        with self.assertRaises(UnsupportedFormat):
+            parse_text("empty.json", json.dumps({"stages": []}, ensure_ascii=False))
+
+    def test_stage_inner_edge_to_another_stage_is_dropped(self):
+        """一条跨阶段的"阶段内边"必须丢掉：契约会硬拒整份图，而那是 400 不是降级。"""
+        body = {
+            "title": "流程",
+            "stages": [
+                {"id": "s1", "root": {"id": "a", "label": "甲"}},
+                {"id": "s2", "root": {"id": "b", "label": "乙"},
+                 "edges": [{"id": "bad", "source": "b", "target": "a"}]},
+            ],
+        }
+        result = parse_text("cross.json", json.dumps(body, ensure_ascii=False))
+        self.assertEqual(result.content.stages[1].edges, [])
+        self.assertIn("edges_dropped", codes(result.warnings))
+
+
+class ContainerBfsTest(unittest.TestCase):
+    """容器（骨 / 阶段）的 BFS：**轮转**而不是"第一根截满、其余全灭"。
+
+    判据不是"实现了某个算法"，而是用户能看到什么：一张鱼骨图少了五根骨，就不再是
+    鱼骨图；一张流程少了两个阶段，流程就断了。而"每根骨少几个最深处的原因"是
+    BFS 在树上一贯的取舍口径（"没读到这里"，不是"这里没有了"）。
+    """
+
+    def fishbone_with(self, causes: int, leaves: int) -> dict:
+        return {
+            "title": "超限鱼骨",
+            "problem": "为什么慢",
+            "bones": [
+                {"category": f"类{index}", "root": {
+                    "label": f"骨{index}",
+                    "children": [
+                        {"label": f"骨{index}原因{cause}", "children": [
+                            {"label": f"骨{index}原因{cause}细节{leaf}"}
+                            for leaf in range(leaves)
+                        ]}
+                        for cause in range(causes)
+                    ],
+                }}
+                for index in range(6)
+            ],
+        }
+
+    def test_every_bone_keeps_its_content_when_over_the_node_limit(self):
+        """6 根骨 × 50 原因 × 5 细节 = 1806 个节点，超过 1000 的上限。
+
+        层序保留的结果：第 1 层六根骨全在，第 2 层每根骨的 50 个原因全在（共 300），
+        第 3 层的额度按容器顺序分配。**关键的断言是"后三根骨的第 1、2 层也在"**——
+        逐个容器截满时它们一个节点都不会剩下。
+        """
+        result = parse_text("huge.json", json.dumps(
+            self.fishbone_with(50, 5), ensure_ascii=False))
+        bones = result.content.bones
+        self.assertEqual(len(bones), 6, "六根骨必须都在")
+        for bone in bones:
+            self.assertEqual(len(bone.root.children), 50,
+                             f"{bone.category} 的原因被整段砍掉了")
+        # 前几根骨的第 3 层有内容，后几根没有——这是"层序"而不是"平均分"
+        self.assertGreater(len(bones[0].root.children[0].children), 0)
+        self.assertEqual(len(bones[5].root.children[0].children), 0)
+        self.assertIn("truncated_nodes", codes(result.warnings))
+
+    def test_every_stage_keeps_its_steps_when_over_the_node_limit(self):
+        """3 个阶段 × 40 步 × 10 细节 = 1323 个节点。三个阶段都必须还在。"""
+        stages = [
+            {"id": f"s{index}", "root": {
+                "label": f"阶段{index}",
+                "children": [
+                    {"label": f"阶段{index}步{step}", "children": [
+                        {"label": f"阶段{index}步{step}细节{leaf}"} for leaf in range(10)
+                    ]}
+                    for step in range(40)
+                ],
+            }}
+            for index in range(3)
+        ]
+        result = parse_text("huge.json", json.dumps(
+            {"title": "超限流程", "stages": stages}, ensure_ascii=False))
+        self.assertEqual(len(result.content.stages), 3, "三个阶段必须都在")
+        for stage in result.content.stages:
+            self.assertEqual(len(stage.root.children), 40,
+                             f"{stage.root.label} 的步骤被整段砍掉了")
+        self.assertIn("truncated_nodes", codes(result.warnings))
+
+    def test_depth_limit_is_counted_per_container(self):
+        """深度按**每棵子树**从 1 数（契约 `_scan_tree` 同口径），不是从虚拟根数。"""
+        deep = {"label": "层1", "children": []}
+        cursor = deep
+        for level in range(2, 10):
+            child = {"label": f"层{level}", "children": []}
+            cursor["children"].append(child)
+            cursor = child
+        body = {"problem": "为什么慢", "bones": [
+            {"category": "人", "root": deep},
+            {"category": "机", "root": {"label": "机", "children": [
+                {"label": "机原因", "children": [{"label": "机原因细节"}]}]}},
+        ]}
+        result = parse_text("deep.json", json.dumps(body, ensure_ascii=False))
+        self.assertIn("truncated_depth", codes(result.warnings))
+        # 另一根骨的内容不受影响：深度是各自的
+        self.assertEqual(len(result.content.bones[1].root.children), 1)
 
 
 if __name__ == "__main__":

@@ -112,6 +112,27 @@ export function isFlow(content: DiagramContent): content is FlowContent {
   return 'stages' in content;
 }
 
+/** 节点在图里扮演什么。与 `MindNode.role` 同值（`null` = 普通步骤）。 */
+export type NodeRole = NonNullable<MindNode['role']>;
+
+/** 画布上这个节点该长什么样。缺省 `rect` 就是加形状之前的样子。 */
+export type NodeShape = 'rect' | 'diamond' | 'pill';
+
+/**
+ * `role` → 画布形状。**只有流程图会走到这里**（判据在 `stores/mindmap.ts`：布局
+ * 结果里有没有 `sizes`）。树与鱼骨的节点即使带着 `role` 也一律 `rect`——那不是
+ * 它们的语义，而且「打开旧图，画布变了」是这个项目里最不能犯的错。
+ *
+ * 判定画菱形是教科书约定：菱形本身就说明"这里有两条以上的出口"。`start` / `end`
+ * 画成胶囊（大圆角），但不画菱形——它们是**端点**，不是分叉点，两者在流程图上
+ * 共用一种形状会让读图的人以为起点也要选一条路走。
+ */
+export function nodeShapeOf(role: NodeRole | null | undefined): NodeShape {
+  if (role === 'decision') return 'diamond';
+  if (role === 'start' || role === 'end') return 'pill';
+  return 'rect';
+}
+
 export function kindOf(content: DiagramContent): ShapeKind {
   if (isFishbone(content)) return 'fishbone';
   if (isFlow(content)) return 'flowchart';
@@ -123,6 +144,20 @@ export function containerNoun(kind: ShapeKind): string {
   if (kind === 'fishbone') return '骨';
   if (kind === 'flowchart') return '阶段';
   return '一级分支';
+}
+
+/**
+ * 这种形状在界面文案里叫什么图。与后端 `DIAGRAM_LABELS` **同一份字面量**。
+ *
+ * 后端那份的注释说得很清楚："写成 fishbone 读不出意思，写成'因果图'又与界面上那个
+ * 下拉的名字对不上"。这里再写一遍是同一件事的另一端：导入结果面板要说"已导入一张
+ * 鱼骨图"，而那条文案只能来自形状（`kindOf`），不能来自 `diagram_type`——理由与
+ * 判别那三个函数一样。
+ */
+export function shapeLabel(kind: ShapeKind): string {
+  if (kind === 'fishbone') return '鱼骨图';
+  if (kind === 'flowchart') return '流程图';
+  return '思维导图';
 }
 
 // ---------------------------------------------------------------- 读：容器、遍历、计数
@@ -419,7 +454,22 @@ export function canvasTreeOf(content: DiagramContent): { root: MindNode; synthet
     ? (content.problem?.trim() || content.title)
     : content.title;
   return {
-    root: { id: CANVAS_ROOT_ID, label, children: rootsOf(content) },
+    root: {
+      id: CANVAS_ROOT_ID,
+      label,
+      /**
+       * 合成根**不带 `role`**：它是这张图的标题，不是流程的端点。
+       *
+       * 曾经给它标过 `start`，让流程图顶端长成一个"开始"胶囊——但后端
+       * `_stamp_flow_roles` 还会把**第一个阶段的根**也标成 `start`（"提交申请"），
+       * 于是画布上并排出现两个一模一样深色的开始胶囊，读者分不出哪一个是图题。
+       * 形状只认内容里的 `role`：合成根不在 content 里，就不该借一个角色来驱动视觉。
+       *
+       * 它仍然走 `depth === 0` 那一档样式（深色实底），与树根、鱼头同一套语言：
+       * 三个形状的顶端都是"这张图叫什么"。
+       */
+      children: rootsOf(content),
+    },
     synthetic: true,
   };
 }

@@ -2,8 +2,12 @@
 
 响应形状（题目给定的契约）：
 
-    200 { content: MindMapContent, warnings: [{code, message}], source_format: "xmind" }
+    200 { content: DiagramContent, warnings: [{code, message}], source_format: "xmind" }
     400 { code: "unsupported_format" | "parse_failed", message }
+
+`content` 是**三种图型的联合**（`DiagramContent`），与 `SaveRequest.content` /
+`MapRecord.content` 是同一个类型：导入进来的图要能直接走保存那条路，两处类型不一致
+的表现是"导入鱼骨图能成功，点保存 422"。
 
 **为什么挂在 `/mindmaps/import` 而不是 `/import`**：它导入的产物就是一张导图，
 与 `/mindmaps` 那组接口是同一件事的两端（一个写库，一个只解析）。放在同一个前缀
@@ -21,7 +25,7 @@ from __future__ import annotations
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.contracts.mindmap import MindMapContent
+from app.contracts.mindmap import DiagramContent
 from app.core.errors import AppError
 from app.importing.errors import ImportFailure
 from app.importing.service import MAX_IMPORT_BYTES, parse_import
@@ -37,7 +41,7 @@ class ImportWarningPayload(BaseModel):
 
 
 class ImportResponse(BaseModel):
-    content: MindMapContent
+    content: DiagramContent
     warnings: list[ImportWarningPayload]
     source_format: str
 

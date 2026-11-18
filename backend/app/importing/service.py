@@ -7,6 +7,11 @@
 **只解析，不落库。** 落库仍走用户点保存：导入失败时不应该在库里留下半张图，而
 "导入成功但用户不想要"也应该能直接丢弃——它在这一层表现为 `dirty=true` 的未保存
 状态，与生成出来的图走同一条保存路径。
+
+产物的类型是 `DiagramContent`（三种图型的联合），不是 `MindMapContent`：本仓库导出
+的 JSON 里有完整结构，鱼骨与流程必须原样导回来（见 `json_import` 的模块 docstring）。
+其余五种格式只产树——那不是缺功能，是那些格式**没有图型概念**（判据与取舍写在
+`docs/IMPORT.md`）。
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from app.contracts.mindmap import MindMapContent
+from app.contracts.mindmap import DiagramContent
 from app.importing import freemind, json_import, markdown, opml, puml, xmind
 from app.importing.detect import SNIFF_BYTES, detect_format
 from app.importing.errors import ImportFailure, ParseFailure, UnsupportedFormat
@@ -51,7 +56,7 @@ MAX_IMPORT_BYTES = 10 * 1024 * 1024
 
 @dataclass(frozen=True)
 class ImportResult:
-    content: MindMapContent
+    content: DiagramContent
     warnings: list[ImportWarning]
     source_format: str
 

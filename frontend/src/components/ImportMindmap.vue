@@ -3,6 +3,7 @@ import { computed, ref } from 'vue';
 
 import { ApiError, importMindMap } from '../api/client';
 import type { ImportWarning } from '../api/types';
+import { kindOf, shapeLabel } from '../mindmap/shape';
 import { useMindMapStore } from '../stores/mindmap';
 
 /**
@@ -21,6 +22,11 @@ import { useMindMapStore } from '../stores/mindmap';
  *     面板可以被关掉，但不会自己消失（成功提示那种 3 秒浮层不够读完 5 条告警）。
  *  3. **失败要说清是哪一步**。后端已经给出"第 12 行第 5 列"这种定位，界面只负责
  *     原样显示 `message`，不再自己编一句"导入失败"把它盖掉。
+ *
+ * 导入的产物**可能是三种形状**（树 / 鱼骨 / 流程），所以这里不碰 `content.root`：
+ * 图型一律走 `shape.ts::kindOf()`。那句"已导入一张鱼骨图"是这条路径唯一说得出
+ * "后端真的导出了另一种形状"的地方——少了它，一张鱼骨图导进来之后画布长得像鱼骨，
+ * 而界面上没有任何一句话承认过这件事。
  */
 
 const props = defineProps<{
@@ -52,6 +58,17 @@ const sourceLabel = computed(
   () => FORMAT_LABELS[importedName.value] ?? importedName.value,
 );
 
+/**
+ * 导进来的是哪种图（"思维导图" / "鱼骨图" / "流程图"）。
+ *
+ * 读的是 `store.content` 而不是 `result.content`：两者是同一个对象（`importMap` 原样
+ * 装进画布），但前者在 `finally` 之后仍然可用——面板是**异步显示**的，而 `result`
+ * 只在 `try` 块里活着。这也顺带证明了一件事：形状信息经过 `slot()` 之后一点没变。
+ */
+const importedShape = computed(
+  () => (store.content ? shapeLabel(kindOf(store.content)) : ''),
+);
+
 function pick(): void {
   if (busy.value) return;
   input.value?.click();
@@ -81,7 +98,8 @@ async function onChange(event: Event): Promise<void> {
     // 成功时也把 `store.status` 之外的那句话补上：状态栏在左侧折叠区下面，用户
     // 不一定看得到；这里给一个明确的「已导入」。
     if (result.warnings.length === 0) {
-      store.status = `已导入「${result.content.title}」（${sourceLabel.value}），还没有保存。`;
+      store.status = `已导入「${result.content.title}」（${sourceLabel.value}，`
+        + `${importedShape.value}），还没有保存。`;
     }
   } catch (err) {
     // 后端两种 400 都会把原因写在 `message` 里（"第 12 行第 5 列解析失败" /
@@ -155,7 +173,8 @@ function dismiss(): void {
         <p class="min-w-0 break-words leading-relaxed" :class="error ? 'text-rose-700' : 'text-amber-800'">
           <span v-if="error">{{ error }}</span>
           <span v-else>
-            已导入「{{ store.content?.title }}」（{{ sourceLabel }}），有 {{ warnings.length }} 条提示：
+            已导入「{{ store.content?.title }}」（{{ sourceLabel }}，{{ importedShape }}），
+            有 {{ warnings.length }} 条提示：
           </span>
         </p>
         <button

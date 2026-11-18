@@ -2523,7 +2523,18 @@
       "ImportResponse": {
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Output"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Output"
+              }
+            ],
+            "title": "Content"
           },
           "warnings": {
             "items": {
