@@ -104,7 +104,7 @@ def _closure_codes() -> set[str]:
     加一条新规则时，这里要多一个夹具——那正是这条用例的作用：新码不许悬空。
     """
     contents = [
-        # 形态（单子节点）+ 同级重复
+        # 形态（单子节点 / 一级分支只有一个叶子）+ 同级重复 + 缺失环节
         _map(_node("r", "根", [
             _node("b", "只有一个孩子", [_leaf("b1", "孤子", detail="有说明")]),
             _node("c", "深支", [_node("c1", "一级", [
@@ -114,6 +114,7 @@ def _closure_codes() -> set[str]:
             ])]),
             _leaf("d", "重复项"),
             _leaf("e", "重复项"),
+            _leaf("f", "没有说明的叶子"),
         ])),
         # 深度上限
         _chain(8),
@@ -137,8 +138,10 @@ def test_every_emitted_code_is_mapped_or_has_a_written_reason():
     建议面板里"——安静得像没做。
     """
     codes = _closure_codes()
-    explicit = {"SINGLE_CHILD", "DUPLICATE_LABEL", "NEAR_DUPLICATE_LABEL",
-                "DEPTH_LIMIT"}
+    explicit = {
+        "HEADING_ONLY_BRANCH", "SINGLE_CHILD", "DUPLICATE_LABEL",
+        "SHALLOW_BRANCH", "MISSING_DETAIL", "NEAR_DUPLICATE_LABEL", "DEPTH_LIMIT",
+    }
     assert explicit <= codes, codes
 
     for code in sorted(codes):
@@ -153,7 +156,7 @@ def test_suggestion_kinds_are_action_words():
     assert SuggestionKind.expand.value == "expand"
     assert SuggestionKind.add_detail.value == "add_detail"
     used = set(_SUGGESTION_OF_CODE.values())
-    assert {SuggestionKind.dedupe, SuggestionKind.expand} <= used
+    assert {SuggestionKind.dedupe, SuggestionKind.expand, SuggestionKind.add_detail} <= used
 
 
 # ---------------------------------------------------------------- 2. 近义（规则层）
@@ -252,6 +255,135 @@ def test_near_duplicate_becomes_a_dedupe_suggestion():
     assert suggestion.evidence == "a"
     # 规则建议没有概率校准，不许伪造可信度
     assert suggestion.confidence is None
+
+
+# ---------------------------------------------------------------- 3. 缺失环节
+
+
+def test_shallow_branch_is_reported_where_the_sibling_side_is_deep():
+    """一支直接到底、同级最深的还有三层 → 「这一支还没展开」。"""
+    content = _map(_node("r", "根", [
+        _leaf("shallow", "只有一个词"),
+        _node("deep", "展开过的支", [
+            _node("d1", "一层", [_node("d2", "两层", [_leaf("d3", "三层")])])]),
+    ]))
+    shallow = _of_code(check(content), "SHALLOW_BRANCH")
+    assert [item.node_id for item in shallow] == ["shallow"]
+    assert "还没展开" in shallow[0].message
+    assert _kinds(suggest(content))["shallow"] is SuggestionKind.expand
+
+
+def test_shallow_branch_needs_a_real_depth_gap():
+    """1 对 2 层是正常密度（一张三层图里到处都是），不报。"""
+    content = _map(_node("r", "根", [
+        _leaf("flat", "直接到底"),
+        _node("mid", "再一层", [_leaf("m1", "叶子")]),
+    ]))
+    assert _of_code(check(content), "SHALLOW_BRANCH") == []
+
+
+def test_heading_like_branch_needs_deeper_siblings_to_be_worth_mentioning():
+    """同一个形状分两条判据：全图两层 → SINGLE_CHILD，别的支更深 → 标题。"""
+    flat = _map(_node("r", "根", [
+        _node("b", "物理", [_leaf("b1", "应用")]),
+        _node("c", "数学", [_leaf("c1", "应用")]),
+    ]))
+    codes = _codes(check(flat))
+    assert "HEADING_ONLY_BRANCH" not in codes
+    assert codes.count("SINGLE_CHILD") == 2
+
+    deep = _map(_node("r", "根", [
+        _node("b", "物理", [_leaf("b1", "应用")]),
+        _node("c", "数学", [_node("c1", "一层", [
+            _node("c2", "两层", [_leaf("c3", "三层")])])]),
+    ]))
+    heading = _of_code(check(deep), "HEADING_ONLY_BRANCH")
+    assert [item.node_id for item in heading] == ["b"]
+    assert "可能只是个标题" in heading[0].message
+    assert _kinds(suggest(deep))["b"] is SuggestionKind.merge
+
+
+def test_one_node_keeps_at_most_one_shape_diagnostic():
+    """**不重复报**：同一个节点不会同时拿到 `SINGLE_CHILD` 与 `HEADING_ONLY_BRANCH`。
+
+    两条判据都落在"恰好一个子节点"上，所以一条只能是另一条的替换。改成追加的
+    实现会同时报两条，用户看到的是"这个节点有两个毛病"，而实际只有一个。
+    """
+    content = _map(_node("r", "根", [
+        _node("b", "物理", [_leaf("b1", "应用")]),
+        _node("c", "数学", [_node("c1", "一层", [
+            _node("c2", "两层", [_leaf("c3", "三层")])])]),
+        _node("d", "化学", [_leaf("d1", "实验")]),
+    ]))
+    shape = [item for item in check(content)
+             if item.code in ("SINGLE_CHILD", "HEADING_ONLY_BRANCH")]
+    node_ids = [item.node_id for item in shape]
+    assert len(node_ids) == len(set(node_ids)), node_ids
+
+
+def test_shallow_branch_and_single_child_are_mutually_exclusive():
+    """`SHALLOW_BRANCH` 要求父节点至少两个子节点，`SINGLE_CHILD` 要求恰好一个。"""
+    content = _map(_node("r", "根", [
+        _leaf("solo", "单子"),
+        _node("deep", "深支", [_node("d1", "一", [
+            _node("d2", "二", [_leaf("d3", "三")])])]),
+    ]))
+    diagnostics = check(content)
+    shallow_ids = {item.node_id for item in _of_code(diagnostics, "SHALLOW_BRANCH")}
+    single_ids = {item.node_id for item in _of_code(diagnostics, "SINGLE_CHILD")}
+    assert shallow_ids == {"solo"}
+    # 深支那条单链上全是 SINGLE_CHILD，但它不能同时被算成"没展开"
+    assert not shallow_ids & single_ids
+
+
+def test_missing_detail_reports_once_with_a_count():
+    """部分覆盖才报，且只报**一条**汇总（不是每个叶子一条）。"""
+    content = _map(_node("r", "根", [
+        _node("b", "支", [
+            _leaf("n1", "写了", detail="这一条有说明"),
+            _leaf("n2", "空一"), _leaf("n3", "空二"), _leaf("n4", "空三"),
+        ]),
+        _node("c", "另一支", [_leaf("c1", "一", detail="有"), _leaf("c2", "二", detail="有")]),
+    ]))
+    missing = _of_code(check(content), "MISSING_DETAIL")
+    assert len(missing) == 1
+    assert missing[0].node_id is None
+    assert "这 3 个" in missing[0].message
+    assert missing[0].evidence.split() == ["n2", "n3", "n4"]
+    assert _kinds(suggest(content))[None] is SuggestionKind.add_detail
+
+
+def test_all_empty_detail_is_an_import_shape_and_is_not_reported():
+    """叶子**全空**不报：导入的 Markdown/OPML 只有标题，整张图没有正文一眼可见。
+
+    报它的代价是每张导入图都被喊一次"没有说明"，而能做的动作不是逐节点补
+    （那是重跑说明阶段）。实测库里 38 张生成图：21 张全满、17 张全空、
+    **0 张部分覆盖**——所以这条规则的现实收益全在手工编辑之后。
+    """
+    content = _map(_node("r", "根", [
+        _leaf("a", "一"), _leaf("b", "二"), _leaf("c", "三"), _leaf("d", "四"),
+    ]))
+    assert _of_code(check(content), "MISSING_DETAIL") == []
+
+
+def test_one_or_two_empty_leaves_are_an_editing_state_not_a_finding():
+    content = _map(_node("r", "根", [
+        _leaf("a", "一", detail="有"), _leaf("b", "二", detail="有"),
+        _leaf("c", "三"), _leaf("d", "四"),
+    ]))
+    assert _of_code(check(content), "MISSING_DETAIL") == []
+
+
+def test_note_counts_as_a_body_so_a_user_written_note_is_not_called_empty():
+    """`note` 是用户自己写的正文，界面上与 `detail` 分区展示，都算"有说明"。"""
+    content = _map(_node("r", "根", [
+        _leaf("a", "一", detail="有"), _leaf("b", "二", detail="有"),
+        _leaf("c", "三", note="我自己写的"),
+        _leaf("d", "四"), _leaf("e", "五"), _leaf("f", "六"),
+    ]))
+    missing = _of_code(check(content), "MISSING_DETAIL")
+    assert len(missing) == 1
+    assert missing[0].evidence.split() == ["d", "e", "f"]
 
 
 # ---------------------------------------------------------------- 4. 模型层

@@ -60,6 +60,14 @@ check() 检查单子节点、达到深度上限及同一父节点下的重复标
 `relations` 目前只有"删节点时被连带清理"（`_prune_dangling_relations`）这一个
 读者。所以因果推断这一项的前置条件是**先把 `relations` 画出来**（F16 的界面
 欠账），不是补一个检测函数。别看到这里缺一块就以为漏做了。
+
+======================================================================
+一个节点最多一条"形态"诊断
+======================================================================
+`SINGLE_CHILD` 与 `HEADING_ONLY_BRANCH` 的判据都落在"恰好一个子节点"上，所以
+后者是前者的**替换**而不是追加（区别只在解释与动作：没展开 vs 只是个标题）。
+`SHALLOW_BRANCH` 要求父节点至少两个子节点，与这两条互斥。
+`tests/test_optimization_rules.py` 钉着这三件事。
 """
 from __future__ import annotations
 
@@ -116,6 +124,26 @@ MIN_PREFIX_RATIO = 0.4
 # 真正近义的 **0 对**。合并掉「监督学习」与「无监督学习」是丢内容，不是去重。
 CONTRASTING_MODIFIERS = frozenset("无非不未否反逆伪假轻重低高多少大小弱强")
 
+# 「这一支还没展开」的对比门槛：同级里有一支**直接到底**，而最深的同级还有至少
+# 3 层。为什么是 3 而不是 2：3 层的图里"要点有一两个孩子"会形成 1 对 2 的对比，
+# 那是正常密度；1 对 3 意味着这一支比兄弟少了两个层级，那才是"分片展开时这一支
+# 没跑成"的现场。
+MIN_SHALLOW_SIBLING_HEIGHT = 3
+
+# 「这一支可能只是个标题」只在**别的一级分支更深**时才报。对比才携带信息：
+# 全图都是两层时报它等于替用户评价文风（导入的 Markdown 大纲大多长这样）。
+# 参照高度与上一条同口径。
+MIN_HEADING_REFERENCE_HEIGHT = 3
+
+# 「这 N 个节点没有说明」的条数下限：一两个叶子缺说明是正常的编辑中间态，
+# 从 3 个起才是"说明阶段没成批跑"。
+MIN_MISSING_DETAIL = 3
+
+# 汇总型诊断的 `evidence` 最多放几个 id。`Diagnostic.node_id` 只能装一个节点，
+# 而"缺说明"是一条**汇总**观察：逐条报 20 个叶子会把前端诊断面板刷满
+# （`DIAGNOSTIC_LIMIT` 只列前三条）。给前几个 id，既能点回去又不刷屏。
+MAX_EVIDENCE_IDS = 8
+
 # ---------------------------------------------------------------- 模型层配置
 
 # 唯一的成本开关，缺省关：这一层要一次网络调用，而"没配模型"在设备上是常态
@@ -158,6 +186,9 @@ _SUGGESTION_OF_CODE: dict[str, SuggestionKind] = {
     "DUPLICATE_LABEL": SuggestionKind.dedupe,
     "NEAR_DUPLICATE_LABEL": SuggestionKind.dedupe,
     "SINGLE_CHILD": SuggestionKind.expand,
+    "SHALLOW_BRANCH": SuggestionKind.expand,
+    "HEADING_ONLY_BRANCH": SuggestionKind.merge,
+    "MISSING_DETAIL": SuggestionKind.add_detail,
 }
 
 # 建议文案的**动作**部分。诊断说"哪里不对"，建议说"点了会怎样"。
@@ -165,6 +196,9 @@ _ACTION_OF_CODE: dict[str, str] = {
     "DUPLICATE_LABEL": "合并这两个同级节点，保留一个",
     "NEAR_DUPLICATE_LABEL": "确认是不是同一件事：是就合并，不是就把说法区分开",
     "SINGLE_CHILD": "把这一支再展开一层，或者并进相邻节点",
+    "SHALLOW_BRANCH": "把这一支补到与其他分支相近的深度",
+    "HEADING_ONLY_BRANCH": "这一支可能只是个标题：并进父节点，或者补出真正的内容",
+    "MISSING_DETAIL": "给这些叶子节点各补一句说明",
 }
 
 # 故意不转建议的码 → 理由。有用例钉着"检查器能产出的每一个码，要么在
@@ -183,6 +217,17 @@ def _iter_nodes(node: Node, depth: int = 1) -> Iterator[tuple[Node, int]]:
     yield node, depth
     for child in node.children:
         yield from _iter_nodes(child, depth + 1)
+
+
+def _subtree_height(node: Node) -> int:
+    """以 `node` 为根的子树的层数（叶子 = 1）。"""
+    return 1 + max((_subtree_height(child) for child in node.children), default=0)
+
+
+def _has_body(node: Node) -> bool:
+    """这个节点有没有正文。`detail` 是生成的、`note` 是用户自己写的，界面上分区
+    展示，两者都算"有说明"——只认 `detail` 会把"用户已经补过备注"报成空白。"""
+    return bool((node.detail or "").strip() or (node.note or "").strip())
 
 
 def _normalize_label(text: str) -> str:
@@ -269,18 +314,40 @@ def _near_reason(left: str, right: str) -> tuple[DiagnosticLevel, str] | None:
     return DiagnosticLevel.info, f"只多了「{inserted}」这 {len(inserted)} 个字"
 
 
-
 def _shape_diagnostics(root: Node) -> list[Diagnostic]:
-    """形态类：单子节点 / 到深度上限。"""
+    """形态类：单子节点 / 一级分支只有一个叶子 / 到深度上限。
+
+    **一个节点最多一条形态诊断**（有用例钉着），所以 `HEADING_ONLY_BRANCH` 是
+    `SINGLE_CHILD` 的替换而不是追加：两者判据都落在"恰好一个子节点"上，差别只在
+    解释——第 2 层（一级分支）那个唯一的子节点还是叶子时，"这更像个标题"比
+    "这一支没展开"更贴切，动作也不同（归并 vs 展开）。
+
+    并且它只在**其他一级分支更深**时才升级成 `HEADING_ONLY_BRANCH`：全图一样浅
+    时这个形状是风格不是缺陷，留在 `SINGLE_CHILD`。
+    """
+    reference = max((_subtree_height(branch) for branch in root.children), default=1)
     diagnostics: list[Diagnostic] = []
     for node, depth in _iter_nodes(root):
         if len(node.children) == 1:
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.info,
-                code="SINGLE_CHILD",
-                node_id=node.id,
-                message=f"节点「{node.label}」只有一个子节点，可考虑展开或合并",
-            ))
+            only_child = node.children[0]
+            is_heading = (depth == 2 and not only_child.children
+                          and reference >= MIN_HEADING_REFERENCE_HEIGHT)
+            if is_heading:
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.info,
+                    code="HEADING_ONLY_BRANCH",
+                    node_id=node.id,
+                    message=(f"一级分支「{node.label}」只有一个子节点「{only_child.label}」，"
+                             f"而其他分支最深的还有 {reference} 层：这一支可能只是个标题"),
+                    evidence=only_child.id,
+                ))
+            else:
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.info,
+                    code="SINGLE_CHILD",
+                    node_id=node.id,
+                    message=f"节点「{node.label}」只有一个子节点，可考虑展开或合并",
+                ))
         if depth >= MAX_DEPTH:
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.warn,
@@ -337,6 +404,60 @@ def _near_duplicate_diagnostics(root: Node) -> list[Diagnostic]:
     return diagnostics
 
 
+def _shallow_branch_diagnostics(root: Node) -> list[Diagnostic]:
+    """「这一支还没展开」：同级里一支直接到底，别的最少还有三层。
+
+    与 `SINGLE_CHILD` 不重叠——这条要求父节点**至少两个**子节点，单子节点那条
+    要求恰好一个，两者互斥。
+    """
+    diagnostics: list[Diagnostic] = []
+    for node, _ in _iter_nodes(root):
+        if len(node.children) < 2:
+            continue
+        heights = {child.id: _subtree_height(child) for child in node.children}
+        deepest = max(heights.values())
+        if deepest < MIN_SHALLOW_SIBLING_HEIGHT:
+            continue
+        for child in node.children:
+            if heights[child.id] != 1:
+                continue
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info,
+                code="SHALLOW_BRANCH",
+                node_id=child.id,
+                message=(f"「{child.label}」这一支还没展开：它是「{node.label}」下的叶子，"
+                         f"而同级最深的一支往下还有 {deepest} 层"),
+                evidence=node.label,
+            ))
+    return diagnostics
+
+
+def _missing_detail_diagnostics(root: Node) -> list[Diagnostic]:
+    """「这 N 个节点没有说明」——**汇总一条**，不逐节点报。
+
+    判据是**部分覆盖**，"有叶子空着"不算：
+
+      · 全空（叶子一个都没说明）不报。那是导入的图（Markdown/OPML 只有标题，
+        带 `>` 引用块的才有 `detail`）或者"说明阶段根本没跑"的形态——界面上整张
+        图都没有正文，一眼可见，能做的动作也不是逐节点补而是重跑说明阶段。
+        对每张导入图都喊一次"没有说明"，这个面板就废了。
+      · 全满不报。
+      · 只有"写了但没写全"才报：漏掉的那几个是肉眼看不出来的。
+    """
+    leaves = [node for node, _ in _iter_nodes(root) if not node.children]
+    empty = [node for node in leaves if not _has_body(node)]
+    if len(empty) < MIN_MISSING_DETAIL or len(empty) == len(leaves):
+        return []
+    sample = "、".join(f"「{node.label}」" for node in empty[:3])
+    return [Diagnostic(
+        level=DiagnosticLevel.info,
+        code="MISSING_DETAIL",
+        node_id=None,
+        message=f"这 {len(empty)} 个叶子节点没有说明（如 {sample}），读者看不出它们各自要做什么",
+        evidence=" ".join(node.id for node in empty[:MAX_EVIDENCE_IDS]),
+    )]
+
+
 def check(content: MindMapContent, sources: list[Source] | None = None) -> list[Diagnostic]:
     """结构诊断；只有显式提供原文时才执行引用校验。
 
@@ -348,6 +469,8 @@ def check(content: MindMapContent, sources: list[Source] | None = None) -> list[
     diagnostics.extend(_shape_diagnostics(root))
     diagnostics.extend(_duplicate_diagnostics(root))
     diagnostics.extend(_near_duplicate_diagnostics(root))
+    diagnostics.extend(_shallow_branch_diagnostics(root))
+    diagnostics.extend(_missing_detail_diagnostics(root))
     if sources is not None:
         diagnostics.extend(verify_source_refs(content, sources))
     return diagnostics
