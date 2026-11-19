@@ -36,6 +36,8 @@ export interface SourcesSnapshot {
   items: SourceItem[];
   draftText: string;
   files: Array<[string, File]>;
+  /** 链接材料的地址，重试要用（见 `addFetchedUrl` / `retry`）。 */
+  urls: Array<[string, string]>;
 }
 
 /**
@@ -79,6 +81,13 @@ export const useSourcesStore = defineStore('sources', () => {
    */
   const recording = ref(false);
   const files = new Map<string, File>();
+  /**
+   * 链接材料那一行的原始地址。
+   *
+   * 文件的重试靠 `files` 拿回字节；链接没有本地副本，地址不留下的话「重试」会走成
+   * 文件那条路（`parseItem` 找不到 File 直接 return），条目永远停在"解析中"。
+   */
+  const urls = new Map<string, string>();
   const active = new Map<string, AbortController>();
   let textNumber = 0;
   let draining: Promise<void> | null = null;
@@ -162,6 +171,43 @@ export const useSourcesStore = defineStore('sources', () => {
   }
 
   /**
+   * 列表里那一行。**必须是它，不能是 push 进去的那个原始对象**。
+   *
+   * `items` 是 `ref<SourceItem[]>`，push 之后数组元素被包成响应式代理；此后改原始
+   * 对象不会触发任何依赖，`parsing`（`items.value.some(...)`）会一直停在 `true`
+   * ——界面上就是"永久解析中"，而条目自己的 `state` 早就变成 `ready` 了。
+   */
+  function rowOf(key: string): SourceItem | undefined {
+    return items.value.find(entry => entry.key === key);
+  }
+
+  /**
+   * 抓一个链接并落到那一行上。失败就落在同一行上写原因。
+   *
+   * 取行用 `rowOf(key)` 而不是闭包里的对象：抓取期间用户可能把它删了、或者撤销
+   * 「清空」重建了一行同名 key 的条目。响应回来时以**当下这一行**为准。
+   */
+  async function loadUrl(key: string, url: string): Promise<void> {
+    try {
+      const source = await fetchUrlSource(url);
+      // 抓取期间用户可能已经把它删了：删掉的条目不能被迟到的响应复活。
+      const item = rowOf(key);
+      if (!item) return;
+      item.source = source;
+      item.id = source.id;
+      item.kind = source.kind;
+      item.label = source.filename ?? item.label;
+      item.state = 'ready';
+    } catch (cause) {
+      const item = rowOf(key);
+      if (!item) return;
+      item.state = 'failed';
+      // 后端的三种失败（没打开 / 没配 key / 抓不到）各有一句给人看的话，直接用。
+      item.error = cause instanceof Error ? cause.message : '抓取失败，请重试或改贴正文。';
+    }
+  }
+
+  /**
    * 贴进来的一个链接 → 后端读成一份材料，返回新条目的 `key`（没加成是 null）。
    *
    * **异步但立刻占一行**：抓取是一次网络往返（本机实测 0.9 秒，慢站点更久），
@@ -179,26 +225,12 @@ export const useSourcesStore = defineStore('sources', () => {
       const rest = url.split('://')[1] ?? url;
       return rest.split('/')[0] || url;
     })();
-    const item: SourceItem = {
+    items.value.push({
       key, id: key, label: host, kind: 'web', state: 'parsing',
       source: null, error: '', seconds: 0,
-    };
-    items.value.push(item);
-    try {
-      const source = await fetchUrlSource(url);
-      // 抓取期间用户可能已经把它删了：删掉的条目不能被迟到的响应复活。
-      if (!items.value.some(entry => entry.key === key)) return key;
-      item.source = source;
-      item.id = source.id;
-      item.kind = source.kind;
-      item.label = source.filename ?? host;
-      item.state = 'ready';
-    } catch (cause) {
-      if (!items.value.some(entry => entry.key === key)) return key;
-      item.state = 'failed';
-      // 后端的三种失败（没打开 / 没配 key / 抓不到）各有一句给人看的话，直接用。
-      item.error = cause instanceof Error ? cause.message : '抓取失败，请重试或改贴正文。';
-    }
+    });
+    urls.set(key, url);
+    await loadUrl(key, url);
     return key;
   }
 
@@ -305,8 +337,19 @@ export const useSourcesStore = defineStore('sources', () => {
   }
 
   async function retry(key: string): Promise<void> {
-    const item = items.value.find(entry => entry.key === key);
+    const item = rowOf(key);
     if (!item || item.state !== 'failed') return;
+    const url = urls.get(key);
+    if (url) {
+      // 链接材料没有本地文件，重试必须回到那个 URL：走 `queued` 那条路时
+      // `parseItem` 第一行在 `files` 里找不到东西就 return，条目会永远停在
+      // "解析中"——用户点「重试」看到的就是"没反应"。
+      item.error = '';
+      item.seconds = 0;
+      item.state = 'parsing';
+      await loadUrl(key, url);
+      return;
+    }
     item.state = 'queued';
     await drain();
   }
@@ -345,6 +388,7 @@ export const useSourcesStore = defineStore('sources', () => {
       items: [...items.value],
       draftText: draftText.value,
       files: [...files.entries()],
+      urls: [...urls.entries()],
     };
   }
 
@@ -353,6 +397,8 @@ export const useSourcesStore = defineStore('sources', () => {
     active.clear();
     files.clear();
     for (const [key, file] of saved.files) files.set(key, file);
+    urls.clear();
+    for (const [key, url] of saved.urls) urls.set(key, url);
     items.value = saved.items.map(item =>
       item.state === 'queued' || item.state === 'parsing'
         ? { ...item, state: 'queued' as const, seconds: 0 }
@@ -365,6 +411,7 @@ export const useSourcesStore = defineStore('sources', () => {
   function remove(key: string): void {
     active.get(key)?.abort();
     files.delete(key);
+    urls.delete(key);
     items.value = items.value.filter(item => item.key !== key);
     error.value = '';
   }
@@ -372,6 +419,7 @@ export const useSourcesStore = defineStore('sources', () => {
   function clear(): void {
     active.forEach(controller => controller.abort());
     files.clear();
+    urls.clear();
     items.value = [];
     error.value = '';
     recording.value = false;
