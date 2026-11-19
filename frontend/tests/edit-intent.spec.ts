@@ -1,4 +1,4 @@
-﻿import { mount, type VueWrapper } from '@vue/test-utils';
+import { mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia, type Pinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -7,6 +7,7 @@ import AgentPanel from '../src/components/AgentPanel.vue';
 import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
+import { isOptimizationRequest, optimizationReply } from './helpers/optimization-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这一组用例只关心
 // 「改这张图」入口与候选 diff，画布换成占位元素。
@@ -43,6 +44,9 @@ function stubFetch(reply: () => Response) {
     // 偏好是挂载时的背景请求（生成面板带预填）。它不属于这里被测的"这个入口发出
     // 什么"，进 calls 只会让 `calls[0]` 指向一个 GET。
     if (isPrefsRequest(url)) return prefsReply(url);
+    // 生成落地之后前端自动跑一次只读结构检查（`ChatDock` 那条 watch）。它是背景
+    // 请求，与 prefs / health 同一条理由：进 calls 会让"只发了一次生成请求"变成两条。
+    if (isOptimizationRequest(url)) return optimizationReply();
     if (url.endsWith('/health')) {
       // 挂载时探一次版本号。它是背景请求，和"点这个入口发出了什么"无关。
       return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {

@@ -9,6 +9,7 @@ import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 import { textSource } from '../src/sources/input';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
+import { isOptimizationRequest, optimizationReply } from './helpers/optimization-stub';
 
 /**
  * 底部对话框的状态机、语音态、材料缩略图与悬浮球。
@@ -47,6 +48,8 @@ function stubFetch(stream: unknown[] = []) {
   const mock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = String(input);
     if (isPrefsRequest(url)) return prefsReply(url);
+    // 生成落地后自动跑的只读结构检查：背景请求，不进"最后一条请求"的断言。
+    if (isOptimizationRequest(url)) return optimizationReply();
     if (url.endsWith('/health')) return { ok: true, status: 200, json: async () => ({ version: 'test' }) } as unknown as Response;
     return streamReply(stream);
   });
@@ -847,7 +850,13 @@ describe('材料参与生成', () => {
     await wrapper.get(SUBMIT).trigger('click');
     await flushPromises();
 
-    const body = JSON.parse(String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1]?.[1]?.body ?? '{}'));
+    // 按 URL 找那条**生成**请求，不取"最后一条"：生成落地之后前端还会自动跑一次
+    // 只读结构检查（`/optimization/check`），它才是最后一条。断言要钉的是"材料进了
+    // 生成请求体"，所以定位方式必须说清是哪一个请求。
+    const streamCall = [...fetchMock.mock.calls]
+      .reverse()
+      .find(([input]) => String(input).includes('/agent/runs/stream'));
+    const body = JSON.parse(String(streamCall?.[1]?.body ?? '{}'));
     expect(body.sources).toHaveLength(1);
   });
 });

@@ -6,6 +6,7 @@ import App from '../src/App.vue';
 import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
+import { isOptimizationRequest, optimizationReply } from './helpers/optimization-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这一组用例只关心
 // 详情面板上那个按钮与它发出的请求，画布整体换成占位元素。
@@ -57,6 +58,9 @@ function stubFetch(reply: () => Response) {
     const url = String(input);
     // 偏好是挂载时的背景请求，不属于"点一次展开发出了什么"，不进 calls。
     if (isPrefsRequest(url)) return prefsReply(url);
+    // 生成/展开落地之后前端自动跑一次只读结构检查（`ChatDock` 那条 watch）。
+    // 同上：它是背景请求，进 calls 会把"只发了一次 agent 请求"变成两条。
+    if (isOptimizationRequest(url)) return optimizationReply();
     // 页面挂载时会探一次 /api/health 取版本号，不算业务请求
     if (url.endsWith('/api/health')) {
       return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {

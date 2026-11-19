@@ -9,8 +9,10 @@ import { useChatStore } from '../stores/chat';
 import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from '../stores/options';
 import { usePrefsStore, DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY } from '../stores/prefs';
 import { useSourcesStore } from '../stores/sources';
+import { useStructureStore } from '../stores/structure';
 import type { DiagramTypeChoice } from '../api/types';
 import { agentDetailVisible, diagnosticCount, diagnosticsHint } from '../mindmap/run-status';
+import { structureHint } from '../mindmap/diagnostics';
 
 /**
  * 底部对话框：**唯一**说一句话的地方。
@@ -35,6 +37,7 @@ const sources = useSourcesStore();
 const options = useGenerationOptions();
 const prefs = usePrefsStore();
 const chat = useChatStore();
+const structure = useStructureStore();
 
 const emit = defineEmits<{ detail: []; submit: [goal: string] }>();
 
@@ -445,6 +448,85 @@ const agentPartial = computed(
 const diagnostics = computed(() => diagnosticCount(store.agentWarnings));
 
 /**
+ * 结构检查（`/optimization/check`）的那半句结论。
+ *
+ * 它与上面那个 `diagnostics` **不是同一个东西**：那个来自生成链上工具回的
+ * `result_summary.diagnostics`（说的是"这次产出缺了什么"），这个来自只读的
+ * `/optimization/check`（说的是"这棵树现在有什么结构问题"）。两个来源各自演化，
+ * 合并成一个会立刻出现"这句话到底在说哪一次"的问题。
+ */
+const structureLine = computed(() => structureHint(structure.counts));
+
+/**
+ * 结构检查那边**需要人动手**的条数：warn / error 诊断 + 候选建议。
+ *
+ * **不含 info**。这一条同时决定两件事：状态行上显不显示数字，以及对话框会不会淡出。
+ * 让 info 参与任何一件，"生成完只剩下画布"这条性质就当场失效——`SINGLE_CHILD` 在
+ * 一棵正常的树上恒有十几条（任何链式子结构都命中），对话框将永远淡不出去。
+ * 判据在 `mindmap/diagnostics.ts::structureHint`，这里只是取那个数。
+ */
+const structureAlert = computed(
+  () => structure.counts.attention + structure.counts.suggestions,
+);
+
+/**
+ * 状态行上那个按钮的文字。
+ *
+ * 优先说生成链自己的诊断（那是"这次生成有问题"），其次说结构检查的条数，都没有时
+ * 退回「明细」——按钮本身仍然要在场，抽屉里还有改动清单与生成中的预览。
+ */
+const detailLabel = computed(() => {
+  if (diagnostics.value > 0) return `${diagnostics.value} 条诊断`;
+  if (structure.counts.suggestions > 0) return `${structure.counts.suggestions} 条建议`;
+  if (structure.counts.attention > 0) return `${structure.counts.attention} 处要注意`;
+  return '明细';
+});
+
+const detailTitle = computed(() => {
+  if (diagnostics.value > 0) return `打开右侧抽屉：${diagnostics.value} 条诊断逐条列出`;
+  if (structureAlert.value > 0) {
+    return '打开右侧抽屉：结构检查的建议与诊断逐条列出（建议可以「应用」或「忽略」）';
+  }
+  return '打开右侧抽屉：改动清单、结构与诊断逐条、生成中的预览';
+});
+
+/**
+ * 生成落地 → **自动跑一次只读结构检查**。
+ *
+ * 为什么自动：它零成本（后端 docstring：“只读诊断”，不落库、不改树、不调模型），
+ * 而"检查"一旦变成一件用户要记得去做的事，就等于没做。结果只并进状态行的一句话，
+ * 点进去才看详情——不新增任何常驻界面，也不挡画布。
+ *
+ * 它**只跑 check，不跑 suggest**：suggest 现在是纯规则，但后端正在给它加模型层，
+ * 那时"每次生成完自动跑"就变成"每次生成完自动花一次模型调用"。界线画在"用户点了
+ * 才发"，后端加成本时前端不用改。
+ *
+ * 新一轮开始（`generatedSummary` 被置回 null——`runGeneration` 开头、换图、撤销生成
+ * 都走这一步）时整份报告作废：它说的还是上一棵树。
+ */
+watch(() => store.generatedSummary, (now, before) => {
+  if (now && !before) {
+    structure.checkAfterGenerate();
+    return;
+  }
+  if (!now && before) structure.reset();
+});
+
+/**
+ * 「检查结构」按钮：手动跑一次 `check` + `suggest`，**带上材料**。
+ *
+ * 只有这条路径带 sources：后端拿到原文才会跑第三层引用核验（"点引用跳回原文"的依据
+ * 就是它），而材料全文可能上万字——用户没点的时候不该发这么大的请求体。自动那次
+ * 不带，只做结构三件套。
+ */
+function runStructureCheck(): void {
+  structure.runFull(sources.readySources);
+  // 结果在右抽屉里，所以顺手把它打开：点了按钮却什么都不出现，用户只会以为坏了。
+  // 抽屉是覆盖式浮层，开合不改画布宽度（与 `emit('detail')` 走同一个出口）。
+  emit('detail');
+}
+
+/**
  * 输入法组合中 / 焦点在主题框里。
  *
  * **为什么需要这两个**：`v-model` 在组合期间**不更新**——中文用户打「机器学习」四个字
@@ -567,8 +649,9 @@ const statusText = computed(() => {
       if (!summary) return '';
       const nodes = summary.nodes ? `${summary.nodes} 个节点` : '';
       const changes = summary.changes == null ? '' : `，改了 ${summary.changes} 处`;
-      // 诊断数量要留在**这句**里：它是"生成完只剩画布"之后用户唯一还看得见的结论。
-      const hint = diagnosticsHint(diagnostics.value);
+      // 两处结论共用**一个**提示位：状态行只有一行，两段同时挂上去就是一句读不完的
+      // 话。生成链自己的诊断优先（"这次产出不完整"更紧急），没有它才轮到结构检查。
+      const hint = diagnosticsHint(diagnostics.value) || structureLine.value;
       const tail = hint ? ` · ${hint}` : '';
       return `已落到画布${nodes ? `（${nodes}${changes}）` : changes}${tail} · 还没保存`;
     }
@@ -687,6 +770,10 @@ const shouldKeep = computed(() => {
   // 结果是成功了，但有几条"某支没展开 / 有重复节点"等着人处理，两秒后连入口一起
   // 淡掉就是把它变成一句谁也找不到的提示（实测：用户找不到"诊断"在哪）。
   if (diagnostics.value > 0) return true;
+  // 结构检查的 warn / 建议同理，但**只认需要人动手的那一档**：info 不刹车。
+  // 让它刹车的话，任何一张正常的树上都有十几条 `SINGLE_CHILD`，对话框将永远淡不出去
+  // ——那正是"生成完只剩画布"这条产品性质的反面。
+  if (structureAlert.value > 0) return true;
   return false;
 });
 
@@ -704,7 +791,9 @@ const canFade = computed(() => statusKind.value === 'ok'
   && !focused.value
   && !sources.draftText.trim()
   // 有诊断就不安排淡出（同 `shouldKeep` 最后那条）：这一轮的结论里还有一笔没算完。
-  && diagnostics.value === 0);
+  && diagnostics.value === 0
+  // 结构检查同理，且同样**只认 warn / 建议**（见 `structureAlert`）。
+  && structureAlert.value === 0);
 
 watch(
   () => [canFade.value, store.nodeCount] as const,
@@ -1097,13 +1186,37 @@ defineExpose({
               />
               智能搜索
             </label>
-            <p class="order-3 min-w-0 flex-1 truncate text-right leading-tight text-slate-400" data-test="external-search-hint">
+            <!--
+              「检查结构」：手动跑一次 `/optimization/check` + `/suggest`。
+
+              自动那次（生成落地之后）只跑 check、不带材料；这里**带上材料**，所以后端
+              会连第三层引用核验一起做——那是"点引用能跳回原文"的依据。
+
+              **只在画布上有图时出现**：没有图就没有检查对象，摆一个点了没反应的按钮
+              比不摆更糟。数字只在有 warn / 建议时出现（info 那一档不进这里，理由见
+              `structureAlert`）。
+            -->
+            <button
+              v-if="store.content"
+              type="button"
+              data-test="structure-check-run"
+              class="order-3 shrink-0 rounded-full border px-2 py-0.5"
+              :class="structureAlert > 0
+                ? 'border-amber-300 bg-amber-50 text-amber-800'
+                : 'border-slate-200 text-slate-500 hover:bg-slate-50'"
+              :disabled="runBlocked || structure.busy"
+              :title="structureAlert > 0
+                ? `这张图有 ${structureAlert} 处值得看一眼的地方；打开右侧抽屉逐条看`
+                : '检查这张图的结构：单子节点、深度上限、同级重名、引用能不能核验。只读，不改任何东西。'"
+              @click="runStructureCheck"
+            >{{ structure.busy ? '检查中…' : structureAlert > 0 ? `检查 · ${structureAlert}` : '检查' }}</button>
+            <p class="order-4 min-w-0 flex-1 truncate text-right leading-tight text-slate-400" data-test="external-search-hint">
               {{ externalSearchHint }}
             </p>
             <button
               type="button"
               data-test="attach"
-              class="order-4 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+              class="order-5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
               :disabled="runBlocked"
               aria-label="添加材料"
               title="添加材料（文档 / 图片 / 粘贴文字 / 录音）"
@@ -1112,7 +1225,7 @@ defineExpose({
             <button
               type="button"
               data-test="voice-toggle"
-              class="order-5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+              class="order-6 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
               :class="voiceMode ? 'border-slate-900 bg-slate-100 text-slate-900' : ''"
               :disabled="runBlocked"
               :aria-pressed="voiceMode"
@@ -1153,11 +1266,9 @@ defineExpose({
               type="button"
               data-test="run-status-detail"
               class="shrink-0 rounded-md px-2 py-0.5 text-xs underline decoration-dotted underline-offset-2 hover:bg-white/60"
-              :title="diagnostics > 0
-                ? `打开右侧抽屉：${diagnostics} 条诊断逐条列出`
-                : '打开右侧抽屉：改动清单、诊断逐条、生成中的预览'"
+              :title="detailTitle"
               @click="emit('detail')"
-            >{{ diagnostics > 0 ? `${diagnostics} 条诊断` : '明细' }}</button>
+            >{{ detailLabel }}</button>
           </div>
 
           <!--
