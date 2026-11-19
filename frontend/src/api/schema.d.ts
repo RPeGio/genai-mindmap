@@ -22,6 +22,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mindmaps/edits/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Edits Health
+         * @description 昨日编辑过的图数 / 昨日保存的图数：**死表探测器**。
+         *
+         *     `user_prefs` 有"尚未生效"这种标记，`edit_events` 原本没有——于是"永远是 0 行"
+         *     这种故障能静默存在很久。实测有过 40 分钟：8000 跑着旧代码，前端在发事件、
+         *     后端在丢，而每一张图的 `summary.total` 都是 0，看起来和"没人改过"一模一样。
+         *
+         *     跨图而不是按图，是因为"这张表还在工作吗"根本不是某一张图的属性。
+         */
+        get: operations["edits_health_api_mindmaps_edits_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/mindmaps/{map_id}": {
         parameters: {
             query?: never;
@@ -34,6 +60,66 @@ export interface paths {
         /** Update Map */
         put: operations["update_map_api_mindmaps__map_id__put"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mindmaps/{map_id}/edits/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Edit Summary
+         * @description 这张图的改动分布。**这一版真正的交付物。**
+         *
+         *     404 而不是"空统计"：给一个不存在的 id 查统计是调用方错了，返回一份全零的
+         *     报告会让它以为"这张图没人改过"——那是完全不同的一件事。
+         */
+        get: operations["edit_summary_api_mindmaps__map_id__edits_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mindmaps/{map_id}/edits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Edits
+         * @description 最近的改动明细，新的在前。`limit` 有上限：这是给人读的一屏，不是导出通道。
+         */
+        get: operations["list_edits_api_mindmaps__map_id__edits_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mindmaps/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import Mindmap */
+        post: operations["import_mindmap_api_mindmaps_import_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -142,6 +228,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/export/json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export Json
+         * @description 导出 JSON（`MindMapContent` 的序列化）。
+         *
+         *     这是唯一**无损**的格式，也是「导出 → 手改 → 导入」的保底：另外三种都只有
+         *     一个文字槽位，往返一次 `note` / `detail` / 颜色 / 图型会退化（见
+         *     `app/export/service.py::to_json` 的 docstring）。
+         */
+        post: operations["export_json_api_export_json_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/ingestion/text": {
         parameters: {
             query?: never;
@@ -244,6 +354,226 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agent/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Runs
+         * @description 运行台账。默认回答的是"上次跑完、我还没存下来的是哪一次"。
+         *
+         *     `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出结果的那次
+         *     同样要能被捡起来**——否则"关掉页面那 40 秒"照样白花，只是从内存白花变成写进
+         *     数据库白花。
+         *
+         *     这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
+         */
+        get: operations["list_runs_api_agent_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Run */
+        get: operations["get_run_api_agent_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/runs/{run_id}/applied": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark Run Applied
+         * @description 这次生成的结果**被保存进库了**。前端在保存成功后调用一次，幂等。
+         *
+         *     "生成过但没保存"与"生成过、也存下来了"只能靠这个时间戳分开：那份内容可能被
+         *     PUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`
+         *     表反推，得到的全是猜。
+         */
+        post: operations["mark_run_applied_api_agent_runs__run_id__applied_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs/suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Suggestions
+         * @description 从历史运行里提出候选建议。**只读，不落库**。
+         *
+         *     判据在 `service.suggestions()` 里写死：最近 3 次有效选择都是同一个值，且与
+         *     当前偏好不同。用户点了"设为默认"才会走 `PUT`，点了"不用"则什么都不发生——
+         *     没有写入就没有记录，一次拒绝不需要留下痕迹。
+         */
+        get: operations["list_suggestions_api_prefs_suggestions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Prefs
+         * @description 面板的全部内容：键、值、来源、两个时间戳，以及**上次生效**。
+         *
+         *     `last_applied_at` 是这一层最该被读的一列：它来自 `runs.request.prefs_applied`，
+         *     也就是"哪几次运行真的带着这条偏好跑过"。它为空不一定是错，但**所有条目都为空**
+         *     就一定说明读路径没接上——那时面板上写满"尚未生效"，不用翻日志就能看出来。
+         */
+        get: operations["list_prefs_api_prefs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prefs/{pref_key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set Pref
+         * @description 写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。
+         *
+         *     非法值（A 类枚举外、C 类超条数/超字数）由 `service.set` 抛 `PrefError`，
+         *     `core/errors.py` 的统一出口会把它变成 `{code, message, detail, request_id}`：
+         *     错误码分得开，界面才能显示"请先删除一条"而不是一句泛泛的失败。
+         */
+        put: operations["set_pref_api_prefs__pref_key__put"];
+        post?: never;
+        /**
+         * Delete Pref
+         * @description 删一条。硬删，没有软删。
+         *
+         *     404 而不是幂等 204：界面上"这条已经不在了"和"我删了但没删掉"必须分得开，
+         *     否则下一次刷新面板会看见它还在，而用户以为删过了。
+         */
+        delete: operations["delete_pref_api_prefs__pref_key__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Memories
+         * @description 最近的若干条，新的在前。
+         *
+         *     它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过
+         *     （会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。
+         */
+        get: operations["list_memories_api_memory_get"];
+        put?: never;
+        /**
+         * Add Memory
+         * @description 手工加一条。`source` 恒为 `user_explicit`，与自动总结的分开。
+         *
+         *     向量服务未配置时条目照样写进去（`has_vector=false`），不报错：那是预期状态
+         *     （本机开发、CI），而"这条以后检索不到"比"这句话丢了"轻得多。
+         */
+        post: operations["add_memory_api_memory_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/{item_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Memory
+         * @description 硬删。404 而不是幂等 204：界面上"这条已经不在了"与"我删了但没删掉"必须分开。
+         */
+        delete: operations["delete_memory_api_memory__item_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Memory
+         * @description 按主题检索一次，返回每条的 cosine / decay / score。
+         *
+         *     **只读**：不刷 `last_used_at`（那是"真的被注入过"的证据，一次人工查询不该冒充它）。
+         *
+         *     与生成时走的是同一个 `store.recall`，所以这里看到的分数就是模型会拿到的排序。
+         */
+        get: operations["search_memory_api_memory_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/knowledge/search": {
         parameters: {
             query?: never;
@@ -334,6 +664,22 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AddMemoryRequest */
+        AddMemoryRequest: {
+            /** Text */
+            text: string;
+            /**
+             * Kind
+             * @default preference
+             */
+            kind: string;
+        };
+        /** AddedMemory */
+        AddedMemory: {
+            item: components["schemas"]["MemoryItem"];
+            /** Created */
+            created: boolean;
+        };
         /** AgentPlan */
         AgentPlan: {
             /** Goal */
@@ -350,7 +696,7 @@ export interface components {
          * AgentRunRequest
          * @description 一次 agent 运行。
          *
-         *     `snapshot` 是前端当前的树。服务端**不**从数据库重读——用户可能有一堆没保存
+         *     `snapshot` 是前端当前的图。服务端**不**从数据库重读——用户可能有一堆没保存
          *     的编辑，重读数据库等于把它们丢掉。
          */
         AgentRunRequest: {
@@ -362,18 +708,30 @@ export interface components {
              * @enum {string}
              */
             intent: "create" | "expand" | "edit";
+            /** Run Id */
+            run_id?: string | null;
             /**
              * Thinking Model
              * @default default
              * @enum {string}
              */
             thinking_model: "default" | "first-principles" | "feynman" | "systematic" | "critical";
-            snapshot?: components["schemas"]["MindMapContent-Input"] | null;
+            /** Diagram Type */
+            diagram_type?: ("tree" | "flowchart" | "fishbone") | null;
+            /** Prefs Applied */
+            prefs_applied?: string[];
+            /** Snapshot */
+            snapshot?: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"] | null;
             /** Selected Ids */
             selected_ids?: string[];
             /** Sources */
             sources?: components["schemas"]["Source"][];
             budget?: components["schemas"]["RunBudget"];
+            /**
+             * Deep Thinking
+             * @default false
+             */
+            deep_thinking: boolean;
         };
         /** AgentTaskRequest */
         AgentTaskRequest: {
@@ -404,9 +762,22 @@ export interface components {
             /** File */
             file: string;
         };
+        /** Body_import_mindmap_api_mindmaps_import_post */
+        Body_import_mindmap_api_mindmaps_import_post: {
+            /** File */
+            file: string;
+        };
         /** CheckRequest */
         CheckRequest: {
-            content: components["schemas"]["MindMapContent-Input"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"];
+            /** Events */
+            events?: components["schemas"]["EditEventIn"][];
+            /**
+             * Truncated
+             * @default 0
+             */
+            truncated: number;
             /** Sources */
             sources?: components["schemas"]["Source"][] | null;
         };
@@ -451,10 +822,534 @@ export interface components {
          * @enum {string}
          */
         DiagnosticLevel: "info" | "warn" | "error";
+        /**
+         * Edge
+         * @description 跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。
+         *
+         *     **为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处
+         *     依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`
+         *     的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、
+         *     前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力
+         *     并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。
+         *
+         *     三件事刻意不做，每一条都有具体后果：
+         *
+         *       - **不要求同父**。连到另一条 subtree 上正是"汇合"的定义；加一条"必须
+         *         同父"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。
+         *       - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有
+         *         "最长环 ≤ `MAX_EDGE_CYCLE_NODES`"，而且是 warn。
+         *       - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），
+         *         边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的
+         *         位置就没了——这是"树 + 边"能成立的前提之一。
+         */
+        Edge: {
+            /** Id */
+            id: string;
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+            /** Label */
+            label?: string | null;
+            /** Kind */
+            kind?: ("flow" | "branch" | "loop") | null;
+        };
+        /**
+         * EditEventIn
+         * @description 一条改动（`POST/PUT /mindmaps` 请求体里的一项）。
+         *
+         *     `extra="forbid"`：字段名漂移（比如前端写成 `nodeId`）必须当场 422。静默丢掉
+         *     一条事件比拒收整次保存更糟——统计会少一块，而没人知道少的是哪一块。
+         */
+        EditEventIn: {
+            /**
+             * Actor
+             * @enum {string}
+             */
+            actor: "user" | "agent";
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate";
+            /** Node Id */
+            node_id?: string | null;
+            /** Field */
+            field?: ("label" | "title" | "detail" | "note" | "color" | "icon") | null;
+            /** Before */
+            before?: string | null;
+            /** After */
+            after?: string | null;
+            /** Depth */
+            depth?: number | null;
+            /** Subtree Size */
+            subtree_size?: number | null;
+            /** Change Count */
+            change_count?: number | null;
+            /** Node Count */
+            node_count?: number | null;
+            /** Run Id */
+            run_id?: string | null;
+            /** At */
+            at?: string | null;
+        };
+        /**
+         * EditEventRow
+         * @description 落库后的一行：载荷 + 自增 id + 服务端写入时刻。
+         */
+        EditEventRow: {
+            /**
+             * Actor
+             * @enum {string}
+             */
+            actor: "user" | "agent";
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate";
+            /** Node Id */
+            node_id?: string | null;
+            /** Field */
+            field?: ("label" | "title" | "detail" | "note" | "color" | "icon") | null;
+            /** Before */
+            before?: string | null;
+            /** After */
+            after?: string | null;
+            /** Depth */
+            depth?: number | null;
+            /** Subtree Size */
+            subtree_size?: number | null;
+            /** Change Count */
+            change_count?: number | null;
+            /** Node Count */
+            node_count?: number | null;
+            /** Run Id */
+            run_id?: string | null;
+            /** At */
+            at: string;
+            /** Id */
+            id: number;
+            /** Map Id */
+            map_id: string;
+            /** Recorded At */
+            recorded_at: string;
+        };
+        /**
+         * EditHealth
+         * @description 跨图的日志链路健康检查（`GET /mindmaps/edits/health`）。
+         *
+         *     判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**。每次生成完成都记
+         *     一条 `generate`（连一处没改也记），所以"昨日有保存、昨日零事件"只能是链路断了
+         *     ——前端在发、后端在丢，或者事件根本没进请求体。实测有过 40 分钟这个状态（8000
+         *     跑旧代码），而当时没有任何告警：单图的 `total=0` 看着和"没人改过"一模一样。
+         *
+         *     窗口是 **UTC 昨日整天**（`[window_start, window_end)`）：库里所有时间戳都是
+         *     `...Z`，按本地日切会让边界那几个小时归错天，而这里要判的只是"有没有发生过"，
+         *     不值得为它引入一处时区配置。
+         */
+        EditHealth: {
+            /** Window Start */
+            window_start: string;
+            /** Window End */
+            window_end: string;
+            /** Edited Maps */
+            edited_maps: number;
+            /** Saved Maps */
+            saved_maps: number;
+            /** Chain Suspect */
+            chain_suspect: boolean;
+            /** Detail */
+            detail: string;
+        };
+        /**
+         * EditSummary
+         * @description `GET /mindmaps/{id}/edits/summary` 的响应。
+         *
+         *     两条恒等式让数字可以先自校验再读结论：
+         *
+         *       - `sum(by_actor) == total`；
+         *       - `sum(by_field) == by_kind["update"] + by_kind["style"]`。
+         *
+         *     对不上就说明有写入路径绕过了契约，而不是"统计有点怪"。
+         *
+         *     改动量与"本来可以不改"的分母分列四组，全部是原始量（比例让读的人自己除）：
+         *     分母 `generated_nodes`、分子 `changed_events`、以及"这次生成一处都没被改"的
+         *     `untouched_runs`。三者必须能对上：`untouched_runs <= generated_runs`，而
+         *     `changed_events == 0` 时 `untouched_runs == generated_runs`。
+         */
+        EditSummary: {
+            /** Total */
+            total: number;
+            /** Last Event At */
+            last_event_at?: string | null;
+            /** By Actor */
+            by_actor: {
+                [key: string]: number;
+            };
+            /** By Kind */
+            by_kind: {
+                [key: string]: number;
+            };
+            /** By Field */
+            by_field: {
+                [key: string]: number;
+            };
+            label_shrunk: components["schemas"]["LabelShrunk"];
+            /** Removed Depth */
+            removed_depth: {
+                [key: string]: number;
+            };
+            /** Removed Subtree */
+            removed_subtree: {
+                [key: string]: number;
+            };
+            /**
+             * Generated Runs
+             * @default 0
+             */
+            generated_runs: number;
+            /**
+             * Generated Nodes
+             * @default 0
+             */
+            generated_nodes: number;
+            /**
+             * Changed Events
+             * @default 0
+             */
+            changed_events: number;
+            /**
+             * Untouched Runs
+             * @default 0
+             */
+            untouched_runs: number;
+        };
+        /**
+         * FishboneBone
+         * @description 鱼骨图上的一根骨：一个类别 + 一棵子树。
+         *
+         *     **`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /
+         *     `detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层
+         *     `Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。
+         *     `causes` 就是 `root.children`，多一层数组只会让"这条原因下面还能不能再展开"
+         *     这件事换个地方回答。
+         *
+         *     骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**
+         *     （人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。
+         */
+        "FishboneBone-Input": {
+            /** Category */
+            category: string;
+            root: components["schemas"]["Node-Input"];
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
+        };
+        /**
+         * FishboneBone
+         * @description 鱼骨图上的一根骨：一个类别 + 一棵子树。
+         *
+         *     **`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /
+         *     `detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层
+         *     `Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。
+         *     `causes` 就是 `root.children`，多一层数组只会让"这条原因下面还能不能再展开"
+         *     这件事换个地方回答。
+         *
+         *     骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**
+         *     （人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。
+         */
+        "FishboneBone-Output": {
+            /** Category */
+            category: string;
+            root: components["schemas"]["Node-Output"];
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
+        };
+        /**
+         * FishboneContent
+         * @description 鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。
+         *
+         *     与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：
+         *
+         *       - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），
+         *         让用户选"横向还是纵向"只会得到一张画歪的鱼。前端按 `diagram_type` 分派
+         *         （`canvas/layout/index.ts`），不读 `layout`。
+         *       - `problem` 独立于 `title`。`title` 是文件名（"报销慢的原因分析"），
+         *         `problem` 是主骨上那一句（"为什么报销要 11 天"）——后半句才是这张图的论点，
+         *         而它会被画在鱼头里，长度与字号都受位置限制。
+         *       - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是
+         *         **类别**，不是"原因 1 / 原因 2"。
+         */
+        "FishboneContent-Input": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default fishbone
+             * @constant
+             */
+            diagram_type: "fishbone";
+            /** Problem */
+            problem: string;
+            /** Bones */
+            bones?: components["schemas"]["FishboneBone-Input"][];
+        };
+        /**
+         * FishboneContent
+         * @description 鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。
+         *
+         *     与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：
+         *
+         *       - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），
+         *         让用户选"横向还是纵向"只会得到一张画歪的鱼。前端按 `diagram_type` 分派
+         *         （`canvas/layout/index.ts`），不读 `layout`。
+         *       - `problem` 独立于 `title`。`title` 是文件名（"报销慢的原因分析"），
+         *         `problem` 是主骨上那一句（"为什么报销要 11 天"）——后半句才是这张图的论点，
+         *         而它会被画在鱼头里，长度与字号都受位置限制。
+         *       - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是
+         *         **类别**，不是"原因 1 / 原因 2"。
+         */
+        "FishboneContent-Output": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default fishbone
+             * @constant
+             */
+            diagram_type: "fishbone";
+            /** Problem */
+            problem: string;
+            /** Bones */
+            bones?: components["schemas"]["FishboneBone-Output"][];
+        };
+        /**
+         * FlowContent
+         * @description 流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。
+         *
+         *     与 `MindMapContent` 的三个差别：
+         *
+         *       - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步
+         *         还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让"这是阶段"与
+         *         "这是阶段里的第一步"在数据里长得一样。
+         *       - **这里这个 `edges` 只装阶段之间的跳转**，端点命名空间是**阶段 id**。这与
+         *         `MindMapContent.edges` 刚好相反，也是同一个 `Edge` 类型在两处的唯一区别
+         *         （见 `_validate_edges` 的 `what` / `where` 参数）。阶段**内部**的边（判定
+         *         节点的两条出边、步骤之间的顺序跳转）在 `FlowStage.edges` 里，端点命名空间
+         *         是那个阶段自己的节点 id——两处是**两个数组、两个命名空间**，见
+         *         `FlowStage` 的 docstring。
+         *       - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。
+         *         `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。
+         */
+        "FlowContent-Input": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default flowchart
+             * @constant
+             */
+            diagram_type: "flowchart";
+            /** Stages */
+            stages: components["schemas"]["FlowStage-Input"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+        };
+        /**
+         * FlowContent
+         * @description 流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。
+         *
+         *     与 `MindMapContent` 的三个差别：
+         *
+         *       - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步
+         *         还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让"这是阶段"与
+         *         "这是阶段里的第一步"在数据里长得一样。
+         *       - **这里这个 `edges` 只装阶段之间的跳转**，端点命名空间是**阶段 id**。这与
+         *         `MindMapContent.edges` 刚好相反，也是同一个 `Edge` 类型在两处的唯一区别
+         *         （见 `_validate_edges` 的 `what` / `where` 参数）。阶段**内部**的边（判定
+         *         节点的两条出边、步骤之间的顺序跳转）在 `FlowStage.edges` 里，端点命名空间
+         *         是那个阶段自己的节点 id——两处是**两个数组、两个命名空间**，见
+         *         `FlowStage` 的 docstring。
+         *       - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。
+         *         `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。
+         */
+        "FlowContent-Output": {
+            /**
+             * Schema Version
+             * @default 2
+             * @constant
+             */
+            schema_version: 2;
+            /** Title */
+            title: string;
+            theme?: components["schemas"]["Theme"];
+            /** Relations */
+            relations?: components["schemas"]["Relation"][];
+            /** Source Usage */
+            source_usage?: components["schemas"]["SourceUsage"][];
+            /**
+             * Diagram Type
+             * @default flowchart
+             * @constant
+             */
+            diagram_type: "flowchart";
+            /** Stages */
+            stages: components["schemas"]["FlowStage-Output"][];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+        };
+        /**
+         * FlowStage
+         * @description 流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。
+         *
+         *     `root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——
+         *     `Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，
+         *     而第一层"步骤"与第 N 层"步骤"在数据里本来就该是同一个东西。`steps` 就是
+         *     `root.children`。
+         *
+         *     ## 两个数组、两个命名空间（这一节是这个结构最容易串的地方）
+         *
+         *     模块里有**两处** `edges`，端点属于**两个互不相通的命名空间**：
+         *
+         *       - `FlowContent.edges` —— **阶段之间**的跳转（提交 → 审查、付款 → 提交驳回）。
+         *         端点必须是**阶段 id**（`stages[i].id`），拿一个真实存在的步骤 id 当端点会被
+         *         硬拒（`test_edge_endpoints_are_stages_not_nodes` 钉着）。它画出来是画布上的
+         *         那根**主轴**。
+         *       - `FlowStage.edges`（就是本字段）—— **这个阶段内部**的边：判定节点的「是 / 否」
+         *         两条出边、以及步骤之间的顺序跳转。端点必须是**该阶段自己的节点 id**，
+         *         拿另一个阶段的节点、或者拿阶段 id，都会被硬拒。它画出来是阶段内部的一条
+         *         **细线**。
+         *
+         *     为什么必须分成两个数组（而不是给端点加 `stage:` / `node:` 前缀，把边都塞进
+         *     `FlowContent.edges`）：命名空间靠**位置**隔离时，校验是"每条边的两个端点都在
+         *     这个集合里"——一次集合查表，且它天然排除了"阶段内的边连到另一个阶段"这种错；
+         *     前缀方案要把每个端点都解析一遍，还会给 id 引入一个转义问题（节点 id 允许任意
+         *     字符，写 `node:x` 的节点 id 和"前缀表示法"就分不开了）。代价是消费者要遍历
+         *     `stages[i].edges`——而它本来就要遍历 `stages[i].root`。
+         *
+         *     为什么要有这个字段（阶段 1 契约的真实空洞）：`role="decision"` 的节点在阶段
+         *     **内部**，而原来的 `FlowContent.edges` 端点只有阶段 → 模型标出来的判定节点，
+         *     它的两条「是 / 否」出边**无处可写**。实测一份流程图 5 个判定节点、`branch_edges`
+         *     恒为 0：不是模型没标，是契约没有位置。
+         *
+         *     `id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点
+         *     引用（那是阶段之间的跳转），节点 id 只被 `relations` 与这两个阶段内数组引用。
+         *     不合并是因为合并之后"这条边连的是阶段还是步骤"要靠形状猜，而两者在画布上画
+         *     出来的东西完全不同（一条主轴 vs 一条细线）。
+         */
+        "FlowStage-Input": {
+            /** Id */
+            id: string;
+            root: components["schemas"]["Node-Input"];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+        };
+        /**
+         * FlowStage
+         * @description 流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。
+         *
+         *     `root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——
+         *     `Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，
+         *     而第一层"步骤"与第 N 层"步骤"在数据里本来就该是同一个东西。`steps` 就是
+         *     `root.children`。
+         *
+         *     ## 两个数组、两个命名空间（这一节是这个结构最容易串的地方）
+         *
+         *     模块里有**两处** `edges`，端点属于**两个互不相通的命名空间**：
+         *
+         *       - `FlowContent.edges` —— **阶段之间**的跳转（提交 → 审查、付款 → 提交驳回）。
+         *         端点必须是**阶段 id**（`stages[i].id`），拿一个真实存在的步骤 id 当端点会被
+         *         硬拒（`test_edge_endpoints_are_stages_not_nodes` 钉着）。它画出来是画布上的
+         *         那根**主轴**。
+         *       - `FlowStage.edges`（就是本字段）—— **这个阶段内部**的边：判定节点的「是 / 否」
+         *         两条出边、以及步骤之间的顺序跳转。端点必须是**该阶段自己的节点 id**，
+         *         拿另一个阶段的节点、或者拿阶段 id，都会被硬拒。它画出来是阶段内部的一条
+         *         **细线**。
+         *
+         *     为什么必须分成两个数组（而不是给端点加 `stage:` / `node:` 前缀，把边都塞进
+         *     `FlowContent.edges`）：命名空间靠**位置**隔离时，校验是"每条边的两个端点都在
+         *     这个集合里"——一次集合查表，且它天然排除了"阶段内的边连到另一个阶段"这种错；
+         *     前缀方案要把每个端点都解析一遍，还会给 id 引入一个转义问题（节点 id 允许任意
+         *     字符，写 `node:x` 的节点 id 和"前缀表示法"就分不开了）。代价是消费者要遍历
+         *     `stages[i].edges`——而它本来就要遍历 `stages[i].root`。
+         *
+         *     为什么要有这个字段（阶段 1 契约的真实空洞）：`role="decision"` 的节点在阶段
+         *     **内部**，而原来的 `FlowContent.edges` 端点只有阶段 → 模型标出来的判定节点，
+         *     它的两条「是 / 否」出边**无处可写**。实测一份流程图 5 个判定节点、`branch_edges`
+         *     恒为 0：不是模型没标，是契约没有位置。
+         *
+         *     `id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点
+         *     引用（那是阶段之间的跳转），节点 id 只被 `relations` 与这两个阶段内数组引用。
+         *     不合并是因为合并之后"这条边连的是阶段还是步骤"要靠形状猜，而两者在画布上画
+         *     出来的东西完全不同（一条主轴 vs 一条细线）。
+         */
+        "FlowStage-Output": {
+            /** Id */
+            id: string;
+            root: components["schemas"]["Node-Output"];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** ImportResponse */
+        ImportResponse: {
+            /** Content */
+            content: components["schemas"]["MindMapContent-Output"] | components["schemas"]["FishboneContent-Output"] | components["schemas"]["FlowContent-Output"];
+            /** Warnings */
+            warnings: components["schemas"]["ImportWarningPayload"][];
+            /** Source Format */
+            source_format: string;
+        };
+        /**
+         * ImportWarningPayload
+         * @description 一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。
+         */
+        ImportWarningPayload: {
+            /** Code */
+            code: string;
+            /** Message */
+            message: string;
         };
         /** KnowledgeHit */
         KnowledgeHit: {
@@ -470,6 +1365,30 @@ export interface components {
              * @default 0
              */
             score: number;
+        };
+        /**
+         * LabelShrunk
+         * @description 标题被改短的统计，**只统计 `actor="user"`**。
+         *
+         *     过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（生成直接落画布时那批
+         *     改动记在 `agent` 名下），它不反映用户的偏好。混进来时 `count` 会比用户的真实
+         *     条数多（实测 B 图 3 条 user 的缩短被算成 4 条，多出来的那条是 agent 的 13→10
+         *     字），而"用户的缩短偏好"正是这个数字要回答的东西。
+         *
+         *     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
+         *     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：
+         *     从 18 缩到 9 是"太长了"，从 18 缩到 17 只是"改了个字"。
+         */
+        LabelShrunk: {
+            /**
+             * Count
+             * @default 0
+             */
+            count: number;
+            /** Avg Before */
+            avg_before?: number | null;
+            /** Avg After */
+            avg_after?: number | null;
         };
         /**
          * LayoutKind
@@ -524,15 +1443,70 @@ export interface components {
             /** Total Chars */
             total_chars: number;
         };
-        /** MapRecord */
+        /**
+         * MapRecord
+         * @description 一条落库的导图。`content` 与 `SaveRequest.content` 是同一个联合类型——
+         *     写进来的是什么形状，读出去就是什么形状（JSON 里 `diagram_type` 与形状都在）。
+         */
         MapRecord: {
             /** Id */
             id: string;
             /** Version */
             version: number;
-            content: components["schemas"]["MindMapContent-Output"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Output"] | components["schemas"]["FishboneContent-Output"] | components["schemas"]["FlowContent-Output"];
             /** Updated At */
             updated_at: string;
+        };
+        /**
+         * MemoryHit
+         * @description 一次命中的**全部**中间量。
+         *
+         *     `score = cosine * decay`。三个数都给出，是为了让"为什么排在这里"可以当场读出来。
+         */
+        MemoryHit: {
+            /** Text */
+            text: string;
+            /** Kind */
+            kind: string;
+            /** Cosine */
+            cosine: number;
+            /** Decay */
+            decay: number;
+            /** Score */
+            score: number;
+            /** Age Days */
+            age_days?: number | null;
+            /** Created At */
+            created_at: string;
+            /** Formed At */
+            formed_at?: string | null;
+        };
+        /**
+         * MemoryItem
+         * @description 列表里的一条。**不带向量**：1024 个 float 对读者没有意义，它是机器用的。
+         */
+        MemoryItem: {
+            /** Id */
+            id: string;
+            /** Text */
+            text: string;
+            /** Kind */
+            kind: string;
+            /** Source */
+            source: string;
+            /** Created At */
+            created_at: string;
+            /** Formed At */
+            formed_at?: string | null;
+            /** Last Used At */
+            last_used_at?: string | null;
+            /** Session Id */
+            session_id?: string | null;
+            /** Has Vector */
+            has_vector: boolean;
+            /** Model */
+            model?: string | null;
         };
         /** MindMapContent */
         "MindMapContent-Input": {
@@ -544,14 +1518,22 @@ export interface components {
             schema_version: 2;
             /** Title */
             title: string;
-            root: components["schemas"]["Node-Input"];
-            /** @default tree */
-            layout: components["schemas"]["LayoutKind"];
             theme?: components["schemas"]["Theme"];
             /** Relations */
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            root: components["schemas"]["Node-Input"];
+            /** @default tree */
+            layout: components["schemas"]["LayoutKind"];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+            /**
+             * Diagram Type
+             * @default tree
+             * @enum {string}
+             */
+            diagram_type: "tree" | "flowchart" | "fishbone";
         };
         /** MindMapContent */
         "MindMapContent-Output": {
@@ -563,14 +1545,22 @@ export interface components {
             schema_version: 2;
             /** Title */
             title: string;
-            root: components["schemas"]["Node-Output"];
-            /** @default tree */
-            layout: components["schemas"]["LayoutKind"];
             theme?: components["schemas"]["Theme"];
             /** Relations */
             relations?: components["schemas"]["Relation"][];
             /** Source Usage */
             source_usage?: components["schemas"]["SourceUsage"][];
+            root: components["schemas"]["Node-Output"];
+            /** @default tree */
+            layout: components["schemas"]["LayoutKind"];
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+            /**
+             * Diagram Type
+             * @default tree
+             * @enum {string}
+             */
+            diagram_type: "tree" | "flowchart" | "fishbone";
         };
         /** Node */
         "Node-Input": {
@@ -595,7 +1585,13 @@ export interface components {
              * @default false
              */
             collapsed: boolean;
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
+            /** Role */
+            role?: ("step" | "decision" | "start" | "end" | "data" | "database") | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;
@@ -623,12 +1619,33 @@ export interface components {
              * @default false
              */
             collapsed: boolean;
+            /** Color */
+            color?: ("blue" | "green" | "amber" | "red" | "purple" | "teal" | "pink" | "gray") | null;
+            /** Icon */
+            icon?: string | null;
             style?: components["schemas"]["NodeStyle"] | null;
+            /** Role */
+            role?: ("step" | "decision" | "start" | "end" | "data" | "database") | null;
             /** Source Refs */
             source_refs?: components["schemas"]["SourceRef"][];
             pos?: components["schemas"]["Position"] | null;
         };
-        /** NodeStyle */
+        /**
+         * NodeStyle
+         * @description 节点样式（v2 预留字段，界面对它只做透传保存）。
+         *
+         *     `style.color` 与 `Node.color` **不是同一个东西**，两者的关系必须写清楚，
+         *     否则下一个人会以为它们是"新旧两版"而随手改坏一处：
+         *
+         *       - `NodeStyle.color` 是 `#RRGGBB`，来源是导入/将来的取色器，**界面不渲染**。
+         *         它是"用户画的那个色"，逐像素还原用。
+         *       - `Node.color` 是**调色板键**（`blue`/`green`/…），界面按它渲染，能跟着
+         *         主题（暗色/亮色）自动适配。
+         *
+         *     两个字段同时存在时 **`Node.color` 优先**：语义色是渲染意图，hex 是历史值。
+         *     `Node.color` 为 `None` 时才回落到…也不回落——`style.color` 仍然不渲染，
+         *     它只是被保留下来，免得用户点一次保存就把导入的颜色丢掉。
+         */
         NodeStyle: {
             /** Color */
             color?: string | null;
@@ -661,6 +1678,49 @@ export interface components {
             x: number;
             /** Y */
             y: number;
+        };
+        /**
+         * Pref
+         * @description 一条偏好。
+         *
+         *     `last_applied_at` 不是存在 `user_prefs` 里的列，是**反查**出来的：它来自
+         *     `runs.request.prefs_applied`，也就是"哪几次运行真的带着这条偏好跑过"。
+         *     这一位是这张表的死表探测器——写进去却从来没有任何一次运行报告它，就说明
+         *     读路径根本没接上，而这件事不需要看日志，打开面板就能看出来。
+         *
+         *     匹配键是 `key=value` 整串而不是 `key`：用户把鱼骨图改成流程图之后，旧值的
+         *     生效记录不该继续挂在它身上，界面该如实回到"尚未生效"。
+         */
+        Pref: {
+            /** Key */
+            key: string;
+            /** Value */
+            value: string;
+            /**
+             * Scope
+             * @default global
+             */
+            scope: string;
+            /**
+             * Source
+             * @default user_explicit
+             * @enum {string}
+             */
+            source: "user_explicit" | "suggestion_accepted";
+            /** Source Run Id */
+            source_run_id?: string | null;
+            /**
+             * Created At
+             * @default
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @default
+             */
+            updated_at: string;
+            /** Last Applied At */
+            last_applied_at?: string | null;
         };
         /**
          * Relation
@@ -716,7 +1776,7 @@ export interface components {
             max_model_calls: number;
             /**
              * Max Tool Calls
-             * @default 8
+             * @default 50
              */
             max_tool_calls: number;
             /**
@@ -735,9 +1795,96 @@ export interface components {
              */
             max_repairs: number;
         };
-        /** SaveRequest */
+        /**
+         * RunDetail
+         * @description 单条：带结果正文与失败原因。
+         */
+        RunDetail: {
+            /** Run Id */
+            run_id: string;
+            /** Status */
+            status: string;
+            /** Intent */
+            intent: string;
+            /** Goal */
+            goal: string;
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Applied At */
+            applied_at?: string | null;
+            /** Candidate */
+            candidate?: unknown | null;
+            /** Failure */
+            failure?: {
+                [key: string]: unknown;
+            } | null;
+            /** Mode */
+            mode?: string | null;
+        };
+        /**
+         * RunSummary
+         * @description 列表里的一行：**不带结果正文**。
+         *
+         *     结果是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句
+         *     "上次有一次生成还没保存"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。
+         */
+        RunSummary: {
+            /** Run Id */
+            run_id: string;
+            /** Status */
+            status: string;
+            /** Intent */
+            intent: string;
+            /** Goal */
+            goal: string;
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Applied At */
+            applied_at?: string | null;
+        };
+        /**
+         * SaveRequest
+         * @description 保存一份导图，**顺带提交这一次保存里攒下的改动日志**。
+         *
+         *     事件为什么不走独立端点（`POST /mindmaps/{id}/edits`）：第一次保存之前根本
+         *     没有 `map_id`。要么发不出去，要么必须先 create 再补发，于是多出一种半截状态
+         *     ——内容存了、事件没存——而统计从此只看见部分改动，且没有任何地方能察觉。
+         *     放进同一个请求体，两者天然同成败：409 冲突时一起失败、重试就都补上。
+         *
+         *     `events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是
+         *     重新点了一下保存）与上一版请求体逐字节相同。
+         *
+         *     `content` 是**三种图型的联合**（`DiagramContent`），不是 `MindMapContent`：
+         *     鱼骨图与流程图的顶层结构不同（`problem` + `bones` / `stages` + 阶段间跳转），
+         *     用树那一套 `extra="forbid"` 装不下。判别靠形状，所以旧前端（只发树形状）的
+         *     请求与加这个联合之前逐字节相同。
+         */
         SaveRequest: {
-            content: components["schemas"]["MindMapContent-Input"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"];
+            /** Events */
+            events?: components["schemas"]["EditEventIn"][];
+            /**
+             * Truncated
+             * @default 0
+             */
+            truncated: number;
+        };
+        /**
+         * Saved
+         * @description `set()` 的结果。
+         *
+         *     `changed=False` 是"这次提交没有改变任何东西"——同值重复提交不刷 `updated_at`。
+         *     不返回这个布尔值，界面上就会出现"我刚设过"的假象：时间戳变了，实际什么都没变。
+         */
+        Saved: {
+            pref: components["schemas"]["Pref"];
+            /** Changed */
+            changed: boolean;
         };
         /** SearchRequest */
         SearchRequest: {
@@ -758,6 +1905,39 @@ export interface components {
              * @default false
              */
             implemented: boolean;
+        };
+        /** SearchResult */
+        SearchResult: {
+            /** Query */
+            query: string;
+            /** Hits */
+            hits: components["schemas"]["MemoryHit"][];
+            /** Scanned */
+            scanned: number;
+            /** Top K */
+            top_k: number;
+            /** Min Cosine */
+            min_cosine: number;
+        };
+        /**
+         * SetPrefRequest
+         * @description `PUT /prefs/{key}` 的请求体。
+         *
+         *     `source` 允许调用方声明"这条是我点了建议才写的"：两种来源在界面上显示不同
+         *     的标签（"你设置的" / "系统建议（你已同意）"），而那个区别只有写入的那一刻
+         *     知道——事后再去猜"这条是不是建议来的"是猜不出来的。
+         */
+        SetPrefRequest: {
+            /** Value */
+            value: string;
+            /**
+             * Source
+             * @default user_explicit
+             * @enum {string}
+             */
+            source: "user_explicit" | "suggestion_accepted";
+            /** Source Run Id */
+            source_run_id?: string | null;
         };
         /** Source */
         Source: {
@@ -798,7 +1978,7 @@ export interface components {
          * SourceKind
          * @enum {string}
          */
-        SourceKind: "text" | "markdown" | "document" | "image" | "audio";
+        SourceKind: "text" | "markdown" | "document" | "image" | "audio" | "web" | "paper";
         /**
          * SourceMetadata
          * @description 来源的描述性元数据：检索前过滤的依据，不参与正文解析。
@@ -828,6 +2008,10 @@ export interface components {
             category?: string | null;
             /** Tags */
             tags?: string[];
+            /** Url */
+            url?: string | null;
+            /** Raw Chars */
+            raw_chars?: number | null;
         };
         /**
          * SourceRef
@@ -871,27 +2055,15 @@ export interface components {
             filename?: string | null;
             /** Char Count */
             char_count: number;
+            /** Url */
+            url?: string | null;
         };
         /** SuggestResponse */
         SuggestResponse: {
             /** Suggestions */
-            suggestions?: components["schemas"]["Suggestion"][];
+            suggestions?: components["schemas"]["app__contracts__diagnostic__Suggestion"][];
             /** Diagnostics */
             diagnostics?: components["schemas"]["Diagnostic"][];
-        };
-        /** Suggestion */
-        Suggestion: {
-            /** Id */
-            id?: string;
-            kind: components["schemas"]["SuggestionKind"];
-            /** Node Id */
-            node_id?: string | null;
-            /** Message */
-            message: string;
-            /** Evidence */
-            evidence?: string | null;
-            /** Confidence */
-            confidence?: number | null;
         };
         /**
          * SuggestionKind
@@ -923,7 +2095,15 @@ export interface components {
         };
         /** UpdateRequest */
         UpdateRequest: {
-            content: components["schemas"]["MindMapContent-Input"];
+            /** Content */
+            content: components["schemas"]["MindMapContent-Input"] | components["schemas"]["FishboneContent-Input"] | components["schemas"]["FlowContent-Input"];
+            /** Events */
+            events?: components["schemas"]["EditEventIn"][];
+            /**
+             * Truncated
+             * @default 0
+             */
+            truncated: number;
             /** Version */
             version: number;
         };
@@ -939,6 +2119,36 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /** Suggestion */
+        app__contracts__diagnostic__Suggestion: {
+            /** Id */
+            id?: string;
+            kind: components["schemas"]["SuggestionKind"];
+            /** Node Id */
+            node_id?: string | null;
+            /** Message */
+            message: string;
+            /** Evidence */
+            evidence?: string | null;
+            /** Confidence */
+            confidence?: number | null;
+        };
+        /**
+         * Suggestion
+         * @description 一条**候选**建议。它不是偏好，落库必须经过用户点一次。
+         */
+        app__prefs__service__Suggestion: {
+            /** Key */
+            key: string;
+            /** Value */
+            value: string;
+            /** Label */
+            label: string;
+            /** Count */
+            count: number;
+            /** Message */
+            message: string;
         };
     };
     responses: never;
@@ -1002,6 +2212,26 @@ export interface operations {
             };
         };
     };
+    edits_health_api_mindmaps_edits_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditHealth"];
+                };
+            };
+        };
+    };
     get_map_api_mindmaps__map_id__get: {
         parameters: {
             query?: never;
@@ -1055,6 +2285,103 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MapRecord"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    edit_summary_api_mindmaps__map_id__edits_summary_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                map_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_edits_api_mindmaps__map_id__edits_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                map_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditEventRow"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_mindmap_api_mindmaps_import_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_import_mindmap_api_mindmaps_import_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1227,6 +2554,37 @@ export interface operations {
             };
         };
     };
+    export_json_api_export_json_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     create_text_source_api_ingestion_text_post: {
         parameters: {
             query?: never;
@@ -1366,6 +2724,331 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_runs_api_agent_runs_get: {
+        parameters: {
+            query?: {
+                /** @description 只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。 */
+                status?: ("done" | "cancelled" | "failed" | "running") | null;
+                /** @description 只列有结果、且后来没被保存过的；置 false 则把这段台账原样列出来。 */
+                unapplied?: boolean;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunSummary"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_run_api_agent_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mark_run_applied_api_agent_runs__run_id__applied_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_suggestions_api_prefs_suggestions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["app__prefs__service__Suggestion"][];
+                };
+            };
+        };
+    };
+    list_prefs_api_prefs_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Pref"][];
+                };
+            };
+        };
+    };
+    set_pref_api_prefs__pref_key__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPrefRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Saved"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_pref_api_prefs__pref_key__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_memories_api_memory_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryItem"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    add_memory_api_memory_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddMemoryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedMemory"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_memory_api_memory__item_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_memory_api_memory_search_get: {
+        parameters: {
+            query: {
+                /** @description 按这次的主题检索，与生成时的 query 同一口径 */
+                q: string;
+                top_k?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchResult"];
                 };
             };
             /** @description Validation Error */

@@ -27,6 +27,18 @@ export interface SourceItem {
 type Lane = 'document' | 'media';
 
 /**
+ * 「清空」之前的一份可撤销快照（`snapshot()` / `restore()`）。
+ *
+ * 只给「新对话」用：那个动作会把材料清干净，而材料可能是用户传了十几分钟、
+ * 刚解析完还没生成过的东西。带文件的条目要靠 `files` 才能重试，所以连它一起留。
+ */
+export interface SourcesSnapshot {
+  items: SourceItem[];
+  draftText: string;
+  files: Array<[string, File]>;
+}
+
+/**
  * 文档泳道并发度 1，保持串行。
  *
  * 文档走 Docling / pymupdf，是本地 CPU 且 Docling 内部有进程级单例锁，
@@ -46,6 +58,26 @@ const MEDIA_CONCURRENCY = 2;
 export const useSourcesStore = defineStore('sources', () => {
   const items = ref<SourceItem[]>([]);
   const error = ref('');
+  /**
+   * 「粘贴材料正文」框里还没点「添加」的草稿。
+   *
+   * **必须住在这里，不能住组件里**：那个框住在底部对话框的材料面板，而整个对话框
+   * 主体在"生成中"那一段被 `v-if="compact"` 换成一条细进度——组件被卸载，本地
+   * `ref` 里的几百字正文连同它的 `beforeunload` 提醒一起消失。用户切一下语音、
+   * 生成一次，草稿就没了，而界面上没有任何提示。
+   *
+   * 放在 store 之后，它同时被三件事看见：`ChatDock` 的淡出刹车（有草稿就不淡出）、
+   * `beforeunload`（关页面提醒，挂在常驻的 `ChatDock` 上）、以及「新对话」的清空。
+   */
+  const draftText = ref('');
+  /**
+   * 正在录音。
+   *
+   * 放在这里而不是某个组件里，因为**两个组件都要看它**：`RecordButton` 那边决定
+   * 按钮形态，画布右上角的生成按钮要据此禁用——录音停下来的那一刻会新增一份材料，
+   * 此刻发出去的请求里一定缺这一块。
+   */
+  const recording = ref(false);
   const files = new Map<string, File>();
   const active = new Map<string, AbortController>();
   let textNumber = 0;
@@ -74,6 +106,14 @@ export const useSourcesStore = defineStore('sources', () => {
     if (items.value.some(item => item.state === 'failed')) return '有来源解析失败，请重试或移除后生成。';
     return sourceInputError(readySources.value);
   });
+  /**
+   * 材料作为**可选**输入时的闸门：一份都没有不是错误。
+   *
+   * `problem` 对空列表返回「请先添加至少一个来源」，那是"合并生成"时代的判据
+   * （生成必须要来源）。现在材料可以不传，谁把 `problem` 直接摆到生成按钮上，
+   * 用户就会看到一个永远禁用的按钮和一句要求他去加材料的话。
+   */
+  const materialProblem = computed(() => (items.value.length ? problem.value : ''));
 
   function hasRoom(count: number): boolean {
     error.value = '';
@@ -84,7 +124,8 @@ export const useSourcesStore = defineStore('sources', () => {
 
   function addText(text: string): boolean {
     if (!text.trim()) {
-      error.value = '请输入主题或文本。';
+      // 这个入口加的是**材料**：说"请输入主题或文本"会让用户以为主题也该贴在这里。
+      error.value = '粘贴的内容是空的，没有加进来源。';
       return false;
     }
     if (!hasRoom(1)) return false;
@@ -96,8 +137,31 @@ export const useSourcesStore = defineStore('sources', () => {
     return true;
   }
 
-  async function parseItem(item: SourceItem): Promise<void> {
-    const file = files.get(item.key);
+  /**
+   * 把草稿加进来源，成功才清空草稿。
+   *
+   * 失败时**保留正文**：超上限、内容为空这两种失败下清空输入框，等于把用户刚贴的
+   * 那段文字扔了——而失败原因恰恰要求他改一改再试。
+   */
+  function addDraft(): boolean {
+    if (!addText(draftText.value)) return false;
+    draftText.value = '';
+    return true;
+  }
+
+  /**
+   * 一段粘贴进来的正文直接变成材料，返回新条目的 `key`（没加进去是 null）。
+   *
+   * `addText` 只回 true/false，而"撤回"需要知道刚加的是哪一条：对话框里那句
+   * "已放进材料"必须能一键把正文放回输入框（并撤掉那条材料），否则这个自动分流
+   * 就成了一次没法反悔的抢夺。条目的 `key` 是行身份，`remove(key)` 认它。
+   */
+  function addPastedText(text: string): string | null {
+    if (!addText(text)) return null;
+    return items.value[items.value.length - 1]?.key ?? null;
+  }
+
+  async function parseItem(item: SourceItem): Promise<void> {    const file = files.get(item.key);
     if (!file) return;
     item.error = '';
     item.seconds = 0;
@@ -225,6 +289,38 @@ export const useSourcesStore = defineStore('sources', () => {
     }
   }
 
+  /**
+   * 一次可回滚的清空：把"清掉的东西"整体留一份，供「撤销」还原。
+   *
+   * `files` 也要一起留：没有它，还原回来的失败条目点「重试」会找不到文件而静静停在
+   * `queued`（`parseItem` 的第一行就 return），用户看到的是"重试没反应"。
+   *
+   * 还原时把 `queued` / `parsing` 重新丢给泳道跑一遍：清空那一刻正在解析的条目，
+   * 它的 `AbortController` 已经随着 `clear()` 被 abort 且从 `active` 里删掉，
+   * 直接放回列表会停在 `parsing` 一秒钟都不会动。
+   */
+  function snapshot(): SourcesSnapshot {
+    return {
+      items: [...items.value],
+      draftText: draftText.value,
+      files: [...files.entries()],
+    };
+  }
+
+  function restore(saved: SourcesSnapshot): void {
+    active.forEach(controller => controller.abort());
+    active.clear();
+    files.clear();
+    for (const [key, file] of saved.files) files.set(key, file);
+    items.value = saved.items.map(item =>
+      item.state === 'queued' || item.state === 'parsing'
+        ? { ...item, state: 'queued' as const, seconds: 0 }
+        : item);
+    draftText.value = saved.draftText;
+    error.value = '';
+    void drain();
+  }
+
   function remove(key: string): void {
     active.get(key)?.abort();
     files.delete(key);
@@ -237,8 +333,17 @@ export const useSourcesStore = defineStore('sources', () => {
     files.clear();
     items.value = [];
     error.value = '';
+    recording.value = false;
+    // `draftText` **不在这里清**：这个函数服务的是"清空来源"那个按钮，而草稿是
+    // 还没成为来源的一段正文。用户点"清空来源"时把他在粘贴框里写了半天的字一起
+    // 抹掉，是另一件事。「新对话」要清它时自己清（`App.newConversation`）。
   }
 
   onScopeDispose(clear);
-  return { items, error, parsing, readySources, problem, addText, addFiles, retry, remove, clear, remap };
+  return {
+    items, error, parsing, recording, readySources, problem, materialProblem,
+    draftText,
+    addText, addDraft, addPastedText, addFiles, retry, remove, clear, remap,
+    snapshot, restore,
+  };
 });

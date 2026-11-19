@@ -68,12 +68,39 @@ def clean_tags(tags: list[str]) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def safe_http_url(value: str | None) -> str | None:
+    """只留 http/https 的绝对地址，其余折成 None。
+
+    这不是洁癖：`SourceMetadata.url` 会被前端直接塞进 `<a href>`，而 `javascript:`
+    与 `data:` 在那里是可执行的。外部检索的地址由我们自己按 API 返回值构造，但
+    "我们自己构造的"不是一条可以依赖的保证——`Source` 也能从请求体、库文件、
+    模型输出那几条路进来。
+
+    不做 URL 规范化（补斜杠、解 unicode 转义）：换个写法还是同一个地址，而改写
+    过的链接如果和用户实际看到的原文不一致，排查引用时会更难对。
+    """
+    text = blank_to_none(value)
+    if text is None:
+        return None
+    scheme, _, rest = text.partition("://")
+    if not rest or scheme.strip().lower() not in ("http", "https"):
+        return None
+    return text
+
+
 class SourceKind(str, Enum):
     text = "text"
     markdown = "markdown"
     document = "document"   # PDF / DOCX / PPTX
     image = "image"         # 手绘草图、截图
     audio = "audio"         # 录音、视频音轨
+    # 外部检索抓回来的网页正文（维基百科等）。它**不是**用户上传的材料：
+    # 内容可信度不同，所以类型也要能分开——界面据此提示"这是外部来源"，
+    # 而不是把百科正文混进"我的材料"里。
+    web = "web"
+    # 学术论文（arXiv）。与 `web` 分开而不是共用一个外部分类：论文的原文地址
+    # 通常是 abs 页，网页是条目页，将来要按来源类型做提示或过滤时这个区别有用。
+    paper = "paper"
 
 
 class SourceSpan(BaseModel):
@@ -115,6 +142,17 @@ class SourceMetadata(BaseModel):
     category: str | None = None
     # 自由标签。同上，只由调用方给；ingestion 永远不填这两项。
     tags: list[str] = Field(default_factory=list)
+    # 原文地址。**外部检索专用**（维基条目页、arXiv 的 abs 页），用户上传的材料
+    # 没有"原文地址"这个概念，留 None。
+    #
+    # 它让"自动填充/验证节点内容"这条链闭环：节点引用的 quote 出自哪篇论文、
+    # 哪个百科条目，用户点一下就能自己核对。只接受 http/https（`safe_http_url`），
+    # 因为前端会把它渲染成可点击链接。
+    url: str | None = None
+    # 抓取时的原始字符数。外部正文按 8000 字入库截断（
+    # `knowledge.external.TEXT_MAX_CHARS`），没有这个数字，"模型只看了开头"与
+    # "这条本来就短"在界面上长得一模一样。
+    raw_chars: int | None = Field(default=None, ge=0)
 
     @field_validator("created_at", "modified_at")
     @classmethod
@@ -135,6 +173,11 @@ class SourceMetadata(BaseModel):
     @classmethod
     def _blank_text_is_none(cls, value: str | None) -> str | None:
         return blank_to_none(value)
+
+    @field_validator("url")
+    @classmethod
+    def _http_url_only(cls, value: str | None) -> str | None:
+        return safe_http_url(value)
 
     @field_validator("tags")
     @classmethod
@@ -212,6 +255,17 @@ class SourceUsage(BaseModel):
     kind: SourceKind
     filename: str | None = None
     char_count: int = Field(ge=1)
+    # 原文地址（外部检索的来源才有）。放摘要里而不是只放 `Source.metadata`：
+    # 保存的导图**不带** `Source`，重新打开时手里只有这份摘要——只把它留在
+    # `Source` 上，等于"这一轮能看到链接、下次打开就没了"。
+    #
+    # 它不参与任何校验：引用可信与否由 `source_refs` 决定，这个字段只负责"点得开"。
+    url: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _http_url_only(cls, value: str | None) -> str | None:
+        return safe_http_url(value)
 
 
 class SourceRef(BaseModel):

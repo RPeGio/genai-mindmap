@@ -61,16 +61,27 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
-def _pack(vector: list[float]) -> bytes:
-    """float32 小端打包。小端是显式指定的，不随机器字节序变。"""
+def pack(vector: list[float]) -> bytes:
+    """float32 小端打包。小端是显式指定的，不随机器字节序变。
+
+    公开而不是私有：**"同一存法"必须只有一个实现**。`memory_items` 的向量列与
+    `chunk_vectors.vector` 逐字节同构，两处各写一份打包函数的结果已经出现过一次：
+    一处改了字节序，另一处的旧向量全部读成 `None`，而失败只有一个沉默的 `None`。
+    """
     return struct.pack(f"<{len(vector)}f", *vector)
 
 
-def _unpack(blob: bytes, dim: int) -> list[float] | None:
+def unpack(blob: bytes, dim: int) -> list[float] | None:
     """解包；长度对不上（维度改过、写坏了）就当没有，绝不返回半截向量。"""
     if dim <= 0 or len(blob) != dim * 4:
         return None
     return list(struct.unpack(f"<{dim}f", blob))
+
+
+# 旧名保留：本模块内部的调用点与可能存在的既有引用都还用这两个下划线名字。
+# 它们只是别名，不是第二份实现。
+_pack = pack
+_unpack = unpack
 
 
 def _open() -> sqlite3.Connection | None:

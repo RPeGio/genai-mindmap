@@ -8,6 +8,7 @@ import type { MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 import { MAX_INPUT_CHARS, MAX_UPLOAD_BYTES } from '../src/sources/input';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这里只验证上传入口与提示区。
 vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
@@ -47,6 +48,9 @@ function stubFetch(handler: (call: Call) => Response | Promise<Response>) {
         body: init?.body,
         headers: init?.headers,
       };
+      // 偏好是挂载时的背景请求（生成面板带预填），不属于这里被测的上传/生成动作：
+      // 它既不该进 `calls`，也不该被各用例的 handler 当成"下一个业务请求"。
+      if (isPrefsRequest(call.url)) return prefsReply(call.url);
       // 页面挂载时会探一次 /api/health 取版本号。它和这里的业务断言无关，
       // 单独答掉且不计入 calls——否则"只发了一个请求"这类断言会被它带偏。
       if (call.url.endsWith('/health')) {
@@ -105,9 +109,11 @@ function buttonByText(wrapper: VueWrapper, text: string) {
   return found;
 }
 
-async function generateCollected(wrapper: VueWrapper) {
-  await vi.waitFor(() => expect(useSourcesStore().parsing).toBe(false));
-  await buttonByText(wrapper, '合并生成导图').trigger('click');
+/** 画布右上角那个框的提交按钮（合并之后唯一的生成/改图入口）。 */
+const AGENT_URL = '/api/agent/runs/stream';
+
+function submitButton(wrapper: VueWrapper) {
+  return buttonByText(wrapper, '生成导图');
 }
 
 function mountApp() {
@@ -283,10 +289,16 @@ describe('多来源输入界面', () => {
     });
     stubFetch(() => jsonResponse({ source: source({ kind: 'audio', filename: audioFile.name }) }));
     const { wrapper, sources } = mountApp();
-    sources.addText('讨论主题');
+    sources.items = [{
+      key: 'text-1', id: 'text-1', label: '文本 1', kind: 'text', state: 'ready',
+      source: { ...source(), id: 'text-1', kind: 'text', filename: null, text: '讨论主题' },
+      error: '', seconds: 0,
+    }];
     await buttonByText(wrapper, '录音添加来源').trigger('click');
     await vi.waitFor(() => expect(buttonByText(wrapper, '停止并添加')).toBeTruthy());
-    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeDefined();
+    // 录音停下来的那一刻才会多出一份材料：此刻发出去的请求一定缺这一块。
+    expect(submitButton(wrapper).attributes('disabled')).toBeDefined();
+    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('正在录音');
     await buttonByText(wrapper, '停止并添加').trigger('click');
     await vi.waitFor(() => expect(sources.readySources).toHaveLength(2));
     expect(sources.readySources[1].kind).toBe('audio');
@@ -297,30 +309,42 @@ describe('多来源输入界面', () => {
     stubFetch(() => jsonResponse({ detail: '图片识别失败' }, 422));
     const { wrapper, sources } = mountApp();
     sources.addText('有效的文本');
+    // 写一句主题：不写的话按钮本来就点不动（只给材料又没标题），这条用例就测不出东西
+    await wrapper.get('textarea#intent').setValue('按材料生成一张图');
     await pickFile(wrapper, smallFile('失败.png'));
     await vi.waitFor(() => expect(wrapper.text()).toContain('图片识别失败'));
-    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeDefined();
+    expect(submitButton(wrapper).attributes('disabled')).toBeDefined();
     await wrapper.get('[aria-label="移除 失败.png"]').trigger('click');
     // 失败项移除后闸门放开：剩下的来源仍然可用（投递形态由 agent 那条链路的用例验）。
-    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeUndefined();
+    expect(submitButton(wrapper).attributes('disabled')).toBeUndefined();
     expect(sources.readySources).toHaveLength(1);
   });
 
-  it('合并长度包含输入框草稿，超限时禁用生成并保留全部输入', async () => {
+  it('合并长度只算来源：粘贴框里的草稿要点「添加文本到来源」才计入', async () => {
     stubFetch(() => jsonResponse({}));
     const { wrapper, sources } = mountApp();
-    // 正文留出分隔换行的两个字符，加上输入框草稿正好超出上限一个字
     sources.addText('字'.repeat(MAX_INPUT_CHARS - 2));
-    await wrapper.get('#prompt').setValue('补');
+    await wrapper.get('textarea#intent').setValue('主题');
+
+    // 草稿还不是材料：它既不算进合并字数，也不会被发出去
+    await wrapper.get('#material-text').setValue('补');
+    expect(wrapper.text()).toContain(`${MAX_INPUT_CHARS - 2} / ${MAX_INPUT_CHARS} 字`);
+    expect(submitButton(wrapper).attributes('disabled')).toBeUndefined();
+
+    // 点「添加文本到来源」之后它才成为第二份材料：正文 + 分隔换行 + 一个字 = 超限
+    await buttonByText(wrapper, '添加文本到来源').trigger('click');
     expect(wrapper.text()).toContain(`${MAX_INPUT_CHARS + 1} / ${MAX_INPUT_CHARS} 字`);
-    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeDefined();
+    expect(submitButton(wrapper).attributes('disabled')).toBeDefined();
     expect(calls).toHaveLength(0);
-    expect(sources.items).toHaveLength(1);
-    await wrapper.get('#prompt').setValue('');
-    expect(buttonByText(wrapper, '合并生成导图').attributes('disabled')).toBeUndefined();
+    expect(sources.items).toHaveLength(2);
+
+    await wrapper.get('[aria-label="移除 文本 2"]').trigger('click');
+    expect(submitButton(wrapper).attributes('disabled')).toBeUndefined();
   });
 
-  it('采集来源不询问是否丢弃导图，只在合并生成前确认', async () => {
+  it('改图不弹「要不要丢弃未保存的修改」', async () => {
+    // 合并前左侧那个按钮每次生成都问一句，问的却是一件不会发生的事——`edit` 的
+    // 改动在 `done` 那一刻才整树落画布，落之前画布一个字都不变。
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
     stubFetch(() => jsonResponse({ source: source() }));
     const { wrapper, store, sources } = mountApp();
@@ -329,11 +353,40 @@ describe('多来源输入界面', () => {
     await pickFile(wrapper, smallFile());
     await vi.waitFor(() => expect(sources.readySources).toHaveLength(1));
     expect(confirm).not.toHaveBeenCalled();
-    await generateCollected(wrapper);
-    expect(confirm).toHaveBeenCalledOnce();
-    expect(calls).toHaveLength(1);
+
+    await wrapper.get('textarea#intent').setValue('把这一支拆细一点');
+    await buttonByText(wrapper, '改这张图').trigger('click');
+    await vi.waitFor(() => expect(calls.some(call => call.url === AGENT_URL)).toBe(true));
+
+    expect(confirm).not.toHaveBeenCalled();
     expect(store.content?.root.children[0].label).toBe('未保存的修改');
     expect(sources.items).toHaveLength(1);
+  });
+
+  it('运行期间冻结来源列表，取消后恢复可编辑', async () => {
+    // 生成中途还能改来源，用户会以为改动对这一轮生效——实际上请求体早就发出去了。
+    // 冻结与"取消后恢复"是同一件事的两半。
+    let release!: (value: Response) => void;
+    stubFetch(() => new Promise<Response>(resolve => { release = resolve; }));
+    const { wrapper, store, sources } = mountApp();
+    sources.addText('正文');
+    await wrapper.get('textarea#intent').setValue('做一张图');
+
+    await submitButton(wrapper).trigger('click');
+    await vi.waitFor(() => expect(store.busy).toBe(true));
+    // 生成中整块对话框收成一条细进度（新状态机）：材料此刻根本点不到，
+    // 比"灰着但还在"更彻底。取消按钮就在那一行里。
+    expect(wrapper.find('input[type="file"]').exists()).toBe(false);
+    expect(wrapper.find('#material-text').exists()).toBe(false);
+    expect(wrapper.find('[data-test="run-status"]').text()).toContain('正在生成');
+
+    await buttonByText(wrapper, '取消').trigger('click');
+    expect(store.busy).toBe(false);
+    // 取消之后对话框回来，材料还在、能继续改：取消不该顺手把用户收集的材料清掉。
+    await wrapper.vm.$nextTick();
+    expect(sources.items).toHaveLength(1);
+    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeUndefined();
+    release(jsonResponse({}));
   });
 
   it('打开带来源摘要的导图显示本图来源，兼容旧导图', async () => {

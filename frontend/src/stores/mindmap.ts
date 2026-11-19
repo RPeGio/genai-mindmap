@@ -2,25 +2,57 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, getMindMap, listMindMaps, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, MapRecord, MindMapContent, MindNode, OpBatch, Source, SourceRef } from '../api/types';
+import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
+import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
+import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
+import {
+  canvasEdgesOf,
+  canvasStageEdgesOf,
+  canvasTreeOf,
+  containerNoun,
+  containerOfNode,
+  countNodesIn,
+  depthIn,
+  edgeEndpointLabel,
+  findIn,
+  findParentIn,
+  iterNodesIn,
+  isContainerRoot,
+  isFlow,
+  isTree,
+  kindOf,
+  nodeShapeOf,
+  pathToIn,
+  replaceContainer,
+  rootsOf,
+  stageInnerEdgesOf,
+  stageOfNode,
+  type NodeRole,
+  type NodeShape,
+} from '../mindmap/shape';
 import { sourceInputError } from '../sources/input';
 import { useSourcesStore } from './sources';
-import { layoutTidy, childSide, NODE_SIZE, type ChildSide, type Direction, type LayoutResult } from '../canvas/layout/tidy';
+import { childSide, NODE_SIZE, type ChildSide, type Direction } from '../canvas/layout/tidy';
+import { diagramTypeOf, layoutDiagram, type DiagramLayout } from '../canvas/layout';
+import type { NodeSize } from '../canvas/layout/flow';
 import {
   addChild,
+  addEdge as addEdgeToContent,
   addSibling,
   charLength,
-  countNodes,
+  dropDanglingEdges,
+  edgesOf,
   findNode,
-  findParent,
   LIMITS,
+  removeEdge as removeEdgeFromContent,
   removeNode,
   renameNode,
   setNodeNote,
+  setNodeVisual,
+  subtreeIds,
   validateDraft,
 } from '../mindmap/edits';
 
@@ -70,13 +102,276 @@ export function displayBody(node: MindNode): string {
   return note && note.length > 0 ? note : node.label.trim();
 }
 
-/** 正文当前来自哪一段。详情面板据此给出"这一段是什么"的说明。 */
+/** 正文本当前来自哪一段。详情面板据此给出"这一段是什么"的说明。 */
 export type BodySource = 'detail' | 'note' | 'label';
 
 export function bodySource(node: MindNode): BodySource {
   if (node.detail?.trim()) return 'detail';
   if (node.note?.trim()) return 'note';
   return 'label';
+}
+
+/**
+ * 一次生成相对生成前那条画布的一条改动。
+ *
+ * 存在的理由：生成**直接落画布**（没有候选确认这一步了），于是"刚才那 25 秒动了
+ * 什么"变成了必须补上的一件事——画布整棵树换了一遍，用户认得的那张图还在，但
+ * 哪几支被改了、哪几个节点没了，光看画布看不出来。没有这份清单，用户只能靠在
+ * 撤销栈里试一步来猜。
+ */
+export interface CandidateChange {
+  /**
+   * 改动种类。前四种是**节点**：`added` / `removed` / `updated` / `moved`；
+   * 后两种是**附加边**（`edge_added` / `edge_removed`）。
+   *
+   * 边单独两种而不是复用 `added` / `removed`：`id` 的语义不同（边 id vs 节点 id），
+   * 而清单上要能一眼分清"这张图多了几个节点"与"多了几条连线"——前者是要看内容
+   * 的地方，后者是要看流程走向的地方。混在一起时，一条"新增关系"会被读成
+   * "新增节点"，用户点它跳不到任何地方。
+   */
+  kind: 'added' | 'removed' | 'updated' | 'moved' | 'edge_added' | 'edge_removed';
+  /** 节点 id（前四种）或边 id（后两种）。 */
+  id: string;
+  /** 显示用标题：更新/移动取**新**标题，删除取原标题。边则显示「A → B（是）」。 */
+  label: string;
+  /** 一句话说明改了什么（"标题 → 新标题"、"颜色 blue→red"、"移到「甲」下"）。 */
+  detail: string;
+  /**
+   * 这条改动**碰到了哪几个节点**（节点改动是一个，边改动是两个端点）。
+   *
+   * 它只服务一件事：判断这条改动落没落在用户当时的选区里。用 `id` 判不行——
+   * 边的 `id` 是边 id，与节点 id 是两套命名空间；`added` 的 `id` 是一个新 id，
+   * 在基线树里根本查不到，而它确实长在用户选中的那棵子树下面。
+   */
+  nodes: string[];
+}
+
+/**
+ * 带上「在不在选区里」的改动条目（`store.generatedChanges` 的返回值）。
+ *
+ * 为什么不把 `inSelection` 直接塞进 `CandidateChange`：那两个纯函数
+ * （`diffCandidate` / `diffEdges`）回答的是"两棵树哪里不一样"，它们**看不到**
+ * 选区——把布尔字段放进去就必须先填一个假值，而"假值"与"算出来是 false"
+ * 在类型上分不开。用一个派生类型把两件事分开：谁需要范围，谁再算一层。
+ */
+export interface ScopedChange extends CandidateChange {
+  /**
+   * 是否落在「这次生成」带上去的选区里（见 `store.generationSelection`）。
+   *
+   * 没有选区时恒为 `false`：那时"范围内/外"不成立，界面也不显示这个标记
+   * （`generationSelection` 为空判断）。刻意用布尔而不是三态 `null`——清单每一行
+   * 都要渲染，三态会让每个读它的地方都写一遍 `=== false` 的分支。
+   */
+  inSelection: boolean;
+}
+
+/**
+ * `MindNode` 还是 `MindNode[]`：这两种都表示"一批并列的子树"。
+ *
+ * 单独抽出来是因为 `diffCandidate` / `selectionScope` 要对**两份**输入各做一次归一，
+ * 写在两个函数里就是两行一样的 `Array.isArray`——而它们迟早会在"传进来是不是数组"
+ * 这件事上分叉（一个允许 `null`、另一个忘了）。
+ */
+function asRoots(value: MindNode | readonly MindNode[]): readonly MindNode[] {
+  return Array.isArray(value) ? value : [value as MindNode];
+}
+
+/**
+ * 多棵**并列**子树的索引（鱼骨的六根骨、流程的各阶段）。
+ *
+ * 树只有一棵，`indexForest([root])` 与原来的 `indexTree(root)` 逐格相同（每棵子树
+ * 的根都是 `parentId: null`），所以树的 diff 结果一条都不该变。
+ */
+function indexForest(
+  roots: readonly MindNode[],
+): Map<string, { node: MindNode; parentId: string | null }> {
+  const out = new Map<string, { node: MindNode; parentId: string | null }>();
+  const walk = (node: MindNode, parentId: string | null) => {
+    out.set(node.id, { node, parentId });
+    for (const child of node.children) walk(child, node.id);
+  };
+  for (const root of roots) walk(root, null);
+  return out;
+}
+
+/** 一个节点上"人看得懂的变化"。没有变化返回空数组。 */
+function nodeFieldChanges(before: MindNode, after: MindNode): string[] {
+  const parts: string[] = [];
+  if (before.label.trim() !== after.label.trim()) {
+    parts.push(`标题「${before.label.trim()}」→「${after.label.trim()}」`);
+  }
+  if ((before.detail ?? '').trim() !== (after.detail ?? '').trim()) {
+    parts.push(after.detail?.trim() ? '改了详情' : '清空了详情');
+  }
+  if ((before.color ?? null) !== (after.color ?? null)) {
+    parts.push(`颜色 ${before.color ?? '无'} → ${after.color ?? '无'}`);
+  }
+  if ((before.icon ?? null) !== (after.icon ?? null)) {
+    parts.push(`图标 ${before.icon ?? '无'} → ${after.icon ?? '无'}`);
+  }
+  // `note` 归用户，生成侧碰不到它；这里仍然比一次，是为了让"某条路径改到了用户
+  // 备注"这种 bug 在界面上直接看得见，而不是等着用户发现自己的字变了。
+  if ((before.note ?? '') !== (after.note ?? '')) {
+    parts.push('改了「我的备注」');
+  }
+  if ((before.source_refs?.length ?? 0) !== (after.source_refs?.length ?? 0)) {
+    parts.push(`引用 ${before.source_refs?.length ?? 0} → ${after.source_refs?.length ?? 0} 条`);
+  }
+  return parts;
+}
+
+/**
+ * 两棵树之间的差异；**没有可比基线时返回 `null`**（画布本来是空的）。
+ *
+ * 为什么用"两份树对比"而不是"记录收到的 op 批次"：
+ *
+ *  - op 帧可能丢、可能乱序（`applyOpsToDraft` 会主动丢弃对不上的批次），按 op
+ *    记账得到的是"我以为改了什么"，而对比得到的是"树到底哪里不一样"；
+ *  - `resumeRun` 从服务端捡回结果时一条 op 帧都没有，那时只有对比能给出差异；
+ *  - 对比不依赖协议：后端将来加一种下发方式，这里一行都不用改。
+ *
+ * 没有基线返回 `null` 而不是"全部节点都是新增"：一张 80 节点的图会得到 80 条
+ * "新增"，那不是 diff，是把整棵树重念一遍。
+ */
+export function diffCandidate(
+  base: MindNode | readonly MindNode[] | null,
+  next: MindNode | readonly MindNode[],
+): CandidateChange[] | null {
+  if (!base) return null;
+  const before = indexForest(asRoots(base));
+  const after = indexForest(asRoots(next));
+  const changes: CandidateChange[] = [];
+
+  for (const [id, entry] of after) {
+    const old = before.get(id);
+    if (!old) {
+      changes.push({
+        kind: 'added', id, label: entry.node.label.trim(), detail: '新增节点', nodes: [id],
+      });
+      continue;
+    }
+    const fields = nodeFieldChanges(old.node, entry.node);
+    if (fields.length) {
+      changes.push({
+        kind: 'updated', id, label: entry.node.label.trim(), detail: fields.join('；'), nodes: [id],
+      });
+    }
+    if (old.parentId !== entry.parentId) {
+      const target = entry.parentId ? after.get(entry.parentId)?.node.label.trim() ?? entry.parentId : '根';
+      // 移动碰到两个节点：被移动的那个，以及它的新父节点。只记前者的话，
+      // "把这一支挂到你选中的节点下面"会被标成范围外——而它正是选区边缘的改动。
+      changes.push({
+        kind: 'moved', id, label: entry.node.label.trim(), detail: `移到「${target}」下`,
+        nodes: entry.parentId ? [id, entry.parentId] : [id],
+      });
+    }
+  }
+  for (const [id, entry] of before) {
+    if (!after.has(id)) {
+      changes.push({
+        kind: 'removed', id, label: entry.node.label.trim(), detail: '删除节点（含子树）', nodes: [id],
+      });
+    }
+  }
+  return changes;
+}
+
+/**
+ * 两份**边集合**之间的差异（附加关系：条件分支 / 汇合 / 回退）。
+ *
+ * 与 `diffCandidate`（对比两份树）并列而不是合并进去：树对比走的是"前序遍历 +
+ * 父 id"，边对比走的是"按 id 对齐的集合差"，两种算法的输入形状不同，硬塞进一个
+ * 函数只会让两边都长出分支。调用方（`commitGenerated`）把两份结果拼起来。
+ *
+ * `nameOf` 把节点 id 换成标题：清单上写「形式审查 → 付款（是）」比写两个 32 位
+ * hex 有用得多，而边本身只有 id。
+ *
+ * `kind` 不同的同 id 边按"改过"上报（`edge_added`），不新增第三种 kind：画布上
+ * 它就是同一条线换了画法，用户要看的也是"这条线变了"。
+ */
+export function diffEdges(
+  base: readonly MindEdge[],
+  next: readonly MindEdge[],
+  nameOf: (id: string) => string,
+): CandidateChange[] {
+  const describe = (edge: MindEdge): string => {
+    const text = `${nameOf(edge.source)} → ${nameOf(edge.target)}`;
+    return edge.label ? `${text}（${edge.label}）` : text;
+  };
+  const before = new Map(base.map(edge => [edge.id, edge]));
+  const changes: CandidateChange[] = [];
+
+  for (const edge of next) {
+    const old = before.get(edge.id);
+    if (!old) {
+      changes.push({
+        kind: 'edge_added', id: edge.id, label: describe(edge),
+        detail: edge.kind === 'loop' ? '新增回退线' : edge.kind === 'branch' ? '新增条件分支' : '新增连线',
+        nodes: [edge.source, edge.target],
+      });
+      continue;
+    }
+    if ((old.label ?? null) !== (edge.label ?? null) || (old.kind ?? null) !== (edge.kind ?? null)) {
+      changes.push({
+        kind: 'edge_added', id: edge.id, label: describe(edge),
+        detail: `关系说明改为「${edge.label ?? edge.kind ?? '无'}」`,
+        nodes: [edge.source, edge.target],
+      });
+    }
+  }
+  for (const [id, edge] of before) {
+    if (!next.some(item => item.id === id)) {
+      changes.push({
+        kind: 'edge_removed', id, label: describe(edge), detail: '删除了一条附加关系',
+        nodes: [edge.source, edge.target],
+      });
+    }
+  }
+  return changes;
+}
+
+/**
+ * 选区覆盖到的节点 id 集合：用户选中的每个节点在**两棵树**里的整棵子树。
+ *
+ * 两棵都要算，各自补上另一种算法看不见的那一半：
+ *
+ *  - **生成后的树**：在选中节点下面新增的节点 id 在基线里根本不存在，只在基线算
+ *    的话，最典型的"选一支、让它展开出三个子节点"会整片被标成范围外；
+ *  - **基线树**：被删掉的节点在生成后的树里已经不存在，只在生成后算的话，"把选中
+ *    的这一支删掉"本身会被标成范围外——那正是用户圈它的原因。
+ *
+ * 空选区返回空集（`withinScope` 据此一律判 false，界面也不显示这个标记）。
+ */
+function selectionScope(
+  before: MindNode | readonly MindNode[] | null,
+  next: MindNode | readonly MindNode[],
+  ids: readonly string[],
+): Set<string> {
+  const scope = new Set<string>();
+  if (ids.length === 0) return scope;
+  for (const group of [before, next]) {
+    if (!group) continue;
+    for (const root of asRoots(group)) {
+      for (const id of ids) {
+        const hit = findNode(root, id);
+        if (!hit) continue;
+        for (const owned of subtreeIds(hit)) scope.add(owned);
+      }
+    }
+  }
+  return scope;
+}
+
+/**
+ * 一条改动算不算"在选中的范围内"：它碰到的**每个**节点都在选区子树里。
+ *
+ * 用"每个"而不是"任意一个"：一条从选中节点连到别处的边，改动确实有一半在选区
+ * 里，但用户需要知道的是"它伸出去了"——按"任意"判就会把这种跨界的改动混进
+ * 范围内那一堆，而那正是这次要给用户看见的东西。
+ */
+function withinScope(change: CandidateChange, scope: Set<string>): boolean {
+  if (scope.size === 0 || change.nodes.length === 0) return false;
+  return change.nodes.every(id => scope.has(id));
 }
 
 /**
@@ -90,6 +385,16 @@ const AGENT_TOOL_LABELS: Record<string, { running: string; done: string }> = {
   node_expand: { running: '正在展开分支', done: '已展开分支' },
   rag_query: { running: '正在查资料', done: '已查好资料' },
   mindmap_edit: { running: '正在改结构', done: '已改好结构' },
+  // 四个细粒度工具。`edit` 意图下模型可能连调几次（一次改一处），所以文案要能
+  // 让人看出"它在逐个改"，而不是以为同一件事被重复执行了。
+  add_node: { running: '正在加节点', done: '已加节点' },
+  update_node: { running: '正在改节点', done: '已改节点' },
+  remove_node: { running: '正在删节点', done: '已删节点' },
+  move_node: { running: '正在移动节点', done: '已移动节点' },
+  // 两条边工具。文案要让人看出"它在连线"，而不是"它在改结构"——连线不改层级，
+  // 用户盯着画布时看到的是"多了一个箭头"，不是"某个节点换了位置"。
+  add_edge: { running: '正在连关系', done: '已连关系' },
+  remove_edge: { running: '正在删关系', done: '已删关系' },
 };
 
 /**
@@ -201,7 +506,7 @@ function agentWarningsFrom(summary?: Record<string, unknown>): AgentWarning[] {
     out.push({
       kind: 'partial',
       code: 'PARTIAL',
-      message: '有分支没能生成完整，候选可能缺内容。',
+      message: '有分支没能生成完整，结果可能缺内容。',
     });
   }
   const raw = summary.diagnostics;
@@ -243,12 +548,51 @@ export interface MindNodeData {
   /** 这个节点有几条来源引用；画布角标用，0 或缺省都不显示角标 */
   refs?: number;
   /**
-   * 这一帧画的是还没进画布的树：`preview` 是生成中，`candidate` 是已就绪但未应用。
-   * 缺省表示它就在 `content` 里，也就是用户的作品。画布据此弱化样式。
+   * 这一帧画的是还没进画布的树：`preview` 是生成中（节点一个一个长出来）。
+   * 缺省表示它就在 `content` 里，也就是用户的作品——生成结果落地之后也在这一档，
+   * 因为它**已经是**画布上的内容了（只是还没保存）。画布据此弱化样式。
    */
-  draft?: 'preview' | 'candidate';
+  draft?: 'preview';
   /** 预览里模型明确标了「不用再展开」的节点，再弱一档；`null` 与 `true` 都不额外标记。 */
   previewLeaf?: boolean;
+  /**
+   * 语义色键（`blue` / `green` / …）。渲染层把它映射到 CSS 变量，色值不在数据里。
+   * 缺省 `undefined` 表示"没有语义色"，节点保持原来的中性样式。
+   */
+  color?: NodeColor;
+  /** 图标（目前是 emoji）。画在 label 前面。 */
+  icon?: string;
+  /**
+   * 这个节点在图里扮演什么（`role` 契约字段）。**只有流程图会把它带到这里**：
+   * 树与鱼骨上它是 `undefined`，渲染路径与加这个字段之前完全相同。
+   */
+  role?: NodeRole;
+  /**
+   * 画布形状。`undefined` / `rect` 走原来那条矩形渲染路径；`diamond` 是判定节点
+   * （见 `canvas/layout/flow.ts` 的 `DECISION_SHAPE_NOTE`），`pill` 是起点/终点。
+   *
+   * 形状由**布局结果**决定（`layout.sizes` 存在才可能有非 `rect`），不是直接读
+   * `role`：一张 `diagram_type=flowchart` 但形状其实是树的历史记录里，也可能有节点
+   * 带着 `role`，那时布局走的是树——形状必须跟着**实际跑的布局**，否则菱形会画在
+   * 一套按矩形排的坐标上。两边各判一次是这类错位的标准来源。
+   */
+  shape?: NodeShape;
+  /**
+   * 外接框（px）。缺省 `NODE_SIZE`。判定节点更大（`flow.DECISION_SIZE`）。
+   *
+   * 渲染层用它设 DOM 尺寸，`position` 用它算左上角——同一个数只有一个来源，
+   * 否则节点会被画偏半个差值，而连线仍按布局坐标画。
+   */
+  size?: NodeSize;
+  /**
+   * 这个节点在**这次生成的改动清单**里被点名（新增除外——新增的节点在画布上还没
+   * 有位置）。
+   *
+   * 只对 `edit` / `expand` 意图有意义：那两个意图是"在当前树上改几处"，落地后画布
+   * 与生成前几乎一模一样，不给一个视觉标记，用户只能靠撤销栈试一步才知道哪几处
+   * 被动过。清单在 `commitGenerated` 里冻结一次（`generatedChanges`）。
+   */
+  changed?: boolean;
 }
 
 export interface FlatNode {
@@ -256,6 +600,50 @@ export interface FlatNode {
   depth: number;
   parentId: string | null;
 }
+
+/**
+ * `runGeneration` 的可选参数。
+ *
+ * 只有一个字段也走对象，不再加第六个位置参数：那个签名已经有五个位置参数了，
+ * 第六个数组读代码时得数一数才知道对应哪个。
+ */
+export interface RunOptions {
+  /**
+   * 这次运行**显式**指定的选区，覆盖 store 里当前的选中。
+   *
+   * 存在的理由只有一条：**看得见的才发**。画布右上角那个框旁边挂着「已选 N 个
+   * 节点」徽标，它按徽标上的数把选区带上；而将来任何不显示选区的入口（快捷动作、
+   * 测试直调）必须显式传 `[]`——否则它会静默带着用户在画布上圈的节点去"重新生成"，
+   * 而用户看不到这件事正在发生。
+   */
+  selection?: string[];
+  /**
+   * 这一次运行**实际带着哪些偏好**（`["diagram_type.default=fishbone"]`）。
+   *
+   * 只由界面那层填：只有它知道"下拉里这个值是偏好预填的、用户没动过"。`store`
+   * 不自己算——它看不出一个值和它的来源，把推断写在这里就会和界面各算一份。
+   *
+   * 落进 `runs.request.prefs_applied`，是偏好面板上"上次生效"的唯一数据源。
+   */
+  prefsApplied?: string[];
+  /**
+   * 「这一次」走不走推理模型（镜像后端 `AgentRunRequest.deep_thinking`）。
+   *
+   * 与 `prefsApplied` 一样只由界面那层填：它是**这一次的开关**，不是设置——用户
+   * 会在"随便出一张"和"这段逻辑要拆准"之间来回切，写死进 store 就变成了一个没有
+   * 出口的全局状态。缺省 `false`，发出去的请求与加它之前逐字节相同。
+   */
+  deepThinking?: boolean;
+}
+
+/**
+ * 单次请求最多带几个选中 id。
+ *
+ * **与后端 `AgentRunRequest.selected_ids` 的 `max_length=50` 同一个数**，两处一个
+ * 值：前端先截断，用户就不用为"按着 Ctrl 点了一整片"收一条 422。改这里时后端
+ * 那个字段要一起看，反过来也一样。
+ */
+const MAX_REQUEST_SELECTION = 50;
 
 /**
  * 画布节点。Vue Flow 的 `Node` 输入类型里没有 `selected`（它把选中当内部状态），
@@ -266,21 +654,69 @@ export type MindFlowNode = FlowNode<MindNodeData> & { selected: boolean };
 /**
  * 画布当前渲染的是哪棵树。
  *
- * 三级优先级：已应用的 `content` → 已就绪但未应用的 `candidate` → 生长中的
- * `agentPreview`。前两级之外的一切（保存、导出、撤销、编辑、采纳）仍然只认
- * `content`——渲染源只决定"画什么"，不决定"什么是用户的作品"。
+ * 两级：`content`（用户的作品，生成结果落地之后也在这里）→ 生长中的 `agentPreview`。
+ * 保存、导出、撤销、编辑全都只认 `content`——渲染源只决定"画什么"。
+ *
+ * **没有"候选"这一级了**：生成完成就把树装进 `content` 并标成未保存，不再有
+ * "看得见但不算你的"这个中间态。代价与补偿见 `commitGenerated`。
  */
-export type RenderKind = 'content' | 'candidate' | 'preview';
+export type RenderKind = 'content' | 'preview';
 
 interface RenderSource {
   root: MindNode;
+  /**
+   * 布局用的合成根 id（见 `shape.canvasTreeOf`）。树型恒为 `null`。
+   *
+   * 这个节点**不在 content 里**：它只在画布上代表"鱼头 / 流程起点"。所以它不可选中
+   * （选中会让详情面板对着一个 `findIn()` 找不到的 id 说话），也不参与层号、
+   * 节点计数与编辑。
+   */
+  syntheticId: string | null;
   kind: RenderKind;
   /** 预览节点的可展开性（派生 id → expandable）；非预览时是空表。 */
   expandable: Map<string, boolean | null>;
+  /**
+   * 附加边。**只画不参与布局**：节点坐标仍然由 `layoutTidy(root)` 决定。
+   *
+   * 这是"树 + 边"能成立的前提之一——边要是参与布局，用户每连一条线，整张画布
+   * 都会重排，他刚记住的位置就没了。预览（生成中）没有边，是空数组。
+   *
+   * 流程图上这里装的是**两路**（阶段之间 + 阶段内部，见 `shape.canvasEdgesOf`）：
+   * 两路都要画出来，否则契约里已经有的判定出边在画面上一条都看不见。
+   */
+  edges: MindEdge[];
+  /**
+   * **喂给布局**的那一路边：只有阶段**之间**的（缺省 = `edges`）。
+   *
+   * 与 `edges` 分成两个字段，而不是让布局函数自己过滤：`layoutFlow` 分不出这两
+   * 层——阶段内边的端点也是节点 id，`order.has()` 一样为 true，它会老老实实把
+   * 一条「是 / 否」出边当成"下一步"排进 dagre，把目标步骤推到下一层。那不叫
+   * "dagre 该做的"，那是布局在吃它不该吃的东西（`Edge` 契约写明边不参与布局）。
+   *
+   * 树与鱼骨没有这个区别（`canvasStageEdgesOf` 与 `canvasEdgesOf` 返回同一个
+   * 数组），所以那两种形状下这两个字段相等，布局输入一个字节都没变。
+   */
+  layoutEdges?: MindEdge[];
 }
 
 /** 共用的空表：非预览来源不需要这份映射，别每次重算都新建一个。 */
 const NO_EXPANDABLE = new Map<string, boolean | null>();
+
+/**
+ * 某个阶段**自己**的附加边条数（`stages[i].edges.length`）。
+ *
+ * 上限判据必须落在这个数上，而不是 `stageInnerEdgesOf()` 的摊平结果：后者是全部
+ * 阶段的合计，用它判 200 等于"所有阶段共享一份额度"，与后端"每个数组各判 200"
+ * 的口径正好相反（`ops._apply_add_flow_edge` 的 `len(sibling)`、契约
+ * `FlowContent.validate_flow` 逐阶段调的 `_validate_edges`）。
+ *
+ * `stageId` 为 `null`（不是流程图）时返回 0：调用方只在"两端点同属一个阶段"时用它，
+ * 那时 `stageId` 必定非空，这里只是把类型收窄成一个可判的空值。
+ */
+function innerEdgeCount(content: DiagramContent, stageId: string | null): number {
+  if (!stageId || !isFlow(content)) return 0;
+  return content.stages.find(stage => stage.id === stageId)?.edges?.length ?? 0;
+}
 
 function flatten(root: MindNode): FlatNode[] {
   const out: FlatNode[] = [];
@@ -292,17 +728,70 @@ function flatten(root: MindNode): FlatNode[] {
   return out;
 }
 
+/**
+ * 还没跑过任何一轮时的状态行。
+ *
+ * 导出成常量是为了让界面能判断"这条状态是不是还没有内容"：画布右上角那个框在
+ * 初始状态下已经有一行提示了，再摆一句"写一个主题后生成"就是在同一个框里说两遍
+ * 同一件事。
+ */
+export const INITIAL_STATUS = '写一个主题后生成，节点会边生成边出现。';
+
 export const useMindMapStore = defineStore('mindmap', () => {
   // 只为了在收到 `sources` 帧时把来源 id 换成持久 id（见 runGeneration）。
   // 依赖方向是单向的：sources 不认识 mindmap，反过来才会。
   const sourcesStore = useSourcesStore();
+  /**
+   * 画布上那份内容。
+   *
+   * **声明类型是 `MindMapContent`，运行时可能装着鱼骨图或流程图。** 这不是笔误：
+   * 全仓几十处既有读点（以及 700 多条用例）全都按树读 `content.root`，把声明换成
+   * 联合类型会让"树的这条路径"在一夜之间多出上百处 narrowing 噪音，而真正需要按
+   * 形状分派的地方（渲染、遍历、定位、写回、校验）已经全部收进 `mindmap/shape.ts`
+   * 了。两件事因此定死：
+   *
+   *  1. 装内容一律走 `slot()`（唯一一处有意的类型断言，见它的注释）；
+   *  2. **新代码不要再直接摸 `content.root`**——判形状用 `kindOf()`，取值用
+   *     `findIn()` / `rootsOf()` / `containerOfNode()`，布局用 `canvasTreeOf()`。
+   */
   const content = ref<MindMapContent | null>(null);
-  const mode = ref<'demo' | 'model' | 'saved' | null>(null);
-  const status = ref('输入主题或文本后生成，节点会边生成边出现。');
+
+  /**
+   * 把任意一种形状装进 `content`。
+   *
+   * 这是全仓**唯一**一处"类型说树、实际可能是别的形状"的断言，收在一个函数里是为了
+   * 让它可数、可查：任何一次新的内容赋值出现在别处，都该被当成"绕过了形状分派"来
+   * 审。运行时不做任何转换——三种形状原样装进去，`shape.ts` 按形状自己认得出来。
+   */
+  function slot(next: DiagramContent | null): MindMapContent | null {
+    return next as MindMapContent | null;
+  }
+  /**
+   * 这张图是怎么来的。顶栏那一小块徽标按它换文案。
+   *
+   * `import` 是新增的一档：导入进来的图既不是示例（`demo`），也不是模型生成的
+   * （`model`），更不是"已保存导图"（`saved`，那个意味着从库里打开、有 mapId）。
+   * 它**没有 mapId**、`dirty` 为真——第一次保存会创建一条新记录。混进任何一档
+   * 都会在界面上说错话：「已保存导图」会让人以为导入的内容已经在库里了。
+   */
+  const mode = ref<'demo' | 'model' | 'saved' | 'import' | null>(null);
+  const status = ref(INITIAL_STATUS);
   const stageText = ref('');
   const waitedMs = ref(0);
   const busy = ref(false);
   const selectedId = ref<string | null>(null);
+  /**
+   * 追加选区（主选区之外的那几个）。
+   *
+   * 为什么要主 + 追加，而不是一个 `string[]`：详情面板、面包屑、Tab/Enter/Delete
+   * 快捷键、`expand` 请求全都只认**一个**节点，它们区分不了"哪个是我正在看的那
+   * 一个"。把主选区继续放在 `selectedId` 上，那些路径一行都不用改；多出来的这层
+   * 只服务一件事——「改这张图」那句话是对谁说的（`selectedIds`）。
+   *
+   * 必须是列表而不是单个"上一个选中"：用户圈三个节点说「这几个合并成一个」时，
+   * `selected_ids` 要发三条，模型才不用从整棵树里猜是哪三个。
+   */
+  const extraSelectedIds = ref<string[]>([]);
   /**
    * 朝向是 content 的派生值（layout + theme.direction），不单独存一份：
    * 否则保存后再打开，画布上的朝向与库里的记录会各说各话。
@@ -335,66 +824,128 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 撤销栈已占的字节数。维护这个数，免得每次压栈都把整栈重新编码一遍。 */
   const pastBytes = ref(0);
 
+  /**
+   * 还没提交的改动（算法与取舍见 `mindmap/edit-log.ts`）。
+   *
+   * 攒到保存时一起发（`save()`），**保存成功才清**：失败就清掉的话，那批事件永远
+   * 丢了，而用户以为已经记下。不保存就关页面 → 事件丢失，这是可接受的——那次编辑
+   * 本来也没保存，日志不该比内容更"诚实"。
+   */
+  const pendingEdits = ref<EditEvent[]>([]);
+
+  /**
+   * 改动**之前**那棵树，以及这次改动该记到谁头上。
+   *
+   * `pushHistory()` 设置、`collectEdits()` 消费并清空。抄引用而不是抄序列化：
+   * `applyContent` 每次都是整体替换 `content.value`，旧树不会被后续修改带跑。
+   *
+   * `content` 允许为 `null`：画布本来是空的时那一步没有"改动之前那棵树"，但差分
+   * 本身会返回空数组（整棵树都是新的，不是 diff）——那条判断在 `diffEdits` 里。
+   */
+  let editBase: {
+    content: DiagramContent | null;
+    actor: EditActor;
+    runId?: string;
+  } | null = null;
+
   const saving = ref(false);
 
   /**
-   * 每次已提交的编辑都递增。agent 的接受动作靠它判断"候选是不是基于一棵已经
-   * 被改过的树算出来的"——用 revision 比比较整树引用更便宜，也比比 dirty 更准
-   * （dirty 只说明"有改动"，不说明"改动发生在候选生成之后"）。
+   * 每次已提交的编辑都递增。生成落地时靠它判断"这棵树是不是基于一棵已经被改过的
+   * 画布算出来的"——用 revision 比比较整树引用更便宜，也比比 dirty 更准
+   * （dirty 只说明"有改动"，不说明"改动发生在生成开始之后"）。
    */
   const clientRevision = ref(0);
 
-  /** agent 算出来的候选。它**不是** content：用户确认之前不写进画布。 */
-  const candidate = ref<MindMapContent | null>(null);
-  /** 候选产出时的 clientRevision，接受时用来判过时。 */
-  let candidateBaseRevision = 0;
+  /**
+   * 生成过程中的**工作副本**：op 批次与 `snapshot` 帧都拼在这上面。
+   *
+   * 它**不是** content，而且生命周期只有一轮运行：
+   *
+   *  - 生成期间不能直接改 `content`：`ops` 是一次几处的增量（`edit` 意图下模型可能
+   *    连调十几次），每条都落画布就等于把 25 秒的中间态全摊给用户看，撤销栈也会被
+   *    切成十几步半成品；
+   *  - 但它也**不是**用户看到的那棵树：`done` 帧一到就整树装进 `content`
+   *    （`commitGenerated`），中间没有任何确认动作。
+   *
+   * 所以它的对错只影响"这一轮生成有没有拼对"，不影响"用户的作品是什么"——那件事
+   * 到 `commitGenerated` 那一刻才发生，且可撤销。
+   */
+  const draft = ref<DiagramContent | null>(null);
 
   /**
-   * 候选产出时所在的导图会话号（见 `mapSession`）。
+   * 生成开始那一刻的画布引用。**只在一轮运行里有意义**，用于两件事：
+   *
+   *  1. `generatedChanges`：告诉用户"这次生成改了什么"，基线必须是生成前那棵树；
+   *  2. 版本冲突判定：完成时 `clientRevision` 变过，说明期间画布被改过（正常路径上
+   *     不可能——`busy` 把所有编辑入口都拦住了，但 `undo` / 将来新加的入口未必），
+   *     那时**不覆盖**，把两棵树都留着让用户选。
+   *
+   * 抄引用而不是深拷贝：`applyContent` 每次整体替换 `content.value`，旧树不会被
+   * 后续修改带跑（与 `editBase` 同一条理由）。
+   */
+  let generationBase: DiagramContent | null = null;
+  /** 生成开始时的 `clientRevision`，完成时用来判"期间画布被改过"。 */
+  let generationBaseRevision = 0;
+
+  /**
+   * 生成开始时所处的导图会话号（见 `mapSession`）。
    *
    * `clientRevision` 只在编辑时递增，切图（loadMap / newMap / preview）不碰它。
-   * 只看 revision 的话："生成候选 A → 打开另一张图 B → 点接受"会把 A 的内容
-   * 装进 B，还沿用 B 的 mapId 与 version，下次保存就把 A 写进 B 的记录。
+   * 只看 revision 的话："生成 A → 打开另一张图 B → 完成"会把 A 的内容装进 B，
+   * 还沿用 B 的 mapId 与 version，下次保存就把 A 写进 B 的记录。
    */
-  let candidateSession = 0;
+  let generationSession = 0;
 
   /**
-   * 候选是在哪种意图下产出的。
+   * 这一轮生成是在哪种意图下跑出来的。
    *
-   * 接受时要按它区分两件事：`create` 是一份新作品，不能继承上一张图的
+   * 落画布时要按它区分两件事：`create` 是一份新作品，不能继承上一张图的
    * `mapId` / `version` / 历史；`expand` / `edit` 改的就是当前这张图，身份必须留着。
    */
-  let candidateIntent: 'create' | 'expand' | 'edit' = 'create';
+  let generationIntent: 'create' | 'expand' | 'edit' = 'create';
 
   /**
    * 正在跑的这一轮是哪种意图（`agentRunning` 为假时只表示"上一次是什么"）。
    *
-   * 与 `candidateIntent` 分开：那个是候选的归属（接受时用），这个是**这一轮在做什么**
-   * （按钮文字用）。两者在候选就绪之后会分叉——候选已经产出、运行却还在收尾，
-   * 那时按钮该说的是"展开中…"，而候选的身份早就不变了。
+   * 与 `generationIntent` 分开不是冗余：那个是结果的归属（落画布时用），这个是
+   * **这一轮在做什么**（按钮文字用）。两者在生成完成之后会分叉——树已经进画布、
+   * 运行却还在收尾，那时按钮该说的是"展开中…"，而结果的归属早就不变了。
    */
   const runIntent = ref<'create' | 'expand' | 'edit'>('create');
 
   /**
-   * 候选树当前走到第几版 op。
+   * 这一轮「改这张图」（`edit`）带上去的 `selected_ids`，原样快照。
+   *
+   * 为什么要存一份而不是直接读 `selectedIds`：生成的整个过程中用户随时会改选中
+   * （点一下清单里的一行就会跳转并选中）。读实时选区的话，diff 上那句"在不在你
+   * 选中的范围内"会随着用户点来点去而变，而那说的其实是**另一个时刻**的选区。
+   *
+   * 只有 `edit` 会写它：`expand` 的选区是"要展开的那一个节点"，新节点按构造就
+   * 落在它下面，"范围内/外"在那条路上没有信息量。
+   */
+  const generationSelection = ref<string[]>([]);
+
+  /**
+   * 生成中的工作副本当前走到第几版 op（见 `draft`）。
    *
    * 每批 op 的 `base_revision` 是后端在**它那棵树**上算的序号（0 起，一批加一），
-   * 这里记的是"我这份候选已经应用到这里"。两者对不上就说明中间漏了一批
+   * 这里记的是"我这份副本已经应用到这里"。两者对不上就说明中间漏了一批
    * （丢帧、乱序），在错位的树上继续套用比不套用更糟。
    *
    * 只放在 store 内部，不进返回对象：界面不需要读它，它只是消费端的一致性账本。
    */
-  let candidateRevision = 0;
+  let draftRevision = 0;
 
   /**
-   * 候选整棵作废时，把 op 版本账本一起归零。
+   * 工作副本整棵作废时，把 op 版本账本一起归零。
    *
    * 零是后端每一轮的新起点（`RunContext.revision` 从 0 起算）。漏掉这一步，
    * 下一轮的第一批 op 会因为 `base_revision=0` 对不上旧账本而被整批丢掉，
-   * 表现出来就是"改了半天候选一点没动"。
+   * 表现出来就是"改了半天画布一点没动"。
    */
-  function resetCandidateOps() {
-    candidateRevision = 0;
+  function resetDraftOps() {
+    draftRevision = 0;
   }
 
   /** 给面板显示的工具进度与阶段。 */
@@ -403,18 +954,158 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const agentError = ref('');
 
   /**
-   * 这一轮 agent 产出的树是演示还是模型给的，取自 `done` 帧的 `mode`。
+   * 上次跑完（或被中断）、但**结果还没被保存**的那次运行。
    *
-   * `null` 表示"没说"（旧后端省略了这个字段），接受时退回 `'model'`——那是
-   * 这条通道一直以来的行为，不能因为多了个字段就让老后端的结果显示成未知。
-   * 而一旦帧里明确写了 `demo`，界面就必须说明白：占位树不能顶着"模型生成"。
+   * 这是"run 身份"落到界面上的唯一痕迹。此前 run 只活在一个 HTTP 连接的寿命里：
+   * 关掉页面，已经生成出来的结果跟着连接一起没了，用户回来什么都看不到。现在
+   * 服务端把它落进 `runs` 表，进页面时问一句"有没有我还没接住的结果"。
+   *
+   * 只是**一条提示**，不是弹窗：用户可能正在做别的事，打断他比让他知道这件事更烦。
+   * 它提醒的是一份**已经进了画布、但没保存**的改动：关掉页面丢的是那份未保存的
+   * 结果，不是"一份还没被采纳的提案"——生成落地那一刻它就是用户的了。
    */
-  const agentMode = ref<'demo' | 'model' | null>(null);
+  const resumableRun = ref<RunSummary | null>(null);
+
+  /**
+   * 这次运行**真正发出去的模型名**与模型的思考过程（`done` 帧带来的两个字段）。
+   *
+   * 为什么留在 store 而不是只写进消息流：它们要能解释"这次为什么不一样"。
+   * `runModel` 是勾了「深度思考」之后**唯一**能证明它真的换了模型的证据（配置里
+   * 没给 `MINDMAP_LLM_MODEL_DEEP` 时后端会退回原模型，界面上必须看得见）；
+   * `lastReasoning` 是折叠面板的数据源，成功时也有内容。
+   *
+   * 两者都随每次运行清空：上一轮的思考过程挂在这一次的结果上是纯粹的误读。
+   */
+  const runModel = ref<string | null>(null);
+  const lastReasoning = ref('');
+
+  /**
+   * 这一次会话里已经明确表示"不要再问"了。
+   *
+   * **只在本会话内静音，不写库**：`dismissed_at` 那一列已经删掉（没有"丢弃候选"
+   * 这个动作了），而后端每次进页面仍会返回这条——那是刻意的，因为它说的是事实：
+   * 你上次生成完没保存。下次开新会话再问一次不算骚扰。
+   */
+  let resumableSettled = false;
+
+  /**
+   * 这次生成落进画布的那个 run，等保存成功后上报 `applied_at`。
+   *
+   * 从前它是"候选属于哪一次运行，应用/丢弃时上报"。现在只有一半留着：保存成功
+   * 才写时间戳，因为 `applied_at` 的语义已经变成"这份结果被存下来了"——它正是
+   * "下次进页面还要不要提醒"的判据。
+   *
+   * 用 ref 而不是普通变量：界面要读它（`ChatDock` 据此判断"上次没保存的那次"
+   * 是不是**刚刚**这一次）。普通变量没有响应性，那个判断会停在上一次的值上。
+   */
+  const pendingSaveRunId = ref<string | null>(null);
+
+  /** 每次点击生成一个新的 run 身份。服务端只在这个 id 相同时才做幂等。 */
+  function newRunId(): string {
+    // 不用 crypto.randomUUID：它在非安全上下文（http://192.168.x.x 打开的开发页）
+    // 里是 undefined，而那正是最需要它的时候。时间戳 + 随机后缀的碰撞概率对
+    // "一次会话里的几十次运行"绰绰有余。
+    return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  /**
+   * 问一次服务端：有没有"跑完了但我还没接住"的结果。
+   *
+   * 失败一声不响：进页面时后端没起来、或者 `runs` 表还是空的，都不该弹一句
+   * "查询失败"——用户此刻什么也没要求。
+   */
+  async function probeResumableRun(): Promise<void> {
+    if (resumableSettled) return;
+    try {
+      const pending = await listRuns();
+      resumableRun.value = pending.length > 0 ? pending[0] : null;
+    } catch {
+      resumableRun.value = null;
+    }
+  }
+
+  /**
+   * 把上次那次生成的结果**直接装进画布**（并标成未保存）。
+   *
+   * 没有"确认"这一步：用户点「载入」就是明确要它，再让他点一次「应用」只是把
+   * 已经表达过的意图问第二遍。但**仍然走 `commitGenerated`**：撤销栈、`generate`
+   * 事件、身份重置、冲突判定一步都不少——不是另开一条"恢复"的旁路。
+   */
+  async function resumeRun(): Promise<void> {
+    const target = resumableRun.value;
+    if (!target) return;
+    // 进这一步之前的画布与版本：下面那趟请求在途时用户可能已经改了画布、或切了图，
+    // 两种都得判（判据与生成落地完全同一套，见 `commitGenerated`）。
+    const session = mapSession;
+    const baseRevision = clientRevision.value;
+    const base = content.value;
+    try {
+      const detail = await getRun(target.run_id);
+      if (detail.candidate) {
+        if (session !== mapSession) {
+          // 等网络这段时间用户切了图：这份结果属于上一张，装上去就是把 A 写进 B。
+          resumableRun.value = null;
+          status.value = '载入期间已经换了一张图，上次的结果没有装进来。';
+          return;
+        }
+        generationBase = base;
+        generationBaseRevision = baseRevision;
+        generationSession = session;
+        generationIntent = detail.intent;
+      }
+      if (!detail.candidate) {
+        resumableRun.value = null;
+        status.value = '那次运行没有留下可用的内容。';
+        return;
+      }
+      agentEvents.value = [];
+      agentWarnings.value = [];
+      agentError.value = '';
+      clearAgentPreview();
+      resetDraftOps();
+      // 来历照原样带过来：占位树恢复成"模型生成"就是界面替它撒谎。
+      runIntent.value = detail.intent;
+      // 捡回来的结果不知道当时圈了谁（`runs` 表存的是请求摘要，没有回读这条路），
+      // 所以范围标记一律按"没有选区"处理：宁可不说"范围内/外"，也不能拿此刻的
+      // 选区去标一份几分钟前产出的改动——那会把用户引到错的地方去核对。
+      generationSelection.value = [];
+      resumableRun.value = null;
+      commitGenerated(detail.candidate, {
+        runId: detail.run_id,
+        intent: detail.intent,
+        mode: detail.mode ?? null,
+        // 载入时基线是**此刻**的画布：用户看到的"这次改了什么"必须是相对他现在
+        // 这张图算的，而不是相对那次运行开始时的某个已不存在的状态。
+        base,
+      });
+    } catch (error) {
+      resumableRun.value = null;
+      status.value = error instanceof ApiError ? error.message : '读取上次的结果失败，请重试。';
+    }
+  }
+
+  /** 本会话内不再提这件事。**不写库**——理由见 `resumableSettled`。 */
+  function ignoreResumable(): void {
+    resumableRun.value = null;
+    resumableSettled = true;
+    status.value = '不再提示上次那次生成。它的结果还在服务端，刷新页面可以再看到。';
+  }
+
+  /**
+   * 上报"这份结果被保存了"。失败不提示：写台账失败不该让用户以为他没保存成功
+   * ——那是两件事。
+   */
+  function reportRunSaved(): void {
+    const id = pendingSaveRunId.value;
+    pendingSaveRunId.value = null;
+    if (!id) return;
+    void markRunSaved(id).catch(() => {});
+  }
 
   /**
    * 本轮运行里"结果不完整"的证据：部分完成标记 + 每条诊断。
    *
-   * 面板在候选上方按琥珀色列出，`status` 也会因此改成「部分分支未完成」。
+   * 面板在结果摘要上方按琥珀色列出，`status` 也会因此改成「部分分支未完成」。
    * 只认 `ok` 的时候，这三条信息一条都没地方落。
    */
   const agentWarnings = ref<AgentWarning[]>([]);
@@ -422,9 +1113,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 生成过程中正在长出来的预览树。
    *
-   * 与 `candidate` 分开存，不共用一份状态：预览没有经过整树校验，也不保证和
-   * 最终候选一致（某一路失败被裁掉、去重丢掉重复项，都会让预览多出几个节点）。
-   * 一旦让它顶替 `candidate`，用户点「应用到画布」就会把半成品装进画布。
+   * 与 `draft` 分开存，不共用一份状态：预览没有经过整树校验，也不保证和最终结果
+   * 一致（某一路失败被裁掉、去重丢掉重复项，都会让预览多出几个节点）。一旦让它
+   * 顶替 `draft`，`done` 就会把半成品直接装进画布——候选层删掉（`acfdb5b`）之后
+   * 落地不再有"用户点一下"这个复核点，混进去就再也拦不住。
    */
   const agentPreview = ref<PreviewNode | null>(null);
 
@@ -645,8 +1337,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 这一次展开就没有预览——那比画一条错的链好。
    */
   function seedExpandPreview(nodeId: string): boolean {
-    const root = content.value?.root;
-    if (!root) return false;
+    const current = content.value;
+    if (!current) return false;
+    // 索引链是"根 → 第 i 个子节点"的坐标语言，只有树有。鱼骨与流程的顶层容器
+    // 不是节点，那条链落不到任何位置上——宁可没有预览，也不给一个错位置
+    // （与后端 `shapes.index_path` 对非树返回 `None` 同一条口径）。
+    if (!isTree(current)) return false;
+    const root = current.root;
     const path = indexPathOf(root, nodeId);
     if (!path) return false;
 
@@ -684,18 +1381,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 「候选已就绪」这句的完整文案。
+   * 「生成完成」那句的完整文案。
    *
-   * 结果不完整时必须和全部成功区分开：只写「候选已就绪」，用户点接受之后
-   * 才发现某几支是空的。partial 与"只有诊断"分开说——「分支未完成」这种话
-   * 放在一棵只是有重复节点待合并的树上并不成立。
+   * 结果不完整时必须和全部成功区分开：只写「已落到画布」，用户改到一半才发现某几支
+   * 是空的，而那时画布已经是他的作品了。partial 与"只有诊断"分开说——「分支未完成」
+   * 这种话放在一棵只是有重复节点待合并的树上并不成立。
    */
-  function candidateStatus(base: string): string {
+  function finishStatus(base: string): string {
     if (agentWarnings.value.some(item => item.kind === 'partial')) {
-      return `${base}（部分分支未完成），确认后才会应用到画布。`;
+      return `${base}（部分分支未完成），可以直接改，也可以撤销回生成前。`;
     }
-    if (agentWarnings.value.length) return `${base}（有诊断提示），确认后才会应用到画布。`;
-    return `${base}，确认后才会应用到画布。`;
+    if (agentWarnings.value.length) return `${base}（有诊断提示），可以直接改，也可以撤销回生成前。`;
+    return `${base}，记得保存。`;
   }
 
   /** 保存撞上 409 时置位，由界面弹窗让用户选"重新加载 / 另存为新导图 / 取消"。 */
@@ -710,35 +1407,64 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 画布该画哪棵树。
    *
-   * 三级优先级各有理由：
-   * 1. `content` 最优先。用户已经打开/生成了一张图时，让还没定稿的东西顶掉它，
-   *    看起来就是"我的图被改了"——而且失败或取消之后才发现内容消失过。
-   * 2. `candidate` 其次。`snapshot` 到达时预览会被整棵作废（那是必须的：不能再
-   *    挂着一棵没校验的树），如果这一级不存在，画布会在"预览→候选"之间空一帧，
-   *    退回到空态占位，用户还得点「应用」才看得见图。
-   * 3. `agentPreview` 垫底。节点一个一个到达，画布跟着长。
+   * 两级优先级，各有理由：
+   * 1. `content` 最优先。用户的作品（含刚生成落地的那棵树）永远是画布上那一个。
+   * 2. `agentPreview` 垫底。只有画布还是空的时候它才露面：节点一个一个到达，画布
+   *    跟着长——这是"生成中"唯一的视觉反馈。一旦生成完成、`content` 有了值，
+   *    预览就再也盖不住任何东西。
    *
-   * 注意候选只是"看得见"：`acceptCandidate()` 的校验一步都没少，候选照样要用户
-   * 点「应用」才会写进 `content`。渲染与采纳是两件事。
+   * **没有"候选"这一级了。** 从前 `candidate` 排在中间，让用户在点「应用」之前
+   * 先看见结果；现在生成完成即落地（`commitGenerated`），看得见的就是他的。
    */
   const renderSource = computed<RenderSource | null>(() => {
     if (content.value) {
-      return { root: content.value.root, kind: 'content', expandable: NO_EXPANDABLE };
-    }
-    if (candidate.value) {
-      return { root: candidate.value.root, kind: 'candidate', expandable: NO_EXPANDABLE };
+      // 树型拿到的是 `content.value.root` **这一个对象**（`canvasTreeOf` 里原样透传），
+      // 所以树布局的入参与返回值一个字节都没变；鱼骨/流程拿到的是一棵合成树
+      // （虚拟根 + 每个容器作为一级子节点），布局函数那边一行都不用改。
+      const tree = canvasTreeOf(content.value);
+      return {
+        root: tree.root,
+        syntheticId: tree.synthetic ? tree.root.id : null,
+        kind: 'content',
+        expandable: NO_EXPANDABLE,
+        // 画布用的边：流程图的阶段跳转在这里换成阶段入口节点的 id（见 `canvasEdgesOf`），
+        // 阶段内的边原样追加在后面。侧栏与删除仍然读内容数组，那是内容真相。
+        edges: canvasEdgesOf(content.value),
+        // 布局只吃阶段**之间**那一路（见 `RenderSource.layoutEdges`）：阶段内的判定
+        // 出边要是进了 dagre，整张流程图的分层就会为了两条"是 / 否"变形。
+        layoutEdges: canvasStageEdgesOf(content.value),
+      };
     }
     if (agentPreview.value) {
       const expandable = new Map<string, boolean | null>();
       const root = previewSubtree(agentPreview.value, [], expandable);
-      return { root, kind: 'preview', expandable };
+      return { root, syntheticId: null, kind: 'preview', expandable, edges: [] };
     }
     return null;
   });
 
-  const layout = computed<LayoutResult | null>(() => {
+  /**
+   * 画布几何。**图型在这里分派**，树 / 流程图 / 鱼骨图各走各的（见
+   * `canvas/layout/index.ts` 的 `layoutDiagram`）。
+   *
+   * 分派放在 store 而不是画布组件：`nodes` 与 `edges` 都从这一份结果里读坐标，
+   * 而连线的手柄是按坐标反推的——两处各算一次，节点与连线一定会分家。
+   *
+   * 树图型仍然逐像素等于 `layoutTidy(root, { direction })`：默认值就是它。
+   */
+  const layout = computed<DiagramLayout | null>(() => {
     const source = renderSource.value;
-    return source ? layoutTidy(source.root, { direction: direction.value }) : null;
+    if (!source) return null;
+    return layoutDiagram({
+      root: source.root,
+      // 布局吃 `layoutEdges`（流程图里只有阶段间边），画布吃 `edges`。两者在树与
+      // 鱼骨上同一个数组，所以那两种形状的入参与改动前逐字节相同。
+      edges: source.layoutEdges ?? source.edges,
+      // 生成中的预览没有 content，也就还没有图型：那一刻按树排，节点一个一个长出来
+      // 的样子与旧行为一致。等 `done` 把结果装进 content，图型才第一次生效。
+      diagramType: diagramTypeOf(content.value),
+      direction: direction.value,
+    });
   });
 
   const flatNodes = computed<FlatNode[]>(() => {
@@ -746,25 +1472,148 @@ export const useMindMapStore = defineStore('mindmap', () => {
     return source ? flatten(source.root) : [];
   });
 
+  /**
+   * 附加边在画布上的几何信息：用哪两个句柄。
+   *
+   * 附件的两端往往**不是父子**（汇合、回退跨越两个 subtree），所以不能像父子线
+   * 那样只按 depth 猜方向，只能看两者的实际坐标：`childSide(from, to, direction)`
+   * 给出的就是"从 from 看 to 在哪一侧"，接线端点即可。
+   *
+   * 端点找不到（不该发生：契约层硬拒 dangling，这里只是兜底）就跳过这条边，
+   * 而不是画一条 `source: undefined` 的线——Vue Flow 会因此抛错，整张画布白屏。
+   *
+   * 流程图里被 dagre 判成**回退**的边（目标层号 ≤ 源层号）单独处理：按坐标算出的
+   * 侧边会是 `bottom`，于是回退线从源节点底部出去、扎进目标节点顶部——一条笔直
+   * 向上穿过整张图的线，正好压在主干上。它们一律改走**左侧**（出左、进左），
+   * 绕在图的边上。这也是 `backEdges` 唯一的用处：判定归布局，接线归这里。
+   */
+  /**
+   * **阶段内部**边的 id 集合：这些边在画布上画成细线（`MindEdge.vue` 的 `inner`）。
+   *
+   * 判据只能从内容取，不能从 `renderSource.edges` 反推：后者已经把阶段间的端点
+   * 换成了节点 id，两路混在一起之后，"这条线是主轴还是判定出边"在数组里再也看不
+   * 出来。用 id 对齐是唯一可靠的对应关系（边 id 在两张表里都唯一，契约层硬保证）。
+   */
+  const innerEdgeIds = computed<Set<string>>(() => {
+    const current = content.value;
+    return new Set(current ? stageInnerEdgesOf(current).map(edge => edge.id) : []);
+  });
+
+  const attachEdges = computed(() => {
+    const current = layout.value;
+    const source = renderSource.value;
+    if (!current || !source) return [];
+
+    const out: Array<{
+      edge: MindEdge; side: ChildSide; targetSide: ChildSide; inner: boolean;
+    }> = [];
+    for (const edge of source.edges) {
+      const from = current.positions.get(edge.source);
+      const to = current.positions.get(edge.target);
+      if (!from || !to) continue;
+      const inner = innerEdgeIds.value.has(edge.id);
+      if (current.backEdges?.has(edge.id)) {
+        out.push({ edge, side: 'left', targetSide: 'left', inner });
+        continue;
+      }
+      const side = childSide(from, to, current.direction);
+      // 与父子线同一套端点约定（见 `edges` 里 targetHandle 那一行）：从哪一侧出去，
+      // 就从对面那侧进来。
+      const targetSide: ChildSide = side === 'left' ? 'right' : side === 'right' ? 'left' : 'top';
+      out.push({ edge, side, targetSide, inner });
+    }
+    return out;
+  });
+
+  /**
+   * 每个节点要为附加边多开哪几个句柄。
+   *
+   * `MindNode.vue` 只渲染 `data.in` / `data.out` 里列出的句柄，而那两个数组原本只
+   * 按**父子线**算。一条从叶子指向远处的回退线，源节点根本没有子节点、也就没有
+   * 任何 `out-*` 句柄——Vue Flow 找不到句柄时线会从头节点中心乱连（或干脆不画），
+   * 而报错只出现在浏览器控制台。
+   */
+  const edgeSideIndex = computed(() => {
+    const index = new Map<string, { out: ChildSide[]; in: ChildSide[] }>();
+    const ensure = (id: string) => {
+      const hit = index.get(id);
+      if (hit) return hit;
+      const fresh = { out: [] as ChildSide[], in: [] as ChildSide[] };
+      index.set(id, fresh);
+      return fresh;
+    };
+    for (const { edge, side, targetSide } of attachEdges.value) {
+      const from = ensure(edge.source);
+      if (!from.out.includes(side)) from.out.push(side);
+      const to = ensure(edge.target);
+      if (!to.in.includes(targetSide)) to.in.push(targetSide);
+    }
+    return index;
+  });
+
   const nodes = computed<MindFlowNode[]>(() => {
     const current = layout.value;
     const source = renderSource.value;
     if (!current || !source) return [];
-    // 只有已应用的树才可编辑：候选与预览都能画出来，但点不动、改不了。
+    // 只有 `content` 可编辑：预览也能画出来，但点不动、改不了。
     const editable = source.kind === 'content';
 
     const parentOf = new Map<string, string | null>();
     for (const { node, parentId } of flatNodes.value) parentOf.set(node.id, parentId);
 
+    /**
+     * 颜色继承：沿父链取**最近的有色祖先**。
+     *
+     * 一级分支一个颜色、它的所有后代用同一个色——这是思维导图"按分支分组"的
+     * 标准做法。每个节点各一色会像调色板测试：颜色不再指示"这属于哪一支"。
+     *
+     * 为什么在**渲染层**继承，而不是生成时给每个节点都填上色：
+     *   1. 旧图立刻有颜色。生成时填只对那一次生成有效，库里已有的树仍然是黑的；
+     *   2. 用户手工改一级分支的颜色时，整支跟着变——他改的是"这一支的分组色"，
+     *      而生成时填下去的是快照，改完只有那一个节点变，视觉上像改坏了；
+     *   3. 落进库里的数据仍然是"一级分支才有 color"（与后端
+     *      `PLAN_PROMPT` / `_slot_from` 的边界一致），导出、保存都不多出噪音。
+     *
+     * 一次前向遍历算完：`flatNodes` 是父在子前的 DFS 序，所以取父节点的结论时
+     * 它一定已经算好了。逐节点沿父链往上走是 O(深度)，这条路是 O(节点数)，而且
+     * 这段代码每次 `flatNodes` 变化都会重跑（画布重排的同一条路）。
+     */
+    const inheritedColor = new Map<string, NodeColor | undefined>();
+    for (const { node, parentId } of flatNodes.value) {
+      const own = node.color ?? undefined;
+      inheritedColor.set(
+        node.id,
+        own ?? (parentId ? inheritedColor.get(parentId) : undefined),
+      );
+    }
+
     return flatNodes.value.map(({ node, depth }) => {
       const point = current.positions.get(node.id) ?? { x: 0, y: 0 };
+      // 合成根（鱼头 / 流程起点）只画不选：它不在 content 里，选中它会让详情面板、
+      // 面包屑、`expand` 请求一起对着一个 `findIn()` 找不到的 id 说话。
+      const inContent = node.id !== source.syntheticId;
+
+      /**
+       * 外接框与形状。
+       *
+       * `current.sizes` **只有流程图会填**（`layoutFlow` 的 `sizes` 出参），树与鱼骨
+       * 没有这个字段。于是这两个派生量本身就是"这张图是不是按流程排的"的判据：
+       * 树与鱼骨恒定 `NODE_SIZE` + `shape: undefined`，渲染路径一个像素都不变——
+       * 哪怕某个历史节点上带着 `role: 'decision'`。这条 gate 是"打开旧图不许变样"
+       * 的执行点，别把它换成直接读 `node.role`。
+       */
+      const size = current.sizes?.get(node.id) ?? NODE_SIZE;
+      const shape = current.sizes ? nodeShapeOf(node.role) : undefined;
 
       // 子节点在哪几侧，就在哪几侧留出口（双向布局里根的两边都有）。
       const outSides: ChildSide[] = [];
       for (const child of node.children) {
         const childPoint = current.positions.get(child.id);
         if (!childPoint) continue;
-        const side = childSide(point, childPoint, direction.value);
+        // 侧边按**这份布局自己报的朝向**算，而不是 `theme.direction`：流程图的分层
+        // 永远是上下（dagre TB），鱼骨的骨线永远是左右，两者都与"用户把树摆成
+        // 哪个方向"无关。树布局里这两个值恒等，所以对树没有任何影响。
+        const side = childSide(point, childPoint, current.direction);
         if (!outSides.includes(side)) outSides.push(side);
       }
 
@@ -772,8 +1621,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const inSides: ChildSide[] = [];
       const parentPoint = current.positions.get(parentOf.get(node.id) ?? '');
       if (parentPoint) {
-        const side = childSide(parentPoint, point, direction.value);
+        const side = childSide(parentPoint, point, current.direction);
         inSides.push(side === 'left' ? 'right' : side === 'right' ? 'left' : 'top');
+      }
+
+      // 附加边也要句柄（理由见 `edgeSideIndex`）。并进来而不是替换：一个节点
+      // 可以同时有父子线和回退线，两侧的句柄都要在。
+      const extra = edgeSideIndex.value.get(node.id);
+      if (extra) {
+        for (const side of extra.out) if (!outSides.includes(side)) outSides.push(side);
+        for (const side of extra.in) if (!inSides.includes(side)) inSides.push(side);
       }
 
       return {
@@ -781,16 +1638,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
         type: 'mind',
         draggable: false,
         connectable: false,
-        // 预览与候选都不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
+        // 预览不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
         // 空内容说话，expand 请求也会把后端不认识的 id 发回去。
-        selectable: editable,
+        selectable: editable && inContent,
         // 选中态由 store 说了算。只在点击时靠 Vue Flow 自己切换的话，代码里改选中
         // （加节点、删节点后跳到父节点）画布上看不出来，用户会以为还停在原来那个节点上。
-        // 不可编辑时一律不显示选中：残留的 selectedId 可能正好撞上候选里的同名 id。
-        selected: editable && selectedId.value === node.id,
+        // 不可编辑时一律不显示选中：残留的 selectedId 可能正好撞上预览里的同名 id。
+        //
+        // 多个节点一起高亮而不是只高亮主选区：「改这张图」吃的是整个选区，
+        // 只亮一个的话，用户圈完三个节点看不出另外两个算不算数。
+        selected: editable && inContent && selectedIds.value.includes(node.id),
         position: {
-          x: point.x - NODE_SIZE.width / 2,
-          y: point.y - NODE_SIZE.height / 2,
+          x: point.x - size.width / 2,
+          y: point.y - size.height / 2,
         },
         data: {
           label: displayTitle(node),
@@ -803,6 +1663,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
           refs: node.source_refs?.length ?? 0,
           draft: source.kind === 'content' ? undefined : source.kind,
           previewLeaf: source.kind === 'preview' && source.expandable.get(node.id) === false,
+          // 视觉元素原样带过去：只有 `content` 那棵树才画（预览用弱化样式，
+          // 它的颜色会让"这是还在长的东西"这件事变得模糊）。
+          // 颜色取**继承**的结果：自身没有就沿用最近的有色祖先（见上面那段）。
+          color: editable ? inheritedColor.get(node.id) : undefined,
+          icon: editable ? node.icon ?? undefined : undefined,
+          // 高亮只在"画布上这棵树 + 有一份生成改动清单"时成立，所以它天然只对 content 生效。
+          changed: changedNodeIds.value.has(node.id),
+          // 形状与尺寸只在流程图上出现（见上面 `size` / `shape` 那段的 gate）。
+          role: shape === undefined ? undefined : node.role ?? undefined,
+          shape,
+          size: shape === undefined ? undefined : size,
         },
       } satisfies MindFlowNode;
     });
@@ -819,9 +1690,33 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const childPoint = current.positions.get(node.id);
       if (!parentPoint || !childPoint) continue;
 
-      const side = childSide(parentPoint, childPoint, direction.value);
+      const id = `${parentId}->${node.id}`;
+      // 鱼骨图的骨线不是两点直线：主骨段 + 60° 斜骨，或者一段十几像素的水平短线。
+      // 折线由布局算好（`layout/fishbone.ts` 的 `links`），这里只交给对应的渲染器。
+      // 句柄仍按约定给：`out-left` / `in-right` 在鱼骨里恒成立（子永远在父的左侧），
+      // 这些句柄也确实由下面 `nodes` 那段按几何算出来了——给错 id 的话 Vue Flow
+      // 找不到句柄，线会从头节点中心乱连。
+      const bone = current.fishbone?.links.get(id);
+      if (bone) {
+        // 主骨末端的箭头只挂给**布局指定的那一条**骨线（锚点最靠右的那根，它的水平段
+        // 就是主骨最右边那一截）。主骨那一小段被六条骨线各画了一遍，六份箭头在
+        // DOM 里是六份、在画面上是一份——布局那边只登记一条，这里就照着给。
+        const arrow = current.fishbone?.spineArrow;
+        out.push({
+          id,
+          source: parentId,
+          sourceHandle: 'out-left',
+          target: node.id,
+          targetHandle: 'in-right',
+          type: 'fishbone',
+          data: arrow && arrow.link === id ? { points: bone, arrow: arrow.points } : { points: bone },
+        });
+        continue;
+      }
+
+      const side = childSide(parentPoint, childPoint, current.direction);
       out.push({
-        id: `${parentId}->${node.id}`,
+        id,
         source: parentId,
         sourceHandle: `out-${side}`,
         target: node.id,
@@ -829,18 +1724,84 @@ export const useMindMapStore = defineStore('mindmap', () => {
         type: 'smoothstep',
       });
     }
+
+    // 附加边（汇合 / 回退 / 条件跳转）。用自定义类型 `mindEdge`：它要画标签、
+    // 按 kind 换颜色/线型，而内置的 smoothstep 做不到（见 `canvas/MindEdge.vue`）。
+    //
+    // 与父子线不同的两点，都在这里定死：
+    //   - 用 `data` 传 label/kind，而不是 Vue Flow 的 `label` 字段：那个会被渲染成
+    //     一个默认标签块，样式没法跟着 kind 变。
+    //   - id 前缀 `attach:`，避免与 `${parentId}->${node.id}` 这种父子线 id 撞车
+    //     （两个节点之间可以同时存在父子线与一条回退线，id 撞了只会剩一条）。
+    for (const { edge, side, targetSide, inner } of attachEdges.value) {
+      out.push({
+        id: `attach:${edge.id}`,
+        source: edge.source,
+        sourceHandle: `out-${side}`,
+        target: edge.target,
+        targetHandle: `in-${targetSide}`,
+        type: 'mindEdge',
+        data: {
+          label: edge.label ?? undefined,
+          kind: edge.kind ?? 'flow',
+          edgeId: edge.id,
+          // 布局判出来的回退（目标层号 ≤ 源层号）。它是**几何事实**，与 `kind`
+          // 不冲突：`kind` 说这条线是什么关系（是/否/回退），`back` 说它在这张
+          // 图的层级里是不是在往回走。只有流程图会给它，树图型下恒为 undefined。
+          //
+          // 阶段内的边永远不会进这里：它们不参与分层，也就没有"回退"这个判据
+          // （`layoutFlow` 从未见过它们，`backEdges` 里不可能有它们的 id）。
+          back: current.backEdges?.has(edge.id) || undefined,
+          // 阶段内部的边（判定节点的「是 / 否」）。画成细线，否则一条"否"看起来
+          // 与阶段之间的主轴跳转一模一样，读图的人分不出哪条是主干。
+          inner: inner || undefined,
+        },
+      });
+    }
     return out;
   });
 
-  const nodeCount = computed(() => flatNodes.value.length);
+  /**
+   * 画布上有几个节点（界面上那个「N 个节点」）。
+   *
+   * 用 content 自己的口径（`countNodesIn`）而不是 `flatNodes.length`：鱼骨与流程的
+   * 布局树上多一个**不在 content 里**的合成根，拿扁平表计数会让顶栏说"23 个节点"
+   * 而实际内容是 22 个。树型两者相等，一个数都不会变。
+   *
+   * 画布本来为空时 `content` 是 null，这时退回扁平表——生成中的预览树还是照旧数
+   * 它自己（那正是"节点一个一个长出来"的反馈）。
+   */
+  const nodeCount = computed(() => (
+    content.value ? countNodesIn(content.value) : flatNodes.value.length
+  ));
 
   /**
    * 详情面板要显示的节点。
    *
-   * 必须落在 `content` 里：画布上可能正画着候选或预览（`flatNodes` 跟着渲染源走），
-   * 而面板上的「改文字 / 加子节点 / 删除」全都写 `content`。没有已应用的树就没有
+   * 必须落在 `content` 里：画布上可能正画着预览（`flatNodes` 跟着渲染源走），
+   * 而面板上的「改文字 / 加子节点 / 删除」全都写 `content`。没有 `content` 就没有
    * 可编辑的节点，否则面板会摆出一排点了没反应的按钮。
    */
+  /**
+   * 这一轮"用户圈住的节点"全集（主选区在前）。
+   *
+   * 顺序有意义：第一个就是详情面板/展开按钮对着的那一个，所以调用方拿
+   * `selectedIds[0]` 与 `selectedId` 是同一件事。
+   *
+   * 这里按 `content` 过滤一次，而不是指望每条删节点的路径都记得清追加选区：
+   * 删掉的节点留在选区里，下次「改这张图」就会把后端根本不认识的 id 发过去
+   * （后端会静默跳过，但那份提示词里就少了一条、而用户以为自己选了三个）。
+   */
+  const selectedIds = computed<string[]>(() => {
+    const all = content.value;
+    if (!all) return [];
+    const primary = selectedId.value;
+    const extra = extraSelectedIds.value.filter(
+      id => id !== primary && findIn(all, id) !== null,
+    );
+    return primary ? [primary, ...extra] : extra;
+  });
+
   const selectedNode = computed<FlatNode | null>(() => {
     if (!content.value) return null;
     return flatNodes.value.find(entry => entry.node.id === selectedId.value) ?? null;
@@ -850,12 +1811,137 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const selectedRefs = computed<SourceRef[]>(() => selectedNode.value?.node.source_refs ?? []);
 
   /**
+   * 已应用内容里的**全部**附加边。
+   *
+   * 只读 `content` 而不是 `renderSource`：侧栏的「附加关系」区块要能删边、要能
+   * 显示"这条线的端点是谁"，而预览里的边还不是任何人的作品（它是生成中的临时树）。
+   * 画布那条路（`edges` computed）才跟着 `renderSource` 走。
+   */
+  const contentEdges = computed<MindEdge[]>(() => edgesOf(content.value));
+
+  /**
+   * 已应用内容里的**阶段内部**边（`stages[i].edges`）。
+   *
+   * 与 `contentEdges` 分成两个 computed 而不是并成一个：它们是**两个数组、两个
+   * 命名空间**（见契约 `FlowStage`）。并起来之后侧栏只能给出一串 id，而"删除"
+   * 必须知道该删哪一层——那正是 `edgesOfContent` 的语义不能动的原因。
+   *
+   * 树与鱼骨恒为空数组。
+   */
+  const contentInnerEdges = computed<MindEdge[]>(() => (
+    content.value ? stageInnerEdgesOf(content.value) : []
+  ));
+
+  /**
+   * 与当前选中节点相关的边（源或目标命中它）。
+   *
+   * 侧栏只用这一份而不是全量：一张流程图可能有几十条线，全列出来用户得自己在
+   * 里面找"这条跟选中的节点有关系吗"。而"改这条线 / 删这条线"的操作入口，本来看
+   * 的就是选中节点周围那几条。
+   *
+   * 流程图里两个命名空间都要认：`FlowContent.edges` 的端点是**阶段 id**，而画布上
+   * 选中的是阶段里的某个**步骤**。只按节点 id 比的话，一张流程图的每条边都不在
+   * 列表里——用户加完线之后再也删不掉它。
+   */
+  const selectedEdges = computed<MindEdge[]>(() => {
+    const id = selectedId.value;
+    if (!id || !content.value) return [];
+    const stage = stageOfNode(content.value, id);
+    return contentEdges.value.filter(edge => (
+      edge.source === id || edge.target === id
+      || (stage !== null && (edge.source === stage || edge.target === stage))
+    ));
+  });
+
+  /**
+   * 与选中节点相关的**阶段内**边。
+   *
+   * 判据只按**节点 id**（不做"该阶段全都列"那一层放宽）：阶段间的边属于**阶段**，
+   * 所以选中阶段里任何一步都该看见它；阶段内的边属于**具体两个步骤**，把一整个
+   * 阶段的判定出边都铺给每一步看，只会让侧栏在一个 8 步阶段里塞进十几条与当前
+   * 节点无关的线。选中的是阶段入口节点时它天然命中（那个节点就是边的端点）。
+   */
+  const selectedInnerEdges = computed<MindEdge[]>(() => {
+    const id = selectedId.value;
+    if (!id) return [];
+    return contentInnerEdges.value.filter(edge => edge.source === id || edge.target === id);
+  });
+
+  /**
+   * 边端点 id → 显示名（节点标题；流程的边给阶段根节点的标题）。
+   *
+   * 两个命名空间混在同一份列表里显示，所以查找要按形状回退——只查节点的话，
+   * 流程图每一条边都会显示成 `s_xxx → s_yyy`。
+   */
+  const edgeNameOf = computed(() => {
+    const current = content.value;
+    return (id: string) => (current ? edgeEndpointLabel(current, id) : id);
+  });
+
+  /**
    * 来源的反向索引。
    *
-   * 只从 `content` 算：画布上可能正画着候选或预览节点，把它们算进引用统计会让
+   * 只从 `content` 算：画布上可能正画着预览节点，把它们算进引用统计会让
    * 左侧说"被 5 个节点引用"、而其中 3 个根本不在导图里。
    */
-  const refIndex = computed(() => buildRefIndex(content.value?.root ?? null));
+  const refIndex = computed(() => buildRefIndex(content.value ? rootsOf(content.value) : null));
+
+  /**
+   * **这次生成改了什么**：生成落地那一刻算好的一份静态快照；没有基线时为 `null`。
+   *
+   * 为什么是 `ref` 而不是 `computed`：`computed` 要两份实时值（基线树 + 当前树），
+   * 而基线在落地之后就没人持有了——`content` 已经被换成新树，再拿它算 diff 只会得到
+   * 一份空清单。落地瞬间算一次并冻结下来的语义恰好就是用户要的那句话："刚才那 25
+   * 秒动了什么"。之后他改画布，这份记录**不该**跟着变——它记的是生成，不是编辑。
+   *
+   * `null` 与空数组要分开：前者是"没有可比基线"（画布本来是空的，整棵树都是新的），
+   * 后者是"算出来了，一处都没改"。前者不该显示清单，后者要显示"这次什么都没改"。
+   */
+  const generatedChanges = ref<ScopedChange[] | null>(null);
+
+  /**
+   * 这次生成落进画布的规模：`nodes` 是节点数，`changes` 是改动条数（`null` = 无基线）。
+   *
+   * 面板读它说清"已落到画布（42 个节点，改了 6 处）"。前端这份只给人看；进统计的
+   * 那份 `node_count` 在同一时刻由 `generate` 事件带上去，两者必须是同一个数——所以
+   * 它们在同一次调用里算（`commitGenerated`）。
+   */
+  const generatedSummary = ref<{ nodes: number; changes: number | null } | null>(null);
+
+  /**
+   * 版本冲突时保留的第二棵树（连同它落地所需的元数据）。
+   *
+   * 正常路径上永远是 `null`——生成期间 `busy` 把所有编辑入口都拦住了，画布不会变。
+   * 但它不是不可能：`undo` / `redo` 走的是 `restoreSnapshot`，绕过 `applyContent`；
+   * 将来新加的编辑入口也未必记得判 `busy`。所以完成时仍然比对 `clientRevision`，
+   * 变过就**不覆盖**，把两棵树都摆出来让用户选。
+   *
+   * 这是"删掉候选层"之后唯一保留的裁决界面，而它的性质与候选不同：候选挡在每一次
+   * 生成前面，它只在数据要丢的时候出现。
+   */
+  const conflictDraft = ref<{ next: DiagramContent; meta: GenerateMeta } | null>(null);
+
+  /**
+   * 最近一次落到画布的那棵树的**引用**（不是副本）。
+   *
+   * 只服务一个判断：`undoGenerate()` 能不能一步回到生成之前。用引用相等比比较整树
+   * 便宜，而且正好是那个语义——画布上还是生成的结果本身，说明撤销栈顶就是生成前
+   * 那棵树；用户改过之后引用变了，那时"撤销一步"只是退掉他自己的一次编辑。
+   */
+  let generatedContent: DiagramContent | null = null;
+
+  /**
+   * `generatedChanges` 里落在「这次生成带上去的选区」中的那些。
+   *
+   * 看的是**请求时**的选区（`generationSelection`），不是此刻的选区：用户点一下清单
+   * 里的一行就会改选中，读实时选区的话这份标记会自己漂走。
+   */
+  const changedNodeIds = computed<Set<string>>(() => {
+    const diff = generatedChanges.value;
+    if (!diff) return new Set<string>();
+    const nodeKinds = new Set<CandidateChange['kind']>(['removed', 'updated', 'moved']);
+    return new Set(diff.filter(item => nodeKinds.has(item.kind)).map(item => item.id));
+  });
 
   /**
    * "把某个节点挪到视野中心"的触发计数。
@@ -865,21 +1951,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const focusTick = ref(0);
 
-  /** 从根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
+  /** 从容器根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
   const breadcrumb = computed<MindNode[]>(() => {
     const target = selectedId.value;
     if (!content.value || !target) return [];
-    const path: MindNode[] = [];
-    const walk = (node: MindNode): boolean => {
-      path.push(node);
-      if (node.id === target) return true;
-      for (const child of node.children) {
-        if (walk(child)) return true;
-      }
-      path.pop();
-      return false;
-    };
-    return walk(content.value.root) ? path : [];
+    // 链首是**它所在那棵子树的根**：鱼骨图里一个原因的祖先链里不该出现另一根骨
+    // 的内容（与后端 `shapes.path_to` 同一条口径）。
+    return pathToIn(content.value, target) ?? [];
   });
 
   const canUndo = computed(() => past.value.length > 0);
@@ -907,29 +1985,84 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
   }
 
-  /** 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。 */
-  function pushHistory() {
-    const snap = snapshot();
-    if (!snap) return;
-    recordPast(snap);
+  /**
+   * 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。
+   *
+   * `actor` 决定这次改动记到谁头上：默认 `user`（手工编辑，绝大多数调用点），
+   * `agent` 只有 `commitGenerated()` 传（用户没动手，改动是模型算的）。
+   * 区分只能靠参数——`pushHistory()` 返回之后 `content.value` 已经是新树，那时候
+   * 再想看出"谁改的"是不可能的。
+   */
+  function pushHistory(actor: EditActor = 'user', runId?: string) {
+    const current = content.value;
+    if (!current) return;
+    recordPast(JSON.stringify(current));
     future.value = [];
+    editBase = { content: current, actor, ...(runId ? { runId } : {}) };
   }
 
   /** 还能撤销几步、占了多少字节：界面与测试都靠它确认字节上限真的生效。 */
   const undoDepth = computed(() => past.value.length);
   const undoBytes = computed(() => pastBytes.value);
 
+  /**
+   * 撤销栈与改动账本一起归零。
+   *
+   * 两个都清是因为它们的适用前提是同一个：**这是同一棵树的历史**。换图（打开 /
+   * 新建 / 示例 / 导入）之后，上一张图那些没提交的事件属于另一条记录，留着它们，
+   * 下一次保存会把它们写到当前这张图的 `map_id` 上——统计一旦串图，就再也分不开
+   * "这张图被改得多"和"这个人改得多"。
+   *
+   * `commitGenerated()` 的 `create` 分支也走它：那是一份新作品，上一张图（如果
+   * 有）的账本同样到此为止。
+   */
   function resetHistory() {
     past.value = [];
     future.value = [];
     pastBytes.value = 0;
+    pendingEdits.value = [];
+    editBase = null;
   }
 
   /**
-   * create 意图接受候选后的那一步撤销。
+   * 改动**已经落到 `content` 之后**调用：算出这次改了什么，攒进待提交队列。
+   *
+   * 与 `pushHistory()` 分成两步，是因为顺序不能换：diff 要"改之前"和"改之后"两份树，
+   * 而 `pushHistory()` 执行时 `content.value` 还是旧值。
+   *
+  /**
+   * 一次提交内所有事件共享同一个 `at`：它是"这次操作产生了几条事件"的唯一分组依据
+   * （一个字段一条事件，见 `edit-log.ts` 文件头）。
+   *
+   * **应用/接受候选那条 `accept` 已经不在这里了**：候选层删掉之后没有"接受"这个
+   * 动作，分母改由 `kind='generate'` 承担，而它由 `commitGenerated()` 直接构造
+   * （那条路要 `node_count`，不属于"用户改了什么"这条差分）。
+   *
+   * 不在这里截断：截断发生在提交那一刻（`save()`），这样"超了多少条"能如实上报；
+   * 在这里截掉的话，超出的部分连数都不知道。
+   */
+  function collectEdits(after: DiagramContent | null, at = new Date().toISOString()) {
+    const base = editBase;
+    editBase = null;
+    if (!base) return;
+    const events = diffEdits(base.content, after, {
+      actor: base.actor,
+      at,
+      ...(base.runId ? { runId: base.runId } : {}),
+    });
+    if (!events.length) return;
+    pendingEdits.value = [...pendingEdits.value, ...events];
+  }
+
+  /**
+   * create 意图落画布后的那一步撤销。
    *
    * 与 `pushHistory()` 只差一处：画布本来是空白时也要留下一步（`'null'` 就是
-   * JSON 里的空画布），否则用户点了「应用到画布」就再也退不回接受之前的样子。
+   * JSON 里的空画布），否则用户点了生成就再也退不回生成之前的样子——而那正是
+   * 删掉候选层之后唯一的后悔药。
+   *
+   * 不设 `editBase`：整棵树不是 diff，`diffEdits(null, ...)` 本来就返回空数组；
+   * 那次生成由一条 `generate` 事件记账（见 `commitGenerated`）。
    */
   function pushHistoryOrEmpty() {
     recordPast(snapshot() ?? 'null');
@@ -940,52 +2073,66 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /** 选中的节点可能已被删掉：兜底清空，免得详情面板指向不存在的节点。 */
   function ensureSelection() {
     const target = selectedId.value;
-    if (target && content.value && !findNode(content.value.root, target)) {
-      selectedId.value = null;
+    if (target && content.value && !findIn(content.value, target)) {
+      setPrimary(null);
     }
   }
 
   /**
    * 把一步历史快照装回画布。
    *
-   * 快照可能是字符串 `'null'`——接受候选之前画布是空的时候，`pushHistoryOrEmpty()`
+   * 快照可能是字符串 `'null'`——生成落进一张空画布的时候，`pushHistoryOrEmpty()`
    * 压的就是它。`JSON.parse('null')` 得到 null，正好是 `MindMapContent | null`
    * 的另一半；但选中与编辑态还指着已经不存在的旧节点，必须一起清掉，
    * 否则详情面板和编辑框会继续对着空白画布说话。
    */
   function restoreSnapshot(snap: string) {
-    const parsed = JSON.parse(snap) as MindMapContent | null;
+    const parsed = slot(JSON.parse(snap) as DiagramContent | null);
     content.value = parsed;
     if (!parsed) {
-      selectedId.value = null;
+      setPrimary(null);
       editingId.value = null;
     }
   }
 
-  function applyContent(next: MindMapContent, history: boolean): boolean {
-    // 生成还在进行时禁止用户改动：done 帧会用完整结果整树替换，期间的编辑
-    // 必然被覆盖；撤销栈里也会混进生成中间态，撤销起来只剩半成品。
-    // 返回 false 让调用方提前退出，免得它接着把 status 改成「已修改」。
-    if (busy.value) {
-      status.value = '正在生成导图，完成之后才能编辑。';
-      return false;
-    }
-    if (history) pushHistory();
-    content.value = next;
+  function applyContent(
+    next: DiagramContent,
+    history: boolean,
+    actor: EditActor = 'user',
+  ): boolean {
+    // **生成期间不再禁止编辑。** 从前锁画布是为了"候选落地"那一步：它要用户点一下，
+    // 而那一刻必须比对版本。现在落地是自动的，锁住反而让"这 25 秒我顺手改个标题"
+    // 变成不可能——而那正是最自然的事。
+    //
+    // 代价由 `commitGenerated` 的冲突判定兜住：期间改过（`clientRevision` 变了）
+    // 就**不覆盖**，两棵树都留着让用户选。这里一个字都不用判。
+    if (history) pushHistory(actor);
+    content.value = slot(next);
     dirty.value = true;
     clientRevision.value += 1;
+    // 改动已经落地，这时候才比得出差：`pushHistory()` 抄下的那棵树 vs `next`。
+    // `history=false` 时 `editBase` 是空的，这里自动什么都不记——"不记历史"与
+    // "不记日志"是同一件事，没有哪条调用路径会只要其中之一。
+    collectEdits(next);
     return true;
   }
 
-  /** 节点深度，1 起算（与契约的"最多 8 层"同一口径）。 */
+  /**
+   * 节点深度，1 起算（与契约的"最多 8 层"同一口径）。
+   *
+   * 直接读 `shape.depthIn` 而不是扁平表：鱼骨与流程的布局树上多一层合成根，拿
+   * `flatNodes` 的 depth 数出来的层号会整体偏 1（一根骨会被算成第 2 层），于是
+   * "最多 8 层"在鱼骨图上前 7 层就开始拦。
+   */
   function depthOfId(id: string): number | null {
+    if (content.value) return depthIn(content.value, id);
     const hit = flatNodes.value.find(entry => entry.node.id === id);
     return hit ? hit.depth + 1 : null;
   }
 
   function beginEdit(id: string) {
-    if (!content.value || !findNode(content.value.root, id)) return;
-    selectedId.value = id;
+    if (!content.value || !findIn(content.value, id)) return;
+    setPrimary(id);
     editingId.value = id;
   }
 
@@ -995,7 +2142,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function commitLabel(id: string, label: string) {
     if (!content.value) return;
-    const node = findNode(content.value.root, id);
+    const node = findIn(content.value, id);
     if (!node) return;
 
     const next = label.trim();
@@ -1014,7 +2161,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    if (!applyContent({ ...content.value, root: renameNode(content.value.root, id, next) }, true)) return;
+    // 写回按"定位到它所在的那棵子树、把子树当根改、再放回原位"（镜像后端
+    // `shapes.replace_node`）：`edits.ts` 那套纯函数因此一行都不用重写，鱼骨与流程
+    // 走的还是同一份实现。
+    const patched = replaceContainer(content.value, id, root => renameNode(root, id, next));
+    if (!applyContent(patched, true)) return;
     if (editingId.value === id) editingId.value = null;
     status.value = '已修改，记得保存。';
   }
@@ -1027,7 +2178,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   function commitNote(id: string, note: string | null) {
     if (!content.value) return;
-    const node = findNode(content.value.root, id);
+    const node = findIn(content.value, id);
     if (!node) return;
 
     const next = note?.trim() ?? '';
@@ -1038,8 +2189,44 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    if (!applyContent({ ...content.value, root: setNodeNote(content.value.root, id, next) }, true)) return;
+    const patched = replaceContainer(content.value, id, root => setNodeNote(root, id, next));
+    if (!applyContent(patched, true)) return;
     status.value = next ? '已修改正文，记得保存。' : '已清空正文，只保留标题，记得保存。';
+  }
+
+  /**
+   * 改节点的语义色与图标（详情面板上的两个控件）。
+   *
+   * 与改标题、改备注同一套语义：内容没变就什么都不做（不记撤销、不置脏），
+   * 变了才是**一次可撤销的内容修改**——换颜色凭什么不能 Ctrl+Z 退回去。
+   *
+   * 传 `null` 是显式清除（选「默认」就是清掉颜色）；要"不动"就别传这个字段。
+   * 图标按码点截到契约上限（`LIMITS.icon`），空串归一成 `null`：一个只含空格的
+   * 图标在画布上什么都不显示，却会让"有没有图标"这件事变成两个分支。
+   */
+  function setNodeVisualById(
+    id: string,
+    patch: { color?: NodeColor | null; icon?: string | null },
+  ): void {
+    if (!content.value) return;
+    const node = findIn(content.value, id);
+    if (!node) return;
+
+    const nextColor = patch.color === undefined ? node.color ?? null : patch.color;
+    const nextIcon = patch.icon === undefined
+      ? node.icon ?? null
+      : (() => {
+        const text = (patch.icon ?? '').trim();
+        return text ? Array.from(text).slice(0, LIMITS.icon).join('') : null;
+      })();
+
+    if ((node.color ?? null) === nextColor && (node.icon ?? null) === nextIcon) return;
+
+    const patched = replaceContainer(
+      content.value, id, root => setNodeVisual(root, id, nextColor, nextIcon),
+    );
+    if (!applyContent(patched, true)) return;
+    status.value = '已修改样式，记得保存。';
   }
 
   function renameTitle(title: string) {
@@ -1067,11 +2254,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function addChildTo(parentId: string) {
     if (!content.value) return;
-    if (countNodes(content.value.root) >= LIMITS.nodes) {
+    if (countNodesIn(content.value) >= LIMITS.nodes) {
       status.value = `导图最多 ${LIMITS.nodes} 个节点`;
       return;
     }
-    const parent = findNode(content.value.root, parentId);
+    const parent = findIn(content.value, parentId);
     if (!parent) return;
     if (parent.children.length >= LIMITS.children) {
       status.value = `一个节点最多 ${LIMITS.children} 个子节点`;
@@ -1082,9 +2269,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    const { root, node } = addChild(content.value.root, parentId);
-    if (!applyContent({ ...content.value, root }, true)) return;
-    selectedId.value = node.id;
+    // 加到"某根骨 / 某个阶段"下与加到树节点下是同一件事：容器内的子树形状不变。
+    // 所以这里只换一个入口——拿容器自己的子树根去 `addChild`，再原位写回。
+    const container = containerOfNode(content.value, parentId);
+    if (!container) return;
+    const { root, node } = addChild(container.root, parentId);
+    const patched = replaceContainer(content.value, parentId, () => root);
+    if (!applyContent(patched, true)) return;
+    setPrimary(node.id);
     editingId.value = node.id;
     status.value = '已加子节点，输入文字后按回车确认。';
   }
@@ -1097,7 +2289,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function commitAndAddChild(label: string) {
     const id = editingId.value;
     if (!id) return;
-    const parent = content.value ? findParent(content.value.root, id) : null;
+    const parent = content.value ? findParentIn(content.value, id) : null;
     commitLabel(id, label);
     // 提交被拦下（空标题、超长）时编辑态还在，别在错误的基础上接着加节点。
     if (editingId.value === id) return;
@@ -1106,12 +2298,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function addSiblingTo(id: string) {
     if (!content.value) return;
-    if (countNodes(content.value.root) >= LIMITS.nodes) {
+    if (countNodesIn(content.value) >= LIMITS.nodes) {
       status.value = `导图最多 ${LIMITS.nodes} 个节点`;
       return;
     }
-    const parent = findParent(content.value.root, id);
-    // 根节点没有兄弟，退化成一个子节点；这时要按"加子节点"的规则校验层数与个数。
+    const parent = findParentIn(content.value, id);
+    // 容器根（骨 / 阶段 / 中心主题）没有兄弟，退化成一个子节点；这时要按"加子节点"
+    // 的规则校验层数与个数。
     if (!parent) {
       addChildTo(id);
       return;
@@ -1125,47 +2318,130 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
 
-    const { root, node } = addSibling(content.value.root, id);
-    if (!applyContent({ ...content.value, root }, true)) return;
-    selectedId.value = node.id;
+    const container = containerOfNode(content.value, id);
+    if (!container) return;
+    const { root, node } = addSibling(container.root, id);
+    const patched = replaceContainer(content.value, id, () => root);
+    if (!applyContent(patched, true)) return;
+    setPrimary(node.id);
     editingId.value = node.id;
     status.value = '已加兄弟节点，输入文字后按回车确认。';
   }
 
   function deleteNode(id: string) {
     if (!content.value) return;
-    if (content.value.root.id === id) {
-      status.value = '根节点不能删除';
+    // 容器根删不得：树的中心主题删了就没这张图了，一根骨/一个阶段删了就不是鱼骨图/
+    // 流程图了。判据走形状（`isContainerRoot`），不看 `diagram_type` 字段。
+    if (isContainerRoot(content.value, id)) {
+      status.value = isTree(content.value)
+        ? '根节点不能删除'
+        : `${containerNoun(kindOf(content.value))}本身不能删除；它下面挂的内容可以删。`;
       return;
     }
 
-    // id 不在树上（预览的派生 id、候选的 id 都会走到这里）就直接退出。
+    // id 不在内容里（预览的派生 id 会走到这里）就直接退出。
     // 交给 removeNode 的话它只会原样返回整棵树，而 applyContent 照样记一步历史、
-    // 递增 clientRevision——用户什么都没删，撤销栈和候选的新鲜度却被改脏了。
-    if (!findNode(content.value.root, id)) return;
+    // 递增 clientRevision——用户什么都没删，撤销栈与生成冲突判定的账本却被改脏了。
+    const doomedNode = findIn(content.value, id);
+    if (!doomedNode) return;
 
-    const parent = findParent(content.value.root, id);
-    if (!applyContent({ ...content.value, root: removeNode(content.value.root, id) }, true)) return;
-    selectedId.value = parent?.id ?? null;
+    const parent = findParentIn(content.value, id);
+    // 连带删边：命中**这棵子树**任意节点的边全部消失，与后端 `_apply_remove` 同一
+    // 语义。只清被点名的那一个节点的话，子孙身上的边会悬空，而 dangling 是契约层
+    // 的硬拒——下一次保存就 422，用户却只是"删了一个节点"。
+    //
+    // 两张边表都要清，理由见 `dropDanglingEdges`：流程图的阶段间边端点是阶段 id
+    // （删步骤碰不到），而阶段内边端点是**节点 id**——那一层以前没有读者，所以
+    // "流程删节点不用管边"这条旧结论在这里不再成立。
+    const doomed = subtreeIds(doomedNode);
+    const removed = replaceContainer(content.value, id, root => removeNode(root, id));
+    const nextContent = dropDanglingEdges(removed, doomed);
+    if (!applyContent(nextContent, true)) return;
+    setPrimary(parent?.id ?? null);
     editingId.value = null;
     status.value = '已删除该节点及其子节点，可撤销。';
   }
 
-  function undo() {
-    if (busy.value) {
-      status.value = '正在生成导图，完成之后才能编辑。';
-      return;
+  /**
+   * 在当前树里连一条**附加关系**（侧栏「连一条关系」的入口）。
+   *
+   * 三件事与 `addEdge`（`edits.ts` 的纯函数）分工，这里只做"界面语义"那部分：
+   *   - **节点必须存在**：面板上的下拉框只会列出真实节点，但 store 是公开 API，
+   *     别处（测试、将来的快捷键）传进来的 id 也要走同一条判据；
+   *   - **自环与重复在 `addEdge` 里抛错**，这里转成 `status` 文案而不是异常：
+   *     用户点错一次不该让整个组件树炸掉；
+   *   - **记一步撤销**：连线是内容修改，凭什么不能 Ctrl+Z。
+   */
+  function connectNodes(
+    source: string, target: string, label?: string | null, kind?: EdgeKind | null,
+  ): boolean {
+    if (!content.value) return false;
+    if (!findIn(content.value, source) || !findIn(content.value, target)) {
+      status.value = '端点节点不存在';
+      return false;
     }
+    // 上限**按每个数组各自算 200**（不是合计，也不是"两类各算"）。判据与契约逐条
+    // 对应：`_validate_edges` 是**按数组各自**调用的（`FlowStage.edges` 逐阶段一次），
+    // 后端 `ops._apply_add_flow_edge` 也只看 `len(sibling)`——它数的是"这条边要落进的
+    // 那个数组"，而不是全部阶段的内部边之和。
+    //
+    // 拿 `contentInnerEdges.length`（全部阶段合计数）当判据是错的：两个阶段各有 100
+    // 条时它等于 200，于是前端把一条本该允许的边拦下来，而同样的动作走后端
+    // （`apply_flow_edge_ops`）能成功——用户看到的是"这个阶段内部最多 200 条"，
+    // 但这个阶段其实只有 100 条。
+    const sourceStage = stageOfNode(content.value, source);
+    const sameStage = sourceStage !== null && sourceStage === stageOfNode(content.value, target);
+    const used = sameStage
+      ? innerEdgeCount(content.value, sourceStage)
+      : contentEdges.value.length;
+    if (used >= LIMITS.edges) {
+      status.value = sameStage
+        ? `这个阶段内部最多 ${LIMITS.edges} 条附加关系，请先删掉一些`
+        : `最多 ${LIMITS.edges} 条附加关系，请先删掉一些`;
+      return false;
+    }
+    let next: DiagramContent;
+    try {
+      next = addEdgeToContent(content.value, source, target, label, kind).content;
+    } catch (error) {
+      status.value = error instanceof Error ? error.message : '这条关系加不上';
+      return false;
+    }
+    if (!applyContent(next, true)) return false;
+    status.value = sameStage
+      ? '已加一条阶段内部的附加关系，记得保存。'
+      : '已加一条附加关系，记得保存。';
+    return true;
+  }
+
+  /**
+   * 删一条附加关系。删线不动结构，所以不检查节点数/层数，也不需要重算布局。
+   *
+   * **两个数组都查**（`removeEdge` 里判层级）：阶段内的边只查 `content.edges` 的话，
+   * 侧栏列得出来却删不掉——按钮点了没反应。
+   */
+  function deleteEdge(edgeId: string): boolean {
+    if (!content.value) return false;
+    const known = contentEdges.value.some(edge => edge.id === edgeId)
+      || contentInnerEdges.value.some(edge => edge.id === edgeId);
+    if (!known) return false;
+    if (!applyContent(removeEdgeFromContent(content.value, edgeId), true)) return false;
+    status.value = '已删除这条附加关系，可撤销。';
+    return true;
+  }
+
+  function undo() {
     const snap = past.value.pop();
     if (!snap) return;
     pastBytes.value -= snapshotBytes(snap);
-    // 当前是空画布时也要压一步 `'null'`，否则「空 → 候选 → 撤销 → 重做 → 撤销」
+    // 当前是空画布时也要压一步 `'null'`，否则「空 → 生成 → 撤销 → 重做 → 撤销」
     // 的最后一步会丢掉：重做那一次不记历史，再撤销就没得可撤，回不到空白。
     future.value.push(snapshot() ?? 'null');
     restoreSnapshot(snap);
     dirty.value = true;
-    // 撤销改的就是画布本身，必须让「候选基于哪个版本算出来」的判断看见这一步。
-    // 不递增的话，用户撤销一步再点「应用到画布」，撤销白做、候选照样落地。
+    // 撤销改的就是画布本身，必须让"这份结果基于哪个版本算出来"的判断看见这一步。
+    // 不递增的话，生成期间用户撤销一步、生成结果照样把画布整棵盖掉——那正是
+    // `commitGenerated` 里那条 `clientRevision` 判据要拦下的情形。
     clientRevision.value += 1;
     ensureSelection();
     editingId.value = null;
@@ -1173,17 +2449,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   function redo() {
-    if (busy.value) {
-      status.value = '正在生成导图，完成之后才能编辑。';
-      return;
-    }
     const snap = future.value.pop();
     if (!snap) return;
     // 与 undo 对称：当前是空画布时把空画布压进撤销栈，这样重做之后仍能撤回空白。
     recordPast(snapshot() ?? 'null');
     restoreSnapshot(snap);
     dirty.value = true;
-    // 同 undo：重做同样把画布换成了另一棵树，候选再不成立。
+    // 同 undo：重做同样把画布换成了另一棵树，生成结果再不成立。
     clientRevision.value += 1;
     ensureSelection();
     editingId.value = null;
@@ -1201,22 +2473,25 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   let mapSession = 0;
 
-  function loadMap(next: MindMapContent, record: { id: string; version: number; updated_at: string }) {
+  function loadMap(next: DiagramContent, record: { id: string; version: number; updated_at: string }) {
     cancel();
     mapSession += 1;
-    // 换了一张图，上一张图算出来的候选没有任何意义：留着它，一次误点就会把
-    // 那张图的内容装进这张图。
-    candidate.value = null;
-    resetCandidateOps();
+    // 换了一张图，上一轮生成的工作副本与"改了什么"没有任何意义：留着它，一次
+    // 误操作就会把那张图的内容装进这张图。
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
     saving.value = false;
     titleDraft.value = null;
-    content.value = next;
+    content.value = slot(next);
     mapId.value = record.id;
     version.value = record.version;
     savedAt.value = record.updated_at;
     mode.value = 'saved';
     dirty.value = false;
-    selectedId.value = null;
+    setPrimary(null);
     editingId.value = null;
     viewAdjusted.value = false;
     resetHistory();
@@ -1226,9 +2501,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function newMap() {
     cancel();
     mapSession += 1;
-    // 同上：新建之后旧候选不再属于画布上的任何一张图。
-    candidate.value = null;
-    resetCandidateOps();
+    // 同上：新建之后旧的工作副本不再属于画布上的任何一张图。
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
     saving.value = false;
     titleDraft.value = null;
     content.value = null;
@@ -1237,7 +2515,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     savedAt.value = null;
     mode.value = null;
     dirty.value = false;
-    selectedId.value = null;
+    setPrimary(null);
     editingId.value = null;
     resetHistory();
     status.value = '新建导图：输入主题生成，或直接在画布上手动编辑。';
@@ -1282,10 +2560,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
     saving.value = true;
     status.value = '正在保存…';
     const session = mapSession;
+    // 事件跟着内容一起提交，不另开端点：**第一次保存前根本没有 `map_id`**，
+    // 一个 `POST /mindmaps/{id}/edits` 要么发不出去，要么必须先 create 再补发——
+    // 那就多出"内容存了、事件没存"这种半截状态，而统计从此只看见部分改动。
+    //
+    // 超限的部分**不是被丢掉**，而是留在 `pendingEdits` 里等下一次保存——截断是
+    // 分批，不是丢弃。`truncated` 只报"这次没带上多少条"，后端记一条 warning；
+    // **不在表里插一条假事件**：`total` 必须是真实改动数，运维事件混进行为事件会
+    // 让每一个统计口径都脏掉。
+    const batch = pendingEdits.value.slice(0, EDIT_EVENT_LIMIT);
+    const truncated = pendingEdits.value.length - batch.length;
     try {
       const record = mapId.value
-        ? await updateMindMap(mapId.value, payload, version.value)
-        : await createMindMap(payload);
+        ? await updateMindMap(mapId.value, payload, version.value, batch, truncated)
+        : await createMindMap(payload, batch, truncated);
 
       // 请求在途时用户可能已经切到别的导图（或点了新建）。这时响应属于
       // 上一张图，不能拿它改当前页面的 mapId —— 改了之后画布显示的是 B、
@@ -1295,12 +2583,21 @@ export const useMindMapStore = defineStore('mindmap', () => {
         return 'saved';
       }
 
+      // 内容与事件在同一次请求里落库，所以"保存成功"就是"这批事件收下了"。
+      // 用 `slice(batch.length)` 而不是清空，两种情形都靠它：
+      //  - 请求在途时用户又改了几处 —— 那几条还没上过网，必须留给下一次；
+      //  - 这批超过 500 条被截 —— 剩下的同样留在队首之后，下一次继续发。
+      if (batch.length) pendingEdits.value = pendingEdits.value.slice(batch.length);
+
       // 请求在途时用户可能还在编辑。applyContent() 是整体替换 content.value，
       // 所以比一次引用就知道内容有没有变过。变了必须把脏标记恢复回来——
       // markSaved() 无条件把它清成 false，那样后改的内容会被误标成"已保存"，
       // 而请求体里发出去的只是点保存那一刻的树，刷新即丢。
       const changedDuringSave = content.value !== current;
       markSaved(record);
+      // 内容与事件都落库了 → 这次生成的结果算"存下来了"，服务端那条台账到此为止
+      // （下次进页面不再问"要不要捡回上次的结果"）。
+      reportRunSaved();
       if (changedDuringSave) {
         dirty.value = true;
         status.value = `已保存版本 ${record.version}，但保存期间又有修改，请再次保存。`;
@@ -1344,14 +2641,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const current = content.value;
     if (!current) return;
     const session = mapSession;
+    // 另存为同样把事件带上：新记录的内容里就含着这批改动，事件挂在旧 `map_id`
+    // 上就成了"改动在 A，内容在 B"。
+    const batch = pendingEdits.value.slice(0, EDIT_EVENT_LIMIT);
+    const truncated = pendingEdits.value.length - batch.length;
     try {
-      const record = await createMindMap(current);
+      const record = await createMindMap(current, batch, truncated);
       if (session !== mapSession) {
         return;
       }
+      if (batch.length) pendingEdits.value = pendingEdits.value.slice(batch.length);
       const changedDuringSave = content.value !== current;
       markSaved(record);
       conflict.value = null;
+      reportRunSaved();
       if (changedDuringSave) {
         dirty.value = true;
         status.value = `已另存为新导图（版本 ${record.version}），但保存期间又有修改，请再次保存。`;
@@ -1367,6 +2670,25 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function dismissConflict() {
     conflict.value = null;
     status.value = '已取消保存，本地修改还在，可以再试一次。';
+  }
+
+  /**
+   * 只把"已保存的导图"列表拉回来，**不打开**那个模态。
+   *
+   * `☰` 抽屉里要直接列出历史，而 `openList()` 会同时把选择模态弹出来（它盖住整个
+   * 界面，抽屉就被压在下面点不到了）。两件事拆开：抽屉用这个，`打开…` 与老入口用
+   * `openList()`。
+   */
+  async function loadMaps(): Promise<void> {
+    listBusy.value = true;
+    try {
+      maps.value = await listMindMaps();
+    } catch (error) {
+      maps.value = [];
+      status.value = error instanceof ApiError ? error.message : '读取导图列表失败。';
+    } finally {
+      listBusy.value = false;
+    }
   }
 
   async function openList() {
@@ -1405,16 +2727,62 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 选中一个节点。
+   * 换主选区，并丢掉追加选区。
    *
-   * 只接受 `content` 里真实存在的节点。预览的派生 id 和候选的 id 都还没进画布：
+   * 所有"跳到某个节点去干活"的路径都走它（点选、加子节点、加兄弟、删完跳父节点、
+   * 开始内联编辑、换图）：那些动作的语义是"现在只对着这一个节点"，留着上一批
+   * 追加选区，下一次「改这张图」会带上一串用户早就忘了自己选过的 id。
+   */
+  function setPrimary(id: string | null) {
+    extraSelectedIds.value = [];
+    selectedId.value = id;
+  }
+
+  /**
+   * 选中一个节点（清掉多选）。
+   *
+   * 只接受 `content` 里真实存在的节点。预览的派生 id 还没进画布：
    * 选中它们会让右侧详情面板、面包屑，以及 `expand` 请求里的 `selected_ids` 一起
    * 对着一个不存在的节点说话。画布那边同样给这些节点设了 `selectable: false`，
    * 这里是不依赖渲染层的最后一道。
    */
   function select(id: string | null) {
-    if (id !== null && !(content.value && findNode(content.value.root, id))) return;
-    selectedId.value = id;
+    if (id !== null && !(content.value && findIn(content.value, id))) return;
+    setPrimary(id);
+  }
+
+  /**
+   * 在画布上按住 Ctrl / Cmd / Shift 点一个节点：加进选区或从选区里拿掉。
+   *
+   * 主选区被取消时把第一个追加选区提上来（详情面板不能停在"没选中但有选区"
+   * 那种状态：`selectedIds` 非空而 `selectedNode` 为 null，界面上每一个按钮都
+   * 不知道自己该对谁说话）。
+   *
+   * 用例与 `select` 同一条判据：只有 `content` 里真实存在的节点才进得来。
+   */
+  function toggleSelect(id: string): void {
+    if (!content.value || !findIn(content.value, id)) return;
+    const rest = extraSelectedIds.value.filter(item => item !== id);
+    if (selectedId.value === id) {
+      const [promoted, ...remaining] = rest;
+      selectedId.value = promoted ?? null;
+      extraSelectedIds.value = remaining;
+      return;
+    }
+    if (rest.length !== extraSelectedIds.value.length) {
+      extraSelectedIds.value = rest;
+      return;
+    }
+    if (selectedId.value === null) {
+      selectedId.value = id;
+      return;
+    }
+    extraSelectedIds.value = [...rest, id];
+  }
+
+  /** 清空整个选区：画布上点空白处走它。 */
+  function clearSelection(): void {
+    setPrimary(null);
   }
 
   /**
@@ -1444,23 +2812,26 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 不经过网络直接装载一份导图，开发期的示例选择器用它预览布局。
    * 走 cancel() 先掐掉在途请求，避免旧流回来后把示例顶掉。
    */
-  function preview(next: MindMapContent, dir: Direction) {
+  function preview(next: DiagramContent, dir: Direction) {
     cancel();
     // 换了一张图，会话必须跟着换：否则上一张图在途的保存响应回来时，
     // 会因为会话号没变而把它的 id 写进 mapId——画布上是新图、身份却是旧图，
     // 下次保存就把新内容 PUT 到旧记录上。
     mapSession += 1;
-    // 换图即作废旧候选（preview 同样会换掉整棵树）。
-    candidate.value = null;
-    resetCandidateOps();
+    // 换图即作废这一轮的工作副本与生成记录（preview 同样会换掉整棵树）。
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
     titleDraft.value = null;
     // 上一张图在途的保存到这里就作废了：它的 finally 因为会话不匹配不会
     // 清理 saving，这里必须自己复位，否则新图永远卡在"保存中"，点保存
     // 只会返回 busy。loadMap / newMap / generate 都是同一套处理。
     saving.value = false;
-    content.value = withDirection(next, dir);
+    content.value = slot(withDirection(next, dir));
     mode.value = 'demo';
-    selectedId.value = null;
+    setPrimary(null);
     editingId.value = null;
     viewAdjusted.value = false;
     // 示例只是用来看布局的，不算用户的作品，别让它挂上"未保存"的包袱。
@@ -1470,6 +2841,52 @@ export const useMindMapStore = defineStore('mindmap', () => {
     dirty.value = false;
     resetHistory();
     status.value = '这是本地示例数据，用来检查布局与截断，不是模型生成的。';
+  }
+
+  /**
+   * 装载一份**导入**的导图。
+   *
+   * 与 `preview` 的三处差别，每一处都是刻意的：
+   *
+   *  1. `dirty = true`。导入的是用户的作品，他必须被提醒"还没保存"。示例数据是
+   *     拿来检查布局的，不算作品，所以那边是 false。
+   *  2. `mode = 'import'`。徽标要说清这张图的来历；混进 `saved` 会让人以为它已经
+   *     在库里了，混进 `demo` 会让人以为这是假数据（他会不敢保存）。
+   *  3. `mapId = null`。后端导入**只解析不落库**，所以第一次保存走 `createMindMap`
+   *     建一条新记录，而不是 PUT 到某张既有图上。
+   *
+   * 朝向不经过 `withDirection`：文件自带的 `theme.direction` / `layout` 就是用户
+   * 原来看到的样子，`direction` 是 content 的派生值（`directionOf`），设好 content
+   * 之后画布自然按它排。强行套一个默认朝向会把一份"向左"的图导成向右。
+   *
+   * `resetHistory()`：导入不是一个可以撤销的编辑步骤——撤销回到导入前就意味着
+   * "把画布清空"，而那不是用户点撤销时想要的东西。
+   */
+  function importMap(next: DiagramContent) {
+    cancel();
+    // 换图必须换会话号，否则上一张图在途的保存响应回来时会把它的 id 写进 mapId，
+    // 而画布上是这张新导入的图——下次保存就把导入的内容 PUT 到旧记录上。
+    mapSession += 1;
+    draft.value = null;
+    resetDraftOps();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
+    titleDraft.value = null;
+    // 与 preview 同一条：上一张图在途的保存作废，saving 必须自己复位，否则新图
+    // 永远卡在"保存中"。
+    saving.value = false;
+    content.value = slot(next);
+    mode.value = 'import';
+    setPrimary(null);
+    editingId.value = null;
+    viewAdjusted.value = false;
+    mapId.value = null;
+    version.value = 0;
+    savedAt.value = null;
+    dirty.value = true;
+    resetHistory();
+    status.value = `已导入「${next.title}」，还没有保存。`;
   }
 
   /**
@@ -1483,7 +2900,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   function loadPreset(preset: {
     label: string;
-    content: MindMapContent;
+    content: DiagramContent;
     direction: Direction;
   }) {
     preview(preset.content, preset.direction);
@@ -1493,11 +2910,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 掐掉在途的 agent 运行。
    *
-   * 取消只是停止这一轮：画布上的 `content` 从来没被这一轮碰过（候选落地要用户
-   * 点「应用」），所以不需要回滚，清掉属于这一轮的中间态就够了。
+   * 取消就是**真正的"不要了"**：这一轮的结果从未进过画布（`draft` 只是工作副本，
+   * `commitGenerated` 才写 `content`），所以不需要回滚，清掉属于这一轮的中间态就够了。
+   * 这也是删掉候选层之后仍然保留的那半个保护——生成 25 秒里发现方向不对，点取消，
+   * 画布一点没变。
    * 换图场景（loadMap / newMap / preview）也走它，把旧流掐死。
-   */
-  function cancel() {
+   */  function cancel() {
     const active = controller;
     controller = null;
     active?.abort();
@@ -1507,6 +2925,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentWarnings.value = [];
     // 取消/换图同理：长到一半的预览属于已经结束的那一次运行。
     clearAgentPreview();
+    // 工作副本同理：它属于被取消的那一轮，留着只会在下一轮开跑前短暂地
+    // 影响一次 ops 批次的基树判断。
+    draft.value = null;
+    resetDraftOps();
     stageText.value = '';
     // 这一轮已经结束，"等了多久"不再有意义：不清的话，静默超 10s 后点取消，
     // 界面会一边写"已取消。"、一边挂着"模型正在思考，已等 20 秒"。
@@ -1514,36 +2936,37 @@ export const useMindMapStore = defineStore('mindmap', () => {
     status.value = '已取消。';
   }
 
-  // ---- agent 运行与候选接受 ----
+  // ---- agent 运行与生成落地 ----
 
   /**
-   * 把一批 op 应用到候选上，返回是否应用成功。
+   * 把一批 op 应用到工作副本上，返回是否应用成功。
    *
-   * 只动 `candidate`，绝不写 `content`：采纳仍然要用户点「应用」。这是整条 agent
-   * 路径的核心约束，不因为帧是增量的就默认落地。
+   * 只动 `draft`，绝不写 `content`：`ops` 是一次几处的增量，`edit` 意图下模型可能
+   * 连调十几次，每条都落画布等于把 25 秒的中间态全摊给用户、撤销栈切成十几步半成品。
+   * 整树只在 `done` 那一刻进画布（`commitGenerated`），那一次是原子的、可撤销的。
    *
-   * 失败与乱序都**静默丢弃**：`done` 帧会带完整树覆盖候选，少应用一批不会丢数据；
-   * 而在这种时候弹一句"修改没能应用"，用户只会以为最终结果不可信。
+   * 失败与乱序都**静默丢弃**：`done` 帧会带完整树覆盖工作副本，少应用一批不会丢
+   * 数据；而在这种时候弹一句"修改没能应用"，用户只会以为最终结果不可信。
    */
-  function applyOpsToCandidate(batch: OpBatch): boolean {
-    // edit / expand 这两条路上后端不发 snapshot（候选从请求带过去的树起步），
-    // 所以候选要由画布那份树的副本兜底——`applyOps` 自己会克隆，不会改到 content。
+  function applyOpsToDraft(batch: OpBatch): boolean {
+    // edit / expand 这两条路上后端不发 snapshot（工作副本从请求带过去的树起步），
+    // 所以副本要由画布那份树兜底——`applyOps` 自己会克隆，不会改到 content。
     // 不兜底的话第一批 op 就没有落点，"打开旧图 → 让 AI 改"依旧一点反应都没有。
-    const base = candidate.value ?? (candidateIntent === 'create' ? null : content.value);
+    const base = draft.value ?? (generationIntent === 'create' ? null : content.value);
     if (!base) return false;
     // 对不上就是中间漏了一批：在错位的树上继续套用只会套出错位的结构。
-    if (batch.base_revision !== candidateRevision) {
-      previewDebug(`[agent] 丢弃 ops 批次：base_revision=${batch.base_revision}，当前 ${candidateRevision}`);
+    if (batch.base_revision !== draftRevision) {
+      previewDebug(`[agent] 丢弃 ops 批次：base_revision=${batch.base_revision}，当前 ${draftRevision}`);
       return false;
     }
     try {
-      candidate.value = applyOps(base, batch).content;
+      draft.value = applyOps(base, batch).content;
     } catch (error) {
       previewDebug(`[agent] 丢弃 ops 批次：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-    // 只有真正落进候选才算这一版完成，失败那批不能推进账本。
-    candidateRevision = batch.base_revision + 1;
+    // 只有真正落进副本才算这一版完成，失败那批不能推进账本。
+    draftRevision = batch.base_revision + 1;
     return true;
   }
 
@@ -1552,6 +2975,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     intent: 'create' | 'expand' | 'edit' = 'create',
     sources?: Source[],
     thinkingModel: string = 'default',
+    diagramType: DiagramTypeChoice = 'auto',
+    options: RunOptions = {},
   ): Promise<void> {
     if (busy.value || agentRunning.value) return;
     // 来源合法性在这里再判一次。组件里已有同样的闸门，但 `runGeneration` 是唯一
@@ -1575,11 +3000,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
       agentError.value = '';
       agentWarnings.value = [];
       clearAgentPreview();
-      status.value = '请在下方「输入主题或文本」里写下要生成的内容；上面的「导图标题」只改名字，不会重新生成。';
+      status.value = '请在画布右上角的输入框里写下主题或要改什么；「导图标题」那个框只改名字，不会重新生成。';
       return;
     }
     if (intent !== 'create' && !content.value) {
       status.value = '当前还没有导图，无法在此基础上修改。';
+      return;
+    }
+    // 鱼骨与流程还不能交给模型改：后端 `AgentRunRequest.snapshot` 只收树形状
+    // （`MindMapContent`，`extra="forbid"` 会把 `bones` / `stages` 拒成 422）。
+    // 拦在这里给一句能读懂的话，好过让用户等一轮之后收到一条后端校验错误。
+    if (intent !== 'create' && content.value && !isTree(content.value)) {
+      status.value = kindOf(content.value) === 'fishbone'
+        ? '鱼骨图还不能让模型改：后端目前只接受树形状的快照，这一步等它放宽之后才能用。'
+        : '流程图还不能让模型改：后端目前只接受树形状的快照，这一步等它放宽之后才能用。';
       return;
     }
 
@@ -1587,21 +3021,40 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentEvents.value = [];
     // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。
     agentWarnings.value = [];
-    // 同理，上一轮是演示还是模型，跟这一轮没关系；不清就会把上一轮的 demo
-    // 标记挂到这一轮的候选上。
-    agentMode.value = null;
-    candidate.value = null;
+    draft.value = null;
     // 新一轮的 op 从第 0 版重新开始，上一轮的账本留着只会把首批 op 判成乱序。
-    resetCandidateOps();
+    resetDraftOps();
     // 上一轮长到一半的预览同样不能留：它的节点属于上一次运行，混进这一轮的
     // 面板里，用户会以为新任务已经长出了这些分支。
     clearAgentPreview();
-    // 记下候选所依据的版本与所在的图：接受时用它判断期间有没有被改过、有没有换了图。
-    // 意图也要记：接受时得知道这份内容算「新作品」还是「改现有这张图」。
-    candidateBaseRevision = clientRevision.value;
-    candidateSession = mapSession;
-    candidateIntent = intent;
-    runIntent.value = intent;
+    // 上一轮"改了什么"与上一轮的冲突裁决到此为止：新一轮有自己的基线。
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    conflictDraft.value = null;
+    // 记下这一轮所依据的画布与所在的图：完成时用它算"改了什么"、判版本冲突、判换了图。
+    // 意图也要记：落地时得知道这份内容算「新作品」还是「改现有这张图」。
+    generationBase = content.value;
+    generationBaseRevision = clientRevision.value;
+    generationSession = mapSession;
+    generationIntent = intent;
+    // 选区按意图取：`expand` 只展开**一个**节点（后端开流前会 422 掉多选的请求），
+    // `edit` 吃整个选区（用户圈了三个节点说「这几个合并成一个」，模型得知道是
+    // 哪三个，否则只能从整棵树里猜）。`create` 没有选区。
+    //
+    // `options.selection` 是**显式覆盖**：看不见选区的入口（左侧「生成」按钮，
+    // 那里没有「已选 N 个」徽标）必须传空数组，否则它会偷偷带着用户在画布上
+    // 圈的东西去"重新生成"——用户看不到这件正在发生的事。
+    const wantedSelection = intent === 'expand'
+      ? (selectedId.value ? [selectedId.value] : [])
+      : intent === 'edit' ? (options.selection ?? [...selectedIds.value]) : [];
+    // 后端 `AgentRunRequest.selected_ids` 的 `max_length` 是 50：超了会被开流前的
+    // 校验直接 422，而用户只是"按着 Ctrl 把一整片都点了一遍"。截断比报错好——
+    // 多出来的那几个在提示词里本来就只是上下文，前 50 个足够说明他圈的是哪一片。
+    const selectionIds = wantedSelection.slice(0, MAX_REQUEST_SELECTION);
+    // diff 的「范围内/外」按**请求时**的选区判，之后用户点来点去不会改写这份记录。
+    // 只对 `edit` 记：`expand` 的选区是"要展开的那一个节点"，新节点按构造就落在
+    // 它下面，每一行都标「范围内」只是噪音；`create` 没有选区。
+    generationSelection.value = intent === 'edit' ? selectionIds : [];    runIntent.value = intent;
     // 展开的预览要有一条祖先链兜着（`node_grow` 的 path 是父节点的索引链）。
     // 生成不用：它的根帧自带 path=null，预览从中心主题开始长。
     if (intent === 'expand' && selectedId.value) {
@@ -1615,31 +3068,64 @@ export const useMindMapStore = defineStore('mindmap', () => {
     stageText.value = '正在连接';
     status.value = '正在与模型协作…';
     waitedMs.value = 0;
+    // 上一轮的模型名与思考过程在**这一次开始的那一刻**就作废：它们描述的是另一个
+    // 运行。留到这一次的 done 帧才清，中间那段时间面板会挂着一个已经不对的模型名。
+    runModel.value = null;
+    lastReasoning.value = '';
 
     // 流只在 done / error 帧上才算有了明确结局；两者都没到就 EOF，说明连接被掐断了，
     // 不能当成正常结束——否则面板会停在「正在与模型协作…」，工具行永远显示「执行中…」。
     let settled = false;
+    // `done` 帧带来的来历（`demo` / `model`）。它只在**这次运行**里有意义，
+    // 所以是局部变量而不是 store 状态：落地那一步把结果写进 `content.mode`，
+    // 之后所有读者看的都是 `mode`（用户作品的来历），不是一个易失的中间值。
+    let doneMode: 'demo' | 'model' | null = null;
 
     try {
+      // 每次点击一个新的身份：幂等只在"带同一个 run_id"时生效，而"点了两次生成"
+      // 本来就是两次运行（按钮禁用与 busy 闸门管那个）。真正需要同一个 id 的场景
+      // 是刷新重发、换标签页、客户端重试——那时服务端能认出这是同一次运行。
+      const runId = newRunId();
       const body: AgentRunRequest = {
         goal: prompt,
         intent,
+        run_id: runId,
         // 始终显式带上：即使宿主页面没给值也发 default，而不是省略字段。
         // 省略会把「前端没传」和「后端默认」两个概念混在一起，排查请求体时看不出
         // 用户到底选了哪套拆解方式；值本身与后端默认一致，传了不影响结果。
         thinking_model: thinkingModel || 'default',
         // create 不能带 snapshot（后端开流前会 422）；另外两种必须带
-        snapshot: intent === 'create' ? null : content.value,
-        selected_ids: intent === 'expand' && selectedId.value ? [selectedId.value] : [],
+        // 后端的 `AgentRunRequest.snapshot` 目前仍声明为 `MindMapContent | None`
+        // （`extra="forbid"`），鱼骨/流程原样发过去会被 422。这里只发树的形状：
+        // 非树内容在 `runGeneration` 开头就被拦下并给出一句人话，不会走到这里。
+        snapshot: intent === 'create' ? null : (content.value && isTree(content.value) ? content.value : null),
+        // 选中节点是**上下文提示**，不是作用域限制：后端会把它拼进 system
+        // （`service.selection_text`），说清"优先改这些节点及其子树，意图明显
+        // 不限于它们时也允许改别处，但要在回复里说明"。所以这里是"我圈了谁"，
+        // 不是"只许改谁"——「整张图都加上时间维度」这类请求仍然照常发得出去。
+        selected_ids: selectionIds,
       };
       // 来源原样送去，一个字都不截：材料是"依据"，goal 是"要做什么"。
       // 把正文拼进 goal 会同时踩两个坑——被截断的材料丢掉大半，且模型分不清
       // 目标与素材。空数组不发：旧后端对多出来的字段是 extra="forbid"。
       if (sources && sources.length > 0) body.sources = sources;
+      // 图型只在用户真的选了、且这次是新建时发出去。两条边界各有理由：
+      //   - `auto`（= 没选）**省略字段**，不发假值：后端 `None` 的语义就是"让模型
+      //     自己判断"，省略与它同一件事，而 `"auto"` 这种字符串会被 Literal 挡成
+      //     422。省略还多换来一条性质：没选图型的请求与老前端逐字节相同。
+      //   - `expand` / `edit` 不生成骨架，后端的编辑工具集里连生成工具都没有。
+      //     那两个意图带图型只会让"图型只在新建时生效"这条边界变成一句空话。
+      if (intent === 'create' && diagramType !== 'auto') body.diagram_type = diagramType;
+      // 空数组不发：老后端对多出来的字段是 `extra="forbid"`，而"这次一条偏好都没用上"
+      // 与"这个字段不存在"对读的人来说是同一件事。
+      if (options.prefsApplied?.length) body.prefs_applied = [...options.prefsApplied];
+      // 「深度思考」只在**勾上**时才发字段：`false` 与"没有这个字段"对后端是同一件
+      // 事，而省略让一次普通生成与加这个开关之前的请求逐字节相同。
+      if (options.deepThinking) body.deep_thinking = true;
 
       await runAgentStream(body, event => {
         // 被取消或被新请求接管的旧流：一帧都不许再改界面状态，
-        // 否则旧回调会把新请求刚设好的 stageText / status / candidate 覆盖掉。
+        // 否则旧回调会把新请求刚设好的 stageText / status / 预览覆盖掉。
         if (controller !== ctrl) return;
         // 心跳不进 `agentEvents`：它只驱动状态行的"已等 N 秒"，面板里没有任何地方
         // 读它。而每帧都整数组复制是 O(n²)——长静默会累积几十帧，没必要为纯保活
@@ -1675,48 +3161,60 @@ export const useMindMapStore = defineStore('mindmap', () => {
             const warnings = agentWarningsFrom(event.result_summary);
             if (warnings.length) {
               recordWarnings(warnings);
-              // 候选可能已经先到了（snapshot 与工具帧的先后不固定）。这时状态行
-              // 还写着"候选已就绪"，得跟着改，不能让两句文案在同一个面板上打架。
-              if (candidate.value && event.ok) status.value = candidateStatus('候选已就绪');
+              // snapshot 可能已经先到了（与工具帧的先后不固定）。这时状态行还写着
+              // "正在收尾"，得把"结果不完整"带上，不能让两句文案在同一个面板上打架。
+              if (draft.value && event.ok) status.value = finishStatus('模型给出了结果');
             }
             break;
           }
           case 'node_grow':
-            // 只进预览树。真正可采纳的内容在 snapshot / done 的 `content` 里，
-            // 两者可能不一致——把预览当候选，等于把一棵没校验过的树交给用户应用。
+            // 只进预览树。真正的结果在 snapshot / done 的 `content` 里：预览没经过
+            // 整树校验，某一路失败被裁掉、去重丢掉重复项，都会让它与最终结果不一致。
             growPreviewNode(event.path, event.label, event.expandable);
             break;
           case 'ops':
             // `edit` 意图的改动**只**以 op 批次下发（没有整树快照）。不接这一帧，
             // "打开旧图 → 让 AI 改 → 界面没反应"就是必然结果。
-            if (applyOpsToCandidate(event.batch)) {
-              status.value = `已应用 ${event.batch.ops.length} 条修改，确认后才会应用到画布。`;
+            if (applyOpsToDraft(event.batch)) {
+              status.value = `已应用 ${event.batch.ops.length} 条修改，生成完会一起落到画布。`;
             }
             break;
           case 'snapshot':
-            // 后端整树校验通过后先推一帧 snapshot：done 之前用户就该看得见候选长什么样。
-            // 完整候选一到，预览就没有存在意义了，整棵作废（含还等着挂的缓存）。
-            clearAgentPreview();
-            // 只放候选、不碰 content——没经用户确认的内容不许进画布。
-            candidate.value = event.content;
-            status.value = candidateStatus('候选已就绪');
+            // 后端整树校验通过后先推一帧 snapshot：`done` 之前先把结果记下来。
+            // 这一帧**不落地**——`done` 通常紧跟，两次落地会留下两步撤销、两条
+            // `generate` 事件，而用户只按了一次生成。
+            //
+            // **也不清预览**：画布此刻还是空的（`content` 为空才看得见预览），
+            // 清掉它就会空一帧——用户正盯着一棵长到一半的树，突然变成空态占位，
+            // 然后 `done` 又把整棵树塞进来。从前这一帧由候选层接住，候选层删掉
+            // 之后，接住它的是"预览再撑到 done"。
+            draft.value = event.content;
+            status.value = '正在收尾…';
             break;
           case 'done':
             settled = true;
-            // 这棵树的来历只有 done 帧说得准，落在这里等「接受」时再写进 mode。
+            // 这棵树的来历只有 done 帧说得准，落在这里捕获成 `doneMode`。
             // 后端 `exclude_none=True`，所以正常帧一定带值；缺字段只说明对面是
             // 没填 mode 的旧版本，记作"没说"，不能替它认成模型产出。
-            agentMode.value = event.mode ?? null;
+            doneMode = event.mode ?? null;
+            // 模型名与思考过程：成功时也留（`done` 帧现在两条都给）。
+            // `model` 缺字段 = 对面没说（演示模式 / 旧后端 / 测试里的假 provider），
+            // 不替它认成 `deepseek-chat`——界面据此只说"模型没说"，不说谎。
+            runModel.value = event.model ?? null;
+            lastReasoning.value = event.reasoning ?? '';
             // 终态已到，预览再留着只会让人以为还有节点在路上。
             clearAgentPreview();
-            if (event.content) {
-              // 只放进候选，不动 content：用户确认之前画布保持原样
-              candidate.value = event.content;
-              status.value = candidateStatus(
-                agentMode.value === 'demo' ? '演示导图已就绪（不是 AI 生成的）' : '模型给出了候选导图',
-              );
-            } else if (!candidate.value) {
-              // 已经收到过 snapshot 的候选就留着：这一帧只是没重复带内容。
+            if (event.content) draft.value = event.content;
+            if (draft.value) {
+              // **生成结果直接进画布**：没有确认这一步了。撤销栈、`generate` 事件、
+              // 身份重置、冲突判定全在 `commitGenerated` 里，一次做完。
+              commitGenerated(draft.value, {
+                runId,
+                intent,
+                mode: doneMode,
+                base: generationBase,
+              });
+            } else {
               status.value = '模型这次没有产出导图。';
             }
             break;
@@ -1762,7 +3260,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 这一轮是不是"在生成"（新建 / 编辑也算），用来与展开互斥。
    *
    * 展开与生成互斥不是保守，是必要的：`runGeneration` 一进来就 `clearAgentPreview`
-   * 并换掉 `controller`，两轮流重叠时后到的那个会把前一个刚长出来的预览与候选一起
+   * 并换掉 `controller`，两轮流重叠时后到的那个会把前一个刚长出来的预览一起
    * 作废——用户看到的是"点了一下，之前的进度消失了"。
    */
   const generating = computed(() => agentRunning.value && runIntent.value !== 'expand');
@@ -1770,7 +3268,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 展开当前选中的节点：走同一个 `/agent/runs/stream`，只是意图换成 `expand`。
    *
-   * 与生成的差别只有三处，其余全部复用（候选、op 帧、版本检查、接受/丢弃都还是
+   * 与生成的差别只有三处，其余全部复用（op 帧、版本检查、落地与冲突裁决都还是
    * 那一条路）：
    *
    *  1. `goal` 写的是"展开哪个节点"，而不是用户的主题；
@@ -1804,87 +3302,246 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 把候选应用到画布。
-   *
-   * 四道校验缺一不可：候选属于当前这张图、有候选、没有未提交的输入、树没被改过。
-   * 少任何一条，用户手打了一半的标题、刚做的编辑，或另一张图的内容都会被候选
-   * 静默覆盖——那正是这次改造要解决的问题，不能在新路径上重演。
+   * 一次生成本次落地的元数据。`commitGenerated` 与冲突裁决共用它。
    */
-  function acceptCandidate(): 'applied' | 'stale' | 'invalid' {
-    // 换图判在"有没有候选"之前：切图会把 candidate 清成 null，但 candidateSession
-    // 还留着上一张图的号码。两者不等就说明这次候选属于另一张图，装上去等于把
-    // 那张图的内容写进当前记录。
-    if (candidateSession !== mapSession) {
-      candidate.value = null;
-      resetCandidateOps();
-      status.value = '候选是在另一张导图上生成的，已失效，请重新运行。';
+  interface GenerateMeta {
+    runId: string;
+    intent: 'create' | 'expand' | 'edit';
+    /** `done` 帧的来历；`null` = 对面没填，落地时退回 `model`。 */
+    mode: 'demo' | 'model' | null;
+    /** 生成开始那一刻的画布，用来算"这次改了什么"、并进改动事件。 */
+    base: DiagramContent | null;
+  }
+
+  /**
+   * **生成结果落到画布**。这是整条 agent 路径的终点，也是删掉候选层之后唯一的入口。
+   *
+   * 它做六件事，一次做完：
+   *
+   *  1. 整树校验——模型产出是外部数据，长度/引用/节点数都可能越界。拦在这里，
+   *     脏数据就不会先进画布、直到保存时才被后端 422 拒绝（那时用户已经改了半天）；
+   *  2. 判冲突——生成期间画布变过就**不覆盖**，把两棵树留着让用户选（`resolveConflict`）；
+   *  3. 压撤销栈——生成前那棵树进 `past`，于是"生成差了"可以一步退回去；
+   *  4. 记一条 `kind='generate'`（带 `node_count`，**在生成完成这一刻定死**）；
+   *  5. 把身份按意图处理——`create` 是一份新作品，不能继承上一张图的 `mapId`；
+   *  6. 算一次"这次改了什么"，冻结成 `generatedChanges`。
+   *
+   * 返回分类而不是布尔：调用方（面板/测试）要能区分"落地了""等用户裁决""数据不合法"。
+   */
+  function commitGenerated(next: DiagramContent, meta: GenerateMeta, force = false): 'applied' | 'conflict' | 'invalid' | 'stale' {
+    // 换了图：`clientRevision` 判不出这件事（切图不递增），只有会话号能。
+    // 装上去等于把上一张图的内容写进当前记录，还顶着它的 mapId。
+    if (generationSession !== mapSession) {
+      draft.value = null;
+      resetDraftOps();
+      conflictDraft.value = null;
+      status.value = '这次生成是在另一张导图上跑的，结果已丢弃，请重新运行。';
       return 'stale';
     }
-    if (!candidate.value) return 'invalid';
+    // 生成期间画布被改过（`undo` 或手工编辑）。**不覆盖**：用户那 25 秒里的编辑
+    // 不能被一次生成静默抹掉——两棵树都留着，让用户选（`resolveConflict`）。
+    if (!force && clientRevision.value !== generationBaseRevision) {
+      conflictDraft.value = { next, meta };
+      status.value = '生成期间你改过这张图。要保留哪个？';
+      return 'conflict';
+    }
     if (editingId.value !== null || titleDraft.value !== null) {
-      status.value = '请先提交或取消正在编辑的内容。';
-      return 'stale';
+      status.value = '请先提交或取消正在编辑的内容，再让模型改这张图。';
+      // 手打了一半的标题不能丢：同样走裁决，用户还能选"保留我的"。
+      conflictDraft.value = { next, meta };
+      return 'conflict';
     }
-    if (clientRevision.value !== candidateBaseRevision) {
-      status.value = '候选生成之后这张图被改过，已失效，请重新运行。';
-      return 'stale';
-    }
-    // 装进画布之前必须整树校验一次。候选是模型产出的外部数据，它的 label
-    // 长度、引用区间、节点数都可能越界；不在这里拦，脏数据会先进画布、
-    // 直到用户点保存才被后端 422 拒绝，而那时他已经在上面改了半天。
-    const invalid = validateDraft(candidate.value);
+    // 装进画布之前整树校验一次（理由见函数头第 1 条）。
+    const invalid = validateDraft(next);
     if (invalid) {
-      status.value = `候选不合法，已丢弃：${invalid}`;
-      candidate.value = null;
-      resetCandidateOps();
+      draft.value = null;
+      resetDraftOps();
+      conflictDraft.value = null;
+      status.value = `生成结果不合法，没有落进画布：${invalid}`;
       return 'invalid';
     }
-    // 到这里候选可以落地了。先按意图处理"这份内容是谁"：
-    // create 是一份新作品，绝不能继承上一张图的身份——否则接受之后点保存会走
+
+    // 身份：create 是一份新作品，绝不能继承上一张图的身份——否则落地之后点保存会走
     // PUT，把刚打开的那条旧记录整条覆盖掉。
-    if (candidateIntent === 'create') {
+    if (meta.intent === 'create') {
       mapId.value = null;
       version.value = 0;
       savedAt.value = null;
-      // 上一张图在途的保存响应回来时不能再把它的 id 写回 mapId（那是"新图挂旧身份"
-      // 的另一条路径），所以会话跟着换；saving 也自己复位——那一轮请求的 finally
-      // 会因为会话不匹配跳过清理，不复位就会永远卡在"保存中"。
+      // 上一张图在途的保存响应回来时不能再把它的 id 写回 mapId，所以会话跟着换；
+      // saving 也自己复位——那一轮请求的 finally 会因为会话不匹配跳过清理。
       mapSession += 1;
       saving.value = false;
       resetHistory();
-      // 新作品不接上一张图的历史：撤销栈里只留「接受之前」这一步。
+      // 新作品不接上一张图的历史：撤销栈里只留「生成之前」这一步（画布本来是空的
+      // 就压 `'null'`，照样退得回去）。
       pushHistoryOrEmpty();
     } else {
-      // 改的是现有这张图：身份、版本、历史都沿用，撤销回到改动前的那棵树。
-      pushHistory();
+      // 改的是现有这张图：身份、版本、历史都沿用，撤销回到生成前的那棵树。
+      //
+      // `actor` 必须是 `agent`：这条路上用户没动手，改动是模型算出来的。
+      // `runId` 带上——统计里"这次生成被改了几处"只能靠它把改动事件与
+      // `generate` 那条对上，而它过了 `reportRunSaved()` 就没了。
+      pushHistory('agent', meta.runId);
     }
-    content.value = candidate.value;
-    candidate.value = null;
-    // 候选落地之后账本归零：这份内容已经进了 content，下一轮从第 0 版重来。
-    resetCandidateOps();
+    content.value = slot(next);
+    // 改动与"这次生成"共享同一个 `at`：它是"一次操作产生了几条事件"的唯一分组
+    // 依据（`GROUP BY at`），两次取时刻会让同一次生成被读成两次操作。
+    const at = new Date().toISOString();
+    // 改动已经落地，这时候才比得出差：`pushHistory()` 抄下的那棵树 vs `next`。
+    collectEdits(next, at);
+    // 生成这条记录紧跟在它带来的那批改动之后：读起来像"改了这些…这是这次生成的规模"。
+    recordGeneration(next, meta.runId, at);
+
+    // 「这次改了什么」——**落地瞬间冻结**。基线是生成开始那一刻的画布，不是此刻的
+    // （此刻就是 next，比出来永远是空）。
+    if (meta.base) {
+      // 两批并列子树（鱼骨的骨、流程的阶段）都要走同一套差：把 `rootsOf` 交进去，
+      // 树的 `[content.root]` 与它逐格等价，所以树的这份清单一个字都不会变。
+      const baseRoots = rootsOf(meta.base);
+      const nextRoots = rootsOf(next);
+      const nodeChanges = diffCandidate(baseRoots, nextRoots) ?? [];
+      const names = new Map<string, string>();
+      for (const root of nextRoots) {
+        for (const entry of flatten(root)) {
+          names.set(entry.node.id, displayTitle(entry.node));
+        }
+      }
+      const nameOf = (id: string) => names.get(id) ?? id;
+      const changes: CandidateChange[] = [
+        ...nodeChanges,
+        ...diffEdges(edgesOf(meta.base), edgesOf(next), nameOf),
+      ];
+      const scope = selectionScope(baseRoots, nextRoots, generationSelection.value);
+      generatedChanges.value = changes.map(item => ({ ...item, inSelection: withinScope(item, scope) }));
+      generatedSummary.value = { nodes: countNodesIn(next), changes: changes.length };
+    } else {
+      // 画布本来是空的：整棵树都是新的，那不是 diff，是把整棵树重念一遍。
+      generatedChanges.value = null;
+      generatedSummary.value = { nodes: countNodesIn(next), changes: null };
+    }
+    generatedContent = next;
+
+    draft.value = null;
+    // 结果已经进了 content，下一轮从第 0 版重来。
+    resetDraftOps();
+    conflictDraft.value = null;
     // 来源标记跟着 done 帧走，不再一律写成「模型」：演示模式产出的是一棵占位树，
     // 给它贴"模型生成"的标签就是让界面替它撒谎。没说（旧后端）才退回 model。
-    mode.value = agentMode.value ?? 'model';
+    mode.value = meta.mode ?? 'model';
     dirty.value = true;
     clientRevision.value += 1;
     editingId.value = null;
-    // 告警说的是"这份候选缺了什么"，候选已落地就没有再挂着的理由；
-    // 留着它，用户会以为画布上这棵树还有问题等着处理。
-    agentWarnings.value = [];
+    // 告警**不清**：它说的是"这棵树缺了什么"，而树已经在画布上了——用户正需要知道
+    // 这件事。清掉就只剩一句"已落到画布"，而某几支是空的。
     ensureSelection();
-    status.value = mode.value === 'demo'
-      ? '已应用演示导图（固定结构，不是 AI 生成），记得保存。'
-      : '已应用模型的修改，记得保存。';
+    status.value = finishStatus(mode.value === 'demo'
+      ? '已落到画布（演示导图，固定结构，不是 AI 生成）'
+      : '模型的结果已落到画布');
+    // 等保存成功再上报 `applied_at`：它的语义是"这份结果被存下来了"，正是
+    // "下次进页面还要不要提醒"的判据（见 `runs.pending`）。
+    pendingSaveRunId.value = meta.runId;
     return 'applied';
   }
 
-  function discardCandidate(): void {
-    const had = candidate.value !== null;
-    candidate.value = null;
-    resetCandidateOps();
-    agentError.value = '';
-    agentWarnings.value = [];
-    status.value = had ? '已丢弃候选，画布未变。' : '没有待处理的候选。';
+  /**
+   * 生成那条事件：`kind='generate'` + `node_count` + `run_id`。
+   *
+   * **`node_count` 在这里定死**，一小时后的保存不再重算：用户改完之后树上的节点数
+   * 已经变了，那时数出来的是"改后的规模"，而分母要的是"模型交给你多少东西"。
+   *
+   * `at` 由调用方给（与同一批改动共享同一个值）：`GROUP BY at` 是"这次操作产生了
+   * 哪几条事件"的唯一分组依据，两次 `new Date()` 会在慢机器上差出几毫秒，把一次
+   * 生成拆成两次操作。
+   */
+  function recordGeneration(after: DiagramContent, runId: string, at: string) {
+    pendingEdits.value = [
+      ...pendingEdits.value,
+      generateEvent(countNodesIn(after), { at, runId }),
+    ];
+  }
+
+  /**
+   * 冲突裁决：生成期间画布被改过，用户挑一棵。
+   *
+   * `generated` = 用模型的结果（他中途的编辑会被这次生成覆盖，但**仍可撤销**：
+   * 落地前压的那一步是"生成开始时的画布"，撤销能退回生成前，再撤销一步才到他的
+   * 中途编辑）；`mine` = 保留画布，生成结果丢掉。
+   *
+   * 这是删掉候选层之后唯一留下的"两棵树"界面，而它的性质与候选不同：候选挡在
+   * **每一次**生成前面，它只在数据要丢的时候出现。
+   */
+  function resolveConflict(choice: 'generated' | 'mine'): 'applied' | 'kept' | 'invalid' {
+    const pending = conflictDraft.value;
+    if (!pending) return 'kept';
+    if (choice === 'mine') {
+      conflictDraft.value = null;
+      draft.value = null;
+      resetDraftOps();
+      status.value = '已保留你的改动，这次生成的结果没有落到画布。';
+      return 'kept';
+    }
+    conflictDraft.value = null;
+    // `force`：用户已经明确选了"用生成的"，那条 revision 判据不该再拦一次
+    // （它刚刚正是拦下这次落地的原因）。
+    const result = commitGenerated(pending.next, pending.meta, true);
+    return result === 'applied' ? 'applied' : 'invalid';
+  }
+
+  /**
+   * 「回到生成之前」：一步退回上一次生成开始时的画布。
+   *
+   * 只在**画布还是生成结果本身**时可用（引用相等）。生成之后又改过就不提供了——
+   * 那时撤销一步只是退掉他自己的一次编辑，把它说成"回到生成前"是骗人；界面会
+   * 让他用普通撤销逐步退回。
+   */
+  function undoGenerate(): boolean {
+    if (content.value === null || content.value !== generatedContent) return false;
+    if (!canUndo.value) return false;
+    undo();
+    generatedChanges.value = null;
+    generatedSummary.value = null;
+    generatedContent = null;
+    status.value = '已回到生成之前的画布。';
+    return true;
+  }
+
+  /**
+   * 「回到生成之前」现在可用吗。
+   *
+   * 判据只有一条：**画布上还是生成结果本身**（引用相等）。用户生成之后又改过，
+   * 这个快捷动作就该消失——那时"撤销一步"退掉的是他自己那次编辑，把它标成
+   * "回到生成前"是骗人。面板据此决定显示不显示那个按钮。
+   */
+  const canUndoGenerate = computed(() => content.value !== null && content.value === generatedContent);
+
+  /**
+   * 画布上**能选中**的那些节点：扁平表去掉合成根（鱼头 / 流程起点）。
+   *
+   * 界面上有两处按节点列表工作（附加关系的下拉框、边端点的显示名），它们要的是
+   * "content 里真实存在的节点"。合成根不在 content 里，选中它 / 给它连线都会得到
+   * 一个 `findIn()` 找不到的 id，所以这里先摘掉；树型没有合成根，这张表与
+   * `flatNodes` 逐项相同。
+   */
+  const selectableNodes = computed<FlatNode[]>(() => {
+    const current = content.value;
+    // 没有 content 时画布上是预览：那棵树本来就全是节点（画布那边已设 `selectable: false`），
+    // 这里原样返回，界面不必再分一次叉。
+    if (!current) return flatNodes.value;
+    // 先建 id 集合再过滤（O(n)）：逐个 `findIn` 是 O(n²)，1000 节点的图每次重排
+    // 都要走一遍百万级的遍历。
+    const known = new Set<string>();
+    for (const node of iterNodesIn(current)) known.add(node.id);
+    return flatNodes.value.filter(entry => known.has(entry.node.id));
+  });
+
+  /**
+   * 这个节点是不是**某块区域的根**（中心主题 / 一根骨 / 一个阶段）。
+   *
+   * 界面上唯一需要它的地方是"删除"按钮的禁用态：删一根骨就不是鱼骨图了，而那件事
+   * 会在点的瞬间被 `deleteNode` 拒掉——按钮灰着比点一次再看一句提示便宜。
+   */
+  function isContainerRootId(id: string): boolean {
+    return content.value ? isContainerRoot(content.value, id) : false;
   }
 
   return {
@@ -1895,6 +3552,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     waitedMs,
     busy,
     selectedId,
+    // 多选：主选区（`selectedId`）+ 追加选区 → `selectedIds`。界面上的「已选 N 个」
+    // 与请求里的 `selected_ids` 都读后者。
+    selectedIds,
+    toggleSelect,
+    clearSelection,
     direction,
     viewAdjusted,
     editingId,
@@ -1906,18 +3568,45 @@ export const useMindMapStore = defineStore('mindmap', () => {
     dirty,
     layout,
     flatNodes,
+    // 可选中/可连线的节点（去掉合成根）：界面按节点列表工作的地方读它
+    selectableNodes,
+    isContainerRootId,
     nodes,
     edges,
     nodeCount,
+    // 附加关系：当前树上的全部边 + 与"选中节点"相关的那几条（侧栏用）。
+    // 两层分开返回：侧栏分组显示、删除按 id 判层级，都靠"谁属于哪一层"这件事。
+    contentEdges,
+    contentInnerEdges,
+    selectedEdges,
+    selectedInnerEdges,
+    // 边端点 id → 显示名：流程的边连的是阶段 id，只查节点会显示成一串 `s_xxx`
+    edgeNameOf,
+    connectNodes,
+    deleteEdge,
     selectedNode,
     selectedRefs,
     refIndex,
+    // 这次生成改了什么：落地瞬间冻结的一份静态快照（`create` 意图无基线时为 null）
+    generatedChanges,
+    // 这次落地的规模与改动条数：面板用它说"已落到画布（42 个节点，改了 6 处）"
+    generatedSummary,
+    // 这一轮请求带上去的选区：diff 的「范围内/外」按它判（不是按此刻的选区）
+    generationSelection,
+    // 版本冲突时保留的第二棵树：非空 = 正在等用户裁决
+    conflictDraft,
+    resolveConflict,
+    undoGenerate,
+    canUndoGenerate,
+    changedNodeIds,
     focusTick,
     breadcrumb,
     canUndo,
     canRedo,
     undoDepth,
     undoBytes,
+    // 还没提交的改动：保存时随内容一起落库，保存成功才清（见 `mindmap/edit-log.ts`）
+    pendingEdits,
     saving,
     conflict,
     maps,
@@ -1925,6 +3614,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     listBusy,
     cancel,
     preview,
+    importMap,
     loadPreset,
     select,
     locate,
@@ -1933,6 +3623,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     endEdit,
     commitLabel,
     commitNote,
+    setNodeVisualById,
     renameTitle,
     addChildTo,
     addSiblingTo,
@@ -1948,11 +3639,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     saveAsNew,
     dismissConflict,
     openList,
+    // 只拉列表不弹模态（`☰` 抽屉的历史区用它）
+    loadMaps,
     closeList,
     openMap,
     // agent 路径
     clientRevision,
-    candidate,
     agentPreview,
     agentPreviewScope,
     agentPreviewDropped,
@@ -1960,13 +3652,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentWarnings,
     agentRunning,
     agentError,
-    agentMode,
     runIntent,
+    // 这一次真正发出去的模型名 + 模型的思考过程（`done` 帧的两条）
+    runModel,
+    lastReasoning,
     expanding,
     generating,
     runGeneration,
     expandSelected,
-    acceptCandidate,
-    discardCandidate,
+    // 上次运行留下的结果（run 身份）
+    resumableRun,
+    probeResumableRun,
+    resumeRun,
+    ignoreResumable,
+    // 刚落进画布、还没保存的那个 run：界面据此把"上次没保存"与"刚刚这一次"分开
+    pendingRunId: pendingSaveRunId,
   };
 });

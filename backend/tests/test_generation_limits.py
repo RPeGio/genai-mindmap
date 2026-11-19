@@ -45,7 +45,7 @@ def _call(name: str, **arguments) -> ToolCall:
 
 def _run(tool: str, arguments: dict, ctx: RunContext):
     with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=_fake)):
-        return asyncio.run(build_registry("create").execute(_call(tool, **arguments), ctx))
+        return asyncio.run(build_registry("create_deep").execute(_call(tool, **arguments), ctx))
 
 
 def _children(*labels: str) -> dict:
@@ -108,34 +108,6 @@ def test_first_generation_never_exceeds_the_call_budget_in_the_formula():
     assert ctx.model_calls_used <= RunBudget().max_model_calls
 
 
-def test_whole_tree_generation_is_clipped_to_the_initial_limit():
-    """整树生成没有"层"的概念，至少要守节点总数：超了裁到 80 并说明。
-
-    裁剪而不是判失败：这一次调用已经花掉，前 80 个节点是一棵合法的树；判失败
-    就什么都没有，而下一轮大概率还是给这么多。
-    """
-    # 每个节点最多 50 个子节点（契约），所以铺两层：5 × 24 + 1 = 121 个节点
-    wide = {"title": "宽树", "root": {"id": "r", "label": "根", "children": [
-        {"id": f"b{group}", "label": f"组{group}", "children": [
-            {"id": f"n{group}-{index}", "label": f"节点{group}-{index}", "children": []}
-            for index in range(24)
-        ]}
-        for group in range(5)
-    ]}}
-
-    async def wide_model(system, user, *, max_tokens=None, on_delta=None):
-        return wide
-
-    ctx = _ctx()
-    with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=wide_model)):
-        result = asyncio.run(build_registry("create").execute(
-            _call("mindmap_generate", topic="宽树"), ctx))
-
-    assert result.ok, result.content
-    assert result.data["node_count"] == INITIAL_MAX_NODES
-    codes = [item["code"] for item in result.data["diagnostics"]]
-    assert "TREE_CLIPPED_TO_INITIAL" in codes
-    assert "80" in result.content
 
 
 # ---------------------------------------------------------------- 扩展限额

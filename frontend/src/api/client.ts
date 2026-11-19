@@ -2,12 +2,23 @@ import type {
   AgentEvent,
   AgentRunRequest,
   CreateTextSourceResponse,
+  EditEventPayload,
+  EditEventRow,
+  EditHealth,
+  EditSummary,
+  ImportResult,
   LibraryList,
   LibrarySource,
   MapRecord,
-  MindMapContent,
+  DiagramContent,
+  Pref,
+  PrefSuggestion,
+  RunDetail,
+  RunSummary,
+  SavedPref,
   Source,
 } from './types';
+import type { EditEvent } from '../mindmap/edit-log';
 
 /** 后端错误体现在只返回 detail；契约 v2 会带 code/request_id，这里先兼容两种。 */
 interface ErrorBody {
@@ -93,27 +104,112 @@ export function getMindMap(id: string): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`);
 }
 
+/** 编辑日志的事件 → 请求体里的形状（前端的 camelCase 只活在内存里）。 */
+function toEventPayload(event: EditEvent): EditEventPayload {
+  return {
+    actor: event.actor,
+    kind: event.kind,
+    at: event.at,
+    ...(event.nodeId !== undefined ? { node_id: event.nodeId } : {}),
+    ...(event.field !== undefined ? { field: event.field } : {}),
+    ...(event.before !== undefined ? { before: event.before } : {}),
+    ...(event.after !== undefined ? { after: event.after } : {}),
+    ...(event.depth !== undefined ? { depth: event.depth } : {}),
+    ...(event.subtreeSize !== undefined ? { subtree_size: event.subtreeSize } : {}),
+    ...(event.nodeCount !== undefined ? { node_count: event.nodeCount } : {}),
+    ...(event.runId !== undefined ? { run_id: event.runId } : {}),
+  };
+}
+
+/**
+ * 保存请求体。
+ *
+ * 空事件数组**不发字段**：与 `sources` / `prefs_applied` 同一条约定——"这次一条
+ * 都没记"与"这个字段不存在"对读的人来说是同一件事，而少发一个字段让一次没有改动的
+ * 保存与上一版逐字节相同。
+ *
+ * `truncated` 是"这一次没带上多少条"（超出 `EDIT_EVENT_LIMIT` 的部分留在前端队列里
+ * 等下次），只在真的发生时才发：后端据此记一条 warning，不落表。
+ */
+function saveBody(
+  content: DiagramContent,
+  events: readonly EditEvent[],
+  truncated: number,
+): { content: DiagramContent; events?: EditEventPayload[]; truncated?: number } {
+  const body: { content: DiagramContent; events?: EditEventPayload[]; truncated?: number } = {
+    content,
+  };
+  if (events.length) body.events = events.map(toEventPayload);
+  if (truncated > 0) body.truncated = truncated;
+  return body;
+}
+
 /** 第一次保存：创建一条新记录，版本由服务端给（1）。 */
-export function createMindMap(content: MindMapContent): Promise<MapRecord> {
+export function createMindMap(
+  content: DiagramContent,
+  events: readonly EditEvent[] = [],
+  truncated = 0,
+): Promise<MapRecord> {
   return request<MapRecord>('/mindmaps', {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(saveBody(content, events, truncated)),
   });
 }
 
 /**
  * 覆盖保存已有导图。`version` 是"我打开时看到的版本"：
  * 服务端发现不是最新就返回 409，不会用旧内容盖掉别人的修改。
+ *
+ * `events` 与内容同一次请求提交，理由见 `stores/mindmap.ts::save()`：
+ * 第一次保存前没有 `map_id`，独立端点根本发不出去。
  */
 export function updateMindMap(
   id: string,
-  content: MindMapContent,
+  content: DiagramContent,
   version: number,
+  events: readonly EditEvent[] = [],
+  truncated = 0,
 ): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`, {
     method: 'PUT',
-    body: JSON.stringify({ content, version }),
+    body: JSON.stringify({ ...saveBody(content, events, truncated), version }),
   });
+}
+
+// ---- 编辑日志（"用户最常改什么"）----
+
+/**
+ * 这张图的改动统计。
+ *
+ * 这是这一版真正的交付物：`label_shrunk` 回答"标题是不是被普遍改短"，
+ * `removed_depth` 回答"删掉的集中在第几层"——两个都直接指向生成侧该改什么。
+ */
+export function getEditSummary(id: string): Promise<EditSummary> {
+  return request<EditSummary>(`/mindmaps/${encodeURIComponent(id)}/edits/summary`);
+}
+
+/**
+ * 最近的改动明细，新的在前。
+ *
+ * 统计给的是分布，明细回答"那 42 条具体是什么"——没有它，一个反常的平均值
+ * 只能靠连数据库才查得下去。
+ */
+export function listEditEvents(id: string, limit = 50): Promise<EditEventRow[]> {
+  return request<EditEventRow[]>(
+    `/mindmaps/${encodeURIComponent(id)}/edits?limit=${encodeURIComponent(limit)}`,
+  );
+}
+
+/**
+ * 跨图的链路健康检查：昨日编辑过的图数 / 昨日保存的图数。
+ *
+ * 单张图的 `summary` 只能回答"这张图记了什么"，回答不了"这张表还在工作吗"——
+ * 一条事件都收不到时，每张图的 `total` 都是 0，而 0 看起来和"没人改过"一模一样。
+ * **"保存了却一条事件都没有"在正常情况下不该发生**（每次生成落画布都记一条
+ * `generate`），所以这个比值是断链的可见证据。
+ */
+export function getEditHealth(): Promise<EditHealth> {
+  return request<EditHealth>('/mindmaps/edits/health');
 }
 
 // ---- agent 流式运行 ----
@@ -198,6 +294,39 @@ export function runAgentStream(
   return postSse<AgentEvent>(`${BASE}/agent/runs/stream`, body, onEvent, signal);
 }
 
+// ---- 运行台账（run 的身份与草稿）----
+
+/**
+ * 上次跑完、但结果还没被保存的运行。
+ *
+ * 默认取后端给的"有结果且没保存过"那一批，其中**包含"被取消但已经产出结果"的
+ * 运行**：那正是"关掉页面那 40 秒别白花"要捡回来的东西。只查 `done` 的话，
+ * 结果会被写进库、然后再也没人读过——表就成了一行字。
+ */
+export function listRuns(status?: RunSummary['status']): Promise<RunSummary[]> {
+  const query = new URLSearchParams({ unapplied: 'true' });
+  if (status) query.set('status', status);
+  return request<RunSummary[]>(`/agent/runs?${query.toString()}`);
+}
+
+/** 单条详情，带结果正文。只有点「载入」时才值得走这一趟。 */
+export function getRun(runId: string): Promise<RunDetail> {
+  return request<RunDetail>(`/agent/runs/${encodeURIComponent(runId)}`);
+}
+
+/**
+ * 这次生成的结果**被保存进库了**。
+ *
+ * 它不是"用户点了应用"（那个动作已经不存在了，生成结果直接落画布）：删掉候选层
+ * 之后，`applied_at` 回答的是"这份结果后来有没有存下来"，也正是"下次进页面还要
+ * 不要提醒"的判据。幂等，只在本来为空时打第一个时间戳，所以前端可以放心重试。
+ */
+export function markRunSaved(runId: string): Promise<void> {
+  return request<void>(`/agent/runs/${encodeURIComponent(runId)}/applied`, {
+    method: 'POST',
+  });
+}
+
 // ---- 文档上传 ----
 
 /**
@@ -228,6 +357,51 @@ export async function uploadDocument(file: File, signal?: AbortSignal): Promise<
   return body.source;
 }
 
+// ---- 用户偏好 ----
+
+/**
+ * 全部偏好，带每条的"上次生效"。
+ *
+ * 启动时调一次，结果填进 `usePrefs` 与 `useGenerationOptions`：偏好面板要列它，
+ * 生成面板的下拉要拿它当预填值。**两处读同一份**——各拉一次会先制造"面板改完、
+ * 下拉没变"的空窗。
+ */
+export function listPrefs(): Promise<Pref[]> {
+  return request<Pref[]>('/prefs');
+}
+
+/**
+ * 写一条。`changed=false` 表示这次提交没有改变任何东西（同值）。
+ *
+ * `source` 只有用户在建议里点"设为默认"时才传 `suggestion_accepted`：两种来源在
+ * 面板上显示不同的标签，而那个区别只有写入的这一刻知道。
+ */
+export function setPref(
+  key: string,
+  value: string,
+  source: 'user_explicit' | 'suggestion_accepted' = 'user_explicit',
+): Promise<SavedPref> {
+  return request<SavedPref>(`/prefs/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ value, source }),
+  });
+}
+
+/** 删一条。**硬删**：没有软删，也就不存在"删了但还能翻出来"这种界面谎言。 */
+export function deletePref(key: string): Promise<void> {
+  return request<void>(`/prefs/${encodeURIComponent(key)}`, { method: 'DELETE' });
+}
+
+/**
+ * 候选建议，**只读不落库**。
+ *
+ * 用户点"设为默认"才会走 `setPref`；点了"不用"则什么都不发生——一次拒绝不需要
+ * 留下任何记录。
+ */
+export function listPrefSuggestions(): Promise<PrefSuggestion[]> {
+  return request<PrefSuggestion[]>('/prefs/suggestions');
+}
+
 // ---- 知识库 ----
 
 /**
@@ -245,13 +419,20 @@ export function readLibrarySource(id: string): Promise<LibrarySource> {
 
 // ---- 导出 ----
 
-/** 后端三种格式都是纯文本响应，不能走 request()——它固定按 JSON 解析。 */
-export type ExportFormat = 'puml' | 'markdown' | 'opml';
+/**
+ * 四种导出都是纯文本响应，不能走 request()——它固定按 JSON 解析。
+ *
+ * `json` 是**唯一无损**的一种：另外三种都只有一个文字槽位（正文优先），
+ * `note` / `detail` 的区分、颜色、图标、图型、附加边往返一次就退化了。
+ * 它也是导入的保底——"导出改一改再导入"只有这条路能保证一条都不丢。
+ */
+export type ExportFormat = 'puml' | 'markdown' | 'opml' | 'json';
 
 const EXPORT_META: Record<ExportFormat, { label: string; extension: string }> = {
   puml: { label: 'PlantUML', extension: 'puml' },
   markdown: { label: 'Markdown', extension: 'md' },
   opml: { label: 'OPML', extension: 'opml' },
+  json: { label: 'JSON', extension: 'json' },
 };
 
 export function exportLabel(format: ExportFormat): string {
@@ -266,15 +447,15 @@ export function exportFilename(format: ExportFormat, title: string): string {
 
 export async function exportMindMap(
   format: ExportFormat,
-  content: MindMapContent,
+  content: DiagramContent,
 ): Promise<string> {
   let response: Response;
   try {
     response = await fetch(`${BASE}/export/${format}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // 后端三种导出统一取 `note or label`，这里直接发原样内容：
-      // 前端不再自己做"把正文折进标题"的拼接，避免同一份内容在两端拼出两种结果。
+      // 后端四种导出统一取 `note or label`（JSON 除外，它全字段照抄），这里直接发
+      // 原样内容：前端不再自己做"把正文折进标题"的拼接，避免同一份内容两端拼出两种结果。
       body: JSON.stringify({ content }),
     });
   } catch {
@@ -283,4 +464,42 @@ export async function exportMindMap(
 
   if (!response.ok) throw await toApiError(response);
   return response.text();
+}
+
+// ---- 导入 ----
+
+/**
+ * 上传一个已有的思维导图文件，由后端识别格式并解析成一份 `DiagramContent`。
+ *
+ * 与 `uploadDocument` 同一个形状（multipart 不能走 `request()`：它固定带
+ * `Content-Type: application/json`，而 multipart 的 boundary 必须由浏览器生成）。
+ *
+ * **后端只解析不落库**：拿到 `content` 之后由 store 装进画布，形态是"有未保存
+ * 修改的新导图"，用户点保存才写库。这样导入失败不会污染已有数据。
+ */
+export async function importMindMap(
+  file: File,
+  signal?: AbortSignal,
+): Promise<ImportResult> {
+  const form = new FormData();
+  // 字段名必须是 `file`：后端签名是 `file: UploadFile = File(...)`。
+  form.append('file', file);
+
+  let response: Response;
+  try {
+    response = await fetch(`${BASE}/mindmaps/import`, { method: 'POST', body: form, signal });
+  } catch {
+    throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
+  }
+
+  if (!response.ok) throw await toApiError(response);
+
+  const body = (await response.json().catch(() => null)) as ImportResult | null;
+  if (!body?.content) {
+    // 契约里失败一定走 400；拿到空壳说明后端出了问题，别把 undefined 塞进画布。
+    // 这里判的是"有没有 content"，不是"有没有 content.root"：导入的产物可能是
+    // 鱼骨图或流程图，那两个顶层结构上没有 `root`。
+    throw new ApiError(response.status, 'empty_import', '后端没有返回解析结果，请重试。');
+  }
+  return body;
 }

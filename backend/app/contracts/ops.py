@@ -15,10 +15,18 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.contracts.source import SourceRef
-from app.contracts.mindmap import MAX_NODE_DETAIL_CHARS, MAX_NODE_LABEL_CHARS, MAX_TREE_NODES
+from app.contracts.mindmap import (
+    MAX_EDGE_LABEL_CHARS,
+    MAX_NODE_DETAIL_CHARS,
+    MAX_NODE_ICON_CHARS,
+    MAX_NODE_LABEL_CHARS,
+    MAX_TREE_NODES,
+    NODE_COLORS,
+    EdgeKind,
+)
 
 
 class OpError(Exception):
@@ -45,6 +53,24 @@ class _OpBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _palette_color(value: str | None) -> str | None:
+    """`color` 的校验：`None` 不动、空串清空、其余必须是调色板键。
+
+    大小写与空白归一（模型常写 `"Blue "`）——这不只是宽容，归一是让"同一个键
+    在不同 op 里写成了两种形式"这个隐患消失。不认识的键**报错**（与
+    `normalize_color` 的"丢掉"不同）：这里已经是 op 契约层，能走到这里的只有
+    服务端自己构造的草案与前端解析出来的批次，报错不会误伤模型的一次正常产出。
+    """
+    if value is None:
+        return None
+    key = value.strip().lower()
+    if not key:
+        return ""
+    if key not in NODE_COLORS:
+        raise ValueError(f"color 只能是 {'/'.join(NODE_COLORS)} 之一，收到 {value!r}")
+    return key
+
+
 class AddOp(_OpBase):
     """在当前树里挂一个新节点。
 
@@ -63,27 +89,49 @@ class AddOp(_OpBase):
     # 那正是"节点是完整句子、画布挤成一团"的成因。缺省 `None` 与"空详情"同义
     # （契约层会把空串归一成 None，见 `mindmap.Node.blank_text_as_none`）。
     detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
+    # 视觉元素，语义见 `mindmap.Node.color` / `Node.icon`。`color` 仍然只收
+    # 调色板键（`_palette_color` 校验）：op 这一层是模型写得到的入口，如果这里
+    # 放开成自由字符串，"契约只允许预设色"这条就只剩下半条防线。
+    color: str | None = None
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
+
+    @field_validator("color")
+    @classmethod
+    def color_in_palette(cls, value: str | None) -> str | None:
+        return _palette_color(value)
 
 
 class UpdateChanges(BaseModel):
-    """只允许改这三个字段。
+    """只允许改这几个字段：`label` / `detail` / `color` / `icon`（+ 契约内部的 `source_refs`）。
 
-    `label` / `detail` / `source_refs` 都是 `None` 表示"这一项不动"，与"清空"
-    区分开：`source_refs=[]` 是显式清空，`source_refs=None` 是保持原样。这个区别
-    丢不得，否则模型漏写一个字段就等于把引用全删了。
+    引用（`source_refs`）在**模型这条路**上是关着的：模型给节点加一条引用就必须
+    逐字匹配原文，而这一步在生成路径上已经由 `validate_generated_content` 做过；
+    编辑路径再开一个入口，等于多一条能凭空造引用的路。契约里保留这个字段是因为
+    原生编辑（导入、界面）需要它——`agent.tools.EditChange` 才是模型看到的那一层，
+    那里没有它。
 
-    `detail` 走同一个约定：`None` = 不动，空串 = 清空（执行器归一成 `None`）。
-    用户在界面上手写的 `note` 不在这三个字段里——生成侧永远碰不到它。
+    五个字段统一的约定：`None` 表示"这一项不动"。空串是**显式清空**（`detail=""`
+    清空正文，`color=""` 清除颜色），执行器把空串归一成 `None`。这个区别丢不得：
+    只写 `None` 的话，模型永远摘不掉一个画错的图标——它会反复发同一条 update，
+    每次都"成功"但什么都没变。
     """
 
     model_config = ConfigDict(extra="forbid")
     label: str | None = Field(default=None, min_length=1, max_length=MAX_NODE_LABEL_CHARS)
     detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
     source_refs: list[SourceRef] | None = Field(default=None, max_length=20)
+    color: str | None = None
+    icon: str | None = Field(default=None, max_length=MAX_NODE_ICON_CHARS)
+
+    @field_validator("color")
+    @classmethod
+    def color_in_palette(cls, value: str | None) -> str | None:
+        return _palette_color(value)
 
     @model_validator(mode="after")
     def at_least_one(self) -> UpdateChanges:
-        if self.label is None and self.detail is None and self.source_refs is None:
+        if (self.label is None and self.detail is None and self.source_refs is None
+                and self.color is None and self.icon is None):
             raise ValueError("update 至少要改一个字段")
         return self
 
@@ -104,7 +152,7 @@ class RemoveOp(_OpBase):
 class MoveOp(_OpBase):
     """把节点（连同子树）挂到另一个父节点下。
 
-    这是四个 op 里唯一能改变拓扑的，也是唯一能造出环的：把 A 移到它自己的
+    这是四个**树** op 里唯一能改变拓扑的，也是唯一能造出环的：把 A 移到它自己的
     子孙下面，树就不再是一棵树。环检测在执行器里，不在这里——契约层拿不到
     整棵树，做不了这个判断。
     """
@@ -115,8 +163,51 @@ class MoveOp(_OpBase):
     index: int = Field(ge=0)
 
 
+class AddEdgeOp(_OpBase):
+    """挂一条附加边（`MindMapContent.edges`）。
+
+    与 `AddOp` 的两处关键差别：
+
+      - **`id` 是边的 id，不是节点的 id**。它只要求在边集合里唯一，与节点 id
+        互不干扰；服务端在规范化阶段分配（`agent/ops.py::new_edge_id`），模型
+        草案里用 `$tmp1` 这类临时名。
+      - **`source` / `target` 必须是已有节点**。这两个字段同样接受 `$` 临时名
+        ——"先在 add 里建两个节点、再用它们的临时 id 连一条边"是一条合法的批次，
+        而且正是批量工具最有用的一种形状。
+
+    `label` / `kind` 的语义与契约里的 `Edge` 完全一致（`kind` 用 `Literal`，
+    不接受自由字符串；`label` ≤ 40 字，纯空白归一成 `None`）。
+    """
+
+    op: Literal["add_edge"]
+    id: str = Field(min_length=1, max_length=100)
+    source: str = Field(min_length=1, max_length=100)
+    target: str = Field(min_length=1, max_length=100)
+    label: str | None = Field(default=None, max_length=MAX_EDGE_LABEL_CHARS)
+    kind: EdgeKind | None = None
+
+    @field_validator("label")
+    @classmethod
+    def blank_label_as_none(cls, value: str | None) -> str | None:
+        """纯空白的标签等于没有标签——与 `mindmap.Edge` 同一条归一。"""
+        return value if value and value.strip() else None
+
+
+class RemoveEdgeOp(_OpBase):
+    """删一条附加边。
+
+    只删边，**不动节点**：边不是结构，删掉它之后树完全不变。这与 `RemoveOp`
+    （级联删子树）是两件不同量级的事，所以分成两个 op 而不是给 `remove` 加一个
+    `edge: true` 开关——那会让"删节点"与"删线"在同一条路径上分叉，而两者的
+    失败语义、返回内容、撤销粒度都不一样。
+    """
+
+    op: Literal["remove_edge"]
+    id: str = Field(min_length=1, max_length=100)
+
+
 MindMapOp = Annotated[
-    Union[AddOp, UpdateOp, RemoveOp, MoveOp],
+    Union[AddOp, UpdateOp, RemoveOp, MoveOp, AddEdgeOp, RemoveEdgeOp],
     Field(discriminator="op"),
 ]
 

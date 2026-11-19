@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；这一组用例只关心
 // 详情面板上那个按钮与它发出的请求，画布整体换成占位元素。
@@ -54,6 +55,8 @@ function stubFetch(reply: () => Response) {
   const calls: Array<{ url: string; body: unknown }> = [];
   const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    // 偏好是挂载时的背景请求，不属于"点一次展开发出了什么"，不进 calls。
+    if (isPrefsRequest(url)) return prefsReply(url);
     // 页面挂载时会探一次 /api/health 取版本号，不算业务请求
     if (url.endsWith('/api/health')) {
       return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {
@@ -118,7 +121,7 @@ afterEach(() => {
 });
 
 describe('展开按钮的三态', () => {
-  it('能展开的节点：按钮可点，说明写清结果先落候选', async () => {
+  it('能展开的节点：按钮可点，说明写清结果直接落画布', async () => {
     const wrapper = mountApp();
     openAndSelect('risk');
     await wrapper.vm.$nextTick();
@@ -126,7 +129,7 @@ describe('展开按钮的三态', () => {
     const button = expandButton(wrapper);
     expect(button.text()).toBe('展开这一支');
     expect(button.attributes('disabled')).toBeUndefined();
-    expect(wrapper.find(EXPAND_SECTION).text()).toContain('确认后才进画布');
+    expect(wrapper.find(EXPAND_SECTION).text()).toContain('直接落画布');
   });
 
   it('expandable=no：按钮禁用，并说明已经到底了', async () => {
@@ -263,8 +266,8 @@ describe('展开中与生成中互斥', () => {
   });
 });
 
-describe('候选 → 确认 → 应用', () => {
-  it('ops 批次落进候选，点应用后新节点挂在被展开的节点下', async () => {
+describe('预览 → 落地', () => {
+  it('ops 批次落进工作树，done 落地后新节点挂在被展开的节点下', async () => {
     const batch = {
       batch_id: 'b1-0',
       base_revision: 0,
@@ -284,20 +287,19 @@ describe('候选 → 确认 → 应用', () => {
     await wrapper.vm.$nextTick();
 
     await expandButton(wrapper).trigger('click');
-    await vi.waitFor(() => expect(store.candidate).not.toBeNull());
+    await vi.waitFor(() => expect(store.generatedSummary).not.toBeNull());
 
-    // 候选只是"看得见"，画布还没变
-    expect(store.content?.root.children[0].children[0].children).toEqual([]);
-    const candidateRisk = store.candidate!.root.children[0].children[0];
-    expect(candidateRisk.children.map(child => child.label)).toEqual(['冒烟范围', '回归范围']);
-
-    expect(store.acceptCandidate()).toBe('applied');
+    // ops 只进工作副本，done 一到整树落地：新节点挂在被展开的那个节点下
     const risk = store.content!.root.children[0].children[0];
     expect(risk.children.map(child => child.label)).toEqual(['冒烟范围', '回归范围']);
     expect(risk.children[0].detail).toBe('先跑冒烟。');
     // 其余分支一个节点都没动
     expect(store.content!.root.children[0].children.map(child => child.label))
       .toEqual(['风险', '已到底', '旧节点']);
+
+    // 一步撤销退回展开之前：这是删掉候选层之后唯一的后悔药
+    store.undo();
+    expect(store.content!.root.children[0].children[0].children).toEqual([]);
   });
 });
 

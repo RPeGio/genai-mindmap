@@ -27,14 +27,14 @@
 | 1 | op 契约支持正文：`AddOp.note`、`UpdateChanges.note`（`None` = 不动、`""` = 清空） | `backend/app/contracts/ops.py`、`backend/app/agent/ops.py` |
 | 2 | 两端同构的 op 执行器与共用用例 | `tests/fixtures/mindmap_ops.json`、`frontend/src/mindmap/ops.ts` |
 | 3 | 生成时产出 1–2 句正文（有来源时不许编材料，仍守"只引用来源"） | `backend/app/generation/service.py`、`backend/app/generation/stream_partial.py` |
-| 4 | 前端把候选里的正文接住（`frontend/src/mindmap/ops.ts`、`stores/mindmap.ts` 的候选接受路径） | `frontend/src/stores/mindmap.ts` |
+| 4 | 前端把生成结果里的正文接住（`frontend/src/mindmap/ops.ts`、`stores/mindmap.ts` 的落地路径 `commitGenerated`） | `frontend/src/stores/mindmap.ts` |
 
 ## 3. 请你尽量别同时改的文件
 
 按冲突风险从高到低：
 
 1. `frontend/src/api/types.ts`、`frontend/src/api/contract-check.ts`——本轮类型收口就靠这两个文件，改动集中。
-2. `frontend/src/stores/mindmap.ts`——B 轮会动候选接受那一小段；A 轮不碰。
+2. `frontend/src/stores/mindmap.ts`——B 轮会动生成落地那一小段；A 轮不碰。
 3. `backend/app/contracts/ops.py`——B 轮的核心改动，等你确认后再动。
 
 反过来说，**A 轮我不会碰**：`backend/app/` 任何业务代码、`frontend/src/agent/`、`stores/sources.ts` 的上传与泳道、`canvas/MindNode.vue` 的节点内编辑与预览态。

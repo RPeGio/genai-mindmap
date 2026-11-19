@@ -2,6 +2,12 @@
 
 > 记录 2026-11-07 这一轮针对「上传材料生成导图」这条链路的排查与修复。
 > 所有数字都来自真机实测，测试结论取自 `python -m pytest` 与 `npm run test`。
+>
+> **后注（`acfdb5b`）**：候选层删掉之后，渲染源从三级降为两级——`content`（含刚生成落地
+> 的那棵树）与生长中的 `agentPreview`；`snapshot` 落地前由预览撑住，`done` 一到即整树进
+> 画布。「五、画布不渲染预览」那一节讲的是**结构**，已按当前实现改写，原来的三级与它当时
+> 的理由作为历史注脚留在节内。本文其余部分是当时的排查与实测结论，原样保留——那些讲的是
+> "为什么当初这么定"，改了会失真。
 
 ## 一句话结论
 
@@ -49,7 +55,11 @@
 
 ### 三、深度被三处压到两级
 
-带材料的新建走 `_generate()` → `SOURCED_DETAIL_PROMPT`，**一次调用生成整棵树，没有递归**。压深度的有三句话，一处比一处隐蔽：
+带材料的新建走 `_generate_deep()` → 骨架 + 按支检索 + 并发展开。**整树一次成型的
+`_generate()` 与其提示词已删除**（`docs/ONE-PATH.md`）：那条路的"一次调用写完整棵树"
+在正文不进 prompt 的前提下覆盖只有 5.1%，而分片按支检索是 30.5%。压深度的三句话
+（`PLAN_PROMPT` 的骨架规则、`BRANCH_EXPAND_PROMPT` 的"只写一层"、`SUBNODE_EXPAND_PROMPT`
+的路径锚点）仍是现行的三处约束，一处比一处隐蔽：
 
 | 位置 | 原文 | 后果 |
 |---|---|---|
@@ -77,13 +87,18 @@
 
 连续五次运行全部 5 层，没有一次退回 4 层。依据没松：逐节点把 label 里的数字串回原文检索，改前改后都是 0 处找不到；无引用节点从 1/103 变成 42/140，多出来的全是「结果（6）」「优化器（5.3）」这类组织性标题层，不是事实断言。
 
-### 四、流式挂错了路径
+### 四、流式挂错了路径（历史记录）
 
-`node_grow` 帧只在 `_generate_deep` → `ask_model` → `_GrowStream` 这条路上上报。而 `build_registry()` 在 `has_sources=True` 时会 `discard("mindmap_generate_deep")`（deep 不读材料，会产出一棵与材料无关的树还以 `ok=true` 返回，移除它是对的）。
+> **这一节描述的问题已经随着整树生成的删除而消失**：`mindmap_generate` 不再存在，
+> `node_grow` 也就只剩分片这一条上报路径（`_generate_deep` → `ask_model` →
+> `_GrowStream`），而分片现在是 `create` 唯一的生成路。下面保留原文，作为"为什么
+> 当初那条路不流式"的存档。
+
+`node_grow` 帧只在 `_generate_deep` → `ask_model` → `_GrowStream` 这条路上上报。而 `build_registry()` 当时在 `has_sources=True` 时会 `discard("mindmap_generate_deep")`（deep 不读材料，会产出一棵与材料无关的树还以 `ok=true` 返回，移除它是对的）。
 
 于是流式只存在于一条「不传材料、只给主题」的路径上，**真正在用的那条完全不流式**。`_generate` 的三处 `chat_async` 一个都没传 `on_delta`。
 
-两条路的增量提取还不能共用：deep 的响应是 `{"children":[{"label","expandable"}]}`，没有 id、位置靠调用方给的 slot 路径；`mindmap_generate` 输出完整树、自带 id。后者复用普通生成早已写好的 `parse_partial`（补括号把半截 JSON 变成可解析）与 `collect_new_nodes`（按 id 挑出真写完的节点、保序），另写一层 `id → 索引链` 的换算。
+两条路的增量提取没有共用：deep 的响应是 `{"children":[{"label","expandable"}]}`，没有 id、位置靠调用方给的 slot 路径；整树那条输出完整树、自带 id，另写了一层 `id → 索引链` 的换算。整树删除之后这条路也不再需要。
 
 `expandable` 一律传 `null`：整树提取器补出来的空 `children` 是解析中间态，不是模型在说「这支到底了」，不能当 `false` 用。
 
@@ -93,23 +108,28 @@
 
 `agentPreview` 只被 `AgentPanel` 消费成一个缩进列表（最多 24 行）；画布的 `store.nodes` / `store.edges` 只从 `content.root` 算，预览根本没进布局。
 
-**修法**：给画布加一层渲染源，三级优先级：
+**修法**：给画布加一层渲染源，**两级**优先级：
 
-1. `content`（已应用的图）——最优先，用户已经打开的图不能被顶掉。
-2. `candidate`（整树校验通过的完整候选）——`content` 为空时用它。
-3. `agentPreview`（生长中的预览）——前两者都没有时用它。
+1. `content`（你的作品，含刚生成落地的那棵树）——最优先，用户已经打开的图不能被顶掉。
+2. `agentPreview`（生长中的预览）——`content` 为空时用它。
 
-第二级是必须的：`snapshot` 到达时预览会被清空（这是对的，不能在快照之后还挂着没校验的树），渲染源不覆盖候选的话，画布会在那一刻掉回空态占位，用户还是得点一下才看得见。
+> **历史注脚（`acfdb5b` 起作废）**：这一节最初写的是三级，中间夹一级 `candidate`
+> （整树校验通过的完整候选）。当时的理由是"`snapshot` 到达时预览会被清空，渲染源
+> 不覆盖候选的话，画布会在那一刻掉回空态占位"。候选层删掉之后 `candidate` 这一级
+> 没有了，`agentPreview` 直接对 `content`：原来靠中间级兜住的那一帧改成**让预览撑到
+> `done`**——`snapshot` 只写工作副本 `draft`，不碰画布、也不清预览。那一帧不再空，
+> 中间级也就不再需要。
 
-`acceptCandidate()` 一行未改——候选只进渲染源、不进 `content`。**渲染与采纳是两件事**：前者看得见，后者才写进用户的图。
+`commitGenerated()` 一行未改——预览只进渲染源、不进 `content`。**渲染与落地是两件事**：
+前者看得见，后者才写进用户的图。
 
 预览节点没有 id，进布局前按路径派生（`preview-0-2-1`）。不用递增计数器：帧是增量到达的，计数器会随插入顺序变化，同一棵树两次渲染拿到不同 id，布局缓存和 Vue 的 key 一起抖。
 
-可编辑性选「不可选中」（`selectable` 只对 `content` 为真、`select(id)` 只接受 `content` 里真实存在的 id）。原因不是怕麻烦：`selectedId` 会被 `runGeneration` 带进 expand 请求的 `selected_ids`，预览与候选的 id 后端根本不认识。
+可编辑性选「不可选中」（`selectable` 只对 `content` 为真、`select(id)` 只接受 `content` 里真实存在的 id）。原因不是怕麻烦：`selectedId` 会被 `runGeneration` 带进 expand 请求的 `selected_ids`，预览的派生 id 后端根本不认识。
 
 顺带修掉三处这次改动会引爆的隐患：
 
-- `selectedNode` 原来只看 `flatNodes`，渲染源换成候选后可能显示一个候选节点，并给它摆出一排写 `content` 的编辑按钮。
+- `selectedNode` 原来只看 `flatNodes`，渲染源画着预览时可能显示一个预览节点，并给它摆出一排写 `content` 的编辑按钮。
 - `deleteNode(id)` 对不在树上的 id 会走完 `applyContent`：记一步历史、`clientRevision++`、状态栏说「已删除」，实际什么都没删。
 - `select(id)` 原来无条件接受画布传来的任何 id。
 
@@ -153,7 +173,7 @@
 ## 遗留
 
 - **深度到 5 层是提示词杠杆的极限**。6 条一级分支里 5 条停在第 4 层，只有「模型架构」一支到第 5 层。再往下只剩两条路——把一句话拆成数字碎片，或写死层数——都会破坏「不许造层级」和「不许写死层数」。要稳定到 6 层以上必须改调用结构（按层递归），本轮没做。
-- **打开旧图后生成，画布不显示生长**。`runGeneration` 不清 `content`，所以 `content` 非空时预览与候选都不顶掉它，生长只在右侧面板可见。要改需要像 `generate()` 那样做 previous/restore，属于 `runGeneration` 的语义变更。
+- **打开旧图后生成，画布不显示生长**。`runGeneration` 不清 `content`，所以 `content` 非空时预览不会顶掉它，生长只在右侧面板可见。要改需要像 `generate()` 那样做 previous/restore，属于 `runGeneration` 的语义变更。
 - **折叠还没做**。1000 节点的图摊平在画布上，可读性靠缩放。折叠做完之后，深度限制才真正可以彻底交给模型。
 - **节点级 `source_refs` 没在界面上体现**，`ops` 帧前端也没消费。
 

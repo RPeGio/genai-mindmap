@@ -35,7 +35,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
-from app.contracts.source import Source, SourceMetadata, blank_to_none, clean_tags, to_utc_iso
+from app.contracts.source import (Source, SourceKind, SourceMetadata, blank_to_none,
+                                  clean_tags, to_utc_iso)
 from app.knowledge import library as knowledge_library
 from app.knowledge import rerank as knowledge_rerank
 from app.knowledge import vector_cache
@@ -1111,16 +1112,16 @@ def _hybrid_enabled() -> bool:
 # 模型从父块里挑一句与查询无关的话也照样通过逐字校验。
 #
 # 两条前提现在都不成立了：
-#   - `MINDMAP_SOURCE_MODE` 已默认 `rag`：正文不进 prompt，检索返回的块**就是**模型
-#     能看到的全部上下文，粒度不够就真的读不懂。这条正是原注释说的"这个开关是为
-#     '只给片段'的形态准备的"——那个形态已经是默认形态。
+#   - 正文不进 prompt（`MINDMAP_SOURCE_MODE=full` 那条路已删除）：检索返回的块
+#     **就是**模型能看到的全部上下文，粒度不够就真的读不懂。这条正是原注释说的
+#     "这个开关是为'只给片段'的形态准备的"——现在只剩这一种形态。
 #   - ②有了对策：命中区间（`leaf_start`/`leaf_end`）会随 hits 一路累积到
 #     `RunContext.evidence`，生成收尾时交给 `verify_source_refs(..., evidence=...)`，
 #     落在父块里但不在命中子块里的引用会被标 `SOURCE_REF_OUTSIDE_EVIDENCE`。
 #     它是 warn 级诊断、**不剔除引用**（要求模型精确落在命中的那 200 字里过于苛刻，
 #     实测会成批删掉合法引用）；接线在 `tools._rag` → `RunContext.record_evidence`
-#     → `_generate` → `validate_generated_content` 这条链上，**先接线、后翻默认值**
-#     的顺序是刻意的：反过来会有一段时间是"父块模式 + 无防护"。
+#     → `tools._generate_deep` → `verify_source_refs` 这条链上，**先接线、后翻
+#     默认值**的顺序是刻意的：反过来会有一段时间是"父块模式 + 无防护"。
 PARENT_RETRIEVAL_ENV = "MINDMAP_PARENT_RETRIEVAL"
 
 # 判定方向与 `_hybrid_enabled` 相反这件事没变，但含义反过来了：那个默认开，所以
@@ -1532,6 +1533,21 @@ def _single_search(
 LIBRARY_SCAN_LIMIT = 100
 LIBRARY_PICK = 5
 
+#: 外部检索抓回来的来源类型（`tools._EXTERNAL_KINDS` 的值域）。
+#:
+#: 它们与用户自己上传的材料**共用一张 `library_sources` 表**，这是 `_external_sources`
+#: 刻意的设计（入库才拿得到持久 id，引用才能点回原文）。代价是"这张表里的东西从哪来"
+#: 在类型上已经分得开、在检索上却没人分开过：用户关掉「联网检索」之后，`_intake`
+#: 那道闸只拦住**新发一次 HTTP**，库里上一次联网抓回来的维基/论文照样会被库检索选中，
+#: 经 `tools._verify_sources` 进 `source_usage`。用户看到的就是"我明明关了，它还在搜"
+#: ——而 `content` 同时宣称"这张图完全基于模型知识"。
+#:
+#: 所以这条偏好在**检索侧**也要有落点（`drop_external`）。判据用 `kind` 而不是
+#: `metadata.tags`：`tags` 的约定是"用户给的分类"，拿它判身份会漂。上传路径
+#: （`ingestion.router` 的 `CreateTextSourceRequest` 只收 text/markdown，`parse_bytes`
+#: 按后缀给 document/image/audio）**产不出**这两类，所以这里等价于"外部检索入库"。
+EXTERNAL_SOURCE_KINDS = (SourceKind.web, SourceKind.paper)
+
 
 def _digest_of(source: Source) -> str | None:
     """来源的正文指纹；没有正文返回 `None`。
@@ -1563,6 +1579,7 @@ def _literal_coverage(terms: list[str], text: str) -> float:
 
 def _library_sources(
     question: str, filters: SourceFilter | None, exclude: list[Source],
+    *, drop_external: bool = False,
 ) -> list[Source]:
     """从库里挑出这次检索要用的来源（含正文），最多 `LIBRARY_PICK` 份。
 
@@ -1570,6 +1587,10 @@ def _library_sources(
     都不必进入切块那一步（`load` 出来的 `Source` 已经带着正文，但粗筛与切块都
     不为它发生）。`filter_sources` 只读 `source.metadata`，所以这一步与
     `search_sources` 里的过滤是同一个判断、同一套语义。
+
+    `drop_external` 把外部检索抓回来的那批（`EXTERNAL_SOURCE_KINDS`）整批剔出
+    候选池。它是"用户关掉了联网检索"这条偏好在检索侧的唯一落点——理由见那个
+    常量的注释：不在这里剔，关掉之后仍会命中上一次联网的产物。
 
     库不可用（磁盘满、文件被锁、表被删）时返回空列表并记 warning：检索退化成
     "只看本次请求的材料"，与加知识库之前一样。这不是静默——日志里有一条，而且
@@ -1589,6 +1610,9 @@ def _library_sources(
     present = {digest for source in exclude if (digest := _digest_of(source))}
     candidates = [item for item in pool
                   if item.content_hash and item.content_hash not in present]
+    if drop_external:
+        candidates = [item for item in candidates
+                      if item.kind not in EXTERNAL_SOURCE_KINDS]
     if filters is not None:
         candidates = filter_sources(candidates, filters)
     if not candidates:
@@ -1604,7 +1628,7 @@ def _library_sources(
 
 def _library_batch(
     question: str, top_k: int, filters: SourceFilter | None, *,
-    exclude: list[Source], parent: bool,
+    exclude: list[Source], parent: bool, drop_external: bool = False,
 ) -> list[EvidenceHit]:
     """库那批来源上的检索结果。
 
@@ -1613,8 +1637,11 @@ def _library_batch(
     `quote` 会是 450–700 字而请求内的那是同一形状……不，反过来：如果库那批走单级
     块，两边返回的 `quote` 粒度不同，调用方按 `end - start` 判断信息密度时会得到
     两个互相矛盾的结论。粒度必须跟着入口走。
+
+    `drop_external` 原样交给 `_library_sources`（剔掉外部检索那批）。它在**取正文
+    之前**生效，所以开关关着时连那几份的切块与 embedding 都不会发生。
     """
-    picked = _library_sources(question, filters, exclude)
+    picked = _library_sources(question, filters, exclude, drop_external=drop_external)
     if not picked:
         return []
     knowledge_library.touch([source.id for source in picked])
@@ -1747,7 +1774,8 @@ def _search_sources_core(
 
 def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
                    filters: SourceFilter | None = None,
-                   library: bool = False) -> list[EvidenceHit]:
+                   library: bool = False,
+                   drop_external: bool = False) -> list[EvidenceHit]:
     """在**本次请求带来的来源**里找相关片段（BM25 + 向量，RRF 融合）。
 
     默认（`library=False`）只查参数给的这些，不碰任何持久化索引：agent 一次运行
@@ -1805,12 +1833,18 @@ def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
       - 库里抽不到东西（空库 / 库不可用 / 被 `filters` 筛光 / 本次材料已覆盖）
         时输出与 `library=False` **完全相同**，连 `score` 都不重算——不该因为
         "库里有别的材料"而让同一批命中看起来变了。
+
+    `drop_external=True` 时库那批里**外部检索抓回来的**（`EXTERNAL_SOURCE_KINDS`）
+    不进候选池。它是「用户关掉联网检索」这条偏好在检索侧的落点，理由见那个常量：
+    不在这里剔，关掉之后仍会命中上一次联网的产物，而 `content` 同时宣称"完全基于
+    模型知识"。`library=False` 时它没有任何作用（那时根本不看库）。
     """
     question = query.strip()
     base = _search_sources_core(sources, question, top_k, filters)
     if not library:
         return base
-    extra = _library_batch(question, top_k, filters, exclude=sources, parent=False)
+    extra = _library_batch(question, top_k, filters, exclude=sources, parent=False,
+                           drop_external=drop_external)
     # 块坐标（`parent=False`）：保底段条数在这里没有下游消费者，丢掉即可。
     return _merge_batches(base, extra, top_k)[0]
 
@@ -2094,7 +2128,8 @@ def _search_parent_core(
 
 def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
                   filters: SourceFilter | None = None,
-                  library: bool = False) -> list[EvidenceHit]:
+                  library: bool = False,
+                  drop_external: bool = False) -> list[EvidenceHit]:
     """**用子块匹配、把父块回给调用方**（small-to-big / parent-document retrieval）。
 
     与 `search_sources` 的差别只有粒度，不是另一套检索：
@@ -2138,8 +2173,8 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
     的旧模块钉着这条）。
 
     为什么从"默认关"翻成"默认开"：原注释说这个能力是为"只给片段"的形态准备的，
-    那时返回的块就是模型能看到全部上下文，粒度不够就真的读不懂——而
-    `MINDMAP_SOURCE_MODE` 已经默认 `rag`，那个形态就是现在的默认形态。另一半
+    那时返回的块就是模型能看到全部上下文，粒度不够就真的读不懂——而正文不进
+    prompt 现在是**唯一**的形态（`MINDMAP_SOURCE_MODE=full` 已删除）。另一半
     顾虑（父块里与查询无关的段落也能通过逐字校验）已经有对策：命中的子块区间随
     hits 累积进 `RunContext.evidence`，生成收尾时交给
     `verify_source_refs(..., evidence=...)` 标 `SOURCE_REF_OUTSIDE_EVIDENCE`
@@ -2150,6 +2185,10 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
     **同一套粒度**：子块匹配、父块返回。开关关着（`MINDMAP_PARENT_RETRIEVAL=0`）时
     本函数转发给 `search_sources`，`library` 一并透传——"关掉父块模式"只该改变
     粒度，不该顺带把知识库关掉。
+
+    `drop_external` 与 `search_sources` 的同名参数同一个意思（剔掉库里的外部检索
+    产物），两条粒度分支都透传：只在一个分支上生效的话，
+    `MINDMAP_PARENT_RETRIEVAL` 一翻，用户关掉的开关就自己又打开了一半。
 
     **重排（`MINDMAP_RERANK`，默认 1）**在这里接：`_rerank_depth(top_k)` 把候选池
     放宽到 `max(top_k*4, 10)` 条，`_rerank_top` 在**融合与去重之后、截断之前**
@@ -2184,7 +2223,8 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
         标出哪几条是图带来的——`method` 不动。
     """
     if not _parent_retrieval_enabled():
-        hits = search_sources(sources, query, top_k, filters=filters, library=library)
+        hits = search_sources(sources, query, top_k, filters=filters, library=library,
+                              drop_external=drop_external)
         return _with_graph(hits, sources, query.strip(), top_k, filters, parent=False)
 
     question = query.strip()
@@ -2194,7 +2234,8 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
         # 单 query 没有"原 query 那一路"可言，池里也没有保底段。
         hits = _rerank_top(question, base, top_k)
     else:
-        extra = _library_batch(question, depth, filters, exclude=sources, parent=True)
+        extra = _library_batch(question, depth, filters, exclude=sources, parent=True,
+                               drop_external=drop_external)
         merged, reserve = _merge_batches(base, extra, depth, parent=True)
         hits = _rerank_top(question, merged, top_k,
                            reserve=min(reserve, _reserve_seats(top_k)))
@@ -2428,6 +2469,7 @@ async def search_multi(
     filters: SourceFilter | None = None,
     hyde: str | None = None,
     library: bool = False,
+    drop_external: bool = False,
 ) -> list[EvidenceHit]:
     """在**同一批来源**上并行跑 N 个 query，按 RRF 名次把各路**累加**后融合。
 
@@ -2460,6 +2502,10 @@ async def search_multi(
     返回形状。`library=True` 时库那批也跟着这个开关走（`_library_batch(parent=)`），
     否则两批的 `quote` 粒度不同，调用方按 `end - start` 估信息密度会得到两个互相
     矛盾的结论。
+
+    `drop_external` 与 `search_sources` / `search_parent` 的同名参数同一个意思
+    （见 `EXTERNAL_SOURCE_KINDS`）：多路是这个函数与它们唯一的差别，开关语义不该
+    因为走了多路而少一半。
 
     `queries` 里的每条问法都会各自产出 BM25 与向量两路名次，同一块被多路命中
     就把 `1/(RRF_K+名次)` 一路一路加起来。这是多路唯一的价值来源：单路里
@@ -2587,7 +2633,8 @@ async def search_multi(
         return _rerank_top(question, fused, top_k, reserve=seats)
     # 跨批融合在**折叠之后**做（`parent` 一致时两批都是同一粒度），理由见
     # docstring 的 `library=True` 那一段。
-    extra = _library_batch(question, depth, filters, exclude=sources, parent=parent)
+    extra = _library_batch(question, depth, filters, exclude=sources, parent=parent,
+                           drop_external=drop_external)
     merged, merged_reserve = _merge_batches(fused, extra, depth, parent=parent)
     return _rerank_top(question, merged, top_k,
                        reserve=min(merged_reserve, _reserve_seats(top_k)))

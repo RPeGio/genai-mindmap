@@ -14,8 +14,9 @@
 写成用例只会测到父块切在哪。拆成两份材料之后这条性质是构造保证的，断言才有
 意义。（这条限制本身值得记下来：同一份材料里兄弟块的内容会随父块一起串门。）
 
-形态前提：分片检索只在 `rag` 下发生（`full` 下正文已在 prompt 里，检索是白花），
-所以本文件默认跑在 `rag`，另有两支用例钉住 `full` 下"不做检索、注册表仍撤掉 deep"。
+形态已不再是一个开关：`MINDMAP_SOURCE_MODE` 与它的 `full` 分支整体删除，判据只剩
+"这次有没有可检索的正文"。所以本文件直接跑在那条唯一的路上；没有正文分支的用例
+（不检索、`retrieval.mode == "off"`）在文末单独一条。
 
 `tests/conftest.py` 默认把 `MINDMAP_PARENT_RETRIEVAL` 关掉（那是为了让检索类用例
 稳定走单级 BM25）。需要两级命中的用例自己打开它——这也正好覆盖了两种开关状态：
@@ -48,7 +49,6 @@ from app.agent.tools import (
     build_registry,
 )
 from app.contracts.source import Source, SourceKind
-from app.generation.service import SOURCE_MODE_ENV
 from app.knowledge.service import EvidenceHit
 
 # 两份互不重叠的材料：一份讲预算审批，一份讲绩效考核。分支标题照这两块起，
@@ -143,7 +143,7 @@ def _run_deep(ctx: RunContext, chat, *, registry_with_sources: bool = True, **ar
     """
     args = {"topic": "管理办法", "branches": 3, "points_per_branch": 2}
     args.update(arguments)
-    registry = build_registry("create", has_sources=registry_with_sources)
+    registry = build_registry("create_deep", has_sources=registry_with_sources)
     with patch("app.agent.tools.chat_async", new=chat):
         return asyncio.run(registry.execute(
             ToolCall(call_id="c-deep", name="mindmap_generate_deep", arguments=args),
@@ -160,9 +160,8 @@ def _codes(result) -> list[str]:
 
 
 @pytest.fixture(autouse=True)
-def _rag_mode(clean_env, monkeypatch):
-    """本文件默认 `rag` 形态：分片检索只在这条路上发生。"""
-    monkeypatch.setenv(SOURCE_MODE_ENV, "rag")
+def _clean_globals(clean_env):
+    """依赖 `clean_env` 清掉宿主机上的凭证与开关（本文件不需要别的形态前提）。"""
     yield
 
 
@@ -275,6 +274,85 @@ def test_citable_quote_is_copied_into_source_refs(monkeypatch):
             assert node.source_refs, node.label
 
 
+def test_evidence_given_but_unused_is_reported(monkeypatch):
+    """每支都拿到证据、模型一条引用都不写 → `EVIDENCE_UNUSED`（warn）。
+
+    `_plain_chat` 就是这种模型：它读得到证据数组，但只保证流程跑完。产出出来的树
+    与"一条都没检索到"逐节点相同（全是无引用的要点），差别只在这条诊断里——不报
+    的话，检索成功与检索扑空在结果上完全无法区分。
+    """
+    monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
+    seen: dict[str, int] = {}
+
+    async def chat(system, user, *, max_tokens=None, on_delta=None):
+        if system.startswith(PLAN_PROMPT):
+            return _plan(*BRANCHES)
+        title = _branch_of(user)
+        seen[title] = len(_evidence_of(user))
+        return _two(title)              # 只看证据、不写引用
+
+    ctx = _ctx()
+    result = _run_deep(ctx, chat)
+
+    assert result.ok, result.content
+    with_evidence = sum(1 for count in seen.values() if count)
+    assert with_evidence, "前提：至少一支拿到了证据"
+    item = next(entry for entry in result.data["diagnostics"]
+                if entry["code"] == "EVIDENCE_UNUSED")
+    assert item["level"] == "warn"
+    # 两个数都在：几条分支/几条（去重后的）证据，最后剩几条引用
+    assert f"{with_evidence} 条分支拿到了材料依据" in item["message"]
+    assert "最终 0 条引用" in item["message"]
+    assert "模型一条引用都没有写" in item["message"]
+    # content 里也要有一句：用户读到的只有它
+    assert "按支检索给到的证据这次没有被用上" in result.content
+    assert result.data["source_refs"]["kept"] == 0
+    assert result.data["source_refs"]["dropped"] == 0
+    assert all(not node.source_refs for branch in ctx.candidate.root.children
+               for node in branch.children)
+
+
+def test_unused_evidence_is_not_reported_when_citations_survive(monkeypatch):
+    """有证据、有引用 → 不报：这条诊断只描述"零引用"，引用少但不是零不在其列。"""
+    monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
+
+    async def chat(system, user, *, max_tokens=None, on_delta=None):
+        if system.startswith(PLAN_PROMPT):
+            return _plan(*BRANCHES)
+        title = _branch_of(user)
+        entry = _evidence_of(user)[0]
+        ref = {"source_id": entry["source_id"], "quote": entry["quote"][:200]}
+        return {"children": [
+            {"label": f"{title}·一", "expandable": False, "source_refs": [ref]},
+            {"label": f"{title}·二", "expandable": False, "source_refs": [dict(ref)]},
+        ]}
+
+    result = _run_deep(_ctx(), chat)
+
+    assert result.ok, result.content
+    assert result.data["source_refs"]["kept"] > 0, "前提：引用留在了树上"
+    assert "EVIDENCE_UNUSED" not in _codes(result)
+
+
+def test_unused_evidence_is_not_reported_without_any_evidence(monkeypatch):
+    """一次都没命中（含整树兜底）→ 不报：那是"没有证据"，不是"证据没用上"。
+
+    这条界限必须钉住：`with_evidence == 0` 时如果把 `refs_kept == 0` 当成"零引用"
+    一律报，每棵检索扑空的树都会多一条无解的告警，而真正的问题已经由
+    `BRANCH_RETRIEVAL_FALLBACK` / `BRANCH_NO_EVIDENCE` 说清楚了。
+    """
+    monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
+    monkeypatch.setattr("app.agent.tools.search_parent", lambda *_a, **_k: [])
+
+    result = _run_deep(_ctx(), _plain_chat)
+
+    assert result.ok, result.content
+    codes = _codes(result)
+    assert "BRANCH_RETRIEVAL_FALLBACK" in codes
+    assert "EVIDENCE_UNUSED" not in codes
+    assert "没有被用上" not in result.content
+
+
 def test_quote_whitespace_is_never_normalised(monkeypatch):
     """引文首尾的空白不许被洗掉：`quote == text[start:end]` 是逐字约束。
 
@@ -333,7 +411,11 @@ def test_branch_query_is_the_title_alone():
         result = _run_deep(_ctx(), _plain_chat)
 
     assert result.ok, result.content
-    assert seen == list(BRANCHES)            # 只有标题，顺序与骨架一致
+    # 顺序不保证：`_search_branch` 走 `asyncio.to_thread(search_parent, ...)`，
+    # append 发生在工作线程里，线程池先跑完哪条由调度决定。
+    # 钉顺序会在全量跑（其他用例占着线程池）时偶发红，而钉集合才是这条用例要说的事。
+    assert sorted(seen) == sorted(BRANCHES)   # 只有标题；集合一致，顺序不作要求
+    assert len(seen) == len(BRANCHES)
     assert all("管理办法" not in query for query in seen)
 
 
@@ -372,12 +454,12 @@ def test_branch_retrieval_does_not_consume_tool_calls():
     """跑一次真正的 agent 循环：`tool_calls` 计数必须是 1，不是 1+N。
 
     检索发生在工具内部，是服务端自己的并发检索——模型看到的仍然只是一次
-    `mindmap_generate_deep` 调用。这条如果退化（比如把检索做成 N 个独立工具），
-    `max_tool_calls` 的默认值 8 会在 20 支的图上直接把整次运行掐断。
+    `mindmap_generate` 调用。这条如果退化（比如把检索做成 N 个独立工具），
+    工具调用数会变成 1+N 并随分支数线性增长，几十支的图上迟早撞上
+    `max_tool_calls`（默认 50），而且撞在"刚生成完骨架"的位置上。
     """
-    deep_call = ToolCall(call_id="deep-1", name="mindmap_generate_deep",
-                         arguments={"topic": "管理办法", "branches": 3,
-                                    "points_per_branch": 2})
+    deep_call = ToolCall(call_id="deep-1", name="mindmap_generate",
+                         arguments={"topic": "管理办法", "branches": 3})
 
     class Provider:
         def __init__(self) -> None:
@@ -401,15 +483,29 @@ def test_branch_retrieval_does_not_consume_tool_calls():
                               usage={"prompt_tokens": 1, "completion_tokens": 1,
                                      "total_tokens": 2})
 
+    async def whole_tree(system: str, user: str, *, max_tokens=None,
+                         on_delta=None) -> dict:
+        """一次生成那条路的替身：骨架三条，一次写出整棵树（不看证据）。"""
+        if system.startswith(PLAN_PROMPT):
+            return _plan(*BRANCHES)
+        return {"title": "管理办法", "root": {
+            "id": "root", "label": "管理办法", "children": [
+                {"id": f"branch{index}", "label": title, "children": [
+                    {"id": f"branch{index}-1", "label": f"{title}·一", "detail": "说明。"},
+                    {"id": f"branch{index}-2", "label": f"{title}·二", "detail": "说明。"},
+                ]}
+                for index, title in enumerate(BRANCHES)
+            ]}}
+
     async def drain():
         return [event async for event in run(_ctx().request, provider=Provider())]
 
-    with patch("app.agent.tools.chat_async", new=_plain_chat):
+    with patch("app.agent.tools.chat_async", new=whole_tree):
         events = asyncio.run(drain())
 
     tool_ends = [event for event in events if event.type == "tool_end"]
     assert len(tool_ends) == 1, [event.type for event in events]
-    assert tool_ends[0].name == "mindmap_generate_deep"
+    assert tool_ends[0].name == "mindmap_generate"
     assert tool_ends[0].ok, tool_ends[0].result_summary
     # 检索确实跑过（不是"因为没跑所以没占额度"）
     assert tool_ends[0].result_summary["retrieval"]["mode"] == "branch"
@@ -599,6 +695,37 @@ def test_branch_hits_accumulate_into_run_context_evidence(monkeypatch):
     assert len(ctx.evidence) == 1
 
 
+# ---------------------------------------------------------------- 8. 没有材料时不检索
+
+
+def test_no_material_means_no_retrieval():
+    """没有可检索正文 → 一次分支检索都不发、`retrieval.mode == "off"`。
+
+    这一段原来是"`full` 形态不检索"的钉子（正文整份在 prompt 里，按支检索是白花）。
+    形态删掉之后判据变成"这次有没有可检索的正文字段"，结论一样：没有正文就没有
+    检索，也没有引用纪律要拼。
+    """
+    searches: list[str] = []
+
+    def spy_search(sources, query, top_k=5, *, filters=None):
+        searches.append(query)
+        return []
+
+    request = AgentRunRequest(
+        goal="整理管理办法", intent="create", sources=[],
+        budget=RunBudget(max_model_calls=20, max_tool_calls=8, max_output_tokens=32768),
+    )
+    empty = RunContext(request=request, candidate=None, sources_by_id={})
+
+    with patch("app.agent.tools.search_parent", new=spy_search):
+        result = _run_deep(empty, _plain_chat, registry_with_sources=False)
+
+    assert result.ok, result.content
+    assert searches == []
+    assert result.data["retrieval"]["mode"] == "off"
+    assert "按支检索" not in result.content
+
+
 def test_evidence_spans_from_every_branch_are_kept(monkeypatch):
     """每支的命中都要进证据集：只把第一支记进去，后面两支的引用会被判越界。"""
     monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
@@ -618,53 +745,3 @@ def test_evidence_spans_from_every_branch_are_kept(monkeypatch):
     assert result.data["retrieval"]["branches_with_hits"] == len(BRANCHES)
 
 
-# ---------------------------------------------------------------- 8/9. 形态与注册表
-
-
-def test_full_mode_never_retrieves_per_branch(monkeypatch):
-    """`full` 形态：一次分支检索都不发，提示词里也没有引用纪律。
-
-    正文整份在 prompt 里，分片检索是白花——而且 `full` 下模型引用没被这次检索
-    命中的段落是合法的，给它加"只许引命中的那一段"反而是错的。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "full")
-    searches: list[str] = []
-
-    def spy_search(sources, query, top_k=5, *, filters=None):
-        searches.append(query)
-        return []
-
-    result = _run_deep(_ctx(), _plain_chat, registry_with_sources=False)
-
-    assert result.ok, result.content
-    assert searches == []
-    assert result.data["retrieval"]["mode"] == "off"
-    assert "按支检索" not in result.content
-
-
-def test_full_mode_still_discards_deep(monkeypatch):
-    """`full` + 有来源：注册表里仍然没有 `mindmap_generate_deep`（行为不变）。
-
-    这是回归钉子：放开 discard 只该在 `rag` 下发生。`full` 下它按主题自由展开
-    的树与材料脱钩却会 ok=True 返回，那条路不能重新长出来。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "full")
-    names = build_registry("create", has_sources=True).names()
-    assert "mindmap_generate_deep" not in names
-    assert "mindmap_generate" in names
-    assert "rag_query" not in names
-
-    # 没有来源时两个生成工具都在场（与形态无关）
-    assert "mindmap_generate_deep" in build_registry("create").names()
-
-
-def test_rag_mode_registry_offers_deep_alongside_generate(monkeypatch):
-    """`rag` + 有来源：两个生成工具都在场，**没有** `rag_query`。
-
-    两条生成路都会在工具内部先检索（整树预检索、分片按支检索），再给检索工具
-    只会让模型连查八次把 `max_tool_calls` 用光、一次生成都没调。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "rag")
-    names = build_registry("create", has_sources=True).names()
-    assert names == ["mindmap_generate", "mindmap_generate_deep"]
-    assert "rag_query" not in names

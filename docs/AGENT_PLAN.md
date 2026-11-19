@@ -1,5 +1,13 @@
 # Agent 化改造实施计划
 
+> **这是一份历史设计稿（立项前后的规划），不是现状。** 正文原样保留，用于回答"当初为什么这么设计"。
+> 两处已与代码分叉，读之前先知道：
+> 1. **候选层已删除**（`acfdb5b`）：生成完成即落画布并标成未保存，没有「应用到画布」/「接受」/「丢弃」这些动作。
+>    下文出现的 `acceptCandidate` / `discardCandidate` / "候选就绪" / "待接受" 都是那一版的接口，现在不存在。
+>    当前落地点是 `frontend/src/stores/mindmap.ts::commitGenerated`。
+> 2. 阅读当下实现请看 `docs/AGENT_STREAM_PROTOCOL.md`、`docs/API.md`、`docs/FLOW.md`。
+> 若要做"把候选层请回来"这类改动，先读 `acfdb5b` 的提交说明——那里逐条写了删掉它换来了什么。
+
 ## 0. 先修三件小事（对应要求 11）
 
 以下均为待实施设计；路径以本仓库为准。`B=backend/app`、`BT=backend/tests`、`F=frontend/src`、`FT=frontend/tests`，表内路径按此前缀展开。

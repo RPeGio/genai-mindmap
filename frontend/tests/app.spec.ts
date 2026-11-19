@@ -1,4 +1,4 @@
-import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -6,6 +6,7 @@ import App from '../src/App.vue';
 import type { LibraryEntry, LibraryList, LibrarySource, MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
+import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 // jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；
 // 界面测试只关心输入区与详情面板，画布替换成占位元素。
@@ -53,7 +54,10 @@ function mountApp() {
  * 生成、保存这类业务请求，把它算进去只会得到一个假失败。
  */
 function apiCalls(fetchMock: ReturnType<typeof vi.fn>) {
-  return fetchMock.mock.calls.filter(([url]) => !String(url).endsWith('/health'));
+  return fetchMock.mock.calls.filter(([url]) => {
+    const u = String(url);
+    return !u.endsWith('/health') && !isPrefsRequest(u);
+  });
 }
 
 /**
@@ -66,6 +70,14 @@ function apiCalls(fetchMock: ReturnType<typeof vi.fn>) {
 const NOTE_TEXTAREA = 'textarea[aria-label="我的备注"]';
 
 /**
+ * 画布右上角那个框（合并后的 #2）：**唯一**说一句话的地方。
+ *
+ * 按 id 定位而不是 `get('textarea')`：左侧材料区还有一个「粘贴材料正文」的
+ * textarea，按标签取会随组件顺序拿到错误的那一个。
+ */
+const INTENT = 'textarea#intent';
+
+/**
  * 按文字找按钮：开发期示例选择器会异步插入一排按钮，
  * 用 `findAll('button')[0]` 会随加载时机拿到不同的东西。
  */
@@ -75,24 +87,45 @@ function buttonByText(wrapper: VueWrapper, text: string) {
   return found;
 }
 
+/** 这次被测动作真的打出去的 URL（偏好那几个背景请求不算）。 */
+/**
+ * 只数业务请求：挂载时的 `/api/prefs` 与 `/api/health` 都是背景动作。
+ *
+ * `/health` 是这一轮合并进来的（顶栏要显示后端版本号），不算业务请求——
+ * 不排除它，"没有发出生成请求"这类断言会被它顶成假失败。
+ */
+function agentUrls(mock: ReturnType<typeof vi.fn>): string[] {
+  return mock.mock.calls
+    .map(call => String(call[0]))
+    .filter(url => !isPrefsRequest(url) && !url.endsWith('/health'));
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe('App', () => {
-  it('空输入时不发请求，并提示用户', async () => {
-    const fetchMock = vi.fn();
+  it('空输入时按钮是禁用的，并说明「要写一个主题」', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      return streamReply([]);
+    });
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
-    await buttonByText(wrapper, '生成导图').trigger('click');
+    // 没主题、没材料：按钮点不动，原因写在那行提示里。合并之前这里是"点得下去、
+    // 然后弹一句「请在下方输入主题或文本」"——那个提示指向的框现在已经不存在了。
+    const submit = wrapper.get('[data-test="intent-box"] button');
+    expect(submit.attributes('disabled')).toBeDefined();
+    await submit.trigger('click');
 
-    expect(apiCalls(fetchMock)).toHaveLength(0);
-    // 提示必须点明是哪个框：用户把主题写进「导图标题」再点生成，界面毫无动静。
-    expect(wrapper.get('[role="status"]').text()).toContain('「输入主题或文本」');
-  });
+    // 挂载时会拉一次偏好（生成面板的两个下拉要带着它），所以断言的粒度是
+    // "没有发出生成请求"，而不是"一次 fetch 都没有"。
+    expect(agentUrls(fetchMock)).toEqual([]);
+    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('写一个主题，或者点「+」添加材料');  });
 
-  it('点生成把请求打到 agent 路由，候选不自动落画布', async () => {
+  it('点生成把请求打到 agent 路由，结果直接落画布', async () => {
     const fetchMock = vi.fn(async () => streamReply([
       { type: 'stage', seq: 1, stage: '准备' },
       doneFrame('model'),
@@ -100,30 +133,29 @@ describe('App', () => {
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('机器学习');
+    await wrapper.get(INTENT).setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
 
     // 生成只剩这一条通道
     await vi.waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith('/api/agent/runs/stream', expect.anything()));
-    // 候选要用户点「应用」才算数：画布可以先预览它，但 content 必须还是空的
-    await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
-    expect(useMindMapStore().content).toBeNull();
+    // 没有「应用」这一步了：done 一到树就进画布，并标成未保存
+    await vi.waitFor(() => expect(useMindMapStore().content).not.toBeNull());
+    expect(useMindMapStore().dirty).toBe(true);
+    expect(wrapper.text()).not.toContain('应用到画布');
   });
 
   it.each([
     { mode: 'model' as const, badge: '模型生成' },
     { mode: 'demo' as const, badge: '演示模式（非 AI 生成）' },
-  ])('接受候选后按 done 帧的 $mode 显示来源徽标', async ({ mode, badge }) => {
+  ])('落地后按 done 帧的 $mode 显示来源徽标', async ({ mode, badge }) => {
     // 演示模式产出的是一棵占位树，界面不能替它贴上"模型生成"。
-    // 来源只有 done 帧说得准，所以整条链路（帧 → 候选 → 接受 → 徽标）一起验。
+    // 来源只有 done 帧说得准，所以整条链路（帧 → 落地 → 徽标）一起验。
     vi.stubGlobal('fetch', vi.fn(async () => streamReply([doneFrame(mode)])));
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('机器学习');
+    await wrapper.get(INTENT).setValue('机器学习');
     await buttonByText(wrapper, '生成导图').trigger('click');
-    await vi.waitFor(() => expect(buttonByText(wrapper, '应用到画布')).toBeTruthy());
-    await buttonByText(wrapper, '应用到画布').trigger('click');
 
     await vi.waitFor(() => expect(wrapper.text()).toContain('3 个节点'));
     expect(wrapper.text()).toContain(badge);
@@ -146,7 +178,7 @@ describe('App', () => {
     );
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('x');
+    await wrapper.get(INTENT).setValue('x');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() =>
       expect(wrapper.get('[role="status"]').text()).toContain('模型服务暂时不可用'));
@@ -160,22 +192,26 @@ describe('App', () => {
     );
     const wrapper = mountApp();
 
-    await wrapper.get('textarea').setValue('x');
+    await wrapper.get(INTENT).setValue('x');
     await buttonByText(wrapper, '生成导图').trigger('click');
     await vi.waitFor(() =>
       expect(wrapper.get('[role="status"]').text()).toContain('模型返回超时'));
   });
 
   it('开发期示例按钮不经过后端就能装载导图', async () => {
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      return streamReply([]);
+    });
     vi.stubGlobal('fetch', fetchMock);
     const wrapper = mountApp();
 
     await vi.waitFor(() => expect(buttonByText(wrapper, '单节点')).toBeTruthy());
     await buttonByText(wrapper, '单节点').trigger('click');
 
-    expect(apiCalls(fetchMock)).toHaveLength(0);
-    expect(wrapper.text()).toContain('1 个节点');
+    // 示例装载走的是本地 `dev/samples`，一条生成/保存请求都不该有。
+    expect(agentUrls(fetchMock)).toEqual([]);    expect(wrapper.text()).toContain('1 个节点');
     expect(wrapper.text()).toContain('演示模式');
   });
 

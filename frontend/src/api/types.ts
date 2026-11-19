@@ -59,9 +59,50 @@ export interface MindNode {
    * 后端下发的这些字段就被序列化丢掉了（`note` 在 v1 阶段已经踩过同一个坑）。
    */
   collapsed?: boolean;
+  /**
+   * 这个节点在图里扮演什么：普通步骤 / 判定 / 起点 / 终点 / 输入输出 / 存储。
+   *
+   * 与 `MindEdge.kind` 是同一条分工的两半——**边**有语义类型（`flow`/`branch`/`loop`），
+   * 节点侧的对偶就是这个字段。流程图里判定节点要画菱形，否则「是/否」两个出口
+   * 从哪儿分出来读不出来。
+   *
+   * 刻意**不复用** `NodeStyle.shape`：那是导入侧的"用户画的那个形状"，逐像素还原
+   * 用；`color` 与 `style.color` 的分工已经把这条线划过一次（语义不能塞进样式）。
+   * 也刻意**不靠出边数推断**：用户编辑到一半会闪变。
+   *
+   * 缺省 `null` = 普通步骤，与加这个字段之前的渲染逐像素相同。
+   */
+  role?: 'step' | 'decision' | 'start' | 'end' | 'data' | 'database' | null;
   style?: NodeStyle | null;
   pos?: NodePosition | null;
+  /**
+   * 语义色（调色板键）。**可选、缺省 `null`**，所以旧图不需要迁移。
+   *
+   * 只接受 `NODE_COLORS` 里的键，不是任意 hex：模型自由发挥的 hex 会得到一堆
+   * 脏色，而且换主题（暗色/亮色）时无法自动适配。渲染层把它映射到 CSS 变量
+   * （`--mind-color-<key>`，见 `styles.css`），色值不在数据里。
+   *
+   * 与 `style.color`（`#RRGGBB`，透传保存、界面不渲染）**不是同一个东西**，
+   * 两者同时存在时以这个为准——语义色是渲染意图，hex 是历史值。
+   */
+  color?: NodeColor | null;
+  /**
+   * 图标。目前是 emoji（零依赖、跨平台、`<span>` 直接渲染）。
+   *
+   * 契约上限 16 码点（组合 emoji 也要放得下）。只有一级分支会被生成侧要求带它：
+   * 一棵 80 节点的树如果每个节点都有图标，图标就不再指示任何东西。
+   */
+  icon?: string | null;
 }
+
+/**
+ * 节点语义色。与后端 `mindmap.NODE_COLORS` 一一对应。
+ *
+ * 用联合类型而不是 `string`：拼错一个键在编译期就红，而不是等到画出来是灰的
+ * 才有人发现。运行时那份清单在 `mindmap/edits.ts::NODE_COLORS`（与 `LIMITS`
+ * 同一个位置、同一条理由：数字与枚举值得两侧共读）。
+ */
+export type NodeColor = 'blue' | 'green' | 'amber' | 'red' | 'purple' | 'teal' | 'pink' | 'gray';
 
 /**
  * 节点还能不能再展开。与后端 `Node.expandable` 的取值一一对应。
@@ -99,18 +140,29 @@ export interface AddOp {
   source_refs?: SourceRef[];
   /** 生成产出的说明（上限 2000 字）。与 `note` 分开：后者永远是用户写的。 */
   detail?: string | null;
+  /** 语义色，只收调色板键（`NodeColor`）；不认识的键在执行器里被拒。 */
+  color?: NodeColor | null;
+  /** 图标（一个 emoji，≤16 码点）。 */
+  icon?: string | null;
 }
 
 /**
  * 改节点。
  *
- * `label`、`detail` 与 `source_refs` 缺省（undefined）表示"这一项不动"，与"清空"
- * 区分开：`source_refs: []` 是显式清空。这个区别丢不得。
+ * `label`、`detail`、`color`、`icon` 与 `source_refs` 缺省（undefined）表示
+ * "这一项不动"，与"清空"区分开：`source_refs: []` 是显式清空，`detail: ''` /
+ * `color: ''` 是清空该项。这个区别丢不得。
  */
 export interface UpdateOp {
   op: 'update';
   id: string;
-  changes: { label?: string; source_refs?: SourceRef[]; detail?: string | null };
+  changes: {
+    label?: string;
+    source_refs?: SourceRef[];
+    detail?: string | null;
+    color?: NodeColor | '';
+    icon?: string | null;
+  };
 }
 
 /** 删节点及整棵子树。根节点不可删。 */
@@ -127,7 +179,31 @@ export interface MoveOp {
   index: number;
 }
 
-export type MindMapOp = AddOp | UpdateOp | RemoveOp | MoveOp;
+/**
+ * 连一条附加边（`MindMapContent.edges`）。
+ *
+ * `id` 是**边 id**，不是节点 id：它只要求在边集合里唯一。服务端在规范化阶段
+ * 分配（`e_` 前缀），模型草案里用 `$tmp1` 这类临时名。
+ *
+ * `source` / `target` 必须是已有节点，且**允许成环**（A→B 之后 B→A 就是回退线）。
+ */
+export interface AddEdgeOp {
+  op: 'add_edge';
+  id: string;
+  source: string;
+  target: string;
+  /** 边上的文字（≤40 字）。`null` 表示没有文字。 */
+  label?: string | null;
+  kind?: EdgeKind | null;
+}
+
+/** 删一条附加边。不动节点：删线之后树一个字节都不变。 */
+export interface RemoveEdgeOp {
+  op: 'remove_edge';
+  id: string;
+}
+
+export type MindMapOp = AddOp | UpdateOp | RemoveOp | MoveOp | AddEdgeOp | RemoveEdgeOp;
 
 /** 整批原子生效。 */
 export interface OpBatch {
@@ -152,6 +228,153 @@ export interface MindMapContent {
   theme?: MindMapTheme;
   /** 契约 v2：节点之间的非层级关系。界面不渲染，原样透传保存。 */
   relations?: MindRelation[];
+  /**
+   * 跨父子节点的**附加边**：流程图里的条件跳转、汇合、回退。
+   *
+   * 树仍然是骨架（布局、展开、限额全部由它决定），这个字段只补上树表达不了的
+   * 那一类关系——**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 边**。
+   *
+   * 三个必须记住的性质：
+   *
+   *  - **不参与布局**。节点坐标仍由 `layoutTidy(root)` 算，边只画连线；否则每加
+   *    一条线整个画布都会重排，用户刚记住的位置就没了。
+   *  - **允许环**（A→B→A 就是回退线），也**允许跨子树**（那正是汇合）。
+   *  - **可选、缺省空**：旧图没有这个字段时按空数组处理，全部节点与行为不变。
+   */
+  edges?: MindEdge[];
+  /**
+   * 这张图**是什么图型**（镜像后端 `MindMapContent.diagram_type`）。
+   *
+   * 与 `layout` 不是一回事：`layout` 描述排布，图型描述"这张图按什么读"——流程图的
+   * 条件分支与回退只对 `flowchart` 有意义，鱼骨图的一级分支固定是人/机/料/法/环/测。
+   *
+   * **可选、缺省按 `tree` 处理**：旧图（与后端加这个字段之前生成的所有记录）没有
+   * 这个键，而它们全部由思维导图那条提示词生成。所以判断时要写 `?? 'tree'`，别写
+   * `=== 'tree'`——后者会把旧图判成"未知图型"。
+   *
+   * 唯一用法是「附加关系」区块的可见性（`App.vue`）：那个区块只对流程图有意义，
+   * 而在此之前代码里没有任何判断依据，只能一直摆着。
+   */
+  diagram_type?: DiagramType;
+}
+
+// ---- 另外两种图型的顶层结构（阶段 2 起后端真的会产出它们）----
+//
+// 三种内容的判别**靠形状，不靠 `diagram_type`**（镜像后端 `DiagramContent` 的注释）：
+// 树必有 `root`、鱼骨必有 `bones` + `problem`、流程必有 `stages`，三者天然互斥；
+// 而 `diagram_type` 在库里有一批"标着 fishbone、形状仍是树"的历史记录，拿它分派会
+// 让那些图走进不存在的分支。判别与分派都在 `mindmap/shape.ts` 里，别处不要自己写。
+
+/**
+ * 鱼骨图上的一根骨：一个类别 + 一棵子树。与后端 `FishboneBone` 逐字段对应。
+ *
+ * `root.children` 就是"这根骨下挂的原因"——套一层 `causes: list[Node]` 只会让
+ * "这条原因下面还能不能再展开"换个地方回答。
+ */
+export interface FishboneBone {
+  /** 主骨上那一行类别（人 / 机 / 料 / 法 / 环 / 测）。 */
+  category: string;
+  /** 骨自己的子树根。**原因挂在它的 `children` 上**，不挂在别处。 */
+  root: MindNode;
+  /** 骨的配色，独立于第一个原因（那是图的骨架，不是内容节点）。 */
+  color?: NodeColor | null;
+  icon?: string | null;
+}
+
+/**
+ * 鱼骨图。与后端 `FishboneContent` 逐字段对应。
+ *
+ * **没有 `layout`**：鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），
+ * 让用户选"横向还是纵向"只会得到一张画歪的鱼。所以这个类型上也不能有 `layout`
+ * ——`extra="forbid"` 会让多出来的那个键变成保存时的 422。
+ */
+export interface FishboneContent {
+  schema_version?: 2;
+  title: string;
+  diagram_type: 'fishbone';
+  /** 主骨上那一句（"为什么报销要 11 天"）。与 `title`（文件名）是两件事。 */
+  problem: string;
+  bones: FishboneBone[];
+  theme?: MindMapTheme;
+  relations?: MindRelation[];
+  source_usage?: SourceUsage[];
+}
+
+/**
+ * 流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。
+ * 与后端 `FlowStage` 逐字段对应。
+ *
+ * `id` 与节点 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 引用，节点 id
+ * 只被 `relations` 与阶段内部的树引用。合并之后"这条边连的是阶段还是步骤"只能靠
+ * 形状猜，而两者在画布上画出来的东西完全不同。
+ *
+ * ## 两处 `edges`、两个命名空间（这个结构最容易串的地方）
+ *
+ *  - `FlowContent.edges` —— **阶段之间**的跳转，端点是**阶段 id**（`s_…`）。画出来
+ *    是画布上的**主轴**，也参与 dagre 分层。
+ *  - `FlowStage.edges`（下面这个字段）—— **这个阶段内部**的边：判定节点的「是 / 否」
+ *    两条出边、以及步骤之间的顺序跳转。端点是**该阶段自己的节点 id**。画出来是
+ *    阶段内部的一条**细线**，**不参与布局**。
+ *
+ * 合成一个数组就得靠前缀区分命名空间，而节点 id 允许任意字符——`node:x` 这种
+ * 节点 id 与"前缀表示法"根本分不开。靠位置隔离则只要"每条边的两个端点都在这个
+ * 集合里"，一次查表，还天然排除了"阶段内的边连到另一个阶段"这种错。
+ */
+export interface FlowStage {
+  /** 阶段 id（后端规范化成 `s_` 前缀）。 */
+  id: string;
+  /** 阶段内部的步骤树根。`root.children` 就是这个阶段的第一步、第二步…… */
+  root: MindNode;
+  /**
+   * 阶段内部的边（端点必须是**这个阶段自己的**节点 id）。可选、缺省空：
+   * 旧记录没有这个键，按空数组处理——它们在加这个字段之前画出来正好也是那样。
+   */
+  edges?: MindEdge[];
+}
+
+/** 流程图。与后端 `FlowContent` 逐字段对应。 */
+export interface FlowContent {
+  schema_version?: 2;
+  title: string;
+  diagram_type: 'flowchart';
+  /** 顺序就是执行先后：流程图的"先后"是数组下标，不需要另一个 `order` 字段。 */
+  stages: FlowStage[];
+  /** **端点是阶段 id**，不是节点 id（与 `MindMapContent.edges` 刚好相反）。 */
+  edges?: MindEdge[];
+  theme?: MindMapTheme;
+  relations?: MindRelation[];
+  source_usage?: SourceUsage[];
+}
+
+/**
+ * 一份内容可能是三种形状之一。保存 / 读取 / 生成产物共用它。
+ *
+ * 写成联合而不是"一个宽松接口 + 一堆可选字段"：可选字段的版本里，`bones` 与
+ * `stages` 同时存在是**合法**的，而那样的图在契约层是 422——类型层面就不该允许
+ * 造出来。
+ */
+export type DiagramContent = MindMapContent | FishboneContent | FlowContent;
+
+/**
+ * 边的语义类型。与后端 `mindmap.EDGE_KINDS` 一一对应。
+ *
+ * 三个值各对应一种画法（`canvas/MindEdge.vue`）：`flow` 实线箭头、`branch` 换色、
+ * `loop` 虚线。所以它是联合类型而不是 `string`——拼错一个值在编译期就红，而不是
+ * 等到画出来是一条"看起来像普通箭头"的线才有人发现。
+ */
+export type EdgeKind = 'flow' | 'branch' | 'loop';
+
+/** 与后端 `app/contracts/mindmap.py::Edge` 一致的附加边。 */
+export interface MindEdge {
+  id: string;
+  /** 起点节点 id（必须在树里）。 */
+  source: string;
+  /** 终点节点 id（必须在树里）。 */
+  target: string;
+  /** 边上的文字（≤40 字）："是" / "否" / "通过" / "驳回"。 */
+  label?: string | null;
+  /** 语义类型；`undefined` / `null` 按 `flow` 画。 */
+  kind?: EdgeKind | null;
 }
 
 /** 与 `backend/app/contracts/mindmap.py::LayoutKind` 一致。 */
@@ -195,20 +418,70 @@ export interface MindRelation {
 export interface MapRecord {
   id: string;
   version: number;
-  content: MindMapContent;
+  /**
+   * 三种形状之一（树 / 鱼骨 / 流程）。
+   *
+   * 此前这里是 `MindMapContent`：阶段 2 之后库里真的会有另外两种，读回来直接
+   * `content.root` 会让"打开一张鱼骨图"炸在渲染层。判别与分派统一走
+   * `mindmap/shape.ts`，不要在这里自己判。
+   */
+  content: DiagramContent;
   updated_at: string;
+}
+
+// ---- 导入（`POST /api/mindmaps/import`）----
+
+/**
+ * 一条导入告警。**只有 code 与 message**（后端 `ImportWarningPayload`）。
+ *
+ * 定位信息（第几行、哪个节点）写在 message 正文里，不占单独字段：多一个字段就
+ * 多一次两端契约对齐，而"第 12 行"读在句子里并不更差。
+ *
+ * `code` 是稳定的（`truncated_nodes` / `source_refs_cleared` / `edges_dropped`…），
+ * 界面按它分组或加图标；`message` 是给人看的中文。**不要按 message 做判断**——
+ * 文案会改，码不会。
+ */
+export interface ImportWarning {
+  code: string;
+  message: string;
+}
+
+/**
+ * 导入的响应体。`source_format` 是识别出来的格式（`json` / `markdown` / `opml` /
+ * `xmind` / `freemind` / `puml`），界面用它说"按 XMind 读进来了"。
+ *
+ * **只解析不落库**：`content` 装进画布后是"有未保存修改"的状态，落库仍走保存。
+ */
+export interface ImportResult {
+  content: DiagramContent;
+  warnings: ImportWarning[];
+  source_format: string;
 }
 
 // ---- 来源（文档解析）----
 
-/** 来源模态，镜像后端 SourceKind。 */
-export type SourceKind = 'text' | 'markdown' | 'document' | 'image' | 'audio';
+/**
+ * 来源模态，镜像后端 SourceKind。
+ *
+ * `web` / `paper` 是**外部检索**抓回来的（维基百科条目、arXiv 论文），不是用户
+ * 上传的材料。分开不是为了好看：两者的可信度不同，界面上要能区分"我的材料"与
+ * "外面抓的资料"（引用只证明这句话出自那个来源，不证明来源本身权威）。
+ */
+export type SourceKind = 'text' | 'markdown' | 'document' | 'image' | 'audio' | 'web' | 'paper';
 
 export interface SourceUsage {
   source_id: string;
   kind: SourceKind;
   filename: string | null;
   char_count: number;
+  /**
+   * 原文地址（外部检索的来源才有）。
+   *
+   * 放在摘要里而不是只放在 `Source.metadata`：保存的导图**不带** `Source`，
+   * 重新打开时手里只有这份摘要——只把它留在 `Source` 上，等于"这一轮能看到链接，
+   * 下次打开就没了"。
+   */
+  url?: string | null;
 }
 
 /** 来源定位，供节点溯源。 */
@@ -279,6 +552,13 @@ export interface SourceMetadata {
   modified_at?: string | null;
   category?: string | null;
   tags?: string[];
+  /**
+   * 原文地址（外部检索专用）。后端只放行 http/https——`javascript:` 之类的 scheme
+   * 在这里是可执行的，所以校验在契约侧就做了，前端可以放心塞进 `<a href>`。
+   */
+  url?: string | null;
+  /** 抓取时的原始字符数（外部检索专用）：正文按 8000 字入库截断，这个数是截断前的。 */
+  raw_chars?: number | null;
 }
 
 /** 音频里的一句话及其在原始录音中的位置。 */
@@ -330,6 +610,23 @@ export interface LibrarySource {
 // ---- agent 运行 ----
 
 /**
+ * 图型（镜像后端 `AgentRunRequest.diagram_type` 的 Literal）。
+ *
+ * `tree` 思维导图 / `flowchart` 流程图 / `fishbone` 鱼骨图。三者共用同一条生成
+ * 流水线，差别只在骨架那一次要哪份提示词、要不要解析附加边。
+ */
+export type DiagramType = 'tree' | 'flowchart' | 'fishbone';
+
+/**
+ * 界面上下拉里可能出现的那四个值。
+ *
+ * `auto` **不是**发给后端的值：它表示"我不指手画脚"，请求体里干脆不带这个字段
+ * （后端 `None` = 让模型自己判断）。省略字段与老前端逐字节相同，而发一个假值
+ * 会让后端多一种要理解的状态。
+ */
+export type DiagramTypeChoice = 'auto' | DiagramType;
+
+/**
  * 一次 agent 运行。字段与 backend/app/agent/contracts.py 的 `AgentRunRequest` 对应。
  *
  * `create` 不能带 snapshot、`expand`/`edit` 必须带——那条约束在后端开流前校验，
@@ -339,6 +636,17 @@ export interface AgentRunRequest {
   goal: string;
   intent: 'create' | 'expand' | 'edit';
   /**
+   * 这次运行的**身份**（镜像后端 `AgentRunRequest.run_id`）。
+   *
+   * 由前端自己生成、每次点击生成一个新的：服务端发的话，客户端要先请求一次才拿得到
+   * id，而那一次请求本身就成了"第一次运行"——刷新重发时照样没有 id 可用。
+   *
+   * 幂等只在"带同一个 run_id"时生效。所以它的价值不是防"重复点击"（那是按钮禁用
+   * 与 `busy` 闸门的事），而是让服务端能认出"这是同一次运行又投递了一遍"：
+   * 正在跑 → 409 而不是再花一份钱；已经跑完 → 直接把上次产出的那棵树重放回来。
+   */
+  run_id?: string | null;
+  /**
    * 拆解方式：同一句主题换一套步骤，长出来的树结构就不同。
    *
    * 取值与后端 `generation.service.THINKING_MODELS` 的键一一对应；后端是
@@ -346,6 +654,27 @@ export interface AgentRunRequest {
    * string，由下拉框保证只在五个值里出现。缺省即 `default`。
    */
   thinking_model?: string;
+  /**
+   * 图型：用户在图型下拉里选的那一个。**省略 = 让模型自己判断**。
+   *
+   * 这个字段是"说了流程图就真的出流程图"的唯一保证：模型看不见界面，而工具参数
+   * `diagram_type` 它有默认值可走——用户说"画个流程图"，它把这句话当主题消化掉，
+   * 然后照默认的 `tree` 生成。提到请求层之后，图型不再依赖模型的记性。
+   *
+   * 只有 `create` 会用它：`expand` / `edit` 不生成骨架，图型对它们没有意义。
+   */
+  diagram_type?: DiagramType | null;
+  /**
+   * 这一次运行**实际带着哪些偏好**，形如 `["diagram_type.default=fishbone"]`。
+   *
+   * 由前端标（镜像后端 `AgentRunRequest.prefs_applied`），因为只有这里知道
+   * "下拉里这个值是偏好预填的、用户没动过"。后端**不会**把这个值塞进
+   * `diagram_type`——那会让"用户没说"与"用户选了"再也分不开。
+   *
+   * 它落进 `runs.request.prefs_applied`，是偏好面板上"上次生效"的唯一数据源。
+   * 没有它，一条偏好写进去之后没有任何办法证明它影响过任何一次生成。
+   */
+  prefs_applied?: string[];
   snapshot?: MindMapContent | null;
   selected_ids?: string[];
   /**
@@ -355,6 +684,42 @@ export interface AgentRunRequest {
    * 而模型需要的是带 source_id 的结构化数据——否则它写不出合法的引用。
    */
   sources?: Source[];
+  /**
+   * 「这一次」走不走推理模型（镜像后端 `AgentRunRequest.deep_thinking`）。
+   *
+   * 它是这**一次**的开关，不是设置：界面上那枚「深度思考」按钮点一下就变一次，
+   * 不写偏好、不进 `prefs_applied`。缺省不发这个字段，与加它之前逐字节相同。
+   */
+  deep_thinking?: boolean;
+}
+
+/**
+ * 运行台账里的一行（镜像后端 `agent.router.RunSummary`）。
+ *
+ * **不带结果正文**：那是一整棵树，20 条一起下发只为显示一句"上次生成还没保存"。
+ * 真要那份内容时点「查看」，走 `GET /api/agent/runs/{run_id}`。
+ *
+ * 这一行是"运行身份"落到界面上的唯一痕迹：此前 run 只活在一个 HTTP 连接的
+ * 寿命里，页面一关，已经跑出来的结果就跟着连接一起没了。
+ */
+export interface RunSummary {
+  run_id: string;
+  status: 'running' | 'done' | 'cancelled' | 'failed';
+  /** 原样回填：`create` 的结果落地时不能继承当前图的身份，`edit`/`expand` 要。 */
+  intent: 'create' | 'expand' | 'edit';
+  goal: string;
+  created_at: string;
+  updated_at: string;
+  /** 这份结果后来被保存了。空值 = 生成过、还没存下来，下次进页面会提醒一次。 */
+  applied_at?: string | null;
+}
+
+/** 单条运行的详情（镜像后端 `RunDetail`）：多出结果正文、失败原因与来历。 */
+export interface RunDetail extends RunSummary {
+  candidate?: DiagramContent | null;
+  failure?: { code?: string; message?: string } | null;
+  /** `demo` 是占位树、`model` 是模型产出。重放时按它标来源，不能一律写成模型。 */
+  mode?: 'demo' | 'model' | null;
 }
 
 /**
@@ -364,7 +729,17 @@ export interface AgentRunRequest {
  * `runGeneration` 里，一个 switch 能从头读到尾。
  */
 export type AgentEvent =
-  | { type: 'stage'; seq: number; stage: string; detail?: string }
+  /**
+   * 一句"现在在干什么"。
+   *
+   * `stage` 是**稳定标识**（`external_search`），不是文案——界面只显示 `detail`，
+   * `stage` 留给"按阶段换样式/抑制"与用例断言，所以它可以随时被后端加值，但已有
+   * 的值不会改。
+   *
+   * `count` 只在"这件事有数量结果"的帧上出现（外部检索的结束帧带命中条数）。
+   * 缺席＝还没结束，`0` ＝结束了但一条没找到，两者必须分得开。
+   */
+  | { type: 'stage'; seq: number; stage: string; detail?: string; count?: number }
   /**
    * 材料入库后的 id 对照表：旧 id → 库里的持久 id。
    *
@@ -401,7 +776,7 @@ export type AgentEvent =
       /** 模型写出来的可展开性；`null` 表示还没写到，与 `false` 不是一回事。 */
       expandable: boolean | null;
     }
-  | { type: 'snapshot'; seq: number; content: MindMapContent }
+  | { type: 'snapshot'; seq: number; content: DiagramContent }
   /**
    * 长静默期间的保活帧。
    *
@@ -412,7 +787,7 @@ export type AgentEvent =
   | {
       type: 'done';
       seq: number;
-      content?: MindMapContent | null;
+      content?: DiagramContent | null;
       usage?: Record<string, unknown>;
       /**
        * 这棵树是演示规则拼出来的还是模型产出的。
@@ -428,6 +803,176 @@ export type AgentEvent =
        * 直接显示，排障不用登服务器翻日志。
        */
       text?: string;
+      /**
+       * 模型这一轮的思考过程（`reasoning_content`）。
+       *
+       * 与 `text` 不同，**成功时也填**：走推理模型时它正是用户勾「深度思考」要看
+       * 的东西，界面用 `<details>` 折叠展示全文。上限见后端 `REASONING_BYTE_LIMIT`
+       * （编码后的 64 KiB，汉字约 21800 字；实测的 3000–8000 字远够，等于不截）。
+       */
       reasoning?: string;
+      /**
+       * 这一轮真正发出去的模型名（`deepseek-chat` / `deepseek-reasoner` / 配置值）。
+       *
+       * 缺字段＝没说（演示模式、按脚本回放的假 provider），不是"用了 chat"。
+       * 界面据此在消息流里写清"这次走了哪个模型"——勾了「深度思考」而配置没给对
+       * 名字时，这是唯一看得见的地方。
+       */
+      model?: string | null;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
+
+// ---- 用户偏好 ----
+
+/**
+ * 一条偏好（镜像后端 `prefs.service.Pref`）。
+ *
+ * 三层记忆里唯一缺的那一层——**跨请求、关于这个人的稳定事实**。会话那层是
+ * `runs` 里存的那棵树，工作区那层是 `MindMapContent` 本身。
+ */
+export interface Pref {
+  /** 键即主键：同一件事只能有一条。`diagram_type.default` / `note.1` …… */
+  key: string;
+  value: string;
+  scope: string;
+  /** `user_explicit` 是用户自己设的，`suggestion_accepted` 是点了建议才写的。 */
+  source: 'user_explicit' | 'suggestion_accepted';
+  source_run_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  /**
+   * 上一次**真的生效**是什么时候（来自 `runs.request.prefs_applied`）。
+   *
+   * 这一位是这张表的死表探测器：`null` 表示"这条偏好从没影响过任何一次生成"。
+   * 一条全都为 `null` 的面板，就是"写进去但没人读"的样子——不用翻日志。
+   */
+  last_applied_at?: string | null;
+}
+
+/** `PUT /prefs/{key}` 的响应：写入后的行，以及这次有没有真的改变。 */
+export interface SavedPref {
+  pref: Pref;
+  /** 同值重复提交是 `false`，且 `updated_at` 不刷新——不制造"我刚设过"的假象。 */
+  changed: boolean;
+}
+
+/**
+ * 一条**候选**建议（镜像后端 `prefs.service.Suggestion`）。
+ *
+ * 它不是偏好，只是一个判断："最近 3 次都是同一个值"。落库必须经过用户点一次，
+ * 因为实测同一主题两分钟内有过两次相反的图型要求——自动总结会在那里写出两条
+ * 互相矛盾的事实。
+ */
+export interface PrefSuggestion {
+  key: string;
+  value: string;
+  /** 值的中文名（"流程图"），供界面直接显示。 */
+  label: string;
+  count: number;
+  message: string;
+}
+
+// ---- 编辑日志（统计"用户最常改什么"）----
+//
+// 这几个类型是**日志载荷**，不是导图契约：它们的形状由 `POST/PUT /mindmaps` 的
+// 请求体决定，后端 `EditEventIn` 带 `extra="forbid"`。所以字段名漂移的表现是
+// **保存直接 422**，不是字段被静默丢掉——那正是 `api/contract-check.ts` 存在的
+// 理由（它防的是静默丢字段），所以这里刻意不把它加进那份检查：多一道编译期镜像
+// 换不来安全，只会让加一个统计字段要改三个文件。
+
+/** 一条改动。`at` 与 `depth` 的语义见 `src/mindmap/edit-log.ts`。 */
+export interface EditEventPayload {
+  actor: 'user' | 'agent';
+  /**
+   * `generate` 是"一次生成落到画布"（新数据）；`accept` 是它的前身（候选层还在时
+   * "用户点了应用"），只在历史行里出现。两字样都在，是因为库里既有老行也有新行。
+   */
+  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept' | 'generate';
+  node_id?: string;
+  field?: 'label' | 'title' | 'detail' | 'note' | 'color' | 'icon';
+  /** 摘要，不是内容（`detail`/`note` 只存 `"1800字"` 这种长度）。 */
+  before?: string;
+  after?: string;
+  depth?: number;
+  /**
+   * 这条 `remove` 一共删掉几个节点（含自己）。`1` = 零散删除，`12` = 整支一起删。
+   *
+   * 只有 `kind='remove'` 有值；`subtree_size` 为空的老数据是"当时没记"，统计里
+   * 单列成 `removed_subtree.size_unknown`，不会被当成 `1` 混进 `removed_depth`。
+   */
+  subtree_size?: number;
+  /** 历史列（`kind='accept'` 才有）。新数据不写它：分母改由 `node_count` 承担。 */
+  change_count?: number;
+  /**
+   * 这次生成落进画布的那棵树有几个节点。只有 `kind='generate'` 有值。
+   *
+   * **在生成完成那一刻算好**：保存时才数会数到用户改之后的树，分母永久偏高。
+   */
+  node_count?: number;
+  run_id?: string;
+  at: string;
+}
+
+/** 落库后的一行：载荷 + 自增 id + 入库时刻（`GET /mindmaps/{id}/edits`）。 */
+export interface EditEventRow extends EditEventPayload {
+  id: number;
+  /**
+   * 服务端写入时刻。与 `at` 分开是为了能诊断"事件说它 09:31 发生、
+   * 实际 09:35 才入库"——前端的时钟不可信，两者相等才是常态。
+   */
+  recorded_at: string;
+  map_id: string;
+}
+
+/**
+ * 统计结果（`GET /mindmaps/{id}/edits/summary`）。
+ *
+ * 两条恒等式让这份数字可以先自校验再读结论：
+ *  - `sum(by_actor) === total`；
+ *  - `sum(by_field) === by_kind.update + by_kind.style`（只有这两种事件带 field）。
+ */
+export interface EditSummary {
+  total: number;
+  /** 最近一条事件的**入库**时刻；空表是 `null`（不是空串）。死表探测器的读数。 */
+  last_event_at: string | null;
+  by_actor: Record<string, number>;
+  by_kind: Record<string, number>;
+  by_field: Record<string, number>;
+  /** 变短的标题改动，**只算 `actor='user'`**。`count` 为 0 时两个平均值为 `null`。 */
+  label_shrunk: { count: number; avg_before: number | null; avg_after: number | null };
+  /**
+   * 删掉的节点按层分布，键是层数（根=1）的字符串形式。
+   *
+   * **只统计零散删除**（`subtree_size = 1`）：一条 remove 现在代表一整棵被删的
+   * 子树，根所在的层不等于"这一层的内容被嫌弃"。
+   */
+  removed_depth: Record<string, number>;
+  /**
+   * 删除规模直方图：`{size_1: 5, size_12: 1, size_unknown: 2}`。
+   *
+   * `size_unknown` 是加列之前的老数据（`subtree_size` 为 NULL），它们**不进**
+   * `removed_depth`——否则那次"每层都在被删"的污染还在。
+   */
+  removed_subtree: Record<string, number>;
+}
+
+/**
+ * 跨图的链路健康检查（`GET /mindmaps/edits/health`）。
+ *
+ * 判据只有一句：**"保存了但没有任何事件"在正常情况下不该发生**——每次生成落画布都记
+ * 一条 `generate`，连一字未改也记。所以"昨日有保存、昨日零事件"只能是链路断了
+ * （前端在发、后端在丢）。这正是那张表能静默坏上 40 分钟的原因：它没有死表探测器。
+ */
+export interface EditHealth {
+  /** 统计窗口：UTC 昨日整天（`[window_start, window_end)`，与库里时间格式一致）。 */
+  window_start: string;
+  window_end: string;
+  /** 昨日有编辑事件的图数（`COUNT(DISTINCT map_id)`）。 */
+  edited_maps: number;
+  /** 昨日保存过的图数。`mindmaps.updated_at` 只留最后一次保存，所以这是下界。 */
+  saved_maps: number;
+  /** `saved_maps > 0 && edited_maps === 0`：日志链路可能是断的。 */
+  chain_suspect: boolean;
+  /** 一句话结论，界面直接显示。 */
+  detail: string;
+}

@@ -9,14 +9,9 @@
 """
 from __future__ import annotations
 
-import asyncio
-import os
-from unittest.mock import AsyncMock, patch
-
-from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
-from app.agent.tools import build_registry
+from app.agent.contracts import AgentRunRequest, RunBudget, RunContext
+from app.agent.tools import _source_readiness_diagnostic
 from app.contracts.source import Source, SourceKind
-from app.generation.service import SOURCE_MODE_ENV, SOURCE_MODE_FULL
 
 MATERIAL = "预算由财务经理核准后执行，超过五十万元报总经理审批。"
 
@@ -35,34 +30,15 @@ def _ctx(sources: list[Source]) -> RunContext:
                       sources_by_id={source.id: source for source in sources})
 
 
-def _tree() -> dict:
-    """三条一级分支（`MIN_BRANCHES` 的下限），不带引用。"""
-    return {
-        "title": "制度要点",
-        "root": {
-            "id": "root", "label": "制度要点",
-            "children": [
-                {"id": f"b{index}", "label": f"分支{index}",
-                 "children": [{"id": f"b{index}-1", "label": f"要点{index}", "children": []}]}
-                for index in range(3)
-            ],
-        },
-    }
-
-
 def _diagnostics(sources: list[Source]) -> list[dict]:
-    ctx = _ctx(sources)
-    mocked = AsyncMock(return_value=_tree())
-    with patch.dict(os.environ, {SOURCE_MODE_ENV: SOURCE_MODE_FULL}), \
-            patch("app.agent.tools.chat_async", new=mocked):
-        result = asyncio.run(
-            build_registry("create", has_sources=bool(sources)).execute(
-                ToolCall(call_id="c-gen", name="mindmap_generate",
-                         arguments={"topic": "制度要点"}),
-                ctx,
-            )
-        )
-    return result.data["diagnostics"]
+    """直接调那个纯函数：它只依赖 `ctx.request.sources` 与 `_verify_sources`。
+
+    上一版走 `mindmap_generate` 工具并 patch `SOURCE_MODE_FULL`——那个工具与
+    那套形态开关都已在「只留一条生成路」里删掉，而诊断本身还在
+    （`_generate_deep` 收尾会调它）。直接调函数比驱动一次生成更贴近被测对象。
+    """
+    diag = _source_readiness_diagnostic(_ctx(sources))
+    return [] if diag is None else [diag.model_dump()]
 
 
 def _readiness(sources: list[Source]) -> dict | None:

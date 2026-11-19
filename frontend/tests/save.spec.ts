@@ -459,7 +459,7 @@ describe('保存', () => {
   });
 
   it('保存期间重新生成：旧响应不会把身份套到生成出的新图上', async () => {
-    // agent 接受候选同样会换掉整张图，会话必须跟着切。否则 A 的保存响应回来时
+    // 生成落地同样会换掉整张图，会话必须跟着切。否则 A 的保存响应回来时
     // 会话号没变，mapId 会被写回 A，之后保存新图就 PUT 到 A 的记录上。
     const store = useMindMapStore();
     store.loadMap(sample(), { id: 'm1', version: 1, updated_at: '2026-11-04T00:00:00Z' });
@@ -474,6 +474,11 @@ describe('保存', () => {
           root: { id: 'nr', label: '新根', children: [] },
         });
       }
+      // 落地的上报是 204、不参与保存时序，不在这里应答的话会掉进下面那个
+      // "攒着不返回"的分支，把保存卡死。
+      if (url.includes('/agent/runs/')) {
+        return jsonResponse(null, 204);
+      }
       await new Promise<void>(resolve => { releaseSave = resolve; });
       return jsonResponse({
         id: 'm1', version: 2, content: sample(), updated_at: '2026-11-04T01:00:00Z',
@@ -483,9 +488,8 @@ describe('保存', () => {
     const saving = store.save();
     await vi.waitFor(() => expect(releaseSave).not.toBeNull());
 
-    // 保存还没回来，用户重新生成并接受了候选
+    // 保存还没回来，用户重新生成（结果直接落画布）
     await store.runGeneration('新主题', 'create');
-    expect(store.acceptCandidate()).toBe('applied');
 
     releaseSave!();
     await saving;

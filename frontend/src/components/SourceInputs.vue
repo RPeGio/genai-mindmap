@@ -1,48 +1,34 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed } from 'vue';
 
 import RecordButton from './RecordButton.vue';
-import { FILE_ACCEPT, MAX_INPUT_CHARS, MAX_SOURCES, mergedCharCount, SOURCE_LABELS, sourceInputError, sourceWarning, textSource } from '../sources/input';
+import { FILE_ACCEPT, MAX_INPUT_CHARS, MAX_SOURCES, mergedCharCount, SOURCE_LABELS, sourceWarning } from '../sources/input';
 import { useMindMapStore } from '../stores/mindmap';
 import { useSourcesStore } from '../stores/sources';
 
-const props = defineProps<{ confirmDiscard: (action: string) => boolean }>();
+/**
+ * **材料区**：它现在住在底部对话框的「+」面板里（`ChatDock.vue`），不再是一个常驻
+ * 左栏——那 320px 让画布永远窄一截，而材料只在"准备"那一步要看。
+ *
+ * 这里只放材料：粘贴的正文、上传的文档/图片、录音，以及它们的来源列表与清空。
+ * 主题和「怎么改」不在这里——那是画布底部那条对话框（`ChatDock.vue` 的 `#intent`）。
+ *
+ * **正文草稿不在这个组件里**（`sources.draftText`）。它曾经是这里的 `ref`，而这个
+ * 组件在生成中会被 `v-if` 整个卸载（对话框收成一条细进度）：还没点「添加」的正文
+ * 当场消失，用户以为是自己弄丢了。`beforeunload` 提醒同理由跟着搬到常驻的
+ * `ChatDock`。
+ */
 const store = useMindMapStore();
 const sources = useSourcesStore();
-const prompt = ref('');
 
-/**
- * 拆解方式（思维模型）。值与后端 `generation.service.THINKING_MODELS` 的键
- * 一一对应；选项写死在这里而不是拉接口，是因为这一批不做那个接口，而写死的
- * 五个值也正是后端 Literal 允许的全集——两边不一致时后端会 422，不会静默变形。
- */
-const THINKING_MODEL_OPTIONS = [
-  { value: 'default', label: '通用' },
-  { value: 'first-principles', label: '第一性原理' },
-  { value: 'feynman', label: '费曼' },
-  { value: 'systematic', label: '5W1H' },
-  { value: 'critical', label: '批判性' },
-];
-const thinkingModel = ref('default');
+/** 关页面提醒的挂载点放在 `ChatDock`（它常驻），这里只留一个说明性引用。 */
 
-/**
- * 拆解方式只在"会真正生效"的路径上出现：已有导图时走 `edit` 意图，后端的编辑
- * 路径不消费这个字段。摆一个选了不起作用的控件，比不摆更糟——用户会以为自己
- * 换过拆法了。
- */
-const thinkingModelVisible = computed(() => !store.content);
-
-const recording = ref(false);
+const recording = computed(() => sources.recording);
+/** 生成期间整块冻结：中途加的来源对这一轮不生效，让用户以为它生效比禁用更糟。 */
 const generating = computed(() => store.busy);
-const combined = computed(() => [
-  ...sources.readySources,
-  ...(prompt.value.trim() ? [textSource(prompt.value)] : []),
-]);
-const charCount = computed(() => mergedCharCount(combined.value));
-const problem = computed(() => {
-  if (!sources.items.length) return '';
-  return sources.problem || sourceInputError(combined.value);
-});
+
+const charCount = computed(() => mergedCharCount(sources.readySources));
+const problem = computed(() => sources.materialProblem);
 
 /**
  * 有导图时才谈"这份来源有没有被引用"。
@@ -52,26 +38,6 @@ const problem = computed(() => {
  */
 const showRefState = computed(() => !!store.content);
 
-/**
- * 状态行第二行：正常时是阶段文案，长静默时换成"模型正在思考"。
- *
- * 后端只在静默达到 10 秒才发心跳，所以 `waitedMs > 0` 基本等价于"已经静默 10 秒"。
- * 阈值再写一遍是为了前端自己也站得住：万一别处的实现改成更密的保活帧，
- * 这里不会 1 秒就把阶段文案顶掉。
- *
- * 外面必须再判一次"这一轮还在跑"：`waitedMs` 是流式状态，取消/断流/EOF 之后
- * 它可能还留着上一次心跳的值（归零由 store 负责，但渲染不该依赖"没忘"）。
- * 少了这个守卫，静默超 10 秒后点取消会看到"已取消。"和"模型正在思考"并列。
- */
-const SILENT_HINT_SECONDS = 10;
-const stageLine = computed(() => {
-  if (!generating.value) return '';
-  if (store.waitedMs >= SILENT_HINT_SECONDS) {
-    return `模型正在思考，已等 ${store.waitedMs} 秒`;
-  }
-  if (!store.stageText) return '';
-  return store.stageText;
-});
 
 function refCount(sourceId: string): number {
   return store.refIndex.counts[sourceId] ?? 0;
@@ -81,10 +47,6 @@ function refHits(sourceId: string) {
   return store.refIndex.hits[sourceId] ?? [];
 }
 
-function addText() {
-  if (sources.addText(prompt.value)) prompt.value = '';
-}
-
 async function onPickFiles(event: Event) {
   const input = event.target as HTMLInputElement;
   const selected = Array.from(input.files ?? []);
@@ -92,69 +54,38 @@ async function onPickFiles(event: Event) {
   input.value = '';
   await sources.addFiles(selected);
 }
-
-async function generate() {
-  if (generating.value || sources.parsing || recording.value || problem.value) return;
-  if (!props.confirmDiscard('重新生成')) return;
-
-  // 输入框里是"要做什么"，来源列表是"依据什么"——两者分开送。
-  // 曾经把材料正文拼进 goal 并截到 1000 字：材料大半被丢掉，而且只要输入框
-  // 有一个字，附件就完全不参与。是否新建取决于当前有没有导图。
-  const text = prompt.value.trim();
-  const ready = sources.readySources;
-  // 只写了材料、没写目标时给一句占位，别把正文当目标塞进去。
-  const goal = text || (ready.length ? `请基于附带的 ${ready.length} 份材料生成导图` : '');
-  await store.runGeneration(goal, store.content ? 'edit' : 'create', ready, thinkingModel.value);
-}
-
-function cancel() {
-  store.cancel();
-}
-
-function beforeUnload(event: BeforeUnloadEvent) {
-  if (!sources.items.length && !prompt.value.trim() && !recording.value) return;
-  event.preventDefault();
-  event.returnValue = '';
-}
-
-onMounted(() => window.addEventListener('beforeunload', beforeUnload));
-onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 </script>
 
 <template>
   <div class="flex flex-col gap-3">
     <div class="flex items-center justify-between">
-      <h2 class="text-sm font-semibold">多来源输入</h2>
+      <h2 class="text-sm font-semibold">材料（可选）</h2>
       <span class="text-xs text-slate-400">文本 · 文档 · 图片 · 语音</span>
     </div>
-    <label for="prompt" class="text-xs font-medium text-slate-600">输入主题或文本</label>
-    <template v-if="thinkingModelVisible">
-      <label for="thinking-model" class="text-xs font-medium text-slate-600">拆解方式</label>
-      <select
-        id="thinking-model"
-        v-model="thinkingModel"
-        :disabled="generating"
-        title="按这种方式拆解主题"
-        class="rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
-      >
-        <option v-for="item in THINKING_MODEL_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
-      </select>
-      <p class="text-xs leading-relaxed text-slate-400">按这种方式拆解主题</p>
-    </template>
+    <!-- 去掉输入框之后必须说明这里是什么；最后那句"不传材料就按主题生成"是**当前
+         默认行为**（`MINDMAP_EXTERNAL_KNOWLEDGE` 默认开），不写用户不知道会联网。 -->
+    <p class="text-xs leading-relaxed text-slate-500">
+      上传文档、粘贴文字或录音；不传材料就按主题生成（会去外部搜资料）。
+    </p>
+
+    <label for="material-text" class="text-xs font-medium text-slate-600">粘贴材料正文</label>
     <textarea
-      id="prompt"
-      v-model="prompt"
-      rows="4"
+      id="material-text"
+      v-model="sources.draftText"
+      rows="3"
       :disabled="generating"
       class="resize-y rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
-      placeholder="例如：机器学习的主要方向，也可粘贴一段补充材料"
+      placeholder="把要整理成导图的文字贴在这里，它会作为一份「材料」参与生成"
     />
     <button
       type="button"
       class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-      :disabled="generating || recording || !prompt.trim()"
-      @click="addText"
+      :disabled="generating || !sources.draftText.trim()"
+      @click="sources.addDraft()"
     >添加文本到来源</button>
+    <p class="text-xs leading-relaxed text-slate-400">
+      这里加的东西都算材料；写主题、说「怎么改」在画布底部那个对话框里。
+    </p>
 
     <label
       class="rounded-md border border-dashed border-slate-300 px-3 py-2 text-center text-xs text-slate-600 focus-within:ring-2 focus-within:ring-slate-200"
@@ -175,7 +106,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
     </p>
     <RecordButton
       :disabled="generating || sources.items.length >= MAX_SOURCES"
-      @active="recording = $event"
+      @active="sources.recording = $event"
       @recorded="sources.addFiles([$event])"
     />
 
@@ -190,7 +121,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       >清空来源</button>
     </div>
     <p v-if="!sources.items.length" class="text-xs leading-relaxed text-slate-400">
-      添加多个来源后一起生成；也可以只输入文本，直接生成导图。
+      添加多个来源后一起生成；不加材料也行，直接在画布底部的对话框里写一个主题。
     </p>
     <ul v-else aria-label="待生成来源" class="flex flex-col gap-2">
       <li v-for="item in sources.items" :key="item.key" class="rounded-md border border-slate-200 p-2">
@@ -258,20 +189,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
       <p class="text-xs" :class="charCount > MAX_INPUT_CHARS ? 'text-rose-700' : 'text-slate-500'">
         合并后 {{ charCount }} / {{ MAX_INPUT_CHARS }} 字（含分隔换行）
       </p>
-      <p v-if="prompt.trim()" class="text-xs text-slate-500">生成时会一并加入输入框中的补充文本。</p>
       <p v-if="problem" class="text-xs leading-relaxed text-amber-700">{{ problem }}</p>
       <p class="text-xs leading-relaxed text-slate-400">来源正文仅在本页保留；保存导图会保留来源摘要。</p>
     </template>
-    <div class="flex gap-2">
-      <button
-        type="button"
-        class="flex-1 rounded-md bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-        :disabled="generating || sources.parsing || recording || !!problem"
-        @click="generate"
-      >{{ generating ? '生成中…' : sources.items.length ? '合并生成导图' : '生成导图' }}</button>
-      <button v-if="generating" type="button" class="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700" @click="cancel">取消</button>
-    </div>
-    <p role="status" class="text-xs leading-relaxed text-slate-500">{{ store.status }}</p>
-    <p v-if="stageLine" class="text-xs text-slate-400">{{ stageLine }}</p>
   </div>
 </template>

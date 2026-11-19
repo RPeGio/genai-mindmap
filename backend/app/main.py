@@ -6,10 +6,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agent.router import router as agent_router
 from app.core.errors import register_error_handlers
 from app.export.router import router as export_router
+from app.importing.router import router as import_router
 from app.ingestion.router import router as ingestion_router
 from app.knowledge.router import router as knowledge_router
+from app.memory.router import router as memory_router
 from app.mindmaps.router import router as mindmap_router
 from app.optimization.router import router as optimization_router
+from app.prefs.router import router as prefs_router
 
 def _app_version() -> str:
     """线上版本号。
@@ -30,16 +33,25 @@ register_error_handlers(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["GET", "POST", "PUT"],
+    # 偏好面板要能删（`DELETE /api/prefs/{key}`）。只列出 GET/POST/PUT 时，浏览器
+    # 的预检会把 DELETE 挡在门外，而错误在界面上表现为一句没有信息量的
+    # "Failed to fetch"——那正是"删不掉"最难查的一种形状。
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
 # 已实现的完整闭环
 app.include_router(mindmap_router, prefix="/api")      # 保存 / 读取 / 版本
+app.include_router(import_router, prefix="/api")        # 导入已有导图（只解析，不落库）
 app.include_router(optimization_router, prefix="/api")  # 结构诊断与建议
 app.include_router(export_router, prefix="/api")       # 导出 puml
 app.include_router(ingestion_router, prefix="/api")    # 多模态输入
 app.include_router(agent_router, prefix="/api")        # AI 代理：文本/多来源 → 导图
+app.include_router(prefs_router, prefix="/api")         # 用户偏好：面板读 / 改 / 删
+# 跨会话记忆：列 / 手工加 / 删 / 按主题检索。手工入口不是给自动化用的，它存在的
+# 理由是让"检索与衰减对不对"能在空库上立刻被验证一次（见 `memory/router.py` 的
+# docstring：自动总结在空库上会合法地产出 0 条，那段时间里什么都证明不了）。
+app.include_router(memory_router, prefix="/api")
 
 # 已规划、接口已固定、实现待补
 app.include_router(knowledge_router, prefix="/api")    # 知识检索（返回空）

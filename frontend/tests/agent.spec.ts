@@ -1,13 +1,20 @@
-import { mount, type VueWrapper } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import AgentPanel from '../src/components/AgentPanel.vue';
+import App from '../src/App.vue';
 import SourceInputs from '../src/components/SourceInputs.vue';
 import type { MindMapContent, Source } from '../src/api/types';
 import { textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
+
+// jsdom 里没有 ResizeObserver，真正的 Vue Flow 画布跑不起来；挂整个 App 的那些
+// 用例只关心状态行，画布替换成占位元素。
+vi.mock('../src/canvas/MindMapCanvas.vue', () => ({
+  default: { name: 'MindMapCanvasStub', template: '<div data-test="canvas" />' },
+}));
 
 /** 把若干事件包成 SSE 帧，模拟后端 /api/agent/runs/stream。 */
 function agentReply(frames: unknown[]): Response {
@@ -42,13 +49,6 @@ function stubFetch(reply: () => Response) {
 
 const doneFrame = (payload: MindMapContent) => ({ type: 'done', seq: 4, content: payload });
 
-/** 按文字找按钮：输入区里「取消」「移除」这类按钮会随状态出现，只按序号取不可靠。 */
-function buttonByText(wrapper: VueWrapper, text: string) {
-  const found = wrapper.findAll('button').find(item => item.text().includes(text));
-  if (!found) throw new Error(`找不到按钮：${text}`);
-  return found;
-}
-
 /** 一次性 JSON 响应：openMap / save 走 request()，只读 json，不读流。 */
 function jsonReply(payload: unknown): Response {
   return { ok: true, status: 200, body: null, json: async () => payload } as unknown as Response;
@@ -59,7 +59,7 @@ function mapRecord(id: string, payload: MindMapContent) {
   return { id, version: 3, content: payload, updated_at: '2024-01-01T00:00:00Z' };
 }
 
-/** 先把一张有 id 的导图打开，供"接受候选之后身份怎么变"的用例起手。 */
+/** 先把一张有 id 的导图打开，供"生成落地之后身份怎么变"的用例起手。 */
 async function openExisting(id: string) {
   vi.stubGlobal('fetch', vi.fn(async () => jsonReply(mapRecord(id, content('原图')))));
   const store = useMindMapStore();
@@ -126,7 +126,7 @@ describe('agent 运行', () => {
     expect((body.snapshot as MindMapContent).root.label).toBe('根');
   });
 
-  it('done 只产生候选，不动画布', async () => {
+  it('done 直接落到画布，并标成未保存', async () => {
     stubFetch(() => agentReply([
       { type: 'stage', seq: 1, stage: '准备' },
       { type: 'tool_start', seq: 2, call_id: 'c1', name: 'mindmap_generate' },
@@ -138,24 +138,26 @@ describe('agent 运行', () => {
 
     await store.runGeneration('做一张导图', 'create');
 
-    expect(store.candidate?.root.label).toBe('新图');
-    // 关键约束：候选不自动应用，画布仍是旧内容
-    expect(store.content?.root.label).toBe('旧图');
-    expect(store.dirty).toBe(false);
+    // 核心行为：没有候选、没有「应用」，done 那一刻树就进画布了
+    expect(store.content?.root.label).toBe('新图');
+    expect(store.dirty).toBe(true);
+    expect(store.generatedSummary?.nodes).toBe(2);
     expect(store.agentEvents.map(event => event.type))
       .toEqual(['stage', 'tool_start', 'tool_end', 'done']);
   });
 
-  it('error 事件写进 agentError 且不产生候选', async () => {
+  it('error 事件写进 agentError 且画布不变', async () => {
     stubFetch(() => agentReply([
       { type: 'error', seq: 1, code: 'generation_failed', message: '模型服务不可用' },
     ]));
     const store = useMindMapStore();
+    store.preview(content('旧图'), 'right');
 
     await store.runGeneration('做一张导图', 'create');
 
     expect(store.agentError).toBe('模型服务不可用');
-    expect(store.candidate).toBeNull();
+    expect(store.content?.root.label).toBe('旧图');
+    expect(store.generatedSummary).toBeNull();
     expect(store.agentRunning).toBe(false);
   });
 
@@ -167,8 +169,9 @@ describe('agent 运行', () => {
 
     expect(calls).toHaveLength(0);
     // 提示必须指出是哪个框：用户把主题写进「导图标题」时，只说"请输入主题"
-    // 会让他以为系统坏了。
-    expect(store.status).toContain('输入主题或文本');
+    // 会让他以为系统坏了。合并之后那个框在画布右上角，提示也得跟着搬家。
+    expect(store.status).toContain('右上角');
+    expect(store.status).toContain('导图标题');
   });
 
   it('没有导图时不允许 edit', async () => {
@@ -195,7 +198,7 @@ describe('agent 运行', () => {
     expect(store.status).toContain('中断');
     expect(store.agentRunning).toBe(false);
     expect(store.busy).toBe(false);
-    expect(store.candidate).toBeNull();
+    expect(store.generatedSummary).toBeNull();
   });
 
   it('状态行显示的是人话，不是工具名', async () => {
@@ -331,9 +334,10 @@ describe('部分完成与诊断', () => {
     await store.runGeneration('做一张导图', 'create');
 
     expect(store.agentWarnings.some(item => item.kind === 'partial')).toBe(true);
-    // 只看 ok 的话这里是「候选已就绪」，与全部成功一模一样——正是要修掉的
-    expect(store.status).toContain('候选');
-    expect(store.status).toContain('部分');
+    // 只看 ok 的话这里只会说「已落到画布」，与全部成功一模一样——正是要修掉的：
+    // 树已经在画布上了，而它少了几个分支，这句话必须出现在落地时那一行里。
+    expect(store.status).toContain('已落到画布');
+    expect(store.status).toContain('部分分支未完成');
   });
 
   it('带 diagnostics 时面板列出诊断 message，超过三条折成计数', async () => {
@@ -376,7 +380,7 @@ describe('部分完成与诊断', () => {
     expect(text).toContain('还有 1 条');
   });
 
-  it('接受候选后告警清空，不再挂在面板上', async () => {
+  it('结果不完整时告警留在面板上，落地之后也不清', async () => {
     stubFetch(() => agentReply([
       {
         type: 'tool_end',
@@ -392,14 +396,14 @@ describe('部分完成与诊断', () => {
     await store.runGeneration('做一张导图', 'create');
     expect(store.agentWarnings).toHaveLength(1);
 
-    expect(store.acceptCandidate()).toBe('applied');
-
-    // 候选已经落到画布上，"这份候选缺了什么"再挂着只会让用户以为画布有问题
-    expect(store.agentWarnings).toHaveLength(0);
+    // 树已经在画布上了，而它少了几个分支——此刻比"落地之前"更需要这句话。
+    // 清掉就只剩一句"已落到画布"，用户改到一半才发现某几支是空的。
+    expect(store.content?.root.label).toBe('候选');
+    expect(store.agentWarnings).toHaveLength(1);
   });
 });
 
-describe('候选接受', () => {
+describe('生成落地', () => {
   async function prepare() {
     stubFetch(() => agentReply([doneFrame(content('候选'))]));
     const store = useMindMapStore();
@@ -408,51 +412,102 @@ describe('候选接受', () => {
     return store;
   }
 
-  it('接受后落到画布，并只记一条撤销', async () => {
+  it('落地只压一步撤销，撤销回到生成之前', async () => {
     const store = await prepare();
-    const before = store.canUndo;
-
-    expect(store.acceptCandidate()).toBe('applied');
-
     expect(store.content?.root.label).toBe('候选');
-    expect(store.candidate).toBeNull();
-    expect(store.dirty).toBe(true);
-    expect(before).toBe(false);
-    expect(store.canUndo).toBe(true);
 
+    expect(store.canUndo).toBe(true);
     store.undo();
     expect(store.content?.root.label).toBe('原图');
   });
 
-  it('候选生成之后改过树，接受要判过时', async () => {
+  it('「回到生成之前」在画布还是生成结果时可用，改过之后失效', async () => {
+    const store = await prepare();
+    expect(store.canUndoGenerate).toBe(true);
+
+    expect(store.undoGenerate()).toBe(true);
+    expect(store.content?.root.label).toBe('原图');
+
+    // 已经退回生成前，这一步没有可退的了
+    expect(store.canUndoGenerate).toBe(false);
+    expect(store.undoGenerate()).toBe(false);
+  });
+
+  it('生成之后又改过画布，「回到生成之前」不再自称一步到位', async () => {
+    const store = await prepare();
+    store.commitLabel('a', '我改的');
+
+    // 画布已经不是生成结果本身了：一次撤销退掉的是上面那次编辑，
+    // 把它说成"回到生成前"是骗人。
+    expect(store.canUndoGenerate).toBe(false);
+    expect(store.undoGenerate()).toBe(false);
+    expect(store.content?.root.children[0].label).toBe('我改的');
+  });
+
+  it('生成期间改过树：不覆盖，两棵树都留着等用户选', async () => {
     const store = await prepare();
 
-    // 模拟用户在等待期间改了节点文字
+    // prepare 之后再生成一次，中途改树（现在的编辑不再被锁住）
+    const reply = controllableReply();
+    stubFetch(() => reply.response);
+    const running = store.runGeneration('再生成一张', 'create');
+    reply.push(doneFrame(content('第二次')));
+    // done 到达之前先改一处：这正是"那 25 秒里我顺手改了个标题"
     store.commitLabel('a', '改过的甲');
-    expect(store.clientRevision).toBeGreaterThan(0);
+    reply.finish();
+    await running;
 
-    expect(store.acceptCandidate()).toBe('stale');
-    // 画布必须保持用户的修改，不能被候选顶掉
+    // 画布保持用户的修改，生成结果放进 conflictDraft
     expect(store.content?.root.children[0].label).toBe('改过的甲');
-    expect(store.candidate).not.toBeNull();
+    expect(store.conflictDraft).not.toBeNull();
+
+    expect(store.resolveConflict('generated')).toBe('applied');
+    expect(store.content?.root.label).toBe('第二次');
+    // 覆盖仍然可撤销：撤销栈顶是"落地之前的画布"，也就是他改过的那一棵，
+    // 再撤一步才回到更早的状态。
+    store.undo();
+    expect(store.content?.root.children[0].label).toBe('改过的甲');
   });
 
-  it('有未提交的编辑时接受要判过时', async () => {
+  it('冲突时选择保留我的，生成结果丢掉', async () => {
     const store = await prepare();
+    const reply = controllableReply();
+    stubFetch(() => reply.response);
+    const running = store.runGeneration('再生成一张', 'create');
+    reply.push(doneFrame(content('第二次')));
+    store.commitLabel('a', '改过的甲');
+    reply.finish();
+    await running;
+
+    expect(store.resolveConflict('mine')).toBe('kept');
+    expect(store.content?.root.children[0].label).toBe('改过的甲');
+    expect(store.conflictDraft).toBeNull();
+  });
+
+  it('生成期间正在编辑：不打断输入，走同一个裁决', async () => {
+    const store = await prepare();
+    const reply = controllableReply();
+    stubFetch(() => reply.response);
+    const running = store.runGeneration('再生成一张', 'create');
+    reply.push(doneFrame(content('第二次')));
     store.beginEdit('a');
+    reply.finish();
+    await running;
 
-    expect(store.acceptCandidate()).toBe('stale');
-    expect(store.candidate).not.toBeNull();
+    // 手打了一半的标题不能丢：进裁决，用户还能选"保留我的"
+    expect(store.conflictDraft).not.toBeNull();
+    expect(store.content?.root.label).toBe('候选');
   });
 
-  it('没有候选时接受返回 invalid', () => {
+  it('没有冲突时 resolveConflict 什么都不做', () => {
     setActivePinia(createPinia());
-    expect(useMindMapStore().acceptCandidate()).toBe('invalid');
+    const store = useMindMapStore();
+    expect(store.resolveConflict('generated')).toBe('kept');
   });
 
-  it('候选本身不合法时拒绝应用并清掉', async () => {
-    // 候选是模型产出的外部数据：label 长度、引用区间、节点数都可能越界。
-    // 不在装上画布之前拦一次，脏数据会先入画布，直到用户点保存才被后端 422
+  it('结果本身不合法时不落画布', async () => {
+    // 模型产出是外部数据：label 长度、引用区间、节点数都可能越界。
+    // 不在落地之前拦一次，脏数据会先进画布，直到用户点保存才被后端 422
     // 拒绝——那时他已经在这棵树上改了半天。
     const dirty = content('脏候选');
     dirty.root.children[0].label = '超'.repeat(201);
@@ -461,128 +516,144 @@ describe('候选接受', () => {
     store.preview(content('原图'), 'right');
 
     await store.runGeneration('做一张图', 'create');
-    expect(store.candidate).not.toBeNull();
 
-    expect(store.acceptCandidate()).toBe('invalid');
-    expect(store.candidate).toBeNull();
     expect(store.content?.root.label).toBe('原图');
-    expect(store.status).toContain('候选不合法');
+    expect(store.generatedSummary).toBeNull();
+    expect(store.status).toContain('不合法');
   });
 
-  it('丢弃清空候选但不动画布', async () => {
+  it('生成中取消：画布一点没变', async () => {
     const store = await prepare();
+    const reply = controllableReply();
+    stubFetch(() => reply.response);
+    const running = store.runGeneration('再生成一张', 'create');
+    reply.push(doneFrame(content('第二次')));
+    store.cancel();
+    reply.finish();
+    await running;
 
-    store.discardCandidate();
-
-    expect(store.candidate).toBeNull();
-    expect(store.content?.root.label).toBe('原图');
+    // 取消是真正的"不要了"：结果从未进过画布（draft 只是工作副本）
+    expect(store.content?.root.label).toBe('候选');
+    expect(store.conflictDraft).toBeNull();
   });
 });
 
-describe('候选与换图', () => {
+describe('生成结果与换图', () => {
   const record = (id: string) => ({ id, version: 1, updated_at: '2024-01-01T00:00:00Z' });
 
-  /** 先在同一张图上产出候选，返回 store，供各用例接上"换图"这一步。 */
+  /** 先在画布上跑完一次生成，返回 store，供各用例接上"换图"这一步。 */
   async function prepared() {
-    stubFetch(() => agentReply([doneFrame(content('候选'))]));
+    stubFetch(() => agentReply([doneFrame(content('结果'))]));
     const store = useMindMapStore();
     store.loadMap(content('原图'), record('map-a'));
     await store.runGeneration('做一张图', 'create');
-    expect(store.candidate?.root.label).toBe('候选');
+    expect(store.content?.root.label).toBe('结果');
     return store;
   }
 
-  it('生成候选后 loadMap 打开另一张图，候选被清掉', async () => {
+  it('落地之后 loadMap 打开另一张图，生成记录被清掉', async () => {
     const store = await prepared();
 
     store.loadMap(content('另一张'), record('map-b'));
 
-    expect(store.candidate).toBeNull();
+    expect(store.generatedSummary).toBeNull();
+    expect(store.generatedChanges).toBeNull();
     expect(store.content?.root.label).toBe('另一张');
     expect(store.mapId).toBe('map-b');
   });
 
-  it('生成候选后切图，接受要判过时', async () => {
-    const store = await prepared();
-
-    // 关键：切图不会递增 clientRevision，只有会话号能区分"这是另一张图"
-    const revisionBefore = store.clientRevision;
-    store.newMap();
-    expect(store.clientRevision).toBe(revisionBefore);
-
-    expect(store.acceptCandidate()).toBe('stale');
-    // 画布必须保持切图后的样子，候选不能借道 mapId 写进新记录
-    expect(store.content).toBeNull();
-    expect(store.mapId).toBeNull();
-  });
-
-  it('preview 换图同样作废旧候选', async () => {
+  it('preview 换图同样清掉生成记录', async () => {
     const store = await prepared();
 
     store.preview(content('示例'), 'right');
 
-    expect(store.candidate).toBeNull();
-    expect(store.acceptCandidate()).toBe('stale');
+    expect(store.generatedSummary).toBeNull();
+    expect(store.conflictDraft).toBeNull();
+  });
+
+  it('载入期间换了图，上次的结果不装进来', async () => {
+    const store = useMindMapStore();
+    store.loadMap(content('原图'), record('map-a'));
+    store.resumableRun = {
+      run_id: 'r1', status: 'done', intent: 'create', goal: '上次那张',
+      created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z',
+    };
+    // 单条详情在途时用户切到了另一张图
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      store.newMap();
+      return jsonReply({
+        run_id: 'r1', status: 'done', intent: 'create', goal: '上次那张',
+        created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z',
+        candidate: content('上次的结果'), failure: null, mode: 'model',
+      });
+    }));
+
+    await store.resumeRun();
+
+    // 会话号变了，结果属于上一张图：装上去就是把 A 写进 B
+    expect(store.content).toBeNull();
+    expect(store.status).toContain('换了一张图');
   });
 });
 
-describe('撤销 / 重做与候选', () => {
-  /** 先留一步可撤销的历史，再产出候选：这样撤销与重做都真的动到画布。 */
+describe('撤销 / 重做与生成落地', () => {
+  /** 先留一步可撤销的历史，再跑一次「改这张图」：撤销栈跨生成保留。 */
   async function preparedWithHistory() {
-    stubFetch(() => agentReply([doneFrame(content('候选'))]));
+    stubFetch(() => agentReply([doneFrame(content('结果'))]));
     const store = useMindMapStore();
     store.preview(content('原图'), 'right');
     // 改一次节点：撤销栈里才有可撤的那一步
     store.commitLabel('a', '改过的甲');
-    await store.runGeneration('做一张图', 'create');
-    expect(store.candidate).not.toBeNull();
+    // 用 `edit` 而不是 `create`：`create` 是一份新作品，落地时会清空历史
+    // （只留「生成之前」一步），那一点另有专门用例守着。
+    await store.runGeneration('改这张图', 'edit');
+    expect(store.content?.root.label).toBe('结果');
     return store;
   }
 
-  it('候选就绪后撤销一次，接受要判过时', async () => {
+  it('落地之后撤销一次，退回生成开始之前的那棵树', async () => {
     const store = await preparedWithHistory();
 
     store.undo();
-    // 撤销确实生效：内容回到改之前那棵树
-    expect(store.content?.root.children[0].label).toBe('甲');
+    // 撤销栈顶是"落地之前的画布"，也就是用户自己改过的那一棵
+    expect(store.content?.root.label).toBe('原图');
+    expect(store.content?.root.children[0].label).toBe('改过的甲');
 
-    // 画布已经退出候选所依据的版本，接受必须被拦下，不能把撤销白做掉
-    expect(store.acceptCandidate()).toBe('stale');
+    // 再撤一步才退回到他那次编辑之前
+    store.undo();
     expect(store.content?.root.children[0].label).toBe('甲');
-    expect(store.candidate).not.toBeNull();
   });
 
-  it('候选就绪后重做一次，接受同样要判过时', async () => {
+  it('落地之后重做一次，回到生成结果', async () => {
     const store = await preparedWithHistory();
 
     // 先撤销再重做，制造出可重做的状态
     store.undo();
     store.redo();
-    expect(store.content?.root.children[0].label).toBe('改过的甲');
-
-    expect(store.acceptCandidate()).toBe('stale');
-    expect(store.content?.root.children[0].label).toBe('改过的甲');
+    expect(store.content?.root.label).toBe('结果');
+    // 重做把画布换成了一个**新对象**（快照 JSON.parse 出来的），所以"一步回到
+    // 生成前"的快捷动作失效——它判的是引用相等，见 `canUndoGenerate`。
+    expect(store.canUndoGenerate).toBe(false);
   });
 
-  it('空画布接受候选后，撤销与重做都能回到空白', async () => {
-    stubFetch(() => agentReply([doneFrame(content('候选'))]));
+  it('空画布生成落地后，撤销与重做都能回到空白', async () => {
+    stubFetch(() => agentReply([doneFrame(content('结果'))]));
     const store = useMindMapStore();
     expect(store.content).toBeNull();
 
     await store.runGeneration('做一张图', 'create');
-    expect(store.acceptCandidate()).toBe('applied');
-    expect(store.content?.root.label).toBe('候选');
+    expect(store.content?.root.label).toBe('结果');
 
-    // 撤销回到接受之前的空画布：pushHistoryOrEmpty 压进去的是字符串 'null'
+    // 撤销回到落地之前的空画布：pushHistoryOrEmpty 压进去的是字符串 'null'
     store.undo();
     expect(store.content).toBeNull();
     expect(store.selectedId).toBeNull();
     expect(store.editingId).toBeNull();
 
-    // 重做回到候选。'null' 解析出来就是 null，不处理这条路径的话
+    // 重做回到结果。'null' 解析出来就是 null，不处理这条路径的话
     // 这一步会把「空画布」从撤销栈里弄丢（缺陷 3）
     store.redo();
-    expect(store.content?.root.label).toBe('候选');
+    expect(store.content?.root.label).toBe('结果');
 
     // 于是再撤销仍然回得到空白
     store.undo();
@@ -590,14 +661,13 @@ describe('撤销 / 重做与候选', () => {
   });
 });
 
-describe('候选接受之后的身份', () => {
-  it('create 意图接受候选后清空 mapId，撤销只回到接受之前', async () => {
+describe('生成落地之后的身份', () => {
+  it('create 意图落地后清空 mapId，撤销只回到落地之前', async () => {
     const store = await openExisting('map-a');
     expect(store.mapId).toBe('map-a');
 
     stubFetch(() => agentReply([doneFrame(content('新建的图'))]));
     await store.runGeneration('做一张新图', 'create');
-    expect(store.acceptCandidate()).toBe('applied');
 
     // 新作品不能顶着上一张图的身份：否则下一次保存会走 PUT，把 map-a 整条覆盖
     expect(store.mapId).toBeNull();
@@ -606,19 +676,18 @@ describe('候选接受之后的身份', () => {
     expect(store.mode).toBe('model');
     expect(store.dirty).toBe(true);
 
-    // 撤销栈里只有一步：撤销回到接受之前的画布，再撤也没有了
+    // 撤销栈里只有一步：撤销回到落地之前的画布，再撤也没有了
     expect(store.canUndo).toBe(true);
     store.undo();
     expect(store.content?.root.label).toBe('原图');
     expect(store.canUndo).toBe(false);
   });
 
-  it('edit 意图接受候选后沿用原记录的身份', async () => {
+  it('edit 意图落地后沿用原记录的身份', async () => {
     const store = await openExisting('map-a');
 
     stubFetch(() => agentReply([doneFrame(content('改后'))]));
     await store.runGeneration('把根改名', 'edit');
-    expect(store.acceptCandidate()).toBe('applied');
 
     // 改的就是这张图：保存仍打 map-a 的 PUT，版本还是开图时看到的那个
     expect(store.mapId).toBe('map-a');
@@ -627,12 +696,12 @@ describe('候选接受之后的身份', () => {
   });
 });
 
-describe('候选可见性', () => {
-  it('收到 snapshot 帧时候选立刻有值，画布不变', async () => {
+describe('snapshot 帧', () => {
+  it('snapshot 只更新工作副本，done 才落画布', async () => {
     stubFetch(() => agentReply([
-      // 后端整树校验通过后先推一帧 snapshot：done 之前候选就该看得见
+      // 后端整树校验通过后先推一帧 snapshot
       { type: 'snapshot', seq: 1, content: content('快照图') },
-      // done 故意不带内容：候选只可能来自上面那一帧 snapshot
+      // done 故意不带内容：结果只可能来自上面那一帧 snapshot
       { type: 'done', seq: 2 },
     ]));
     const store = useMindMapStore();
@@ -640,10 +709,12 @@ describe('候选可见性', () => {
 
     await store.runGeneration('做一张图', 'create');
 
-    expect(store.candidate?.root.label).toBe('快照图');
-    // snapshot 只进候选，绝不写画布
-    expect(store.content?.root.label).toBe('原图');
+    // 两帧都在，但落地只发生一次（done 那一刻），所以只压了一步撤销
+    expect(store.content?.root.label).toBe('快照图');
+    expect(store.generatedSummary?.nodes).toBe(2);
     expect(store.agentEvents.map(event => event.type)).toEqual(['snapshot', 'done']);
+    store.undo();
+    expect(store.content?.root.label).toBe('原图');
   });
 });
 
@@ -709,86 +780,21 @@ describe('思维模型进入请求体', () => {
     // 一眼能看出用户选了哪套拆解方式，不用去猜"没这个字段是什么意思"。
     expect((calls[0].body as Record<string, unknown>).thinking_model).toBe('default');
   });
-
-  it('下拉的五个选项与后端标识一致，默认选中通用', async () => {
-    // 新行为：下拉只在「会真正生效」时渲染（画布为空时走 create，后端才消费
-    // thinking_model）。已有导图时走 edit，见下面那条用例。
-    const wrapper = mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
-    });
-
-    const select = wrapper.get('#thinking-model');
-    const options = select.findAll('option');
-    expect(options.map(option => option.attributes('value'))).toEqual([
-      'default', 'first-principles', 'feynman', 'systematic', 'critical',
-    ]);
-    expect(options.map(option => option.text())).toEqual([
-      '通用', '第一性原理', '费曼', '5W1H', '批判性',
-    ]);
-    expect((select.element as HTMLSelectElement).value).toBe('default');
-    expect(select.attributes('disabled')).toBeUndefined();
-    // 旁边那一行短说明：用户得知道选了它会影响什么
-    expect(wrapper.text()).toContain('按这种方式拆解主题');
-
-    // 生成期间与旁边的输入框行为一致：禁用，免得用户改了方式却看不到它生效
-    useMindMapStore().busy = true;
-    await wrapper.vm.$nextTick();
-    expect(select.attributes('disabled')).toBeDefined();
-  });
-
-  it('已有导图（edit 场景）时下拉不渲染', async () => {
-    // 有导图时点击生成走 edit 意图，后端的编辑路径同样不消费 thinking_model。
-    const wrapper = mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
-    });
-    expect(wrapper.find('#thinking-model').exists()).toBe(true);
-
-    useMindMapStore().preview(content('原图'), 'right');
-    await wrapper.vm.$nextTick();
-
-    expect(wrapper.find('#thinking-model').exists()).toBe(false);
-  });
-});
-
-describe('运行中的来源区', () => {
-  it('运行期间冻结来源列表，取消后恢复可编辑', async () => {
-    // 生成中途还能改来源，用户会以为改动对这一轮生效——实际上请求体早就发出去了。
-    // 冻结与"取消后恢复"是同一件事的两半。
-    const gate = controllableReply();
-    stubFetch(() => gate.response);
-    const wrapper = mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
-    });
-    const store = useMindMapStore();
-    const sources = useSourcesStore();
-    sources.addText('正文');
-
-    const running = store.runGeneration('做一张图', 'create', sources.readySources);
-    await vi.waitFor(() => expect(store.busy).toBe(true));
-    expect(wrapper.get('input[type="file"]').attributes('disabled')).toBeDefined();
-    expect(buttonByText(wrapper, '清空来源').attributes('disabled')).toBeDefined();
-    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeDefined();
-
-    await buttonByText(wrapper, '取消').trigger('click');
-    expect(store.busy).toBe(false);
-    // 取消不该顺手把用户收集的材料清掉
-    expect(sources.items).toHaveLength(1);
-    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeUndefined();
-
-    gate.finish();
-    await running;
-  });
 });
 
 describe('静默提示', () => {
   function panel() {
-    return mount(SourceInputs, {
-      global: { plugins: [createPinia()] },
-      props: { confirmDiscard: () => true },
+    // 挂整个 App：合并之后状态行在画布右上角那个框里（`App.vue` 的 `stageLine`），
+    // `SourceInputs` 只剩材料区，不再渲染生成状态。挂载时 App 会拉偏好与版本号，
+    // 按 URL 应答掉，断言只关心状态行那一段文字。
+    const mock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/prefs') || url.endsWith('/prefs/suggestions')) return jsonReply([]);
+      if (url.endsWith('/health')) return jsonReply({ status: 'ok', version: 'test' });
+      return jsonReply({});
     });
+    vi.stubGlobal('fetch', mock);
+    return mount(App, { global: { plugins: [createPinia()] } });
   }
 
   it('静默到 10 秒时把阶段文案换成「模型正在思考」，两句话不并存', async () => {
@@ -846,7 +852,7 @@ describe('静默提示', () => {
   });
 });
 
-describe('面板文案与候选骨架', () => {
+describe('面板文案与生成结果', () => {
   /** 把状态铺好再挂载，首帧渲染就带着内容，不用等 nextTick 再断言。 */
   function panel(seed: (store: ReturnType<typeof useMindMapStore>) => void) {
     const store = useMindMapStore();
@@ -872,31 +878,64 @@ describe('面板文案与候选骨架', () => {
     expect(text).not.toContain('node_expand');
   });
 
-  it('候选骨架列出根标题与一级分支，超过 12 条时截断', () => {
+  it('生成落地后说清规模、没保存、以及怎么退回去', () => {
     const wrapper = panel((store) => {
-      store.candidate = {
-        title: '候选',
-        root: {
-          id: 'root',
-          label: '机器学习',
-          children: Array.from({ length: 14 }, (_, index) => ({
-            id: `n${index}`,
-            label: `分支 ${index}`,
-            children: [{ id: `n${index}c`, label: '子节点', children: [] }],
-          })),
-        },
-      };
+      store.preview(content('原图'), 'right');
+      store.generatedSummary = { nodes: 14, changes: 3 };
     });
 
     const text = wrapper.text();
-    // 标题要写明"未应用"，否则用户会以为画布已经变了
-    expect(text).toContain('候选（未应用）');
-    expect(text).toContain('机器学习');
-    expect(text).toContain('（1 个子节点）');
-    // 只列前 12 条，剩下的折成一句话
-    expect(text).toContain('分支 11');
-    expect(text).not.toContain('分支 12');
-    expect(text).toContain('……还有 2 个分支');
+    // 三个信息缺一不可：落了多大、改了几处、还没保存
+    expect(text).toContain('已落到画布 · 14 个节点 · 改了 3 处');
+    expect(text).toContain('还没保存');
+    // 没有「应用」这一步了：那句话不该再出现
+    expect(text).not.toContain('应用到画布');
+    expect(text).not.toContain('候选已就绪');
+  });
+
+  it('画布本来是空的时说"整张新图"而不是"改了 0 处"', () => {
+    const wrapper = panel((store) => {
+      store.generatedSummary = { nodes: 9, changes: null };
+    });
+
+    expect(wrapper.text()).toContain('整张新图');
+  });
+
+  it('画布还是生成结果时提供「回到生成之前」，点了就退回去', async () => {
+    stubFetch(() => agentReply([doneFrame(content('结果'))]));
+    const store = useMindMapStore();
+    store.preview(content('原图'), 'right');
+    await store.runGeneration('做一张导图', 'create');
+
+    const wrapper = mount(AgentPanel);
+    const button = wrapper.find('[data-test="undo-generate"]');
+    expect(button.exists()).toBe(true);
+
+    await button.trigger('click');
+    expect(store.content?.root.label).toBe('原图');
+    // 退回去之后这个按钮就该消失：再点一次没有可退的了
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="undo-generate"]').exists()).toBe(false);
+  });
+
+  it('生成期间画布被改过：面板摆出两棵树让用户选', async () => {
+    stubFetch(() => agentReply([doneFrame(content('结果'))]));
+    const store = useMindMapStore();
+    store.preview(content('原图'), 'right');
+    store.commitLabel('a', '我改的');
+
+    const wrapper = panel((target) => {
+      // 落地被判成冲突之后的样子（正常路径上画布被锁，见 store 的冲突判定）
+      target.generatedSummary = null;
+      target.conflictDraft = { next: content('结果'), meta: { runId: 'r1', intent: 'create', mode: 'model', base: null } };
+    });
+
+    const box = wrapper.find('[data-test="generate-conflict"]');
+    expect(box.exists()).toBe(true);
+    expect(box.text()).toContain('生成期间你改过这张图');
+    expect(box.text()).toContain('用模型的结果');
+    expect(box.text()).toContain('保留我的');
+    expect(store.content?.root.children[0].label).toBe('我改的');
   });
 
   it('工具失败时在对应进度行下方直接显示 code 与 message', () => {
