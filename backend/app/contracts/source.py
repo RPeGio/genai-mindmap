@@ -323,3 +323,18 @@ class CreateTextSourceRequest(BaseModel):
 
 class CreateTextSourceResponse(BaseModel):
     source: Source
+
+
+class FetchUrlRequest(BaseModel):
+    """按 URL 读一篇网页 → 变成一份材料（`POST /api/knowledge/fetch`）。
+
+    `url` 的上限 2000：实测正常的落地页地址在 100–300 字符，2000 是"带一长串
+    query 参数的搜索页"的量级；再长就不是一个能读的地址了。`min_length=1` 让空串
+    在契约层 422，而不是穿过校验去发一个必然失败的请求。
+
+    这里**不校验 scheme**：`safe_http_url` 那条规矩是"只往 `<a href>` 里放"，而
+    这个字段是**要去请求的地址**——判据在服务层（`external._deepseek_fetch` 只收
+    http/https），两处各判一次会让"哪一层负责拒绝"变含糊。
+    """
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=1, max_length=2000)

@@ -27,11 +27,13 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from app.agent import tools as agent_tools
 from app.contracts.source import SourceKind
 from app.knowledge import external
 from app.knowledge import external_cache
+from app.main import app
 
 # 真实响应（2026-11 实测，正文截短到几十字）。三个结果刻意覆盖三种情形：
 #   1. 正常命中（中文站、有 content）；
@@ -479,3 +481,68 @@ def test_request_limit_covers_the_sixth_source():
     """
     assert external.REQUEST_LIMIT == 9 + 1 + external.DEFAULT_LIMIT
     assert external.DIRECTION_SOURCES == ("wikipedia", "openalex", "crossref", "arxiv")
+
+
+# ---------------------------------------------------------------- 8 用途 A：/fetch
+
+
+def _api() -> TestClient:
+    return TestClient(app)
+
+
+def test_fetch_endpoint_is_off_by_default(monkeypatch):
+    """没打开时 409，文案说清"去把开关打开"而不是"抓取失败"。"""
+    monkeypatch.delenv(external.DEEPSEEK_FETCH_ENV, raising=False)
+    with _api() as api:
+        response = api.post("/api/knowledge/fetch", json={"url": "https://example.com/a"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "fetch_disabled"
+
+
+def test_fetch_endpoint_without_key_says_so(monkeypatch):
+    """打开了但没 key：503（部署问题），不是 502（"这个链接读不出正文"）。"""
+    monkeypatch.setenv(external.DEEPSEEK_FETCH_ENV, "1")
+    monkeypatch.delenv(external.DEEPSEEK_KEY_ENV, raising=False)
+    monkeypatch.delenv("MINDMAP_LLM_API_KEY", raising=False)
+    with _api() as api:
+        response = api.post("/api/knowledge/fetch", json={"url": "https://example.com/a"})
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "fetch_unconfigured"
+
+
+def test_fetch_endpoint_returns_a_source(monkeypatch):
+    """成功时给一个能直接当材料用的 `Source`。"""
+    monkeypatch.setenv(external.DEEPSEEK_FETCH_ENV, "1")
+    monkeypatch.setenv(external.DEEPSEEK_KEY_ENV, "sk-test")
+    _patch(monkeypatch, _routes())
+    with _api() as api:
+        response = api.post("/api/knowledge/fetch", json={"url": "https://example.com/a"})
+
+    assert response.status_code == 200
+    source = response.json()["source"]
+    assert source["status"] == "parsed"
+    assert source["kind"] == "web"
+    assert source["text"].startswith("专利正文")
+    # 文件名带抓取层前缀，与外部检索那条路一致（材料清单里的显示规则只有一套）
+    assert source["filename"].startswith("deepseek: ")
+    assert source["metadata"]["url"] == "https://example.com/a"
+
+
+def test_fetch_endpoint_reports_a_broken_link(monkeypatch):
+    """抓不到正文：502，而不是 200 + 空材料。"""
+    monkeypatch.setenv(external.DEEPSEEK_FETCH_ENV, "1")
+    monkeypatch.setenv(external.DEEPSEEK_KEY_ENV, "sk-test")
+    _patch(monkeypatch, _routes(fetch=httpx.Response(500, text="nope")))
+    with _api() as api:
+        response = api.post("/api/knowledge/fetch", json={"url": "https://example.com/a"})
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "fetch_failed"
+
+
+def test_fetch_rejects_blank_url_at_the_contract():
+    """空 url 在契约层 422，不去发一个必然失败的请求。"""
+    with _api() as api:
+        assert api.post("/api/knowledge/fetch", json={"url": ""}).status_code == 422

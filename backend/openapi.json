@@ -1359,6 +1359,54 @@
         }
       }
     },
+    "/api/knowledge/fetch": {
+      "post": {
+        "tags": [
+          "知识增强"
+        ],
+        "summary": "Fetch Url Source",
+        "description": "把一个 URL 读成一份材料。**用户在粘贴框里贴链接**走的就是这里。\n\n四种结果分开说，因为用户的下一步各不相同：\n\n  - 开关关着（409 `fetch_disabled`）：去把它打开，重试同一个链接；说成\"抓取\n    失败\"会让他反复试一个永远不会成功的东西；\n  - 没配置 key（503 `fetch_unconfigured`）：这是部署问题，用户改不了；\n  - 抓取失败 / 正文为空（502 `fetch_failed`）：换一个链接，或者直接把正文贴进来；\n  - 成功：返回 `Source`，前端把它当材料（与\"粘贴长正文\"完全同一条路）。\n\n**失败不抛裸异常**：`_deepseek_fetch` 自己吞掉一切并返回 None，所以这里只判\n返回值。外部抓取是这个接口唯一的目的，拿不到就是失败，没有\"部分成功\"可报。",
+        "operationId": "fetch_url_source_api_knowledge_fetch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchUrlRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTextSourceResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "这个功能没打开（`code=fetch_disabled`）"
+          },
+          "502": {
+            "description": "抓取失败：地址打不开、正文为空（`code=fetch_failed`）"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/health": {
       "get": {
         "tags": [
@@ -2314,6 +2362,23 @@
         ],
         "title": "EditSummary",
         "description": "`GET /mindmaps/{id}/edits/summary` 的响应。\n\n两条恒等式让数字可以先自校验再读结论：\n\n  - `sum(by_actor) == total`；\n  - `sum(by_field) == by_kind[\"update\"] + by_kind[\"style\"]`。\n\n对不上就说明有写入路径绕过了契约，而不是\"统计有点怪\"。\n\n改动量与\"本来可以不改\"的分母分列四组，全部是原始量（比例让读的人自己除）：\n分母 `generated_nodes`、分子 `changed_events`、以及\"这次生成一处都没被改\"的\n`untouched_runs`。三者必须能对上：`untouched_runs <= generated_runs`，而\n`changed_events == 0` 时 `untouched_runs == generated_runs`。"
+      },
+      "FetchUrlRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Url"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "FetchUrlRequest",
+        "description": "按 URL 读一篇网页 → 变成一份材料（`POST /api/knowledge/fetch`）。\n\n`url` 的上限 2000：实测正常的落地页地址在 100–300 字符，2000 是\"带一长串\nquery 参数的搜索页\"的量级；再长就不是一个能读的地址了。`min_length=1` 让空串\n在契约层 422，而不是穿过校验去发一个必然失败的请求。\n\n这里**不校验 scheme**：`safe_http_url` 那条规矩是\"只往 `<a href>` 里放\"，而\n这个字段是**要去请求的地址**——判据在服务层（`external._deepseek_fetch` 只收\nhttp/https），两处各判一次会让\"哪一层负责拒绝\"变含糊。"
       },
       "FishboneBone-Input": {
         "properties": {

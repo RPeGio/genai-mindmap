@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import { computed, onScopeDispose, ref } from 'vue';
 
-import { uploadDocument } from '../api/client';
+import { fetchUrlSource, uploadDocument } from '../api/client';
 import type { Source, SourceKind } from '../api/types';
 import { fileKind, MAX_AUDIO_BYTES, MAX_SOURCES, MAX_UPLOAD_BYTES, newSourceId, sourceInputError, textSource } from '../sources/input';
 
@@ -159,6 +159,47 @@ export const useSourcesStore = defineStore('sources', () => {
   function addPastedText(text: string): string | null {
     if (!addText(text)) return null;
     return items.value[items.value.length - 1]?.key ?? null;
+  }
+
+  /**
+   * 贴进来的一个链接 → 后端读成一份材料，返回新条目的 `key`（没加成是 null）。
+   *
+   * **异步但立刻占一行**：抓取是一次网络往返（本机实测 0.9 秒，慢站点更久），
+   * 先把条目以 `parsing` 插进去，用户马上看得到"这条在读了"；失败就落在同一行上
+   * 显示原因（`state = 'failed'`），而不是弹一个与材料清单脱节的提示。这个形态与
+   * 文件上传完全一致——两种材料在列表里长得一样，用户不必学第二套。
+   *
+   * `label` 先填主机名，成功后换成后端给的 `filename`（`deepseek: 网页标题`）：
+   * 抓取期间还没有标题，而"example.com"比"文本 3"更能让用户认出是哪一条。
+   */
+  async function addFetchedUrl(url: string): Promise<string | null> {
+    if (!hasRoom(1)) return null;
+    const key = newSourceId();
+    const host = (() => {
+      const rest = url.split('://')[1] ?? url;
+      return rest.split('/')[0] || url;
+    })();
+    const item: SourceItem = {
+      key, id: key, label: host, kind: 'web', state: 'parsing',
+      source: null, error: '', seconds: 0,
+    };
+    items.value.push(item);
+    try {
+      const source = await fetchUrlSource(url);
+      // 抓取期间用户可能已经把它删了：删掉的条目不能被迟到的响应复活。
+      if (!items.value.some(entry => entry.key === key)) return key;
+      item.source = source;
+      item.id = source.id;
+      item.kind = source.kind;
+      item.label = source.filename ?? host;
+      item.state = 'ready';
+    } catch (cause) {
+      if (!items.value.some(entry => entry.key === key)) return key;
+      item.state = 'failed';
+      // 后端的三种失败（没打开 / 没配 key / 抓不到）各有一句给人看的话，直接用。
+      item.error = cause instanceof Error ? cause.message : '抓取失败，请重试或改贴正文。';
+    }
+    return key;
   }
 
   async function parseItem(item: SourceItem): Promise<void> {    const file = files.get(item.key);
@@ -343,7 +384,7 @@ export const useSourcesStore = defineStore('sources', () => {
   return {
     items, error, parsing, recording, readySources, problem, materialProblem,
     draftText,
-    addText, addDraft, addPastedText, addFiles, retry, remove, clear, remap,
+    addText, addDraft, addPastedText, addFetchedUrl, addFiles, retry, remove, clear, remap,
     snapshot, restore,
   };
 });

@@ -311,18 +311,64 @@ function onIntentKeydown(event: KeyboardEvent) {
 /** 粘到主题框里的正文多长就不再当"主题"。 */
 const PASTE_AS_MATERIAL_CHARS = 120;
 
-/** 刚被自动分流的那一段正文（记着它落在哪一份材料里，才能撤回）。 */
-const pastedMaterial = ref<{ key: string; text: string; chars: number } | null>(null);
+/**
+ * 整段只有一个 http(s) 链接时的形状。
+ *
+ * 不允许任何空白：主题框里的粘贴是**整段**内容，含空格的多半是"标题 + 链接"或一整句
+ * 话，那些该按原来的规则走。尾部标点是常见的复制残留（`…/a。`），剥掉再判一次。
+ */
+const URL_ONLY = /^https?:\/\/[^\s<>"']+$/i;
+
+/** 这段粘贴是一个链接就返回它（已去首尾空白与尾部标点），否则 null。 */
+function pastedLink(text: string): string | null {
+  const trimmed = text.trim().replace(/[，。、；：）】」』]+$/u, '');
+  if (!trimmed || /\s/.test(trimmed)) return null;
+  return URL_ONLY.test(trimmed) ? trimmed : null;
+}
+
+/** 刚被自动分流的那一段正文 / 那一个链接（记着它落在哪一份材料里，才能撤回）。 */
+const pastedMaterial = ref<{
+  key: string; text: string; chars: number; link: boolean;
+} | null>(null);
 
 function onIntentPaste(event: ClipboardEvent): void {
   const text = event.clipboardData?.getData('text/plain') ?? '';
+  // **链接优先于"长正文"**，理由是三件事叠在一起：
+  //   1. 把 URL 当**主题**去生成一棵树是这份输入最坏的归宿——树会长成一棵以网址为
+  //      中心的图，用户要的那篇内容一个字都没进来；
+  //   2. 而 URL 通常不到 120 字，正好落进"当主题"那一支；
+  //   3. 带一长串查询参数的 URL 会落进"当材料"那一支，那同样是一份没有内容的材料
+  //      （正文就是一串百分号编码）。
+  // 所以判据放在最前面、且与长度无关。读不到正文时**回退**到原来的分流，不吞内容。
+  const link = pastedLink(text);
+  if (link) {
+    event.preventDefault();
+    void attachLink(link);
+    return;
+  }
   const chars = text.trim().length;
   if (chars < PASTE_AS_MATERIAL_CHARS) return;   // 短的就是主题，照常粘进输入框
   event.preventDefault();
   const key = sources.addPastedText(text);
   // 加不进去（超上限、合并后超长）时 store 里已经有错误提示；正文没丢，仍在剪贴板。
   if (!key) return;
-  pastedMaterial.value = { key, text, chars };
+  pastedMaterial.value = { key, text, chars, link: false };
+}
+
+/**
+ * 把一个链接读成材料，成功之后给一条可撤回的提示。
+ *
+ * **失败不弹提示条**：那一行材料自己的 `error` 里已经是后端给的原因（没打开 / 没配
+ * key / 抓不到），再在输入框下面重复一句会让用户以为发生了两件事。同时这个链接
+ * **不回填输入框**——它读不出来，放回去也还是读不出来；用户该做的是换一个链接或者
+ * 直接贴正文，而那正是错误提示在那一行上说的话。
+ */
+async function attachLink(url: string): Promise<void> {
+  const key = await sources.addFetchedUrl(url);
+  if (!key) return;
+  const item = sources.items.find(entry => entry.key === key);
+  if (!item || item.state !== 'ready') return;
+  pastedMaterial.value = { key, text: url, chars: url.length, link: true };
 }
 
 /** 把这段正文放回输入框，并撤掉刚建的那份材料。 */
@@ -867,7 +913,12 @@ defineExpose({
             class="flex items-center gap-2 rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] text-sky-900"
           >
             <span class="min-w-0 flex-1">
-              这段正文（{{ pastedMaterial.chars }} 字）已经放进材料，主题框留给"要它做什么"。
+              <template v-if="pastedMaterial.link">
+                这个链接已经读成一份材料，主题框留给"要它做什么"。
+              </template>
+              <template v-else>
+                这段正文（{{ pastedMaterial.chars }} 字）已经放进材料，主题框留给"要它做什么"。
+              </template>
             </span>
             <button
               type="button"

@@ -357,6 +357,25 @@ export async function uploadDocument(file: File, signal?: AbortSignal): Promise<
   return body.source;
 }
 
+/**
+ * 按 URL 读一篇网页 → 一份材料（`POST /api/knowledge/fetch`）。
+ *
+ * 与 `uploadDocument` 共用同一套错误处理：后端已经把三种失败分成了三种状态码
+ * （409 没打开 / 503 没配 key / 502 抓不到），`ApiError.message` 里就是给人看的那句话，
+ * 调用方**直接显示**，不要再拼一层"抓取失败"——那会把"去把开关打开"盖成一句废话。
+ */
+export async function fetchUrlSource(url: string, signal?: AbortSignal): Promise<Source> {
+  const body = await request<CreateTextSourceResponse>('/knowledge/fetch', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+    signal,
+  });
+  if (!body?.source?.id) {
+    throw new ApiError(0, 'empty_source', '后端没有返回抓取结果，请重试。');
+  }
+  return body.source;
+}
+
 // ---- 用户偏好 ----
 
 /**

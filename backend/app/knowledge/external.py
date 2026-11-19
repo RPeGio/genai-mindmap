@@ -329,7 +329,7 @@ DEEPSEEK_BASE_ENV = "MINDMAP_DEEPSEEK_TOOLS_BASE_URL"
 # 海外、必须走代理才能到国内"那种环境留的出口。
 DEEPSEEK_PROXY_ENV = "MINDMAP_DEEPSEEK_TOOLS_PROXY"
 
-# 开关，**默认关**。三条理由按分量排序：
+# 两个开关，**都默认关**。三条理由按分量排序：
 #
 #   1. **数据出境**。Search 把主题原文发给第三方；五源里唯一带 query 出境的是 arXiv /
 #      OpenAlex / Crossref（英文学术库），而它们在默认路径上本来就发。多一路出境是
@@ -341,6 +341,7 @@ DEEPSEEK_PROXY_ENV = "MINDMAP_DEEPSEEK_TOOLS_PROXY"
 # 关着时它连 `DEFAULT_SOURCES` 都不会进（`_source_available`），所以行为与 `3c40ba6`
 # 逐字节相同：不发请求、不占预算、日志里不多一行。
 DEEPSEEK_SEARCH_ENV = "MINDMAP_EXTERNAL_DEEPSEEK_SEARCH"
+DEEPSEEK_FETCH_ENV = "MINDMAP_EXTERNAL_DEEPSEEK_FETCH"
 
 # 单次调用的超时。8 秒：实测 0.47–1.13 秒（20 个主题、每次 3 条、`need_content` 为真），
 # 8 秒是"抖动 5 倍也还能回来"的量级。**不能直接用 `REQUEST_TIMEOUT=10`**：那个数
@@ -1226,6 +1227,26 @@ def deepseek_search_enabled() -> bool:
     return str(os.getenv(DEEPSEEK_SEARCH_ENV, "")).strip().lower() in _TRUTHY
 
 
+def deepseek_fetch_enabled() -> bool:
+    """按 URL 抓正文的开关（粘贴链接 → 材料），**默认关**。
+
+    它与 Search 分开而不是共用：Search 是"生成时自动多发一次请求"，Fetch 是"用户
+    自己贴了一个链接"。两件事的成本与出境面不同（一次生成 = 一次 Search；一个链接 =
+    一次 Fetch），要开哪一个由用户决定。
+    """
+    return str(os.getenv(DEEPSEEK_FETCH_ENV, "")).strip().lower() in _TRUTHY
+
+
+def deepseek_configured() -> bool:
+    """有没有可用的 key。**只回答"配没配"，不发请求**。
+
+    读者是 `knowledge.router` 的 `/fetch`：没有 key 时它在契约层给 503（"这是部署
+    问题，你改不了"），而不是让请求打出去换成 401 再被吞成 502（"这个链接读不出
+    正文"）——后者会指着一个好链接说它坏了。
+    """
+    return bool(_deepseek_config()[1])
+
+
 def _deepseek_client() -> httpx.Client:
     """DeepSeek 专用的客户端：**默认直连**，与五源那个 `_client()` 分开。
 
@@ -1434,6 +1455,16 @@ def _host_of(url: str) -> str:
     _, _, rest = (url or "").partition("://")
     host = rest.split("/", 1)[0].split("?", 1)[0].strip()
     return host[:120]
+
+
+def fetch_url(url: str, *, max_chars: int = TEXT_MAX_CHARS) -> ExternalHit | None:
+    """用途 A 的入口：按 URL 读一篇网页，返回一条 `ExternalHit`；失败返回 None。
+
+    单独一个公开名而不是让调用方直接调 `_deepseek_fetch`：那个私有函数还带
+    `budget` / `slot` 两个"生成链路预算"的参数，而这条路上没有预算（用户点了一下，
+    还没开始生成）。一个只收 URL 的签名把这件事说清楚，调用方也不会传错。
+    """
+    return _deepseek_fetch(url, max_chars=max_chars)
 
 
 def _fill_missing_content(

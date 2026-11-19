@@ -643,6 +643,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/knowledge/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fetch Url Source
+         * @description 把一个 URL 读成一份材料。**用户在粘贴框里贴链接**走的就是这里。
+         *
+         *     四种结果分开说，因为用户的下一步各不相同：
+         *
+         *       - 开关关着（409 `fetch_disabled`）：去把它打开，重试同一个链接；说成"抓取
+         *         失败"会让他反复试一个永远不会成功的东西；
+         *       - 没配置 key（503 `fetch_unconfigured`）：这是部署问题，用户改不了；
+         *       - 抓取失败 / 正文为空（502 `fetch_failed`）：换一个链接，或者直接把正文贴进来；
+         *       - 成功：返回 `Source`，前端把它当材料（与"粘贴长正文"完全同一条路）。
+         *
+         *     **失败不抛裸异常**：`_deepseek_fetch` 自己吞掉一切并返回 None，所以这里只判
+         *     返回值。外部抓取是这个接口唯一的目的，拿不到就是失败，没有"部分成功"可报。
+         */
+        post: operations["fetch_url_source_api_knowledge_fetch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -1024,6 +1055,22 @@ export interface components {
              * @default 0
              */
             untouched_runs: number;
+        };
+        /**
+         * FetchUrlRequest
+         * @description 按 URL 读一篇网页 → 变成一份材料（`POST /api/knowledge/fetch`）。
+         *
+         *     `url` 的上限 2000：实测正常的落地页地址在 100–300 字符，2000 是"带一长串
+         *     query 参数的搜索页"的量级；再长就不是一个能读的地址了。`min_length=1` 让空串
+         *     在契约层 422，而不是穿过校验去发一个必然失败的请求。
+         *
+         *     这里**不校验 scheme**：`safe_http_url` 那条规矩是"只往 `<a href>` 里放"，而
+         *     这个字段是**要去请求的地址**——判据在服务层（`external._deepseek_fetch` 只收
+         *     http/https），两处各判一次会让"哪一层负责拒绝"变含糊。
+         */
+        FetchUrlRequest: {
+            /** Url */
+            url: string;
         };
         /**
          * FishboneBone
@@ -3168,6 +3215,53 @@ export interface operations {
             };
             /** @description 知识库暂时读不出来（`code=library_unavailable`） */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    fetch_url_source_api_knowledge_fetch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchUrlRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateTextSourceResponse"];
+                };
+            };
+            /** @description 这个功能没打开（`code=fetch_disabled`） */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description 抓取失败：地址打不开、正文为空（`code=fetch_failed`） */
+            502: {
                 headers: {
                     [name: string]: unknown;
                 };
