@@ -60,9 +60,12 @@ export const useChatStore = defineStore('chat', () => {
 
   function push(message: Omit<ChatMessage, 'id' | 'at'> & { at?: number }): ChatMessage {
     const entry: ChatMessage = {
-      id: nextId(),
-      at: message.at ?? Date.now(),
+      // **先展开、最后写 `id` / `at`**：`said(text, at?)` 显式传进来的 `at` 可能是
+      // `undefined`，展开在默认值之后会把它覆盖回去，时间线里那条消息就没有时间了
+      // （显示成 `NaN:NaN`）。顺序反了就必然出这个洞。
       ...message,
+      id: nextId(),
+      at: Number.isFinite(message.at) ? (message.at as number) : Date.now(),
     };
     messages.value = [...messages.value, entry];
     if (!open.value) unread.value += 1;

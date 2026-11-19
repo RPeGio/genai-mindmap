@@ -646,6 +646,41 @@ describe('悬浮球与消息时间线', () => {
     expect(chat.messages[0].role).toBe('user');
     expect(chat.messages[0].text).toBe('把报销流程画清楚');
   });
+
+  /**
+   * 用户那条消息的时间是 `NaN:NaN`，模型那条正常。
+   *
+   * 两条路各自漏一次：`said(text, at?)` 把 `at: undefined` 显式传进 `push`，而
+   * `push` 先写默认时间、再展开 `message`，展开把它覆盖成 `undefined`；显示层又
+   * 没判无效日期。写入与显示都得挡住——只修一个，另一条路照样把 `NaN:NaN` 摆上屏。
+   */
+  it('用户消息也带有效时间（NaN 不再来自默认值被覆盖）', async () => {
+    stubFetch();
+    mountApp();
+    const chat = useChatStore();
+
+    const said = chat.said('第一句');
+    expect(Number.isFinite(said.at)).toBe(true);
+    expect(said.at).toBeGreaterThan(0);
+    // 显式给时间时用给的，不要一律改写成 now。
+    expect(chat.said('第二句', 1700000000000).at).toBe(1700000000000);
+  });
+
+  it('时间无效时显示占位，不把 NaN:NaN 摆出来', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const chat = useChatStore();
+    // 绕过 push 直接塞一条脏数据：显示层必须自己挡得住（历史数据、回放都可能带）。
+    chat.messages = [{ id: 'm1', at: Number.NaN, role: 'user', text: '嗨' }];
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[data-test="message-fab"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    const item = wrapper.get('[data-test="message-item"]');
+    expect(item.text()).not.toContain('NaN');
+    expect(item.text()).toContain('--:--');
+  });
 });
 
 describe('thinking 全链路：请求体与折叠展示', () => {

@@ -22,6 +22,10 @@ const badge = computed(() => (chat.unread > 99 ? '99+' : String(chat.unread)));
 
 function timeOf(at: number): string {
   const date = new Date(at);
+  // 显示层也要兜底：`at` 缺失或脏数据时 `getHours()` 是 NaN，直接拼出来就是
+  // `NaN:NaN` 摆在用户脸上。这一行回答的是"什么时候说的"，不知道就写不知道。
+  // （写入那一侧已经修了默认时间，两条路都得挡住，只修一个另一条还会漏。）
+  if (!Number.isFinite(date.getTime())) return '--:--';
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
