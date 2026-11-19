@@ -88,6 +88,11 @@ BEHAVIOUR = (
     # 谁在本地设过 `MINDMAP_LIBRARY_REMEMBER=0`，"入库后换 id"那批用例就会集体变红
     # ——一个只在某些机器上出现的绿/红。
     "MINDMAP_LIBRARY_REMEMBER",
+    # 风格画像要不要拼进 user 末尾（`prefs/style.PROMPT_SWITCH_ENV`）。**清空而不是
+    # 置 0**：它默认**开**（代价只有几十个汉字），而"默认开 + 临时库的 style_profile
+    # 是空表 = 拼出来是空串 = 既有断言逐字节不变"正是接线时要验的那条前提。
+    # 置 0 会让所有生成用例都不经过"读了画像表但没读到"那条路。
+    "MINDMAP_STYLE_PROMPT",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
@@ -111,7 +116,12 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # 停在"六源里的五个"——也就是 `3c40ba6` 的形状。要它们的用例自己
             # `setenv(..., "1")`，并同时把 `_client` 换成假响应。
             "MINDMAP_EXTERNAL_DEEPSEEK_SEARCH",
-            "MINDMAP_EXTERNAL_DEEPSEEK_FETCH")
+            "MINDMAP_EXTERNAL_DEEPSEEK_FETCH",
+            # 画像加权（`prefs/profile.SWITCH_ENV`）。**置 0**：它默认关（打开之后
+            # 每条命中要多一次 embedding，见 `profile.SWITCH_ENV`），而这里的用例
+            # 全部走 `no_real_http`——清空会让"默认开"那一侧的用例真的去 embed。
+            # 需要它的用例自己 `setenv(..., "1")` 并替换 `embed_texts`。
+            "MINDMAP_PROFILE_RERANK")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。

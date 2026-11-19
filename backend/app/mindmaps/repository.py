@@ -198,6 +198,12 @@ def connect() -> sqlite3.Connection:
     from app.memory.store import ensure_schema as ensure_memory_schema
 
     ensure_memory_schema(conn)
+    # 风格画像的统计层（`app/prefs/style.py`）。import 放在函数内：那个模块顶层要
+    # `from app.mindmaps import repository` 拿 `connect`，模块顶层反向 import 回去
+    # 就成环。与 `library` / `store` 两处同一条理由。
+    from app.prefs.style import ensure_schema as ensure_style_schema
+
+    ensure_style_schema(conn)
     return conn
 
 
