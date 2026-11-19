@@ -28,11 +28,22 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
 
     不做数据回填：新列在老行上是 NULL，而 NULL 在这里有确切含义（"当时没记"），
     比一个编出来的 0 诚实。
+
+    "先查再补"不是原子的：两个连接同时第一次打开一个新库，都读到缺列，于是各发一条
+    `ALTER TABLE ADD COLUMN`，后到的那条抛 `duplicate column name`。这条错误恰好说明
+    想要的结果已经发生，所以吞掉；不吞的话，第一个访问新库的并发请求会莫名其妙失败
+    一次（线上是 `/runs/stream` 的八路并发认领，它本来就靠写锁串行，不该被一个建列
+    动作带崩）。
     """
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     for name, declaration in columns.items():
-        if name not in existing:
+        if name in existing:
+            continue
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error):
+                raise
 
 
 def _drop_columns(conn: sqlite3.Connection, table: str, columns: Sequence[str]) -> None:
