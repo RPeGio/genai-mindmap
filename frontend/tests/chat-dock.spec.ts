@@ -681,6 +681,28 @@ describe('悬浮球与消息时间线', () => {
     expect(item.text()).not.toContain('NaN');
     expect(item.text()).toContain('--:--');
   });
+
+  /**
+   * 淡出的对话框仍然在 DOM 里（「继续说一句」要靠它叫回来），但它不该再吃键盘。
+   *
+   * 只设透明 + `pointer-events-none` + `aria-hidden` 只挡住鼠标和读屏：按 Tab 焦点
+   * 照样会走进那个看不见的框，接着按 Enter 就是对着空气提交。
+   */
+  it('淡出之后整块是 inert：键盘焦点进不去', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
+    const wrapper = mountApp();
+    await wrapper.get('textarea#intent').setValue('机器学习');
+    await wrapper.get(SUBMIT).trigger('click');
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(2100);
+    await wrapper.vm.$nextTick();
+
+    const dock = wrapper.get('[data-test="chat-dock"]');
+    expect(dock.attributes('data-faded')).toBe('true');
+    expect(dock.attributes('inert')).toBeDefined();
+    // 另一半没丢：DOM 还在，叫得回来。
+    expect(wrapper.find('textarea#intent').exists()).toBe(true);
+  });
 });
 
 describe('thinking 全链路：请求体与折叠展示', () => {

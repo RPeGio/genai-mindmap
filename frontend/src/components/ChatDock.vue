@@ -708,7 +708,14 @@ watch(
 const running = computed(() => statusKind.value === 'running');
 /** 生成中：整块收成一条细进度。 */
 const compact = computed(() => running.value);
-/** 生成完淡出：**opacity 归零而不是 v-if**，DOM 留着，测试与键盘用户都还找得到它。 */
+/**
+ * 生成完淡出：**opacity 归零而不是 v-if**，DOM 留着——「继续说一句」要能把它原样
+ * 叫回来，`v-if` 会把材料面板、输入框状态一起扔掉。
+ *
+ * 但"留着"不等于"还能操作"：淡出时整块要 `inert`。只给 `opacity-0` +
+ * `pointer-events-none` + `aria-hidden` 挡得住鼠标和读屏，挡不住 Tab——焦点会走进
+ * 一个用户根本看不见的对话框，接着再按 Enter 就是对着空气提交。
+ */
 const faded = computed(() => dismissed.value && !shouldKeep.value && !compact.value);
 
 function openComposer(prefill?: string): void {
@@ -801,6 +808,7 @@ defineExpose({
       class="pointer-events-auto w-full max-w-[760px] transition-all duration-300"
       :class="faded ? 'pointer-events-none translate-y-2 opacity-0' : 'translate-y-0 opacity-100'"
       :aria-hidden="faded ? 'true' : undefined"
+      :inert="faded ? true : undefined"
     >
       <!-- 生成中：一条细进度。它取代了整个对话框（不是叠在上面）——两处都说"正在生成"
            只会互相削弱，而画布此刻正是用户想看的东西。 -->
