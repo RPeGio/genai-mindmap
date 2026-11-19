@@ -1038,6 +1038,190 @@
         }
       }
     },
+    "/api/memory": {
+      "get": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "List Memories",
+        "description": "最近的若干条，新的在前。\n\n它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过\n（会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。",
+        "operationId": "list_memories_api_memory_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2000,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MemoryItem"
+                  },
+                  "title": "Response List Memories Api Memory Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "Add Memory",
+        "description": "手工加一条。`source` 恒为 `user_explicit`，与自动总结的分开。\n\n向量服务未配置时条目照样写进去（`has_vector=false`），不报错：那是预期状态\n（本机开发、CI），而\"这条以后检索不到\"比\"这句话丢了\"轻得多。",
+        "operationId": "add_memory_api_memory_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMemoryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddedMemory"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/memory/{item_id}": {
+      "delete": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "Delete Memory",
+        "description": "硬删。404 而不是幂等 204：界面上\"这条已经不在了\"与\"我删了但没删掉\"必须分开。",
+        "operationId": "delete_memory_api_memory__item_id__delete",
+        "parameters": [
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Item Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/memory/search": {
+      "get": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "Search Memory",
+        "description": "按主题检索一次，返回每条的 cosine / decay / score。\n\n**只读**：不刷 `last_used_at`（那是\"真的被注入过\"的证据，一次人工查询不该冒充它）。\n\n与生成时走的是同一个 `store.recall`，所以这里看到的分数就是模型会拿到的排序。",
+        "operationId": "search_memory_api_memory_search_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "按这次的主题检索，与生成时的 query 同一口径",
+              "title": "Q"
+            },
+            "description": "按这次的主题检索，与生成时的 query 同一口径"
+          },
+          {
+            "name": "top_k",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "default": 6,
+              "title": "Top K"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/knowledge/search": {
       "post": {
         "tags": [
@@ -1197,6 +1381,45 @@
   },
   "components": {
     "schemas": {
+      "AddMemoryRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind",
+            "default": "preference"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "AddMemoryRequest"
+      },
+      "AddedMemory": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/MemoryItem"
+          },
+          "created": {
+            "type": "boolean",
+            "title": "Created"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item",
+          "created"
+        ],
+        "title": "AddedMemory"
+      },
       "AgentPlan": {
         "properties": {
           "goal": {
@@ -2819,6 +3042,152 @@
         "title": "MapRecord",
         "description": "一条落库的导图。`content` 与 `SaveRequest.content` 是同一个联合类型——\n写进来的是什么形状，读出去就是什么形状（JSON 里 `diagram_type` 与形状都在）。"
       },
+      "MemoryHit": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "cosine": {
+            "type": "number",
+            "title": "Cosine"
+          },
+          "decay": {
+            "type": "number",
+            "title": "Decay"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "age_days": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age Days"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "formed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Formed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "kind",
+          "cosine",
+          "decay",
+          "score",
+          "created_at"
+        ],
+        "title": "MemoryHit",
+        "description": "一次命中的**全部**中间量。\n\n`score = cosine * decay`。三个数都给出，是为了让\"为什么排在这里\"可以当场读出来。"
+      },
+      "MemoryItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "formed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Formed At"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "has_vector": {
+            "type": "boolean",
+            "title": "Has Vector"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "text",
+          "kind",
+          "source",
+          "created_at",
+          "has_vector"
+        ],
+        "title": "MemoryItem",
+        "description": "列表里的一条。**不带向量**：1024 个 float 对读者没有意义，它是机器用的。"
+      },
       "MindMapContent-Input": {
         "properties": {
           "schema_version": {
@@ -3746,6 +4115,43 @@
         },
         "type": "object",
         "title": "SearchResponse"
+      },
+      "SearchResult": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryHit"
+            },
+            "type": "array",
+            "title": "Hits"
+          },
+          "scanned": {
+            "type": "integer",
+            "title": "Scanned"
+          },
+          "top_k": {
+            "type": "integer",
+            "title": "Top K"
+          },
+          "min_cosine": {
+            "type": "number",
+            "title": "Min Cosine"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "query",
+          "hits",
+          "scanned",
+          "top_k",
+          "min_cosine"
+        ],
+        "title": "SearchResult"
       },
       "SetPrefRequest": {
         "properties": {

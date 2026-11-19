@@ -9,6 +9,7 @@ from app.export.router import router as export_router
 from app.importing.router import router as import_router
 from app.ingestion.router import router as ingestion_router
 from app.knowledge.router import router as knowledge_router
+from app.memory.router import router as memory_router
 from app.mindmaps.router import router as mindmap_router
 from app.optimization.router import router as optimization_router
 from app.prefs.router import router as prefs_router
@@ -47,6 +48,10 @@ app.include_router(export_router, prefix="/api")       # 导出 puml
 app.include_router(ingestion_router, prefix="/api")    # 多模态输入
 app.include_router(agent_router, prefix="/api")        # AI 代理：文本/多来源 → 导图
 app.include_router(prefs_router, prefix="/api")         # 用户偏好：面板读 / 改 / 删
+# 跨会话记忆：列 / 手工加 / 删 / 按主题检索。手工入口不是给自动化用的，它存在的
+# 理由是让"检索与衰减对不对"能在空库上立刻被验证一次（见 `memory/router.py` 的
+# docstring：自动总结在空库上会合法地产出 0 条，那段时间里什么都证明不了）。
+app.include_router(memory_router, prefix="/api")
 
 # 已规划、接口已固定、实现待补
 app.include_router(knowledge_router, prefix="/api")    # 知识检索（返回空）
