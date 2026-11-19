@@ -8,6 +8,7 @@ import ChatDock from './components/ChatDock.vue';
 import HistoryDrawer from './components/HistoryDrawer.vue';
 import MessageFab from './components/MessageFab.vue';
 import NodeToolbar from './components/NodeToolbar.vue';
+import StructureCheck from './components/StructureCheck.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
 import type { LibraryEntry, LibrarySource } from './api/types';
@@ -1154,6 +1155,22 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
             </summary>
             <div class="mt-2"><AgentPanel /></div>
           </details>
+
+          <!--
+            结构检查（`/optimization/check` + `/suggest`）：诊断逐条 + 候选建议。
+
+            **放在右抽屉里，不给它自己的浮层**。上一轮刚解决的是"诊断/建议不许挡住
+            画布"：抽屉是覆盖式的（`absolute` 挂在 `<main>` 上，不参与主区 flex），
+            它开合时画布宽度一个像素都没变，也不会触发一次自动 fitView。
+
+            它排在上面那块「本次生成明细」之后：明细是"刚才那 25 秒发生了什么"的日志，
+            结构检查是"这张图现在有什么问题"的结论——后者常常在生成之后很久才被点开，
+            所以不该把它压在一份长日志的下方，也不该顶在节点详情前面。
+
+            自己判可见性（没跑过、没有发现、没有错误时整块不渲染），这里不再套一层
+            `v-if`——那会让"有没有东西可说"这件事在 App 与组件里各写一遍。
+          -->
+          <StructureCheck />
 
           <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
