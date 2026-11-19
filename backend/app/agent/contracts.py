@@ -450,6 +450,16 @@ class RunContext:
     # 默认空串是硬要求：单测与直接构造 `RunContext` 的代码没有检索过，注入的那一段
     # 必须与加这个字段之前**逐字节相同**（`_system_text` 里那个 `if part` 过滤）。
     memory_hints: str = ""
+    # 这次运行拼进 **user 末尾**的**风格画像**那一段（`app/prefs/style.py` 从历史
+    # 产物里数出来的形状描述；没有画像时是空串）。
+    #
+    # 与 `memory_hints` 分开两个字段，而不是合成一段：两者的位置不同（记忆在
+    # system、画像在 user），可信度也不同（记忆是"关于这个人的话"，画像是
+    # "他过去的图长什么样"）。合成一段就得在 `_system_text` 里再拆开，而拆分
+    # 依据是一个字符串前缀——那是把位置信息编码进文本内容，最容易被改坏。
+    #
+    # 默认空串同样是为了"接线没接通时与旧版本逐字节相同"。
+    style_hints: str = ""
 
     def record_library_sources(self, sources: Iterable[Source]) -> None:
         """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。

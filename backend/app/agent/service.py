@@ -59,6 +59,7 @@ from app.generation.service import (
 )
 from app.memory import store as memory_store
 from app.prefs import service as prefs
+from app.prefs import style as prefs_style
 
 DEFAULT_STAGES = ["目标澄清", "要点拆解", "分支展开", "风险与验证"]
 logger = logging.getLogger(__name__)
@@ -302,10 +303,50 @@ def _system_text(
     ) if part).strip()
 
 
-def _initial_messages(request: AgentRunRequest, memory: str = "") -> list[dict[str, Any]]:
+def _style_text() -> str:
+    """用户风格画像那一段（读 `style_profile` 表算出来的一句形状描述）。
+
+    **拼在 user 末尾，不在 system 里**，所以这个函数只负责取文本、不负责拼接
+    （拼接在 `_initial_messages`）。位置的理由见 `_initial_messages` 的 docstring。
+
+    失败一律返回空串：画像是附属信息，它读不出来（表被删、字段是上一版实现的、
+    库锁住）不该让一次生成失败。这与 `_notes_text` 里"超限只记日志"同一条方向
+    ——降级的方向永远是"这次少一句个性化"。
+
+    同步调用而不是 `to_thread`：这是一次本地 sqlite 查询（8 行），微秒级，
+    与 `_intent_rule` 每轮读一次库同一个理由。
+    """
+    if not prefs_style.enabled():
+        return ""
+    try:
+        return prefs_style.prompt_block()
+    except Exception as exc:  # noqa: BLE001 — 见 docstring 第 2 段
+        logger.warning("风格画像读取失败（%s），这次不注入", type(exc).__name__)
+        return ""
+
+
+def _initial_messages(
+    request: AgentRunRequest, memory: str = "", style: str = "",
+) -> list[dict[str, Any]]:
+    """开头的两条消息。`style` 拼在 **user 末尾**。
+
+    三条规律叠加起来决定了这个位置，不是随手放的：
+
+      1. **不进 system**。本仓库已经验证过三次（`role=decision`、`_detail_ask`
+         的自查句、全塞模式下的引用规则），写在 system 里的具体指令会被那一段
+         长且稳定的背景稀释；挪到 user 里才生效。
+      2. **在 user 的末尾，不在开头**。开头是用户这次的原话，它的权重最高；
+         把画像插在它前面等于替用户改写了需求陈述。
+      3. **只拼一次，不每轮刷新**。`_refresh_outline` 每轮只换 system[0]，
+         user 那条从头到尾不变——画像也该是这次运行的一份常量。
+
+    `style` 为空串时返回的消息与加这个参数之前**逐字节相同**（`{"role": "user",
+    "content": request.goal}`），这是既有 2162 条用例的前提。
+    """
+    goal = request.goal if not style else f"{request.goal}\n\n{style}"
     return [
         {"role": "system", "content": _system_text(request, request.snapshot, memory=memory)},
-        {"role": "user", "content": request.goal},
+        {"role": "user", "content": goal},
     ]
 
 
@@ -1084,8 +1125,18 @@ async def _loop(
     #
     # query 是 `goal` + 材料标题（见 `store.query_text`），所以它天然是"这次的主题"。
     ctx.memory_hints = await _memory_hints(request)
+    # 风格画像：**一次运行读一次**，拼进 user 末尾（见 `_initial_messages`）。
+    #
+    # 它不进 `_system_text`：那个函数每轮被 `_refresh_outline` 调一次，而 user
+    # 那条从头到尾不变——画像也是这样一份常量。放进 system 还会顺带每轮多查一次库。
+    #
+    # 位置在这一行（`_memory_hints` 之后）只是顺序：两者互不依赖，检索是会等的
+    # 那次（0.3–1 秒），读表是立即的。
+    ctx.style_hints = _style_text()
+    if ctx.style_hints:
+        logger.info("风格画像已注入 user 末尾（%d 字）", len(ctx.style_hints))
     budget = request.budget
-    messages = _initial_messages(request, ctx.memory_hints)
+    messages = _initial_messages(request, ctx.memory_hints, ctx.style_hints)
     seq = itertools.count(first_seq)
     started = time.monotonic()
     tool_calls = 0
