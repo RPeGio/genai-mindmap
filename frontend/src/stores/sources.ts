@@ -149,6 +149,18 @@ export const useSourcesStore = defineStore('sources', () => {
     return true;
   }
 
+  /**
+   * 一段粘贴进来的正文直接变成材料，返回新条目的 `key`（没加进去是 null）。
+   *
+   * `addText` 只回 true/false，而"撤回"需要知道刚加的是哪一条：对话框里那句
+   * "已放进材料"必须能一键把正文放回输入框（并撤掉那条材料），否则这个自动分流
+   * 就成了一次没法反悔的抢夺。条目的 `key` 是行身份，`remove(key)` 认它。
+   */
+  function addPastedText(text: string): string | null {
+    if (!addText(text)) return null;
+    return items.value[items.value.length - 1]?.key ?? null;
+  }
+
   async function parseItem(item: SourceItem): Promise<void> {    const file = files.get(item.key);
     if (!file) return;
     item.error = '';
@@ -331,7 +343,7 @@ export const useSourcesStore = defineStore('sources', () => {
   return {
     items, error, parsing, recording, readySources, problem, materialProblem,
     draftText,
-    addText, addDraft, addFiles, retry, remove, clear, remap,
+    addText, addDraft, addPastedText, addFiles, retry, remove, clear, remap,
     snapshot, restore,
   };
 });

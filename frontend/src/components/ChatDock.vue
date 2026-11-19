@@ -129,9 +129,11 @@ const submitGoal = computed(() => {
 
 const canSubmit = computed(() => {
   if (runBlocked.value || !submitGoal.value) return false;
-  if (intentState.value !== 'create') return true;
-  // 录音停下来的那一刻会多出一份材料：此刻发出去的请求一定缺这一块。
-  return !materialProblem.value && !sources.recording;
+  // 材料没准备好时**任何**一处入口都不发：编辑请求照样带 `sources`，正在解析或解析
+  // 失败的那几份会被请求体静默漏掉（用户看到的是"改了，但新材料没算进去"）。
+  // 这条闸门以前只挂在新建那条路上，改图那条提前 return true 把它跳过去了。
+  if (materialProblem.value || sources.recording) return false;
+  return true;
 });
 
 /** 材料够长到"这次一定不走外部检索"没有。够长时那个勾置灰。 */
@@ -205,9 +207,14 @@ const intentHint = computed(() => {
   if (runBlocked.value) {
     return store.agentRunning ? '正在跑，等这一次结束。' : '正在生成，等这一次跑完再改。';
   }
+  // 材料那道闸门对**改图**同样成立（见 `canSubmit`）。原因必须写在同一条提示里：
+  // 否则改图时按钮灰着、下面这句还在说"先在画布上选中节点"，用户找不到为什么。
+  if (sources.recording) return '正在录音：先松开「按住说话」，再提交。';
+  if (materialProblem.value) return materialProblem.value;
+  if (pastedMaterial.value && !typed.value) {
+    return '正文已经当材料了：写一句要它怎么整理（比如「按主题分三层」），不写就用材料标题当中心主题。';
+  }
   if (intentState.value === 'create') {
-    if (sources.recording) return '正在录音：先松开「按住说话」，再生成。';
-    if (materialProblem.value) return materialProblem.value;
     if (typed.value) {
       return sources.items.length
         ? '会带上这里附的材料一起生成。'
@@ -228,7 +235,7 @@ const intentHint = computed(() => {
     : `优先改这 ${selectionCount.value} 个节点及其子分支；真要动别处也能改，清单里会标出来。`;
 });
 
-const intentHintWarn = computed(() => intentState.value === 'create' && !!materialProblem.value);
+const intentHintWarn = computed(() => !!materialProblem.value);
 
 /** 状态行只在"有一件事要讲"时出现。 */
 const showStatus = computed(() => store.status !== INITIAL_STATUS);
@@ -262,6 +269,9 @@ async function submitIntent() {
   // 这句话发出去之后，"用户要求留着"这件事就结束了：输入框已经空出来，
   // 接下来该按状态判（生成中就收起、成功就淡出）。
   pinned.value = false;
+  // 那句"这段正文已放进材料"的提示随着这一轮发出去就过期了：材料进了请求体，
+  // 再摆一个"放回输入框"只会把用户已提交的东西又抄回框里。
+  pastedMaterial.value = null;
   // 发出去的那一刻就把这句话记进时间线：对话框随后会收成进度条，"我说了什么"
   // 不能只活在输入框里（那个框马上要清空）。
   emit('submit', wanted);
@@ -285,6 +295,47 @@ function onIntentKeydown(event: KeyboardEvent) {
   event.preventDefault();
   void submitIntent();
 }
+
+// ---------------------------------------------------------------- 粘贴 = 材料
+//
+// 「粘贴正文」以前只有一条路：点「+」→ 面板展开 → 点里面那个粘贴框 → Ctrl+V →
+// 点「添加文本到来源」→ 收起面板，五步，而且藏在"上传附件"的图标后面。入口分类错了：
+// 「+」是**传文件**，粘贴是**另一种输入**，它不是附件的子类。
+//
+// 处置：长正文直接由那个"唯一说一句话的地方"接住。粘进来超过 `PASTE_AS_MATERIAL_CHARS`
+// 的，就地变成一份材料，不进主题框；同时给一条能一键放回去的提示——自动分流必须是
+// 可反悔的，否则它就从"少点四步"变成"抢走了我刚粘的东西"。
+
+/** 粘到主题框里的正文多长就不再当"主题"。 */
+const PASTE_AS_MATERIAL_CHARS = 120;
+
+/** 刚被自动分流的那一段正文（记着它落在哪一份材料里，才能撤回）。 */
+const pastedMaterial = ref<{ key: string; text: string; chars: number } | null>(null);
+
+function onIntentPaste(event: ClipboardEvent): void {
+  const text = event.clipboardData?.getData('text/plain') ?? '';
+  const chars = text.trim().length;
+  if (chars < PASTE_AS_MATERIAL_CHARS) return;   // 短的就是主题，照常粘进输入框
+  event.preventDefault();
+  const key = sources.addPastedText(text);
+  // 加不进去（超上限、合并后超长）时 store 里已经有错误提示；正文没丢，仍在剪贴板。
+  if (!key) return;
+  pastedMaterial.value = { key, text, chars };
+}
+
+/** 把这段正文放回输入框，并撤掉刚建的那份材料。 */
+function undoPastedMaterial(): void {
+  const pasted = pastedMaterial.value;
+  if (!pasted) return;
+  sources.remove(pasted.key);
+  intentText.value = pasted.text;
+  pastedMaterial.value = null;
+}
+
+// 材料在别处被移除（缩略图上的 ✕、「清空来源」）时提示跟着走：它指的是**那一行**。
+watch(() => sources.items.map(item => item.key), keys => {
+  if (pastedMaterial.value && !keys.includes(pastedMaterial.value.key)) pastedMaterial.value = null;
+});
 
 // ---------------------------------------------------------------- 语音
 
@@ -779,11 +830,29 @@ defineExpose({
             :disabled="runBlocked"
             :placeholder="intentPlaceholder"
             @keydown="onIntentKeydown"
+            @paste="onIntentPaste"
             @compositionstart="composing = true"
             @compositionend="composing = false"
             @focus="focused = true"
             @blur="focused = false"
           />
+
+          <!-- 自动分流是可反悔的：这段正文去哪了、怎么放回去，就在原地写着。 -->
+          <div
+            v-if="pastedMaterial"
+            data-test="paste-material"
+            class="flex items-center gap-2 rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] text-sky-900"
+          >
+            <span class="min-w-0 flex-1">
+              这段正文（{{ pastedMaterial.chars }} 字）已经放进材料，主题框留给"要它做什么"。
+            </span>
+            <button
+              type="button"
+              data-test="paste-material-undo"
+              class="shrink-0 underline decoration-sky-400 underline-offset-2 hover:text-sky-700"
+              @click="undoPastedMaterial"
+            >放回输入框</button>
+          </div>
 
           <!--
             拆解方式与图型只在**新建**那一次生效：后端的编辑路径既不消费

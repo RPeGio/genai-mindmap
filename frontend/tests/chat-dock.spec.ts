@@ -361,6 +361,135 @@ describe('材料缩略图', () => {
   });
 });
 
+describe('粘贴正文：长正文直接进材料', () => {
+  /** jsdom 没有 `ClipboardEvent` 的构造函数，按它的形状造一个。 */
+  function paste(el: Element, text: string): Event {
+    const event = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: { getData: () => text } });
+    el.dispatchEvent(event);
+    return event;
+  }
+
+  it('粘一段正文：一步变成材料，主题框里不留字，并说明能放回去', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    const body = '这一段是要整理成导图的正文。'.repeat(20);
+
+    const event = paste(wrapper.get('textarea#intent').element, body);
+    await wrapper.vm.$nextTick();
+
+    // 五步（点 + → 面板 → 粘贴框 → Ctrl+V → 点添加）变成一步。
+    expect(event.defaultPrevented).toBe(true);
+    expect(sources.items).toHaveLength(1);
+    expect(sources.items[0].state).toBe('ready');
+    expect((wrapper.get('textarea#intent').element as HTMLTextAreaElement).value).toBe('');
+
+    const notice = wrapper.get('[data-test="paste-material"]');
+    expect(notice.text()).toContain(`${body.length} 字`);
+    expect(notice.text()).toContain('已经放进材料');
+  });
+
+  it('「放回输入框」把正文退回主题框，并撤掉那份材料', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    const body = '一段要整理的材料正文'.repeat(20);
+    paste(wrapper.get('textarea#intent').element, body);
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[data-test="paste-material-undo"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    expect(sources.items).toHaveLength(0);
+    expect((wrapper.get('textarea#intent').element as HTMLTextAreaElement).value).toBe(body);
+    expect(wrapper.find('[data-test="paste-material"]').exists()).toBe(false);
+  });
+
+  it('短粘贴照旧进输入框（主题是两个词，不是一篇正文）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+
+    const event = paste(wrapper.get('textarea#intent').element, '机器学习');
+    await wrapper.vm.$nextTick();
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(sources.items).toHaveLength(0);
+    expect(wrapper.find('[data-test="paste-material"]').exists()).toBe(false);
+  });
+
+  it('材料在别处被移除时提示跟着走（它指的是那一行）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    paste(wrapper.get('textarea#intent').element, '要整理的材料正文'.repeat(20));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="paste-material"]').exists()).toBe(true);
+
+    sources.remove(sources.items[0].key);
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="paste-material"]').exists()).toBe(false);
+  });
+});
+
+describe('材料没解析完时，改图也不能提交', () => {
+  it('编辑已有图 + 材料解析中：提交按钮禁用，提示说的是材料', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    store.preview(TREE, 'right');
+    store.select('a');
+    sources.items = [{
+      key: 'k1', id: 'k1', label: '大文件.pdf', kind: 'document', state: 'parsing',
+      source: null, error: '', seconds: 3,
+    }];
+    await wrapper.get('textarea#intent').setValue('把这一支改细一点');
+    await wrapper.vm.$nextTick();
+
+    // 编辑请求也带 `sources`：正在解析的这一份会被静默漏掉，所以这里必须拦住。
+    expect(wrapper.get(SUBMIT).attributes('disabled')).toBeDefined();
+    expect(wrapper.text()).toContain('来源正在解析');
+  });
+
+  it('解析失败也一样拦住（失败那份同样进不了请求体）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    store.preview(TREE, 'right');
+    store.select('a');
+    sources.items = [{
+      key: 'k1', id: 'k1', label: '坏文件.pdf', kind: 'document', state: 'failed',
+      source: null, error: '这个来源没有解析出可用文字', seconds: 0,
+    }];
+    await wrapper.get('textarea#intent').setValue('把这一支改细一点');
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.get(SUBMIT).attributes('disabled')).toBeDefined();
+    expect(wrapper.text()).toContain('重试或移除');
+  });
+
+  it('材料都就绪时改图照常提交', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    const sources = useSourcesStore();
+    store.preview(TREE, 'right');
+    store.select('a');
+    sources.items = [{
+      key: 's1', id: 'doc-1', label: '材料.pdf', kind: 'document', state: 'ready',
+      source: { ...textSource('材料正文'), id: 'doc-1', kind: 'document', filename: '材料.pdf' },
+      error: '', seconds: 0,
+    }];
+    await wrapper.get('textarea#intent').setValue('把这一支改细一点');
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.get(SUBMIT).attributes('disabled')).toBeUndefined();
+  });
+});
+
 describe('语音模式', () => {
   it('点 🎤 换成「按住说话」，⌨ 能切回键盘', async () => {
     stubFetch();
