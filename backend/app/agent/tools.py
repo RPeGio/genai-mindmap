@@ -4154,17 +4154,15 @@ def _profile_pool(ctx: RunContext) -> str:
 def _run_directions(
     ctx: RunContext, sources: Sequence[Any],
 ) -> list[profile_rank.Direction]:
-    """这次运行的画像方向：**一次运行只算一次**（内容下一提交换成按图取）。
+    """这次运行的画像方向：**只从这张图的材料算，一次运行只算一次**。
 
-    这一版落地的是一条：**算一次**。结果挂 `ctx`（理由见
-    `RunContext.profile_directions`）。方向的**内容**还是 `_samples()` 那批全局
-    样本，所以"图 B 被图 A 的方向加权"这件事在这一层还成立——下一提交把
-    `build_directions(_samples())` 换成 `build_directions_from_sources(sources)`，
-    两件事一起归零：跨图污染、以及那 6 次 embedding 往返。
+    三件事同时在这里落地：
 
-    `sources` 现在就收着（这一版还没读它），是为了让调用点的形状在下一提交
-    一个字都不用改：那个签名表达的是"方向由**这次的材料**决定"，而不是
-    "由库里某处决定"。
+      1. **隔离**：输入只有 `sources`（用户为这张图传的材料），没有一次库查询、
+         没有别的图的任何痕迹。图 A 的方向不可能出现在图 B 的列表里；
+      2. **零往返**：`build_directions_from_sources` 只读 `chunk_vectors` 里现成的
+         块向量，不调 `embed_texts`。开关打开也不再"多花几次 embedding"；
+      3. **一次**：结果挂 `ctx`（理由见 `RunContext.profile_directions`）。
 
     失败一律降级成空列表（= 这次不加权 + 一条诊断）：画像是排序上的二阶修正，
     算不出来时正确的行为是"这次不做个性化"，不是"这次检索失败"。
@@ -4178,11 +4176,7 @@ def _run_directions(
         # 缓存的空列表，而那个空列表与"真的没有方向"分不开。
         return []
     try:
-        # **这一版仍是全局样本**：隔离做到了"每个池一列、按池读、boost 必须显式
-        # 指定方向"，但方向的**内容**还是库里全部材料算出来的那批，所以跨图串味
-        # 在这一层还留着（下一提交换成 `build_directions_from_sources(sources)`：
-        # 只从这张图的材料算，顺带把那 6 次 embed 整笔省掉）。
-        directions = profile_rank.build_directions(profile_rank._samples())
+        directions = profile_rank.build_directions_from_sources(list(sources))
     except Exception as exc:  # noqa: BLE001 — 见 docstring 最后一段
         logger.warning("画像方向算不出来（%s），这次不做个性化加权",
                        type(exc).__name__)

@@ -108,6 +108,10 @@ MIN_SAMPLES = 5
 #: 最多取多少样本。一次 rebuild 要对每个样本 embed 一次（走 `vector_cache`，
 #: 命中就不花钱），上限 60 意味着最坏情况 6 批 HTTP（`embedding.MAX_BATCH = 10`）。
 #: 超过上限时**按来源类型分层**截断（见 `_samples`），不是简单地砍尾巴。
+#:
+#: 隔离之后这条路只剩脚本在用（`rebuild()` 不传材料时的老全局口径）；生成链路走
+#: `build_directions_from_sources`，它按**材料**轮流取块，同样是这个上限——理由
+#: 一样（60 个 1024 维向量的球面 k-means 实测 89 ms，再多就得不偿失）。
 MAX_SAMPLES = 60
 
 #: 迭代上限。球面 k-means 在 40 个样本上通常 4–6 轮就稳定，12 是留足余量的上界；
@@ -710,16 +714,157 @@ def build_directions(samples: Sequence[Sample]) -> list[Direction]:
     return directions
 
 
+# ---------------------------------------------------------------- 按图取方向
+#
+# 这一节是"按导图隔离"的落地，也是"零 embedding 往返"的落地。两件事其实是同一件
+# 事的两面：**方向只从这张图的材料算，而那些材料已经是切好的块、块向量已经在
+# `chunk_vectors` 里了**。所以"隔离"不但没让成本变高，反而把唯一那笔成本（60 条
+# 拼接文本的 embed）整笔省掉了。
+
+
+@dataclass(frozen=True)
+class ChunkSample:
+    """一个块样本：**向量来自 `chunk_vectors`，不来自任何新的 HTTP**。
+
+    `tag` 只进 `Direction.label`（日志与排查面板），不参与打分。用
+    "文件名#块序" 而不是块原文：label 要能一眼指回是哪份材料的哪一段，而块原文
+    是材料正文，不进日志（与 `embedding` 的注释同一条纪律）。
+    """
+
+    vector: list[float]
+    tag: str
+
+
+def _sub_spans(text: str) -> list[tuple[int, int]]:
+    """这份材料按检索那套切块器切出来的**子块**区间。
+
+    取 `level == 1` 而不是父块：实测同一批材料上，子块的块向量有 95% 命中
+    `chunk_vectors`，父块只有 21%。原因是检索**实际 embed 的是子块**
+    （`service._collect_leaves` 只把子块当匹配单元，父块是"被子块找到之后返回"
+    的窗口），而父块只在 `search_sources` 单级路径下才 embed——那条路在
+    `MINDMAP_PARENT_RETRIEVAL=1`（默认）时不走。
+
+    延迟 import `_chunk_tree`：`service` 顶层会 import 本模块（经 `prefs` 的
+    其它入口），反向 import 就是环。切块算法**只有这一份**，这里只是消费它。
+
+    子块为空的材料（零宽父块，见 `_chunk_tree` 的说明）退回父块：退回去最多是
+    这几条样本命中不了缓存，不会比"这份材料一条样本都不贡献"更差。
+    """
+    from app.knowledge.service import _chunk_tree
+
+    tree = _chunk_tree(text)
+    leaves = [(node.start, node.end) for node in tree if node.level == 1]
+    return leaves or [(node.start, node.end) for node in tree]
+
+
+def chunk_samples(sources: Sequence[Any]) -> list[ChunkSample]:
+    """这批材料的块 → **现成向量**。任何一条取不到就跳过，绝不补 embed。
+
+    "不补 embed"是这一整节存在的理由，不是保守：
+
+      - 补一次 embed 就是开关一打开多 N 次往返，而那正是默认关着的理由；
+      - 取不到的块只在**这份材料还没被任何检索碰过**时出现（刚上传、立刻生成）。
+        那一刻的正确行为是"这次没有方向、不加权"，不是"先花 6 次往返凑一批"。
+
+    取块用**轮流**（round-robin）而不是"前 60 条按顺序砍"：一张图 3 份材料、
+    第一份 200 块、另两份各 10 块时，砍尾巴等于方向全部来自第一份材料。轮流取的
+    效果是每份材料各占 1/3 配额，与 `_samples` 按来源类型分层配额同一条理由。
+    """
+    model = embedding.model_name()
+    per_source: list[list[ChunkSample]] = []
+    for source in sources:
+        text = str(getattr(source, "text", "") or "")
+        if not text.strip():
+            continue
+        name = str(getattr(source, "filename", "") or getattr(source, "id", "") or "")
+        spans = _sub_spans(text)
+        keys = [vector_cache.text_hash(text[start:end]) for start, end in spans]
+        cached = vector_cache.get_vectors(keys, model)
+        found: list[ChunkSample] = []
+        for (start, _end), key in zip(spans, keys):
+            vector = cached.get(key)
+            if vector:
+                found.append(ChunkSample(vector=vector, tag=f"{name}#{start}"))
+        if found:
+            per_source.append(found)
+    return _round_robin(per_source, MAX_SAMPLES)
+
+
+def _round_robin(groups: Sequence[Sequence[ChunkSample]], limit: int) -> list[ChunkSample]:
+    """按份轮流取，每份最多 `limit` 条，总数不超过 `limit`。"""
+    ordered: list[ChunkSample] = []
+    cursor = 0
+    while len(ordered) < limit and any(cursor < len(group) for group in groups):
+        for group in groups:
+            if cursor < len(group) and len(ordered) < limit:
+                ordered.append(group[cursor])
+        cursor += 1
+    return ordered
+
+
+def build_directions_from_sources(sources: Sequence[Any]) -> list[Direction]:
+    """**这张图的材料** → 这张图的方向。零 embedding 往返，没有向量服务也能用。
+
+    与 `build_directions`（老路径：库里三张表的全局样本 + 现 embed）的分工：
+
+      - 这个函数是生成链路的唯一入口。它的输入是"用户为这张图传的材料"，所以
+        两张不同主题的图**没有任何共享的自由度**——图 B 的检索不可能被图 A 的
+        方向加权，那是隔离的全部内容；
+      - `build_directions` 留着给脚本与面板（`rebuild()` 不带材料时的老口径），
+        它仍然是全局的，也就仍然是"跨图串味"的，**不要在生成链路里调它**。
+
+    不检查 `embedding.configured()`：这一路**不发请求**，只用 `chunk_vectors` 里
+    已有的向量。缓存是别的（配了凭证的）进程写进去的，它们同样有用——按"没凭证
+    就等于没有方向"把它挡掉，会让"有向量但刚换了环境变量"这种情况白白降级。
+
+    样本不足（`MIN_SAMPLES`）返回空列表，**不抛错**：新图没有材料时这就是正常
+    路径——没有样本 → 没有方向 → 不加权。这条降级不特判，也不记 warning；调用方
+    用 `Boost.reason` 给用户一句可读的诊断。
+    """
+    samples = chunk_samples(sources)
+    if len(samples) < MIN_SAMPLES:
+        logger.info("画像：这张图的材料只给出 %d 条块向量（需要 %d 条），本次没有方向",
+                    len(samples), MIN_SAMPLES)
+        return []
+    matrix = [_normalize(sample.vector) for sample in samples]
+    # 块之间**不带时间衰减**：它们是同一张图这次用的材料，彼此没有先后。衰减是
+    # 给"一个人换了课题"用的（`build_directions` 那条路），在这里加只会让
+    # "刚上传的另一份材料"无故变轻。
+    weights = [1.0] * len(matrix)
+    groups = cluster(matrix, _pick_k(len(matrix)), weights)
+    total = float(len(matrix)) or 1.0
+    directions: list[Direction] = []
+    for center, members in groups:
+        best = max(members, key=lambda position: _dot(matrix[position], center))
+        directions.append(Direction(
+            label=samples[best].tag[:32] or f"{len(members)} 块",
+            vector=center,
+            weight=round(len(members) / total, 4),
+            samples=len(members),
+        ))
+    directions.sort(key=lambda item: (-item.weight, item.label))
+    logger.info("画像：这张图 %d 份材料 / %d 条块向量聚成 %d 个方向（%s）",
+                len(sources), len(matrix), len(directions),
+                "；".join(f"{d.label}({d.samples})" for d in directions))
+    return directions
+
+
 # ---------------------------------------------------------------- 落库与读回
 
 
-def rebuild(map_id: str | None = None) -> list[Direction]:
+def rebuild(
+    map_id: str | None = None, *, sources: Sequence[Any] | None = None,
+) -> list[Direction]:
     """重算方向并按池键落库。样本不足时**清空这个池**并返回空列表。
 
-    样本仍取自 `_samples()`（库里三张表的全局样本），这一版只把**归属**改成池：
-    方向现在有了池键，`stored(map_id=…)` 也只按池读。**但方向本身还是全局算的**
-    ——跨图污染还在这一层，下一提交才把它换成本图材料的块向量
-    （`build_directions_from_sources`，同时省掉那 6 次 embed）。
+    两种口径，由 `sources` 是否给出来分开，**不要混着用**：
+
+      - `sources is None`（默认）→ 老全局口径：`_samples()` 三张表的样本 + 现
+        embed（最坏 6 次 HTTP）。这是 `--report` 与面板用的，它会跨图串味，因为
+        它本来就是"这个人所有材料"的平均；
+      - `sources` 给了 → 这张图的材料（`build_directions_from_sources`，零往返）。
+        生成链路走这条（由 `rebuild(map_id=pool, sources=request.sources)` 显式
+        触发，或不落库直接算）。
 
     清空的范围是**这个池**，不是整张表：`DELETE FROM ... WHERE map_id = ?`。
     否则给一张图重建方向会把其它图（以及隔离之前的全局方向）一起抹掉——那是
@@ -730,7 +875,10 @@ def rebuild(map_id: str | None = None) -> list[Direction]:
     而这里没有 `OR IGNORE`）。改动是纯机械的，`stored` 从不读 `id`。
     """
     pool = "" if map_id is None else str(map_id)
-    directions = build_directions(_samples())
+    directions = (
+        build_directions_from_sources(sources) if sources is not None
+        else build_directions(_samples())
+    )
     with closing(_connect()) as conn, conn:
         conn.execute(
             f"DELETE FROM {VECTOR_TABLE} WHERE COALESCE(map_id, '') = ?", (pool,))
@@ -1007,11 +1155,14 @@ __all__ = [
     "SWITCH_ENV",
     "VECTOR_TABLE",
     "Boost",
+    "ChunkSample",
     "Direction",
     "Sample",
     "Stored",
     "boost",
     "build_directions",
+    "build_directions_from_sources",
+    "chunk_samples",
     "cluster",
     "enabled",
     "ensure_schema",
