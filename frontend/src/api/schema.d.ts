@@ -2118,9 +2118,16 @@ export interface components {
         };
         /**
          * SuggestionKind
+         * @description 建议的**动作**名词，不是诊断码。
+         *
+         *     用户看到的是"点一下会发生什么"，所以值域按动作分，不按诊断分：同一个
+         *     `NEAR_DUPLICATE_LABEL` 与 `DUPLICATE_LABEL` 都是 `dedupe`，因为对用户来说
+         *     要做的是同一件事。`expand` / `add_detail` 是 F15 那一轮补的——`fill` 说的是
+         *     "整张图缺了哪一块"（结构级），而"这一支没展开"与"这几个节点没有说明"是
+         *     节点级的两件事，混进 `fill` 会让按钮文案说不清要点哪里。
          * @enum {string}
          */
-        SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop";
+        SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop" | "expand" | "add_detail";
         /** Theme */
         Theme: {
             /**
