@@ -21,7 +21,8 @@ import pytest
 
 from app.agent import provider as provider_module
 from app.agent.contracts import AgentRunRequest, Completion, DoneEvent, RunBudget, ToolCall
-from app.agent.service import REASONING_TEXT_LIMIT, run
+from app.agent.service import REASONING_BYTE_LIMIT, run
+from app.agent.stream import encode_event
 from app.contracts.mindmap import MindMapContent
 # 模型名的判定只有一份，在 generation 那边：两条出口（provider 与 chat_async）
 # 都从那里取名字，所以这里也从那里导入。
@@ -153,10 +154,91 @@ def test_long_reasoning_is_not_clipped_at_the_summary_limit():
 def test_runaway_reasoning_is_bounded_and_says_so():
     """跑飞时留一条上限，并且**在文本里写明**截了——不要静默少一段。"""
     request = AgentRunRequest(goal="机器学习", deep_thinking=True, snapshot=MindMapContent(**TREE))
-    done = done_of(collect(request, _ReasoningProvider("思" * (REASONING_TEXT_LIMIT + 500))))
+    done = done_of(collect(request, _ReasoningProvider("思" * REASONING_BYTE_LIMIT)))
 
-    assert done.reasoning.startswith("思" * REASONING_TEXT_LIMIT)
     assert "已截断" in done.reasoning
+    assert _frame_bytes(done) <= REASONING_BYTE_LIMIT + _FRAME_OVERHEAD
+
+
+# ---------------------------------------------------------------- 字节口径
+#
+# 上限管的是"这一帧有多大"，那就按**编码之后**的字节钉。三种字符各自是不同的一档：
+# 汉字 3 字节、emoji 4 字节、控制字符被 JSON 转义成 `\u0000` 六字节——按字数设上限
+# 时这一档能跑出 120KB。
+
+# `data: ` + 帧里除 `reasoning` 之外的字段（`type`/`seq`/`model`/`usage`）+ `\n\n`。
+# 这里留一个宽松的余量，钉的是量级不是常量。
+_FRAME_OVERHEAD = 512
+
+
+def _frame_bytes(done: DoneEvent) -> int:
+    """这一帧真实发出去的字节数（与 `stream.encode_event` 同一个编码函数）。"""
+    return len(encode_event(done).encode("utf-8"))
+
+
+def _encoded_size(text: str) -> int:
+    """这段文本落进帧之后占的字节数（JSON 转义 + UTF-8，与 service 里同一个口径）。"""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("name", "char", "clipped"),
+    [
+        # 2 万字的三档：汉字（3 字节）、emoji（4 字节）、控制字符（JSON 转义成 `\u0000`，6 字节）。
+        # 汉字 60000 字节本来就在 64 KiB 以内，所以现在**整段放行**；另外两档按老口径
+        # （字数）能跑出 80/120KB，现在被截回界内。
+        ("汉字", "思", False),
+        ("emoji", "😀", True),
+        ("控制字符", "\x00", True),
+    ],
+)
+def test_frame_bytes_are_bounded_for_every_character_class(name, char, clipped):
+    """2 万字的跑飞输入：三种字符的帧都要落回字节上界内，且**不切半个字**。"""
+    runaway = char * 20_000
+    done = done_of(collect(
+        AgentRunRequest(goal="机器学习", deep_thinking=True, snapshot=MindMapContent(**TREE)),
+        _ReasoningProvider(runaway),
+    ))
+
+    # 两个口径都钉：字段自己（也就是"这一帧比纯帧头多出来的那部分"）在界内，整帧在
+    # 界 + 帧头余量内。
+    assert _encoded_size(done.reasoning) <= REASONING_BYTE_LIMIT
+    assert _encoded_size(done.reasoning) <= _encoded_size(runaway)  # 不会比原来更大
+    assert _frame_bytes(done) <= REASONING_BYTE_LIMIT + _FRAME_OVERHEAD
+
+    if not clipped:
+        assert done.reasoning == runaway
+        return
+
+    # 截在字符边界上：留下来的那段只由原字符组成（没有替换字符、也没有半个码位），
+    # 而且它确实是原文的前缀。
+    kept = done.reasoning[: done.reasoning.index("…（思考过程过长")]
+    assert kept and kept == char * len(kept) and runaway.startswith(kept)
+    assert "已截断" in done.reasoning
+
+
+def test_reasoning_within_the_budget_is_byte_identical():
+    """上限内的 reasoning **逐字节**不变——不 trim、不 normalize、不补说明。"""
+    text = "先看材料，再定分支。" * 500          # 5000 汉字 ≈ 15KB
+    done = done_of(collect(
+        AgentRunRequest(goal="机器学习", deep_thinking=True, snapshot=MindMapContent(**TREE)),
+        _ReasoningProvider(text),
+    ))
+    assert done.reasoning.encode("utf-8") == text.encode("utf-8")
+
+
+def test_an_emoji_at_the_boundary_is_not_split():
+    """真正贴着上界的那个 emoji 也不能被劈成两个半个（半个是无效 UTF-8）。"""
+    # 16400 个 emoji = 65600 字节，刚好越过 budget（65536 减掉那句说明）：截断点落在
+    # emoji 串中间，正是"按字节硬切"会切出半个字符的那个位置。
+    body = "😀" * 16_400
+    done = done_of(collect(
+        AgentRunRequest(goal="机器学习", deep_thinking=True, snapshot=MindMapContent(**TREE)),
+        _ReasoningProvider(body),
+    ))
+    kept = done.reasoning[: done.reasoning.index("…（思考过程过长")]
+    assert kept and set(kept) == {"😀"}
+    assert len(kept) < len(body)
 
 
 def test_done_frame_carries_no_model_name_from_an_anonymous_provider():

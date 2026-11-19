@@ -840,7 +840,8 @@ class DoneEvent(_EventBase):
     # 主动要看的东西——界面上那个折叠面板就是为它做的，成功时反而藏起来等于这个
     # 开关白勾了。
     #
-    # 上限见 `service.REASONING_TEXT_LIMIT`（远大于实测的 3000–8000 字，等于"不截"）。
+    # 上限见 `service.REASONING_BYTE_LIMIT`（按**编码后的字节**算，64 KiB；实测的
+    # 3000–8000 字连一半都用不到，等于"不截"）。
     reasoning: str = ""
     # 这一轮真正发出去的模型名（`deepseek-chat` / `deepseek-reasoner` / 配置里的任意值）。
     #

@@ -807,8 +807,8 @@ export type AgentEvent =
        * 模型这一轮的思考过程（`reasoning_content`）。
        *
        * 与 `text` 不同，**成功时也填**：走推理模型时它正是用户勾「深度思考」要看
-       * 的东西，界面用 `<details>` 折叠展示全文。上限见后端 `REASONING_TEXT_LIMIT`
-       * （20000 字，远大于实测的 3000–8000 字，等于不截）。
+       * 的东西，界面用 `<details>` 折叠展示全文。上限见后端 `REASONING_BYTE_LIMIT`
+       * （编码后的 64 KiB，汉字约 21800 字；实测的 3000–8000 字远够，等于不截）。
        */
       reasoning?: string;
       /**

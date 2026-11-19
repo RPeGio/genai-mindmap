@@ -325,23 +325,56 @@ def _clip(text: str, limit: int = MODEL_TEXT_LIMIT) -> str:
 # 思考过程推给界面的上限。**不是** `MODEL_TEXT_LIMIT`：那 4000 字是"排障摘要"的
 # 口径，而 reasoner 的思考过程实测就是 3000–8000 字，用它去截等于每次都截掉一半。
 #
-# 20000 这个数怎么来的：它比实测上界还宽一倍多，够覆盖"想得很长"的那几次；同时
-# 它离"把一帧撑到几 MB"很远——中文在 SSE 里按 UTF-8 原样发（`ensure_ascii=False`），
-# 20000 汉字约 60KB 一帧。实测（`.visioncheck` 那条 mock 上游链路）8000 字 reasoning
-# 的 done 帧是 24KB 量级，前端 `postSse` 按 `\n\n` 切帧、不设单帧长度上限，nginx 那边
-# 配的是 900 秒长连接——一帧几十 KB 不触发任何一层。
+# **上限为什么是字节、不是字数**——同一句"2 万字"，编码之后差 6 倍（实测 `done` 帧，
+# 编码函数就是 `stream.encode_event`）：
+#
+#     2 万汉字       60076 字节   （3 字节/字）
+#     2 万 emoji     80076 字节   （4 字节/字）
+#     2 万控制字符  120076 字节   （JSON 把 U+0000 转义成 `\u0000`，6 字节/字）
+#
+# 按字符设上限，管的是"模型想了多少"；真正压到链路上的是"这一帧多大"。两者在
+# 控制字符那一档差 6 倍，所以口径换成编码后的字节。
+#
+# 65536（64 KiB）这一个数同时做到三件事：
+#   · 实测上界（8000 字）整段过去、一个字不动：汉字 24KB / emoji 32KB / 控制字符 48KB；
+#   · 比原来的"2 万字"更宽也更安全——汉字约 21800 字（原来 60KB），emoji 约 16300 字
+#     （原来 80KB），控制字符约 10900 字（原来 120KB）；
+#   · 最坏一帧 ≈ 64 KiB + 一百多字节帧头，任何一层都不必为它调参（前端 `postSse` 按
+#     `\n\n` 切帧、不设单帧上限，nginx 那边是 900 秒长连接）。
 #
 # 留这条上限不是为了"截"，是为了防跑飞：模型吐 200 万字符时不能把它整段塞进
 # 事件流（也塞不进 `_MAX_RESPONSE_BYTES` 之外的地方）。截断时补一句说明，
 # 让"少了一段"这件事在界面上是看得见的。
-REASONING_TEXT_LIMIT = 20000
+REASONING_BYTE_LIMIT = 65_536
+
+
+def _encoded_size(text: str) -> int:
+    """这段文本落进 SSE 帧之后占多少字节：JSON 转义与 UTF-8 都算进去。
+
+    量的是**编码之后**。控制字符会被 JSON 转义成 `\u0000`（1 字节 → 6 字节），
+    那正是字符口径看不见的一半；`ensure_ascii=False` 与 `stream.encode_event` 同一个
+    口径，汉字 3 字节、emoji 4 字节。`surrogatepass` 只为让孤立代理项也能度量
+    （真按 strict 编会在截断路径里自己抛出去，而那不是这条函数该处理的事）。
+    """
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass"))
 
 
 def _reasoning_text(text: str) -> str:
     """思考过程原样推给前端，只挡"跑飞"那一档。"""
-    if len(text) <= REASONING_TEXT_LIMIT:
+    if _encoded_size(text) <= REASONING_BYTE_LIMIT:
         return text
-    return text[:REASONING_TEXT_LIMIT] + f"…（思考过程过长，已截断，原文 {len(text)} 字）"
+    note = f"…（思考过程过长，已截断，原文 {len(text)} 字）"
+    # 截在**字符**边界上：二分找的是"多长的前缀还装得下"，`text[:k]` 按码位切，
+    # 不会切开一个 3/4 字节的 UTF-8 序列——所以这里不需要事后修补半个字符。
+    budget = REASONING_BYTE_LIMIT - _encoded_size(note)
+    lo, hi = 0, min(len(text), REASONING_BYTE_LIMIT)  # 一个字至少 1 字节，先压一档
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _encoded_size(text[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + note
 
 
 def _dedupe_key(call: ToolCall) -> str:
@@ -1142,7 +1175,7 @@ async def _loop(
                     text="" if ctx.candidate is not None else _clip(said),
                     # 思考过程**成功时也留**：走 reasoner 时它正是用户勾「深度思考」
                     # 要看的东西，藏起来等于那个开关白勾了。截断上限见
-                    # `REASONING_TEXT_LIMIT`（不是 `MODEL_TEXT_LIMIT`）。
+                    # `REASONING_BYTE_LIMIT`（不是 `MODEL_TEXT_LIMIT`）。
                     reasoning=_reasoning_text(reasoning),
                     # 与两条收尾路径（预算耗尽 / 空转停止）同一个来源：`model_name`
                     # 是这一轮 provider 真正发出去的名字。
