@@ -127,6 +127,12 @@ def _report() -> int:
         print(f"  假数据最集中的图：{top[0][:8]}… 有 {top[1]} 条（判据见 _is_synthetic）")
 
     params = style_mod.summarize(observations)
+    data = style_mod.provenance()
+    print(f"样本构成（`style.provenance()`）：原始 {data['runs']} 条 → 可用 "
+          f"{data['usable']} 条 → 折叠重复形状后 {data['kept']} 条独立观察"
+          f"（折掉 {data['folded']} 条，不同形状 {data['distinct_shapes']} 种）")
+    print(f"  **最大单一形状占 {data['dominant_share']:.1%}**"
+          f"——超过 50% 就说明画像主要在描述一件事，而不是一个人的习惯。")
     if not params:
         print("样本不足，画像不启用。")
     else:

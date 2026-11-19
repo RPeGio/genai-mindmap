@@ -301,6 +301,25 @@ def test_refresh_drops_keys_no_longer_produced():
     assert "retired" not in style.read()
 
 
+def test_provenance_reports_how_monotonous_the_data_is():
+    """画像要自报家底：原始 / 可用 / 折叠后 / 最大单一形状占比。
+
+    这几条不是好看的统计，它们是"画像学到的是习惯还是测试者的习惯"这个问题
+    唯一能被机器回答的部分：`dominant_share` 高就说明画像主要在描述一件事。
+    """
+    repeated = [_store_run(f"same{index}", _tree(branches=3, depth=2, detail=None))
+                for index in range(6)]
+    for index, count in enumerate((5, 6, 7, 8)):
+        _store_run(f"v{index}", _distinct(count, index))
+    assert repeated is not None
+    data = style.provenance()
+    assert data["runs"] == 10 and data["usable"] == 10
+    assert data["kept"] == 6            # 6 条同形状折成 2 票 + 4 条不同的
+    assert data["folded"] == 4
+    assert data["dominant_share"] == pytest.approx(0.6)
+    assert data["repeat_cap"] == style.REPEAT_CAP
+
+
 def test_describe_reports_enabled_flag():
     style.refresh()
     assert style.describe()["enabled"] is False

@@ -672,8 +672,52 @@ def prompt_block(params: dict[str, Param] | None = None) -> str:
     return "\n".join([STYLE_HEADER, *lines, SHAPE_RULE])
 
 
+def provenance() -> dict[str, Any]:
+    """这批画像**是由什么样的数据算出来的**——不是给运行打标签，是让画像自报家底。
+
+    用户问过一个问题："要不要在画像里加一条『数据来源是测试还是真实使用』的标记？"
+    答案是**要**，但**不能靠给每次运行打一个布尔标签**：
+
+      - "测试"不是一个能从产物里读出来的属性，只能靠 `goal` 里的字面（"再改一处"）
+        去猜，而那种判据不可穷尽、不可解释、下一个人接手时也不知道该不该扩；
+      - 更要紧的是，同一个 goal 被重跑三次到底是"测试"还是"用户在微调"，从数据侧
+        根本分不开——两者的产物形状可能完全不重叠。
+
+    所以这里报的是三个**机械可算**的量，它们合起来回答了同一个问题：
+
+      - `kept` / `runs`：折叠之后还剩几条独立观察（本机 21 / 34）；
+      - `folded`：因为"形状重复"被折掉几条（本机 13）；
+      - `dominant_share`：**最大的那一种形状占多少**。这个数超过 0.5 就说明
+        画像主要在描述"一件事"——本机 `[1,3,3]`、零 detail 的那一种占了原始
+        样本的一半，去掉它之前一级分支的中位数是 3，去掉之后是 5。
+
+    与之配套的两条硬判据已经在实现里：`_dedupe`（同形状最多两票）与
+    `profile.MIN_MINDMAP_NODES`（不足 20 节点的图不进向量样本——本机那 15 张
+    验收图的标题是脚手架）。**它们降低影响，但不消除污染**：一份才是测试产物
+    的库，`dominant_share` 会诚实地高到 0.5 以上。
+    """
+    observations = _observations()
+    usable = [item for item in observations if item.depth > 0]
+    kept, folded = _dedupe(usable)
+    shapes: dict[str, int] = {}
+    for item in usable:
+        key = _fingerprint(item)
+        shapes[key] = shapes.get(key, 0) + 1
+    dominant = max(shapes.values()) / len(usable) if usable else 0.0
+    return {
+        "runs": len(observations),
+        "usable": len(usable),
+        "kept": len(kept),
+        "folded": folded,
+        "distinct_shapes": len(shapes),
+        "dominant_share": round(dominant, 3),
+        "min_samples": MIN_SAMPLES,
+        "repeat_cap": REPEAT_CAP,
+    }
+
+
 def describe() -> dict[str, Any]:
-    """面板/脚本要的一份完整视图：8 个参数 + 是否启用。"""
+    """面板/脚本要的一份完整视图：8 个参数 + 是否启用 + 这批数据的来路。"""
     params = read()
     return {
         "enabled": bool(params),
@@ -688,6 +732,7 @@ def describe() -> dict[str, Any]:
             "confidence": param.confidence,
             "detail": param.detail,
         } for key, param in params.items()},
+        "provenance": provenance(),
     }
 
 
@@ -716,6 +761,7 @@ __all__ = [
     "iter_observations",
     "observe",
     "prompt_block",
+    "provenance",
     "read",
     "refresh",
     "summarize",
