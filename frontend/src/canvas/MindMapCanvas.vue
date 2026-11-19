@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Background } from '@vue-flow/background';
 import { VueFlow, useVueFlow } from '@vue-flow/core';
-import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import { NODE_SIZE } from './layout/tidy';
@@ -22,6 +22,21 @@ const store = useMindMapStore();
 const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
   useVueFlow();
 
+/**
+ * 画布外壳。结构键（Tab / Enter / Delete / F2）只服务它，所以它必须能拿到焦点。
+ *
+ * **为什么要有这一层**：这些键原先挂在 `window` 上，只排除了输入框。于是选中一个
+ * 节点之后，焦点随便落在哪个按钮上，按 Tab（想切到下一个控件）都会往图里加一个子
+ * 节点、按 Enter 会加一个兄弟节点——用户以为自己只是在用键盘导航，图已经被改了。
+ * 这不是"少一次校验"，是数据损坏。
+ */
+const shell = ref<HTMLElement | null>(null);
+
+function focusCanvas(): void {
+  // `preventScroll`：画布可能比视口大，聚焦外壳时页面跳一下会让人以为图动了。
+  shell.value?.focus({ preventScroll: true });
+}
+
 // 预览节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
 // 画布这边不必自己判断来源，点不中就是点不中。
 //
@@ -32,9 +47,14 @@ onNodeClick(({ node, event }) => {
   const additive = event.ctrlKey || event.metaKey || event.shiftKey;
   if (additive) store.toggleSelect(node.id);
   else store.select(node.id);
+  // 点了节点就把焦点交给画布：接下来按 Tab / Enter 是要改图，不是去别处。
+  focusCanvas();
 });
 onNodeDoubleClick(({ node }) => store.beginEdit(node.id));
-onPaneClick(() => store.clearSelection());
+onPaneClick(() => {
+  store.clearSelection();
+  focusCanvas();
+});
 // 用户手动平移或缩放后停止自动适配，否则每长一个节点视图就会被拽回全图。
 onMoveEnd(() => {
   store.viewAdjusted = true;
@@ -47,6 +67,36 @@ function isTyping(target: EventTarget | null): boolean {
   return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
 }
 
+/**
+ * 控件：它们的 Enter 是"点一下"，Tab 是"去下一个"，都不归画布。
+ *
+ * 节点卡片自己也带 `tabindex="0"`（可聚焦、可读屏），那是**画布内**的焦点，
+ * 结构键归画布——所以这里只排除真正的交互控件。
+ */
+function isControl(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || tag === 'A') {
+    return true;
+  }
+  const role = el.getAttribute('role');
+  return role === 'button' || role === 'link' || role === 'textbox' || role === 'menuitem';
+}
+
+/**
+ * 这一下按键该不该归画布：焦点必须在画布里，且不落在控件上。
+ *
+ * 撤销 / 重做（Ctrl+Z）不在这条判据里——那是全局操作，焦点在哪都该生效。
+ */
+function ownsStructureKeys(event: KeyboardEvent): boolean {
+  if (isTyping(event.target)) return false;
+  const el = shell.value;
+  if (!el) return false;
+  const active = document.activeElement;
+  if (!active || !el.contains(active)) return false;
+  return !isControl(active as HTMLElement);
+}
+
 function onKeydown(event: KeyboardEvent) {
   if (isTyping(event.target)) return;
 
@@ -56,6 +106,10 @@ function onKeydown(event: KeyboardEvent) {
     else store.undo();
     return;
   }
+
+  // 焦点不在画布里就到此为止：Tab 要能继续在表单控件之间走，Enter 要能按下那个
+  // 按钮。这一步之前漏了，选中节点后在别处按 Tab / Enter 会改图。
+  if (!ownsStructureKeys(event)) return;
 
   const id = store.selectedId;
   if (!id) return;
@@ -154,7 +208,17 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="relative h-full w-full">
+  <!--
+    画布要能拿到焦点：`tabindex="0"` 让它进 Tab 序列，也让"点了画布 → 键盘改图"
+    这条链成立。焦点环只在键盘走到这里时出现（`focus-visible`），鼠标点画布不长出
+    一圈框。
+  -->
+  <div
+    ref="shell"
+    tabindex="0"
+    aria-label="导图画布（选中节点后 Tab 加子节点、Enter 加兄弟节点、Delete 删除、F2 改名）"
+    class="relative h-full w-full outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-300"
+  >
     <VueFlow
       :nodes="store.nodes"
       :edges="store.edges"
