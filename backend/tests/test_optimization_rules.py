@@ -512,3 +512,44 @@ def test_live_model_finds_a_synonym_pair_the_rules_cannot_see():
     """
     pairs = service._model_near_pairs([["正则化", "规范化", "过拟合", "欠拟合"]])
     assert any({"正则化", "规范化"} == {left, right} for _, left, right, _ in pairs), pairs
+
+
+# ---------------------------------------------------------------- 路由层的树型闸
+#
+# 在此之前传鱼骨/流程会 `AttributeError: ... has no attribute 'root'`（500）。
+# 前端 `stores/structure.ts` 已经在发请求前拦住了，所以这个雷只在接口层可见 ——
+# 换一个客户端（curl、将来的移动端）就会踩。422 比 500 诚实：500 说的是"服务器
+# 坏了"，而事实是"这个输入不在这个接口的服务范围里"。
+
+
+def _client():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    return TestClient(app)
+
+
+_FISH = {"content": {"title": "t", "problem": "p",
+                     "bones": [{"category": "人", "root": {"id": "b1", "label": "x"}}]}}
+_FLOW = {"content": {"title": "t",
+                     "stages": [{"id": "s1", "root": {"id": "a", "label": "提交"}}]}}
+
+
+@pytest.mark.parametrize("endpoint", ["/api/optimization/check",
+                                      "/api/optimization/suggest"])
+@pytest.mark.parametrize("body", [_FISH, _FLOW], ids=["fishbone", "flow"])
+def test_non_tree_shapes_get_422_not_500(endpoint: str, body: dict) -> None:
+    response = _client().post(endpoint, json=body)
+    assert response.status_code == 422
+    assert "只支持树型" in response.json()["detail"]
+
+
+def test_tree_still_gets_diagnostics() -> None:
+    body = {"content": {"title": "t", "root": {
+        "id": "r", "label": "根",
+        "children": [{"id": "c1", "label": "唯一子节点"}]}}}
+    response = _client().post("/api/optimization/check", json=body)
+    assert response.status_code == 200
+    codes = [item["code"] for item in response.json()["diagnostics"]]
+    assert "SINGLE_CHILD" in codes
