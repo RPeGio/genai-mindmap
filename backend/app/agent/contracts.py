@@ -861,6 +861,19 @@ class DoneEvent(_EventBase):
     # 测试里按脚本回放的假 provider）时是 None，帧里整条不存在——"没说"不该长得
     # 像"说了 chat"。
     model: str | None = None
+    # 这一帧交出去的那棵树**没有生成完**：预算耗尽、工具超时、连续失败、空转都算。
+    #
+    # 从前这几条收尾路径一律发 `error` 帧，哪怕树上已经长出了大半个能用的结构——
+    # 前端收到 `error` 会清掉预览、`content` 也不动，于是用户看着它跑了三分钟，
+    # 最后什么都没拿到。现在统一成"有树就交树，没树才报错"，`partial` 就是
+    # "交了，但不是完整的一次生成"这个事实的落点。
+    #
+    # 缺省 None 而不是 False：`exclude_none=True` 会把它整条抹掉，正常收尾的帧
+    # 与加这个字段之前**逐字节相同**——老客户端、`_replay` 重放都不受影响。
+    partial: bool | None = None
+    # 为什么是半棵树（"模型调用次数已用完（已执行 6 次工具调用，树上是 41 个节点）…"）。
+    # 与 `partial` 成对出现；前端把它显示成告警文案，不要只给一个布尔值。
+    partial_reason: str | None = None
 
 
 class ErrorEvent(_EventBase):

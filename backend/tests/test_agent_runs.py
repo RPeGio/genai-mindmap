@@ -385,6 +385,50 @@ def test_replay_keeps_demo_mode():
     assert _frames(response.text)[-1]["mode"] == "demo"
 
 
+def test_replay_keeps_the_partial_flag():
+    """重放出来的帧要带原来那个"没长完"的标记与原因。
+
+    同一份产出，重连后若变成"完整生成"，用户会以为上一轮真的一次跑完了——
+    而他断开之前看到的明明是"部分完成"。标记必须落库，正是为了这一刻。
+    """
+    runs.begin("partial-1", {"goal": "g"})
+    runs.finish("partial-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model",
+                partial=True, partial_reason="模型调用次数已用完（已执行 6 次工具调用）")
+
+    def should_not_start(*_args, **_kwargs):
+        raise AssertionError("不该重新跑")
+
+    with patch("app.agent.router.run", new=should_not_start):
+        response = client.post(URL, json={"goal": "g", "intent": "create",
+                                          "run_id": "partial-1"})
+
+    done = _frames(response.text)[-1]
+    assert done["type"] == "done"
+    assert done["partial"] is True
+    assert done["partial_reason"] == "模型调用次数已用完（已执行 6 次工具调用）"
+
+
+def test_completed_run_replays_without_a_partial_flag():
+    """完整跑完的那次重放时不该凭空多出 `partial`。
+
+    正常收尾根本不传 `partial`（`DoneEvent.partial` 是 None），`COALESCE` 让它留
+    在 NULL 上；重放时读到 None，`exclude_none` 就把它抹掉——帧与加字段之前一样。
+    """
+    runs.begin("full-1", {"goal": "g"})
+    runs.finish("full-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model")
+
+    def should_not_start(*_args, **_kwargs):
+        raise AssertionError("不该重新跑")
+
+    with patch("app.agent.router.run", new=should_not_start):
+        response = client.post(URL, json={"goal": "g", "intent": "create",
+                                          "run_id": "full-1"})
+
+    done = _frames(response.text)[-1]
+    assert "partial" not in done
+    assert "partial_reason" not in done
+
+
 def test_cancelled_run_is_reopened_instead_of_being_replayed():
     """取消过的 run 允许用同一个 id 重跑：那是用户主动重试，不是重复投递。"""
     runs.begin("retry-1", {"goal": "g"})

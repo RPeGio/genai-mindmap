@@ -433,8 +433,12 @@ def test_count_budgets_keep_their_short_message():
 def test_timed_out_tool_reports_the_same_sentence_as_the_loop(caplog):
     """工具超时与循环判停必须说同一句话，且都带进度。
 
-    两处各写一份文案的话，同一件事在日志、`tool_end` 与 `error` 帧里会长得不一样，
+    两处各写一份文案的话，同一件事在日志、`tool_end` 与收尾帧里会长得不一样，
     而排查的人只能靠它们互相对上。
+
+    这里带着候选超时，所以收尾帧是 `done`（标 `partial`）而不是 `error`——树的
+    交出口径统一之后，"跑到一半停了"不再等于"什么都没拿到"。那句解释从
+    `error.message` 移到了 `done.partial_reason`，仍然是**逐字相同的一句**。
     """
     async def slow(args, ctx):
         await asyncio.sleep(2)
@@ -452,8 +456,11 @@ def test_timed_out_tool_reports_the_same_sentence_as_the_loop(caplog):
     end = _ends(events)[0]
     assert end.result_summary["code"] == "tool_timeout"
     assert "已执行 1 次工具调用" in end.result_summary["message"]
-    assert events[-1].limit == "max_seconds"
-    assert events[-1].message == end.result_summary["message"]
+    last = events[-1]
+    assert last.type == "done", "树已经在手上了，超时不该把它报成失败"
+    assert last.content is not None
+    assert last.partial is True
+    assert last.partial_reason == end.result_summary["message"]
     assert caplog.text.count("tool_timeout") >= 1
 
 

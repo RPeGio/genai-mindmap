@@ -87,6 +87,15 @@ class RunRecord:
     #: 老行上两者都是 None（那时还没这两列），重放时整条字段不存在，与"没说"同义。
     model: str | None = None
     reasoning: str | None = None
+    #: 这次收尾**交出的树没长完**（预算耗尽、工具超时、连续失败、空转），以及为什么。
+    #:
+    #: 落库的理由与 `model` / `reasoning` 一样，都是为了让 `_replay` 与第一次
+    #: 完全同形：重连后拿到的若是"完整生成"，用户会以为自己上一轮真的成功了。
+    #:
+    #: `partial` 用 `bool | None` 而不是 `bool`：老行上是 NULL，意思是"这条记录
+    #: 早于这个字段"——与"明确知道它是完整的"（False）不是一回事。
+    partial: bool | None = None
+    partial_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +158,10 @@ def _record(row: sqlite3.Row) -> RunRecord:
             candidate = None
     request = _loads(row["request"])
     failure = _loads(row["failure"])
+    # `row["partial"]` 只在补过列的新库上有；老库这一行读出来会是 NULL。
+    # `sqlite3.Row` 对不存在的列会抛 `IndexError`，所以取值要按列名列表判一下——
+    # 但 `_ensure_columns` 在每次连接时都跑，正常路径上列一定在。
+    raw_partial = row["partial"] if "partial" in row.keys() else None
     return RunRecord(
         run_id=row["run_id"],
         status=row["status"],
@@ -161,6 +174,8 @@ def _record(row: sqlite3.Row) -> RunRecord:
         mode=row["mode"],
         model=row["model"],
         reasoning=row["reasoning"],
+        partial=None if raw_partial is None else bool(raw_partial),
+        partial_reason=row["partial_reason"] if "partial_reason" in row.keys() else None,
     )
 
 
@@ -213,6 +228,8 @@ def finish(
     mode: str | None = None,
     model: str | None = None,
     reasoning: str | None = None,
+    partial: bool | None = None,
+    partial_reason: str | None = None,
 ) -> bool:
     """写终态。返回这一行有没有真的被改动。
 
@@ -231,6 +248,9 @@ def finish(
     `model` / `reasoning` 用 `COALESCE`，与 `mode` 同一档：它们是**观察值**，缺了
     只说明这次没收尾到那一步（比如取消），不该把上一轮已经记下的值抹成 NULL——
     那一行代表的始终是同一次运行的结果。
+
+    `partial` / `partial_reason` 也走 `COALESCE`：同一次运行的终态只可能写一次
+    （`done` 之后冻结），传 None 的含义是"这次没说"，不是"这次是完整的"。
     """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"finish 只接受终态，收到 {status!r}")
@@ -241,11 +261,16 @@ def finish(
                 "UPDATE runs SET status = ?, candidate = COALESCE(?, candidate), "
                 "failure = ?, mode = COALESCE(?, mode), "
                 "model = COALESCE(?, model), reasoning = COALESCE(?, reasoning), "
+                "partial = COALESCE(?, partial), "
+                "partial_reason = COALESCE(?, partial_reason), "
                 "updated_at = " + _NOW +
                 " WHERE run_id = ? AND status <> ?",
                 (status, _dump_candidate(candidate),
                  None if failure is None else json.dumps(failure, ensure_ascii=False),
-                 mode, model, reasoning, run_id, STATUS_DONE),
+                 mode, model, reasoning,
+                 None if partial is None else int(partial),
+                 partial_reason,
+                 run_id, STATUS_DONE),
             )
             conn.execute("COMMIT")
         except BaseException:
