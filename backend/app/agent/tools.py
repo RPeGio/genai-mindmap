@@ -5191,8 +5191,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         content, diagram_type=diagram_type, raw_plan=raw_plan,
         diagnostics=diagnostics)
 
-    ctx.candidate = content
-    ctx.revision += 1
+    ctx.publish_tree(content)
     count = shapes.count_nodes(content)
     kept_refs = shapes.count_refs(content)
 
@@ -6800,8 +6799,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         or bool(cut_total) or bool(level_skipped) or bool(level_failed) or bool(shallow)
     )
 
-    ctx.candidate = content
-    ctx.revision += 1
+    ctx.publish_tree(content)
     count = _count_nodes(content.root)
 
     # ---- 三条"这次依据从哪来 / 为什么没有依据"----------------------------------
@@ -7960,9 +7958,8 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
         if found is not None:
             expandable[node_id] = found.expandable
 
-    ctx.candidate = updated
+    ctx.publish_tree(updated)
     ctx.batches.append(batch)
-    ctx.revision += 1
 
     # ---- 生长预览：落在**被展开的那个节点**下面 ----
     #
@@ -8867,9 +8864,8 @@ def _commit_drafts(
         # 把执行器的错误原样回给模型：它知道是哪一条、哪个字段错了才能自己改对
         return _fail(exc.code, f"{exc.path}：{exc.message}", path=exc.path)
 
-    ctx.candidate = updated
+    ctx.publish_tree(updated)
     ctx.batches.append(batch)
-    ctx.revision += 1
     return updated, batch, id_map
 
 

@@ -652,13 +652,22 @@ def _deliver_or_fail(
     reasoning: str = "",
     log_code: str | None = None,
 ) -> DoneEvent | ErrorEvent:
-    """收尾的唯一口径：**树上已经有东西就交树，一棵都没有才报错。**
+    """收尾的唯一口径：**这一轮产出过树就交树，一棵都没长出来才报错。**
 
     六条终态路径（预算用尽、空转、工具超时、连续失败、意外收尾、工具次数到顶）
     从这里一起出：从前它们各写一份，其中两条按规矩交候选、四条无条件发 error，
     于是同一件事——"跑到一半停了"——在界面上有两种截然不同的样子。用户看到的差别
     不是"停的原因不同"，而是"一次拿到了半棵树、一次什么都没拿到"，而后者往往还
     是跑了三五分钟的那次。
+
+    **判据是 `ctx.produced`，不是 `ctx.candidate is not None`。** 后者看着等价，
+    实际差得很远：`edit` / `expand` 必须带 `request.snapshot`（`router._validate`），
+    而 `RunContext(candidate=request.snapshot)` 把它直接装进了候选位。于是编辑意图下
+    "候选非空"在**第一帧之前**就成立了——那棵树是用户自己的，不是模型交付的。按
+    `candidate` 判的结果是：模型没配置、模型报错、工具全挂，一律返回
+    `done(partial=True, content=用户原树)`，前端把它当新结果落进画布、记一条 0 改动的
+    生成事件、状态行写"结果已落到画布"——用户以为模型改过了，而"去配模型"那张卡片
+    永远不会出现。
 
     交出去的树标 `partial`：它确实不是一次完整的生成（有分支没长出来、说明可能
     没写完），**必须让用户知道**，否则"半棵树"会被当成模型认为的完整答案。但
@@ -676,7 +685,7 @@ def _deliver_or_fail(
     决定了下次该调 `max_seconds` 还是 `max_model_calls`。
     """
     _log_failure(ctx, tool_calls, call=call, code=log_code or code, message=message)
-    if ctx.candidate is not None:
+    if ctx.produced and ctx.candidate is not None:
         return DoneEvent(
             seq=next(seq), content=ctx.candidate, usage=usage_total,
             mode="model", model=model, reasoning=_reasoning_text(reasoning),
@@ -1099,7 +1108,7 @@ async def _loop(
         # 也记到 ctx 上：草稿要按"这次运行产出的那棵树"落库，占位树同样是产出。
         # 不写这里的话，演示模式的 run 会以"没产出"收尾，回放时前端只看到
         # 一句"模型这次没有产出导图"。
-        ctx.candidate = demo
+        ctx.publish_tree(demo)
         demo_seq = itertools.count(first_seq)
         yield StageEvent(seq=next(demo_seq), stage="demo", detail="演示模式，不调用模型")
         yield SnapshotEvent(seq=next(demo_seq), content=demo)
@@ -1213,7 +1222,9 @@ async def _loop(
             )
             return
         except GenerationError as exc:
-            _log_failure(ctx, tool_calls, code="generation_failed", message=str(exc))
+            # 日志由 `_deliver_or_fail` 统一记（它带 `log_code`，两条分支都记一次）。
+            # 这里再写一条会把同一次失败记成两条——两条都带 `model_calls_used`，
+            # 长得像两次独立事件，按 code 数失败次数就会翻倍。
             yield _deliver_or_fail(
                 ctx, seq, usage_total,
                 code="generation_failed", message=str(exc),
@@ -1366,8 +1377,28 @@ async def _loop(
                 )
                 return
             if outcome.error is not None:
-                # 工具内部抛异常时原样上抛，交给路由那个兜底把它变成一帧可读错误；
-                # 在这里转成 ToolResult 等于替工具谎报"执行完了"。
+                # 工具内部抛的异常：**这一轮已经产出过树时走统一收尾**，否则原样上抛。
+                #
+                # 从前这里一律上抛，由路由那三条 `except` 兜成 error 帧——而路由
+                # 只看得到异常，看不到 `ctx`，于是"工具里模型挂了、但树上已经有东西"
+                # 这条路仍然把半棵树丢了。`_deliver_or_fail` 存在的全部意义就是不丢这
+                # 棵树，那么最后这条绕过它的路也得堵上，否则六条变七条、缺口仍在。
+                #
+                # 没产出时必须继续上抛：把一个"什么都没做成"的运行由这里改写成
+                # `_deliver_or_fail` 的 error 帧，等于替路由做决定（它还要落库、
+                # 发 DONE_FRAME），两条出口对同一件事各说一遍容易漂移。
+                if ctx.produced and isinstance(outcome.error, (ModelNotConfigured, GenerationError)):
+                    config_error = isinstance(outcome.error, ModelNotConfigured)
+                    yield _deliver_or_fail(
+                        ctx, seq, usage_total,
+                        code="model_not_configured" if config_error else "generation_failed",
+                        message=str(outcome.error),
+                        tool_calls=tool_calls, call=call,
+                        model=model_name, reasoning=last_reasoning,
+                    )
+                    return
+                # 这里的 `_log_failure` 只覆盖"继续上抛"的那一半：走上面分支时
+                # `_deliver_or_fail` 自己会记，记两次等于一次失败两条日志。
                 _log_failure(
                     ctx, tool_calls, call=call,
                     code="generation_failed" if isinstance(outcome.error, GenerationError) else "agent_failed",

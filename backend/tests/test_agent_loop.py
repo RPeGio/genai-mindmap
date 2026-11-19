@@ -185,6 +185,20 @@ def test_long_failure_message_is_only_a_bounded_log_summary(caplog):
     assert reason not in caplog.text
 
 
+def test_generation_error_is_logged_exactly_once(caplog):
+    """一次失败只记一条：收尾处统一记，`except` 分支不许再记一遍。
+
+    两处各记一次不会让排查变容易，只会让人以为"失败了两次"：同一句话在日志里
+    出现两遍，还各自带着当时的 `model_calls_used`，看得人以为是两个不同的 run。
+    """
+    events = _collect(_request(), ScriptedProvider([GenerationError("模型服务返回 HTTP 502")]))
+    assert events[-1].code == "generation_failed"
+
+    logs = [entry for entry in _failure_logs(caplog) if entry["code"] == "generation_failed"]
+    assert len(logs) == 1, f"同一次失败记了 {len(logs)} 条日志"
+    assert logs[0]["message"] == "模型服务返回 HTTP 502"
+
+
 @pytest.mark.parametrize("failure,code", [
     (GenerationError("模型服务返回 HTTP 429"), "generation_failed"),
     (RuntimeError("适配器意外失败"), "agent_failed"),
@@ -808,12 +822,12 @@ class OutlineRefreshTest(unittest.TestCase):
                 return await super().complete_tools(messages, tools, budget=budget)
 
         def generate(args, ctx):
-            ctx.candidate = MindMapContent.model_validate({
+            ctx.publish_tree(MindMapContent.model_validate({
                 "title": "新图",
                 "root": {"id": "root", "label": "根", "children": [
                     {"id": "fresh-node", "label": "刚生成的", "children": []},
                 ]},
-            })
+            }))
             return ToolResult(ok=True, content="已生成")
 
         call = ToolCall(call_id="c1", name="echo", arguments={"text": "生成"})
@@ -894,7 +908,7 @@ class SnapshotEmissionTest(unittest.TestCase):
         tree = MindMapContent.model_validate(TREE)
 
         def handler(args, ctx):
-            ctx.candidate = tree.model_copy(deep=True)
+            ctx.publish_tree(tree.model_copy(deep=True))
             return ToolResult(ok=True, content="ok")
 
         call = ToolCall(call_id="c1", name="echo", arguments={"text": "改"})
@@ -1108,7 +1122,7 @@ class SourcesContextTest(unittest.TestCase):
 
 
 def _candidate_handler(args, ctx):
-    ctx.candidate = MindMapContent.model_validate(TREE)
+    ctx.publish_tree(MindMapContent.model_validate(TREE))
     return ToolResult(ok=True, content="ok", data={"content": TREE})
 
 
@@ -1167,7 +1181,7 @@ class PartialDeliveryTest(unittest.TestCase):
         """工具卡死超时：之前已经落进候选的树要交，而不是只甩一条错误。"""
 
         async def slow(args, ctx):
-            ctx.candidate = self._half_tree()  # 先产出，再卡住
+            ctx.publish_tree(self._half_tree())  # 先产出，再卡住
             ctx.reserve_model_call()
             await asyncio.Event().wait()
 
@@ -1188,7 +1202,7 @@ class PartialDeliveryTest(unittest.TestCase):
         """连续失败到顶：树已经在那儿了，报错等于把它一起扔掉。"""
 
         def broken(args, ctx):
-            ctx.candidate = self._half_tree()
+            ctx.publish_tree(self._half_tree())
             return ToolResult(ok=False, content="参数不对", data={"code": "nope"})
 
         calls = [ToolCall(call_id=f"c{index}", name="echo", arguments={"text": str(index)})
@@ -1208,7 +1222,7 @@ class PartialDeliveryTest(unittest.TestCase):
         """`length` 截断这类意外收尾：前面长出来的树一样是能用的。"""
 
         def handler(args, ctx):
-            ctx.candidate = self._half_tree()
+            ctx.publish_tree(self._half_tree())
             return ToolResult(ok=True, content="ok")
 
         call = ToolCall(call_id="c1", name="echo", arguments={"text": "x"})
@@ -1229,7 +1243,7 @@ class PartialDeliveryTest(unittest.TestCase):
         """工具次数到顶：这一轮的其余工具不做了，但树要交出去。"""
 
         def handler(args, ctx):
-            ctx.candidate = self._half_tree()
+            ctx.publish_tree(self._half_tree())
             return ToolResult(ok=True, content="ok")
 
         calls = [ToolCall(call_id=f"c{index}", name="echo", arguments={"text": str(index)})
@@ -1247,7 +1261,7 @@ class PartialDeliveryTest(unittest.TestCase):
         """模型服务抛错时，已经长出来的那部分同样不该被丢掉。"""
 
         def handler(args, ctx):
-            ctx.candidate = self._half_tree()
+            ctx.publish_tree(self._half_tree())
             return ToolResult(ok=True, content="ok")
 
         call = ToolCall(call_id="c1", name="echo", arguments={"text": "x"})
@@ -1305,6 +1319,138 @@ class PartialDeliveryTest(unittest.TestCase):
         self.assertEqual(error.type, "error")
         self.assertEqual(error.code, "model_not_configured")
         self.assertIn("环境变量", error.message)
+
+
+class EditKeepsItsOwnSnapshotTest(unittest.TestCase):
+    """`edit`/`expand` 带着用户原树进来时，"有没有产出"不能拿候选位判。
+
+    这是半棵树交付最容易踩反的一处：`edit` 的候选位从第一帧起就是用户那张导图
+    （`router._validate` 要求非 create 必须带 snapshot），拿 `candidate is not None`
+    当判据，任何一次失败都会被当成"交付了半棵树"——界面收到 `done`、把原封不动的
+    快照重新写回画布、记一条 0 个节点变化的生成事件，而用户以为模型改过了。
+    `model_not_configured` 尤其明显：本该弹"去配模型"的卡片，结果什么都没说。
+
+    判据因此是"这一轮真的 publish 过树"，这组用例把两个方向都钉住：
+    一棵都没长出来时必须是 error，长出来了才允许 done。
+    """
+
+    def _snapshot(self):
+        return MindMapContent.model_validate(TREE)
+
+    def _last(self, events):
+        return events[-1]
+
+    def _edit_request(self, **budget):
+        return AgentRunRequest(
+            goal="改一下这张图", intent="edit", snapshot=self._snapshot(),
+            budget=RunBudget(**budget),
+        )
+
+    def test_edit_that_grew_nothing_reports_the_failure(self):
+        """模型没配好 + 用户原树在手：必须报错，不能把原树当成果交回去。"""
+
+        def noop(args, ctx):
+            return ToolResult(ok=True, content="什么都没改")
+
+        call = ToolCall(call_id="c1", name="echo", arguments={"text": "x"})
+        events = _collect(
+            self._edit_request(),
+            ScriptedProvider([
+                _completion([call], finish="tool_calls"),
+                ModelNotConfigured("请在后端环境变量中配置模型地址、密钥和模型名称"),
+            ]),
+            _registry(noop),
+        )
+        last = self._last(events)
+        self.assertEqual(last.type, "error", "一棵都没长出来，不能发 done")
+        self.assertEqual(last.code, "model_not_configured")
+        self.assertFalse(any(event.type == "done" for event in events))
+
+    def test_edit_with_a_truncated_finish_is_a_correctable_failure(self):
+        """`length` 截断且无产出：同样是 error，而不是"半棵树"。
+
+        这条走的是 `unexpected_finish`，与上一条的 `ModelNotConfigured` 不是同一
+        个分支，两条都要覆盖：判据在 `_deliver_or_fail` 里，而调用它有 8 条路。
+        """
+
+        def noop(args, ctx):
+            return ToolResult(ok=True, content="什么都没改")
+
+        call = ToolCall(call_id="c1", name="echo", arguments={"text": "x"})
+        events = _collect(
+            self._edit_request(),
+            ScriptedProvider([
+                _completion([call], finish="tool_calls"),
+                _completion(finish="length"),
+            ]),
+            _registry(noop),
+        )
+        last = self._last(events)
+        self.assertEqual(last.type, "error")
+        self.assertEqual(last.code, "unexpected_finish")
+        self.assertFalse(any(event.type == "done" for event in events))
+
+    def test_edit_that_grew_a_tree_still_hands_it_over(self):
+        """真的长出过树之后，`edit` 的半棵树照旧要交——修判据不能顺手把交付关掉。"""
+
+        def grow(args, ctx):
+            ctx.publish_tree(self._snapshot())
+            return ToolResult(ok=True, content="改了")
+
+        call = ToolCall(call_id="c1", name="echo", arguments={"text": "x"})
+        events = _collect(
+            self._edit_request(),
+            ScriptedProvider([
+                _completion([call], finish="tool_calls"),
+                _completion(finish="length"),
+            ]),
+            _registry(grow),
+        )
+        done = next((event for event in events if event.type == "done"), None)
+        self.assertIsNotNone(done)
+        self.assertTrue(done.partial)
+        self.assertIn("length", done.partial_reason or "")
+
+    def test_tool_raising_generation_error_keeps_the_half_tree(self):
+        """工具内部抛模型层异常：已有树要走统一收尾，不能整条上抛成 error。
+
+        工具里那次模型调用失败，从前是 `raise outcome.error` 直接穿出循环，路由兜成
+        `error` 帧——树在 `ctx` 上，但一个字节都没交出去。这正是"跑了三分钟什么都
+        没拿到"的另一条路径。
+        """
+
+        def grow_then_explode(args, ctx):
+            ctx.publish_tree(self._snapshot())
+            raise GenerationError("模型服务返回 HTTP 502")
+
+        call = ToolCall(call_id="c1", name="echo", arguments={"text": "x"})
+        events = _collect(
+            self._edit_request(),
+            ScriptedProvider([_completion([call], finish="tool_calls")]),
+            _registry(grow_then_explode),
+        )
+        last = self._last(events)
+        self.assertEqual(last.type, "done", "树已经产出过，工具内异常不该把树扔掉")
+        self.assertTrue(last.partial)
+        self.assertIn("502", last.partial_reason or "")
+
+    def test_tool_raising_generation_error_without_a_tree_reports_it(self):
+        """同样在工具里抛，但一棵树都没长：继续上抛，由路由收成 `error` 帧。
+
+        这一条故意留在上抛状态：没东西可交时，落库与终态帧的判断在路由那一层
+        （它要把 run 标成 failed）。在循环里就地吞掉会让"失败"与"没产出"分不清。
+        """
+
+        def explode(args, ctx):
+            raise GenerationError("模型服务返回 HTTP 502")
+
+        call = ToolCall(call_id="c1", name="echo", arguments={"text": "x"})
+        with pytest.raises(GenerationError):
+            _collect(
+                self._edit_request(),
+                ScriptedProvider([_completion([call], finish="tool_calls")]),
+                _registry(explode),
+            )
 
 
 class HeartbeatTest(unittest.TestCase):
