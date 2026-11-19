@@ -148,18 +148,41 @@ const externalSearchApplies = computed(
   () => intentState.value === 'create' && !materialLongEnough.value,
 );
 
-const externalSearchHint = computed(() => {
+/**
+ * 联网检索这一次会怎么走：**判据与文案都只有这一份**。
+ *
+ * 这件事原先在两处各写一遍——勾选框旁的提示，与提交行下面那句"没传材料，会先去
+ * 外部搜资料"。开关关掉之后，前者说"不会联网"、后者仍然说"会去搜"，两行同时挂在
+ * 一个面板上互相打脸，而后端（`tools.external_knowledge_off_reason`）只认开关：
+ * 错的是后者。
+ *
+ * 所以判据只留这里：三态（关闭 / 材料太短 / 材料充足）外加"这次是改图"那一态，
+ * 两个渲染点都读同一句 `line`。
+ */
+type SearchState = {
+  kind: 'edit' | 'off' | 'short' | 'enough';
+  line: string;
+};
+
+const externalSearchState = computed<SearchState>(() => {
   // edit / expand 这条路不生成骨架、也不发检索请求：灰着就得说明原因，
   // 否则用户会以为"勾了没反应"是坏了。
-  if (intentState.value !== 'create') return '这次是改图，不走联网检索';
+  if (intentState.value !== 'create') {
+    return { kind: 'edit', line: '这次是改图，不走联网检索' };
+  }
   if (materialLongEnough.value) {
     // 置灰的原因必须写出来。灰着不解释，用户只会以为功能坏了。
-    return '这次带材料，不走联网检索';
+    // 这一态排在开关之前：材料够长时开关本来就不起作用，说"已关闭"会让人
+    // 以为关掉它是这次不联网的原因。
+    return { kind: 'enough', line: '这次带材料，不走联网检索' };
   }
-  return prefs.externalSearchEnabled
-    ? '没材料时先联网搜一轮资料，命中会变成能点回原文的引用（约 4 秒）'
-    : '已关闭：没材料时直接按主题生成，节点上不会有引用';
+  if (!prefs.externalSearchEnabled) {
+    return { kind: 'off', line: '已关闭：没材料时直接按主题生成，节点上不会有引用' };
+  }
+  return { kind: 'short', line: '会先去外部搜一轮资料，命中会变成能点回原文的引用（约 4 秒）' };
 });
+
+const externalSearchHint = computed(() => externalSearchState.value.line);
 
 /**
  * 勾选即落库。写失败时把勾**拨回去**：`:checked` 绑的是 store，而 store 没变就等于
@@ -218,9 +241,12 @@ const intentHint = computed(() => {
   }
   if (intentState.value === 'create') {
     if (typed.value) {
+      // 「会不会联网」与勾选框旁那句读的是**同一份判据**（`externalSearchState`）。
+      // 这里曾自己写了一句"没传材料，会先去外部搜资料"，开关关掉之后它还在说会搜，
+      // 与旁边那行正好相反；两份文案各自演化过一次就足够了。
       return sources.items.length
-        ? '会带上这里附的材料一起生成。'
-        : '没传材料，会先去外部搜资料。';
+        ? `会带上这里附的材料一起生成。${externalSearchHint.value}`
+        : externalSearchHint.value;
     }
     if (materialTopicChoice.value.topic) {
       return `没写主题：用材料标题「${materialTopicChoice.value.topic}」当中心主题。`;
@@ -1072,6 +1098,7 @@ defineExpose({
           </div>
 
           <p
+            data-test="intent-hint"
             class="text-[11px] leading-tight"
             :class="intentHintWarn ? 'text-amber-700' : 'text-slate-400'"
           >{{ intentHint }}</p>

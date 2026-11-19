@@ -32,6 +32,7 @@ const INTENT = 'textarea#intent';
 const SUBMIT = '[data-test="intent-box"] button';
 const TOGGLE = '[data-test="external-search"]';
 const HINT = '[data-test="external-search-hint"]';
+const SUBMIT_HINT = '[data-test="intent-hint"]';
 const PANEL_TOGGLE = `[data-test="pref-toggle-${EXTERNAL_SEARCH_PREF_KEY}"]`;
 
 const content = (label = '根'): MindMapContent => ({
@@ -233,8 +234,55 @@ describe('有材料时它不生效', () => {
   });
 });
 
-describe('偏好面板里也能改', () => {
-  it('布尔型偏好画成勾选框，勾一下发 PUT，标签跟着变', async () => {
+/**
+ * 「会不会联网」这件事有两个渲染点：勾选框旁那行（`external-search-hint`），与提交
+ * 行下面那行（`intent-hint`）。它们曾经各写一份文案：开关关掉之后，前者说"不会有
+ * 引用"、后者还在说"会先去外部搜资料"，两行同时挂在一个面板上互相打脸，而后端只认
+ * 开关。这一组钉住"判据只有一份、两处说的是同一件事"。
+ */
+describe('两处提示共用同一份判据', () => {
+  it('开关关着：两处一字不差，都不再说"会去外部搜"', async () => {
+    stubBackend([externalPref('false')]);
+    const wrapper = mountApp();
+    await vi.waitFor(() =>
+      expect((wrapper.get(TOGGLE).element as HTMLInputElement).checked).toBe(false));
+
+    await wrapper.get(INTENT).setValue('碳中和');
+
+    const beside = wrapper.get(HINT).text();
+    const under = wrapper.get(SUBMIT_HINT).text();
+    expect(beside).toContain('已关闭');
+    expect(under).toBe(beside);
+    expect(under).not.toContain('外部搜');
+  });
+
+  it('材料太短 + 开关开着：两处都说会先补一轮资料', async () => {
+    stubBackend();
+    const wrapper = mountApp();
+    addMaterial('rust 学习路线');
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get(INTENT).setValue('整理成学习路线');
+
+    expect(wrapper.get(HINT).text()).toContain('约 4 秒');
+    expect(wrapper.get(SUBMIT_HINT).text()).toContain('约 4 秒');
+  });
+
+  it('材料够长：两处都说不走联网检索', async () => {
+    stubBackend();
+    const wrapper = mountApp();
+    addMaterial('字'.repeat(320));
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get(INTENT).setValue('整理这份材料');
+
+    expect(wrapper.get(HINT).text()).toBe('这次带材料，不走联网检索');
+    expect(wrapper.get(SUBMIT_HINT).text()).toContain('这次带材料，不走联网检索');
+    expect(wrapper.get(SUBMIT_HINT).text()).not.toContain('外部搜');
+  });
+});
+
+describe('偏好面板里也能改', () => {  it('布尔型偏好画成勾选框，勾一下发 PUT，标签跟着变', async () => {
     const backend = stubBackend([externalPref('true')]);
     const wrapper = mountApp();
     await vi.waitFor(() => expect(wrapper.find(PANEL_TOGGLE).exists()).toBe(true));
