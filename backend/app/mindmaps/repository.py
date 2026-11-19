@@ -188,6 +188,16 @@ def connect() -> sqlite3.Connection:
     from app.knowledge.library import ensure_schema
 
     ensure_schema(conn)
+    # 跨会话记忆（`app/memory/store.py`）。同样在这里建、同样幂等、同样为了消掉
+    # "发现表不存在 → 建表"那条分支：读它的两条路径（每次生成前的一次检索、
+    # 会话结束时的总结）都在热路径上，多一个可能抛错的分支没有任何好处。
+    #
+    # import 同样放在函数内：`store` 顶层要 `from app.mindmaps import repository`
+    # 拿 `connect`，模块顶层反向 import 回去就成环。函数内的 import 在第一次连接
+    # 之后由 sys.modules 缓存命中，没有反复开销。
+    from app.memory.store import ensure_schema as ensure_memory_schema
+
+    ensure_memory_schema(conn)
     return conn
 
 
