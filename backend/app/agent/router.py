@@ -382,6 +382,13 @@ class RunSummary(BaseModel):
     updated_at: str
     #: 这份结果后来被保存了。空值 = 生成过、还没存下来，下次进页面会提醒一次。
     applied_at: str | None = None
+    #: 半棵树（有产出但没跑完）。**None 是"这条记录没记过"**，不是"完整"——
+    #: 老行上这列是 NULL，判"是否半棵"必须写 `is True`。
+    #:
+    #: 列表里也要带：前端靠它决定"捡回上次结果"时该不该提示"有分支没生成完整"。
+    #: 只在 `done` 帧上带过、读接口丢掉的那一版，用户点「载入」拿到的半棵树与一次
+    #: 完整生成长得一模一样——而这恰恰是本 PR 想消灭的那种"坏了和本来就没有长得一样"。
+    partial: bool | None = None
 
 
 class RunDetail(RunSummary):
@@ -391,6 +398,8 @@ class RunDetail(RunSummary):
     candidate: Any | None = None
     failure: dict[str, Any] | None = None
     mode: str | None = None
+    #: 半棵树的那一句原因（与 `done` 帧的 `partial_reason` 同一句）。
+    partial_reason: str | None = None
 
 
 def _summary(record: runs.RunRecord) -> RunSummary:
@@ -403,6 +412,7 @@ def _summary(record: runs.RunRecord) -> RunSummary:
         created_at=record.created_at,
         updated_at=record.updated_at,
         applied_at=record.applied_at,
+        partial=record.partial,
     )
 
 
@@ -444,6 +454,7 @@ def get_run(run_id: str) -> RunDetail:
         candidate=None if record.candidate is None else record.candidate.model_dump(mode="json"),
         failure=record.failure,
         mode=record.mode,
+        partial_reason=record.partial_reason,
     )
 
 

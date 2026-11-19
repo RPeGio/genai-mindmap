@@ -191,6 +191,11 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
     **任何分支都不碰 `candidate`**：同一 id 重复 `begin`（两个标签页同时点）不能把
     上一轮已经产出的草稿抹掉；重跑期间用户回来查，仍能看见那份草稿，直到新的
     终态写进新的一份。
+
+    **重开时清 `partial` / `partial_reason`**：这两列描述的是"上一次那一轮交付了
+    什么"，新一轮开始后就不再成立。不清的话，`finish` 的 `COALESCE` 会把上一轮的
+    `partial` 保住，于是"这一轮什么都没产出、报错收尾"的台账上仍写着
+    `partial=1`——前端点「载入」时按半棵树提示，而那份内容早就不是半棵树了。
     """
     payload = None if not request else json.dumps(request, ensure_ascii=False)
     with closing(_connect()) as conn:
@@ -204,7 +209,8 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
             claimed = created.rowcount == 1
             if not claimed:
                 reopened = conn.execute(
-                    f"UPDATE runs SET status = ?, failure = NULL, updated_at = {_NOW} "
+                    f"UPDATE runs SET status = ?, failure = NULL, "
+                    f"partial = NULL, partial_reason = NULL, updated_at = {_NOW} "
                     "WHERE run_id = ? AND status IN (?, ?)",
                     (STATUS_RUNNING, run_id, *RESTARTABLE_STATUSES),
                 )

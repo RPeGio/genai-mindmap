@@ -121,13 +121,26 @@ JSON 内自带的 id，只能由工具层带上路径。
 
 ## `done` 帧上的 `partial`：半棵树也是交付
 
-从前"没跑完"一律发 `error`：预算耗尽、工具超时、连续失败、空转收尾，四条路径
-各自写了一份收尾逻辑，其中只有两条按规矩交出手上的树。结果是用户看着它跑了三分钟，
-最后两手空空——而 `ctx.candidate` 里其实已经长出了大半棵树，只是前端收到 `error`
-会清掉预览、`content` 又一点没动。
+从前"没跑完"一律发 `error`：预算耗尽、工具超时、连续失败、空转收尾、意外收尾、
+工具次数到顶，六条路径各自写了一份收尾逻辑，其中只有两条按规矩交出手上的树。
+结果是用户看着它跑了三分钟，最后两手空空——而 `ctx.candidate` 里其实已经长出了
+大半棵树，只是前端收到 `error` 会清掉预览、`content` 又一点没动。
 
-现在四条路径统一走 `backend/app/agent/service.py::_deliver_or_fail`：
-**有树就交树，真没树才报错。**
+现在统一走 `backend/app/agent/service.py::_deliver_or_fail`：
+**这一轮产出过树就交树，一棵都没长出来才报错。**
+
+"产出过"这个判据很具体，不是"候选位里有东西"：`edit` / `expand` 必须带
+`request.snapshot`，那份快照就是用户自己的树，构造 `RunContext` 时它直接落进
+`candidate`。按"候选非空"判的话，编辑意图下模型没配置、模型报错、工具全挂都会
+返回 `done(partial=true, content=用户原树)`——前端把它当新结果落进画布、记一条
+0 改动的生成事件，而"去配模型"那张卡片永远不会出现。所以判据是
+`RunContext.produced`，由 `publish_tree()` 在四处产出点（`_generate` /
+`_generate_deep` / `_expand` / `_commit_drafts`）统一置位。
+
+台账读取接口（`GET /api/agent/runs/{id}` 与列表）同样带 `partial` /
+`partial_reason`：只在实时流上说过一次的话，隔天点「载入」时那份半棵树与一次
+完整生成长得一模一样。重开同一个 `run_id` 时这两个字段会被清空——它们描述的是
+上一轮交付了什么，而 `finish` 的 `COALESCE` 会让旧值赖着不走。
 
 ```json
 {"seq": 12, "type": "done", "content": {…}, "mode": "model",
