@@ -1,4 +1,4 @@
-import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { ref } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -29,9 +29,17 @@ import { useMindMapStore } from '../src/stores/mindmap';
  * 把视口尺寸给成真值、把 `setViewport` 的参数记下来。
  */
 
-const setViewport = vi.fn(async () => true);
+const setViewport = vi.fn(
+  async (_transform: { x: number; y: number; zoom: number }, _options?: { duration?: number }) => true,
+);
 const getViewport = vi.fn(() => ({ x: 12, y: 34, zoom: 0.93 }));
 const dimensions = ref({ width: 1600, height: 852 });
+
+/** 最近一次真正写进画布的变换。 */
+function lastViewport(): { x: number; y: number; zoom: number } {
+  const calls = setViewport.mock.calls;
+  return calls[calls.length - 1][0];
+}
 
 vi.mock('@vue-flow/core', () => ({
   VueFlow: { name: 'VueFlowStub', template: '<div class="vue-flow-stub" />' },
@@ -196,7 +204,7 @@ describe('画布上的两个按钮', () => {
     const wrapper = await mountWith(longTree());
     // 42 个节点，默认这一枪的缩放就是 0.857（不是 0.36）。
     expect(setViewport).toHaveBeenCalled();
-    const last = setViewport.mock.calls.at(-1)?.[0] as { zoom: number };
+    const last = lastViewport();
     expect(last.zoom).toBeCloseTo(MIN_READABLE_SCALE, 9);
     expect(wrapper.get('[data-test="view-mode-width"]').attributes('aria-pressed')).toBe('true');
     expect(wrapper.get('[data-test="view-mode-all"]').attributes('aria-pressed')).toBe('false');
@@ -212,14 +220,14 @@ describe('画布上的两个按钮', () => {
 
     await wrapper.get('[data-test="view-mode-all"]').trigger('click');
     await flushPromises();
-    const toAll = setViewport.mock.calls.at(-1)?.[0] as { zoom: number };
+    const toAll = lastViewport();
     expect(toAll.zoom).toBeCloseTo(allScale, 9);
     expect(wrapper.get('[data-test="view-mode-all"]').attributes('aria-pressed')).toBe('true');
 
     await wrapper.get('[data-test="view-mode-width"]').trigger('click');
     await flushPromises();
     // 原样还回去的就是切走之前 `getViewport()` 那一份，不是"重新适配一次"。
-    expect(setViewport.mock.calls.at(-1)?.[0]).toEqual(getViewport());
+    expect(lastViewport()).toEqual(getViewport());
   });
 
   it('装不下时说清楚"还能往哪看"', async () => {

@@ -1,9 +1,17 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { Handle, Position } from '@vue-flow/core';
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
 import type { ChildSide } from '../canvas/layout/tidy';
 import { NODE_SIZE } from '../canvas/layout/tidy';
+import {
+  DETAIL_WIDTH,
+  canvasArea,
+  nodeRect,
+  planOverlays,
+  sizeOf,
+} from '../canvas/overlay-layout';
+import { overlayState } from '../canvas/overlay-state';
 import type { MindNodeData } from '../stores/mindmap';
 
 const props = defineProps<{
@@ -201,7 +209,8 @@ const colorAttrs = computed(() => {
 });
 
 const card = ref(false);
-let timer: ReturnType<typeof setTimeout> | undefined;
+let showTimer: ReturnType<typeof setTimeout> | undefined;
+let hideTimer: ReturnType<typeof setTimeout> | undefined;
 
 /**
  * 悬停卡片的位置（视口坐标）。
@@ -212,51 +221,39 @@ let timer: ReturnType<typeof setTimeout> | undefined;
  * 还能读，切到「全图」（0.364）就是 5px，点开一张"详情"看到的是一片灰。
  *
  * 悬停卡片是**读长文**的地方，它的字号不该由"图有多挤"决定。
+ *
+ * **位置不由这里决定**：和工具条一起在 `overlay-layout.ts::planOverlays` 里摆。
+ * 原先两者都贴节点上方，于是"选中一个节点"再"悬停它"时，工具条正好压在正文上。
  */
 const cardAt = ref<{ x: number; y: number } | null>(null);
 const rootEl = ref<HTMLElement | null>(null);
 const cardRef = ref<HTMLElement | null>(null);
 
-/** 卡片与节点之间的缝，以及它离画布边缘至少留的空。 */
-const CARD_GAP = 8;
-const CARD_MARGIN = 8;
-
-function clamp(value: number, low: number, high: number): number {
-  return Math.min(Math.max(value, low), Math.max(low, high));
-}
-
-/** 画布那块的边界：卡片待在里面，不压顶栏、也不飘出屏幕。 */
-function area(): { left: number; top: number; right: number; bottom: number } {
-  const rect = document.querySelector('main > section')?.getBoundingClientRect();
-  if (rect && rect.width > 0 && rect.height > 0) {
-    return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
-  }
-  return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
-}
-
 function placeCard(): void {
   const node = rootEl.value?.getBoundingClientRect();
   if (!node) return;
   const box = cardRef.value?.getBoundingClientRect();
-  const width = box?.width ?? 288;
-  const height = box?.height ?? 0;
-  const bounds = area();
+  // 卡片自己多大要记进共享状态：工具条拿它避让（"一处算"的另一半输入）。
+  if (box) overlayState.detailSize = { width: box.width, height: box.height };
 
-  const x = clamp(
-    node.left + node.width / 2 - width / 2,
-    bounds.left + CARD_MARGIN,
-    bounds.right - CARD_MARGIN - width,
-  );
-  // 上方优先（不糊住节点）；放不下就翻到下方。
-  const above = node.top - CARD_GAP - height;
-  const y = above >= bounds.top + CARD_MARGIN ? above : node.bottom + CARD_GAP;
-  cardAt.value = { x, y: clamp(y, bounds.top + CARD_MARGIN, bounds.bottom - CARD_MARGIN - height) };
+  const toolbarNode = overlayState.toolbarId ? nodeRect(overlayState.toolbarId) : null;
+  const plan = planOverlays({
+    area: canvasArea(),
+    detail: {
+      anchor: { left: node.left, top: node.top, right: node.right, bottom: node.bottom },
+      size: box ? sizeOf(box) : { width: DETAIL_WIDTH, height: 0 },
+    },
+    toolbar: toolbarNode ? { anchor: toolbarNode, size: overlayState.toolbarSize } : null,
+  });
+  if (plan.detail) cardAt.value = { x: plan.detail.x, y: plan.detail.y };
 }
 
 function scheduleCard() {
-  clearTimeout(timer);
+  clearTimeout(showTimer);
+  clearTimeout(hideTimer);
   // 200ms 延迟：鼠标扫过画布时不该到处弹卡片。
-  timer = setTimeout(() => {
+  showTimer = setTimeout(() => {
+    overlayState.detailId = props.id;
     card.value = true;
     // 先量一次（卡片的宽高要等它挂上去才知道），下一帧再按真实尺寸摆正。
     void nextTick(() => {
@@ -266,10 +263,25 @@ function scheduleCard() {
   }, 200);
 }
 
+/**
+ * 离开节点之后**晚一点**再收卡片。
+ *
+ * 卡片是 `Teleport` 出去的独立一层，与节点之间隔着 `OVERLAY_GAP` 那么一条缝：
+ * 立刻收的话，鼠标朝卡片移过去的第一步就已经把卡片关掉了——而卡片里那段长正文
+ * 是 `max-h-56 overflow-y-auto`，滚不动等于白给。这 120ms 就是穿过那条缝的时间，
+ * 鼠标真的进了卡片（`@mouseenter="scheduleCard"`）就把这次收起取消。
+ */
+function hideCardSoon() {
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(hideCard, 120);
+}
+
 function hideCard() {
-  clearTimeout(timer);
+  clearTimeout(showTimer);
+  clearTimeout(hideTimer);
   card.value = false;
   cardAt.value = null;
+  if (overlayState.detailId === props.id) overlayState.detailId = null;
 }
 
 const draft = ref('');
@@ -333,7 +345,11 @@ function finishAndNext() {
   emit('next', draft.value);
 }
 
-onBeforeUnmount(() => clearTimeout(timer));
+onBeforeUnmount(() => {
+  clearTimeout(showTimer);
+  clearTimeout(hideTimer);
+  if (overlayState.detailId === props.id) overlayState.detailId = null;
+});
 </script>
 
 <template>
@@ -341,7 +357,7 @@ onBeforeUnmount(() => clearTimeout(timer));
     ref="rootEl"
     class="relative"
     @mouseenter="scheduleCard"
-    @mouseleave="hideCard"
+    @mouseleave="hideCardSoon"
     @focusin="scheduleCard"
     @focusout="hideCard"
   >
@@ -463,7 +479,7 @@ onBeforeUnmount(() => clearTimeout(timer));
         class="fixed z-30 w-72 rounded-md border border-slate-300 bg-white p-3 text-left shadow-lg"
         :style="{ left: `${cardAt.x}px`, top: `${cardAt.y}px` }"
         @mouseenter="scheduleCard"
-        @mouseleave="hideCard"
+        @mouseleave="hideCardSoon"
       >
         <p class="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-sm text-slate-700">
           {{ data.body }}
