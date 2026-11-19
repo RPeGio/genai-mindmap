@@ -15,12 +15,15 @@
 """
 from __future__ import annotations
 
+import os
+from unittest.mock import patch
 
 import pytest
 
 from app.contracts.diagnostic import DiagnosticLevel, SuggestionKind
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
+from app.optimization import service
 from app.optimization.service import (
     NOT_SUGGESTED,
     _SUGGESTION_OF_CODE,
@@ -250,3 +253,130 @@ def test_near_duplicate_becomes_a_dedupe_suggestion():
     # 规则建议没有概率校准，不许伪造可信度
     assert suggestion.confidence is None
 
+
+# ---------------------------------------------------------------- 4. 模型层
+
+
+@pytest.fixture
+def _model_off(monkeypatch):
+    monkeypatch.delenv(service.LLM_ENV, raising=False)
+
+
+def _wide_map() -> MindMapContent:
+    """同级节点够多的图（≥ `MIN_LLM_SIBLINGS`），模型层才会被考虑。"""
+    return _map(_node("r", "根", [
+        _node("b1", "支一", [_leaf(f"b1_{index}", f"要点{index}") for index in range(1, 6)]),
+        _node("b2", "支二", [_leaf(f"b2_{index}", f"细节{index}") for index in range(1, 6)]),
+    ]))
+
+
+def test_model_layer_is_off_by_default(_model_off):
+    """缺省关：一次调用都不发生。"""
+    with patch.object(service, "_model_near_pairs") as call:
+        suggest(_wide_map())
+    call.assert_not_called()
+
+
+def test_small_maps_never_reach_the_model(_model_off):
+    """同级节点总数 < 8：人一眼扫完，不值得花一次调用。"""
+    small = _map(_node("r", "根", [_leaf("a", "一"), _leaf("b", "二")]))
+    with patch.object(service, "_model_near_pairs") as call:
+        suggest(small, use_model=True)
+    call.assert_not_called()
+
+
+def test_env_switch_turns_the_layer_on(_model_off, monkeypatch):
+    monkeypatch.setenv(service.LLM_ENV, "1")
+    with patch.object(service, "_model_near_pairs", return_value=[]) as call:
+        suggest(_wide_map())
+    call.assert_called_once()
+
+
+def test_model_pairs_become_dedupe_suggestions():
+    """模型按行号回答，建议自己也带得动：不依赖先有诊断。
+
+    行号在这里是硬契约：`_wide_map` 的三行依次是根的分支、要点组、细节组，
+    「要点2」在第 2 行（0 起算的 1）。
+    """
+    def fake(groups):
+        assert groups, "喂给模型的同级行不能是空的"
+        return [(1, "要点2", "要点3", "两处都在讲要点")]
+
+    with patch.object(service, "_model_near_pairs", new=fake):
+        suggestions = suggest(_wide_map(), use_model=True)
+
+    assert len(suggestions) == 1
+    item = suggestions[0]
+    assert item.kind is SuggestionKind.dedupe
+    assert item.node_id == "b1_3" and item.evidence == "b1_2"
+    assert "模型判定" in item.message
+    assert item.confidence is None
+
+
+def test_model_pairs_outside_one_line_are_dropped():
+    """行号对不上、或标签不在那一行里 → 丢弃（模型实测里 11/11 都是这种）。"""
+    with patch.object(service, "_model_near_pairs",
+                      new=lambda groups: [(1, "要点2", "细节2", "跨行")]):
+        assert suggest(_wide_map(), use_model=True) == []
+    with patch.object(service, "_model_near_pairs",
+                      new=lambda groups: [(9, "要点2", "要点3", "行号越界")]):
+        assert suggest(_wide_map(), use_model=True) == []
+
+
+def test_model_pairs_already_found_by_the_rules_are_not_repeated():
+    """规则层报过的那一对，模型再说一遍也只留一条建议。"""
+    content = _map(_node("r", "根", [
+        _node("b1", "支一", [
+            _leaf("x", "数据处理"), _leaf("y", "数据预处理"),
+            *[_leaf(f"z{index}", f"别的{index}") for index in range(1, 7)],
+        ]),
+        _node("b2", "支二", [_leaf(f"w{index}", f"要点{index}") for index in range(1, 6)]),
+    ]))
+    assert [item.node_id for item in suggest(content)] == ["y"]
+
+    with patch.object(service, "_model_near_pairs",
+                      new=lambda groups: [(1, "数据处理", "数据预处理", "重复")]):
+        suggestions = suggest(content, use_model=True)
+    assert [item.node_id for item in suggestions] == ["y"]
+
+
+def test_one_node_takes_at_most_one_model_suggestion():
+    with patch.object(service, "_model_near_pairs", new=lambda groups: [
+        (1, "要点1", "要点2", "a"), (1, "要点1", "要点3", "b"),
+    ]):
+        suggestions = suggest(_wide_map(), use_model=True)
+    assert len(suggestions) == 1
+
+
+def test_model_layer_is_silent_without_configuration(_model_off):
+    """没配 `MINDMAP_LLM_*` → 空列表、不抛异常（体检不能因为模型不可用变 500）。"""
+    for name in ("MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY", "MINDMAP_LLM_MODEL"):
+        os.environ.pop(name, None)
+    assert service._model_near_pairs([["甲", "乙"]]) == []
+
+
+def test_model_layer_swallows_transport_errors(monkeypatch):
+    """网络层抛错 → 空列表。这一层是附加信息，不许把 `/suggest` 拖成 500。"""
+    import httpx
+
+    monkeypatch.setenv("MINDMAP_LLM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("MINDMAP_LLM_API_KEY", "k")
+    monkeypatch.setenv("MINDMAP_LLM_MODEL", "m")
+
+    def boom(*args, **kwargs):
+        raise httpx.ConnectError("no route")
+
+    with patch("app.optimization.service.httpx.Client", new=boom):
+        assert service._model_near_pairs([["甲", "乙"]]) == []
+
+
+@pytest.mark.skipif(not os.getenv("MINDMAP_LLM_API_KEY"),
+                    reason="需要 MINDMAP_LLM_* 才能跑真模型")
+def test_live_model_finds_a_synonym_pair_the_rules_cannot_see():
+    """真模型一次：规则层看不见的换字型近义必须被找到。
+
+    「正则化」/「规范化」几乎没有共同字面，正是留给模型的那一档。没有 key 时
+    跳过——离线跑全量套件不该产生网络请求与费用。
+    """
+    pairs = service._model_near_pairs([["正则化", "规范化", "过拟合", "欠拟合"]])
+    assert any({"正则化", "规范化"} == {left, right} for _, left, right, _ in pairs), pairs
