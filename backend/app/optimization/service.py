@@ -55,6 +55,7 @@ check() 检查单子节点、达到深度上限及同一父节点下的重复标
 """
 from __future__ import annotations
 
+import unicodedata
 from typing import Iterator
 
 from app.contracts.diagnostic import (
@@ -76,6 +77,33 @@ MAX_DEPTH = 8
 # 判漏的代价是"重复的两支一直留在图里"，所以宁可把低置信度那档降成 info，
 # 也不要把阈值调到几乎不响——一个常年沉默的检查等于没有检查。
 
+# 模糊比较的字符下限。2 个字之间编辑距离 1 意味着换掉一半（「定义」⇄「定理」、
+# 「物理」⇄「数学」），那是两个概念；3 个字起才会出现「监督学习」⇄「有监督学习」
+# 这种"同一个概念的两种写法"。
+MIN_FUZZY_CHARS = 3
+
+# 编辑距离上限。只用在**纯插删**这一种变形上（见 `_near_reason`）：中文里"同一个
+# 概念的两种写法"最典型的形态就是加一个限定词（数据→**预**处理、监督学习→**有**
+# 监督学习），一次插入；上限 2 允许加两个字的修饰语（「交叉验证」⇄「分层交叉验证」），
+# 再多就不是修饰而是另一个概念了。
+MAX_EDIT_DISTANCE = 2
+
+# 归一化编辑距离上限 = 插入字数 / 较短标签字数。3 个字里加 2 个字（0.67）已经
+# 换掉了大半语义，挡掉；5 个字加 2 个（0.4）放行。
+MAX_EDIT_RATIO = 0.4
+
+# 前缀关系的长度占比下限。「监督学习」/「监督学习与无监督学习」= 4/10；
+# 0.4 挡掉"短标题是长标题前缀"的偶然命中（3/12 更像"分类名 + 具体做法"）。
+MIN_PREFIX_RATIO = 0.4
+
+# 反向 / 程度对照类的修饰语。插进标签的若是这一类字，两条标签描述的是**两个并列
+# 方向**而不是同一个东西，不报。依据是全库 38 张真实生成图上的实测：纯编辑距离
+# 判据一共命中 43 对，其中 40 对是平行/对立命名（「监督学习」/「无监督学习」3 张图、
+# 「从重处罚的适用」/「从轻处罚的适用」、「分类任务选算法」/「回归任务选算法」、
+# 「业务指标监控」/「技术指标监控」、「第一条分支」/「第二条分支」…），
+# 真正近义的 **0 对**。合并掉「监督学习」与「无监督学习」是丢内容，不是去重。
+CONTRASTING_MODIFIERS = frozenset("无非不未否反逆伪假轻重低高多少大小弱强")
+
 # 引用类诊断的前缀。这类码只给诊断、不给建议（理由见模块 docstring）。
 _REFERENCE_CODE_PREFIXES = (
     "SOURCE_", "UNSOURCED_", "UNVERIFIED_", "INVALID_", "EMPTY_",
@@ -85,12 +113,14 @@ _REFERENCE_CODE_PREFIXES = (
 # 诊断码的复述：用户看到的是"点一下会发生什么"。
 _SUGGESTION_OF_CODE: dict[str, SuggestionKind] = {
     "DUPLICATE_LABEL": SuggestionKind.dedupe,
+    "NEAR_DUPLICATE_LABEL": SuggestionKind.dedupe,
     "SINGLE_CHILD": SuggestionKind.expand,
 }
 
 # 建议文案的**动作**部分。诊断说"哪里不对"，建议说"点了会怎样"。
 _ACTION_OF_CODE: dict[str, str] = {
     "DUPLICATE_LABEL": "合并这两个同级节点，保留一个",
+    "NEAR_DUPLICATE_LABEL": "确认是不是同一件事：是就合并，不是就把说法区分开",
     "SINGLE_CHILD": "把这一支再展开一层，或者并进相邻节点",
 }
 
@@ -110,6 +140,90 @@ def _iter_nodes(node: Node, depth: int = 1) -> Iterator[tuple[Node, int]]:
     yield node, depth
     for child in node.children:
         yield from _iter_nodes(child, depth + 1)
+
+
+def _normalize_label(text: str) -> str:
+    """归一化到"只留文字"：全半角、大小写、空白、标点符号全部抹平。
+
+    NFKC 把全角折成半角（`Ａ`→`A`、`（`→`(`），`casefold` 处理拉丁文大小写，
+    `P*`（标点）与 `S*`（符号）按**类别**整类删——枚举字符必然漏（半角括号与
+    全角方括号在 NFKC 之后也不同形）。
+    """
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(
+        char for char in folded
+        if not char.isspace() and not unicodedata.category(char).startswith(("P", "S"))
+    )
+
+
+def _inserted_text(shorter: str, longer: str) -> str | None:
+    """`longer` 是否只是 `shorter` 中间插了几个字；是则返回插入的那一段。
+
+    返回 None 表示不是"纯插入"关系（有替换、或者顺序变了）。这一判定比编辑距离
+    严格得多，而严格正是这里的要点：替换型差异（重→轻、分类→回归、题→模）在真实
+    图上几乎全是**平行命名**，把「从重处罚的适用」与「从轻处罚的适用」判成重复，
+    用户点一下就会丢一条刑法情节。
+    """
+    if len(longer) <= len(shorter):
+        return None
+    head = 0
+    while head < len(shorter) and shorter[head] == longer[head]:
+        head += 1
+    tail = 0
+    while (tail < len(shorter) - head
+           and shorter[-1 - tail] == longer[-1 - tail]):
+        tail += 1
+    if head + tail != len(shorter):
+        return None          # 中间还有对不上的部分 → 不是纯插入
+    return longer[head:len(longer) - tail]
+
+
+def _near_reason(left: str, right: str) -> tuple[DiagnosticLevel, str] | None:
+    """两条同级标签"近义"到什么程度；不近义返回 None。
+
+    判据按可信度从高到低排，命中即返回：
+
+      1. 归一化后相同（只差标点/空格/全半角）→ **warn**：字面已经一样，只剩排版；
+      2. 一方是另一方的前缀 → **info**，「监督学习」/「监督学习与无监督学习」；
+      3. 一方是另一方**插入**少量限定词的结果 → **info**，「数据处理」/「数据预处理」、
+         「监督学习」/「有监督学习」。插入的词属于反向/程度对照类
+         （`CONTRASTING_MODIFIERS`）时不报——那是两个并列方向。
+
+    2、3 只给 info 而不是 warn，因为它们**也可能是上下位关系**（「解方程」/
+    「解方程组的」）：字面包含是事实，"是不是同一件事"还得人看一眼。warn 留给
+    "字面已经相同"这一档。
+
+    **替换型差异一律不报**，这是全库实测的结论而不是保守：38 张真实生成图上，
+    带替换的命中 40 对全是平行/对立命名，真正近义 0 对。换字型近义（评估/评价、
+    整理/管理）留给模型层——规则层看不见"两个字是不是同义词"。
+
+    调用方负责先排掉"逐字相同"的那一对：那是 `DUPLICATE_LABEL` 的地盘，
+    同一个节点不能既报重复又报近义。
+    """
+    left_raw, right_raw = left.strip(), right.strip()
+    if left_raw == right_raw:
+        return None
+    left_norm, right_norm = _normalize_label(left_raw), _normalize_label(right_raw)
+    if left_norm and left_norm == right_norm:
+        return DiagnosticLevel.warn, "去掉标点与空格后完全相同"
+
+    shorter, longer = sorted((left_norm, right_norm), key=len)
+    if len(shorter) < MIN_FUZZY_CHARS:
+        return None
+    if longer.startswith(shorter) and len(shorter) / len(longer) >= MIN_PREFIX_RATIO:
+        return (DiagnosticLevel.info,
+                f"文字上「{shorter}」是「{longer}」的前缀")
+
+    inserted = _inserted_text(shorter, longer)
+    if inserted is None:
+        return None
+    if len(inserted) > MAX_EDIT_DISTANCE:
+        return None
+    if len(inserted) / len(shorter) > MAX_EDIT_RATIO:
+        return None
+    if set(inserted) & CONTRASTING_MODIFIERS:
+        return None
+    return DiagnosticLevel.info, f"只多了「{inserted}」这 {len(inserted)} 个字"
 
 
 
@@ -154,6 +268,32 @@ def _duplicate_diagnostics(root: Node) -> list[Diagnostic]:
     return diagnostics
 
 
+def _near_duplicate_diagnostics(root: Node) -> list[Diagnostic]:
+    """同级**近义**冗余（规则层，零成本）。
+
+    报告在**后一个**节点上（`node_id` = 后者、`evidence` = 前者的 id），与
+    `DUPLICATE_LABEL` 同口径：一条建议只需要一个"要动它"的落点。
+    """
+    diagnostics: list[Diagnostic] = []
+    for parent, _ in _iter_nodes(root):
+        children = parent.children
+        for index, right in enumerate(children):
+            for left in children[:index]:
+                reason = _near_reason(left.label, right.label)
+                if reason is None:
+                    continue
+                level, why = reason
+                diagnostics.append(Diagnostic(
+                    level=level,
+                    code="NEAR_DUPLICATE_LABEL",
+                    node_id=right.id,
+                    message=(f"同级节点「{right.label.strip()}」与「{left.label.strip()}」"
+                             f"{why}，请确认是否指的是同一件事"),
+                    evidence=left.id,
+                ))
+    return diagnostics
+
+
 def check(content: MindMapContent, sources: list[Source] | None = None) -> list[Diagnostic]:
     """结构诊断；只有显式提供原文时才执行引用校验。
 
@@ -164,6 +304,7 @@ def check(content: MindMapContent, sources: list[Source] | None = None) -> list[
     diagnostics: list[Diagnostic] = []
     diagnostics.extend(_shape_diagnostics(root))
     diagnostics.extend(_duplicate_diagnostics(root))
+    diagnostics.extend(_near_duplicate_diagnostics(root))
     if sources is not None:
         diagnostics.extend(verify_source_refs(content, sources))
     return diagnostics

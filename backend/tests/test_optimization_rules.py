@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 
+import pytest
 
 from app.contracts.diagnostic import DiagnosticLevel, SuggestionKind
 from app.contracts.mindmap import MindMapContent
@@ -23,6 +24,7 @@ from app.contracts.source import Source, SourceKind
 from app.optimization.service import (
     NOT_SUGGESTED,
     _SUGGESTION_OF_CODE,
+    _near_reason,
     _not_converted_reason,
     check,
     suggest,
@@ -112,6 +114,8 @@ def _closure_codes() -> set[str]:
         ])),
         # 深度上限
         _chain(8),
+        # 同级近义
+        _map(_node("r", "根", [_leaf("a", "数据处理"), _leaf("b", "数据预处理")])),
     ]
     codes: set[str] = set()
     for content in contents:
@@ -130,7 +134,8 @@ def test_every_emitted_code_is_mapped_or_has_a_written_reason():
     建议面板里"——安静得像没做。
     """
     codes = _closure_codes()
-    explicit = {"SINGLE_CHILD", "DUPLICATE_LABEL", "DEPTH_LIMIT"}
+    explicit = {"SINGLE_CHILD", "DUPLICATE_LABEL", "NEAR_DUPLICATE_LABEL",
+                "DEPTH_LIMIT"}
     assert explicit <= codes, codes
 
     for code in sorted(codes):
@@ -146,4 +151,102 @@ def test_suggestion_kinds_are_action_words():
     assert SuggestionKind.add_detail.value == "add_detail"
     used = set(_SUGGESTION_OF_CODE.values())
     assert {SuggestionKind.dedupe, SuggestionKind.expand} <= used
+
+
+# ---------------------------------------------------------------- 2. 近义（规则层）
+
+
+def test_identical_labels_stay_duplicate_and_are_not_reported_twice():
+    """逐字相同是 `DUPLICATE_LABEL` 的地盘，近义那条不能再来一遍。
+
+    两条诊断落在同一个节点上、只差一个码，是最典型的"重复报"。
+    """
+    content = _map(_node("r", "根", [_leaf("a", "数据"), _leaf("b", "数据")]))
+    assert _codes(check(content)) == ["DUPLICATE_LABEL"]
+    assert [item.kind for item in suggest(content)] == [SuggestionKind.dedupe]
+
+
+def test_labels_that_differ_only_in_punctuation_are_near_duplicates():
+    """去标点/空格/全半角后相同 → warn（字面已经不是"不同"，只剩排版）。"""
+    content = _map(_node("r", "根", [_leaf("a", "监督学习"), _leaf("b", "（监督）学习")]))
+    near = _of_code(check(content), "NEAR_DUPLICATE_LABEL")
+    assert len(near) == 1
+    assert near[0].level is DiagnosticLevel.warn
+    assert near[0].node_id == "b" and near[0].evidence == "a"
+    assert "去掉标点与空格后完全相同" in near[0].message
+
+
+def test_full_width_and_case_are_normalized_too():
+    assert _near_reason("ML 基础", "ml基础") is not None
+    assert _near_reason("ＡＢＣ处理", "ABC处理") is not None
+
+
+def test_prefix_relation_is_reported_at_info_level():
+    """一方是另一方的前缀 → info：字面包含是事实，"是不是同一件事"还要人看。"""
+    content = _map(_node("r", "根", [
+        _leaf("a", "监督学习"), _leaf("b", "监督学习与无监督学习"),
+    ]))
+    near = _of_code(check(content), "NEAR_DUPLICATE_LABEL")
+    assert len(near) == 1
+    assert near[0].level is DiagnosticLevel.info
+    assert near[0].node_id == "b" and near[0].evidence == "a"
+    assert "前缀" in near[0].message
+
+
+@pytest.mark.parametrize("left,right", [
+    ("监督学习", "有监督学习"),      # 任务说明里的第一个"模型层"例子，规则层其实抓得到
+    ("数据处理", "数据预处理"),
+])
+def test_inserted_modifier_counts_as_near_duplicate(left, right):
+    """加一个限定词 = 同一个概念的两种写法。
+
+    这一档在生成的图上很罕见（提示词本来就要求每支给不同的要点），但用户手工
+    在原地补一个更细的分支时极常见。
+    """
+    near = _of_code(check(_map(_node("r", "根", [
+        _leaf("a", left), _leaf("b", right)]))), "NEAR_DUPLICATE_LABEL")
+    assert len(near) == 1
+    assert near[0].node_id == "b"
+    assert "只多了" in near[0].message
+
+
+@pytest.mark.parametrize("left,right", [
+    ("监督学习", "无监督学习"),        # 反向修饰语：合并掉一条就是丢内容
+    ("从重处罚的适用", "从轻处罚的适用"),
+    ("分类任务选算法", "回归任务选算法"),
+    ("按题型分配", "按模块分配"),      # 同一模板的两个实例（带替换）
+    ("错题本管理", "错题本整理"),      # 换字型近义：规则层看不见，留给模型层
+    ("机器学习", "深度学习"),          # 上下位
+    ("定义", "定理"),                  # 太短：距离 1 就是换掉一半
+    ("交叉验证", "分层交叉验证"),      # 插入占比 0.5，更像上下位
+])
+def test_pairs_that_must_not_be_flagged(left, right):
+    """**故意不报**的那些形状。每一条都能在真实库里找到同形样本。
+
+    「监督学习」/「无监督学习」尤其重要：它是"平行命名"这一类的代表，全库实测
+    38 张真实生成图上，纯编辑距离判据命中 43 对、这类占 40 对、真正近义 0 对。
+    合掉一支等于删内容。
+    """
+    assert _near_reason(left, right) is None
+
+
+def test_near_duplicates_are_only_compared_within_one_parent():
+    """跨分支的近名不报：不同父节点下的「数据处理」「数据预处理」可以各自成立。"""
+    content = _map(_node("r", "学科", [
+        _node("a", "物理", [_leaf("a1", "数据处理")]),
+        _node("b", "数学", [_leaf("b1", "数据预处理")]),
+    ]))
+    assert _of_code(check(content), "NEAR_DUPLICATE_LABEL") == []
+
+
+def test_near_duplicate_becomes_a_dedupe_suggestion():
+    content = _map(_node("r", "根", [
+        _leaf("a", "数据处理"), _leaf("b", "数据预处理"),
+    ]))
+    suggestion = suggest(content)[0]
+    assert suggestion.kind is SuggestionKind.dedupe
+    assert suggestion.node_id == "b"
+    assert suggestion.evidence == "a"
+    # 规则建议没有概率校准，不许伪造可信度
+    assert suggestion.confidence is None
 
