@@ -5,6 +5,7 @@ import SourceInputs from './SourceInputs.vue';
 import VoicePress from './VoicePress.vue';
 import { mergedCharCount, SHORT_MATERIAL_CHARS, materialTitle, SOURCE_LABELS } from '../sources/input';
 import { INITIAL_STATUS, useMindMapStore } from '../stores/mindmap';
+import { useChatStore } from '../stores/chat';
 import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from '../stores/options';
 import { usePrefsStore, DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY } from '../stores/prefs';
 import { useSourcesStore } from '../stores/sources';
@@ -33,6 +34,7 @@ const store = useMindMapStore();
 const sources = useSourcesStore();
 const options = useGenerationOptions();
 const prefs = usePrefsStore();
+const chat = useChatStore();
 
 const emit = defineEmits<{ detail: []; submit: [goal: string] }>();
 
@@ -712,7 +714,15 @@ defineExpose({
 </script>
 
 <template>
-  <div class="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center px-4 pb-4">
+  <!--
+    `pr` 的两档：消息面板停在右下角时，这里让出它的宽度（380 + 24 的间隙），
+    对话框整块左移居中——两者从"横向切进去 136px"变成并排。
+    窄屏（<900px）那边面板自己改成整屏抽屉（`MessageFab.vue`），对话框不再让位。
+  -->
+  <div
+    class="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center pb-4 pl-4 transition-all duration-300"
+    :class="chat.open ? 'pr-4 min-[900px]:pr-[404px]' : 'pr-4'"
+  >
     <div
       data-test="chat-dock"
       :data-faded="faded ? 'true' : 'false'"
@@ -748,46 +758,59 @@ defineExpose({
         class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl shadow-slate-900/5"
       >
         <!-- 材料缩略图区：左栏那个 320px 常驻区块的内容全在这里（横向），画布因此
-             回到全宽。每份材料一个缩略块 + ✕；状态（解析中/失败）就地显示。 -->
+             回到全宽。每份材料一个缩略块 + ✕；状态（解析中/失败）就地显示。
+
+             `flex-nowrap` + `overflow-x-auto`：材料多了就**横向滚**，不换行也不撑宽
+             ——换行会把对话框一层层顶高，直到把画布盖住。`min-w-0` 是那半个坑：
+             这一行是 flex 子项，默认 `min-width:auto` 会按内容的最小宽度顶回去，
+             溢出容器就白设了。
+
+             「管理材料」放在滚动区**外面**（不是当成最后一个缩略块）：它是个常驻
+             入口，材料一多就被推出视野、得先滚到底才点得到，等于没有。
+        -->
         <div
           v-if="sources.items.length"
-          data-test="thumbs"
-          class="flex gap-2 overflow-x-auto border-b border-slate-100 px-3 py-2"
+          class="flex items-center gap-2 border-b border-slate-100 pr-3"
         >
           <div
-            v-for="item in sources.items"
-            :key="item.key"
-            class="group relative flex w-[132px] shrink-0 flex-col gap-1 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5"
-            :title="item.label"
+            data-test="thumbs"
+            class="flex min-w-0 flex-1 flex-nowrap gap-2 overflow-x-auto overflow-y-hidden px-3 py-2"
           >
-            <button
-              type="button"
-              class="absolute -right-1.5 -top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 bg-white text-[11px] text-slate-500 hover:text-rose-600 disabled:opacity-50"
-              :aria-label="`移除 ${item.label}`"
-              :disabled="store.busy"
-              @click="sources.remove(item.key)"
-            >✕</button>
-            <span class="truncate text-[11px] font-medium text-slate-700">{{ item.label }}</span>
-            <span class="text-[10px] text-slate-500">
-              {{ SOURCE_LABELS[item.kind] }}
-              <template v-if="item.state === 'ready' && item.source">
-                · {{ Array.from(item.source.text?.trim() ?? '').length }} 字
-              </template>
-            </span>
-            <span v-if="item.state === 'queued'" class="text-[10px] text-slate-500">等待解析…</span>
-            <span v-else-if="item.state === 'parsing'" class="text-[10px] text-slate-500" aria-live="polite">
-              正在解析…{{ item.seconds }} 秒
-            </span>
-            <span v-else-if="item.state === 'failed'" class="text-[10px] leading-tight text-rose-700" role="alert">
-              {{ item.error }}
-            </span>
-            <button
-              v-if="item.state === 'failed'"
-              type="button"
-              class="text-left text-[10px] text-slate-600 underline disabled:opacity-50"
-              :disabled="store.busy"
-              @click="sources.retry(item.key)"
-            >重试</button>
+            <div
+              v-for="item in sources.items"
+              :key="item.key"
+              class="group relative flex w-[132px] shrink-0 flex-col gap-1 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5"
+              :title="item.label"
+            >
+              <button
+                type="button"
+                class="absolute -right-1.5 -top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 bg-white text-[11px] text-slate-500 hover:text-rose-600 disabled:opacity-50"
+                :aria-label="`移除 ${item.label}`"
+                :disabled="store.busy"
+                @click="sources.remove(item.key)"
+              >✕</button>
+              <span class="truncate text-[11px] font-medium text-slate-700">{{ item.label }}</span>
+              <span class="text-[10px] text-slate-500">
+                {{ SOURCE_LABELS[item.kind] }}
+                <template v-if="item.state === 'ready' && item.source">
+                  · {{ Array.from(item.source.text?.trim() ?? '').length }} 字
+                </template>
+              </span>
+              <span v-if="item.state === 'queued'" class="text-[10px] text-slate-500">等待解析…</span>
+              <span v-else-if="item.state === 'parsing'" class="text-[10px] text-slate-500" aria-live="polite">
+                正在解析…{{ item.seconds }} 秒
+              </span>
+              <span v-else-if="item.state === 'failed'" class="text-[10px] leading-tight text-rose-700" role="alert">
+                {{ item.error }}
+              </span>
+              <button
+                v-if="item.state === 'failed'"
+                type="button"
+                class="text-left text-[10px] text-slate-600 underline disabled:opacity-50"
+                :disabled="store.busy"
+                @click="sources.retry(item.key)"
+              >重试</button>
+            </div>
           </div>
           <button
             type="button"
@@ -1077,11 +1100,15 @@ defineExpose({
           它**在 `intent-box` 之外**：面板里的说明会重复输入框提示里的"写一个主题"，
           混在同一个分组里会让"这个框里有几句话在说同一件事"变成一件要数一数才知道的事。
           默认收起——它是"准备材料"这一步，不是每一轮都要看的东西。
+
+          `max-h` + `overflow-y-auto`：这份列表是**无上限**的（最多 30 份，每份还可能
+          展开正文与引用明细）。不给高度上限时它一路往下长，把画布连同视口一起顶出去
+          ——面板本身成了整页最高的一层，用户连对话框的提交按钮都看不到了。
         -->
         <div
           v-show="materialOpen"
           data-test="material-panel"
-          class="border-t border-slate-100 bg-slate-50/60 px-2.5 py-2"
+          class="max-h-[min(60vh,520px)] overflow-y-auto overscroll-contain border-t border-slate-100 bg-slate-50/60 px-2.5 py-2"
         >
           <div class="mb-1 flex items-center justify-between">
             <p class="text-[11px] font-medium text-slate-600">材料（可选）</p>

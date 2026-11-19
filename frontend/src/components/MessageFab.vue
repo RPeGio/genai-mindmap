@@ -55,12 +55,19 @@ onBeforeUnmount(() => window.removeEventListener('keydown', closeOnEscape));
 
 <template>
   <div class="pointer-events-none absolute bottom-4 right-4 z-40 flex flex-col items-end gap-2">
-    <!-- 消息流：贴着球往左上方展开，不遮画布中心 -->
+    <!--
+      消息流：贴着球往左上方展开，不遮画布中心。
+
+      **窄屏（<900px）改成整屏抽屉**：380px 的面板钉在右下角时，横向会正好切进底部
+      对话框（1280 宽时盖掉 136px），纵向一相交就把提交按钮挡住——用户既看不全消息，
+      也点不到要点的按钮。到了这个宽度还并排放两列本来就没地方，所以干脆整屏盖住：
+      要么看消息，要么用对话框，用那个悬浮球切换。宽屏那边由 `ChatDock` 让位并排。
+    -->
     <section
       v-show="chat.open"
       data-test="message-panel"
       aria-label="消息记录"
-      class="pointer-events-auto flex h-[min(60vh,520px)] w-[min(92vw,380px)] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl"
+      class="pointer-events-auto flex h-[min(60vh,520px)] w-[min(92vw,380px)] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl max-[899px]:fixed max-[899px]:inset-x-0 max-[899px]:bottom-0 max-[899px]:h-[min(86vh,680px)] max-[899px]:w-full max-[899px]:rounded-b-none max-[899px]:rounded-t-2xl max-[899px]:border-x-0 max-[899px]:border-b-0"
     >
       <header class="flex items-center justify-between border-b border-slate-100 px-3 py-2">
         <p class="text-xs font-semibold text-slate-700">消息记录</p>
