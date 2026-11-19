@@ -239,7 +239,7 @@ def test_user_text_carries_runs_and_events(monkeypatch):
     assert "图型: fishbone" in text
     assert "diagram_type.default=fishbone" in text
     assert "三要素界定学习" in text
-    assert "他title：以Mitchell三要素界定学习 → 三要素界定学习｜第 2 层" in text
+    assert "他改 title：以Mitchell三要素界定学习 → 三要素界定学习｜第 2 层" in text
 
 
 def test_events_window_covers_the_minutes_after_a_run(monkeypatch):
@@ -258,6 +258,53 @@ def test_events_window_covers_the_minutes_after_a_run(monkeypatch):
     texts = [row["before"] for row in rows]
     assert "长标题一二三四五六七八九十" in texts
     assert "窗口之外的旧改动" not in texts
+
+
+def test_identical_consecutive_edits_collapse_with_a_count(monkeypatch):
+    """同一处连改三遍 → prompt 里一行 + `（×3）`。
+
+    实测出来的必要：不折叠时 prompt 里有三行一模一样的「改 label：A → B」，模型会把
+    它读成"三个不同场合的偏好"，于是产出三条互相重复的记忆（`text_hash` 只挡得住
+    字面完全一致的那些）。而真实信息"同一件事他改了三遍"——次数就是它，折叠之后
+    还在。
+    """
+    enable_llm(monkeypatch)
+    add_run("r1", ended_minutes_ago=40, started_minutes_ago=50)
+    for minutes in (28, 27, 26):
+        add_event(field="label", before="以Mitchell三要素界定学习",
+                  after="三要素界定学习", minutes_ago=minutes)
+    session = summarize.due()
+    text = summarize.user_text(session, summarize._events(
+        session.started_at, session.ended_at), [])
+    assert text.count("以Mitchell三要素界定学习 → 三要素界定学习") == 1
+    assert "（×3）" in text
+    assert "3 处，合并连续重复后 1 条" in text
+
+
+def test_non_consecutive_edits_are_not_collapsed(monkeypatch):
+    """`A, B, A` 不折叠：中间那个"改回来"是最有信息量的动作。"""
+    enable_llm(monkeypatch)
+    add_run("r1", ended_minutes_ago=40, started_minutes_ago=50)
+    add_event(field="label", before="长标题", after="短标题", minutes_ago=28)
+    add_event(field="detail", before="旧说明", after="新说明", minutes_ago=27)
+    add_event(field="label", before="长标题", after="短标题", minutes_ago=26)
+    session = summarize.due()
+    text = summarize.user_text(session, summarize._events(
+        session.started_at, session.ended_at), [])
+    assert text.count("长标题 → 短标题") == 2
+    assert "×2" not in text
+
+
+def test_generate_events_have_no_subject(monkeypatch):
+    """一次生成没有主语：它是统计的分母，不是"他亲手加了 23 个节点"。"""
+    enable_llm(monkeypatch)
+    add_run("r1", ended_minutes_ago=40, started_minutes_ago=50)
+    add_event(kind="generate", field=None, node_count=23, minutes_ago=45)
+    session = summarize.due()
+    text = summarize.user_text(session, summarize._events(
+        session.started_at, session.ended_at), [])
+    assert "这次生成落了 23 个节点" in text
+    assert "他这次生成" not in text
 
 
 def test_user_text_says_zero_edits_explicitly(monkeypatch):

@@ -227,9 +227,13 @@ def test_new_and_old_mix_into_one_score_table(monkeypatch):
     assert len(old) == 15, "旧的 15 条一条都不许被丢掉"
     assert [hit.decay for hit in old] == sorted(
         (hit.decay for hit in old), reverse=True), "同余弦的旧记忆必须按年龄递减"
-    # 7 天的旧记忆（0.70 × 0.5**(7/30) ≈ 0.595）压过 0.60 的新记忆：
-    # 这是"衰减真的进了排序"而不是"新的永远第一"。
-    assert 0.59 < old[0].score < hits[0].score
+    # 一条余弦**更高**（0.70）但 7 天前的记忆，已经被一条余弦**更低**（0.60）的新
+    # 记忆反超（0.5955 < 0.6000）——这是"衰减真的进了排序"的直接证据：名次不再只由
+    # 相似度决定。只差 0.0045，也正好说明 7 天 = 半衰期的 23%，权重掉 15%。
+    newest_low = next(hit for hit in hits if hit.text == "新的偏好 0")
+    assert old[0].score < newest_low.score
+    # 30 天那条的 decay 恰好 0.5：半衰期在表里是看得见的。
+    assert old[2].decay == pytest.approx(0.5, abs=0.01)
     # 350 天那条：decay ≈ 0.00031，score ≈ 0.00022，仍在结果里。
     assert old[-1].score > 0
     assert old[-1].score < 0.001

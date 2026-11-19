@@ -342,11 +342,18 @@ def _run_line(index: int, run: SessionRun) -> str:
     return "｜".join(parts)
 
 
-def _event_line(row: Any) -> str:
+def _event_line(row: Any, count: int = 1) -> str:
+    """一条编辑事件 → 一句摘要。
+
+    措辞刻意用**动词开头**（"改 label：A → B"而不是"他label：A → B"）：主语由
+    `actor` 决定，而 `generate` 那条不属于"谁改了什么"（它是统计的分母），不该带
+    主语。第一版统一拼成"他{field}："，读出来是"他label"，而且把一次生成也写成了
+    "他一次生成落了 23 个节点"——那句话读起来像他亲手加的 23 个节点。
+    """
     kind = row["kind"]
     depth = f"第 {row['depth']} 层" if row["depth"] else ""
     if kind in ("update", "style"):
-        body = f"{row['field'] or '?'}：{_clip(row['before'])} → {_clip(row['after'])}"
+        body = f"改 {row['field'] or '?'}：{_clip(row['before'])} → {_clip(row['after'])}"
     elif kind == "add":
         body = f"新增「{_clip(row['after'])}」"
     elif kind == "remove":
@@ -356,12 +363,38 @@ def _event_line(row: Any) -> str:
     elif kind == "move":
         body = "移动了节点"
     elif kind == "generate":
-        body = f"一次生成落了 {row['node_count']} 个节点"
-        depth = ""
+        # 不带主语：这是"一次生成落了几个节点"，是统计的分母，不是一次修改。
+        return f"这次生成落了 {row['node_count']} 个节点"
     else:
         body = kind
     actor = "他" if row["actor"] == "user" else "模型"
-    return "｜".join(part for part in (f"{actor}{body}", depth) if part)
+    repeat = f"（×{count}）" if count > 1 else ""
+    return "｜".join(part for part in (f"{actor}{body}{repeat}", depth) if part)
+
+
+def _collapse_events(rows: list[Any]) -> list[tuple[Any, int]]:
+    """把**连续**完全相同的编辑折叠成一条，带上次数。
+
+    实测出来的必要：一次会话里同一处改了三遍，prompt 里就是三行一模一样
+    「改 label：以Mitchell三要素界定学习 → 三要素界定学习」。模型读到三行同样的
+    改动，会把它读成"三个不同场合的偏好"（于是产出三条互相重复的记忆，去重只能
+    挡掉字面完全一致的那些），而真实信息是"同一件事他改了三遍"——次数就是这条
+    信息，折叠之后它还在（`（×3）`）。
+
+    只折叠**连续**的：`A, B, A` 是"改了这个、改了那个、又改回来"，那三个动作各
+    自是一件事，合并会把"改回来"这个最有信息量的动作抹掉。
+    """
+    grouped: list[tuple[Any, int]] = []
+    previous_key: tuple[Any, ...] | None = None
+    for row in rows:
+        key = (row["kind"], row["field"], row["before"], row["after"],
+               row["depth"], row["actor"])
+        if grouped and key == previous_key:
+            grouped[-1] = (grouped[-1][0], grouped[-1][1] + 1)
+        else:
+            grouped.append((row, 1))
+        previous_key = key
+    return grouped
 
 
 def user_text(session: Session, events: list[Any], known: list[str]) -> str:
@@ -382,8 +415,9 @@ def user_text(session: Session, events: list[Any], known: list[str]) -> str:
     lines.extend(_run_line(index, run) for index, run in enumerate(session.runs, start=1))
     lines.append("")
     if events:
-        lines.append(f"## 他事后的修改（{len(events)} 处）")
-        lines.extend(f"- {_event_line(row)}" for row in events)
+        collapsed = _collapse_events(events)
+        lines.append(f"## 他事后的修改（{len(events)} 处，合并连续重复后 {len(collapsed)} 条）")
+        lines.extend(f"- {_event_line(row, count)}" for row, count in collapsed)
     else:
         lines.append("## 他事后的修改")
         lines.append("（这次没有任何修改：生成的结果他一个字都没动）")
