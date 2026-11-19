@@ -314,10 +314,10 @@ def test_stored_skips_vectors_with_wrong_dimension(monkeypatch):
     with closing(repository.connect()) as conn, conn:
         conn.execute(
             "INSERT INTO profile_vectors (id, vector, label, weight, samples,"
-            " created_at, updated_at) VALUES ('d0', ?, '方向', 1.0, 2,"
-            " '2026-11-19T00:00:00.000Z', '2026-11-19T00:00:00.000Z')",
+            " created_at, updated_at, map_id) VALUES ('d0', ?, '方向', 1.0, 2,"
+            " '2026-11-19T00:00:00.000Z', '2026-11-19T00:00:00.000Z', 'run:x')",
             (profile.vector_cache.pack([1.0, 0.0]),))
-    assert profile.stored() == []
+    assert profile.stored(map_id=None) == []
 
 
 def test_stale_is_true_when_empty():
@@ -333,13 +333,15 @@ def test_stale_is_false_right_after_rebuild(monkeypatch):
     with closing(repository.connect()) as conn, conn:
         conn.execute(
             "INSERT INTO profile_vectors (id, vector, label, weight, samples,"
-            " created_at, updated_at) VALUES ('d0', ?, '方向', 1.0, 2,"
-            " strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            " created_at, updated_at, map_id) VALUES ('d0', ?, '方向', 1.0, 2,"
+            " strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
+            " '')",
             (profile.vector_cache.pack([1.0, 0.0]),))
     assert profile.stale() is False
 
 
 def test_profile_vectors_schema_is_the_agreed_one():
+    """`map_id` 是后来加的列，顺序排在最后——老行的该列是 NULL（"当时还没有隔离"）。"""
     from contextlib import closing
 
     from app.mindmaps import repository
@@ -347,7 +349,7 @@ def test_profile_vectors_schema_is_the_agreed_one():
     with closing(repository.connect()) as conn:
         columns = [row[1] for row in conn.execute("PRAGMA table_info(profile_vectors)")]
     assert columns == ["id", "vector", "label", "weight", "samples",
-                       "created_at", "updated_at"]
+                       "created_at", "updated_at", "map_id"]
 
 
 def test_switch_is_off_by_default(monkeypatch):

@@ -4128,38 +4128,108 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
 # ---------------------------------------------------------------- 工具实现
 
 
-async def _profile_rank(
-    hits: list[EvidenceHit],
-) -> tuple[list[EvidenceHit], list[str]]:
-    """按用户画像重排检索命中。**只改顺序，不改集合**。
+def _profile_pool(ctx: RunContext) -> str:
+    """这次运行的方向池键。**新图还没有 `map_id`，所以退到 `run:<run_id>`。**
 
-    返回（重排后的列表，被抬上来的那几条的定位键 `source_id:start`）。
+    依据（判据与推导见 `profile.pool_key` 的 docstring）：`AgentRunRequest` /
+    `DiagramContent` / `RunContext` 三处都没有 `map_id`——图在服务端要等
+    `repository.create_map` 才拿到 uuid4，而生成发生在保存之前。`run_id` 是唯一
+    在生成开始前就存在、且能区分"这次运行"的标识。
+
+    所以"一张图一次生成 = 一个方向池"。**新图天然是一个新池**（新 run_id），也就是
+    用户要的那句"新开一张导图就不推了"；两张不同主题的图之间没有任何共享的向量，
+    跨图污染在结构上就不可能，不是靠某处 if 挡住的。
+
+    保存之后再 `expand` 同一张图：又是新 run_id、新池，但材料还是同一批
+    （`request.sources` 带着），而聚类是确定性的——算出来是同一批方向。池键只决定
+    "存在哪一行、按谁读回"，不决定"算出来是什么"。
+    """
+    from app.prefs import profile as profile_rank
+
+    map_id = getattr(ctx.request, "map_id", None)
+    run_id = getattr(ctx.request, "run_id", None)
+    return profile_rank.pool_key(map_id=map_id, run_id=run_id)
+
+
+def _run_directions(
+    ctx: RunContext, sources: Sequence[Any],
+) -> list[profile_rank.Direction]:
+    """这次运行的画像方向：**一次运行只算一次**（内容下一提交换成按图取）。
+
+    这一版落地的是一条：**算一次**。结果挂 `ctx`（理由见
+    `RunContext.profile_directions`）。方向的**内容**还是 `_samples()` 那批全局
+    样本，所以"图 B 被图 A 的方向加权"这件事在这一层还成立——下一提交把
+    `build_directions(_samples())` 换成 `build_directions_from_sources(sources)`，
+    两件事一起归零：跨图污染、以及那 6 次 embedding 往返。
+
+    `sources` 现在就收着（这一版还没读它），是为了让调用点的形状在下一提交
+    一个字都不用改：那个签名表达的是"方向由**这次的材料**决定"，而不是
+    "由库里某处决定"。
+
+    失败一律降级成空列表（= 这次不加权 + 一条诊断）：画像是排序上的二阶修正，
+    算不出来时正确的行为是"这次不做个性化"，不是"这次检索失败"。
+    """
+    pool = _profile_pool(ctx)
+    if ctx.profile_directions is not None and ctx.profile_pool == pool:
+        return ctx.profile_directions
+    if not profile_rank.enabled():
+        # 开关关着时**一次查询都不发**（不读 `chunk_vectors`、不聚类），并且不把
+        # 结果写进 `ctx`：写进去会让"开关在运行中途被打开"读到一份开关关着时
+        # 缓存的空列表，而那个空列表与"真的没有方向"分不开。
+        return []
+    try:
+        # **这一版仍是全局样本**：隔离做到了"每个池一列、按池读、boost 必须显式
+        # 指定方向"，但方向的**内容**还是库里全部材料算出来的那批，所以跨图串味
+        # 在这一层还留着（下一提交换成 `build_directions_from_sources(sources)`：
+        # 只从这张图的材料算，顺带把那 6 次 embed 整笔省掉）。
+        directions = profile_rank.build_directions(profile_rank._samples())
+    except Exception as exc:  # noqa: BLE001 — 见 docstring 最后一段
+        logger.warning("画像方向算不出来（%s），这次不做个性化加权",
+                       type(exc).__name__)
+        directions = []
+    ctx.profile_directions = directions
+    ctx.profile_pool = pool
+    return directions
+
+
+async def _profile_rank(
+    hits: list[EvidenceHit], directions: Sequence[Any],
+) -> tuple[list[EvidenceHit], list[str], str]:
+    """按**这张图的**画像重排检索命中。**只改顺序，不改集合**。
+
+    返回（重排后的列表，被抬上来的那几条的定位键 `source_id:start`，未加权的原因）。
     第二个返回值是**过滤气泡检验**的唯一入口：把"哪些命中是因为画像才进了前几名"
     记下来，才可能在事后问出"这些命中后来被删掉了几条"。定位键只到偏移、不带原文
     ——引文是材料正文，不进日志（与 `knowledge.embedding` 的注释同一条纪律）。
+    第三个返回值是"这次为什么没有个性化"（空串 = 正常加权过）：没有它，用户看到的
+    只有"个性化好像没生效"，而"这张图的材料还没有块向量"与"开关关着"长得一样。
+
+    `directions` 由调用方给（`_run_directions`），`boost` 不再自己去读库：读全表
+    正是跨图串味的那条路。漏传在这里是 `TypeError`，不是静默的全局加权。
 
     `app/prefs/profile.py` 的三条硬约束在这里落成三行：
 
       1. 返回的是同一个列表的另一个顺序——没有一条被加进来或去掉。画像决定
          "这几条谁先"，不决定"要不要这条"；拿去过滤就是过滤气泡。
-      2. 开关（`MINDMAP_PROFILE_RERANK`）默认关。打开之后每条命中要一次
-         embedding（有 `vector_cache` 则免），20 支分支串起来就是 20 批，
-         这个代价不该由"没要求个性化"的部署承担。
+      2. 开关（`MINDMAP_PROFILE_RERANK`）默认关。**打开之后也不再新增 embedding
+         往返**（方向复用的是块向量缓存），这条约束的成本理由已经基本消失。
       3. 任何失败都返回原顺序：画像是排序上的一个二阶修正，它算不出来时
          正确的降级是"这次不做个性化"，不是"这次检索失败"。
 
-    放进 `to_thread` 是因为 `boost` 里有一次同步的 embedding HTTP（0.3–1 秒）：
-    直接在事件循环里调用会把同一台服务器上别人的流一起卡住——与 `_search_branch`
-    把 `search_parent` 扔进线程池同一个理由。
+    放进 `to_thread` 是因为 `boost` 里有一次同步的 embedding HTTP（0.3–1 秒，命中
+    缓存时为 0）：直接在事件循环里调用会把同一台服务器上别人的流一起卡住——与
+    `_search_branch` 把 `search_parent` 扔进线程池同一个理由。
     """
     if not hits or not profile_rank.enabled():
-        return hits, []
+        return hits, [], ""
     try:
-        result = await asyncio.to_thread(profile_rank.boost, hits)
+        result = await asyncio.to_thread(
+            profile_rank.boost, hits, directions=list(directions))
     except Exception as exc:  # noqa: BLE001 — 见 docstring 第 3 条
         logger.warning("画像加权跳过（%s），这次按原顺序交付", type(exc).__name__)
-        return hits, []
-    return result.hits, [_hit_key(hit) for hit in result.lifted]
+        return hits, [], ""
+    return result.hits, [_hit_key(hit) for hit in result.lifted], result.reason
+
 
 
 def _hit_key(hit: Any) -> str:
@@ -4169,6 +4239,7 @@ def _hit_key(hit: Any) -> str:
 
 async def _search_branch(
     sources: list[Source], title: str, intents: Sequence[str] = (),
+    *, directions: Sequence[Any] | None = None,
 ) -> list[EvidenceHit] | None:
     """一条分支的检索：标题（`_branch_query`）**加至多 2 条同义问法**，各 top_k=3。
 
@@ -4211,6 +4282,11 @@ async def _search_branch(
     embedding 网络往返。直接在协程里调用等于把 20 支串成一条队；线程池让它们真的
     同时发。多路那条**不需要** to_thread：`search_multi` 是协程，它内部已经把
     向量往返扔进线程池（见 `service._route_vectors`）。
+
+    `directions` 不传 = **这一支不做画像加权**，不是"读全局方向"。这个默认值是
+    "按图隔离"的边界：`_retrieve_branches`（批量口径，留作钉桩）与单测不传它，
+    于是它们的行为与画像这一层上线之前逐字节一致；生成链路的 `safe_search` 会传
+    `_run_directions(ctx, sources)`，那是唯一有权加权的地方。
     """
     query = _branch_query(title)
     queries = _branch_queries(title, intents)
@@ -4227,7 +4303,7 @@ async def _search_branch(
     # 画像只改这一支内部"这三条谁先"（`DEEP_BRANCH_TOP_K = 3`），不改这一支有没有
     # 命中。抬上来的那几条不需要在这里记账：过滤气泡检验看的是 `_rag` 那一路
     # （模型主动检索），骨架的每支检索没有可供事后对齐的节点级痕迹。
-    ranked, _ = await _profile_rank(found)
+    ranked, _, _ = await _profile_rank(found, directions or ())
     return ranked
 
 
@@ -6225,8 +6301,19 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         让这一支变成"整支留空"，而它的语义只该是"这一支没查到证据"。
 
         取消必须原样抛回去：那是上层被取消（客户端断开），不是这次检索失败。
+
+        画像方向在这里传进去（而不是让 `_search_branch` 自己取）：方向要"一次运行
+        只算一次"（见 `_run_directions`），而 `_search_branch` 拿不到 `ctx`。
         """
         try:
+            # 开关关着（`_run_directions` 返回空）时**连这个关键字都不传**：调用
+            # 形态与画像这一层上线之前逐字节相同，`test_deep_pipeline` 里那些
+            # 只接受三个位置参数的检索替身因此一个字都不用改。
+            directions = _run_directions(ctx, sources)
+            if directions:
+                return await _search_branch(
+                    sources, title, expansions.get(title, ()),
+                    directions=directions)
             return await _search_branch(sources, title, expansions.get(title, ()))
         except asyncio.CancelledError:
             raise
@@ -8691,8 +8778,13 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         )
 
     # 画像加权：**只重排这批命中**，不增不减（见 `_profile_rank`）。放在空结果
-    # 判定之后、证据累积之前——空结果那几种早退不该为一次排序付 embedding。
-    hits, lifted = await _profile_rank(hits)
+    # 判定之后、证据累积之前——空结果那几种早退不该为一次排序付代价。
+    #
+    # 方向只从 **`sources`**（这张图的材料）算，一次运行一次（`_run_directions`）。
+    # 这是"按图隔离"的唯一入口：另一个池的方向根本不在这个列表里，所以图 B 的
+    # 命中不可能被图 A 的方向顶上来。
+    hits, lifted, profile_note = await _profile_rank(
+        hits, _run_directions(ctx, sources))
 
     # 库里来的命中带持久 id：取回 `Source` 并记进 ctx，收尾的引用校验才查得到
     # 原文（`_verify_sources`）。失败只跳过这一份，不影响本次检索结果。
@@ -8741,6 +8833,16 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         # 只有一个：事后回答"这些被画像抬上来的命中，后来有几个节点是用户删掉的"
         # （过滤气泡检验，见 `scripts/measure_profile_ab.py`）。
         data["profile_lifted"] = lifted
+    if profile_note:
+        # **"这次为什么没做个性化"。** 只在开关开着时才可能出现（开关关着时上面
+        # 那句 `_profile_rank` 直接早退，`profile_note` 恒为空串），所以键集不会
+        # 因为这一行多出来。
+        #
+        # 没有它，"个性化没生效"的唯一线索是"感觉好像差不多"，而三条完全不同的
+        # 原因——这张图还没有块向量 / 画像开关关着 / α 为 0——在界面上长得一模一样。
+        data["profile"] = {"applied": False, "note": profile_note}
+    elif lifted:
+        data["profile"] = {"applied": True, "lifted": len(lifted)}
     return ToolResult(
         ok=True,
         content=json.dumps(_citable_hits(hits, citable_sources), ensure_ascii=False),

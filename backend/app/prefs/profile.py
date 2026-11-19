@@ -34,6 +34,44 @@ sklearn**：`requirements.txt` 里没有它们，为一个 40 个样本、1024 �
 毫秒的离线任务新增两个部署依赖不划算。初始化也不用随机数——用"最大最小距离"的
 确定性版本，于是同一批样本永远聚出同一批簇，`profile_vectors` 不会每跑一次
 就换个方向（那会让 A/B 的差异全变成噪声）。
+
+## 方向按导图隔离（`map_id` / 池键）
+
+上面那一节说"这个人的每个方向都是一个独立的兴趣"。**这句话在跨图维度上是错的**：
+"碳中和"那张图的方向被拿去给"机器学习"那张图加权时，用户写「机器学习」却看到碳中和
+的引用被顶上来。而那批被顶上去的碳中和材料又会成为新样本——**越用越窄**，这正是
+过滤气泡的机制，只是它发生在"图与图之间"而不是"人与人之间"。
+
+所以方向池按**一次生成**隔离：
+
+```
+pool_key = "run:<run_id>"          # 一次运行一个池（判据见 pool_key 的 docstring）
+stored(map_id=pool_key)            # 只读这个池；map_id 为空的旧全局方向**不返回**
+```
+
+`style`（统计层）不动：那 8 个参数是"这个人怎么做事"，该跨图；内容方向是"这张图
+讲什么"，不该跨图。
+
+## 为什么方向可以零 embedding 往返
+
+旧路径从三张表取 60 条"文件名 + 前 600 字"**拼接文本**再去 embed。那批文本从来没人
+embed 过（`chunk_vectors` 里存的是**块**的向量），所以每条都是 cache miss：60 条
+÷ `embedding.MAX_BATCH`(10) = **6 次 HTTP**。开关默认关的理由就是这个成本。
+
+新路径的样本换成**这张图自己的材料块**，而块向量检索时已经写进 `chunk_vectors` 了
+（`service._vector_scores` 按块文本哈希缓存）。取现成的即可：
+
+```
+这张图的材料 → _chunk_tree 切块 → level=1 子块 → text_hash → chunk_vectors 查
+                                                                  ↑ 0 次 HTTP
+```
+
+本机实测（`data/mindmaps.db`，18 份来源 / 80 个子块）：**子块命中 76 条 = 95%**。
+父块只有 21%（父块只在 `search_sources` 单级路径下被 embed，`MINDMAP_PARENT_RETRIEVAL`
+开着时那条路不走），所以样本取**子块**。
+
+没命中的块**不补 embed**——这是"零成本"的全部含义。少几条样本的后果只是这次方向
+粗一点，而补 embed 的后果是开关一打开就多 N 次往返，那正是默认关着的理由。
 """
 from __future__ import annotations
 
@@ -129,6 +167,28 @@ MAX_ALPHA = 0.25
 #: 一条 norm=0.6 的命中——**加分改得了相邻顺位，改不了"与主题无关"这个判断**。
 GATE_RATIO = 0.5
 
+#: 贴合门：与最佳方向的余弦低于这个值的命中**不算"属于这张图"**，不加分。
+#:
+#: 这个闸是**实测逼出来的**，不是补一个漂亮常数。两张不同主题的图上
+#: （`scripts/measure_profile_isolation.py --run`）：
+#:
+#:   | 命中来自 | 本图材料的余弦 | 另一张图材料的余弦 |
+#:   |---|---|---|
+#:   | 图 B（碳中和） | 0.918 / 0.958 / 0.962 | 0.487 / 0.497 |
+#:   | 图 A（机器学习） | 0.843 / 0.916 / 0.927 | 0.518 |
+#:
+#: 两个分布之间空着一大段（0.52 ↔ 0.84），0.6 落在空档里。没有这道门时实测出现过
+#: 这样一次排序：一条跨图命中 cos = 0.497，一条本图命中 cos = 0.9625，两条的
+#: `norm` 并列（RRF 分相同），而画像把它们排成了跨图的在前——因为 α 还乘了方向的
+#: 权重，跨图那条"最像"的是重方向（权重 0.44 → α 0.15），本图那条"最像"的是轻方向
+#: （权重 0.22 → α 0.075），`0.497 × 0.15 > 0.9625 × 0.075`。**那是真的错排序**，
+#: 而它只有逐条看分数才看得出来（汇总的条数一个都没变，见 `boost` 的约束 1）。
+#:
+#: 隔离之后这道门才真正有牙齿：同一批材料算出来的方向，对**别的图**的材料余弦
+#: 掉到 0.5 附近（跨主题基线），过不了门；而隔离之前，图 A 的材料与图 A 的方向
+#: 余弦是 0.90+，一路过门。**"跨图污染为 0"就是这条 + 隔离一起成立的。**
+MIN_COSINE = 0.6
+
 #: 一次最多给多少条命中算画像余弦。top_k 通常是 3（`DEEP_BRANCH_TOP_K`）或 5，
 #: 8 留出余量。这个闸是成本闸：每条命中要一次 embedding（有缓存则免），
 #: 20 支分支串起来就是 20 批；截到"前 8 条"时，排在后面的本来就轮不到被加权
@@ -143,10 +203,26 @@ STALE_HOURS = 24.0
 #: 开关。**默认关**：打开之后每次生成会多出 N 次 embedding 往返（N = 检索次数），
 #: 在收益被 A/B 证明之前，默认值不该是"多花这些时间"。
 #: `scripts/measure_profile_ab.py` 用它把两组分开。
+#:
+#: **按导图隔离 + 复用块向量之后，这个理由已经弱到几乎不成立**：方向从"这张图的
+#: 材料"现成的块向量算，不再有"新 embed"那一次往返（实测 80 个子块里 76 条命中
+#: 缓存，剩下 4 条不补）。剩下的成本只有聚类本身（60 样本 89 ms，一次运行一次）。
+#: 但默认值不改在这一轮：先把"跨图污染是不是真的降到 0"测出来，再谈默认值。
+#: 见 `docs/PROFILE-ISOLATION.md` 的两图实测。
 SWITCH_ENV = "MINDMAP_PROFILE_RERANK"
+
+#: 池键的前缀：**新图还没保存时用 `run:<run_id>`**。判据见 `pool_key`。
+POOL_RUN_PREFIX = "run:"
 
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
+#: `map_id` 是**池键**（不是"导图主键"）：
+#:   - 空串 / NULL = 隔离之前那批全局方向（`stored(map_id=None)` 的全量视图里还在，
+#:     给脚本与排查用；`stored(map_id="…")` 时**不返回**——它们属于"没有隔离概念的
+#:     时代"，任何一张图都不该被它们加权）；
+#:   - `run:<run_id>` = 一次生成的方向池（新图还没保存时的形态，见 `pool_key`）；
+#:   - 已保存图的 `map_id` = 同一张图的多轮生成可以共用（接口就位，当前生成链路
+#:     拿不到它，见 `pool_key`）。
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {VECTOR_TABLE} (
     id         TEXT PRIMARY KEY,
     vector     BLOB NOT NULL,
@@ -154,7 +230,8 @@ _CREATE = f"""CREATE TABLE IF NOT EXISTS {VECTOR_TABLE} (
     weight     REAL NOT NULL,
     samples    INTEGER NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    map_id     TEXT
 )"""
 
 
@@ -191,28 +268,81 @@ class Direction:
 class Boost:
     """一次画像加权的全部可观测结果。
 
-    三个字段都留着（而不只返回排好序的列表）：
+    五个字段都留着（而不只返回排好序的列表）：
     `lifted` 是"过滤气泡检验"的唯一输入——加权上来的命中后来被删掉了几条，
     这个问题的答案只能从"哪几条是被抬上来的"出发；
-    `cosines` 让排查能区分"没加分"与"加了但都一样"。
+    `cosines` 让排查能区分"没加分"与"加了但都一样"；
+    `bonuses` 是**每条命中实际拿到的加分**（下标 → `final - base`，没加分的是 0）。
+    它是"跨图污染"唯一干净的量化：`cosines` 只说"像不像"，而"像"过不了门
+    （`MIN_COSINE`）就不该算污染；`bonuses` 说"到底加了几分"，一分没加就是没被
+    这张图的方向碰过。`lifted` 单独看不出来——它数的是名次变化，而名次会**互相
+    挤压**（别的条目被降下去，不动的那条也会相对上升）；
+    `reason` 是**这次为什么没加权**（空串 = 正常加权过）。没有它，用户看到的
+    只是"个性化好像没生效"——而"这张图的材料还没有块向量"与"开关关着"在界面上
+    长得一模一样。
     """
 
     hits: list[Any]
     lifted: list[Any]
     cosines: dict[int, float] = field(default_factory=dict)
+    bonuses: dict[int, float] = field(default_factory=dict)
+    reason: str = ""
 
 
 # ---------------------------------------------------------------- 建表
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    """建表，并给已存在的表补上 `map_id` 列（幂等）。
+
+    补列是必须的：`CREATE TABLE IF NOT EXISTS` 只保证"表存在"，不保证"列齐全"。
+    老库里有 4 行隔离之前的全局方向，缺列的后果不是报错，是 `stored(map_id=…)`
+    那句 `WHERE map_id = ?` 直接 `no such column`——**画像整层静默失效**，而唯一的
+    信号是那条被 `stored` 自己吞掉的异常。
+
+    补出来的列在老行上是 NULL，而 NULL 在这里有确切含义（"当时还没有隔离这个概念"），
+    正是 `stored(map_id="…")` 必须把它们排除掉、`stored(map_id=None)` 必须把它们
+    包含进来的依据。不做数据回填：给它们编一个 `map_id` 等于伪造归属。
+    """
     conn.execute(_CREATE)
+    from app.mindmaps.repository import _ensure_columns
+
+    _ensure_columns(conn, VECTOR_TABLE, {"map_id": "TEXT"})
 
 
 def _connect() -> sqlite3.Connection:
     from app.mindmaps import repository
 
     return repository.connect()
+
+
+def pool_key(*, map_id: str | None = None, run_id: str | None = None) -> str:
+    """一次生成用哪个方向池：**有 `map_id` 用它，没有用 `run:<run_id>`**。
+
+    为什么不是纯 `map_id`：**新图在服务端根本没有 id**。`repository.create_map` 才
+    发 uuid4（`SaveRequest` 的注释写着"第一次保存之前没有 map_id"），而
+    `DiagramContent` / `AgentRunRequest` / `RunContext` 三处都没有这个字段——
+    生成链路拿不到一个还不存在的东西。纯 `map_id` 的后果是"首次生成永远没有池"，
+    而那恰恰是最需要个性化的一刻（用户刚传完 3 份材料）。
+
+    为什么不是纯 `run_id`：已保存图的多轮生成（`expand` / `edit`）本该共用一张图的
+    方向。`run_id` 每轮都换，池也跟着换——用户看到的是"个性化时有时无"，比跨图串味
+    更难理解。所以接口按"有 map_id 优先"设计，等生成链路能拿到它时直接生效。
+
+    这条判据要一直成立，因为**"新图还没保存"这个状态会永远存在**（每次 create 都
+    是它）。所以别把 `run:` 当成过渡形态。
+
+    另一个性质让纯 `run_id` 在实践中没那么糟：聚类是**确定性**的（`cluster` 的
+    最大最小距离初始化，没有随机数），所以同一批材料在两轮里会算出同一批方向。
+    `pool_key` 只决定"存在哪一行、按谁读回"，不决定"算出来是什么"。
+    """
+    if map_id:
+        return str(map_id)
+    if not run_id:
+        # 两边都没有：老脚本直接调 `rebuild()` 时就是这种。返回空串 = 隔离之前那个
+        # 全局池，`stored(map_id="")` 与它的语义一致。
+        return ""
+    return f"{POOL_RUN_PREFIX}{run_id}"
 
 
 def enabled() -> bool:
@@ -583,25 +713,37 @@ def build_directions(samples: Sequence[Sample]) -> list[Direction]:
 # ---------------------------------------------------------------- 落库与读回
 
 
-def rebuild() -> list[Direction]:
-    """重算画像并落库。样本不足或向量服务不可用时**清空**并返回空列表。
+def rebuild(map_id: str | None = None) -> list[Direction]:
+    """重算方向并按池键落库。样本不足时**清空这个池**并返回空列表。
 
-    清空而不是留旧值：与 `style.refresh` 同一条理由——画像是"现在的数据支持什么
-    结论"，留着上一批方向会让这句话变成假话。
+    样本仍取自 `_samples()`（库里三张表的全局样本），这一版只把**归属**改成池：
+    方向现在有了池键，`stored(map_id=…)` 也只按池读。**但方向本身还是全局算的**
+    ——跨图污染还在这一层，下一提交才把它换成本图材料的块向量
+    （`build_directions_from_sources`，同时省掉那 6 次 embed）。
+
+    清空的范围是**这个池**，不是整张表：`DELETE FROM ... WHERE map_id = ?`。
+    否则给一张图重建方向会把其它图（以及隔离之前的全局方向）一起抹掉——那是
+    "隔离"最不该有的副作用。`map_id=None` 归一成空串，正好只清"全局池"那一批。
+
+    主键 `id` 从 `d0` 改成 `{pool}#d{index}`：`profile_vectors.id` 是主键，
+    多个池共用 `d0` 会让第二个池的第一条方向静默写不进去（`INSERT` 撞主键抛错，
+    而这里没有 `OR IGNORE`）。改动是纯机械的，`stored` 从不读 `id`。
     """
+    pool = "" if map_id is None else str(map_id)
     directions = build_directions(_samples())
     with closing(_connect()) as conn, conn:
-        conn.execute(f"DELETE FROM {VECTOR_TABLE}")
+        conn.execute(
+            f"DELETE FROM {VECTOR_TABLE} WHERE COALESCE(map_id, '') = ?", (pool,))
         for index, direction in enumerate(directions):
             conn.execute(
                 f"""INSERT INTO {VECTOR_TABLE}
-                        (id, vector, label, weight, samples, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, {_NOW}, {_NOW})""",
-                (f"d{index}", vector_cache.pack(direction.vector), direction.label,
-                 direction.weight, direction.samples),
+                        (id, vector, label, weight, samples, created_at, updated_at, map_id)
+                    VALUES (?, ?, ?, ?, ?, {_NOW}, {_NOW}, ?)""",
+                (f"{pool}#d{index}", vector_cache.pack(direction.vector), direction.label,
+                 direction.weight, direction.samples, pool),
             )
     if directions:
-        logger.info("画像向量已更新：%d 个方向", len(directions))
+        logger.info("画像向量已更新：%d 个方向（池 %s）", len(directions), pool or "全局")
     return directions
 
 
@@ -612,20 +754,42 @@ class Stored:
     weight: float
     samples: int
     updated_at: str
+    #: 这个方向属于哪个池。空串 = 隔离之前的全局方向（`stored(map_id=None)` 才看得到）。
+    map_id: str = ""
 
 
-def stored() -> list[Stored]:
-    """读现成的方向。**不重算、不抛错**（读失败就当没有画像）。
+def stored(*, map_id: str | None) -> list[Stored]:
+    """读某个池现成的方向。**不重算、不抛错**（读失败就当没有画像）。
+
+    `map_id` **没有默认值**，这是刻意的：漏传时 Python 直接抛 `TypeError`，而不是
+    静默退化成"读全部池"——**那正是这个 bug 的形状**（全局方向被当成这张图的
+    方向用）。加一个 `= None` 的默认值，代码里就再也不会有人注意到这件事。
+
+    三种取值，语义各不相同：
+
+      - `None` → **全量**（含隔离之前的全局行）。只给脚本与排查用：`--report`
+        要能看到"老的那 4 个方向还在不在"；
+      - `"…"`（含空串）→ 只这个池。`WHERE COALESCE(map_id,'') = ?` 让隔离之前那批
+        NULL 行**不返回**：它们属于"没有隔离概念的时代"，任何一张图都不该被它们
+        加权。空串是显式要"全局池"的写法，与 `None`（全量）不是一回事；
+      - 池里没有行 → 空列表。新图没材料时就是这条，调用方据此走"不加权"。
 
     维度校验与 `memory.store.recall` 同一条规矩：换了 embedding 模型/维度之后，
     库里的旧向量与新的查询向量不在同一个空间里，点积会得到一个"看起来合理、
     实际是垃圾"的数。对不上就整条跳过，绝不截断对齐。
     """
     dim = embedding.dimension()
+    columns = "label, vector, weight, samples, updated_at, COALESCE(map_id, '') AS pool"
     with closing(_connect()) as conn:
-        rows = conn.execute(
-            f"SELECT label, vector, weight, samples, updated_at FROM {VECTOR_TABLE} "
-            "ORDER BY weight DESC, label").fetchall()
+        if map_id is None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM {VECTOR_TABLE} "
+                "ORDER BY weight DESC, label").fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {columns} FROM {VECTOR_TABLE} "
+                "WHERE COALESCE(map_id, '') = ? "
+                "ORDER BY weight DESC, label", (str(map_id),)).fetchall()
     result: list[Stored] = []
     for row in rows:
         vector = vector_cache.unpack(row["vector"], dim)
@@ -633,17 +797,21 @@ def stored() -> list[Stored]:
             continue
         result.append(Stored(
             label=str(row["label"]), vector=vector, weight=float(row["weight"]),
-            samples=int(row["samples"]), updated_at=str(row["updated_at"])))
+            samples=int(row["samples"]), updated_at=str(row["updated_at"]),
+            map_id=str(row["pool"])))
     return result
 
 
-def stale(now: datetime | None = None) -> bool:
-    """画像是否过期：最旧那条 `updated_at` 距现在超过 `STALE_HOURS`。
+def stale(*, map_id: str | None = None, now: datetime | None = None) -> bool:
+    """这个池的画像是否过期：最旧那条 `updated_at` 距现在超过 `STALE_HOURS`。
 
     取**最旧**而不是最新：几条方向是一起 rebuild 出来的，但某一条可能是更早那轮
     留下的。只有所有方向都还新鲜，这个画像才新鲜。
+
+    `map_id` 默认 `None`（全量）而不是强制显式：这个函数只进日志与面板，判断错了
+    不影响任何一次排序——而它的调用方（`--report`）本来就在看全量。
     """
-    rows = stored()
+    rows = stored(map_id=map_id)
     if not rows:
         return True
     ages = [age for age in (age_days(row.updated_at, now=now) for row in rows)
@@ -713,15 +881,23 @@ def _cosines(
 def boost(
     hits: Sequence[Any],
     *,
-    directions: Sequence[Stored] | None = None,
+    directions: Sequence[Stored | Direction],
     alpha: float = ALPHA,
 ) -> Boost:
     """把画像贴合度加进**排序**，返回重排后的列表与被抬上来的那几条。
 
     ```
     norm    = min_max(hit.score)                 # 本批内的相对分
-    final   = norm + alpha * max(cos(hit, v))    # v 遍历所有画像方向
+    final   = norm + alpha * max(cos(hit, v))    # v 遍历**这张图**的方向
     ```
+
+    `directions` **是必填的、且不接受默认值**。它曾经默认 `stored()`（读全表），
+    而那正是跨图串味的来源：一张讲机器学习的图，检索时被"碳中和"那个方向加权，
+    而且没有任何地方看得出来。改成必填之后，调用方必须显式回答"用哪个池"，
+    漏答是 `TypeError`（立刻、可见），而不是一次静默的全局加权。
+
+    `v` 只遍历传入的这几根向量，所以"两张图互不加权"不是靠调用方自觉——**另一个
+    池的方向根本不在这个列表里**。这是隔离在打分层的落点。
 
     **为什么不能直接 `hit.score + alpha * cos`**（也就是"候选分数 = BM25 + 余弦 +
     RRF + α·…"的字面写法）：本仓库的 `hit.score` 在不同路径上是三种口径
@@ -738,12 +914,15 @@ def boost(
     """
     if not hits:
         return Boost(hits=[], lifted=[])
-    current = list(directions) if directions is not None else stored()
+    current = list(directions)
     if not current:
-        return Boost(hits=list(hits), lifted=[])
+        # 这条分支是**新图的正常路径**，不是错误：没有材料 → 没有样本 → 没有方向
+        # → 不加权。给一句人话，否则用户只能靠"好像没生效"来猜。
+        return Boost(hits=list(hits), lifted=[],
+                     reason="这张图还没有可用于算方向的材料块向量，这次不做个性化加权")
     limit = min(max(0.0, float(alpha)), MAX_ALPHA)
     if limit <= 0:
-        return Boost(hits=list(hits), lifted=[])
+        return Boost(hits=list(hits), lifted=[], reason="画像加权的 α 为 0，这次不加权")
     # 权重进 α：一个只占 5% 样本的方向不该与占 40% 的方向同样重。用相对权重
     # （最快最强那个方向 = 1.0）而不是绝对值，因为 `weight` 是占比、总和为 1。
     top = max((item.weight for item in current), default=0.0) or 1.0
@@ -760,6 +939,7 @@ def boost(
     gate = max(norm) * GATE_RATIO
 
     final: list[float] = []
+    bonuses: dict[int, float] = {}
     for index, base in enumerate(norm):
         picked = cosines.get(index)
         if picked is None or base < gate:
@@ -767,11 +947,19 @@ def boost(
             final.append(base)
             continue
         cosine, slot = picked
+        if cosine < MIN_COSINE:
+            # 过不了**贴合门**：与这张图的任何一个方向都不够像，说明它不属于这张图
+            # （多半是知识库里另一张图的材料被 `library=True` 带进来的）。加分给它
+            # 就是跨图污染——理由与实测见 `MIN_COSINE`。
+            final.append(base)
+            continue
         # α 由"赢的那个方向有多重"定标，而不是一律用 `limit`：一个只占 5% 样本
         # 的方向不该与占 40% 的方向同样重。除以 `top` 是把权重归一成"最强的方向
         # = 1.0"，这样默认参数下最强方向拿到满额 α，弱方向按比例缩。
         alpha_for = scaled[slot][1]
-        final.append(base + cosine * alpha_for)
+        bonus = cosine * alpha_for
+        final.append(base + bonus)
+        bonuses[index] = round(bonus, 6)
 
     order = sorted(range(len(hits)), key=lambda i: (-final[i], i))
     reordered = [hits[index] for index in order]
@@ -781,18 +969,21 @@ def boost(
     if lifted:
         logger.info("画像加权：%d 条命中里 %d 条被抬上来（α=%.2f，%d 个方向）",
                     len(hits), len(lifted), limit, len(current))
-    return Boost(hits=reordered, lifted=lifted,
+    return Boost(hits=reordered, lifted=lifted, bonuses=bonuses,
                  cosines={index: value for index, (value, _) in cosines.items()})
 
 
-def prompt_directions() -> str:
+def prompt_directions(*, map_id: str | None = None) -> str:
     """画像方向 → 一行可读的描述（进日志或面板，**不进提示词**）。
 
     方向不进提示词：模型不需要知道"这个人有 4 个兴趣方向"这件事，它需要的只是
     这次的材料与这次的图。把方向写进 system 会让它开始猜"这次该往哪个方向靠"，
     而那不是它的活。
+
+    `map_id` 默认 `None`（全量）：这个函数只进日志与排查面板，把全量列出来正好
+    回答"隔离之前那批全局方向还在不在"。要看某一个池就显式传池键。
     """
-    rows = stored()
+    rows = stored(map_id=map_id)
     if not rows:
         return ""
     return "；".join(f"{row.label}（{row.samples} 条，权重 {row.weight:.2f}）"
@@ -807,8 +998,10 @@ __all__ = [
     "MAX_HITS",
     "MAX_SAMPLES",
     "MIN_CLUSTERS",
+    "MIN_COSINE",
     "MIN_MINDMAP_NODES",
     "MIN_SAMPLES",
+    "POOL_RUN_PREFIX",
     "SAMPLE_CHARS",
     "STALE_HOURS",
     "SWITCH_ENV",
@@ -822,6 +1015,7 @@ __all__ = [
     "cluster",
     "enabled",
     "ensure_schema",
+    "pool_key",
     "prompt_directions",
     "rebuild",
     "stale",

@@ -171,18 +171,26 @@ def _report() -> int:
                for kind in ("material", "mindmap", "memory")}
     print(f"样本 {len(samples)} 条：{by_kind}；k = {profile_mod._pick_k(len(samples))}"
           f"（`_pick_k` 夹在 {profile_mod.MIN_CLUSTERS}–{profile_mod.MAX_CLUSTERS}）")
-    stored = profile_mod.stored()
+    # `map_id=None` = **全量**（含隔离之前那批全局方向）。这个脚本就是"要看全量"的
+    # 那个调用方：它回答"老的方向还在不在、新的池各是什么"。生成链路一律按池读，
+    # 见 `profile.stored` 的 docstring。
+    stored = profile_mod.stored(map_id=None)
     if not stored:
         print("库里没有方向。先跑 `profile.rebuild()`（需要 embedding 凭证）。")
     else:
-        print(f"\n{'方向':<44}{'权重':>7}{'样本':>5}")
+        print(f"\n{'方向':<40}{'权重':>7}{'样本':>5}  池")
         for item in stored:
-            print(f"{item.label[:42]:<44}{item.weight:>7.3f}{item.samples:>5}")
+            # "池"这一列是隔离之后才有的：空 = 隔离之前那批全局方向（生成链路
+            # 读不到它们），`run:…` = 一次生成的方向池，UUID = 已保存的图。
+            pool = item.map_id or "（隔离之前的全局方向）"
+            print(f"{item.label[:38]:<40}{item.weight:>7.3f}{item.samples:>5}  {pool}")
         if profile_mod.stale():
             print("\n⚠ 画像已过期（超过 %.0f 小时未更新）" % profile_mod.STALE_HOURS)
         print("\n轮廓系数（`profile.silhouette`）记在 rebuild 的日志里——它是"
               "『这批数据到底有没有方向』的唯一凭据：\n"
               "  ≥0.35 隔开了 / 0.15–0.35 弱结构 / <0.15 等于把无关文本切成了几份。")
+        print("\n跨图污染要看另一个脚本（同一主题跑三次测不出它）："
+              "\n  python scripts/measure_profile_isolation.py --run")
     return 0
 
 

@@ -469,6 +469,21 @@ class RunContext:
     #
     # 默认空串同样是为了"接线没接通时与旧版本逐字节相同"。
     style_hints: str = ""
+    # 这次运行的**内容方向池**（`app/prefs/profile.py` 的 `Direction` 列表）与它的
+    # 池键。方向按图隔离之后，它必须"一次运行算一次"：
+    #
+    #   - 算一次：从这批材料的块向量聚类，实测 ~100 ms（60 样本 × 1024 维 × 球面
+    #     k-means）。20 支分支各算一遍就是 20 × 100 ms 的纯 Python 循环抢 GIL，
+    #     而它们读的是**同一批材料**，算出来也必然是同一批方向（聚类是确定性的）；
+    #   - 存 ctx 而不是 `lru_cache`：缓存键是"这批材料"，而 `Source` 不可哈希，
+    #     拿 `id(sources)`、文件名或材料份数做键都会在"换了一批材料但份数相同"时
+    #     把上一张图的方向喂给这一张图——那是隔离最不该有的漏洞。
+    #
+    # `None` = **还没算**（而不是"没有方向"）；算出来是空列表才是"这张图没有方向"。
+    # 两者必须分得开，否则每次调用都会重算一遍那个"确定没有"的结果。
+    profile_directions: list[Any] | None = None
+    #: 上面那批方向属于哪个池（`profile.pool_key()` 的结果）。池变了就重算。
+    profile_pool: str = ""
 
     def record_library_sources(self, sources: Iterable[Source]) -> None:
         """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。

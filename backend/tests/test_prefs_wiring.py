@@ -79,8 +79,8 @@ class _Hit:
 def test_profile_rank_is_a_no_op_when_switch_is_off(monkeypatch):
     monkeypatch.delenv(profile.SWITCH_ENV, raising=False)
     hits = [_Hit(0.08), _Hit(0.02)]
-    ranked, lifted = asyncio.run(tools._profile_rank(hits))
-    assert ranked == hits and lifted == []
+    ranked, lifted, note = asyncio.run(tools._profile_rank(hits, []))
+    assert ranked == hits and lifted == [] and note == ""
 
 
 def test_profile_rank_returns_original_order_on_failure(monkeypatch):
@@ -92,7 +92,7 @@ def test_profile_rank_returns_original_order_on_failure(monkeypatch):
 
     monkeypatch.setattr(profile, "boost", boom)
     hits = [_Hit(0.08), _Hit(0.02)]
-    ranked, lifted = asyncio.run(tools._profile_rank(hits))
+    ranked, lifted, _note = asyncio.run(tools._profile_rank(hits, []))
     assert ranked == hits and lifted == []
 
 
@@ -106,7 +106,7 @@ def test_profile_rank_reports_lifted_keys(monkeypatch):
                              cosines={0: 0.1, 1: 0.9})
 
     monkeypatch.setattr(profile, "boost", fake_boost)
-    ranked, lifted = asyncio.run(tools._profile_rank(hits))
+    ranked, lifted, _note = asyncio.run(tools._profile_rank(hits, []))
     assert ranked == [hits[1], hits[0]]
     assert lifted == ["s2:120"]
 
