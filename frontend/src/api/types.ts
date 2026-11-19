@@ -964,6 +964,55 @@ export interface EditSummary {
   removed_subtree: Record<string, number>;
 }
 
+// ---- 结构诊断与建议（`POST /api/optimization/check` / `suggest`）----
+//
+// 镜像 `backend/app/contracts/diagnostic.py`。两个端点都**只读**：不落库、不改任何
+// 东西（后端 docstring 的原话是"只读诊断""用户确认后才能应用"）。所以"生成完成后
+// 自动跑一次 check"是零成本的——它既不会改用户的作品，也不会有模型调用。
+//
+// `code` / `kind` / `level` 一律声明成 `string`，**不是**字面量联合。这是刻意的：
+// 后端正在持续加新的诊断码（近义冗余、缺失环节…），写成 `"SINGLE_CHILD" | …` 之后
+// 每来一个新码前端都要跟着改类型；而界面要的只是"把不认识的东西原样显示出来"。
+// 人话映射在 `mindmap/diagnostics.ts`，认不出来的码就显示码本身。
+
+/** 一条诊断。`level` 目前是 info / warn / error；未知值按 info 画。 */
+export interface Diagnostic {
+  level: string;
+  code: string;
+  /** 指向哪个节点；`null` 表示这条诊断不针对单个节点（如整图层面的问题）。 */
+  node_id?: string | null;
+  message: string;
+  /** 原文片段或相似节点 id。界面原样展示，不解释。 */
+  evidence?: string | null;
+}
+
+/**
+ * 一条**候选**修改。必须由用户确认才应用——后端没有自动应用接口。
+ *
+ * `kind` 决定"应用"这个动作到底做什么（`structure.ts::applySuggestion`）。只有
+ * `dedupe` 有定义（删掉那个重复节点）；其余 kind 后端还没给出对应的操作，界面
+ * 只显示不给按钮——摆一个点了不知道会发生什么的按钮比不摆更糟。
+ */
+export interface Suggestion {
+  /** 每次请求都会变（后端 `uuid4` 默认值）。**不要**拿它当"忽略过"的键。 */
+  id?: string;
+  kind: string;
+  node_id?: string | null;
+  message: string;
+  evidence?: string | null;
+  /** 规则建议没有经过概率校准；`null` = 未评估，与"置信 0"不是一回事。 */
+  confidence?: number | null;
+}
+
+export interface CheckResponse {
+  diagnostics: Diagnostic[];
+}
+
+export interface SuggestResponse {
+  suggestions: Suggestion[];
+  diagnostics: Diagnostic[];
+}
+
 /**
  * 跨图的链路健康检查（`GET /mindmaps/edits/health`）。
  *
