@@ -42,6 +42,7 @@ from app.agent.stream import DONE_FRAME, encode_event
 from app.core.errors import AppError
 from app.generation.service import GenerationError
 from app.knowledge.remember import remember_sources
+from app.memory import summarize as memory_summarize
 
 logger = logging.getLogger(__name__)
 
@@ -317,8 +318,29 @@ async def stream_run(body: AgentRunRequest) -> StreamingResponse:
         return StreamingResponse(_replay(record), media_type="text/event-stream",
                                  headers=_SSE_HEADERS)
 
+    _maybe_summarize(run_id)
     return StreamingResponse(_frames(body, run_id), media_type="text/event-stream",
                              headers=_SSE_HEADERS)
+
+
+def _maybe_summarize(run_id: str) -> None:
+    """看看有没有"刚结束、还没总结"的上一个会话，有就起一个后台线程去总结。
+
+    **位置**：认领完这次运行之后、返回流之前。不能更早（认领之前 `runs` 表里还
+    没有当前这一行，`due()` 会把"现在"当成上一次运行的结束时刻，间隔永远不够），
+    也不能更晚（生成一开始就没人关心上一次会话了）。
+
+    **为什么能在这里做**：这就是"会话结束由后端自己判定、不需要前端配合"的落点。
+    后端唯一能自己判定的时刻是"下一次运行开始"，而这里正是那个时刻。
+
+    **失败只记 warning**：总结是附属动作，它抛出去会让一次本来正常的生成 500。
+    读库超时、模型配置坏掉、库被锁——这些都不该影响用户这一次要的图。
+    """
+    try:
+        memory_summarize.maybe_summarize(exclude_run_id=run_id)
+    except Exception as exc:  # noqa: BLE001 — 见 docstring
+        logger.warning("上一个会话的记忆总结没有启动（%s），这次生成不受影响",
+                       type(exc).__name__)
 
 
 # ---------------------------------------------------------------- 读：run 的台账
