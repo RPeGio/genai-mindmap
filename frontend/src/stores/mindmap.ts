@@ -6,6 +6,7 @@ import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, ma
 import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
+import { CONNECTION_LOST, guideForFailure, INVALID_SOURCES, NO_CONTENT, type FailureGuide } from '../mindmap/failures';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import {
@@ -637,6 +638,25 @@ export interface RunOptions {
 }
 
 /**
+ * 上一次真正发出去的请求，留着给「重试」用。
+ *
+ * 只活在内存里：刷新页面之后没什么可重试的——服务端 `runs` 表那条路走的是
+ * 「上次跑完但没保存」的结果载入（`probeResumableRun`），不是重发请求。两者
+ * 解决的也不是同一件事：这里要的是"把刚才那句话再跑一遍"。
+ *
+ * 存的是**规整后的参数**而不是原始的 `arguments`：`runGeneration` 有五个位置参数
+ * 加一个对象，原样转发会在加了默认值之后悄悄改变行为。
+ */
+export interface RunAttempt {
+  goal: string;
+  intent: 'create' | 'expand' | 'edit';
+  sources?: Source[];
+  thinkingModel: string;
+  diagramType: DiagramTypeChoice;
+  options: RunOptions;
+}
+
+/**
  * 单次请求最多带几个选中 id。
  *
  * **与后端 `AgentRunRequest.selected_ids` 的 `max_length=50` 同一个数**，两处一个
@@ -954,6 +974,27 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const agentError = ref('');
 
   /**
+   * 失败分类用的两个字段，与 `agentError` 的文案分开存。
+   *
+   * `agentError` 只够"说清发生了什么"，说不出"接下来该怎么办"：同一个 `message`
+   * 可能来自重试有意义的失败，也可能来自重试一百次都一样的配置缺失。判据在
+   * `mindmap/failures.ts`，这两个字段是它的输入。
+   *
+   * 为什么不用 `agentEvents` 里那帧 `error`：面板拿的是**最后一次运行**的失败，
+   * 而事件数组还留着前几轮的帧；从这里取不会串。
+   */
+  const agentErrorCode = ref('');
+  const agentErrorLimit = ref('');
+
+  /**
+   * 上一次真正发出去的请求，只给「重试」用（内存态，刷新即失效）。
+   *
+   * 记在 store 而不是组件里：将来不止一个入口会用到重试（面板、状态行、快捷键），
+   * 而组件卸载（抽屉收起来）不该让"刚才那次"跟着消失。
+   */
+  const lastAttempt = ref<RunAttempt | null>(null);
+
+  /**
    * 上次跑完（或被中断）、但**结果还没被保存**的那次运行。
    *
    * 这是"run 身份"落到界面上的唯一痕迹。此前 run 只活在一个 HTTP 连接的寿命里：
@@ -1061,6 +1102,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
       agentEvents.value = [];
       agentWarnings.value = [];
       agentError.value = '';
+      // 载入成功即"这次没有失败"：不跟着清的话，卡片会挂着一份几分钟前那次的
+      // 解释，而用户刚刚明明把结果接住了。
+      agentErrorCode.value = '';
+      agentErrorLimit.value = '';
       clearAgentPreview();
       resetDraftOps();
       // 来历照原样带过来：占位树恢复成"模型生成"就是界面替它撒谎。
@@ -2985,7 +3030,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (sources && sources.length > 0) {
       const problem = sourceInputError(sources);
       if (problem) {
+        // 材料没解析好不是"运行失败"，它的下一步是改输入而不是重试——原样再发
+        // 一遍，后端照样会把这几份剔掉。所以用单独的分类码。
         agentError.value = problem;
+        agentErrorCode.value = INVALID_SOURCES;
+        agentErrorLimit.value = '';
         status.value = problem;
         return;
       }
@@ -2998,6 +3047,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 看起来像"这次又失败了"。
       agentEvents.value = [];
       agentError.value = '';
+      agentErrorCode.value = '';
+      agentErrorLimit.value = '';
       agentWarnings.value = [];
       clearAgentPreview();
       status.value = '请在画布右上角的输入框里写下主题或要改什么；「导图标题」那个框只改名字，不会重新生成。';
@@ -3018,6 +3069,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
 
     agentError.value = '';
+    // 上一轮失败分类的理由跟着一起清：留着的话新一轮刚开跑，失败卡片就已经在
+    // 按上一轮的 code 解释了——而这一轮可能什么都还没发生。
+    agentErrorCode.value = '';
+    agentErrorLimit.value = '';
+    // 记住这一次的完整参数，「重试」要原样再发一遍。放在清理之后、发请求之前：
+    // 拦在闸门外的请求（没写主题、非树快照）不算"发出去过"，不该变成可重试的对象。
+    lastAttempt.value = {
+      goal: prompt,
+      intent,
+      sources: sources && sources.length > 0 ? [...sources] : undefined,
+      thinkingModel,
+      diagramType,
+      options,
+    };
     agentEvents.value = [];
     // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。
     agentWarnings.value = [];
@@ -3202,6 +3267,23 @@ export const useMindMapStore = defineStore('mindmap', () => {
             // 不替它认成 `deepseek-chat`——界面据此只说"模型没说"，不说谎。
             runModel.value = event.model ?? null;
             lastReasoning.value = event.reasoning ?? '';
+            // 半棵树也是交付：后端在预算耗尽、工具超时、连续失败、空转收尾时不发
+            // `error` 了，而是交出手上那棵树，用 `partial` 标明它没长完。**必须收进
+            // 告警**——否则用户看到一棵树落到画布上，会当它是模型认为的完整答案。
+            //
+            // 判断用 `=== true`：缺字段是"没说"（正常收尾、加字段之前的老帧），
+            // 不是"完整"；拿 `event.partial` 直接当真会把这批老帧全判成不完整。
+            if (event.partial === true) {
+              recordWarnings([
+                {
+                  kind: 'partial',
+                  code: 'PARTIAL',
+                  // 后端给的原因比这里的兜底文案具体得多（"模型调用次数已用完"
+                  // 和"这次运行超过了时间上限"对用户是两件不同的事）。
+                  message: event.partial_reason || '有分支没能生成完整，结果可能缺内容。',
+                },
+              ]);
+            }
             // 终态已到，预览再留着只会让人以为还有节点在路上。
             clearAgentPreview();
             if (event.content) draft.value = event.content;
@@ -3215,6 +3297,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
                 base: generationBase,
               });
             } else {
+              // 这一轮有终态帧但没有树：是一类**失败**，只是后端走了 done。
+              // 不给分类码的话，面板只会显示一句干巴巴的"没有产出导图"，
+              // 而用户此时最想知道的是"再点一次有没有用"。
+              agentError.value = '模型这次没有产出导图。';
+              agentErrorCode.value = NO_CONTENT;
+              agentErrorLimit.value = '';
               status.value = '模型这次没有产出导图。';
             }
             break;
@@ -3222,7 +3310,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
             settled = true;
             // 失败时预览同样作废：它可能正好停在半截，留着会被当成"这次的结果"。
             clearAgentPreview();
+            // 文案与分类分开存：`message` 说"发生了什么"，code/limit 让面板翻出
+            // "接下来该怎么办"（见 `mindmap/failures.ts`）。只存 message 的话，
+            // 界面除了把后端原话再念一遍什么也做不了。
             agentError.value = event.message;
+            agentErrorCode.value = event.code;
+            agentErrorLimit.value = event.limit ?? '';
             status.value = event.message;
             break;
         }
@@ -3233,12 +3326,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
       if (!settled && !ctrl.signal.aborted) {
         // 流正常结束但没有终态帧：中途断了，不能假装成功。
         agentError.value = '连接中断，结果可能不完整，请重试。';
+        agentErrorCode.value = CONNECTION_LOST;
+        agentErrorLimit.value = '';
         status.value = '连接中断，结果可能不完整，请重试。';
       }
     } catch (error) {
       if (controller !== ctrl) return;
       const message = error instanceof ApiError ? error.message : '运行失败，请重试。';
       agentError.value = message;
+      // 422 这类"请求本身就不合法"不该显示「重试」——原样再发一遍还是同一个 422。
+      // 用它自己的错误码，面板据此给出"改输入"而不是"再来一次"。
+      agentErrorCode.value = error instanceof ApiError ? error.code || '' : '';
+      agentErrorLimit.value = '';
       status.value = message;
     } finally {
       // 取消后立刻重新运行、或换图后新请求已接管时，旧请求的收尾不能清掉新请求的状态。
@@ -3251,6 +3350,47 @@ export const useMindMapStore = defineStore('mindmap', () => {
         waitedMs.value = 0;
       }
     }
+  }
+
+  /**
+   * 失败卡片要说的话：把后端那句"发生了什么"翻成"接下来该怎么办"。
+   *
+   * 判据在 `mindmap/failures.ts`（纯函数，逐条有用例），这里只负责把手上这三个
+   * 分散的字段（`agentError` / `agentErrorCode` / `agentErrorLimit`）与"能不能
+   * 重试"拼成它的输入。没有失败时返回 null，面板据此整块不渲染。
+   */
+  const failureGuide = computed<FailureGuide | null>(() => {
+    if (!agentError.value) return null;
+    return guideForFailure({
+      code: agentErrorCode.value,
+      limit: agentErrorLimit.value,
+      message: agentError.value,
+      // 有 lastAttempt 才谈得上重试：被闸门拦下的请求（没写主题、快照不是树）
+      // 从没发出去过，给「重试」只会让用户点一次、什么都不会发生。
+      canRetry: lastAttempt.value !== null,
+      running: agentRunning.value || busy.value,
+    });
+  });
+
+  /**
+   * 把上一次请求原样再发一遍。
+   *
+   * **新开一个 run 身份**：重试是一次新的运行，不是"把上一次那个 run 接着跑"。
+   * 沿用旧 id 会被后端按幂等判成"同一个 run 已经 done"，直接把旧结果重放回来——
+   * 用户点「重试」却看到同一份失败，会以为按钮坏了。
+   */
+  async function retryLastRun(): Promise<void> {
+    const attempt = lastAttempt.value;
+    if (!attempt) return;
+    if (agentRunning.value || busy.value) return;
+    await runGeneration(
+      attempt.goal,
+      attempt.intent,
+      attempt.sources,
+      attempt.thinkingModel,
+      attempt.diagramType,
+      attempt.options,
+    );
   }
 
   /** 这一轮是不是"展开某个选中节点"。按钮文字与互斥判定都读它。 */
@@ -3652,6 +3792,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentWarnings,
     agentRunning,
     agentError,
+    // 失败卡片：分类字段 + 翻译好的"下一步"，以及「重试」（原样重发上一次请求）
+    agentErrorCode,
+    agentErrorLimit,
+    failureGuide,
+    lastAttempt,
+    retryLastRun,
     runIntent,
     // 这一次真正发出去的模型名 + 模型的思考过程（`done` 帧的两条）
     runModel,

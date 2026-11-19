@@ -819,6 +819,24 @@ export type AgentEvent =
        * 名字时，这是唯一看得见的地方。
        */
       model?: string | null;
+      /**
+       * 交出来的这棵树**没长完**：预算耗尽、工具超时、连续失败、空转收尾。
+       *
+       * 从前这些收尾一律发 `error`，前端清掉预览、画布也不动，用户跑了三分钟什么
+       * 都没拿到。现在改成"有树就交树"，但必须让用户知道它不是一次完整生成——
+       * 否则半棵树会被当成模型认为的完整答案。
+       *
+       * 缺字段＝没说（正常收尾、以及加这个字段之前的老帧），与 `false`（明确完整）
+       * 不是一回事，所以判的时候用 `=== true`。
+       */
+      partial?: boolean | null;
+      /**
+       * 为什么没长完，一句人话（与 `error.message` 同源，可直接显示）。
+       *
+       * 与 `partial` 成对出现：只给布尔值的话，界面只能说"不完整"却说不出原因，
+       * 而"额度用完"与"工具卡死"对用户意味着完全不同的下一步。
+       */
+      partial_reason?: string | null;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
 
