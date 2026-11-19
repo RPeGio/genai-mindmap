@@ -86,6 +86,11 @@ class RunRecord:
     #:
     #: 老行上两者都是 None（那时还没这两列），重放时整条字段不存在，与"没说"同义。
     model: str | None = None
+    #: 服务端在响应体 `model` 里回报的名字（**它实际跑的**），与上面那个请求名分开存。
+    #:
+    #: 落库理由与 `model` 一样是重放：同一个 run_id 再投一次，界面上的
+    #: 「请求 X → 服务 Y」不能只剩半句。老行上它是 NULL，重放时字段整条不存在。
+    served_model: str | None = None
     reasoning: str | None = None
 
 
@@ -160,6 +165,7 @@ def _record(row: sqlite3.Row) -> RunRecord:
         applied_at=row["applied_at"],
         mode=row["mode"],
         model=row["model"],
+        served_model=row["served_model"],
         reasoning=row["reasoning"],
     )
 
@@ -212,6 +218,7 @@ def finish(
     failure: dict[str, Any] | None = None,
     mode: str | None = None,
     model: str | None = None,
+    served_model: str | None = None,
     reasoning: str | None = None,
 ) -> bool:
     """写终态。返回这一行有没有真的被改动。
@@ -228,9 +235,9 @@ def finish(
     `failure` 反过来是直接赋值：它是"这一次的终态为什么是这样"，属于最新事实，
     上一次的失败原因留在上面只会让人读错。
 
-    `model` / `reasoning` 用 `COALESCE`，与 `mode` 同一档：它们是**观察值**，缺了
-    只说明这次没收尾到那一步（比如取消），不该把上一轮已经记下的值抹成 NULL——
-    那一行代表的始终是同一次运行的结果。
+    `model` / `served_model` / `reasoning` 用 `COALESCE`，与 `mode` 同一档：它们是
+    **观察值**，缺了只说明这次没收尾到那一步（比如取消），不该把上一轮已经记下的值
+    抹成 NULL——那一行代表的始终是同一次运行的结果。
     """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"finish 只接受终态，收到 {status!r}")
@@ -240,12 +247,13 @@ def finish(
             changed = conn.execute(
                 "UPDATE runs SET status = ?, candidate = COALESCE(?, candidate), "
                 "failure = ?, mode = COALESCE(?, mode), "
-                "model = COALESCE(?, model), reasoning = COALESCE(?, reasoning), "
+                "model = COALESCE(?, model), served_model = COALESCE(?, served_model), "
+                "reasoning = COALESCE(?, reasoning), "
                 "updated_at = " + _NOW +
                 " WHERE run_id = ? AND status <> ?",
                 (status, _dump_candidate(candidate),
                  None if failure is None else json.dumps(failure, ensure_ascii=False),
-                 mode, model, reasoning, run_id, STATUS_DONE),
+                 mode, model, served_model, reasoning, run_id, STATUS_DONE),
             )
             conn.execute("COMMIT")
         except BaseException:

@@ -375,9 +375,19 @@ describe('部分完成与诊断', () => {
     expect(text).toContain('部分完成');
     expect(text).toContain(messages[0]);
     expect(text).toContain(messages[2]);
-    // 前三条之后折成一句计数
+    // 前三条之后折起来，**但留着一条能走到全部的路**：只写"还有 1 条"等于把后几条锁住
     expect(text).not.toContain(messages[3]);
-    expect(text).toContain('还有 1 条');
+    const expand = wrapper.get('[data-test="diagnostics-expand"]');
+    expect(expand.text()).toContain('还有 1 条');
+    expect(expand.text()).toContain('4 条');
+
+    await expand.trigger('click');
+    // 展开之后四条全在，按钮变成"收起"
+    expect(wrapper.text()).toContain(messages[3]);
+    expect(wrapper.get('[data-test="diagnostics-expand"]').text()).toBe('收起');
+
+    await wrapper.get('[data-test="diagnostics-expand"]').trigger('click');
+    expect(wrapper.text()).not.toContain(messages[3]);
   });
 
   it('结果不完整时告警留在面板上，落地之后也不清', async () => {

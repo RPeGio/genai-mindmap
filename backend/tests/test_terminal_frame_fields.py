@@ -216,3 +216,66 @@ def test_replay_of_an_old_row_omits_the_two_fields():
     # `reasoning` 在契约里是 `str = ""`（不是 None）：空串会出现在帧里，
     # 但前端读到的就是"没有思考过程"，与加这个字段之前一样。
     assert done.get("reasoning", "") == ""
+    assert "served_model" not in done
+
+
+# ---------------------------------------------------------------- 服务端回报的模型名
+
+
+class _ServingProvider(_NamedProvider):
+    """响应里带 `model` 的 provider：`deepseek-chat` 请求、`deepseek-flash` 服务。
+
+    `served_model` 只摆在 `Completion` 上（真 provider 的 `_parse_completion` 会填），
+    实例属性那一份这里刻意**不写**——两条来源任意一条能到 done 帧就够，
+    而假 provider 只有前者。
+    """
+
+    def __init__(self, script: list[Any], served: str | None = "deepseek-flash") -> None:
+        super().__init__(script)
+        self._served = served
+
+    async def complete_tools(self, messages, tools, *, budget):
+        completion = await super().complete_tools(messages, tools, budget=budget)
+        completion.served_model = self._served
+        return completion
+
+
+def test_done_frame_carries_both_requested_and_served_model():
+    """请求名与服务名分开两条：合成一条就再也看不出服务端把请求路由到了别处。"""
+    provider = _ServingProvider([_completion_with_call("grow")])
+    request = AgentRunRequest(
+        goal="整理", budget=RunBudget(max_model_calls=1, max_tool_calls=50))
+    done = _last_done(_collect(request, provider, _grow_registry()))
+
+    assert done.model == "deepseek-reasoner"
+    assert done.served_model == "deepseek-flash"
+
+
+def test_served_model_is_omitted_when_the_service_does_not_say():
+    """没回报就是"没说"：帧里整条不存在，界面据此写"未知"，不拿请求名冒充。"""
+    provider = _ServingProvider([_completion_with_call("grow")], served=None)
+    request = AgentRunRequest(
+        goal="整理", budget=RunBudget(max_model_calls=1, max_tool_calls=50))
+    done = _last_done(_collect(request, provider, _grow_registry()))
+
+    assert done.model == "deepseek-reasoner"
+    assert done.served_model is None
+    # `exclude_none=True` 编码时不出现——与 `model` 同一条规矩。
+    assert "served_model" not in json.loads(done.model_dump_json(exclude_none=True,
+                                                                by_alias=True))
+
+
+def test_replay_returns_the_served_model_too():
+    """重放要还原整句「请求 X → 服务 Y」，只回一半等于同一个 run 两种说法。"""
+    runs.begin("run-served", {"intent": "create", "goal": "整理"})
+    runs.finish(
+        "run-served", runs.STATUS_DONE,
+        candidate=TREE, mode="model", model="deepseek-chat",
+        served_model="deepseek-flash", reasoning=REASONING,
+    )
+
+    record = runs.get("run-served")
+    assert record is not None
+    done = [frame for frame in _frames_of(record) if frame["type"] == "done"][-1]
+    assert done["model"] == "deepseek-chat"
+    assert done["served_model"] == "deepseek-flash"

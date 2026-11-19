@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 
 import { agentDetailVisible, runResultLine } from '../mindmap/run-status';
 import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
@@ -317,8 +317,20 @@ const diagnostics = computed(() => store.agentWarnings.filter(item => item.kind 
 
 /** 最多列三条诊断：再往下列就不是提个醒，而是让用户读长文了。 */
 const DIAGNOSTIC_LIMIT = 3;
-const shownDiagnostics = computed(() => diagnostics.value.slice(0, DIAGNOSTIC_LIMIT));
+
+/**
+ * 「展开全部」。
+ *
+ * 前三条足够让人判断"要不要现在处理"，但**不是**全部真相：4 条以上时原来只写
+ * 「还有 N 条」，没有展开入口——用户知道有东西却看不到（实测：状态行说"有诊断提示"，
+ * 界面上找不到那 N 条在哪）。折叠的默认值不变，缺的只是那条出路。
+ */
+const allDiagnosticsOpen = ref(false);
+const shownDiagnostics = computed(() => (
+  allDiagnosticsOpen.value ? diagnostics.value : diagnostics.value.slice(0, DIAGNOSTIC_LIMIT)
+));
 const hiddenDiagnostics = computed(() => diagnostics.value.length - shownDiagnostics.value.length);
+const canExpandDiagnostics = computed(() => diagnostics.value.length > DIAGNOSTIC_LIMIT);
 
 /**
  * 冲突裁决：`generated` = 用模型的结果，`mine` = 保留画布。
@@ -418,15 +430,23 @@ function cancel() {
       <p v-if="partialWarning" class="font-medium">
         部分完成<span class="font-normal">：{{ partialWarning.message }}</span>
       </p>
-      <p v-else class="font-medium">这次生成有诊断提示</p>
+      <p v-else class="font-medium">
+        这次生成有 {{ diagnostics.length }} 条诊断提示
+      </p>
       <ul v-if="shownDiagnostics.length" class="mt-1 flex flex-col gap-0.5 text-[11px]">
         <li v-for="item in shownDiagnostics" :key="`${item.code}|${item.message}`" class="break-words">
           {{ item.message }}
         </li>
       </ul>
-      <p v-if="hiddenDiagnostics > 0" class="mt-1 text-[11px]">
-        还有 {{ hiddenDiagnostics }} 条
-      </p>
+      <!-- 折叠之后必须留一条**能走到全部**的路：只写"还有 N 条"等于把后几条锁起来。 -->
+      <button
+        v-if="canExpandDiagnostics"
+        type="button"
+        data-test="diagnostics-expand"
+        class="mt-1 text-[11px] underline decoration-dotted underline-offset-2 hover:text-amber-900"
+        :aria-expanded="allDiagnosticsOpen"
+        @click="allDiagnosticsOpen = !allDiagnosticsOpen"
+      >{{ allDiagnosticsOpen ? '收起' : `展开全部 ${diagnostics.length} 条（还有 ${hiddenDiagnostics} 条）` }}</button>
     </div>
 
     <!-- 生成中的预览：节点边跑边上屏，用户先看清树在往哪个方向长。

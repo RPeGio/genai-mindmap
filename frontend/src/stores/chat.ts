@@ -35,6 +35,8 @@ export interface ChatMessage {
   kind?: 'said' | 'done' | 'partial' | 'error' | 'system';
   /** 这次真正发出去的模型名（缺省 = 对面没说）。 */
   model?: string | null;
+  /** 服务端回报的模型名（缺省 = 没回报）。与 `model` 分开，界面才看得出路由。 */
+  servedModel?: string | null;
   /** 模型的思考过程全文（走推理模型时有）。 */
   reasoning?: string;
   /** 落地规模与改动条数（`done` 才有）。 */
@@ -82,6 +84,7 @@ export const useChatStore = defineStore('chat', () => {
     text: string;
     kind?: ChatMessage['kind'];
     model?: string | null;
+    servedModel?: string | null;
     reasoning?: string;
     nodes?: number;
     changes?: number | null;

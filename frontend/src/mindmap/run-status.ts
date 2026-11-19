@@ -38,3 +38,48 @@ export function agentDetailVisible(state: AgentVisibilityState): boolean {
     || state.agentEvents.length > 0
     || !!state.agentError;
 }
+
+/**
+ * 模型名该怎么写。**请求名字与服务名字是两件事，两个都要显示。**
+ *
+ * 实测这个 API 接受 `deepseek-chat` 并把请求路由到 `deepseek-flash`（两个名字是同一
+ * 个模型的两个别名，区别只在思不思考）。只写请求名，界面上永远看不出"服务端把我
+ * 的请求转给了别处"——而这件事我们整整一周都不知道。
+ *
+ * 缺值写"未知"而不是拿请求名顶替：`served_model` 缺字段意味着对方没说，
+ * 把请求名填进去就是把"没说"变成"说了"。
+ */
+export const UNKNOWN_MODEL = '未知';
+
+export interface ModelTrace {
+  /** 这次请求里写出去的模型名（`done` 帧的 `model`）。 */
+  requested?: string | null;
+  /** 响应体里回报的模型名（`done` 帧的 `served_model`）。 */
+  served?: string | null;
+}
+
+export function modelTraceLine(trace: ModelTrace): string {
+  const requested = trace.requested?.trim() || UNKNOWN_MODEL;
+  const served = trace.served?.trim() || UNKNOWN_MODEL;
+  return `请求 ${requested} → 服务 ${served}`;
+}
+
+/** 这两条里有没有任何一条能说：都说不出就整块不显示，免得挂一条"未知 → 未知"。 */
+export function hasModelInfo(trace: ModelTrace): boolean {
+  return !!(trace.requested?.trim() || trace.served?.trim());
+}
+
+/**
+ * 诊断（不含 `partial` 那一类）有几条。
+ *
+ * 状态行与抽屉里的入口都要说这个数：原来只写「有诊断提示」，用户在界面上找了半天
+ * 找不到"诊断"在哪——一句**有数量**的提示才是可核对的。
+ */
+export function diagnosticCount(warnings: readonly { kind: string }[]): number {
+  return warnings.filter(item => item.kind === 'diagnostic').length;
+}
+
+/** 状态行/落地消息里的那半句：`有 2 条诊断`；没有诊断时是空串。 */
+export function diagnosticsHint(count: number): string {
+  return count > 0 ? `有 ${count} 条诊断` : '';
+}

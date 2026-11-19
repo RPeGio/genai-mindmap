@@ -249,6 +249,15 @@ class Completion(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     finish_reason: str | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
+    # 响应体里的 `model`：**服务端说它实际跑了哪个模型**。
+    #
+    # 与请求里写出去的名字（`provider.model_name`）是两件事：实测这个 API 接受
+    # `deepseek-chat` 并把请求路由到 `deepseek-flash`（两个名字是同一个模型的两个
+    # 别名，区别只在思不思考）。把响应里的这一位丢掉，界面上就只能显示"我要的那个
+    # 名字"，用户永远看不出请求被路由到了别处。
+    #
+    # 缺省 None 而不是空串：没这个字段＝对面没说，界面据此写"未知"，不编一个名字。
+    served_model: str | None = None
 
 
 class ToolProvider(Protocol):
@@ -881,6 +890,16 @@ class DoneEvent(_EventBase):
     # 测试里按脚本回放的假 provider）时是 None，帧里整条不存在——"没说"不该长得
     # 像"说了 chat"。
     model: str | None = None
+    # 服务端在响应体的 `model` 里回报的模型名——**它实际跑的是哪个**。
+    #
+    # 与上面那个 `model` 是两件事，两个都要显示：请求名是我们发出去的意图
+    # （`deepseek-chat`），服务名是对面的回答（实测是 `deepseek-flash`）。只报请求名，
+    # 用户永远看不出请求被路由到了别处；这一位丢了整整一周才被发现，就是因为它
+    # 从没出现在任何一帧上。
+    #
+    # 取不到（演示模式、按脚本回放的假 provider、老版本服务端）时是 None，帧里整条
+    # 不存在，界面写"未知"——不拿请求名冒充答案。
+    served_model: str | None = None
 
 
 class ErrorEvent(_EventBase):

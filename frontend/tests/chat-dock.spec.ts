@@ -583,8 +583,42 @@ describe('悬浮球与消息时间线', () => {
     expect(wrapper.find('[data-test="message-badge"]').exists()).toBe(true);
   });
 
-  it('失败也进时间线，写成一条错误（而不是静默消失）', async () => {
-    stubFetch();
+  it('模型名写成「请求 X → 服务 Y」：服务端把请求路由到别处要看得出', async () => {
+    // 这一帧就是线上的形状：请求 deepseek-chat，响应回 deepseek-flash。
+    stubFetch([{
+      type: 'done', seq: 2, content: TREE, mode: 'model',
+      model: 'deepseek-chat', served_model: 'deepseek-flash',
+    }]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    await store.runGeneration('再加一支', 'edit');
+    await flushPromises();
+
+    expect(store.runModel).toBe('deepseek-chat');
+    expect(store.runServedModel).toBe('deepseek-flash');
+
+    await wrapper.get('[data-test="message-fab"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    const chip = wrapper.get('[data-test="message-model"]');
+    expect(chip.text()).toBe('请求 deepseek-chat → 服务 deepseek-flash');
+  });
+
+  it('服务端没回报模型名时写"未知"，不拿请求名冒充', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model', model: 'deepseek-chat' }]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    await store.runGeneration('再加一支', 'edit');
+    await flushPromises();
+
+    await wrapper.get('[data-test="message-fab"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get('[data-test="message-model"]').text()).toBe('请求 deepseek-chat → 服务 未知');
+  });
+
+
+  it('失败也进时间线，写成一条错误（而不是静默消失）', async () => {    stubFetch();
     const wrapper = mountApp();
     const store = useMindMapStore();
     store.preview(TREE, 'right');

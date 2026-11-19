@@ -819,6 +819,14 @@ export type AgentEvent =
        * 名字时，这是唯一看得见的地方。
        */
       model?: string | null;
+      /**
+       * 服务端在响应体 `model` 里回报的名字——**它实际跑的是哪个**。
+       *
+       * 与上面那个 `model` 是两件事：那是我们发出去的意图，这是对面的回答。
+       * 实测请求写 `deepseek-chat`、响应回 `deepseek-flash`（同一模型的两个别名，
+       * 区别只在思不思考）。缺字段＝服务端没说，界面写"未知"。
+       */
+      served_model?: string | null;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
 

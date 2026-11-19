@@ -160,11 +160,13 @@ async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
         seq += 1
         yield encode_event(DoneEvent(
             seq=seq, content=record.candidate, mode=mode,
-            model=record.model, reasoning=record.reasoning or ""))
+            model=record.model, served_model=record.served_model,
+            reasoning=record.reasoning or ""))
     else:
         yield encode_event(DoneEvent(
             seq=1, content=None, mode=mode,
-            model=record.model, reasoning=record.reasoning or ""))
+            model=record.model, served_model=record.served_model,
+            reasoning=record.reasoning or ""))
     yield DONE_FRAME
 
 
@@ -196,6 +198,9 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     # 同一个 run_id 第二次投递（`_replay`）拿到的帧就少了 model/reasoning，
     # 而第一次是有的——同一个 run 两种结果，用户会以为重放丢了东西。
     model: str | None = None
+    # 服务端回报的模型名（与请求名分开记）。理由同上：重放要还原「请求 X → 服务 Y」
+    # 的整句，少一半等于同一个 run 两条路径给两种说法。
+    served_model: str | None = None
     reasoning: str | None = None
     # 候选的两个来源，按可信度排：`ctx` 是权威（含 edit/expand 那些只走 op 批次的
     # 改动），`observed` 是兜底（只在 `run()` 的收尾回调没能执行时才有用，比如
@@ -235,6 +240,7 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
                     resolved = runs.STATUS_DONE
                     mode = event.mode
                     model = event.model
+                    served_model = event.served_model
                     # 空串按"没说"落库：`runs.finish()` 用 COALESCE，写成空串会把
                     # 上一轮已经记下的思考过程盖成空。
                     reasoning = event.reasoning or None
@@ -270,7 +276,7 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         # 拦下它并留下日志，用户至少还能从 done 帧拿到候选。
         try:
             runs.finish(run_id, resolved, candidate=candidate, failure=failure, mode=mode,
-                        model=model, reasoning=reasoning)
+                        model=model, served_model=served_model, reasoning=reasoning)
         except Exception:  # noqa: BLE001 — 见上
             logger.exception("run %s 的终态没有落库", run_id)
     if finished:

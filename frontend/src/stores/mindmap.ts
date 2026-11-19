@@ -8,6 +8,7 @@ import { directionOf, withDirection } from '../mindmap/direction';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
+import { diagnosticCount, diagnosticsHint } from '../mindmap/run-status';
 import {
   canvasEdgesOf,
   canvasStageEdgesOf,
@@ -977,6 +978,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 两者都随每次运行清空：上一轮的思考过程挂在这一次的结果上是纯粹的误读。
    */
   const runModel = ref<string | null>(null);
+  /**
+   * 服务端在响应里回报的模型名（`done` 帧的 `served_model`）。
+   *
+   * 与 `runModel` **不是**一个东西：`runModel` 是这次请求写出去的名字（我们的意图），
+   * 这个是对方说它实际跑的那个。实测请求写 `deepseek-chat`、响应回 `deepseek-flash`
+   * （两个名字是同一模型的两个别名，区别只在思不思考）。只显示请求名时，
+   * "服务端把请求路由到了别处"这件事在界面上根本看不出来。
+   */
+  const runServedModel = ref<string | null>(null);
   const lastReasoning = ref('');
 
   /**
@@ -1386,12 +1396,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 结果不完整时必须和全部成功区分开：只写「已落到画布」，用户改到一半才发现某几支
    * 是空的，而那时画布已经是他的作品了。partial 与"只有诊断"分开说——「分支未完成」
    * 这种话放在一棵只是有重复节点待合并的树上并不成立。
+   *
+   * **诊断要带数量**：原来只写「有诊断提示」，而界面上没有任何地方写着"诊断"两个字，
+   * 用户不知道该去哪儿看（实测：生成完在界面上找了半天）。`有 2 条诊断` 是能对上的；
+   * 数量与状态行上的入口按钮同一个来源（`diagnosticCount`）。
    */
   function finishStatus(base: string): string {
+    const diagnostics = diagnosticCount(agentWarnings.value);
+    const tail = diagnostics > 0 ? `，${diagnosticsHint(diagnostics)}` : '';
     if (agentWarnings.value.some(item => item.kind === 'partial')) {
-      return `${base}（部分分支未完成），可以直接改，也可以撤销回生成前。`;
+      return `${base}（部分分支未完成${tail}），可以直接改，也可以撤销回生成前。`;
     }
-    if (agentWarnings.value.length) return `${base}（有诊断提示），可以直接改，也可以撤销回生成前。`;
+    if (diagnostics > 0) {
+      return `${base}（${diagnosticsHint(diagnostics)}），可以直接改，也可以撤销回生成前。`;
+    }
     return `${base}，记得保存。`;
   }
 
@@ -3071,6 +3089,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 上一轮的模型名与思考过程在**这一次开始的那一刻**就作废：它们描述的是另一个
     // 运行。留到这一次的 done 帧才清，中间那段时间面板会挂着一个已经不对的模型名。
     runModel.value = null;
+    runServedModel.value = null;
     lastReasoning.value = '';
 
     // 流只在 done / error 帧上才算有了明确结局；两者都没到就 EOF，说明连接被掐断了，
@@ -3201,6 +3220,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
             // `model` 缺字段 = 对面没说（演示模式 / 旧后端 / 测试里的假 provider），
             // 不替它认成 `deepseek-chat`——界面据此只说"模型没说"，不说谎。
             runModel.value = event.model ?? null;
+            // 服务端回报的那个名字。缺字段＝服务端没说（演示模式 / 旧后端 / 本地假件），
+            // 界面据此写"未知"，不拿请求名冒充答案——那正是这个字段要拆开的原因。
+            runServedModel.value = event.served_model ?? null;
             lastReasoning.value = event.reasoning ?? '';
             // 终态已到，预览再留着只会让人以为还有节点在路上。
             clearAgentPreview();
@@ -3655,6 +3677,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     runIntent,
     // 这一次真正发出去的模型名 + 模型的思考过程（`done` 帧的两条）
     runModel,
+    // 服务端回报的模型名（同一条帧的另一个字段）：与请求名分开，才能看出路由。
+    runServedModel,
     lastReasoning,
     expanding,
     generating,

@@ -97,6 +97,10 @@ def connect() -> sqlite3.Connection:
     # 两列都可空：老行上是 NULL，意思是"当时没记"（那时 done 帧也没有这两个字段），
     # 比编一个空串诚实——重放时据此决定"这条帧不带 model/reasoning"。
     _ensure_columns(conn, "runs", {"model": "TEXT", "reasoning": "TEXT"})
+    # `served_model` 是第三个观察列（服务端回报的模型名）。理由同上：缺列时
+    # `runs.finish()` 的 UPDATE 抛 `no such column` 并被自己的日志吞掉，
+    # 结果是**每次运行的终态都不落库**，而现象只是 `pending()` 少返回几条。
+    _ensure_columns(conn, "runs", {"served_model": "TEXT"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
     # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
     # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该

@@ -10,7 +10,7 @@ import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } fr
 import { usePrefsStore, DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY } from '../stores/prefs';
 import { useSourcesStore } from '../stores/sources';
 import type { DiagramTypeChoice } from '../api/types';
-import { agentDetailVisible } from '../mindmap/run-status';
+import { agentDetailVisible, diagnosticCount, diagnosticsHint } from '../mindmap/run-status';
 
 /**
  * 底部对话框：**唯一**说一句话的地方。
@@ -437,6 +437,14 @@ const agentPartial = computed(
 );
 
 /**
+ * 这次有几条诊断。
+ *
+ * 判据与抽屉里那份明细共用（`run-status.ts`）：状态行说"有 2 条诊断"、按钮上写着
+ * "2 条诊断"，点开必须正好是那两条。两处各数一次的话，某一天它们会开始不一样。
+ */
+const diagnostics = computed(() => diagnosticCount(store.agentWarnings));
+
+/**
  * 输入法组合中 / 焦点在主题框里。
  *
  * **为什么需要这两个**：`v-model` 在组合期间**不更新**——中文用户打「机器学习」四个字
@@ -559,7 +567,10 @@ const statusText = computed(() => {
       if (!summary) return '';
       const nodes = summary.nodes ? `${summary.nodes} 个节点` : '';
       const changes = summary.changes == null ? '' : `，改了 ${summary.changes} 处`;
-      return `已落到画布${nodes ? `（${nodes}${changes}）` : changes} · 还没保存`;
+      // 诊断数量要留在**这句**里：它是"生成完只剩画布"之后用户唯一还看得见的结论。
+      const hint = diagnosticsHint(diagnostics.value);
+      const tail = hint ? ` · ${hint}` : '';
+      return `已落到画布${nodes ? `（${nodes}${changes}）` : changes}${tail} · 还没保存`;
     }
     default:
       return '';
@@ -672,6 +683,10 @@ const shouldKeep = computed(() => {
   const kind = statusKind.value;
   if (kind && kind !== 'ok' && kind !== 'running') return true;
   if (kind === 'running') return true;
+  // 有诊断＝**该看的东西还没看**。它是第 4 条刹车（失败 / 部分完成 / 冲突）的延伸：
+  // 结果是成功了，但有几条"某支没展开 / 有重复节点"等着人处理，两秒后连入口一起
+  // 淡掉就是把它变成一句谁也找不到的提示（实测：用户找不到"诊断"在哪）。
+  if (diagnostics.value > 0) return true;
   return false;
 });
 
@@ -687,7 +702,9 @@ const canFade = computed(() => statusKind.value === 'ok'
   && !typed.value
   && !composing.value
   && !focused.value
-  && !sources.draftText.trim());
+  && !sources.draftText.trim()
+  // 有诊断就不安排淡出（同 `shouldKeep` 最后那条）：这一轮的结论里还有一笔没算完。
+  && diagnostics.value === 0);
 
 watch(
   () => [canFade.value, store.nodeCount] as const,
@@ -1136,9 +1153,11 @@ defineExpose({
               type="button"
               data-test="run-status-detail"
               class="shrink-0 rounded-md px-2 py-0.5 text-xs underline decoration-dotted underline-offset-2 hover:bg-white/60"
-              title="打开右侧抽屉：改动清单、诊断逐条、生成中的预览"
+              :title="diagnostics > 0
+                ? `打开右侧抽屉：${diagnostics} 条诊断逐条列出`
+                : '打开右侧抽屉：改动清单、诊断逐条、生成中的预览'"
               @click="emit('detail')"
-            >明细</button>
+            >{{ diagnostics > 0 ? `${diagnostics} 条诊断` : '明细' }}</button>
           </div>
 
           <!--

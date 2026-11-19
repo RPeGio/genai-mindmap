@@ -99,6 +99,10 @@ class OpenAICompatibleProvider:
         # 界面上"这次到底用了哪个模型"就有据可查——否则勾了「深度思考」而配置里
         # 没给对名字时，用户只能看到一张图，看不出它走的哪条路。
         self.model_name: str | None = None
+        # 服务端回报的模型名（响应体的 `model`）。与 `model_name` 分开两个字段：
+        # 一个是"我要的"，一个是"它给的"，实测这两个不一样（请求 `deepseek-chat`、
+        # 服务 `deepseek-flash`）。把它们合成一个，界面上就再也看不出路由发生。
+        self.served_model: str | None = None
 
     async def complete_tools(
         self,
@@ -146,7 +150,10 @@ class OpenAICompatibleProvider:
         except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
             raise GenerationError("无法连接模型服务或请求超时") from exc
 
-        return _parse_completion(buffer)
+        completion = _parse_completion(buffer)
+        # 响应里的 `model` 记在实例上，与 `model_name` 并存：`_loop` 收尾时两个都要。
+        self.served_model = completion.served_model
+        return completion
 
 
 def _parse_completion(buffer: bytearray) -> Completion:
@@ -199,6 +206,11 @@ def _parse_completion(buffer: bytearray) -> Completion:
         tool_calls=calls,
         finish_reason=finish_reason,
         usage=payload.get("usage") or {},
+        # 响应体里的顶层 `model`。不填默认值：字段缺失就是"对面没说"，界面上写
+        # "未知"。这里读的是 `payload` 而不是 `message`——`model` 在顶层，与 `choices`
+        # 平级；写成 `message.get("model")` 会永远拿到 None，而那个 bug 看起来像
+        # "这个服务端不返回模型名"。
+        served_model=payload.get("model") if isinstance(payload.get("model"), str) else None,
     )
 
 

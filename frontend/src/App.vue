@@ -898,6 +898,7 @@ watch(
         text: `这次没成：${store.agentError}`,
         kind: 'error',
         model: store.runModel,
+        servedModel: store.runServedModel,
         reasoning: store.lastReasoning || undefined,
       });
       return;
@@ -911,6 +912,7 @@ watch(
       text: bits.join(' · '),
       kind: partial ? 'partial' : 'done',
       model: store.runModel,
+      servedModel: store.runServedModel,
       reasoning: store.lastReasoning || undefined,
       nodes: summary.nodes,
       changes: summary.changes,

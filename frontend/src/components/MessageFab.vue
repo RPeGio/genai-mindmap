@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
 import { useChatStore, type ChatMessage } from '../stores/chat';
+import { hasModelInfo, modelTraceLine } from '../mindmap/run-status';
 
 /**
  * 右下角那颗悬浮球 + 展开后的消息时间线。
@@ -35,6 +36,15 @@ function toneOf(message: ChatMessage): string {
   if (message.kind === 'partial') return 'bg-amber-50 text-amber-900 ring-1 ring-amber-200';
   if (message.role === 'system') return 'bg-slate-50 text-slate-500';
   return 'bg-white text-slate-700 ring-1 ring-slate-200';
+}
+
+/** 这条消息的模型名怎么说（请求名 → 服务名，缺的写"未知"）。 */
+function traceOf(message: ChatMessage): string {
+  return modelTraceLine({ requested: message.model, served: message.servedModel });
+}
+
+function hasTrace(message: ChatMessage): boolean {
+  return hasModelInfo({ requested: message.model, served: message.servedModel });
 }
 
 /** 面板打开时滚到底：用户点开就是想看最新那条。 */
@@ -106,9 +116,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', closeOnEscape));
           <div class="flex items-center gap-1.5 text-[10px] text-slate-400">
             <span>{{ message.role === 'user' ? '你' : message.role === 'ai' ? '模型' : '界面' }}</span>
             <span>{{ timeOf(message.at) }}</span>
-            <span v-if="message.model" class="rounded bg-slate-100 px-1 text-slate-500" data-test="message-model">
-              {{ message.model }}
-            </span>
+            <!--
+              两条名字都写出来：请求的那个是我们发出去的意图，服务的那个是对面的回答。
+              实测同一个地址会把 `deepseek-chat` 路由到 `deepseek-flash`——只写请求名，
+              这件事在界面上永远看不出来。
+            -->
+            <span
+              v-if="hasTrace(message)"
+              class="rounded bg-slate-100 px-1 text-slate-500"
+              data-test="message-model"
+            >{{ traceOf(message) }}</span>
             <span v-else-if="message.role === 'ai'" class="text-slate-400">（模型名未上报）</span>
           </div>
           <p
