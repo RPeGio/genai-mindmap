@@ -500,6 +500,80 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Memories
+         * @description 最近的若干条，新的在前。
+         *
+         *     它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过
+         *     （会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。
+         */
+        get: operations["list_memories_api_memory_get"];
+        put?: never;
+        /**
+         * Add Memory
+         * @description 手工加一条。`source` 恒为 `user_explicit`，与自动总结的分开。
+         *
+         *     向量服务未配置时条目照样写进去（`has_vector=false`），不报错：那是预期状态
+         *     （本机开发、CI），而"这条以后检索不到"比"这句话丢了"轻得多。
+         */
+        post: operations["add_memory_api_memory_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/{item_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Memory
+         * @description 硬删。404 而不是幂等 204：界面上"这条已经不在了"与"我删了但没删掉"必须分开。
+         */
+        delete: operations["delete_memory_api_memory__item_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Memory
+         * @description 按主题检索一次，返回每条的 cosine / decay / score。
+         *
+         *     **只读**：不刷 `last_used_at`（那是"真的被注入过"的证据，一次人工查询不该冒充它）。
+         *
+         *     与生成时走的是同一个 `store.recall`，所以这里看到的分数就是模型会拿到的排序。
+         */
+        get: operations["search_memory_api_memory_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/knowledge/search": {
         parameters: {
             query?: never;
@@ -590,6 +664,22 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AddMemoryRequest */
+        AddMemoryRequest: {
+            /** Text */
+            text: string;
+            /**
+             * Kind
+             * @default preference
+             */
+            kind: string;
+        };
+        /** AddedMemory */
+        AddedMemory: {
+            item: components["schemas"]["MemoryItem"];
+            /** Created */
+            created: boolean;
+        };
         /** AgentPlan */
         AgentPlan: {
             /** Goal */
@@ -1368,6 +1458,56 @@ export interface components {
             /** Updated At */
             updated_at: string;
         };
+        /**
+         * MemoryHit
+         * @description 一次命中的**全部**中间量。
+         *
+         *     `score = cosine * decay`。三个数都给出，是为了让"为什么排在这里"可以当场读出来。
+         */
+        MemoryHit: {
+            /** Text */
+            text: string;
+            /** Kind */
+            kind: string;
+            /** Cosine */
+            cosine: number;
+            /** Decay */
+            decay: number;
+            /** Score */
+            score: number;
+            /** Age Days */
+            age_days?: number | null;
+            /** Created At */
+            created_at: string;
+            /** Formed At */
+            formed_at?: string | null;
+        };
+        /**
+         * MemoryItem
+         * @description 列表里的一条。**不带向量**：1024 个 float 对读者没有意义，它是机器用的。
+         */
+        MemoryItem: {
+            /** Id */
+            id: string;
+            /** Text */
+            text: string;
+            /** Kind */
+            kind: string;
+            /** Source */
+            source: string;
+            /** Created At */
+            created_at: string;
+            /** Formed At */
+            formed_at?: string | null;
+            /** Last Used At */
+            last_used_at?: string | null;
+            /** Session Id */
+            session_id?: string | null;
+            /** Has Vector */
+            has_vector: boolean;
+            /** Model */
+            model?: string | null;
+        };
         /** MindMapContent */
         "MindMapContent-Input": {
             /**
@@ -1765,6 +1905,19 @@ export interface components {
              * @default false
              */
             implemented: boolean;
+        };
+        /** SearchResult */
+        SearchResult: {
+            /** Query */
+            query: string;
+            /** Hits */
+            hits: components["schemas"]["MemoryHit"][];
+            /** Scanned */
+            scanned: number;
+            /** Top K */
+            top_k: number;
+            /** Min Cosine */
+            min_cosine: number;
         };
         /**
          * SetPrefRequest
@@ -2771,6 +2924,132 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_memories_api_memory_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryItem"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    add_memory_api_memory_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddMemoryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedMemory"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_memory_api_memory__item_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_memory_api_memory_search_get: {
+        parameters: {
+            query: {
+                /** @description 按这次的主题检索，与生成时的 query 同一口径 */
+                q: string;
+                top_k?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchResult"];
+                };
             };
             /** @description Validation Error */
             422: {
