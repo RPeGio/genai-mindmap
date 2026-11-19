@@ -119,6 +119,7 @@ from app.knowledge.service import (
 )
 from app.optimization import nli
 from app.optimization.service import check
+from app.prefs import profile as profile_rank
 from app.prefs import service as prefs
 from app.optimization.source_refs import (
     MAX_NLI_CHECKS,
@@ -4127,6 +4128,45 @@ async def _external_sources(topic: str, ctx: RunContext) -> _ExternalFetch:
 # ---------------------------------------------------------------- 工具实现
 
 
+async def _profile_rank(
+    hits: list[EvidenceHit],
+) -> tuple[list[EvidenceHit], list[str]]:
+    """按用户画像重排检索命中。**只改顺序，不改集合**。
+
+    返回（重排后的列表，被抬上来的那几条的定位键 `source_id:start`）。
+    第二个返回值是**过滤气泡检验**的唯一入口：把"哪些命中是因为画像才进了前几名"
+    记下来，才可能在事后问出"这些命中后来被删掉了几条"。定位键只到偏移、不带原文
+    ——引文是材料正文，不进日志（与 `knowledge.embedding` 的注释同一条纪律）。
+
+    `app/prefs/profile.py` 的三条硬约束在这里落成三行：
+
+      1. 返回的是同一个列表的另一个顺序——没有一条被加进来或去掉。画像决定
+         "这几条谁先"，不决定"要不要这条"；拿去过滤就是过滤气泡。
+      2. 开关（`MINDMAP_PROFILE_RERANK`）默认关。打开之后每条命中要一次
+         embedding（有 `vector_cache` 则免），20 支分支串起来就是 20 批，
+         这个代价不该由"没要求个性化"的部署承担。
+      3. 任何失败都返回原顺序：画像是排序上的一个二阶修正，它算不出来时
+         正确的降级是"这次不做个性化"，不是"这次检索失败"。
+
+    放进 `to_thread` 是因为 `boost` 里有一次同步的 embedding HTTP（0.3–1 秒）：
+    直接在事件循环里调用会把同一台服务器上别人的流一起卡住——与 `_search_branch`
+    把 `search_parent` 扔进线程池同一个理由。
+    """
+    if not hits or not profile_rank.enabled():
+        return hits, []
+    try:
+        result = await asyncio.to_thread(profile_rank.boost, hits)
+    except Exception as exc:  # noqa: BLE001 — 见 docstring 第 3 条
+        logger.warning("画像加权跳过（%s），这次按原顺序交付", type(exc).__name__)
+        return hits, []
+    return result.hits, [_hit_key(hit) for hit in result.lifted]
+
+
+def _hit_key(hit: Any) -> str:
+    """一条命中的定位键：`source_id:start`。只到偏移，不带原文。"""
+    return f"{getattr(hit, 'source_id', '')}:{getattr(hit, 'start', '')}"
+
+
 async def _search_branch(
     sources: list[Source], title: str, intents: Sequence[str] = (),
 ) -> list[EvidenceHit] | None:
@@ -4176,13 +4216,19 @@ async def _search_branch(
     queries = _branch_queries(title, intents)
     try:
         if len(queries) <= 1:
-            return await asyncio.to_thread(
+            found = await asyncio.to_thread(
                 search_parent, sources, query, DEEP_BRANCH_TOP_K)
-        return await search_multi(sources, queries, DEEP_BRANCH_TOP_K)
+        else:
+            found = await search_multi(sources, queries, DEEP_BRANCH_TOP_K)
     except Exception as exc:  # noqa: BLE001 — 检索失败只降级，不该废掉整张图
         logger.warning("分支检索失败（%s / %d 路）：%s: %s",
                        title, len(queries), type(exc).__name__, str(exc)[:160])
         return None
+    # 画像只改这一支内部"这三条谁先"（`DEEP_BRANCH_TOP_K = 3`），不改这一支有没有
+    # 命中。抬上来的那几条不需要在这里记账：过滤气泡检验看的是 `_rag` 那一路
+    # （模型主动检索），骨架的每支检索没有可供事后对齐的节点级痕迹。
+    ranked, _ = await _profile_rank(found)
+    return ranked
 
 
 async def _expand_branches(
@@ -8644,6 +8690,10 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
             data={"hits": [], "method": "lexical"},
         )
 
+    # 画像加权：**只重排这批命中**，不增不减（见 `_profile_rank`）。放在空结果
+    # 判定之后、证据累积之前——空结果那几种早退不该为一次排序付 embedding。
+    hits, lifted = await _profile_rank(hits)
+
     # 库里来的命中带持久 id：取回 `Source` 并记进 ctx，收尾的引用校验才查得到
     # 原文（`_verify_sources`）。失败只跳过这一份，不影响本次检索结果。
     library_used = _remember_library_hits(hits, ctx)
@@ -8683,6 +8733,14 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         # 必须与 `07a2740` 逐字节相同（`tests/test_library_wiring.py` 拿旧模块
         # 钉着），多一个恒为 0 的键就已经不是"逐字节"了。
         data["library_sources"] = library_used
+    if lifted:
+        # 哪几条命中是**因为画像**才进了前几名。只在真的抬上来过时才加这个键，
+        # 理由同上：画像默认关着，关着时的键集一个字都不该变。
+        #
+        # 记号是 `source_id:start`，不是引文——原文不进日志与事件流。这个键的用途
+        # 只有一个：事后回答"这些被画像抬上来的命中，后来有几个节点是用户删掉的"
+        # （过滤气泡检验，见 `scripts/measure_profile_ab.py`）。
+        data["profile_lifted"] = lifted
     return ToolResult(
         ok=True,
         content=json.dumps(_citable_hits(hits, citable_sources), ensure_ascii=False),
