@@ -40,10 +40,13 @@ function stubFetch() {
 
 const wrappers: VueWrapper[] = [];
 
-function mountApp(): VueWrapper {
+function mountApp(attach = false): VueWrapper {
   const pinia = createPinia();
   setActivePinia(pinia);
-  const wrapper = mount(App, { global: { plugins: [pinia] } });
+  const wrapper = mount(App, {
+    global: { plugins: [pinia] },
+    ...(attach ? { attachTo: document.body } : {}),
+  });
   wrappers.push(wrapper);
   return wrapper;
 }
@@ -55,28 +58,62 @@ function mountApp(): VueWrapper {
  * jsdom 里没有 Vue Flow，所以这里手工放一个同形状的元素——测的是"定位与浮出"，
  * 不是 Vue Flow 自己的渲染。
  */
-function placeNode(id: string): void {
+function placeNode(id: string, rect = { left: 100, top: 200, width: 120, height: 40 }): HTMLElement {
   const node = document.createElement('div');
   node.className = 'vue-flow__node';
   node.setAttribute('data-id', id);
   node.getBoundingClientRect = () => ({
-    x: 100, y: 200, top: 200, left: 100, right: 220, bottom: 240, width: 120, height: 40,
+    x: rect.left, y: rect.top, top: rect.top, left: rect.left,
+    right: rect.left + rect.width, bottom: rect.top + rect.height,
+    width: rect.width, height: rect.height,
     toJSON: () => ({}),
   }) as DOMRect;
   document.body.appendChild(node);
+  return node;
+}
+
+/**
+ * 画布视口元素：真 Vue Flow 的 DOM 是
+ * `.vue-flow__viewport > .vue-flow__pane > .vue-flow__transformationpane`，
+ * 平移/缩放写的是**最里面**那个的 `transform`。工具条监听的就是它。
+ */
+function placeViewport(): HTMLElement {
+  const viewport = document.createElement('div');
+  viewport.className = 'vue-flow__viewport';
+  const pane = document.createElement('div');
+  pane.className = 'vue-flow__pane';
+  const pane2 = document.createElement('div');
+  pane2.className = 'vue-flow__transformationpane';
+  pane.appendChild(pane2);
+  viewport.appendChild(pane);
+  document.body.appendChild(viewport);
+  return pane2;
+}
+
+const originalWidth = window.innerWidth;
+const originalHeight = window.innerHeight;
+
+function setViewportSize(width: number, height: number): void {
+  Object.defineProperty(window, 'innerWidth', { value: width, configurable: true, writable: true });
+  Object.defineProperty(window, 'innerHeight', { value: height, configurable: true, writable: true });
 }
 
 afterEach(() => {
   wrappers.splice(0).forEach(wrapper => wrapper.unmount());
-  document.querySelectorAll('.vue-flow__node').forEach(node => node.remove());
+  document.querySelectorAll('.vue-flow__node, .vue-flow__viewport, .vue-flow__pane, .vue-flow__transformationpane')
+    .forEach(node => node.remove());
+  setViewportSize(originalWidth, originalHeight);
   vi.unstubAllGlobals();
 });
 
 beforeEach(() => {
-  // 工具条用 requestAnimationFrame 定位
+  // 工具条用 requestAnimationFrame 定位。这里同步执行，并且**返回 0**：
+  // 生产代码是 `frame = requestAnimationFrame(...)`，回调里再 `frame = 0`；同步桩要是
+  // 返回 1，那次赋值会把"没有排队中的帧"这个状态又改成 1，之后所有重测都被 `if (frame)`
+  // 挡掉（真浏览器里异步执行不会撞上这个顺序）。
   vi.stubGlobal('requestAnimationFrame', (fn: FrameRequestCallback) => {
     fn(0);
-    return 1;
+    return 0;
   });
   vi.stubGlobal('cancelAnimationFrame', () => {});
 });
@@ -177,8 +214,7 @@ describe('节点工具条', () => {
     expect(wrapper.get('[data-test="node-action-delete"]').attributes('disabled')).toBeDefined();
   });
 
-  it('点「展开」把当前材料一起发出去（旧图 + 新材料那条路）', async () => {
-    /** 只关心开流那一条的请求体：其它请求（prefs / health）照旧回空。 */
+  it('点「展开」把当前材料一起发出去（旧图 + 新材料那条路）', async () => {    /** 只关心开流那一条的请求体：其它请求（prefs / health）照旧回空。 */
     const streams: Array<Record<string, unknown>> = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -224,5 +260,89 @@ describe('节点工具条', () => {
     expect(streams[0].intent).toBe('expand');
     const sent = streams[0].sources as Array<{ id: string }>;
     expect(sent.map(source => source.id)).toEqual(['doc-new']);
+  });
+});
+
+describe('工具条跟着视口走', () => {
+  it('平移画布之后工具条跟着节点（Vue Flow 只改视口那个 transform，不发 scroll/resize）', async () => {
+    stubFetch();
+    const viewport = placeViewport();
+    const node = placeNode('a');
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.select('a');
+    await flushPromises();
+
+    // 节点宽 120、左 100 → 中点 160。
+    expect(wrapper.get('[data-test="node-toolbar"]').attributes('style')).toContain('left: 160px');
+
+    // 用户按住画布往右拖了 300px：节点在屏幕上是另一个位置了。
+    node.getBoundingClientRect = () => ({
+      x: 400, y: 260, top: 260, left: 400, right: 520, bottom: 300,
+      width: 120, height: 40, toJSON: () => ({}),
+    }) as DOMRect;
+    viewport.style.transform = 'translate(300px, 60px) scale(1)';
+    await flushPromises();
+
+    const style = wrapper.get('[data-test="node-toolbar"]').attributes('style');
+    expect(style).toContain('left: 460px');
+    expect(style).toContain('top: 260px');
+  });
+
+  it('缩放之后也重量（0.5 倍时节点变小、位置也变）', async () => {
+    stubFetch();
+    const viewport = placeViewport();
+    const node = placeNode('a');
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.select('a');
+    await flushPromises();
+
+    node.getBoundingClientRect = () => ({
+      x: 250, y: 350, top: 350, left: 250, right: 310, bottom: 370,
+      width: 60, height: 20, toJSON: () => ({}),
+    }) as DOMRect;
+    viewport.style.transform = 'translate(0px, 0px) scale(0.5)';
+    await flushPromises();
+
+    // 中点是 250 + 60/2 = 280（不是缩放前的 160）。
+    expect(wrapper.get('[data-test="node-toolbar"]').attributes('style')).toContain('left: 280px');
+  });
+
+  it('贴右边、贴上边的节点：工具条被按回画布里，不飘出视口也不压住顶栏', async () => {
+    stubFetch();
+    setViewportSize(800, 600);
+    const viewport = placeViewport();
+    // 节点右边缘 820 已经越过 800 的视口宽；top 是 0（顶在屏幕最上面）。
+    placeNode('a', { left: 700, top: 0, width: 120, height: 40 });
+    // 挂在 body 上才找得到 `main > section`（工具条用它当"能待的区域"）。
+    const wrapper = mountApp(true);
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.select('a');
+    await flushPromises();
+
+    // 画布那块：左边 100、上边 60（顶栏下面）、右下 700×560。
+    const section = document.querySelector('main > section') as HTMLElement;
+    section.getBoundingClientRect = () => ({
+      x: 100, y: 60, left: 100, top: 60, right: 700, bottom: 560,
+      width: 600, height: 500, toJSON: () => ({}),
+    }) as DOMRect;
+
+    // 工具条自己 150×36（jsdom 量不出布局，手工给它一个尺寸）。
+    const bar = wrapper.get('[data-test="node-toolbar"]').element as HTMLElement;
+    bar.getBoundingClientRect = () => ({
+      x: 0, y: 0, top: 0, left: 0, right: 150, bottom: 36,
+      width: 150, height: 36, toJSON: () => ({}),
+    }) as DOMRect;
+    viewport.style.transform = 'translate(1px, 1px) scale(1)';
+    await flushPromises();
+
+    const style = wrapper.get('[data-test="node-toolbar"]').attributes('style');
+    // 横向：700 - 8（边距）- 75（半宽）= 617；纵向：60 + 8 + 36 = 104（不是 8）。
+    expect(style).toContain('left: 617px');
+    expect(style).toContain('top: 104px');
   });
 });

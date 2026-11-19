@@ -29,6 +29,11 @@ const emit = defineEmits<{ edit: [label: string]; expand: [] }>();
 
 const anchor = ref<{ x: number; y: number } | null>(null);
 const paletteOpen = ref(false);
+/** 工具条自己，用来量它有多大——贴边时要靠这个尺寸把它按回视口里。 */
+const barRef = ref<HTMLElement | null>(null);
+
+/** 工具条离视口边缘至少留这么多像素：贴边节点的工具条也不该压在屏幕边上。 */
+const VIEWPORT_MARGIN = 8;
 
 const selected = computed(() => store.selectedNode);
 const visible = computed(() => !!selected.value && !!anchor.value);
@@ -37,6 +42,24 @@ const visible = computed(() => !!selected.value && !!anchor.value);
 const deleteDisabled = computed(
   () => (selected.value ? store.isContainerRootId(selected.value.node.id) : true),
 );
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.min(Math.max(value, low), Math.max(low, high));
+}
+
+/**
+ * 工具条允许待的区域：**画布那块**（`main > section`），不是整个视口。
+ *
+ * 用视口的话，一个被平移到屏幕外的节点会把工具条按在 (8, 8)——正好压在顶栏上，
+ * "没飘出去"变成了"盖住了返回键"。量不到画布（jsdom、还没布局）时退回整个视口。
+ */
+function bounds(): { left: number; top: number; right: number; bottom: number } {
+  const rect = document.querySelector('main > section')?.getBoundingClientRect();
+  if (rect && rect.width > 0 && rect.height > 0) {
+    return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+  }
+  return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+}
 
 function measure(): void {
   const id = selected.value?.node.id;
@@ -51,7 +74,21 @@ function measure(): void {
     return;
   }
   const rect = el.getBoundingClientRect();
-  anchor.value = { x: rect.left + rect.width / 2, y: rect.top };
+  // 工具条是 `-translate-x-1/2 -translate-y-full`：锚点就是它自己的**下边中点**。
+  // 所以横向按半个宽度让位，纵向整块高度都得在锚点上方。
+  const bar = barRef.value?.getBoundingClientRect();
+  const halfWidth = (bar?.width ?? 0) / 2;
+  const height = bar?.height ?? 0;
+  const area = bounds();
+  anchor.value = {
+    x: clamp(
+      rect.left + rect.width / 2,
+      area.left + VIEWPORT_MARGIN + halfWidth,
+      area.right - VIEWPORT_MARGIN - halfWidth,
+    ),
+    // 节点顶到画布上沿时往下让：宁可压在节点上，也不飘出屏幕（或压住顶栏）。
+    y: clamp(rect.top, area.top + VIEWPORT_MARGIN + height, area.bottom - VIEWPORT_MARGIN),
+  };
 }
 
 let frame = 0;
@@ -63,23 +100,67 @@ function schedule(): void {
   });
 }
 
+/**
+ * 盯住 Vue Flow 那个**真正承载平移/缩放**的元素。
+ *
+ * 平移与缩放不是 window 事件：Vue Flow 把整张图挂在一个元素上，用一句
+ * `transform: translate(...) scale(...)` 挪它——既不发 scroll 也不发 resize。
+ * 只听 window 的 resize/scroll 时，用户按住画布一拖，工具条就停在拖之前的坐标，
+ * 而节点早就跟着走了；缩放到 0.5 倍之后同样对不上。
+ *
+ * 注意落点：`@vue-flow/core` 1.x 的 DOM 是
+ * `.vue-flow__viewport > .vue-flow__pane > .vue-flow__transformationpane`，那句
+ * transform 写在**最里面**那个 `transformationpane` 上（`viewport` 只是外框，
+ * 它身上只有 `-webkit-tap-highlight-color`）。盯错了元素，监听装得上、一次都不响。
+ * 两个都盯：将来搬回外层也不会悄悄失效。
+ */
+const VIEWPORT_SELECTORS = ['.vue-flow__transformationpane', '.vue-flow__viewport'];
+
+let viewportObserver: MutationObserver | null = null;
+
+function watchViewport(): void {
+  if (viewportObserver) return;
+  const targets = document.querySelectorAll(VIEWPORT_SELECTORS.join(', '));
+  if (!targets.length) return;  // 画布还没渲染完：下一次 watch 触发时会再试
+  viewportObserver = new MutationObserver(schedule);
+  targets.forEach(target =>
+    viewportObserver?.observe(target, { attributes: true, attributeFilter: ['style'] }));
+}
+
 watch(
   () => [selected.value?.node.id, store.nodeCount, store.direction, store.focusTick] as const,
   async () => {
     paletteOpen.value = false;
     await nextTick();
+    watchViewport();
     schedule();
   },
   { immediate: true },
 );
 
+/**
+ * 工具条第一次真的画出来之后再量一次。
+ *
+ * 第一次 `measure` 时它还不存在（`v-if` 跟着 `anchor` 走），量不到自己的宽高，
+ * 贴边的节点就会踩着边缘飘出去半个工具条。`visible` 变真之后补这一枪——只补一次，
+ * 而且不是在 `anchor` 上循环（那会在 rAF 里自激）。
+ */
+watch(visible, async on => {
+  if (!on) return;
+  await nextTick();
+  schedule();
+});
+
 onMounted(() => {
   window.addEventListener('resize', schedule);
   window.addEventListener('scroll', schedule, true);
+  watchViewport();
 });
 
 onBeforeUnmount(() => {
   if (frame) cancelAnimationFrame(frame);
+  viewportObserver?.disconnect();
+  viewportObserver = null;
   window.removeEventListener('resize', schedule);
   window.removeEventListener('scroll', schedule, true);
 });
@@ -112,6 +193,7 @@ function setColor(value: string): void {
 <template>
   <div
     v-if="visible && anchor"
+    ref="barRef"
     data-test="node-toolbar"
     class="fixed z-40 flex -translate-x-1/2 -translate-y-full flex-col items-center gap-1 pb-2"
     :style="{ left: `${anchor.x}px`, top: `${anchor.y}px` }"
