@@ -28,11 +28,25 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
 
     不做数据回填：新列在老行上是 NULL，而 NULL 在这里有确切含义（"当时没记"），
     比一个编出来的 0 诚实。
+
+    **`PRAGMA` 与 `ALTER` 之间有一个竞态**，而 SQLite 没有 `ADD COLUMN IF NOT EXISTS`：
+    两个连接同时进来时，两边都查到"列不存在"，然后一个成功、另一个抛
+    `duplicate column name`。本地单线程跑不出来，但 `test_agent_runs` 那条
+    "八个并发 `begin()`" 在 Linux 上必红（CI 就是这么红的）。
+
+    所以这里 catch 住"列已经存在"这一种失败并当作成功 —— 它要达成的事已经达成了。
+    **只吞这一个错误码**：`ALTER` 还可能因为表名拼错、声明非法而失败，那些要继续抛，
+    否则迁移出问题时会被静默跳过，而缺列的后果是"事件全部静默丢失"（见上）。
     """
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     for name, declaration in columns.items():
-        if name not in existing:
+        if name in existing:
+            continue
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def _drop_columns(conn: sqlite3.Connection, table: str, columns: Sequence[str]) -> None:
