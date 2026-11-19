@@ -311,8 +311,10 @@ def _ab(goal: str, runs: int) -> int:
           f"B {sum(1 for r in rounds if r.arm.startswith('B') and not r.error)} 次"
           f"（每组的失败次数：A {sum(1 for r in rounds if r.arm.startswith('A') and r.error)}、"
           f"B {sum(1 for r in rounds if r.arm.startswith('B') and r.error)}）")
-    print("\n**改动量这一列不在上面**：它要真人去改。跑完 `--save` 把两组的图存进画布，"
-          "改完用 `--pair MAP_A MAP_B` 数 `edit_events`。")
+    print("\n**改动量这一列不在上面**：它要真人去改。本脚本不代劳保存——两组的图各存"
+          "一次（界面里落画布即可），改完用 `--pair MAP_A MAP_B` 数 `edit_events`。"
+          "\n偏离度也不是改动量：它测的是『模型有没有按画像那个形状生成』，机器就能算，"
+          "但它替代不了用户的判断。n=3 这个量级只够看方向，不够下结论。")
     return 0
 
 
