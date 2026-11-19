@@ -148,6 +148,44 @@ describe('底部对话框的状态机', () => {
     expect(wrapper.find('textarea#intent').exists()).toBe(true);
   });
 
+  it('有诊断：成功那行写着条数，按钮能直达明细，而且不淡出', async () => {
+    // 后端分片生成的真实形态：ok=true，但两条诊断。
+    stubFetch([
+      {
+        type: 'tool_end',
+        seq: 1,
+        call_id: 'c1',
+        name: 'mindmap_generate',
+        ok: true,
+        result_summary: {
+          diagnostics: [
+            { level: 'warn', code: 'D1', message: '分支「a」展开失败，已留空' },
+            { level: 'warn', code: 'D2', message: '分支「b」只有 2 个要点' },
+          ],
+        },
+      },
+      { type: 'done', seq: 2, content: TREE, mode: 'model' },
+    ]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    await store.runGeneration('做一张导图', 'edit');
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+
+    // 1) 成功那行里留着可核对的**数量**
+    expect(wrapper.get('[data-test="run-status-text"]').text()).toContain('有 2 条诊断');
+    // 2) 入口就在同一行，写着同一个数
+    expect(wrapper.get('[data-test="run-status-detail"]').text()).toBe('2 条诊断');
+    // 3) `store.status` 那句（对话框淡出之后唯一还看得见的结论）也带数量
+    expect(store.status).toContain('有 2 条诊断');
+
+    // 4) 有诊断＝该看的东西还没看：两秒过去也不淡出
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(false);
+  });
+
   it('输入框里还有没发出去的字时，成功也不淡出', async () => {
     stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
     const wrapper = mountApp();
