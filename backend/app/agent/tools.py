@@ -485,6 +485,46 @@ EXTERNAL_DISABLED_NOTE = (
 #     模型自己的知识，而界面上它们与有引用的节点长得一模一样。
 SHORT_MATERIAL_CHARS = LEAF_MAX_CHARS
 
+# 「装得下的材料直接塞进 prompt」的闸：材料正文**合计** ≤ 它时，整份正文拼进 prompt、
+# 不走按支检索（`_generate` 的 `full_text` 分支）；> 它时照旧每支检索一次。
+#
+# 与 `SHORT_MATERIAL_CHARS` 是两件事，别合并：那个判的是"太短，短到一条引文就能装下
+# 整份材料"（引用失去指向性），这个判的是"够长，但还没长到模型看不住"。同一份 200
+# 字材料两条都命中，处理方式是"当主题提示"（短的那条优先），全塞分支根本不会跑。
+#
+# **这个数的依据只有实测**（`scripts/measure_incontext.py`：三个长度 × 全塞/按支检索，
+# 量中间位置关键事实的命中、引用存活率、引用准确性与 detail 质量）。物理上限是
+# `CONTEXT_TOKEN_LIMIT`（200k token）/ 1.5 字每 token ≈ 30 万字，但注意力先于物理
+# 边界失效——"看得到却用不上"发生在窗口塞满之前。
+#
+# 取 5 万字的实测量（1 万 / 5 万 / 15 万字三档，同一份材料、同一主题，每格两次采样，
+# 原始数据见 `docs/FULL-CONTEXT.md`）：
+#
+#   | 长度 | 结尾段覆盖（检索 / 全塞） | 中间事实命中 | 触发裁剪（检索 / 全塞） | detail 均长 |
+#   |---|---|---|---|---|
+#   | 1 万 | 0/2 · **2/2** | 2/2 · 2/2 | 0/2 · 0/2 | 122 / 106 |
+#   | 5 万 | 0/2 · **2/2** | 1/2 · **2/2** | 0/2 · **2/2** | 98 / 102 |
+#   | 15 万 | 0/2 · 1/2 | 2/2 · 2/2 | 0/2 · **2/2** | 115 / 105 |
+#
+# 两条判据把闸定在 5 万：
+#   - **覆盖**是这条路唯一的真实收益，而且很硬：六次检索一次都没覆盖到结尾那段
+#     （那里与任何分支标题都不重合），全塞六次里覆盖了五次。那正是"按支检索的召回
+#     上限由分支标题决定"这个结构性缺陷（`_search_branch` 的 28.8%）在产出上的样子；
+#   - **代价不是"抄不准"，是"树写满"**（这一条是回头查原始响应才纠正的）：全塞时
+#     模型产出 79–80 个节点、贴着 `INITIAL_MAX_NODES`，于是 `_clip_tree` 裁掉尾巴，
+#     尾巴上的引用跟着消失（`data.source_refs.declared → kept` 的差额全部落在那几次
+#     `TREE_CLIPPED_TO_INITIAL` 里，逐字校验一条都没剔）。检索那一路产出 62–75 个
+#     节点，从不触发裁剪。裁剪从 5 万字档就开始（7–9% 的节点），15 万档还多丢了
+#     一次覆盖——再往上开，用户拿到的就是"内容更全但树被砍短"，那不是这条路想要的形状。
+#
+# 反方向也要说清（别让这张表被读成"全塞更好"）：**detail 均长**全塞低 7%（104 vs 112），
+# **引用密度**两路持平但检索那路自己抖动极大（1 万档两次采样 0.63 与 0.99，不足以下
+# 结论）。所以这条路换来的是**覆盖**，不是出处密度也不是更好的说明。
+#
+# 取 0 或负数等于**关掉这条路**（一切照旧走检索）：留这个取值是为了让"哪天实测推翻了
+# 全塞"有一个只改一行就能回退的开关，不必动代码结构。
+FULL_TEXT_MATERIAL_CHARS = 50_000
+
 
 def external_knowledge_off_reason() -> str:
     """这次为什么没走外部检索：`"deploy"` / `"user"` / `""`（开着）。
@@ -2828,6 +2868,33 @@ def _render_outline(entries: Sequence[Any], sources: list[Source]) -> str:
     return "\n".join(lines)
 
 
+def _full_text_sections(sources: list[Source]) -> list[str]:
+    """把材料**整份**渲染成 prompt 里的分节：一份一节，标题带文件名、字数与 source_id。
+
+    与 `EVIDENCE_SECTION_HEADER` 那套（按一级分支分组）是同一个洞的两个方向：那条路
+    给的是"每支检索到的片段"，这条路给的是"每份材料的全文"。两者都要求模型**只从
+    给定的内容里抄**，所以分节表头必须自带 `source_id`——全塞没有 `evidence_*` 可用，
+    模型能写对 `source_refs[].source_id` 的唯一依据就是这里。
+
+    不带偏移渲染：全文进 prompt 之后模型的坐标感不可靠，让它自己数 `start/end` 只会
+    产出一批过不了逐字校验的引用。只抄 `quote`，偏移由服务端在全文里唯一定位
+    （`source_refs._locate_quote`）。
+
+    顺序按 `sources` 原序（请求里用户给的顺序），不按长度排：材料在清单里的次序本身
+    是用户表达"哪份更重要"的方式，重排会让它写出来的结构对不上它看到的界面。
+    """
+    sections: list[str] = []
+    for index, source in enumerate(
+            [item for item in sources if (item.text or "").strip()], start=1):
+        text = (source.text or "").strip()
+        title = (source.filename or "").strip() or f"材料 {index}"
+        sections.append(
+            FULL_TEXT_SECTION_HEADER.format(
+                index=index, title=title[:80], chars=len(text), source_id=source.id
+            ) + "\n" + text)
+    return sections
+
+
 def _plan_ask(
     topic: str, branches: int, *, outline: str = "", diagram_type: str = "tree",
 ) -> str:
@@ -3213,6 +3280,48 @@ BRANCHED_EVIDENCE_RULES = (
 EVIDENCE_SECTION_HEADER = "第 {index} 支「{title}」的检索结果（evidence 数组）："
 
 
+# ---------------------------------------------------------------- 全塞：正文进 prompt
+#
+# 与上面那套是**同一个契约的两种投递方式**：字段形状一致（`source_refs` 的写法一个字
+# 都没变），差别只有"给的是检索片段还是完整正文"。分两套是刻意的——同一句话不能同时
+# 说"只能从本组抄"和"全文都在这里"，模型会按前一句自我限制。
+#
+# 三处与按支那套**必须**不同的措辞，各有实测依据：
+#   - "这是完整正文，不是片段"：不说清时模型把它当检索结果用，只挑开头几段；
+#   - "每一份材料都应当被用上"：全塞买到的正是**覆盖**（按支检索的覆盖率实测 28.8%，
+#     见 `_search_branch`），不点名要求覆盖，模型会集中写它最先读到的那一份；
+#   - **不要求 `evidence_*`**：全塞没有命中区间，写了 `start/end` 反而过不了逐字校验
+#     （偏移是它自己数的）。只抄 quote，服务端自己在全文里唯一定位并补偏移
+#     （`source_refs._locate_quote`）。
+FULL_TEXT_EVIDENCE_RULES = (
+    "\n材料已经**整份**给你了：user 消息末尾是全部材料的完整正文，按材料分节"
+    "（每节标题写明文件名、字数与 source_id）。它比检索片段更全——检索只返回命中的"
+    "几段，这里是全文，所有内容都在里面，你可以直接精读并引用任意一处。\n"
+    '引用写在节点自己的 source_refs 数组里，例如 {"source_id":"…","quote":"…"}；'
+    "source_refs 与 label、detail 平级，不要写进 detail。"
+    "quote 必须**逐字**照抄原文里连续的一段（不超过 300 字），"
+    "不要改写、不要概括；start / end 可以不写（服务端会在全文里定位），"
+    "要写就必须与 quote 对得上，page 不用写。\n"
+    "**凡是内容出自材料，就必须给这个节点挂一条 source_refs**；"
+    "每一份材料都要用上——一段材料的核心内容应当落在某个节点的 detail 与引用里，"
+    "不要只写最先读到的那一份。只有你自己补充的内容才给空数组："
+    "不挂引用是对的，编造不是。\n"
+)
+
+# 全塞时的分节表头。为什么要带**字数**：模型据此判断这一份该给多少节点，
+# 而不是把一份 200 字的材料与一份 4 万字的材料按同一权重摊（全塞的优势就是它可以
+# 按实际体量分配注意力）。
+FULL_TEXT_SECTION_HEADER = "第 {index} 份材料「{title}」（全文 {chars} 字，source_id={source_id}）："
+
+# 第三段（只写说明）在全塞时的引导句。与 `DETAIL_ONLY_EVIDENCE_RULES` 的区别：
+# 那个说"以本组为准"（分组是检索给的），这里没有分组，只有全文。
+DETAIL_ONLY_FULL_TEXT_RULES = (
+    "\nuser 消息末尾附的是材料的**完整正文**（与结构那一轮同一份，按材料分节）。"
+    "写某个节点的说明时，先在这一份正文里找到它对应的那段再写，不要凭印象；"
+    "原文与你的知识冲突时按原文写。不要新增或改动引用。\n"
+)
+
+
 # ---------------------------------------------------------------- 第三段：只写 detail
 #
 # 为什么要有这一段：把"骨架 + 每支的结构 + 每段说明"塞进一次输出时，模型的注意力
@@ -3366,7 +3475,7 @@ def _split_nodes(
 
 def _detail_ask(
     topic: str, targets: Sequence[tuple[Node, tuple[str, ...]]],
-    sections: Sequence[str],
+    sections: Sequence[str], *, full_text: bool = False,
 ) -> str:
     """第三段的 user 消息：主题 + 节点清单（id / label / 位置）+ 可选的原文。
 
@@ -3376,6 +3485,10 @@ def _detail_ask(
 
     带 id 是这一段唯一能对上号的东西：**不靠顺序**——顺序错一位，整棵树的说明就会
     整体串行错位，而且从产出上看不出来（每段话本身都通顺）。
+
+    `full_text` 只影响末尾那段**引导句**，`sections` 本身的形状决定了它们是"按支分组
+    的检索结果"还是"按材料分节的完整正文"：同一份内容配上错的引导句（"以本组为准"
+    挂在全文上）会让模型以为每组之间互不相干。
     """
     lines = [
         f"{index}. id={node.id}｜{node.label}｜位置：{' / '.join(path) or '中心主题'}"
@@ -3388,8 +3501,13 @@ def _detail_ask(
         + "\n".join(lines)
     )
     if sections:
-        user += ("\n\n结构那一轮用过的原文（按一级分支分组；写说明时以本组为准）：\n\n"
-                 + "\n\n".join(sections))
+        guide = (
+            "\n\n结构那一轮用过的**完整正文**（按材料分节；写某个节点时先在它对应的"
+            "那一份里找到那段原文）：\n\n"
+            if full_text else
+            "\n\n结构那一轮用过的原文（按一级分支分组；写说明时以本组为准）：\n\n")
+        user += guide + "\n\n".join(sections)
+
     # 自查句放在**最末尾**：它紧挨着模型开始输出的位置。上面每一条规则都在 system 里，
     # 而实测"每段至少 3 句"这一条只有写在最后才会被逐条执行（见 `DETAIL_ONLY_PROMPT`
     # 的注释——前两轮有 1–3 个节点只写了一句）。
@@ -3511,6 +3629,7 @@ async def _fill_details_half(
     topic: str,
     sections: Sequence[str],
     external_rules: str,
+    full_text: bool = False,
 ) -> _DetailHalf:
     """发这一次「只写说明」的请求并解析。**预算是调用方的事**（见 `_fill_details`）。
 
@@ -3526,15 +3645,20 @@ async def _fill_details_half(
     half = _DetailHalf(requested=len(targets),
                        target_ids=[node.id for node, _ in targets])
     system = DETAIL_ONLY_PROMPT
-    if sections:
+    if sections and full_text:
+        # 全塞：给的是完整正文，没有"本组"这个概念（分组来自按支检索）。用错引导句
+        # 会让模型以为每份材料各管一支、跨份的内容不写——那正好浪费掉全塞的覆盖优势。
+        system += DETAIL_ONLY_FULL_TEXT_RULES + external_rules
+    elif sections:
         system += DETAIL_ONLY_EVIDENCE_RULES + external_rules
     else:
         system += DETAIL_NO_SOURCE_RULES
     started = time.perf_counter()
     try:
         raw = await _chat(
-            ctx, system, _detail_ask(topic, targets, sections),
+            ctx, system, _detail_ask(topic, targets, sections, full_text=full_text),
             max_tokens=_max_tokens(ctx))
+
     except GenerationError as exc:
         half.skipped = "error"
         half.failure = str(exc)
@@ -3632,6 +3756,7 @@ async def _fill_details(
     content: MindMapContent, *, ctx: RunContext, topic: str,
     sections: Sequence[str], external_rules: str,
     diagnostics: list[Diagnostic], skip_ids: Collection[str] = (),
+    full_text: bool = False,
 ) -> tuple[MindMapContent, dict[str, Any]]:
     """第三段：给缺说明的节点补 detail。**只读结构、只写 detail**。
 
@@ -3698,7 +3823,7 @@ async def _fill_details(
     await _emit_stage(ctx, DETAIL_STAGE, f"正在给 {len(targets)} 个节点写说明…")
     results = await asyncio.gather(*(
         _fill_details_half(half, ctx=ctx, topic=topic, sections=sections,
-                           external_rules=external_rules)
+                           external_rules=external_rules, full_text=full_text)
         for half in pending
     ), return_exceptions=True)
     settled = _settle_halves(results, pending)
@@ -4261,6 +4386,16 @@ class _Intake:
 
     `external` 为 None 表示这次没走外部检索（有材料，或开关关着）。它同时决定
     `data` 里有没有那个键——开关关着时的键集必须与加这个能力之前逐字节相同。
+
+    `full_text` 是"这次走全塞"：材料正文合计不超过 `FULL_TEXT_MATERIAL_CHARS`。
+    它在这里只**算一个信号**，不改变任何既有分支（`sources` 仍是"可检索的来源"）：
+    改它会让短材料退化、外部检索补位、按支检索三处的语义同时漂移。谁消费这个信号
+    （目前只有 `_generate`）谁负责把正文拼进 prompt。
+
+    `full_text_chars` 与 `material_chars` **必须是两个数**：后者只统计用户随请求带来的
+    那批（`picked`），而前者是 `sources` 的合计——外部检索补进来的几份也在里面。
+    用 `material_chars` 判闸会漏掉整条外部检索路：那条路上 `material_chars` 恒为 0
+    （用户没给材料），于是"0 字，装得下"会让每一次外部检索结果都被整份塞进 prompt。
     """
 
     sources: list[Source]
@@ -4268,6 +4403,8 @@ class _Intake:
     material_chars: int
     hint_block: str
     external: _ExternalFetch | None
+    full_text: bool = False
+    full_text_chars: int = 0
 
 
 async def _intake(topic: str, ctx: RunContext) -> _Intake:
@@ -4285,6 +4422,11 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
 
     外部检索排在额度预探**之后**（调用方先判额度再调这里）：额度已经用光时，
     白等一次 6 秒的外网往返没有意义。
+
+    **全塞的判定放在最后一行**：材料总量不超过 `FULL_TEXT_MATERIAL_CHARS` 时才为真。
+    它必须排在短材料那道闸之后（太短的材料先被换成 `hint_block`，`sources` 已经是
+    空的），也必须排在外部检索之后（外部补进来的那几份同样可以整份塞进去）。
+    阈值取 0 或负数时这个信号恒为 False，这条路上的一切与加它之前逐字节相同。
     """
     picked = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
     material_chars = sum(len((source.text or "").strip()) for source in picked)
@@ -4309,7 +4451,11 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
             count=len(external.sources),
         )
         sources = external.sources
-    return _Intake(sources, short_material, material_chars, hint_block, external)
+    full_text_chars = sum(len((source.text or "").strip()) for source in sources)
+    full_text = bool(sources) and 0 < full_text_chars <= FULL_TEXT_MATERIAL_CHARS
+    return _Intake(sources, short_material, material_chars, hint_block, external,
+                   full_text, full_text_chars)
+
 
 
 def _apply_skeleton(
@@ -4740,6 +4886,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
          并行）。命中按分支分组渲染进 user 消息，**带分支归属**——这是与旧版
          整树生成最大的差别：旧版只做一次主题级 top_k=5 预检索，实测对 14,120 字
          材料的覆盖率 5.1%，而按支检索是 30.5%（`docs/RAG-DECISIONS.md` 第 5 节）。
+         **材料装得下时这一步整段跳过**（`intake.full_text`，闸是
+         `FULL_TEXT_MATERIAL_CHARS`）：改成把每份材料的全文拼进 user 消息。检索的
+         覆盖率上限由"分支标题命中不命中原文"决定，而全文在上下文里时它不再是瓶颈
+         ——代价是输入 token，见下面那段成本口径。
       3. 结构：一次 `chat_async`，骨架 + 全部命中一起给，**只写 id / label / 层级**
          ——`SKELETON_TREE_RULES` 明确要求 detail 留空，引用在这一轮按证据写。
       4. 说明：`_fill_details` 发**两次并发的 `chat_async`**（节点够多时，见
@@ -4791,6 +4941,14 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     第 4 步的失败一律**降级不失败**（见 `_fill_details`）：`detail` 是可选字段，
     为了"说明写短了"把已经成型的结构与引用丢掉是拿确定的好换不确定的好。
 
+    **全塞的成本口径**（这是它唯一的代价，必须能一口说出来）：正文进 prompt 的只有
+    两次内容调用——结构那一次与说明的那两次（说明是**两次并发**、各自带全文，所以
+    是 3 次带正文的请求）。10 万字按 1.5 字/token 折算是 6.7 万 token，于是
+    **3 × 6.7 万 ≈ 20 万 token 输入**；骨架那一次不带正文（它只需要目录：标题行本来
+    就是原文的子集，见 `_skeleton_outline`），把 6.7 万 token 花在"让它分出几条
+    一级分支"上买不到任何东西。按支检索那条路的输入是"N 支 × top_k=3 × 父块
+    ≈ 6–8 千 token"，相差一个数量级——所以闸门（`FULL_TEXT_MATERIAL_CHARS`）宁紧勿松。
+
     **"全部支都没命中"不兜底整树检索**（与 `_generate_deep` 不同）。那条路的兜底
     是必要的：空支在它那里就是一块空白。这里所有证据本来就在同一次响应里，
     "全空"就是真的全空，模型照 `DETAIL_NO_SOURCE_RULES` 写满内容、引用留空——
@@ -4817,6 +4975,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     material_chars = intake.material_chars
     hint_block = intake.hint_block
     external = intake.external
+    # 材料装得下 → 整份正文进 prompt，不走按支检索（第二步整段跳过）。信号在
+    # `_intake` 里算好，这里只消费：判据（`FULL_TEXT_MATERIAL_CHARS`）只该有一处。
+    full_text = intake.full_text
+    # 真的会被拼进 prompt 的那份字数（含外部检索补进来的）。与 `material_chars`
+    # （只数用户随请求带来的）分开报：诊断里说"合计 X 字"必须能与 prompt 对上。
+    full_text_chars = intake.full_text_chars
 
     diagnostics: list[Diagnostic] = []
     thinking = thinking_block(ctx.request.thinking_model)
@@ -4916,11 +5080,17 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 这一段是"保留分片那条路的检索质量"的全部：query 是分支标题本身
     # （`_branch_query`，三组消融见该函数），top_k 与分片一致（`DEEP_BRANCH_TOP_K`），
     # 预热策略也一致（`_retrieve_branches` 的"第一支先串一条"）。
+    #
+    # **材料装得下时整段跳过**（`intake.full_text`）：全塞买到的正是检索做不到的那件事
+    # ——覆盖率。按支检索的召回上限由"分支标题能不能命中原文"决定（实测 28.8%，
+    # 见 `_search_branch`），而全文进 prompt 之后，材料里每一段都在模型的上下文里，
+    # 覆盖率不再取决于它的 query 写得好不好。代价是输入 token（见
+    # `FULL_TEXT_MATERIAL_CHARS` 的成本口径），所以闸门按实测的注意力拐点定。
     evidences: list[_BranchEvidence | None] = []
     retrieval_queries: list[str] = []
     expansions: dict[str, list[str]] = {}
     retrieval_seconds = 0.0
-    if sources:
+    if sources and not full_text:
         retrieval_started = time.perf_counter()
         expansions = await _expand_branches(sources, titles)
         retrieval_queries = [
@@ -4945,11 +5115,20 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 分组渲染是这一段唯一的新东西：同一次响应里可能有十几组形状相同的 evidence
     # 数组，不带归属的话模型无法知道哪条命中属于哪一支（分片那条路不需要这层，
     # 它每次只给一支看）。
-    sections = [
-        EVIDENCE_SECTION_HEADER.format(index=index, title=title) + "\n" + evidence.text
-        for index, (title, evidence) in enumerate(zip(titles, evidences), start=1)
-        if evidence is not None
-    ]
+    #
+    # 全塞时 `sections` 换成"每份材料一整节"。两种渲染的**形状**必须与 system 里那句
+    # 引用规则一致（"每组一个 evidence 数组" vs "每份一整节"）：规则说按分支分组、
+    # 正文按材料分节，模型会把材料当成"第 N 支的证据"，然后只从第一份里抄。
+    sections = (
+        _full_text_sections(sources) if full_text else
+        [
+            EVIDENCE_SECTION_HEADER.format(index=index, title=title)
+            + "\n" + evidence.text
+            for index, (title, evidence) in enumerate(zip(titles, evidences), start=1)
+            if evidence is not None
+        ]
+    )
+
     skeleton_block = _skeleton_block(plan)
     # 两级的开头那句必须跟着变：它说的是"这是一层还是两层"，与清单的形状必须一致，
     # 否则模型看到缩进却读到"一级分支"，会按扁平的根规则摆（那就白分组了）。
@@ -5000,7 +5179,24 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             '例如：{"id":"…","label":"录入报销单","role":"data","children":[]}、'
             '{"id":"…","label":"写入审批台账","role":"database","children":[]}。'
         )
-    if sections:
+    if sections and full_text:
+        user += ("\n\n下面是**材料的完整正文**（按材料分节，每节标题写明文件名与字数）；"
+                 "它不是检索片段——写任何一支时都先在这些正文里找对应内容，"
+                 "引用逐字从里面抄：\n\n" + "\n\n".join(sections))
+        # 引用要求必须在**正文之后**再说一遍，不能只留在 system 里。
+        #
+        # 这不是"多提醒一遍更保险"，而是位置问题：全塞把上万个字的正文放在 user 末尾，
+        # system 里那句"凡是内容出自材料就挂 source_refs"距离输出位置隔了一万字。
+        # 实测（`scripts/measure_incontext.py`，1 万字档）只写在 system 里时模型
+        # **一条引用都不写**（declared=0），而同一次调用里它明明把中间的备案号抄进了
+        # detail——内容用上了、出处没标。同一个教训在 `_detail_ask` 的自查句与 flowchart
+        # 的 role 说明上都出现过：模型对紧挨着输出位置的那句话最敏感。
+        user += (
+            '\n\n写结构时每个节点的引用字段一起写：内容出自上面正文的，挂 source_refs'
+            '（[{"source_id":"…","quote":"逐字抄原文连续一段"}]，source_id 照抄那一节'
+            "标题里的值）；自己补充的内容给空数组 []。"
+        )
+    elif sections:
         user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"
                  "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
     external_rules = (
@@ -5023,9 +5219,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         else FISHBONE_TREE_RULES if diagram_type == "fishbone"
         else SKELETON_TREE_RULES
     )
-    if sources and sections:
+    if sections and full_text:
+        # 全塞：引用规则换成"这是全文"那一套。**不能复用 `BRANCHED_EVIDENCE_RULES`**
+        # ——它开头就说"已经按一级分支各做过一次检索"，与这次真的没检索相矛盾；
+        # 模型会据此推断"没被检索到的内容不存在"，然后只写第一份材料覆盖的部分。
+        system = (DETAIL_PROMPT + thinking + shape_rules
+                  + FULL_TEXT_EVIDENCE_RULES + external_rules)
+    elif sources and sections:
         system = (DETAIL_PROMPT + thinking + shape_rules
                   + BRANCHED_EVIDENCE_RULES + external_rules)
+
     elif sources:
         # 有材料但这一轮一条都没命中：与旧的整树路径同一条降级——按无来源写满，
         # 引用留空。**不把 `sources` 判成 None**：模型在本次运行前几轮可能已经
@@ -5150,7 +5353,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     content, detail_report = await _fill_details(
         content, ctx=ctx, topic=args.topic, sections=sections,
         external_rules=external_rules, diagnostics=diagnostics,
-        skip_ids=group_ids)
+        skip_ids=group_ids, full_text=full_text)
 
     # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"
     # ——这个区别在这里最实，用户下一步就是点开某个节点继续展开，而把被裁的那几个
@@ -5184,7 +5387,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         ))
 
     # 退化成"只凭主题"的那一版：请求带了材料，但这次一条依据都没拿到。
-    unsourced = bool(sources) and not with_evidence
+    #
+    # **全塞不算退化**（`not full_text`）：那条路上根本没检索，`with_evidence` 恒为 0，
+    # 不排除它的话，每一次成功的全塞生成都会被判成"材料里没有相关内容"——一条在
+    # 事实上错、而且会盖住真正的检索失败（有材料、检索返回空）的诊断。
+    unsourced = bool(sources) and not full_text and not with_evidence
+
     if unsourced:
         # 逐节点重复几十遍的 `UNSOURCED_NODE` 会淹掉别的诊断，聚成一条说清
         # "为什么整张图没有引用"（与 `_generate_deep` 的处理一致）。
@@ -5237,6 +5445,23 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 + "；证据给了却没被用上，不等于材料里没有相关内容"
             ),
         ))
+    # 全塞的同一件事，**另起一个码**：失败面和按支那条不一样。这里"材料全在
+    # prompt 里"是既成事实，零引用只能是模型没抄（提示词/模型问题），没有"检索
+    # 没召回"这一档可能；混进 `EVIDENCE_UNUSED` 会让"分支标题写歪了"与"全文给了
+    # 也不抄"在遥测里再也分不开，而用户能做的动作完全不同。
+    material_unused = bool(full_text) and bool(sections) and not kept_refs
+    if material_unused:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="MATERIAL_UNUSED",
+            message=(
+                f"本次把 {len(sections)} 份材料的全文（合计 {full_text_chars} 字）"
+                f"整份拼进了提示词，但生成的 {count} 个节点最终 0 条 source_refs"
+                + (f"（模型写了 {declared_refs} 条，全部没通过逐字校验）"
+                   if declared_refs else "（模型一条引用都没有写）")
+                + "；全文就在上下文里，没抄不等于材料里没有相关内容"
+            ),
+        ))
+
     if unsourced:
         reason = ("检索出错" if any(item is None for item in evidences) and not sections
                   else "材料里没有查到与这个主题相关的原文片段")
@@ -5364,6 +5589,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "但这张图的节点没有留下任何引用（模型没写，或写了没通过逐字校验）；"
             "这不代表「材料里没有相关内容」，换一个更贴近原文的说法重试可能就好了。"
         )
+    if material_unused:
+        summary += (
+            f"本次把 {len(sections)} 份材料的全文（合计 {full_text_chars} 字）整份给了模型，"
+            "但这张图的节点没有留下任何引用（模型没写，或写了没通过逐字校验）；"
+            "全文就在上下文里，这不代表「材料里没有相关内容」。"
+        )
     if clipped:
         summary += (
             f"节点数超过初次生成的 {INITIAL_MAX_NODES} 个上限，已保留前 "
@@ -5405,7 +5636,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 多一层而改一遍读法。
         "branches": _top_level_rows(content),
         "retrieval": {
-            "mode": "branch" if sources else "off",
+            # 三种模式：`full` = 正文整份进 prompt、一条检索都没发（`FULL_TEXT_MATERIAL_CHARS`
+            # 那条闸）；`branch` = 每支检索一次；`off` = 没有可检索的材料。
+            # 三个值分开报而不是合成一个布尔：`full` 与 `off` 都能让
+            # `branches_with_hits == 0`，而它们的原因、成本、以及"下次该改什么"
+            # 完全不同（前者是设计、后者是没材料）。
+            "mode": "full" if full_text else ("branch" if sources else "off"),
+
             "top_k": DEEP_BRANCH_TOP_K,
             "queries": retrieval_queries,
             "expanded_branches": len(expansions),
@@ -5480,6 +5717,23 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "threshold": SHORT_MATERIAL_CHARS,
             "degraded": True,
         }
+    if full_text:
+        # 与上面那个 `material` 块**互斥**（短材料的 `sources` 已经空了，`full_text`
+        # 恒为 False）：同一个键不会在一份 `data` 里出现两次。
+        #
+        # 报 `token_estimate` 而不是只报字数：这道闸的**唯一**代价就是输入 token，
+        # 而"6.7 万 token × 4 次调用"这个数是用户唯一能拿去和检索成本比较的口径。
+        # 估算口径与 `chat_async` 的物理边界同一个函数（`estimate_input_tokens`）。
+        data["material"] = {
+            "chars": full_text_chars,
+            "sources": len(sources),
+            "threshold": FULL_TEXT_MATERIAL_CHARS,
+            "degraded": False,
+            "full_text": True,
+            "token_estimate": estimate_input_tokens(
+                "".join((source.text or "") for source in sources)),
+        }
+
     if diagram_type != "tree":
         # 图型与附加边：`diagram_type` 是**输入**，`edges` 是**产出**。"选了流程图
         # 但一条边都没画出来"与"选了思维导图"在树上长得一样，而前者是要去补的动作。
@@ -5654,6 +5908,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     hint_block = intake.hint_block
     external = intake.external
     # 分片检索的前提：真的有可检索的正文。空正文的来源不参与。
+    #
+    # **这条路不采用全塞**（`intake.full_text` 在这里故意不读），理由是结构性的：
+    # 分片的每一次展开调用只装自己那一支，这正是它"单次输出量不受整图上限约束"的
+    # 来源。把全文塞进那 20 次调用 = 20 × 6.7 万 token，比 `_generate` 的 3 次贵一个
+    # 数量级，而换来的覆盖优势它已经有了（覆盖度由骨架决定，不靠 query）。
+    # 全塞是为 `_generate`（一次成型、正文只有进 prompt 才能被看到）设计的那条路。
     slicing = bool(sources)
 
     need = min(args.points_per_branch, MAX_CHILDREN)
@@ -8088,20 +8348,21 @@ def _rag_filters(raw: dict[str, Any] | None) -> SourceFilter | None:
 def _material_inputs(sources: list[Source]) -> list[str]:
     """给 `plan_query` 的材料摘要：每份「标题 + 正文开头」压平成一段。
 
-    **这是主动把正文塞进 LLM prompt 的两处之一**（另一处是 `_skeleton_outline`
-    拼进骨架的章节标题；检索命中不算：那就是检索的产出）。
-    它的边界很小且是刻意的——只在前 200 字、只在 `MINDMAP_QUERY_EXPANSION` 打开
-    时才走（默认关），而 planner 判断"该用哪些词、范围有多大"本来就需要看一眼
-    材料长什么样，只给标题它只能靠猜。
+    **正文进 prompt 有三条路，这条是其中最窄的一条**：
+      - `_skeleton_outline` 拼进骨架的标题行（原文的子集，一条最多 40 字）；
+      - **全塞**（`FULL_TEXT_MATERIAL_CHARS`）：材料合计装得下时整份正文进结构那次
+        与说明那两次调用（`_full_text_sections`）；
+      - 这一处：每份标题 + 前 200 字，只在 `MINDMAP_QUERY_EXPANSION` 打开时才走
+        （默认关）。
 
-    所以"正文不出进程"这句话**不成立**，准确的三种说法：
-      - 进 prompt：检索片段（`rag_query` 的返回、按支检索的命中）+ 这里的前 200 字
-        （默认关）+ `mindmap_generate_deep` 骨架那一次的**标题行**
-        （`_skeleton_outline`，原文的子集，一条最多 40 字）；
-      - 离开进程但不进 prompt：混合检索的 embedding 请求（每个参与打分的块发一次，
-        按 `sha256(quote)` 缓存），与这个开关无关；
-      - 共同点：**结构线索（标题行）会进，正文段不进**。目录不改变这一点，
-        它只是把"标题行"这条边从"顺带"变成了"明确的一条输入"。
+    它的边界很小且是刻意的——只在前 200 字、只在这个开关打开时。planner 判断"该用
+    哪些词、范围有多大"本来就需要看一眼材料长什么样，只给标题它只能靠猜。
+
+    所以"正文不出进程"这句话**不成立**，准确的说法是：检索片段（`rag_query` 的返回、
+    按支检索的命中）、全塞时的整份正文、这里的 200 字（默认关）、以及骨架那一次的
+    **标题行**会进 prompt；embedding 请求会离开进程但不进 prompt（按 `sha256(quote)`
+    缓存）。共同点只剩下一条：**没有一处会把正文发进 prompt 而不告诉模型它是正文**
+    ——全塞那一路的提示词就是这么写的（`FULL_TEXT_EVIDENCE_RULES`）。
 
     截断与份数上限全部交给 `_material_snippets`：两处各写一份"前 200 字、最多
     10 份"，迟早出现"提示词看到的是 A、检索依据是 B"这种没人查得出来的差集。

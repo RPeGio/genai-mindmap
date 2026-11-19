@@ -135,6 +135,27 @@ def clean_env(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def full_text_material_off(monkeypatch):
+    """把"装得下的材料直接塞进 prompt"这条路**置关**（`FULL_TEXT_MATERIAL_CHARS=0`）。
+
+    与 `SWITCHES` 里那几项同一个理由：它线上默认是**开**（5 万字，依据见
+    `tools.FULL_TEXT_MATERIAL_CHARS` 的注释），而绝大多数既有用例钉的是"带材料 →
+    按支检索"那条路——它们的模型替身（`test_one_path._tree_chat`）就是按 user 里的
+    "第 N 支「标题」的检索结果"分组造引用的，全塞一开、那些分组不在 user 里了，
+    引用自然造不出来，断言会以"引用被剔掉了"的形式失败，而真正的原因是这次请求
+    走了另一条路。
+
+    需要它的用例自己 `monkeypatch.setattr(tools, "FULL_TEXT_MATERIAL_CHARS", ...)`
+    （见 `tests/test_full_text_material.py`）；"默认值是 50_000"这件事由那个文件里
+    的一条专门用例钉着——放这里等于把产品口径藏进测试配置。
+    """
+    from app.agent import tools
+
+    monkeypatch.setattr(tools, "FULL_TEXT_MATERIAL_CHARS", 0)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def reset_graph_driver():
     """图存储的驱动单例在每个用例前后都关掉。
 
