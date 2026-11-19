@@ -231,39 +231,44 @@ describe('乱序与丢帧', () => {
   });
 });
 
-describe('预览与候选的隔离', () => {
-  it('预览不进候选，只有预览时也没有可采纳的内容', async () => {
+describe('预览与结果的隔离', () => {
+  it('预览不进画布：生成中画布一点不动', async () => {
     const { stream, store, running } = startStream();
     stream.push(grow(null, '预览根'));
     stream.push(grow([], '预览分支'));
 
     await vi.waitFor(() => expect(store.agentPreview?.children).toHaveLength(1));
-    expect(store.candidate).toBeNull();
-    // 预览是没校验过的半成品，接受动作只能认 snapshot / done 给的候选
-    expect(store.acceptCandidate()).toBe('invalid');
+    // 预览是没校验过的半成品，落地只认 snapshot / done 给的整树
+    expect(store.content).toBeNull();
+    expect(store.generatedSummary).toBeNull();
 
-    stream.push({ type: 'done', seq: 9, content: content('最终候选') });
+    stream.push({ type: 'done', seq: 9, content: content('最终结果') });
     stream.finish();
     await running;
+    expect(store.content?.root.label).toBe('最终结果');
   });
 
-  it('snapshot 到达时用完整候选替换预览，缓存一并清空', async () => {
+  it('snapshot 到达时预览继续撑住画布，done 才清掉它', async () => {
     const { stream, store, running } = startStream();
     stream.push(grow(null, '预览根'));
     stream.push(grow([], '预览分支'));
-    // 这条帧的父节点一直没来：它躺在缓存里，snapshot 之后也不能再冒出来
+    // 这条帧的父节点一直没来：它躺在缓存里，落地之后也不能再冒出来
     stream.push(grow([0, 3], '永远等不到父的节点'));
     await vi.waitFor(() => expect(store.agentPreview?.children).toHaveLength(1));
 
     stream.push({ type: 'snapshot', seq: 8, content: content('快照根') });
 
-    await vi.waitFor(() => expect(store.candidate?.root.label).toBe('快照根'));
-    expect(store.agentPreview).toBeNull();
+    // snapshot 只更新工作副本：预览留着，否则画布会空一帧（画布空才看得见预览）
+    await vi.waitFor(() => expect(store.agentEvents.some(item => item.type === 'snapshot')).toBe(true));
+    expect(store.agentPreview).not.toBeNull();
+    expect(store.content).toBeNull();
 
     stream.push({ type: 'done', seq: 9 });
     stream.finish();
     await running;
 
+    expect(store.content?.root.label).toBe('快照根');
+    expect(store.agentPreview).toBeNull();
     // 缓存清空了：再补一帧也不会把上一轮的孤儿挂到已经作废的树上
     expect(store.agentPreview).toBeNull();
   });
@@ -347,8 +352,8 @@ describe('面板上的预览', () => {
     expect(text).toContain('生成中（预览）');
     expect(text).toContain('机器学习');
     expect(text).toContain('线性回归');
-    // 预览是半成品，必须写明以候选为准，否则用户会当作可应用的结果
-    expect(text).toContain('以最终候选为准');
+    // 预览是半成品，必须写明以落到画布的结果为准，否则用户会当作最终结果
+    expect(text).toContain('以落进画布的结果为准');
 
     // expandable 为 false 才带小圆点；true 与 null 都不加标记
     expect(row(wrapper, '监督学习').find('span[aria-hidden="true"]').exists()).toBe(true);
@@ -378,26 +383,25 @@ describe('面板上的预览', () => {
     await running;
   });
 
-  it('候选到达后切到完整候选，预览不再出现', async () => {
+  it('结果落地后预览不再出现，画布上是那棵树', async () => {
     const { stream, store, running } = openPanel();
     stream.push(grow(null, '预览根'));
     stream.push(grow([], '只在预览里的分支'));
     await vi.waitFor(() => expect(store.agentPreview?.children).toHaveLength(1));
 
     stream.push({ type: 'snapshot', seq: 8, content: content('快照根') });
-    await vi.waitFor(() => expect(store.candidate?.root.label).toBe('快照根'));
-
-    const wrapper = mount(AgentPanel);
-    const text = wrapper.text();
-    expect(text).toContain('候选（未应用）');
-    expect(text).toContain('快照根');
-    expect(text).not.toContain('生成中（预览）');
-    // 预览独有的节点不能残留：它不在最终候选里，出现就是两棵树拼在了一起
-    expect(text).not.toContain('只在预览里的分支');
-
     stream.push({ type: 'done', seq: 9 });
     stream.finish();
     await running;
+
+    const wrapper = mount(AgentPanel);
+    const text = wrapper.text();
+    // 面板不再有"候选（未应用）"这块：结果已经在画布上了
+    expect(text).toContain('已落到画布');
+    expect(text).not.toContain('候选（未应用）');
+    expect(text).not.toContain('生成中（预览）');
+    // 预览独有的节点不能残留：它不在最终结果里，出现就是两棵树拼在了一起
+    expect(text).not.toContain('只在预览里的分支');
   });
 
   it('预览很长时只列前 24 行，剩下的折成计数', async () => {

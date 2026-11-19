@@ -1,10 +1,10 @@
-# API 与数据契约
+﻿# API 与数据契约
 
 前后端以 `/api` 为前缀。FastAPI 启动后的 `/docs` 展示当前路由；本页说明每条路由是否真正实现。当前无身份认证，仅限本机开发。
 
 **错误体已统一**：所有错误响应都是 `{code, message, detail, request_id}`（实现见 `backend/app/core/errors.py`）。`message` 是中文可读文案，`detail` 保留原始细节（校验错误为数组），`request_id` 优先沿用请求头 `X-Request-ID`、没有则生成，并同时通过响应头回传。前端 `src/api/client.ts` 的 `ApiError` 读 `message`，缺失时回退到 `detail`。
 
-**前端消费情况**（截至 2026-11-16）：`POST /api/agent/runs/stream`（`runAgentStream`，生成与编辑的**唯一**入口）、`POST /api/ingestion/files`（`uploadDocument`）、`POST /api/export/{puml,markdown,opml}`、四个 `/api/mindmaps*` 端点、`GET /api/knowledge/library` 与 `GET /api/knowledge/library/{source_id}`（`listLibrary` / `readLibrarySource`，顶栏「知识库」抽屉）。画布与编辑全部在 `src/canvas/`、`src/mindmap/{edits,ops}.ts` 里完成，只把整棵树发给后端。节点引用（`node.source_refs`）已能展示：角标显示条数，详情面板列来源与位置，抽屉里看原文并高亮命中句，实现见 `src/mindmap/refs.ts`。
+**前端消费情况**（截至 2026-11-17）：`POST /api/agent/runs/stream`（`runAgentStream`，生成与编辑的**唯一**入口）、`POST /api/ingestion/files`（`uploadDocument`）、`POST /api/export/{puml,markdown,opml,json}`、`POST /api/mindmaps/import`、四个 `/api/mindmaps*` 端点（另有两条改动日志读路径 `GET .../edits/summary` 与 `GET .../edits`，界面暂无入口，供统计与排查）、`GET /api/prefs` 系列（顶栏「我的偏好」）、`GET /api/knowledge/library` 与 `GET /api/knowledge/library/{source_id}`（`listLibrary` / `readLibrarySource`，顶栏「知识库」抽屉）。画布与编辑全部在 `src/canvas/`、`src/mindmap/{edits,ops}.ts` 里完成，只把整棵树发给后端。节点引用（`node.source_refs`）已能展示：角标显示条数，详情面板列来源与位置，抽屉里看原文并高亮命中句，实现见 `src/mindmap/refs.ts`。
 
 **尚未封装**：`POST /api/ingestion/text`、`GET /api/ingestion/formats`、`POST /api/optimization/check`、`POST /api/optimization/suggest`、`POST /api/knowledge/search`、`POST /api/agent/tasks`。其中前两个是小事，中间两个是"结构诊断还没进界面"，后两个仍是桩。
 
@@ -46,7 +46,7 @@
 
 前端从 2026-11-10 起按 v2 发送（`frontend/src/api/types.ts` 已补字段），保存 / 打开 / 导出都带 `note` 与 `layout` / `theme`；`frontend/src/api/client.ts` 里原有的两个裁剪函数 `toContractV1()` / `toExportV1()` 已删除。三种导出取节点正文（`note`），没有正文时回落标题。
 
-`source_usage` 是可选的**整张导图来源摘要**：agent 的 `mindmap_generate` 按实际输入重建（`generation/service.py::validate_generated_content`），保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。直接文本生成时该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
+`source_usage` 是可选的**整张导图来源摘要**：agent 的 `mindmap_generate_deep` 在合并候选树时按实际输入重建（`backend/app/agent/tools.py::_generate_deep`），保存导图时一并保存；旧数据省略时默认为空列表。它只记录来源 ID、类型、文件名和使用的字符数，不保存原文，也没有节点到来源片段的对应关系，不能作为节点级引用或事实验证。没有来源的生成该列表为空；后续完整追溯还需要来源存储、分段定位与节点关联。
 
 ## 已实现
 
@@ -62,15 +62,62 @@
 | `POST /api/ingestion/files` | multipart，字段名 `file` | `{"source": 来源}`，`source.text` 是解析出的正文 | 扩展名不在白名单 422；文档/图片超 10MB 或音频超 20MB 413；扫描件无文本层、音频无人声、图片视觉不可用、缺语音凭证 422 |
 | `GET /api/ingestion/formats` | 无 | `{"document":[…],"audio":[".wav"],"image":[".png",…],"maxUploadBytes":…,"maxAudioBytes":…,"maxImageBytes":…}` | — |
 | `GET /api/mindmaps` | 无 | 导图记录数组 | — |
-| `POST /api/mindmaps` | `{"content":导图}` | 201，导图记录 | 结构无效 422 |
+| `POST /api/mindmaps` | `{"content":导图,"events":[改动事件…],"truncated":0}`（后两个可省略） | 201，导图记录 | 结构无效 422；事件形状不对（字段名漂移、未知 kind/field、时间戳以外的多余键）422 |
 | `GET /api/mindmaps/{map_id}` | 无 | 导图记录 | 不存在 404 |
-| `PUT /api/mindmaps/{map_id}` | `{"version":1,"content":导图}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409；结构无效 422 |
-| `POST /api/agent/runs/stream` | `{"goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `sources` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `heartbeat` / `done` / `error`；响应体最前面还有一行 **SSE 注释帧** `: 正在把材料收进知识库`（入库在首帧之前，先用它把首字节送出去；不是数据帧、不占 `seq`）；`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`，所以 demo / model 帧必带，缺字段只说明对面"没说"），产物是**候选**；另外**只在没产出导图时** `done` 还带 `text` / `reasoning`——模型收尾那一轮的原话与思考内容（各截断到 4000 字），用于排障"它为什么只写字、不调工具"；模型思考期间还有 `heartbeat` 帧（`{seq, type:"heartbeat", waited_ms}`，每 10 秒一帧，只保活、不带业务进度，详见协议文档）；`sources` 帧**只在材料真的进了知识库时出现**（见下） | 目标为空 422；来源合计超出模型上下文 422；预算用尽或模型失败以 `error` 事件下发 |
-| `GET /api/knowledge/library` | 可选 `limit`（默认 50，范围 1–200；越界 422） | `{"items":[…],"total":N}`；每条含 `source_id` / `filename` / `kind` / `chars` / `chunks` / `created_at` / `last_used_at` / `cited_by`（被几张**已保存导图**引用，`source_usage` 与节点 `source_refs` 都算，同图去重；该计数带 30 秒缓存，缓存键是导图表指纹，**存完/改完导图再列库会立刻反映**） | — （库读不出来时返回空列表；导图表里有读不出的行时该行跳过、`cited_by` 按 0 计，都不返回 500） |
+| `PUT /api/mindmaps/{map_id}` | `{"version":1,"content":导图,"events":[…]}` | 更新后的记录，版本加 1 | 不存在 404；版本过期 409（此时**事件一条都不写**）；结构无效 422 |
+| `GET /api/mindmaps/{map_id}/edits/summary` | 无 | 改动分布：`total` / `last_event_at` / `by_actor` / `by_kind` / `by_field` / `label_shrunk` / `removed_depth` / `removed_subtree`（见下） | 不存在 404（不返回全零报告——"这张图没人改过"是另一件事） |
+| `GET /api/mindmaps/edits/health` | 无 | 跨图死表探测器：`window_start` / `window_end` / `edited_maps` / `saved_maps` / `chain_suspect` / `detail` | — |
+| `GET /api/mindmaps/{map_id}/edits` | 查询参数 `limit`（1–500，默认 50） | 改动明细，新的在前：`id` / `map_id` / `run_id` / `actor` / `kind` / `node_id` / `field` / `before` / `after` / `depth` / `subtree_size` / `change_count` / `at` / `recorded_at` | 不存在 404 |
+
+**改动日志（"用户最常改什么"）只记录、不总结。** 表是 `edit_events`（在 `repository.connect()` 里与其余表同一时刻建好）。写入口只有一个：`POST`/`PUT /api/mindmaps` 的 `events` 字段——**并进保存，不另开端点**，因为第一次保存前没有 `map_id`，一个 `POST /mindmaps/{id}/edits` 要么发不出去，要么必须 create 之后补发，那就会多出"内容存了、事件没存"的半截状态，而统计从此只看见部分改动。所以：内容与事件同一次请求、同一次成败；409 冲突时两者一起拒。
+
+一条事件的形状（`before` / `after` 是**摘要**，`detail` 只存 `"1800字"` 这种长度）：
+
+```json
+{"actor":"user","kind":"update","field":"label","node_id":"d1a",
+ "before":"缺失值、异常值与重复样本的清理顺序","after":"缺失值清洗","depth":3,
+ "subtree_size":null,"change_count":null,
+ "run_id":null,"at":"2026-11-17T09:30:01.250Z"}
+```
+
+`kind` ∈ `add` / `remove` / `update` / `move` / `edge` / `style` / `generate`（历史行里还有 `accept`）；`field` **只在 `update` / `style` 上有值**（`label` / `title` / `detail` / `note` / `color` / `icon`）。这条规则让统计能自校验：`sum(by_field) == by_kind.update + by_kind.style`，`sum(by_actor) == total`。对不上就说明有写入路径绕过了契约。
+
+`generate` 是**一次"生成落到画布"**（`create` / `expand` / `edit` 三条路都算），不是改动：`node_id` / `field` / `depth` 全空，只有 `node_count`（这次落进画布的那棵树有几个节点，**在生成完成那一刻定死**）与 `run_id`，`actor` 固定 `agent`。它**每次都记**，哪怕一处都没改——没有它，"生成完一字不改直接保存"在表里是 0 行，与"用户从没用过"不可区分，缺的不是样本而是分母。它的前身是 `accept`（候选层还在时"用户点了应用"，`actor='user'` + `change_count`）；候选层删掉之后新数据一律写 `generate`，老行原样保留、`by_kind` 照样读得到。
+
+`depth` 是节点层数（**根是 1**），`remove` 事件填删除前所在层。`subtree_size` 是这条 `remove` **一共删掉几个节点**（含自己，数的是真的消失的那些）：删一个叶节点是 1，删一整支 12 个节点是**一条**事件、`subtree_size=12`。加列之前的老数据这一位是 `null`（当时没记，不做回填）。`at` 由前端给（事件发生的时刻，非法时退回入库时刻），`recorded_at` 是服务端写入时刻——分开才诊断得出时钟漂移。单次保存最多 500 条，超出的部分留在前端队列里**等下一次**（分批，不是丢弃），只把条数上报成一条服务端 warning。
+
+`label_shrunk` 是 `field='label'`、**`actor='user'`** 且 `length(after) < length(before)` 的条数与两个平均值（码点口径，`count=0` 时平均值为 `null` 而不是 0——0 会被读成"平均改成 0 字"）。过滤 actor 是因为 `agent` 那批是"用户点了应用、模型又改了一遍"，性质不同：实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条。
+
+`removed_depth` 是删掉的节点按层分布，**只含零散删除**（`subtree_size = 1`）；`subtree_size` 为空的老数据**不进**这个分布，否则"每层都在被删"那次污染还在。`removed_subtree` 是删除规模直方图：`{"size_1": 5, "size_12": 1, "size_unknown": 2}`，`size_unknown` 就是那些老数据。
+
+这几个数直接对应生成侧该改什么：标题普遍被缩短 → 16 字上限可能还不够短；零散删掉的集中在第 4 层 → 初次深度太深；成规模删掉的是整支 → 那一支根本不该生成。**它们只说发生了什么，不说为什么**（见 `docs/EDIT-LOG.md` 的局限一节）。
+
+`last_event_at` 是这张图最近一条事件的**入库**时刻（`recorded_at`，不是前端给的 `at`；空表是 `null` 而不是空串）。`GET /mindmaps/edits/health` 是跨图的死表探测器：**"保存了但没有任何事件"在正常情况下不该发生**（每次生成落地都记一条 `generate`，连一处没改也记），所以"昨日保存 > 0 且昨日编辑 = 0"判定 `chain_suspect`——前端在发、后端在丢的那种静默故障，40 分钟里没有任何告警，就靠这一条捞。
+| `POST /api/agent/runs/stream` | `{"run_id":"…","goal":"…","intent":"create / expand / edit","thinking_model":"default / first-principles / feynman / systematic / critical","snapshot":导图或省略,"selected_ids":[…],"sources":[…],"prefs_applied":["diagram_type.default=fishbone"],"deep_thinking":true / 省略,"budget":{…}}` | SSE v2：每帧 `data: <json>`，信封 `{seq, type, ...}`（`backend/app/agent/contracts.py::_EventBase` 只有 `seq`），`type` ∈ `stage` / `sources` / `tool_start` / `tool_end` / `ops` / `snapshot` / `node_grow` / `heartbeat` / `done` / `error`；**有材料时**响应体最前面还有一行 **SSE 注释帧** `: 正在把材料收进知识库`（入库在首帧之前，先用它把首字节送出去；不是数据帧、不占 `seq`；没有材料时整段跳过，所以不带材料的请求帧与加这段之前逐字节相同）。`done` 带 `mode`（`demo` / `model`，序列化用 `exclude_none=True`），`content` 是这次生成的整棵树（前端拿到就直接落画布并标成未保存，没有"候选待确认"这一步）；`done` 还可能带 `text`（收尾原话，**只在没产出导图时**填，截断 4000 字）、`reasoning`（思考过程，**成功时也填**，上限 20000 字）、`model`（这一轮真正发出去的模型名，缺字段＝没说）；模型思考期间有 `heartbeat` 帧（`{seq, type:"heartbeat", waited_ms}`，每 10 秒一帧，只保活）；`sources` 帧**只在材料真的进了知识库时出现**（旧 id → 库里的持久 id） | 目标为空 422；来源合计超出模型上下文 422；同一个 `run_id` 正在跑 409（`run_in_progress`）；预算用尽或模型失败以 `error` 事件下发 |
+| `GET /api/agent/runs` | 查询参数 `status`（`done` / `cancelled` / `failed` / `running`，可省略）、`unapplied`（默认 `true`）、`limit`（1–100，默认 20） | 运行台账数组（`run_id` / `status` / `intent` / `goal` / 时间戳），**不含结果正文**。`status` 省略时取 `done` + `cancelled` 中"有结果且没被保存过"的 | — |
+| `GET /api/agent/runs/{run_id}` | 无 | 同上再加 `candidate`（整棵树；字段名沿用，语义是"这次生成产出的树"）、`failure`、`mode` | 不存在 404 |
+| `POST /api/agent/runs/{run_id}/applied` | 无 | 204；幂等（只打第一个时间戳）。语义是**这份结果被保存进库了**（前端在保存成功后调用），它决定下次进页面还要不要提醒 | 不存在 404 |
+| `GET /api/prefs` | 无 | 全部偏好：`key` / `value` / `scope` / `source` / 两个时间戳，以及 `last_applied_at`（来自 `runs.request.prefs_applied`，为空 = 从未生效） | — |
+| `PUT /api/prefs/{pref_key}` | `{"value":"…","source":"user_explicit / suggestion_accepted","source_run_id":null}` | `{"pref":…,"changed":true/false}`；同值重复提交 `changed=false` 且不刷新 `updated_at` | 键非法 / 枚举外 / 备注超 8 条或 500 字 400（`pref_key_invalid` / `pref_value_invalid` / `pref_limit_exceeded`） |
+| `DELETE /api/prefs/{pref_key}` | 无 | 204，硬删（没有软删） | 不存在 404（与"删了但还在"必须分得开） |
+| `GET /api/prefs/suggestions` | 无 | 候选建议数组（`key` / `value` / `label` / `count` / `message`）。**只读不落库**：最近 3 次有效选择都是同一个值、且与当前偏好不同才提 | — |
+| `GET /api/knowledge/library` | 可选 `limit`（默认 50，范围 1–200；越界 422） | `{"items":[…],"total":N}`；每条含 `source_id` / `filename` / `kind` / `chars` / `chunks` / `created_at` / `last_used_at` / `cited_by`（被几张**已保存导图**引用，`source_usage` 与节点 `source_refs` 都算，同图去重；该计数带 30 秒缓存，缓存键是导图表指纹，**存完/改完导图再列库会立刻反映**） | 库读不出来时返回空列表；导图表里有读不出的行时该行跳过、`cited_by` 按 0 计，都不返回 500 |
 | `GET /api/knowledge/library/{source_id}` | 无 | `{"source_id","filename","kind","text","truncated","total_chars"}`，正文最多前 4000 字 | 库里没有这份 404（`code=not_found`）；库本身读不出来 503（`code=library_unavailable`，稍后重试） |
 
+
 **流式接口只有一套帧格式**，就是 `/api/agent/runs/stream` 的这套；旧的 `/api/generations/stream`（`stage` / `skeleton` / `node` / `done` / `error` + 末尾 `data: [DONE]`）已连路由一起删除。`backend/app/generation/stream_partial.py` 现在只剩增量解析器（`parse_partial` / `collect_new_nodes`），供 agent 的 `node_grow` 预览调用，不再有帧拼装。
-信封只有 `{seq, type, ...}`：`seq` 由服务端补齐，没有 `v` / `runId` / revision 字段（轮次与候选版本在各事件自己的 payload 里）。产物是 `ops` 操作批次或整树 `snapshot` 而不是"增量节点上屏"；`node_grow` 只作深层生成的预览帧、收到 `snapshot` 即作废，前端把它挂在候选副本上，用户点接受才落到画布。`MINDMAP_LLM_MODE=demo` 也作用于 agent：`run()` 入口直接发 `stage` / `snapshot` / `done` 三帧（`done.mode=demo`），不调用模型，因此演示模式下没有 `tool_start` / `ops` / `node_grow` 帧。协议见 `docs/AGENT_STREAM_PROTOCOL.md`，设计背景见 `docs/AGENT_PLAN.md`。
+
+**`run_id` 让一次运行有身份（新增）。** 以前请求里没有 run id，服务端没有能力识别"同一次运行又投递了一遍"，于是换标签页、刷新重发、客户端重试都会新开一次真跑——两倍的钱、两份结果，两个标签页各存一次就是两张图（`create_map` 每次 `uuid4()`）。现在：
+
+- 带同一个 `run_id` 且该行 `status=running` → 409 `run_in_progress`（同一个 run 并发跑两次会互相打架）。
+- 带同一个 `run_id` 且该行 `done` → 直接把已有结果按原样的帧重放（`snapshot` → `done`，`mode` 照原值），**不再调模型**。
+- 带同一个 `run_id` 且该行 `cancelled` / `failed` → 允许重跑，复用同一个 id（那是用户主动重试，不是重复投递）。重跑期间不清空上一轮的草稿。
+- 不带 `run_id`（老客户端）→ 服务端补一个，**响应体逐字节不变**，只是额外落一行台账。
+
+`done` 之后这行冻结：一条迟到的取消不许把已经交付的结果改写成 `cancelled`。SSE 因此从"run 本身"降级成"这一行的一次观察窗口"，帧格式一个字节都没改。
+
+**运行结束（含被取消）时草稿落库。** 这是"关掉页面那 40 秒白花"的解：abort 会让 uvicorn 关掉生成器、`aclosing` 触发 `task.cancel()`，工具里的模型请求被取消且已经花掉的调用不回滚——原先 `ctx.candidate` 只活内存，用户回来什么都看不到。现在 `_frames` 的 `finally` 里写一次（正常 → `done`，异常 → `failed` + `failure`，什么都没发出去就断了 → `cancelled`，**只要树非空就写**）。前端进页面时问一次 `GET /api/agent/runs`，有残留就在侧栏提示一句（不是弹窗）：点「查看」把那份结果直接装进画布（与生成落地走同一条 `commitGenerated`），点「丢弃」只在本会话内静音——`dismissed_at` 那一列已随候选层删除（`acfdb5b`），没有"丢弃"这个写库动作了。
+信封只有 `{seq, type, ...}`：`seq` 由服务端补齐，没有 `v` / `runId` / revision 字段（轮次与树的版本在各事件自己的 payload 里）。产物是 `ops` 操作批次或整树 `snapshot` 而不是"增量节点上屏"；`node_grow` 只作深层生成的预览帧、收到 `snapshot` 即作废，前端把它单独挂在 `agentPreview` 上（不混进 `draft`），`done` 一到才整树落画布——没有"用户点接受"这一步。`MINDMAP_LLM_MODE=demo` 也作用于 agent：`run()` 入口直接发 `stage` / `snapshot` / `done` 三帧（`done.mode=demo`），不调用模型，因此演示模式下没有 `tool_start` / `ops` / `node_grow` 帧。协议见 `docs/AGENT_STREAM_PROTOCOL.md`，设计背景见 `docs/AGENT_PLAN.md`。
 
 记录形如 `{"id":"...","version":1,"content":{...},"updated_at":"...Z"}`。生成接口不会自动保存。`demo` 为演示模式，不是 AI；`model` 表示请求已成功经模型服务处理，不代表内容必然正确。`/api/agent/tasks` 仍返回固定阶段列表，那是桩，不反映真实进度。
 
@@ -97,7 +144,7 @@
 | 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。当前只有 agent 这一条 SSE 流，没有持久任务。 |
 | 优化 | 已有 `/api/optimization/suggest`，持久化和应用接口待确定 | 未来补齐矛盾、缺失、重组、跨节点关系候选及依据，不直接覆盖。 |
 | 知识库 | 已落地只读入口 `GET /api/knowledge/library` 与 `.../library/{id}`；写入侧只有"生成时入库" | 材料列表、被引用次数、正文预览可用；检索（`POST /api/knowledge/search`）仍是桩，检索真正参与生成要等记忆模块。 |
-| AI 代理 | `POST /api/agent/runs/stream` 已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环与候选确认已可用；任务化长跑、过程记录落库与多角色仍待设计。 |
+| AI 代理 | `POST /api/agent/runs/stream`、`GET /api/agent/runs` 系列已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环、生成即落画布、"运行结束后落草稿"（`runs` 表，SQLite）与用户偏好（`user_prefs`）已可用；任务化长跑、`runs` 的跨进程/跨机存储（现为本地 SQLite，多 worker 共享同一文件）与多角色仍待设计。 |
 | 协作 | 房间授权接口 + Yjs WebSocket | 房间鉴权、实时同步、在线状态、恢复；最终协议由协作负责人完成设计。 |
 | 更多导出 | `/api/export/puml`、`/markdown`、`/opml` 均已实现；图像导出待开发 | PNG/SVG 渲染要额外依赖，优先用浏览器端截图或交给 PlantUML 服务。 |
 

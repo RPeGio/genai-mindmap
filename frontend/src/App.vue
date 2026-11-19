@@ -4,17 +4,27 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
-import SourceInputs from './components/SourceInputs.vue';
+import ChatDock from './components/ChatDock.vue';
+import HistoryDrawer from './components/HistoryDrawer.vue';
+import MessageFab from './components/MessageFab.vue';
+import NodeToolbar from './components/NodeToolbar.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
 import type { LibraryEntry, LibrarySource } from './api/types';
 import type { SampleMap } from './dev/samples';
 import type { DemoPreset } from './demo/presets';
 import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
+import { useChatStore } from './stores/chat';
 import { useSourcesStore } from './stores/sources';
+import { usePrefsStore } from './stores/prefs';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
+import { agentDetailVisible } from './mindmap/run-status';
+import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
+import type { DiagramContent, EdgeKind } from './api/types';
+import { containerNoun, kindOf, topBranchesOf } from './mindmap/shape';
 
 const store = useMindMapStore();
+const chat = useChatStore();
 const sources = useSourcesStore();
 
 /**
@@ -38,8 +48,16 @@ const copied = ref('');
  * 导出的结果原来只写进左侧来源面板的 `store.status` 小字里，位置在折叠区下方，
  * 失败时看上去就是"点了没反应"（用户实测：控制台 422，界面无提示）。成功和失败
  * 都要能一眼看到，所以单独开一条浮层，四秒后自动消失。
+ *
+ * `action` 是给"刚清掉的东西"用的撤销入口（「新对话」清材料那一句）：只写"已清空
+ * 3 份材料"而不给回去的路，等于让用户确认一次损失再目送它消失。带动作的提示停
+ * 8 秒——比纯通知久，因为他可能正在读那句"清掉了什么"。
  */
-const notice = ref<{ kind: 'ok' | 'error'; text: string } | null>(null);
+const notice = ref<{
+  kind: 'ok' | 'error';
+  text: string;
+  action?: { label: string; run: () => void };
+} | null>(null);
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 后端自报的版本号（线上是 tag，本机是 dev）；拉不到就是空串。 */
@@ -53,13 +71,18 @@ const versionLabel = computed(() => {
   return /^v/i.test(raw) ? raw : `v${raw}`;
 });
 
-function flash(kind: 'ok' | 'error', text: string): void {
+function flash(
+  kind: 'ok' | 'error',
+  text: string,
+  action?: { label: string; run: () => void },
+): void {
   if (noticeTimer) clearTimeout(noticeTimer);
-  notice.value = { kind, text };
+  notice.value = { kind, text, action };
+  const ms = action ? 8000 : kind === 'error' ? 6000 : 3000;
   noticeTimer = setTimeout(() => {
     notice.value = null;
     noticeTimer = null;
-  }, kind === 'error' ? 6000 : 3000);
+  }, ms);
 }
 
 // 开发期示例选择器：只在 dev 服务器下加载，生产构建里这段会被整体去掉。
@@ -143,6 +166,138 @@ function resetNoteDraft() {
   noteDraft.value = store.selectedNode?.node.note ?? '';
 }
 
+// ---- 附加关系（流程图的条件分支 / 汇合 / 回退）--------------------------------
+//
+// 最小可用入口，三条理由让它必须存在：
+//   1. 模型只在 `flowchart` 生成时给边，用户手里一张 `tree` 图永远补不出流程；
+//   2. 模型给的边可能是错的，而"删掉那条画错的回退线"没有别的入口；
+//   3. 边不参与布局，所以增删它不会重排画布——这件事只有在界面上点一次才看得出。
+
+/** 新边连到哪个节点（下拉框的值）。默认空：用户得自己挑，不替他猜。 */
+const edgeTarget = ref('');
+const edgeLabel = ref('');
+const edgeKind = ref<EdgeKind>('branch');
+
+/**
+ * 候选目标：当前内容里除选中节点之外的所有节点。自环在契约层就是硬拒的，列出来也没用。
+ *
+ * 读 `selectableNodes` 而不是 `flatNodes`：鱼骨与流程的画布上多一个**不在 content 里**
+ * 的合成根（鱼头 / 流程起点），它是一个纯渲染产物，既不能当端点也不该出现在下拉框里。
+ */
+const edgeTargets = computed(() => {
+  const current = selected.value?.node.id;
+  return store.selectableNodes
+    .filter(entry => entry.node.id !== current)
+    .map(entry => ({ id: entry.node.id, label: entry.node.label.trim(), depth: entry.depth }));
+});
+
+/**
+ * 边端点的显示名：`id → 标题`。删边/列边都要它，用户认标题不认 id。
+ *
+ * 走 store 的 `edgeNameOf` 而不是在这里自己建表：流程图的边端点存的是**阶段 id**
+ * （另一个命名空间），自己按节点建的表会把它显示成一串 `s_xxx`。
+ */
+const edgeNodeName = computed(() => store.edgeNameOf);
+
+/**
+ * 选中节点相关的边，拼成"谁 → 谁（标签）"给列表用。
+ *
+ * **两层分开两份**（而不是拼成一份带标记的列表）：阶段之间与阶段内部是两个数组、
+ * 两个命名空间（`FlowContent.edges` 的端点是阶段 id，`FlowStage.edges` 的端点是
+ * 该阶段的节点 id），界面上也确实是两种东西——一个是这张图的走向，一个是某一步上
+ * 的分叉。混在一列里用户读到"提交申请 → 付款"和"审不审 → 退回"会以为是同一类关系。
+ */
+function edgeRow(edge: { id: string; source: string; target: string; label?: string | null; kind?: string | null }) {
+  return {
+    id: edge.id,
+    text: `${edgeNodeName.value(edge.source)} → ${edgeNodeName.value(edge.target)}`,
+    label: edge.label ?? '',
+    kind: edge.kind ?? 'flow',
+  };
+}
+
+const selectedEdgeRows = computed(() => store.selectedEdges.map(edgeRow));
+
+/** 阶段内部的边（判定节点的「是 / 否」与步骤之间的顺序跳转）。 */
+const selectedInnerEdgeRows = computed(() => store.selectedInnerEdges.map(edgeRow));
+
+/** 两条列表加起来才是"这个节点有几条附加关系"。 */
+const selectedEdgeTotal = computed(
+  () => selectedEdgeRows.value.length + selectedInnerEdgeRows.value.length,
+);
+
+const edgeHint = computed(() => {
+  if (!selected.value) return '';
+  if (!store.content) return '先生成或打开一张导图。';
+  if (store.busy) return '正在生成，完成之后才能加关系。';
+  // 上限**两类各算 200**（判据与 store 的 `connectNodes` 一致）：阶段之间的边与
+  // 某个阶段内部的边是两份独立的账，合计起来算的话，一条吵闹的阶段会先把主轴的
+  // 额度吃光，而两者在画布上的规模本来就不成比例。
+  if (store.contentEdges.length >= 200) return '阶段之间的附加关系已到上限（200 条），请先删掉一些。';
+  if (store.contentInnerEdges.length >= 200) return '阶段内部的附加关系已到上限（200 条），请先删掉一些。';
+  if (!edgeTarget.value) return '选一个终点节点，再点「连一条关系」。';
+  return '关系只画连线，不会改变节点位置。';
+});
+
+/**
+ * 「附加关系」区块的可见性。
+ *
+ * 它此前**一直摆着**：这个区块只对流程图有意义（思维导图与鱼骨图的边为空是正常
+ * 的，不是"这个节点没有关系"），但代码里没有任何判断依据，只能一直显示。加在
+ * `MindMapContent.diagram_type` 上之后，这里才有据可依。
+ *
+ * 两个条件缺一不可：
+ *
+ *   1. 图型是流程图：模型会给边，而用户要能补错的、删画歪的；
+ *   2. **或者手里已经有边**。`diagram_type` 是后加的字段，库里那些旧图缺省是
+ *      `tree`，但用户可能早就手工加过边——只按图型判会让那些边再也删不掉
+ *      （列表与删除按钮都在这个区块里）。
+ *
+ * `?? 'tree'` 不能省：字段缺失（旧图、上一个版本保存的草稿）时读成 `undefined`，
+ * 直接比较会让 `=== 'flowchart'` 之外的一切都落到"没有边就隐藏"这一支，看起来
+ * 恰好也对——但它把"字段缺失"与"明确是 tree"混成了一件事，而将来 `fishbone`
+ * 也要有专属区块时，这个区别就是要害。
+ */
+const showEdgeSection = computed(
+  () => (store.content?.diagram_type ?? 'tree') === 'flowchart'
+    || store.contentEdges.length > 0
+    || store.contentInnerEdges.length > 0,
+);
+
+/**
+ * 保存列表里那一行的规模描述：「6 个一级分支」/「6 根骨」/「4 个阶段」。
+ *
+ * 三种形状的顶层容器是同一个概念（画布上的一块区域），但中文里各有各的量词。
+ * 在这之前这里写的是 `content.root.children.length`——一张鱼骨图打开列表就会炸。
+ */
+function mapShapeLine(content: DiagramContent): string {
+  // 树的"一级分支"是 `root.children`（中心主题是标题，不算一块内容），鱼骨/流程是
+  // 容器本身——两边的口径收在 `shape.topBranchesOf` 一处。
+  const count = topBranchesOf(content).length;
+  return `${count} 个${containerNoun(kindOf(content))}`;
+}
+
+function connectEdge() {
+  const source = selected.value?.node.id;
+  const target = edgeTarget.value;
+  if (!source || !target) return;
+  if (store.connectNodes(source, target, edgeLabel.value, edgeKind.value)) {
+    edgeLabel.value = '';
+    edgeTarget.value = '';
+  }
+}
+
+function disconnectEdge(edgeId: string) {
+  store.deleteEdge(edgeId);
+}
+
+// 换选中节点时清掉上一轮的目标：留着它会让"给甲连到乙"在切到丙之后变成
+// "给丙连到乙"，而用户以为自己点的还是甲。
+watch(() => selected.value?.node.id ?? null, () => {
+  edgeTarget.value = '';
+  edgeLabel.value = '';
+});
+
 /**
  * 「展开这一支」按钮的状态。
  *
@@ -151,8 +306,8 @@ function resetNoteDraft() {
  *     （灰着不解释，用户只会以为功能坏了）；
  *   - 正在展开：转成「展开中…」，同时禁用——重复点击会发两次请求，而第二次
  *     会被 `runGeneration` 的闸门静默丢掉，看起来像"点了没反应"；
- *   - 正在生成 / 编辑：互斥。两轮 agent 运行重叠时后到的那个会清掉前一个的预览
- *     与候选，用户看到的是"之前的进度消失了"。
+ *   - 正在生成 / 编辑：互斥。两轮 agent 运行重叠时后到的那个会清掉前一个的预览，
+ *     用户看到的是"之前的进度消失了"。
  *
  * `unknown` **不禁用**：那正是"旧图，或者上次被额度截断"的情况，按钮可点才有
  * 意义——把不确定当成"到头了"，唯一能继续长的地方就灰掉了。旧图没有这个字段
@@ -163,11 +318,11 @@ const expandState = computed(() => {
   if (!node) return { disabled: true, label: '展开这一支', hint: '' };
   const done = node.expandable === 'no';
   const busyElsewhere = store.agentRunning || store.busy;
-  let hint = '让模型给这个节点补 2–4 个子节点；结果先落候选，确认后才进画布。';
+  let hint = '让模型给这个节点补 2–4 个子节点；结果直接落画布，标成未保存。';
   if (done) {
     hint = '已经到底了：模型说过这个节点没有更细的内容可展开。';
   } else if (store.expanding) {
-    hint = '正在展开这一支，新节点会先出现在候选里。';
+    hint = '正在展开这一支，新节点会边生成边长在画布上。';
   } else if (store.generating) {
     hint = '正在生成，先等这一次跑完再展开。';
   } else if (node.expandable !== 'yes') {
@@ -180,10 +335,50 @@ const expandState = computed(() => {
   };
 });
 
+/**
+ * 「展开这一支」——**带材料**的唯一起点。
+ *
+ * 两处按钮（抽屉里那个、节点工具条上那个）都走这里，不是各自调 `store.expandSelected()`：
+ * 工具条原先自己调的版本没传 `sources`，于是"给旧图新上传一份材料、再点节点上的展开"
+ * 时，请求里只有节点 id，后端只能按 `source_refs` 回查图里的旧引用——新材料这一次
+ * 完全没用上，而界面上材料就在那儿摆着。两条入口各写一遍 = 漏一半，所以只留这一条。
+ *
+ * 材料正文只在本次会话内存里；重新打开旧图时它是空的，后端会按节点的
+ * `source_refs` 从知识库把来源找回来，所以这里照传、传空也不拦。
+ */
 function expandBranch() {
-  // 材料正文只在本次会话内存里；重新打开旧图时它是空的，后端会按节点的
-  // `source_refs` 从知识库把来源找回来，所以这里照传、传空也不拦。
   void store.expandSelected(sources.readySources);
+}
+
+/**
+ * 说一句话的地方只有一处，但它已经不在画布右上角了——`ChatDock.vue`（画布底部那条
+ * 对话框）承担 `create` 与 `edit` 两个意图，文案随状态变，选区该不该带由**看得见的
+ * 徽标**决定。这个组件只负责外壳：顶栏、抽屉、悬浮球、模态与文件。
+ *
+ * 「展开这一支」不并入对话框：那是快捷动作（节点工具条上一枚按钮），不是文字输入。
+ *
+ * 后端 `edit` 意图给的是四个细粒度工具 + 批量 `mindmap_edit`，`create` 只有分片
+ * 生成；两条路的改动都在 `done` 那一刻直接落画布（`commitGenerated`），没有确认步骤。
+ */
+const prefs = usePrefsStore();
+
+
+/** 详情面板的「样式」两个控件：颜色是下拉（只列调色板），图标是一个输入框。 */
+function changeColor(event: Event) {
+  const id = selected.value?.node.id;
+  if (!id) return;
+  const value = (event.target as HTMLSelectElement).value;
+  store.setNodeVisualById(id, { color: value ? (value as (typeof NODE_COLORS)[number]) : null });
+}
+
+function changeIcon(event: Event) {
+  const id = selected.value?.node.id;
+  if (!id) return;
+  const value = (event.target as HTMLInputElement).value;
+  store.setNodeVisualById(id, { icon: value });
+  // 以 store 归一后的值为准（空串→清空、超长→截断），否则框里留着空格，
+  // 界面上却显示"没有图标"——与备注框同一条处理。
+  (event.target as HTMLInputElement).value = store.selectedNode?.node.icon ?? '';
 }
 
 /** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
@@ -387,7 +582,13 @@ const exporting = ref(false);
 // 表现为点了没反应。
 const exportChoice = ref<ExportFormat | ''>('');
 
-/** 浏览器端落盘：三种导出都是纯文本，不需要后端再跑一趟。 */
+/**
+ * 浏览器端落盘：四种导出都是纯文本（JSON 也是），不需要后端再跑一趟。
+ *
+ * 统一用 `text/plain` 而不是给 JSON 单独一个 `application/json`：浏览器只按
+ * 扩展名决定保存的文件名与打开方式，MIME 在这里不影响写盘结果，而多一个分支
+ * 就多一处"两种格式走了不同代码路径"的机会。
+ */
 function saveTextFile(filename: string, text: string): void {
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -435,6 +636,7 @@ function formatTime(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false });
 }
 
+
 /** Ctrl/Cmd+S 保存。画布那边的键盘处理也会收到事件，但 S 不在它的分支里，不冲突。 */
 function onKeydown(event: KeyboardEvent) {
   // 知识库抽屉是模态的：Esc 先关它，Tab 也不能跑到背后的画布上。
@@ -445,6 +647,24 @@ function onKeydown(event: KeyboardEvent) {
       return;
     }
     if (event.key === 'Tab' && trapLibraryFocus(event)) return;
+  }
+  // 偏好浮层盖在抽屉左上角，Esc 关它是这类浮层的默认预期（它不带遮罩，也没有确定按钮）。
+  if (prefsOpen.value && event.key === 'Escape') {
+    event.preventDefault();
+    prefsOpen.value = false;
+    return;
+  }
+  // 左抽屉（`☰`）是覆盖层，不是模态：Esc 收起它。
+  if (historyOpen.value && event.key === 'Escape') {
+    event.preventDefault();
+    historyOpen.value = false;
+    return;
+  }
+  // 右抽屉是覆盖层，不是模态：画布仍然可点，所以只见 Esc 这一条"退出"手势要接住。
+  if (sideOpen.value && event.key === 'Escape') {
+    event.preventDefault();
+    closeSide();
+    return;
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
@@ -465,6 +685,9 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onMounted(() => {
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('beforeunload', onBeforeUnload);
+  // 启动即拉偏好：生成面板的两个下拉要在用户动手之前就填好，否则第一次生成总是
+  // "没带偏好"的那一次——而那正是最该被记住偏好的那一次。
+  void prefs.load();
   void loadVersion();
 });
 
@@ -487,6 +710,7 @@ async function loadVersion() {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('beforeunload', onBeforeUnload);
+  // 计时器必须跟着组件走：它是**展示**用的，没有组件可展示时继续跑只是泄漏。
   if (noticeTimer) clearTimeout(noticeTimer);
 });
 
@@ -517,125 +741,285 @@ async function copyBody() {
     copied.value = '';
   }, 2000);
 }
+
+// ---------------------------------------------------- 侧栏收窄与底部状态行
+//
+// 右栏原来是常驻 320px 的 flex 兄弟节点，它和左侧材料区一起把画布夹在中间，而画布
+// 上还压着一个 400px 的生成框。可那块宽度上的四样东西使用频率完全不同——偏好一次
+// 设置、节点详情按需、原文本来就是抽屉、模型协作只在生成那几十秒里才有意义。所以：
+//
+//   - 常驻宽度只留**一行**（画布底部）：进度 / 结果 / 异常；
+//   - 偏好进顶栏齿轮的浮层；
+//   - 节点详情与改动明细进**覆盖式**右抽屉（沿用原文抽屉那套 `fixed inset-y-0 right-0`）。
+//
+// **抽屉开合不改画布容器尺寸**：它是 `fixed` 覆盖层，不是参与 flex 布局的兄弟节点。
+// 这一点是刻意的——画布变宽不会自动 `fitView`（适配只在初始化、节点数/方向变化时
+// 按条件触发），所以"推挤式"的抽屉恰逢生成时，反而会在节点增长那一刻把视图拽一下。
+
+/** 右抽屉开着没有。默认关：画布默认拿到全部剩余宽度。 */
+const sideOpen = ref(false);
+
+/**
+ * 抽屉里「本次生成明细」那一块展开没有。
+ *
+ * 默认折叠：抽屉打开时用户多半是来看节点详情的，改动清单挡在上面就成了新的遮挡。
+ * 状态行上的「明细」按钮是它的快捷入口——那里点一下，抽屉打开并且这一块展开。
+ */
+const agentDetailOpen = ref(false);
+
+/** `☰` 打开的左抽屉（历史导图 + 原来的顶栏操作）。 */
+const historyOpen = ref(false);
+
+/**
+ * 偏好浮层的开合。
+ *
+ * 浮层本身搬进了 `HistoryDrawer`（齿轮在那儿），这里只留一位状态：Esc 与"点外面关掉"
+ * 由 `App` 统一管——键盘监听与 pointerdown 捕获都挂在 window/document 上，写在抽屉里
+ * 会让它自己也有两份。
+ */
+const prefsOpen = ref(false);
+
+function toggleSide(): void {
+  sideOpen.value = !sideOpen.value;
+}
+
+function closeSide(): void {
+  sideOpen.value = false;
+}
+
+/** 状态行上的「明细」：抽屉打开并直接展开明细，省掉两次点击。 */
+function openAgentDetail(): void {
+  agentDetailOpen.value = true;
+  sideOpen.value = true;
+}
+
+function toggleHistory(): void {
+  historyOpen.value = !historyOpen.value;
+  if (!historyOpen.value) prefsOpen.value = false;
+  // 打开就顺手拉一次列表：抽屉里的"历史导图"不该要求用户先点一次「打开」才出现。
+  // 注意用 `loadMaps()` 而不是 `openList()`——后者会同时把选择模态弹出来，正好盖住抽屉。
+  else void store.loadMaps();
+}
+
+/** 抽屉里那个「打开已保存的导图…」：打开原来的列表模态（选择更清楚，带版本与图型）。 */
+function openHistoryList(): void {
+  void store.openList();
+}
+
+/**
+ * 偏好写失败要主动说一句。
+ *
+ * 面板收进抽屉之后，"保存失败"那一行不再常驻——不主动提示的话，用户点了个勾、
+ * 勾自己弹回原样、然后什么都没有发生。「偏好建议与保存错误要有提醒」就是这条。
+ */
+watch(() => prefs.error, message => {
+  if (message) flash('error', message);
+});
+
+// ---- 新外壳的三件事：历史 / 新对话 / 消息流 ----------------------------------
+
+/** 当前图的来历（原来顶栏那枚徽章，现在在抽屉的状态区里）。 */
+const modeLabel = computed(() => {
+  switch (store.mode) {
+    case 'demo': return '演示模式（非 AI 生成）';
+    case 'model': return '模型生成';
+    case 'saved': return '已保存导图';
+    case 'import': return '导入';
+    default: return '未生成';
+  }
+});
+
+const modeTone = computed(() => {
+  switch (store.mode) {
+    case 'demo': return 'bg-amber-100 text-amber-700';
+    case 'model': return 'bg-emerald-100 text-emerald-700';
+    case 'saved': return 'bg-slate-100 text-slate-600';
+    case 'import': return 'bg-sky-100 text-sky-700';
+    default: return 'bg-slate-100 text-slate-500';
+  }
+});
+
+/** 底部对话框：叫回它、预填一句话（选中节点点「改」走这条）。 */
+const dock = ref<{
+  openComposer: (prefill?: string) => void;
+  openMaterial: () => void;
+  takeDraft: () => string;
+} | null>(null);
+
+function onNodeEdit(label: string): void {
+  dock.value?.openComposer(`关于「${label}」…`);
+}
+
+/**
+ * 悬浮球里的「继续说一句」：把对话框叫回来并关掉消息面板。
+ *
+ * 这是"生成完对话框淡出"之后的主要回程入口。没有它，用户想接着改一句就得先去画布
+ * 上选个节点（那是"改这一支"），或者点 `+`（那会新开一轮、丢掉当前这张图）。
+ */
+function onComposeFromFab(): void {
+  chat.closePanel();
+  dock.value?.openComposer();
+}
+
+/**
+ * 悬浮球里某条用户消息的「改这句」：把原句填回对话框。
+ *
+ * 这是自评里那条顾虑的落地：对话框淡出之后，用户想"改一个词重发"的成本变成
+ * 一次点击——不用先翻历史再重打一遍。
+ */
+function onReuseFromFab(text: string): void {
+  chat.closePanel();
+  dock.value?.openComposer(text);
+}
+
+/**
+ * 用户发出去一句话：立刻记进时间线。
+ *
+ * 记的是**发出去的那句**（`goal`），不是输入框里此刻的内容——对话框随后会收成进度条
+ * 并清空，用户回头要看的正是他刚说的话。
+ */
+function onIntentSubmitted(goal: string): void {
+  chat.said(goal);
+}
+
+/**
+ * 一轮跑完：把模型的答复写进消息流。
+ *
+ * 它承担的正是"生成完对话框就淡出"之后的信息出口：结果好不好、改了几处、走的哪个
+ * 模型、想了什么——全在这里，不用去翻抽屉。
+ */
+watch(
+  () => store.agentRunning,
+  (running, was) => {
+    if (!was || running) return;
+    const summary = store.generatedSummary;
+    if (store.agentError) {
+      chat.replied({
+        text: `这次没成：${store.agentError}`,
+        kind: 'error',
+        model: store.runModel,
+        reasoning: store.lastReasoning || undefined,
+      });
+      return;
+    }
+    if (!summary) return;
+    const partial = store.agentWarnings.find(item => item.kind === 'partial');
+    const bits = [`已落到画布：${summary.nodes} 个节点`];
+    if (summary.changes != null) bits.push(`改了 ${summary.changes} 处`);
+    if (partial) bits.push(`（部分完成：${partial.message}）`);
+    chat.replied({
+      text: bits.join(' · '),
+      kind: partial ? 'partial' : 'done',
+      model: store.runModel,
+      reasoning: store.lastReasoning || undefined,
+      nodes: summary.nodes,
+      changes: summary.changes,
+    });
+  },
+);
+
+/**
+ * `+`：新的一轮。
+ *
+ * 四件事同时发生，缺一件都会让"新对话"看起来没生效：清空画布（`newMap`）、清空
+ * 时间线、把材料与草稿一起清掉、把对话框叫回来放在输入位置。
+ *
+ * **材料为什么要清**：它和主题句一样属于"这一轮的工作台"。留着它的后果不是"多带
+ * 几份材料"，而是下一次生成会拿上一轮的材料当依据——用户点的是"新对话"，画布空着、
+ * 时间线空着，只有材料在暗处延续，他没有任何办法看出来。
+ *
+ * 但材料可能是刚传完、刚解析好几份文件，所以清之前留一句**带撤销**的提示：
+ * 只写"已清空 3 份材料"而不给回去的路，等于让用户确认一次损失再目送它消失。
+ */
+function newConversation(): void {
+  if (!confirmDiscard('开一个新对话')) return;
+  const materials = sources.items.length;
+  const hasMaterialDraft = !!sources.draftText.trim();
+  // 先取走输入框里的那句话：`clear()` 之前要先知道它有没有内容，撤销时要原样放回。
+  const typed = dock.value?.takeDraft() ?? '';
+  // 材料与粘贴框正文是一份整体（含 `files`，失败条目靠它才能重试），一次快照。
+  const stash = materials || hasMaterialDraft ? sources.snapshot() : null;
+
+  sources.clear();
+  sources.draftText = '';
+  store.newMap();
+  chat.clear();
+  historyOpen.value = false;
+  dock.value?.openComposer();
+
+  const what: string[] = [];
+  if (materials) what.push(`${materials} 份材料`);
+  if (hasMaterialDraft) what.push('粘贴框里没添加的正文');
+  if (typed.trim()) what.push('没发出去的那句话');
+  if (!what.length) return;
+  flash('ok', `已清空 ${what.join('、')}`, {
+    label: '撤销',
+    run: () => {
+      if (stash) sources.restore(stash);
+      if (typed) dock.value?.openComposer(typed);
+    },
+  });
+}
+
+/** 抽屉里选一个导出格式：先把值写回，再走原来那条导出。 */
+function onExportFromDrawer(format: ExportFormat): void {
+  exportChoice.value = format;
+  void onExport();
+}
+
+const agentHasDetail = computed(() => agentDetailVisible(store));
 </script>
 
 <template>
   <div class="flex h-full w-full flex-col bg-slate-50 text-slate-900">
-    <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-2">
-      <div class="flex items-center gap-3">
-        <h1 class="text-sm font-semibold">生成式 AI 思维导图</h1>
-        <span
-          v-if="versionLabel"
-          class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-500"
-          :title="`后端版本 ${appVersion}`"
-        >{{ versionLabel }}</span>
-        <div v-if="samples.length" class="flex items-center gap-1 text-xs text-slate-500">
-          <span class="mr-1">布局示例</span>
-          <button
-            v-for="item in samples"
-            :key="item.id"
-            type="button"
-            class="rounded border border-slate-200 px-2 py-0.5 hover:bg-slate-100"
-            @click="loadSample(item.id)"
-          >
-            {{ item.label }}
-          </button>
-        </div>
+    <!--
+      瘦顶栏：**只有三件东西**。左边 `☰` 开历史与全部操作，中间是当前图名（就地改名），
+      右边 `+` 开新的一轮。
+
+      原来那一排（保存 / 演示 / 知识库 / 打开 / 新建 / 导入 / 导出 / 偏好 / 节点详情 /
+      版本号 / 来历徽章）一件没少，全搬进了 `HistoryDrawer`——每一件都还能找到，只是
+      不再天天占着一条横边。顶栏的高度因此从 ~44px 降到 48px 以内，画布多出一整条宽。
+    -->
+    <header class="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-3">
+      <div class="flex min-w-0 flex-1 items-center gap-2">
+        <button
+          type="button"
+          data-test="history-toggle"
+          class="shrink-0 rounded-md border border-slate-200 px-2 py-1 text-slate-600 hover:bg-slate-50"
+          :aria-expanded="historyOpen"
+          aria-controls="history-drawer"
+          aria-label="历史导图与更多操作"
+          title="历史导图与更多操作"
+          @click="toggleHistory"
+        >
+          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" stroke-linecap="round" />
+          </svg>
+        </button>
+        <!-- 标题就是那个"当前图名"，点进去直接改名（#title 一直是同一个输入框）。 -->
+        <input
+          id="title"
+          :value="store.content?.title ?? ''"
+          :placeholder="store.content ? '' : '新对话'"
+          :disabled="!store.content"
+          class="min-w-0 flex-1 truncate rounded border border-transparent bg-transparent px-1 py-0.5 text-sm font-medium text-slate-800 outline-none hover:border-slate-200 focus:border-slate-400 disabled:text-slate-400"
+          aria-label="导图标题"
+          @input="onTitleInput"
+          @change="commitTitle"
+          @blur="store.setTitleDraft(null)"
+        />
       </div>
-      <div class="flex items-center gap-3 text-xs text-slate-500">
-        <span v-if="saveHint" :class="store.dirty ? 'text-amber-600' : 'text-slate-400'">
-          {{ saveHint }}
-        </span>
-        <button
-          type="button"
-          class="rounded-md bg-slate-900 px-3 py-1.5 text-xs text-white disabled:opacity-40"
-          :disabled="!store.content || store.saving"
-          title="保存（Ctrl+S）"
-          @click="saveNow"
-        >
-          保存
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
-          @click="openDemoPresets"
-        >
-          演示示例
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
-          @click="openLibrary"
-        >
-          知识库
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 disabled:opacity-40"
-          :disabled="store.listBusy"
-          @click="store.openList()"
-        >
-          打开
-        </button>
-        <button
-          type="button"
-          class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700"
-          @click="newMap"
-        >
-          新建
-        </button>
-        <select
-          v-model="exportChoice"
-          class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 disabled:opacity-40"
-          :disabled="!store.content || exporting"
-          title="导出为文本格式"
-          @change="onExport"
-        >
-          <option value="" hidden>{{ exporting ? '导出中…' : '导出' }}</option>
-          <option value="puml">PlantUML</option>
-          <option value="markdown">Markdown</option>
-          <option value="opml">OPML（XMind）</option>
-        </select>
-        <p>
-          <span v-if="store.mode === 'demo'" class="rounded bg-amber-100 px-2 py-0.5 text-amber-700">
-            演示模式（非 AI 生成）
-          </span>
-          <span v-else-if="store.mode === 'model'" class="rounded bg-emerald-100 px-2 py-0.5 text-emerald-700">
-            模型生成
-          </span>
-          <span v-else-if="store.mode === 'saved'" class="rounded bg-slate-100 px-2 py-0.5 text-slate-600">
-            已保存导图
-          </span>
-          <span v-else>未生成</span>
-          <span class="ml-3">{{ store.nodeCount }} 个节点</span>
-        </p>
-      </div>
+      <button
+        type="button"
+        data-test="new-run"
+        class="shrink-0 rounded-md bg-slate-900 px-2.5 py-1 text-xs text-white hover:bg-slate-800"
+        aria-label="新对话"
+        title="新对话（清空画布，开新的一轮）"
+        @click="newConversation"
+      >+</button>
     </header>
 
-    <main class="flex min-h-0 flex-1">
-      <section class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-white p-4">
-        <div class="flex flex-col gap-1">
-          <label for="title" class="text-xs font-medium text-slate-600">
-            导图标题 <span class="font-normal text-slate-400">· 只改名，不重新生成</span>
-          </label>
-          <input
-            v-if="store.content"
-            id="title"
-            :value="store.content.title"
-            class="rounded-md border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-slate-500"
-            @input="onTitleInput"
-            @change="commitTitle"
-            @blur="store.setTitleDraft(null)"
-          />
-          <p v-else class="text-xs text-slate-400">生成或新建之后可以改标题</p>
-        </div>
-
-        <SourceInputs :confirm-discard="confirmDiscard" />
-
-        <p class="mt-auto text-xs leading-relaxed text-slate-400">
-          双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销、Ctrl+Shift+Z 重做。
-        </p>
-      </section>
+    <main class="relative flex min-h-0 flex-1">
 
       <section class="relative min-w-0 flex-1">
         <div class="absolute left-4 top-4 z-10 flex gap-1 rounded-md border border-slate-200 bg-white p-1 shadow-sm">
@@ -670,11 +1054,106 @@ async function copyBody() {
           </button>
         </div>
         <MindMapCanvas />
+
+        <!--
+          选中节点旁浮出的工具条（`[改][展开][删][色]`）。它读画布 DOM 定位，
+          不改动一个像素的渲染——"点节点要求 AI 修改"这条需求的落点就在这里。
+        -->
+        <NodeToolbar @edit="onNodeEdit" @expand="expandBranch" />
+
+        <!--
+          底部对话框。**生成中**收成一条细进度、**生成完**淡出，只剩画布 + 悬浮球；
+          失败 / 有草稿 / 画布还空着时留着（判据在 `ChatDock.shouldKeep`）。
+        -->
+        <ChatDock ref="dock" @detail="openAgentDetail" @submit="onIntentSubmitted" />
+
+        <!-- 右下角悬浮球：未读角标 + 消息时间线（生成完对话框消失之后的信息出口）。
+             `@compose` 把对话框叫回来——那是淡出之后"再说一句"的入口。 -->
+        <MessageFab @compose="onComposeFromFab" @reuse="onReuseFromFab" />
       </section>
 
-      <aside class="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l border-slate-200 bg-white p-4">
-        <AgentPanel />
-        <template v-if="selected">
+      <!--
+        `☰` 打开的左抽屉：历史导图 + 原来顶栏那一排按钮。
+        与右抽屉同一个套路——`absolute` 相对 `<main>`，不盖住顶栏（那个开关必须一直点得到）。
+      -->
+      <HistoryDrawer
+        :open="historyOpen"
+        :confirm-discard="confirmDiscard"
+        :exporting="exporting"
+        :export-choice="exportChoice"
+        :save-hint="saveHint"
+        :version-label="versionLabel"
+        :mode-label="modeLabel"
+        :mode-tone="modeTone"
+        :node-count="store.nodeCount"
+        :side-open="sideOpen"
+        :samples="samples"
+        @close="historyOpen = false"
+        @save="saveNow"
+        @new-map="newMap"
+        @open-list="openHistoryList"
+        @open-map="openSaved"
+        @demo="openDemoPresets"
+        @library="openLibrary"
+        @export="onExportFromDrawer"
+        @update-export="value => exportChoice = value"
+        @load-sample="loadSample"
+        @toggle-side="toggleSide"
+        @prefs-open="value => prefsOpen = value"
+      />
+
+      <!--
+        右抽屉：**覆盖式**，不参与主区的 flex 布局。
+
+        它取代了原来那个常驻 320px 的右栏。四块内容没有变少，只是改成了"要看的时候
+        才占屏幕"，而且占的是盖在画布上的那一层——**画布宽度一点都没变**。
+
+        刻意不设 `role="dialog"` / `aria-modal`：它不是模态。画布仍然可点、可拖、可以
+        继续选节点（选完这里的详情跟着变），这正是"覆盖而不是推挤"的好处，也是它与
+        原文抽屉、知识库抽屉的区别——那两个是"看图之外的另一件事"。
+
+        `absolute` 挂着而不是 `fixed`：它相对的是 `<main>`，于是**不盖住顶栏**——
+        那个开关按钮必须始终点得到（"点开、再点收起"，不能被自己打开的东西挡住）。
+      -->
+      <aside
+        v-show="sideOpen"
+        id="side-panel"
+        data-test="side-panel"
+        aria-label="节点详情与本次改动"
+        class="absolute inset-y-0 right-0 z-30 flex w-[360px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl"
+      >
+        <div class="flex items-center justify-between border-b border-slate-200 px-4 py-2">
+          <p class="text-xs font-semibold text-slate-700">节点详情与本次改动</p>
+          <button
+            type="button"
+            data-test="side-close"
+            class="text-xs text-slate-500 hover:text-slate-900"
+            title="关闭（Esc）"
+            @click="closeSide"
+          >关闭</button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+          <!--
+            本次生成的明细（工具进度、改动清单、诊断、预览、冲突裁决）。
+
+            默认折叠：打开抽屉时多半是来看节点详情的，一份改动清单挡在上面就成了新的
+            遮挡。状态行上的「明细」按钮会把它撑开——那里是"我关心这次改了什么"的入口。
+          -->
+          <details
+            v-if="agentHasDetail"
+            :open="agentDetailOpen"
+            data-test="agent-detail"
+            class="text-xs"
+            @toggle="agentDetailOpen = ($event.target as HTMLDetailsElement).open"
+          >
+            <summary class="cursor-pointer rounded-md border border-slate-200 bg-slate-50 px-2 py-1 font-medium text-slate-600">
+              本次生成明细
+            </summary>
+            <div class="mt-2"><AgentPanel /></div>
+          </details>
+
+          <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
           <!-- 标题：与画布上那颗节点是同一段文字（双击节点改的就是它） -->
           <h2 class="text-sm font-semibold">
@@ -696,7 +1175,7 @@ async function copyBody() {
           <!--
             按需展开：初次只出 4 层，往下的内容由用户点哪个节点就展开哪个。
             走的是与生成同一条 `/api/agent/runs/stream`（intent=expand），
-            结果同样是**候选**——确认与版本检查一步都没少。
+            结果同样直接落画布——版本检查与冲突裁决一步都没少。
           -->
           <section class="flex flex-col gap-1" aria-label="展开这一支">
             <button
@@ -710,7 +1189,53 @@ async function copyBody() {
             <p class="text-xs leading-relaxed text-slate-400">{{ expandState.hint }}</p>
           </section>
 
-          <label class="flex flex-1 flex-col gap-1">
+          <!--
+            样式：语义色 + 图标。两个值都可选、缺省为空（"默认"）。
+            颜色只给调色板里的键——不是取色器。理由与契约那边一致：任意 hex 会
+            得到一堆脏色，而且换主题（暗色/亮色）时无法自动适配；键是语义，
+            色值在 CSS 变量里（`styles.css`），换主题只改那一处。
+            图标是**一个 emoji**：前端没有图标库，为一个纯装饰字段新增依赖不划算。
+          -->
+          <section class="flex flex-col gap-1" aria-label="节点样式">
+            <h3 class="text-xs font-medium text-slate-500">样式</h3>
+            <div class="flex items-center gap-2">
+              <select
+                aria-label="节点颜色"
+                class="min-w-0 flex-1 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700"
+                :value="selected.node.color ?? ''"
+                @change="changeColor"
+              >
+                <option value="">默认（无色）</option>
+                <option v-for="key in NODE_COLORS" :key="key" :value="key">
+                  {{ NODE_COLOR_LABELS[key] }}
+                </option>
+              </select>
+              <input
+                aria-label="节点图标"
+                class="w-16 rounded-md border border-slate-300 px-2 py-1.5 text-center text-xs text-slate-700"
+                :value="selected.node.icon ?? ''"
+                :maxlength="16"
+                placeholder="🎯"
+                title="一个 emoji；清空表示去掉图标"
+                @change="changeIcon"
+              />
+            </div>
+            <p class="text-[11px] leading-relaxed text-slate-400">
+              颜色只收预设的 8 个语义色（换主题时自动适配）；图标是一个 emoji。生成时只有一级分支会带这两个值。
+            </p>
+            <!--
+              继承规则必须写出来，否则这里会成为一处"看起来坏了"的地方：给一个二级
+              节点选「默认（无色）」之后它**仍然是带色的**（继承上级），用户会以为
+              选择没生效。说清"下级选默认 = 继承"比让那条下拉自己解释要省事。
+            -->
+            <p class="text-[11px] leading-relaxed text-slate-400">
+              一级分支定了颜色，它的所有下级都跟着用这个色（在这里改一级分支，整支一起变）；下级节点选「默认」表示继承上级。
+            </p>
+          </section>
+
+          <!-- 备注框不再用 `flex-1` 争抢高度：抽屉的滚动容器里没有"剩余高度"可分，
+               那会让滚动区忽高忽低；固定 `min-h-24` + 可拖拽更可预测。 -->
+          <label class="flex flex-col gap-1">
             <span class="text-xs text-slate-400">
               我的备注 {{ noteLength }} / 2000
               <span v-if="!(selected.node.note ?? '').trim()">· 现在是空的，不影响详情与导出</span>
@@ -730,24 +1255,172 @@ async function copyBody() {
             <h3 class="text-xs font-medium text-slate-500">来源引用（{{ selectedRefs.length }}）</h3>
             <ul class="flex flex-col gap-1.5">
               <li v-for="(item, index) in selectedRefs" :key="`${item.ref.source_id}-${index}`">
-                <button
-                  type="button"
-                  class="w-full rounded-md border border-slate-200 px-2 py-1.5 text-left hover:border-slate-300 hover:bg-slate-50"
-                  @click="activeRef = item"
-                >
-                  <span class="block truncate text-xs text-slate-600">
-                    {{ item.name }}<span v-if="item.where"> · {{ item.where }}</span>
-                  </span>
-                  <span class="mt-0.5 line-clamp-2 block text-xs leading-relaxed text-slate-500">
-                    {{ item.quote || '（这条引用没有摘录）' }}
-                  </span>
-                </button>
+                <div class="rounded-md border border-slate-200 px-2 py-1.5 hover:border-slate-300 hover:bg-slate-50">
+                  <!--
+                    有原文地址的来源（外部检索的维基条目 / arXiv 论文）名字就是链接：
+                    用户读完这句可以直接去核对出处，而不是只能在抽屉里看一段没有上下文的
+                    摘录。没有地址时保持原来的样子（点开抽屉），不给一个点不动的假链接。
+                  -->
+                  <a
+                    v-if="item.url"
+                    :href="item.url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="block truncate text-xs text-sky-700 underline decoration-sky-300 underline-offset-2 hover:text-sky-900"
+                    :title="`在新窗口打开原文：${item.url}`"
+                  >
+                    {{ item.name }}<span v-if="item.where" class="text-slate-500"> · {{ item.where }}</span>
+                  </a>
+                  <button
+                    v-else
+                    type="button"
+                    class="w-full text-left"
+                    @click="activeRef = item"
+                  >
+                    <span class="block truncate text-xs text-slate-600">
+                      {{ item.name }}<span v-if="item.where"> · {{ item.where }}</span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    class="mt-0.5 block w-full text-left"
+                    @click="activeRef = item"
+                  >
+                    <span class="line-clamp-2 block text-xs leading-relaxed text-slate-500">
+                      {{ item.quote || '（这条引用没有摘录）' }}
+                    </span>
+                  </button>
+                </div>
               </li>
             </ul>
           </section>
           <p v-else class="border-t border-slate-200 pt-3 text-xs text-slate-400">
             这个节点没有来源引用。
           </p>
+
+          <!--
+            附加关系（流程图的条件分支 / 汇合 / 回退）。
+
+            这一段是**唯一**的手工补边入口：模型只在 flowchart 生成时给边，
+            而它给错的那些（比如画到了错的出口、或者本该是顺序却标成了回退）
+            没有别的地方能改。删边同样在这里——画布上点线不做选中，因为节点
+            已经有选中态了，两套选中语义混在一起会让「Delete 删什么」变得不可预测。
+
+            **两层分开列**：`FlowContent.edges`（阶段之间，端点用阶段 id）与
+            `FlowStage.edges`（阶段内部，端点用该阶段的节点 id）是两个数组、两个
+            命名空间。合成一列的话，"审不审 → 退回（否）"与"提交申请 → 付款"长得
+            一样，而它们在这张图里是两件不同的事：一个是主干走向，一个是某一步上的
+            分叉。删除按钮两边都有——只列不删等于把用户引进一个死胡同。
+
+            `v-if` 的依据是产物自己的 `diagram_type`（见 `showEdgeSection`）：
+            对思维导图与鱼骨图来说，"没有附加关系"不是缺陷而是定义。
+          -->
+          <section
+            v-if="showEdgeSection"
+            class="flex flex-col gap-2 border-t border-slate-200 pt-3"
+            aria-label="附加关系"
+          >
+            <h3 class="text-xs font-medium text-slate-500">
+              附加关系（{{ selectedEdgeTotal }}）
+            </h3>
+            <!--
+              两组分开列。第一组是**阶段之间**的跳转（端点存在阶段 id 上），第二组
+              是**阶段内部**的判定出边（端点存在该阶段的节点 id 上）。合成一列的话，
+              "审不审 → 退回（否）"与"提交申请 → 付款"长得一模一样，而它们在这张图里
+              是两件不同的事：一个是主干的走向，一个是某一步上的分叉。
+            -->
+            <div v-if="selectedEdgeRows.length" class="flex flex-col gap-1">
+              <p v-if="selectedInnerEdgeRows.length" class="text-[11px] text-slate-400">阶段之间</p>
+              <ul class="flex flex-col gap-1">
+                <li
+                  v-for="row in selectedEdgeRows"
+                  :key="row.id"
+                  class="flex items-center gap-2 rounded-md border border-slate-200 px-2 py-1"
+                  :class="row.kind === 'loop' ? 'border-amber-200 bg-amber-50' : ''"
+                >
+                  <span class="min-w-0 flex-1 truncate text-xs text-slate-700" :title="row.text">
+                    {{ row.text }}
+                    <span v-if="row.label" class="text-slate-500">（{{ row.label }}）</span>
+                  </span>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                    :title="`删除这条关系（${row.id}）`"
+                    @click="disconnectEdge(row.id)"
+                  >
+                    删除
+                  </button>
+                </li>
+              </ul>
+            </div>
+            <div v-if="selectedInnerEdgeRows.length" class="flex flex-col gap-1">
+              <p class="text-[11px] text-slate-400">阶段内部（判定出口）</p>
+              <ul class="flex flex-col gap-1">
+                <li
+                  v-for="row in selectedInnerEdgeRows"
+                  :key="row.id"
+                  class="flex items-center gap-2 rounded-md border border-dashed border-slate-200 px-2 py-1"
+                  :class="row.kind === 'loop' ? 'border-amber-200 bg-amber-50' : ''"
+                >
+                  <span class="min-w-0 flex-1 truncate text-xs text-slate-700" :title="row.text">
+                    {{ row.text }}
+                    <span v-if="row.label" class="text-slate-500">（{{ row.label }}）</span>
+                  </span>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                    :title="`删除这条关系（${row.id}）`"
+                    @click="disconnectEdge(row.id)"
+                  >
+                    删除
+                  </button>
+                </li>
+              </ul>
+            </div>
+            <p v-if="!selectedEdgeTotal" class="text-xs text-slate-400">
+              这个节点没有附加关系。流程图里的条件分支与回退线都记在这里。
+            </p>
+
+            <div class="flex items-center gap-1">
+              <select
+                v-model="edgeTarget"
+                aria-label="关系终点"
+                class="min-w-0 flex-1 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700"
+              >
+                <option value="">连到哪个节点…</option>
+                <option v-for="item in edgeTargets" :key="item.id" :value="item.id">
+                  {{ '·'.repeat(item.depth) }} {{ item.label }}
+                </option>
+              </select>
+              <select
+                v-model="edgeKind"
+                aria-label="关系类型"
+                class="w-24 shrink-0 rounded-md border border-slate-300 bg-white px-1 py-1.5 text-xs text-slate-700"
+              >
+                <option v-for="kind in EDGE_KINDS" :key="kind" :value="kind">
+                  {{ EDGE_KIND_LABELS[kind] }}
+                </option>
+              </select>
+            </div>
+            <div class="flex items-center gap-1">
+              <input
+                v-model="edgeLabel"
+                aria-label="关系说明"
+                class="min-w-0 flex-1 rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-700"
+                :maxlength="40"
+                placeholder="边上的文字：是 / 否 / 驳回"
+              />
+              <button
+                type="button"
+                class="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                :disabled="!edgeTarget || store.busy"
+                @click="connectEdge"
+              >
+                连一条关系
+              </button>
+            </div>
+            <p class="text-[11px] leading-relaxed text-slate-400">{{ edgeHint }}</p>
+          </section>
           <div class="grid grid-cols-2 gap-2">
             <button
               type="button"
@@ -773,7 +1446,7 @@ async function copyBody() {
             <button
               type="button"
               class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
-              :disabled="selected.node.id === store.content?.root.id"
+              :disabled="store.isContainerRootId(selected.node.id)"
               @click="store.deleteNode(selected.node.id)"
             >
               删除（Delete）
@@ -796,7 +1469,9 @@ async function copyBody() {
             点击画布上的任意节点查看完整内容与它所在的层级路径；双击节点可以直接改文字。
           </p>
         </template>
-        <details v-if="store.content?.source_usage?.length" class="mt-auto border-t border-slate-200 pt-3 text-xs text-slate-600" open>
+        <!-- 本图来源：整图口径的来源清单，与各节点自己的引用互为对照。
+             它留在抽屉最底部——它属于"这张图整体"的信息，与节点详情不同层级。 -->
+        <details v-if="store.content?.source_usage?.length" class="border-t border-slate-200 pt-3 text-xs text-slate-600" open>
           <summary class="cursor-pointer font-medium">本图来源（{{ store.content.source_usage.length }}）</summary>
           <ul class="mt-2 flex flex-col gap-2">
             <li v-for="(source, index) in store.content.source_usage" :key="source.source_id" class="break-words">
@@ -810,18 +1485,27 @@ async function copyBody() {
           </ul>
           <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源（整图口径），具体出处见各节点的引用；原文未随导图保存。</p>
         </details>
+        </div>
       </aside>
     </main>
 
-    <!-- 导出等一次性操作的结果浮层；错误停 6 秒，成功 3 秒。 -->
+    <!-- 导出等一次性操作的结果浮层；错误停 6 秒，成功 3 秒，带撤销的那条 8 秒。 -->
     <div
       v-if="notice"
-      class="fixed bottom-6 left-1/2 z-50 max-w-[90vw] -translate-x-1/2 rounded-md px-4 py-2 text-sm shadow-lg"
+      data-test="notice"
+      class="fixed bottom-6 left-1/2 z-50 flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-md px-4 py-2 text-sm shadow-lg"
       :class="notice.kind === 'error' ? 'bg-rose-600 text-white' : 'bg-slate-900 text-white'"
       :role="notice.kind === 'error' ? 'alert' : 'status'"
       aria-live="polite"
     >
-      {{ notice.text }}
+      <span class="min-w-0">{{ notice.text }}</span>
+      <button
+        v-if="notice.action"
+        type="button"
+        data-test="notice-action"
+        class="shrink-0 rounded border border-white/40 px-2 py-0.5 text-xs hover:bg-white/10"
+        @click="notice.action?.run(); notice = null"
+      >{{ notice.action.label }}</button>
     </div>
 
     <!--
@@ -1055,7 +1739,7 @@ async function copyBody() {
             <div class="min-w-0">
               <p class="truncate text-sm text-slate-800">{{ item.content.title }}</p>
               <p class="text-xs text-slate-400">
-                版本 {{ item.version }} · {{ item.content.root.children.length }} 个一级分支 ·
+                版本 {{ item.version }} · {{ mapShapeLine(item.content) }} ·
                 {{ formatTime(item.updated_at) }}
               </p>
             </div>

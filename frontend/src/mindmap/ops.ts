@@ -1,12 +1,27 @@
 import type {
+  DiagramContent,
+  MindEdge,
   MindMapContent,
   MindMapOp,
   MindNode,
+  NodeColor,
   OpBatch,
   SourceRef,
-  SourceUsage,
 } from '../api/types';
-import { charLength, cloneTree, findNode, findParent, LIMITS, removeNode } from './edits';
+import {
+  charLength,
+  cloneTree,
+  EDGE_KINDS,
+  findNode,
+  findParent,
+  isNodeColor,
+  LIMITS,
+  NODE_COLORS,
+  pruneDanglingRefs,
+  removeNode,
+  subtreeIds,
+} from './edits';
+import { containersOf, isFlow, isTree, replaceContainer, rootsOf, walkNodes } from './shape';
 
 /**
  * 导图操作执行器（前端侧）。
@@ -17,7 +32,7 @@ import { charLength, cloneTree, findNode, findParent, LIMITS, removeNode } from 
  * 需要契约类型的地方继续从本文件 import 也可以——下面做了 re-export，
  * 现有调用方的路径不用改。
  */
-export type { AddOp, MindMapOp, MoveOp, OpBatch, RemoveOp, UpdateOp } from '../api/types';
+export type { AddEdgeOp, AddOp, MindMapOp, MoveOp, OpBatch, RemoveEdgeOp, RemoveOp, UpdateOp } from '../api/types';
 
 /** 单个 op 失败。`path` 形如 `ops.2.id`，会作为工具结果回给模型。 */
 export class OpError extends Error {
@@ -31,8 +46,8 @@ export class OpError extends Error {
   }
 }
 
-export interface ApplyResult {
-  content: MindMapContent;
+export interface ApplyResult<T extends DiagramContent = DiagramContent> {
+  content: T;
   /** 被改动的节点 id，用于引用重校验与局部刷新。 */
   changed_ids: string[];
 }
@@ -101,16 +116,23 @@ function insertChildAt(root: MindNode, parentId: string, index: number, child: M
 }
 
 /**
- * 整批 op 执行完后的整树校验。
+ * 整批 op 执行完后的**整份内容**校验。
  *
  * 为什么放在最后而不是每条 op 里：add/move 单条合法、合起来越界的组合很常见
- * （比如一条 batch 里补 30 个节点），逐条校验会在中途误报；但整批交付的树
+ * （比如一条 batch 里补 30 个节点），逐条校验会在中途误报；但整批交付的内容
  * 一旦越界，后端 Pydantic 会 422，所以这里必须兜住。
  *
  * 失败一律抛 `tree_invalid` + path `ops`：没有任何一条 op 能单独定位到问题，
  * 硬塞一个下标只会误导模型去改一条本来正确的 op。
+ *
+ * ## 三种形状共用这一份
+ *
+ * 判据与后端三处 validator 逐条对齐：节点 id 在**所有容器之间**唯一、节点总数按
+ * 合计算、层号按每棵子树各自从 1 数（`_scan_tree` 一条 `seen` 穿到底就是这么做的）；
+ * 边的端点命名空间随形状走——树是节点 id，流程是**阶段 id**，鱼骨没有边。
  */
-function assertTreeValid(root: MindNode, sourceUsage: SourceUsage[]): void {
+function assertContentValid(content: DiagramContent): void {
+  const sourceUsage = content.source_usage ?? [];
   const invalid = (message: string): never => {
     throw new OpError('tree_invalid', 'ops', message);
   };
@@ -120,49 +142,201 @@ function assertTreeValid(root: MindNode, sourceUsage: SourceUsage[]): void {
   // 的反馈继续改了。
   const allowedSources = new Set(sourceUsage.map(item => item.source_id));
   const seen = new Set<string>();
-  const stack: Array<{ node: MindNode; depth: number }> = [{ node: root, depth: 1 }];
 
-  while (stack.length > 0) {
-    const { node, depth } = stack.pop()!;
+  for (const root of rootsOf(content)) {
+    const stack: Array<{ node: MindNode; depth: number }> = [{ node: root, depth: 1 }];
 
-    if (seen.has(node.id)) invalid(`节点 ID 必须唯一，重复的是 ${node.id}`);
-    seen.add(node.id);
-    if (seen.size > LIMITS.nodes) invalid(`导图最多 ${LIMITS.nodes} 个节点`);
-    if (depth > LIMITS.depth) invalid(`导图最多 ${LIMITS.depth} 层`);
+    while (stack.length > 0) {
+      const { node, depth } = stack.pop()!;
 
-    // 非空按 trim 后的值判；长度按**原始** label 算——后端 `Field(max_length=200)`
-    // 量的也是原始值，前端用 trim 后的长度会把「200 字 + 一个尾随空格」放过去，
-    // 下一次保存就被 422 打回。
-    const label = node.label.trim();
-    if (!label) invalid(`节点 ${node.id} 的标题不能为空`);
-    if (charLength(node.label) > LIMITS.label) {
-      invalid(`节点 ${node.id} 的标题超过 ${LIMITS.label} 个字`);
-    }
-    if (node.children.length > LIMITS.children) {
-      invalid(`节点 ${node.id} 最多 ${LIMITS.children} 个子节点`);
-    }
-    for (const ref of node.source_refs ?? []) {
-      if (!allowedSources.has(ref.source_id)) {
-        invalid(`节点 ${node.id} 引用的来源 ${ref.source_id} 不在 source_usage 中`);
+      if (seen.has(node.id)) invalid(`节点 ID 必须唯一，重复的是 ${node.id}`);
+      seen.add(node.id);
+      if (seen.size > LIMITS.nodes) invalid(`导图最多 ${LIMITS.nodes} 个节点`);
+      if (depth > LIMITS.depth) invalid(`导图最多 ${LIMITS.depth} 层`);
+
+      // 非空按 trim 后的值判；长度按**原始** label 算——后端 `Field(max_length=200)`
+      // 量的也是原始值，前端用 trim 后的长度会把「200 字 + 一个尾随空格」放过去，
+      // 下一次保存就被 422 打回。
+      const label = node.label.trim();
+      if (!label) invalid(`节点 ${node.id} 的标题不能为空`);
+      if (charLength(node.label) > LIMITS.label) {
+        invalid(`节点 ${node.id} 的标题超过 ${LIMITS.label} 个字`);
       }
-      // 与 SourceRef.validate_range 同口径：start / end 要么都给、要么都不给，
-      // 且区间不能为空（end 必须严格大于 start）。
-      const start = ref.start ?? null;
-      const end = ref.end ?? null;
-      if ((start === null) !== (end === null)) {
-        invalid(`节点 ${node.id} 的引用 start 和 end 必须同时提供`);
+      if (node.children.length > LIMITS.children) {
+        invalid(`节点 ${node.id} 最多 ${LIMITS.children} 个子节点`);
       }
-      if (start !== null && end !== null && end <= start) {
-        invalid(`节点 ${node.id} 的引用 end 必须大于 start`);
+      // 视觉元素：`color` 只收调色板键（后端是 `Literal`，非法值会 422）。
+      // 与 `add` 那条入口的校验同一口径：走到整树兜底还留着非法值，说明有一条
+      // 写入路径绕过了 op 层的检查——那时报错比把它画成一个灰点好。
+      if (node.color != null && !isNodeColor(node.color)) {
+        invalid(`节点 ${node.id} 的颜色不在调色板里（${NODE_COLORS.join('/')}）`);
       }
-    }
+      if (node.icon != null && (!node.icon.trim() || charLength(node.icon) > LIMITS.icon)) {
+        invalid(`节点 ${node.id} 的图标应为 1–${LIMITS.icon} 个字符`);
+      }
+      for (const ref of node.source_refs ?? []) {
+        if (!allowedSources.has(ref.source_id)) {
+          invalid(`节点 ${node.id} 引用的来源 ${ref.source_id} 不在 source_usage 中`);
+        }
+        // 与 SourceRef.validate_range 同口径：start / end 要么都给、要么都不给，
+        // 且区间不能为空（end 必须严格大于 start）。
+        const start = ref.start ?? null;
+        const end = ref.end ?? null;
+        if ((start === null) !== (end === null)) {
+          invalid(`节点 ${node.id} 的引用 start 和 end 必须同时提供`);
+        }
+        if (start !== null && end !== null && end <= start) {
+          invalid(`节点 ${node.id} 的引用 end 必须大于 start`);
+        }
+      }
 
-    for (const child of node.children) stack.push({ node: child, depth: depth + 1 });
+      for (const child of node.children) stack.push({ node: child, depth: depth + 1 });
+    }
+  }
+
+  // 附加边：只拦后端会硬拒的那两种（dangling / 自环），与契约
+  // `MindMapContent.validate_tree` 同口径。条数与环长不拦——它们在后端是 warn，
+  // 前端拦下来会让一张 250 条边的旧图再也存不回去。
+  //
+  // 端点按**形状自己的命名空间**查：流程的边连的是阶段（`s_…`），拿节点 id 去查
+  // 会把每一条合法的阶段跳转判成 dangling。
+  const edgeSpace = isFlow(content) ? new Set(containersOf(content).map(c => c.id)) : seen;
+  const edgeName = isFlow(content) ? '阶段' : '节点';
+  const edges = 'edges' in content ? content.edges ?? [] : [];
+  const edgeIds = new Set<string>();
+  for (const edge of edges) {
+    if (edgeIds.has(edge.id)) invalid(`边 ID 必须唯一，重复的是 ${edge.id}`);
+    edgeIds.add(edge.id);
+    if (!edgeSpace.has(edge.source)) {
+      invalid(`边 ${edge.id} 的起点${edgeName} ${edge.source} 不在导图中`);
+    }
+    if (!edgeSpace.has(edge.target)) {
+      invalid(`边 ${edge.id} 的终点${edgeName} ${edge.target} 不在导图中`);
+    }
+    if (edge.source === edge.target) invalid(`边 ${edge.id} 的起点与终点不能是同一个节点`);
+    if (charLength(edge.label ?? '') > LIMITS.edgeLabel) {
+      invalid(`边 ${edge.id} 的文字超过 ${LIMITS.edgeLabel} 个字`);
+    }
   }
 }
 
 /**
  * 按序执行一整批 op，返回新内容与被触及的 id。
+ *
+ * **树走原路**（`applyOpsOnTree`，逐字节等于阶段 2 之前的那份实现），鱼骨与流程
+ * 借道同一条路：把命中的那棵子树当作一棵临时树的根跑一遍，再把结果写回原位
+ * （镜像后端 `tools._apply_ops_any`）。原子性与 id 规范化因此仍然只有一份实现——
+ * "失败一个 op 都不落"这件事不该被实现三遍。
+ *
+ * **一批 op 只允许落在一棵子树里**（一根骨 / 一个阶段）。跨子树的搬动在数据上
+ * 没有"它该属于哪根骨"的确定答案：那是三套结构各自的语义，属于阶段 3。这里明确
+ * 报 `cross_container` 而不是猜一个位置——猜错的后果是内容静默地换了骨，而那种
+ * 错位事后没人看得出来。
+ *
+ * 一个已知的口径缺口（**后端已经补上，这里还没跟**）：非树路径只把 `root` 写回原位，
+ * 临时树上的 `edges` 不落回内容。后端那边现在按层级判（`ops.resolve_flow_edge_placement`：
+ * 两个阶段 id → `FlowContent.edges`，同阶段两个节点 → `FlowStage.edges`），所以
+ * **`edit` 意图在流程图上能连出阶段内的边**。
+ *
+ * 这里不跟的理由是这条路当前不可达：`stores/mindmap.ts::runGeneration` 在非树内容上
+ * 直接拒绝 `expand` / `edit`（后端 `AgentRunRequest.snapshot` 收的是三种形状，但
+ * 前端那一层先拦了，给的是人话）。前端 `ops.ts` 只用于镜像"生成过程中收到的 op 批
+ * 次"，而那条路上不会有流程图。要放开那条闸门时，这里必须一起改——否则模型发来的
+ * `add_edge` 会在这层被静默丢掉，画布与后端候选图不一致。
+ */
+/** 树上的调用点（含既有用例）拿到的仍是 `MindMapContent`，`content.root` 照旧可用。 */
+export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult<MindMapContent>;
+export function applyOps(content: DiagramContent, batch: OpBatch): ApplyResult<DiagramContent>;
+export function applyOps(content: DiagramContent, batch: OpBatch): ApplyResult {
+  if (isTree(content)) return applyOpsOnTree(content, batch);
+
+  const ids = opTargetIds(batch);
+  const holders = holdersOf(content, ids);
+  if (holders.length === 0) {
+    throw new OpError(
+      'node_not_found', 'ops',
+      '这一批操作提到的节点都不在当前导图里（鱼骨图与流程图按骨/阶段分片，'
+      + '改之前先确认节点 id 取自这份导图）',
+    );
+  }
+  if (holders.length > 1) {
+    const names = holders.slice(0, 5)
+      .map(({ id }) => containersOf(content).find(item => item.id === id)?.label ?? id)
+      .join('、');
+    throw new OpError(
+      'cross_container', 'ops',
+      `这一批操作跨了 ${holders.length} 处（${names}）：鱼骨图的每一根骨、流程图的`
+      + '每一个阶段是一棵独立的子树，一次只能改其中一处；请拆成几批',
+    );
+  }
+
+  const rootId = holders[0].id;
+  const root = findAcross(content, rootId);
+  if (!root) throw new OpError('node_not_found', 'ops', `子树根 ${rootId} 不在这份导图里`);
+
+  const temp: MindMapContent = {
+    title: content.title,
+    root,
+    theme: content.theme,
+    source_usage: content.source_usage ?? [],
+  };
+  const applied = applyOpsOnTree(temp, batch);
+  // 删节点连带删掉悬空的跨节点引用（`relations` + 阶段内边）。**只能落在写回之后**：
+  // 临时 `MindMapContent` 只有一棵子树，`relations`（属于整图）与 `stages[i].edges`
+  // （属于阶段，不在这棵临时树里）在那里都看不见。与后端 `tools._prune_stage_edges` /
+  // `_prune_dangling_relations` 同一个位置、同一条判据（按存活节点判）。
+  //
+  // 这条路当前不可达（见上面的缺口说明），所以这一段是**为放开闸门预埋的干净起点**：
+  // 删节点这一半（悬空引用）已经对齐后端，仍未跟的是 `add_edge` 的层级落笔。
+  const moved = pruneDanglingRefs(replaceContainer(content, rootId, () => applied.content.root));
+  // 写回之后再校验一次整份内容：临时树只能看到自己那一棵，跨容器的 id 唯一性与
+  // 边/阶段的关系要在这里兜住（后端那一步是 `shapes.revalidate`）。
+  assertContentValid(moved);
+  return { content: moved, changed_ids: applied.changed_ids };
+}
+
+/** 一批 op 里提到的**所有**节点 id（含临时 id，交给调用方去筛）。 */
+const OP_NODE_FIELDS = ['id', 'parent_id', 'new_parent_id', 'source', 'target'] as const;
+
+function opTargetIds(batch: OpBatch): string[] {
+  const seen: string[] = [];
+  for (const op of batch.ops) {
+    const record = op as unknown as Record<string, unknown>;
+    for (const name of OP_NODE_FIELDS) {
+      const value = record[name];
+      if (typeof value === 'string' && value && !seen.includes(value)) seen.push(value);
+    }
+  }
+  return seen;
+}
+
+/** 这些 id 分别落在哪棵并列子树里（去重保序）。 */
+function holdersOf(content: DiagramContent, ids: readonly string[]): Array<{ index: number; id: string }> {
+  const wanted = new Set(ids);
+  const holders: Array<{ index: number; id: string }> = [];
+  rootsOf(content).forEach((root, index) => {
+    for (const node of walkNodes(root)) {
+      if (wanted.has(node.id)) {
+        holders.push({ index, id: root.id });
+        return;
+      }
+    }
+  });
+  return holders;
+}
+
+function findAcross(content: DiagramContent, nodeId: string): MindNode | null {
+  for (const root of rootsOf(content)) {
+    for (const node of walkNodes(root)) {
+      if (node.id === nodeId) return node;
+    }
+  }
+  return null;
+}
+
+/**
+ * 在**一棵树**上执行整批 op。树图型唯一走这条路的入口，也是鱼骨/流程借道的那份
+ * 实现（入参是一棵临时 `MindMapContent`，出参是它的新根）。
  *
  * 整批原子生效：全部操作都在 `cloneTree` 出来的副本上做，任何一条抛 `OpError`
  * 就把副本整个丢掉。调用方不可能拿到"改了一半"的树 —— 半批生效会让树的 shape
@@ -172,7 +346,9 @@ function assertTreeValid(root: MindNode, sourceUsage: SourceUsage[]): void {
  * 意义所在（先建父节点再往里挂子节点）。也正因为如此，中间没有"延迟解析"，
  * 每条 op 都拿当时的树做判断。
  */
-export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
+export function applyOpsOnTree(
+  content: MindMapContent, batch: OpBatch,
+): ApplyResult<MindMapContent> {
   const next: MindMapContent = cloneTree(content);
   const changed = new Set<string>();
 
@@ -208,6 +384,10 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
           // `detail` 是生成产出的说明，与用户备注 `note` 分开存；`add` 不带
           // note 字段，正是为了这两条写入路径永不交叉。
           detail: op.detail ?? null,
+          // 视觉元素：空串归一成 null（`add` 没有"清空"语义，新节点本来就没有
+          // 颜色）。值是调色板键——校验在 `assertTreeValid` 里统一做。
+          color: op.color ? op.color : null,
+          icon: op.icon ? op.icon : null,
         };
         next.root = insertChildAt(next.root, op.parent_id, op.index, node);
         changed.add(op.id);
@@ -222,14 +402,21 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         if (!node) {
           throw new OpError('node_not_found', path('id'), `节点 ${op.id} 不存在`);
         }
-        const changes: { label?: string; source_refs?: SourceRef[]; detail?: string | null } =
-          op.changes ?? {};
+        const changes: {
+          label?: string;
+          source_refs?: SourceRef[];
+          detail?: string | null;
+          color?: NodeColor | '';
+          icon?: string | null;
+        } = op.changes ?? {};
         // 后端 UpdateChanges.at_least_one 直接拒绝空 changes。前端不拦的话，
         // 同一条 op 在这里成功、在服务端 ValidationError，模型收到的反馈相反。
         if (
           changes.label === undefined &&
           changes.source_refs === undefined &&
-          changes.detail === undefined
+          changes.detail === undefined &&
+          changes.color === undefined &&
+          changes.icon === undefined
         ) {
           throw new OpError('empty_changes', path('changes'), `节点 ${op.id} 的 update 至少要改一个字段`);
         }
@@ -246,6 +433,30 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
           const detail = (changes.detail ?? '').trim();
           node.detail = detail ? detail : null;
         }
+        // 视觉元素同一条约定：`undefined` 不动，空串是**显式清除**。
+        // 与后端 `_apply_update` 逐条对齐（`color: ''` → `null`），否则同一个
+        // batch 会一边清掉颜色、一边在树里留一个查不到 CSS 变量的空串。
+        if (changes.color !== undefined) {
+          if (changes.color !== '' && !isNodeColor(changes.color)) {
+            throw new OpError(
+              'invalid_color',
+              path('changes.color'),
+              `颜色只能是 ${NODE_COLORS.join('/')} 之一，收到 ${String(changes.color)}`,
+            );
+          }
+          node.color = changes.color === '' ? null : changes.color;
+        }
+        if (changes.icon !== undefined) {
+          const icon = (changes.icon ?? '').trim();
+          if (icon && charLength(icon) > LIMITS.icon) {
+            throw new OpError(
+              'invalid_icon',
+              path('changes.icon'),
+              `图标最多 ${LIMITS.icon} 个字符`,
+            );
+          }
+          node.icon = icon ? icon : null;
+        }
         changed.add(op.id);
         break;
       }
@@ -254,11 +465,93 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         if (op.id === next.root.id) {
           throw new OpError('cannot_remove_root', path('id'), '根节点不能删除');
         }
-        if (!findNode(next.root, op.id)) {
+        const doomed = findNode(next.root, op.id);
+        if (!doomed) {
           throw new OpError('node_not_found', path('id'), `节点 ${op.id} 不存在`);
         }
         next.root = removeNode(next.root, op.id);
+        // 连带删边（与后端 `_apply_remove` 逐条对齐）：源或目标命中**被删子树**
+        // 的边全部消失。只清被点名那一个节点的话，子孙身上的边会悬空，下一次
+        // 缆校验就报 dangling，而那条报错指的位置与用户做的事隔得很远。
+        const removedIds = subtreeIds(doomed);
+        next.edges = (next.edges ?? []).filter(
+          edge => !removedIds.has(edge.source) && !removedIds.has(edge.target),
+        );
+        // `relations` 与 `edges` 是**两套字段、同一条判据**（契约对两者的 dangling
+        // 一样硬拒）。只清 edges 时，删一个被关系引用的节点会让这一批 op 在
+        // `assertContentValid` 里整批失败——而那条关系界面根本不渲染，用户连
+        // "是哪条线挡住的"都看不到。
+        next.relations = (next.relations ?? []).filter(
+          relation => !removedIds.has(relation.source) && !removedIds.has(relation.target),
+        );
         changed.add(op.id);
+        break;
+      }
+
+      case 'add_edge': {
+        const source = findNode(next.root, op.source);
+        if (!source) {
+          throw new OpError('node_not_found', path('source'), `起点节点 ${op.source} 不存在`);
+        }
+        if (!findNode(next.root, op.target)) {
+          throw new OpError('node_not_found', path('target'), `终点节点 ${op.target} 不存在`);
+        }
+        if (op.source === op.target) {
+          throw new OpError(
+            'self_loop',
+            path('target'),
+            `${op.source} 不能连到自己：自环在画布上只会渲染成一个点`,
+          );
+        }
+        const edges = next.edges ?? [];
+        if (edges.some(edge => edge.id === op.id)) {
+          throw new OpError('duplicate_edge', path('id'), `边 id ${op.id} 已经存在`);
+        }
+        const label = (op.label ?? '').trim() || null;
+        if (edges.some(edge => edge.source === op.source && edge.target === op.target
+          && (edge.label ?? null) === label)) {
+          throw new OpError(
+            'duplicate_edge',
+            path('target'),
+            `${op.source} → ${op.target}${label ? `（${label}）` : ''} 这条边已经存在`,
+          );
+        }
+        if (op.kind != null && !(EDGE_KINDS as readonly string[]).includes(op.kind)) {
+          throw new OpError(
+            'invalid_kind',
+            path('kind'),
+            `边的类型只能是 ${EDGE_KINDS.join('/')} 之一，收到 ${String(op.kind)}`,
+          );
+        }
+        if (edges.length >= LIMITS.edges) {
+          throw new OpError(
+            'too_many_edges',
+            path('id'),
+            `这张图已经有 ${edges.length} 条附加边，达到上限 ${LIMITS.edges} 条`,
+          );
+        }
+        const edge: MindEdge = {
+          id: op.id,
+          source: op.source,
+          target: op.target,
+          label,
+          kind: op.kind ?? null,
+        };
+        next.edges = [...edges, edge];
+        changed.add(op.source);
+        changed.add(op.target);
+        break;
+      }
+
+      case 'remove_edge': {
+        const edges = next.edges ?? [];
+        const hit = edges.find(edge => edge.id === op.id);
+        if (!hit) {
+          throw new OpError('edge_not_found', path('id'), `边 ${op.id} 不存在`);
+        }
+        next.edges = edges.filter(edge => edge.id !== op.id);
+        changed.add(hit.source);
+        changed.add(hit.target);
         break;
       }
 
@@ -316,7 +609,7 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
     }
   });
 
-  assertTreeValid(next.root, next.source_usage ?? []);
+  assertContentValid(next);
 
   return { content: next, changed_ids: Array.from(changed) };
 }
@@ -351,6 +644,18 @@ export function normalizeOps(
     return fresh;
   };
 
+  /** 边 id 走 `e_` 前缀（与后端 `new_edge_id` 同口径），端点是节点 id 走上面那个。 */
+  const realEdgeIdOf = (id: string): string => {
+    if (!id.startsWith('$')) return id;
+    const cached = idMap.get(id);
+    if (cached !== undefined) return cached;
+    let fresh = `e_${fullRandomId().replace(/-/g, '').slice(0, 32)}`;
+    while (used.has(fresh)) fresh = `e_${fullRandomId().replace(/-/g, '').slice(0, 32)}`;
+    used.add(fresh);
+    idMap.set(id, fresh);
+    return fresh;
+  };
+
   const ops = drafts.map((draft): MindMapOp => {
     switch (draft.op) {
       case 'add':
@@ -362,6 +667,18 @@ export function normalizeOps(
         return { ...draft, id: realIdOf(draft.id) };
       case 'move':
         return { ...draft, id: realIdOf(draft.id), new_parent_id: realIdOf(draft.new_parent_id) };
+      case 'add_edge':
+        // 端点也是临时名：同一批里"先建两个节点、再用它们的 `$` 名连一条边"
+        // 是合法且常用的一种形状（模型一条批次描述整段流程时就会这样写）。
+        return {
+          ...draft,
+          id: realEdgeIdOf(draft.id),
+          source: realIdOf(draft.source),
+          target: realIdOf(draft.target),
+        };
+      case 'remove_edge':
+        // 边 id 可能是刚在**同一条批次**里 add 出来的临时名。
+        return { ...draft, id: realEdgeIdOf(draft.id) };
     }
   });
 

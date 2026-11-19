@@ -19,24 +19,43 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
-from app.contracts.mindmap import MindMapContent, Node
+from app.contracts.mindmap import (
+    MAX_EDGES,
+    Edge,
+    FlowContent,
+    FlowStage,
+    MindMapContent,
+    Node,
+)
 from app.contracts.ops import (
+    AddEdgeOp,
     AddOp,
     MindMapOp,
     MoveOp,
     OpBatch,
     OpError,
+    RemoveEdgeOp,
     RemoveOp,
     UpdateOp,
 )
+from collections.abc import Sequence
+from typing import NamedTuple
 
 # 草案里临时 id 的前缀。模型没法预知树里已有那些 id，自造名字只有两种结局：
 # 撞上既有节点，或者在被要求"引用刚才那个新节点"时写了个它自己都不确定的名字。
 TEMP_ID_PREFIX = "$"
 
-# 会承载"节点 id"的三个字段。add 的 id、update/remove/move 的 id、
-# move 的 new_parent_id 都可能是一个临时名。
-_ID_FIELDS = ("id", "parent_id", "new_parent_id")
+# 会承载"节点 id"的四个字段。add 的 id、update/remove/move 的 id、
+# move 的 new_parent_id，以及 add_edge 的两端。它们都可能是一个临时名。
+#
+# `id` 对 `add_edge` 是**边 id**（见 `_apply_add_edge`），但临时名的解析规则
+# 完全一样：同一个 `$tmp1` 无论出现几次都指向同一个真实 id。
+_ID_FIELDS = ("id", "parent_id", "new_parent_id", "source", "target")
+
+# 承载"边 id"的 op。规范化时它们的 `id` 走 `new_edge_id` 而不是 `new_node_id`：
+# 前缀不同不是为了好看，而是为了让日志与数据里一眼能分清"这是一条线的 id"，
+# 排查"删错了线还是删错了节点"时省一次翻代码。
+_EDGE_ID_OPS = ("add_edge",)
 
 _OP_ADAPTER: TypeAdapter[MindMapOp] = TypeAdapter(MindMapOp)
 
@@ -51,6 +70,14 @@ def new_node_id(existing: set[str]) -> str:
     """
     while True:
         candidate = f"n_{uuid4().hex}"
+        if candidate not in existing:
+            return candidate
+
+
+def new_edge_id(existing: set[str]) -> str:
+    """生成一个不在 `existing` 里的**边** id（`e_` 前缀，理由见 `_EDGE_ID_OPS`）。"""
+    while True:
+        candidate = f"e_{uuid4().hex}"
         if candidate not in existing:
             return candidate
 
@@ -129,6 +156,10 @@ def apply_ops(content: MindMapContent, batch: OpBatch) -> MindMapContent:
             _apply_remove(working, op, base)
         elif isinstance(op, MoveOp):
             _apply_move(working, op, base)
+        elif isinstance(op, AddEdgeOp):
+            _apply_add_edge(working, op, base)
+        elif isinstance(op, RemoveEdgeOp):
+            _apply_remove_edge(working, op, base)
         else:
             # 判别联合已经把类型定死在这里，走到这一支说明契约新增了 op
             # 而执行器忘了实现。宁可明确失败，也不要静默跳过一条 op。
@@ -159,14 +190,20 @@ def normalize_ops(drafts: list[dict], existing: set[str]) -> tuple[list[MindMapO
     rewritten: list[dict] = []
 
     for draft in drafts:
-        # 浅拷贝即可：只改顶层这三个标量字段，不碰嵌套结构，也不改调用方给的草案。
+        # 浅拷贝即可：只改顶层这几个标量字段，不碰嵌套结构，也不改调用方给的草案。
         item = dict(draft)
+        # 边 op 的 `id` 是**边 id**：走 `e_` 前缀。这一步必须在字段循环之前
+        # 决定，因为 `id` 在循环里被处理。
+        edge_op = item.get("op") in _EDGE_ID_OPS
         for field in _ID_FIELDS:
             value = item.get(field)
             if not isinstance(value, str) or not value.startswith(TEMP_ID_PREFIX):
                 continue
             if value not in mapping:
-                real_id = new_node_id(taken)
+                if edge_op and field == "id":
+                    real_id = new_edge_id(taken)
+                else:
+                    real_id = new_node_id(taken)
                 taken.add(real_id)
                 mapping[value] = real_id
             item[field] = mapping[value]
@@ -227,6 +264,11 @@ def _apply_add(content: MindMapContent, op: AddOp, base: str) -> None:
         # `detail` 是生成产出的说明，与用户备注 `note` 分开存：这里只带 detail，
         # 永远不碰 note——重新生成一次就把用户敲的字盖掉是最不该发生的那种丢失。
         detail=op.detail,
+        # `color` / `icon` 是可选的视觉元素，缺省 None。空串在这里归一成 None：
+        # `add` 没有"清空"这个语义（新节点本来就没有颜色），把它传成 `""` 会在
+        # 契约层被判非调色板键。
+        color=op.color or None,
+        icon=op.icon,
     ))
 
 
@@ -247,17 +289,57 @@ def _apply_update(content: MindMapContent, op: UpdateOp, base: str) -> None:
     if op.changes.detail is not None:
         detail = op.changes.detail.strip()
         node.detail = detail or None
+    # 视觉元素同一条约定：`None` 不动；空串是**显式清除**。
+    # `color` 在契约层已经归一成调色板键或空串（`ops._palette_color`），这里只把
+    # 空串收成 `None`——不这么做，模型摘掉一个颜色之后树里会留一个 `""`，
+    # 前端读到它就会去查一个不存在的 CSS 变量（画出来是透明/继承色）。
+    if op.changes.color is not None:
+        node.color = op.changes.color or None
+    if op.changes.icon is not None:
+        node.icon = op.changes.icon or None
 
 
 def _apply_remove(content: MindMapContent, op: RemoveOp, base: str) -> None:
-    """删节点连整棵子树。根节点不可删——删了就没有导图了。"""
+    """删节点连整棵子树。根节点不可删——删了就没有导图了。
+
+    **连带删掉与这棵子树相关的附加边与跨节点关系**（源或目标命中被删的任意一个
+    节点）。不删的话，库里会留下指向已消失节点的边/关系：契约层下一次校验会报
+    `边 X 的起点节点 Y 不在导图中`，于是"删一个节点"变成"整张图存不回去"，
+    而报错指的位置（某条边）与用户做的事（删节点）之间隔了很远。
+
+    `relations` 与 `edges` 是**两套字段、同一条判据**：契约 `_validate_relations` 与
+    `_validate_edges` 对 dangling 一样是硬拒。只清 `edges` 时，删一个被 `relations`
+    引用的节点会让整批 op 在最后那次整树校验里被拒，工具层报成 `tree_invalid`
+    ——模型只收到"改动之后整张图不合法"，指不回"我刚才删的那个节点"。
+
+    命中范围是**整棵子树**而不是只有 `op.id` 一个节点：级联删除会把子孙一起
+    摘掉，只清理被点名那一个，子孙身上的边同样会悬空。
+    """
     if op.id == content.root.id:
         raise OpError("cannot_remove_root", f"{base}.id", "根节点不能删除")
     parent = find_parent(content.root, op.id)
     if parent is None:
         raise OpError("node_not_found", f"{base}.id", f"节点 {op.id} 不存在")
+    doomed = _subtree_ids(find_node(content.root, op.id))
     # 摘掉这一个引用，它下面的整棵子树随之从树上消失，不需要逐个清理。
     parent.children = [child for child in parent.children if child.id != op.id]
+    content.edges = [edge for edge in content.edges
+                     if edge.source not in doomed and edge.target not in doomed]
+    content.relations = [relation for relation in content.relations
+                         if relation.source not in doomed and relation.target not in doomed]
+
+
+def _subtree_ids(node: Node | None) -> set[str]:
+    """节点及其全部子孙的 id（`node` 为 None 时返回空集）。"""
+    if node is None:
+        return set()
+    ids: set[str] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        ids.add(current.id)
+        stack.extend(current.children)
+    return ids
 
 
 def _apply_move(content: MindMapContent, op: MoveOp, base: str) -> None:
@@ -298,3 +380,288 @@ def _apply_move(content: MindMapContent, op: MoveOp, base: str) -> None:
             f"index 最大为 {len(target.children)}，收到 {op.index}",
         )
     target.children.insert(op.index, node)
+
+
+def _apply_add_edge(content: MindMapContent, op: AddEdgeOp, base: str) -> None:
+    """挂一条附加边。四个判据，全部在写之前。
+
+    为什么这里要自己判一遍（契约层的 `validate_tree` 也会判）：执行器在**批次
+    中途**跑，一条非法边不该等到整批跑完才由整树校验打回——那时错误只剩一句
+    "边 X 的起点节点 Y 不在导图中"，`path` 指不到 `ops.3.target`，模型下一轮
+    还得猜是哪条。这里判一次，错误码与字段路径都是准的。
+
+    与契约层的一处**不同**（且是刻意的）：重复边在这里报 `duplicate_edge`
+    而不是静默去重。契约层的去重服务于"库里的历史数据/别人构造的 payload"，
+    执行器服务于"模型刚发来的这一批"——同一个批次里连发两条一模一样的边，
+    模型需要知道其中一条没生效，否则它会以为"我加了两条"。
+    """
+    source = find_node(content.root, op.source)
+    if source is None:
+        raise OpError("node_not_found", f"{base}.source", f"边的起点节点 {op.source} 不存在")
+    target = find_node(content.root, op.target)
+    if target is None:
+        raise OpError("node_not_found", f"{base}.target", f"边的终点节点 {op.target} 不存在")
+    if op.source == op.target:
+        raise OpError(
+            "self_loop", f"{base}.target",
+            f"{op.source} 不能连到自己：自环在画布上只会渲染成一个点",
+        )
+    if any(edge.id == op.id for edge in content.edges):
+        raise OpError("duplicate_edge", f"{base}.id", f"边 id {op.id} 已经存在")
+    if any(edge.source == op.source and edge.target == op.target and edge.label == op.label
+           for edge in content.edges):
+        same = f"（标签「{op.label}」）" if op.label else ""
+        raise OpError(
+            "duplicate_edge", f"{base}.target",
+            f"{op.source} → {op.target}{same} 这条边已经存在",
+        )
+    if len(content.edges) >= MAX_EDGES:
+        raise OpError(
+            "too_many_edges", base,
+            f"这张图已经有 {len(content.edges)} 条附加边，达到上限 {MAX_EDGES} 条，"
+            "加不了新边",
+        )
+    content.edges.append(Edge(
+        id=op.id,
+        source=op.source,
+        target=op.target,
+        label=op.label,
+        kind=op.kind,
+    ))
+
+
+def _apply_remove_edge(content: MindMapContent, op: RemoveEdgeOp, base: str) -> None:
+    """删一条附加边。**不动节点**：边不是结构，删它之后树一个字节都不变。"""
+    if not any(edge.id == op.id for edge in content.edges):
+        raise OpError("edge_not_found", f"{base}.id", f"边 {op.id} 不存在")
+    content.edges = [edge for edge in content.edges if edge.id != op.id]
+
+
+# ---------------------------------------------------------------- 流程图：两层边
+#
+# `FlowContent` 上有**两处** `edges`、端点属于**两个互不相通的命名空间**
+# （契约 `FlowStage` 的 docstring 是这条边的权威定义）：
+#
+#   - `FlowContent.edges`：**阶段之间**的跳转，端点必须是阶段 id（`s_…`）；
+#   - `FlowStage.edges`：**阶段内部**的边（判定节点的「是 / 否」、步骤之间的顺序
+#     跳转），端点必须是**该阶段自己的节点 id**。
+#
+# 所以一条 `add_edge` / `remove_edge` 在流程图上要**先判它属于哪一层**再落笔。
+# 此前这里明确拒绝（`edges_not_supported`）：那是个"实现会静默丢数据"的判断——
+# 借道树的执行器时边落在一棵临时 `MindMapContent` 里，而写回只换子树根，工具回一句
+# "已连接"而 `ctx.candidate` 里一条边都没有。现在判定这一层真的存在了，拒绝可以撤。
+#
+# 判据与 `shapes._split_edges`（树 → 流程的迁移分流）**必须同源**，否则同一对端点在
+# 生成路径与编辑路径上会落进不同的数组；所以这里用同一套"端点归属"规则：
+#
+#   1. 两个端点都是阶段 id            → 阶段之间（原生跳转，不降级）
+#   2. 两个端点属于**同一个阶段**      → 那个阶段的内部
+#   3. 两个端点属于**不同阶段**        → 阶段之间，端点换成各自的阶段 id，记 `demoted`
+#      （精确端点保不住，但方向还在——与 `_split_edges` 的 `demoted` 同一个取舍）
+#   4. 一个是阶段 id、另一个是节点 id  → 拒（两套命名空间混用，无法判断意图）
+#   5. 端点根本不存在                  → 拒（`node_not_found` / `edge_not_found`）
+
+STAGE_LAYER = "stage"
+INNER_LAYER = "inner"
+
+
+class FlowEdgePlacement(NamedTuple):
+    """一条边在 `FlowContent` 里该落到哪一层、落笔时的端点是什么。
+
+    `layer` / `source` / `target` 是**要写进数组的那三个值**；`stage_id` 只有
+    `inner` 时才有意义（那个阶段的 id）；`demoted` 说明这条边本来指的是两个**深层
+    步骤**，被降级成了阶段之间的连线——调用方据此在摘要里说清楚，别让模型以为
+    精确端点被保留了。
+    """
+
+    layer: str
+    source: str
+    target: str
+    stage_id: str | None
+    demoted: bool
+
+
+def _stage_owner_of(content: FlowContent) -> dict[str, str]:
+    """节点 id → 它所属阶段的 id。阶段之间的端点用不上它，阶段内边全靠它。"""
+    owner: dict[str, str] = {}
+    stack: list[Node] = []
+    for stage in content.stages:
+        stack.append(stage.root)
+        while stack:
+            node = stack.pop()
+            owner[node.id] = stage.id
+            stack.extend(node.children)
+    return owner
+
+
+def resolve_flow_edge_placement(
+    content: FlowContent, source: str, target: str, *, base: str = "edge",
+) -> FlowEdgePlacement:
+    """判一条 `(source, target)` 属于哪一层，返回落笔时该用的端点。
+
+    纯函数、不改内容：工具那层的预检（要报"起点不存在"这种精确到参数的错）与
+    执行器（要报 `ops.<下标>.target`）共用它，两处各写一份判据只会有一天互相矛盾。
+    """
+    stage_ids = {stage.id for stage in content.stages}
+    owner = _stage_owner_of(content)
+
+    source_is_stage = source in stage_ids
+    target_is_stage = target in stage_ids
+    source_stage = owner.get(source)
+    target_stage = owner.get(target)
+
+    if source_is_stage and target_is_stage:
+        return FlowEdgePlacement(STAGE_LAYER, source, target, None, False)
+
+    if source_is_stage != target_is_stage:
+        stage_side = source if source_is_stage else target
+        node_side = target if source_is_stage else source
+        raise OpError(
+            "mixed_edge_namespace", f"{base}.target",
+            f"一条边的两个端点必须同属一个命名空间：阶段之间用阶段 id（如 {stage_side}），"
+            f"阶段内部用该阶段的节点 id（如 {node_side}）。收到 {source} → {target}，"
+            "两套混用无法判断这条线画在哪一层；要连阶段就用两个阶段 id，"
+            "要连判定出口就用同一阶段里的两个节点 id。",
+        )
+
+    if source_stage is None:
+        raise OpError("node_not_found", f"{base}.source", f"边的起点 {source} 不在任何阶段里")
+    if target_stage is None:
+        raise OpError("node_not_found", f"{base}.target", f"边的终点 {target} 不在任何阶段里")
+
+    if source_stage == target_stage:
+        return FlowEdgePlacement(INNER_LAYER, source, target, source_stage, False)
+
+    return FlowEdgePlacement(STAGE_LAYER, source_stage, target_stage, None, True)
+
+
+def _flow_stage(content: FlowContent, stage_id: str) -> FlowStage:
+    """按 id 取阶段。找不到是**内部错误**（`resolve_flow_edge_placement` 已经保证它存在）。"""
+    for stage in content.stages:
+        if stage.id == stage_id:
+            return stage
+    raise OpError("node_not_found", "edge", f"阶段 {stage_id} 不在这份流程图里")
+
+
+def _all_flow_edge_ids(content: FlowContent) -> set[str]:
+    """两处数组的全部边 id。**跨数组唯一**是契约的硬约束（`validate_flow` 查它）：
+    前端按 id 建索引，重名的两条边里有一条会永远画不出来。"""
+    ids = {edge.id for edge in content.edges}
+    for stage in content.stages:
+        ids.update(edge.id for edge in stage.edges)
+    return ids
+
+
+def _apply_add_flow_edge(content: FlowContent, op: AddEdgeOp, base: str) -> None:
+    """把一条边挂到它该在的那一层。判据全部在写之前，与树上那版逐条对应。"""
+    placement = resolve_flow_edge_placement(content, op.source, op.target, base=base)
+    if op.source == op.target or placement.source == placement.target:
+        # 两个不同阶段的深层步骤被降级之后可能撞到同一个阶段（同一个阶段内部，
+        # 那条边落进 inner 层，端点就是原来那两个，不会相等）。走到这里说明源与目标
+        # 归一之后重合了——画出来是一个点。
+        raise OpError(
+            "self_loop", f"{base}.target",
+            f"{placement.source} 不能连到自己：自环在画布上只会渲染成一个点",
+        )
+    if op.id in _all_flow_edge_ids(content):
+        raise OpError("duplicate_edge", f"{base}.id", f"边 id {op.id} 已经存在")
+
+    sibling: list[Edge]
+    where: str
+    stage: FlowStage | None = None
+    if placement.layer == INNER_LAYER:
+        stage = _flow_stage(content, placement.stage_id or "")
+        sibling = stage.edges
+        where = f"阶段 {stage.id} 内部"
+        allowed = {node.id for node in _walk(stage.root)}
+        for endpoint in (placement.source, placement.target):
+            if endpoint not in allowed:
+                raise OpError(
+                    "node_not_found", f"{base}.source",
+                    f"边的端点 {endpoint} 不在{where}：阶段内边的两个端点必须属于同一个阶段",
+                )
+    else:
+        sibling = content.edges
+        where = "阶段之间"
+
+    if any(edge.source == placement.source and edge.target == placement.target
+           and edge.label == op.label for edge in sibling):
+        same = f"（标签「{op.label}」）" if op.label else ""
+        raise OpError(
+            "duplicate_edge", f"{base}.target",
+            f"{placement.source} → {placement.target}{same} 这条边已经存在（{where}）",
+        )
+    # 上限**两层各算**（不是合计）：判据与契约一致——`_validate_edges` 是按数组各自
+    # 调用的，`edge_diagnostics` 也是按各自的清单报 `EDGE_LIMIT`。合计会让一条吵闹的
+    # 阶段先把阶段之间的额度吃光，而两者在画布上的规模本来就不成比例。
+    if len(sibling) >= MAX_EDGES:
+        raise OpError(
+            "too_many_edges", base,
+            f"{where}已经有 {len(sibling)} 条附加边，达到上限 {MAX_EDGES} 条，加不了新边",
+        )
+
+    edge = Edge(id=op.id, source=placement.source, target=placement.target,
+                label=op.label, kind=op.kind)
+    if stage is not None:
+        stage.edges.append(edge)
+    else:
+        content.edges.append(edge)
+
+
+def _apply_remove_flow_edge(content: FlowContent, op: RemoveEdgeOp, base: str) -> None:
+    """删一条流程图的边。**按 id 查两个数组**，删线不动结构。
+
+    只查 `content.edges` 的话，阶段内的边列得出来却删不掉——而"删不掉"的表现是
+    工具回一句"边不存在"，模型下一轮继续试同一条。
+    """
+    for stage in content.stages:
+        if any(edge.id == op.id for edge in stage.edges):
+            stage.edges = [edge for edge in stage.edges if edge.id != op.id]
+            return
+    if any(edge.id == op.id for edge in content.edges):
+        content.edges = [edge for edge in content.edges if edge.id != op.id]
+        return
+    raise OpError("edge_not_found", f"{base}.id", f"边 {op.id} 不存在")
+
+
+def _walk(root: Node):
+    """前序遍历一棵子树。这里只要"这个阶段里有哪些节点 id"。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(node.children)
+
+
+def validate_flow(content: FlowContent) -> FlowContent:
+    """整图兜底校验（与 `_validate_tree` 同一个理由、同一套走法）。
+
+    `model_copy` / 直接 append 都不经 pydantic 校验，而这层是"整批 op 合起来把图
+    搞坏了"的唯一防线：dangling、跨数组的边 id 重名、阶段内边连到别的阶段，全部
+    由契约的 `validate_flow` 在这里收口，错误码统一是 `tree_invalid`。
+    """
+    try:
+        return FlowContent.model_validate(content.model_dump())
+    except ValidationError as exc:
+        details = "；".join(error["msg"] for error in exc.errors()[:3])
+        raise OpError("tree_invalid", "ops", details or "执行这批 op 之后流程图不合法") from exc
+
+
+def apply_flow_edge_ops(
+    content: FlowContent, items: Sequence[tuple[str, MindMapOp]],
+) -> FlowContent:
+    """把一批**只含边 op** 的批次落到流程图的正确那一层上，整批原子。
+
+    `items` 是 `(字段路径, op)`：路径由调用方从**原始批次的下标**算出来
+    （`ops.3`），所以在拆分批次之后 `OpError.path` 仍然指得回模型发的那一条——
+    重排下标会让报错指向另一条 op，那比不报错更糟。
+    """
+    working = content.model_copy(deep=True)
+    for base, op in items:
+        if isinstance(op, AddEdgeOp):
+            _apply_add_flow_edge(working, op, base)
+        elif isinstance(op, RemoveEdgeOp):
+            _apply_remove_flow_edge(working, op, base)
+        else:
+            raise OpError("unknown_op", base, f"边批次里出现了非边 op：{op.op!r}")
+    return validate_flow(working)

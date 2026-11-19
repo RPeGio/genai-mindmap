@@ -69,6 +69,28 @@
         }
       }
     },
+    "/api/mindmaps/edits/health": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Edits Health",
+        "description": "昨日编辑过的图数 / 昨日保存的图数：**死表探测器**。\n\n`user_prefs` 有\"尚未生效\"这种标记，`edit_events` 原本没有——于是\"永远是 0 行\"\n这种故障能静默存在很久。实测有过 40 分钟：8000 跑着旧代码，前端在发事件、\n后端在丢，而每一张图的 `summary.total` 都是 0，看起来和\"没人改过\"一模一样。\n\n跨图而不是按图，是因为\"这张表还在工作吗\"根本不是某一张图的属性。",
+        "operationId": "edits_health_api_mindmaps_edits_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditHealth"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/mindmaps/{map_id}": {
       "get": {
         "tags": [
@@ -144,6 +166,149 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MapRecord"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mindmaps/{map_id}/edits/summary": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Edit Summary",
+        "description": "这张图的改动分布。**这一版真正的交付物。**\n\n404 而不是\"空统计\"：给一个不存在的 id 查统计是调用方错了，返回一份全零的\n报告会让它以为\"这张图没人改过\"——那是完全不同的一件事。",
+        "operationId": "edit_summary_api_mindmaps__map_id__edits_summary_get",
+        "parameters": [
+          {
+            "name": "map_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Map Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditSummary"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mindmaps/{map_id}/edits": {
+      "get": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "List Edits",
+        "description": "最近的改动明细，新的在前。`limit` 有上限：这是给人读的一屏，不是导出通道。",
+        "operationId": "list_edits_api_mindmaps__map_id__edits_get",
+        "parameters": [
+          {
+            "name": "map_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Map Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EditEventRow"
+                  },
+                  "title": "Response List Edits Api Mindmaps  Map Id  Edits Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mindmaps/import": {
+      "post": {
+        "tags": [
+          "导入"
+        ],
+        "summary": "Import Mindmap",
+        "operationId": "import_mindmap_api_mindmaps_import_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_import_mindmap_api_mindmaps_import_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportResponse"
                 }
               }
             }
@@ -323,6 +488,41 @@
         "summary": "Export Opml",
         "description": "导出 OPML，便于导入 XMind 等工具。",
         "operationId": "export_opml_api_export_opml_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/export/json": {
+      "post": {
+        "tags": [
+          "导出"
+        ],
+        "summary": "Export Json",
+        "description": "导出 JSON（`MindMapContent` 的序列化）。\n\n这是唯一**无损**的格式，也是「导出 → 手改 → 导入」的保底：另外三种都只有\n一个文字槽位，往返一次 `note` / `detail` / 颜色 / 图型会退化（见\n`app/export/service.py::to_json` 的 docstring）。",
+        "operationId": "export_json_api_export_json_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -535,6 +735,493 @@
         }
       }
     },
+    "/api/agent/runs": {
+      "get": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "List Runs",
+        "description": "运行台账。默认回答的是\"上次跑完、我还没存下来的是哪一次\"。\n\n`status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出结果的那次\n同样要能被捡起来**——否则\"关掉页面那 40 秒\"照样白花，只是从内存白花变成写进\n数据库白花。\n\n这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。",
+        "operationId": "list_runs_api_agent_runs_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "done",
+                    "cancelled",
+                    "failed",
+                    "running"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。",
+              "title": "Status"
+            },
+            "description": "只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。"
+          },
+          {
+            "name": "unapplied",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "只列有结果、且后来没被保存过的；置 false 则把这段台账原样列出来。",
+              "default": true,
+              "title": "Unapplied"
+            },
+            "description": "只列有结果、且后来没被保存过的；置 false 则把这段台账原样列出来。"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunSummary"
+                  },
+                  "title": "Response List Runs Api Agent Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Get Run",
+        "operationId": "get_run_api_agent_runs__run_id__get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/runs/{run_id}/applied": {
+      "post": {
+        "tags": [
+          "AI 代理"
+        ],
+        "summary": "Mark Run Applied",
+        "description": "这次生成的结果**被保存进库了**。前端在保存成功后调用一次，幂等。\n\n\"生成过但没保存\"与\"生成过、也存下来了\"只能靠这个时间戳分开：那份内容可能被\nPUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`\n表反推，得到的全是猜。",
+        "operationId": "mark_run_applied_api_agent_runs__run_id__applied_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs/suggestions": {
+      "get": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "List Suggestions",
+        "description": "从历史运行里提出候选建议。**只读，不落库**。\n\n判据在 `service.suggestions()` 里写死：最近 3 次有效选择都是同一个值，且与\n当前偏好不同。用户点了\"设为默认\"才会走 `PUT`，点了\"不用\"则什么都不发生——\n没有写入就没有记录，一次拒绝不需要留下痕迹。",
+        "operationId": "list_suggestions_api_prefs_suggestions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/app__prefs__service__Suggestion"
+                  },
+                  "type": "array",
+                  "title": "Response List Suggestions Api Prefs Suggestions Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs": {
+      "get": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "List Prefs",
+        "description": "面板的全部内容：键、值、来源、两个时间戳，以及**上次生效**。\n\n`last_applied_at` 是这一层最该被读的一列：它来自 `runs.request.prefs_applied`，\n也就是\"哪几次运行真的带着这条偏好跑过\"。它为空不一定是错，但**所有条目都为空**\n就一定说明读路径没接上——那时面板上写满\"尚未生效\"，不用翻日志就能看出来。",
+        "operationId": "list_prefs_api_prefs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Pref"
+                  },
+                  "type": "array",
+                  "title": "Response List Prefs Api Prefs Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prefs/{pref_key}": {
+      "put": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "Set Pref",
+        "description": "写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。\n\n非法值（A 类枚举外、C 类超条数/超字数）由 `service.set` 抛 `PrefError`，\n`core/errors.py` 的统一出口会把它变成 `{code, message, detail, request_id}`：\n错误码分得开，界面才能显示\"请先删除一条\"而不是一句泛泛的失败。",
+        "operationId": "set_pref_api_prefs__pref_key__put",
+        "parameters": [
+          {
+            "name": "pref_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pref Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPrefRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Saved"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "Delete Pref",
+        "description": "删一条。硬删，没有软删。\n\n404 而不是幂等 204：界面上\"这条已经不在了\"和\"我删了但没删掉\"必须分得开，\n否则下一次刷新面板会看见它还在，而用户以为删过了。",
+        "operationId": "delete_pref_api_prefs__pref_key__delete",
+        "parameters": [
+          {
+            "name": "pref_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pref Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/memory": {
+      "get": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "List Memories",
+        "description": "最近的若干条，新的在前。\n\n它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过\n（会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。",
+        "operationId": "list_memories_api_memory_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2000,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MemoryItem"
+                  },
+                  "title": "Response List Memories Api Memory Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "Add Memory",
+        "description": "手工加一条。`source` 恒为 `user_explicit`，与自动总结的分开。\n\n向量服务未配置时条目照样写进去（`has_vector=false`），不报错：那是预期状态\n（本机开发、CI），而\"这条以后检索不到\"比\"这句话丢了\"轻得多。",
+        "operationId": "add_memory_api_memory_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMemoryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddedMemory"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/memory/{item_id}": {
+      "delete": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "Delete Memory",
+        "description": "硬删。404 而不是幂等 204：界面上\"这条已经不在了\"与\"我删了但没删掉\"必须分开。",
+        "operationId": "delete_memory_api_memory__item_id__delete",
+        "parameters": [
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Item Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/memory/search": {
+      "get": {
+        "tags": [
+          "记忆"
+        ],
+        "summary": "Search Memory",
+        "description": "按主题检索一次，返回每条的 cosine / decay / score。\n\n**只读**：不刷 `last_used_at`（那是\"真的被注入过\"的证据，一次人工查询不该冒充它）。\n\n与生成时走的是同一个 `store.recall`，所以这里看到的分数就是模型会拿到的排序。",
+        "operationId": "search_memory_api_memory_search_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "按这次的主题检索，与生成时的 query 同一口径",
+              "title": "Q"
+            },
+            "description": "按这次的主题检索，与生成时的 query 同一口径"
+          },
+          {
+            "name": "top_k",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "default": 6,
+              "title": "Top K"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/knowledge/search": {
       "post": {
         "tags": [
@@ -694,6 +1381,45 @@
   },
   "components": {
     "schemas": {
+      "AddMemoryRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind",
+            "default": "preference"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "AddMemoryRequest"
+      },
+      "AddedMemory": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/MemoryItem"
+          },
+          "created": {
+            "type": "boolean",
+            "title": "Created"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item",
+          "created"
+        ],
+        "title": "AddedMemory"
+      },
       "AgentPlan": {
         "properties": {
           "goal": {
@@ -738,6 +1464,20 @@
             "title": "Intent",
             "default": "create"
           },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
           "thinking_model": {
             "type": "string",
             "enum": [
@@ -750,15 +1490,46 @@
             "title": "Thinking Model",
             "default": "default"
           },
+          "diagram_type": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "tree",
+                  "flowchart",
+                  "fishbone"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagram Type"
+          },
+          "prefs_applied": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Prefs Applied"
+          },
           "snapshot": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/MindMapContent-Input"
               },
               {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Snapshot"
           },
           "selected_ids": {
             "items": {
@@ -778,6 +1549,11 @@
           },
           "budget": {
             "$ref": "#/components/schemas/RunBudget"
+          },
+          "deep_thinking": {
+            "type": "boolean",
+            "title": "Deep Thinking",
+            "default": false
           }
         },
         "additionalProperties": false,
@@ -786,7 +1562,7 @@
           "goal"
         ],
         "title": "AgentRunRequest",
-        "description": "一次 agent 运行。\n\n`snapshot` 是前端当前的树。服务端**不**从数据库重读——用户可能有一堆没保存\n的编辑，重读数据库等于把它们丢掉。"
+        "description": "一次 agent 运行。\n\n`snapshot` 是前端当前的图。服务端**不**从数据库重读——用户可能有一堆没保存\n的编辑，重读数据库等于把它们丢掉。"
       },
       "AgentTaskRequest": {
         "properties": {
@@ -847,10 +1623,49 @@
         ],
         "title": "Body_create_file_source_api_ingestion_files_post"
       },
+      "Body_import_mindmap_api_mindmaps_import_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_import_mindmap_api_mindmaps_import_post"
+      },
       "CheckRequest": {
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Input"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              }
+            ],
+            "title": "Content"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EditEventIn"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Events"
+          },
+          "truncated": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Truncated",
+            "default": 0
           },
           "sources": {
             "anyOf": [
@@ -982,6 +1797,944 @@
         ],
         "title": "DiagnosticLevel"
       },
+      "Edge": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "source": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Target"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "flow",
+                  "branch",
+                  "loop"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "target"
+        ],
+        "title": "Edge",
+        "description": "跨父子节点的附加关系：流程图里的条件跳转、汇合、回退。\n\n**为什么是「树 + 附加边」而不是扁平的 `nodes + edges`**：树这一层被每一处\n依赖——`_generate_deep` 的骨架与按支展开、`INITIAL_MAX_NODES` / `MAX_DEPTH`\n的限额、`node_expand`、`expandable` 三态、`child_counts` 与 `path` 索引链、\n前端的 `flatten()` 与 tidy 布局、三种导出。全推倒的代价远超收益，而表达能力\n并不缺：**主干顺序 = 父链**，**条件分支 = 子节点**，**汇合与回退 = 这条边**。\n\n三件事刻意不做，每一条都有具体后果：\n\n  - **不要求同父**。连到另一条 subtree 上正是\"汇合\"的定义；加一条\"必须\n    同父\"等于把这个字段能表达的东西全部禁掉，流程图又退化回树。\n  - **不要求无环**。A→B→A 是流程图的核心需求（驳回、返工、重试）。上限只有\n    \"最长环 ≤ `MAX_EDGE_CYCLE_NODES`\"，而且是 warn。\n  - **不参与布局**。节点坐标仍由树算出（`frontend/src/canvas/layout/tidy.ts`），\n    边只画连线。边参与布局的话，用户每加一条线整个画布都会重排，刚记住的\n    位置就没了——这是\"树 + 边\"能成立的前提之一。"
+      },
+      "EditEventIn": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "enum": [
+              "user",
+              "agent"
+            ],
+            "title": "Actor"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "add",
+              "remove",
+              "update",
+              "move",
+              "edge",
+              "style",
+              "accept",
+              "generate"
+            ],
+            "title": "Kind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "label",
+                  "title",
+                  "detail",
+                  "note",
+                  "color",
+                  "icon"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "before": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Before"
+          },
+          "after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 64.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depth"
+          },
+          "subtree_size": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtree Size"
+          },
+          "change_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Count"
+          },
+          "node_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Count"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "actor",
+          "kind"
+        ],
+        "title": "EditEventIn",
+        "description": "一条改动（`POST/PUT /mindmaps` 请求体里的一项）。\n\n`extra=\"forbid\"`：字段名漂移（比如前端写成 `nodeId`）必须当场 422。静默丢掉\n一条事件比拒收整次保存更糟——统计会少一块，而没人知道少的是哪一块。"
+      },
+      "EditEventRow": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "enum": [
+              "user",
+              "agent"
+            ],
+            "title": "Actor"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "add",
+              "remove",
+              "update",
+              "move",
+              "edge",
+              "style",
+              "accept",
+              "generate"
+            ],
+            "title": "Kind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "label",
+                  "title",
+                  "detail",
+                  "note",
+                  "color",
+                  "icon"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "before": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Before"
+          },
+          "after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 64.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depth"
+          },
+          "subtree_size": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtree Size"
+          },
+          "change_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Count"
+          },
+          "node_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Count"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "at": {
+            "type": "string",
+            "title": "At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "map_id": {
+            "type": "string",
+            "title": "Map Id"
+          },
+          "recorded_at": {
+            "type": "string",
+            "title": "Recorded At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "actor",
+          "kind",
+          "at",
+          "id",
+          "map_id",
+          "recorded_at"
+        ],
+        "title": "EditEventRow",
+        "description": "落库后的一行：载荷 + 自增 id + 服务端写入时刻。"
+      },
+      "EditHealth": {
+        "properties": {
+          "window_start": {
+            "type": "string",
+            "title": "Window Start"
+          },
+          "window_end": {
+            "type": "string",
+            "title": "Window End"
+          },
+          "edited_maps": {
+            "type": "integer",
+            "title": "Edited Maps"
+          },
+          "saved_maps": {
+            "type": "integer",
+            "title": "Saved Maps"
+          },
+          "chain_suspect": {
+            "type": "boolean",
+            "title": "Chain Suspect"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "window_start",
+          "window_end",
+          "edited_maps",
+          "saved_maps",
+          "chain_suspect",
+          "detail"
+        ],
+        "title": "EditHealth",
+        "description": "跨图的日志链路健康检查（`GET /mindmaps/edits/health`）。\n\n判据只有一句：**\"保存了但没有任何事件\"在正常情况下不该发生**。每次生成完成都记\n一条 `generate`（连一处没改也记），所以\"昨日有保存、昨日零事件\"只能是链路断了\n——前端在发、后端在丢，或者事件根本没进请求体。实测有过 40 分钟这个状态（8000\n跑旧代码），而当时没有任何告警：单图的 `total=0` 看着和\"没人改过\"一模一样。\n\n窗口是 **UTC 昨日整天**（`[window_start, window_end)`）：库里所有时间戳都是\n`...Z`，按本地日切会让边界那几个小时归错天，而这里要判的只是\"有没有发生过\"，\n不值得为它引入一处时区配置。"
+      },
+      "EditSummary": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "last_event_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Event At"
+          },
+          "by_actor": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Actor"
+          },
+          "by_kind": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Kind"
+          },
+          "by_field": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Field"
+          },
+          "label_shrunk": {
+            "$ref": "#/components/schemas/LabelShrunk"
+          },
+          "removed_depth": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Removed Depth"
+          },
+          "removed_subtree": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Removed Subtree"
+          },
+          "generated_runs": {
+            "type": "integer",
+            "title": "Generated Runs",
+            "default": 0
+          },
+          "generated_nodes": {
+            "type": "integer",
+            "title": "Generated Nodes",
+            "default": 0
+          },
+          "changed_events": {
+            "type": "integer",
+            "title": "Changed Events",
+            "default": 0
+          },
+          "untouched_runs": {
+            "type": "integer",
+            "title": "Untouched Runs",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "by_actor",
+          "by_kind",
+          "by_field",
+          "label_shrunk",
+          "removed_depth",
+          "removed_subtree"
+        ],
+        "title": "EditSummary",
+        "description": "`GET /mindmaps/{id}/edits/summary` 的响应。\n\n两条恒等式让数字可以先自校验再读结论：\n\n  - `sum(by_actor) == total`；\n  - `sum(by_field) == by_kind[\"update\"] + by_kind[\"style\"]`。\n\n对不上就说明有写入路径绕过了契约，而不是\"统计有点怪\"。\n\n改动量与\"本来可以不改\"的分母分列四组，全部是原始量（比例让读的人自己除）：\n分母 `generated_nodes`、分子 `changed_events`、以及\"这次生成一处都没被改\"的\n`untouched_runs`。三者必须能对上：`untouched_runs <= generated_runs`，而\n`changed_events == 0` 时 `untouched_runs == generated_runs`。"
+      },
+      "FishboneBone-Input": {
+        "properties": {
+          "category": {
+            "type": "string",
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Category"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Input"
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "category",
+          "root"
+        ],
+        "title": "FishboneBone",
+        "description": "鱼骨图上的一根骨：一个类别 + 一棵子树。\n\n**`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /\n`detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层\n`Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。\n`causes` 就是 `root.children`，多一层数组只会让\"这条原因下面还能不能再展开\"\n这件事换个地方回答。\n\n骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**\n（人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。"
+      },
+      "FishboneBone-Output": {
+        "properties": {
+          "category": {
+            "type": "string",
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Category"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Output"
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "category",
+          "root"
+        ],
+        "title": "FishboneBone",
+        "description": "鱼骨图上的一根骨：一个类别 + 一棵子树。\n\n**`root: Node` 而不是 `causes: list[Node]`**：`Node` 已经把 `children` /\n`detail` / `color` / `icon` / `source_refs` / `expandable` 全带上了，套一层\n`Node` 等于免费获得编辑、引用、展开这些能力——它们的实现全都只认 `Node`。\n`causes` 就是 `root.children`，多一层数组只会让\"这条原因下面还能不能再展开\"\n这件事换个地方回答。\n\n骨本身额外带 `color` / `icon`，而不是复用 `root.color`：主骨上那一行是**类别**\n（人 / 机 / 料），它属于图的骨架而不是内容节点，配色要能独立于第一个原因。"
+      },
+      "FishboneContent-Input": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "fishbone",
+            "title": "Diagram Type",
+            "default": "fishbone"
+          },
+          "problem": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Problem"
+          },
+          "bones": {
+            "items": {
+              "$ref": "#/components/schemas/FishboneBone-Input"
+            },
+            "type": "array",
+            "maxItems": 6,
+            "title": "Bones"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "problem"
+        ],
+        "title": "FishboneContent",
+        "description": "鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。\n\n与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：\n\n  - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），\n    让用户选\"横向还是纵向\"只会得到一张画歪的鱼。前端按 `diagram_type` 分派\n    （`canvas/layout/index.ts`），不读 `layout`。\n  - `problem` 独立于 `title`。`title` 是文件名（\"报销慢的原因分析\"），\n    `problem` 是主骨上那一句（\"为什么报销要 11 天\"）——后半句才是这张图的论点，\n    而它会被画在鱼头里，长度与字号都受位置限制。\n  - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是\n    **类别**，不是\"原因 1 / 原因 2\"。"
+      },
+      "FishboneContent-Output": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "fishbone",
+            "title": "Diagram Type",
+            "default": "fishbone"
+          },
+          "problem": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Problem"
+          },
+          "bones": {
+            "items": {
+              "$ref": "#/components/schemas/FishboneBone-Output"
+            },
+            "type": "array",
+            "maxItems": 6,
+            "title": "Bones"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "problem"
+        ],
+        "title": "FishboneContent",
+        "description": "鱼骨图：主骨上的一句话（`problem`）+ 至多六根骨，每根骨挂一棵子树。\n\n与 `MindMapContent` 的三个差别都不是命名问题，是**这张图按什么读**：\n\n  - 没有 `layout`。鱼的排布是几何定死的（主骨横贯、骨按类别固定上下交替），\n    让用户选\"横向还是纵向\"只会得到一张画歪的鱼。前端按 `diagram_type` 分派\n    （`canvas/layout/index.ts`），不读 `layout`。\n  - `problem` 独立于 `title`。`title` 是文件名（\"报销慢的原因分析\"），\n    `problem` 是主骨上那一句（\"为什么报销要 11 天\"）——后半句才是这张图的论点，\n    而它会被画在鱼头里，长度与字号都受位置限制。\n  - 原因挂在 `bone.root.children` 上，而不是挂在主骨上。鱼骨图的一级结构是\n    **类别**，不是\"原因 1 / 原因 2\"。"
+      },
+      "FlowContent-Input": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "flowchart",
+            "title": "Diagram Type",
+            "default": "flowchart"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/FlowStage-Input"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Stages"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "stages"
+        ],
+        "title": "FlowContent",
+        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - **这里这个 `edges` 只装阶段之间的跳转**，端点命名空间是**阶段 id**。这与\n    `MindMapContent.edges` 刚好相反，也是同一个 `Edge` 类型在两处的唯一区别\n    （见 `_validate_edges` 的 `what` / `where` 参数）。阶段**内部**的边（判定\n    节点的两条出边、步骤之间的顺序跳转）在 `FlowStage.edges` 里，端点命名空间\n    是那个阶段自己的节点 id——两处是**两个数组、两个命名空间**，见\n    `FlowStage` 的 docstring。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
+      },
+      "FlowContent-Output": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 2,
+            "title": "Schema Version",
+            "default": 2
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/Theme"
+          },
+          "relations": {
+            "items": {
+              "$ref": "#/components/schemas/Relation"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Relations"
+          },
+          "source_usage": {
+            "items": {
+              "$ref": "#/components/schemas/SourceUsage"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Usage"
+          },
+          "diagram_type": {
+            "type": "string",
+            "const": "flowchart",
+            "title": "Diagram Type",
+            "default": "flowchart"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/FlowStage-Output"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Stages"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "stages"
+        ],
+        "title": "FlowContent",
+        "description": "流程图：按顺序排的阶段 + 阶段之间的跳转（含回退）。\n\n与 `MindMapContent` 的三个差别：\n\n  - 没有单一的 `root`。流程的一级结构是**阶段**（提交 / 审查 / 付款），每一步\n    还各自有内部的步骤树；把它们塞进一棵树的第 1、2 层，会让\"这是阶段\"与\n    \"这是阶段里的第一步\"在数据里长得一样。\n  - **这里这个 `edges` 只装阶段之间的跳转**，端点命名空间是**阶段 id**。这与\n    `MindMapContent.edges` 刚好相反，也是同一个 `Edge` 类型在两处的唯一区别\n    （见 `_validate_edges` 的 `what` / `where` 参数）。阶段**内部**的边（判定\n    节点的两条出边、步骤之间的顺序跳转）在 `FlowStage.edges` 里，端点命名空间\n    是那个阶段自己的节点 id——两处是**两个数组、两个命名空间**，见\n    `FlowStage` 的 docstring。\n  - 允许环，而且环是**核心需求**：驳回 / 返工 / 重试就是 `付款 → 提交`。\n    `MAX_EDGE_CYCLE_NODES` 那条 warn 在流程里同样适用（见 `mindmaps/edges.py`）。"
+      },
+      "FlowStage-Input": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Input"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "root"
+        ],
+        "title": "FlowStage",
+        "description": "流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n## 两个数组、两个命名空间（这一节是这个结构最容易串的地方）\n\n模块里有**两处** `edges`，端点属于**两个互不相通的命名空间**：\n\n  - `FlowContent.edges` —— **阶段之间**的跳转（提交 → 审查、付款 → 提交驳回）。\n    端点必须是**阶段 id**（`stages[i].id`），拿一个真实存在的步骤 id 当端点会被\n    硬拒（`test_edge_endpoints_are_stages_not_nodes` 钉着）。它画出来是画布上的\n    那根**主轴**。\n  - `FlowStage.edges`（就是本字段）—— **这个阶段内部**的边：判定节点的「是 / 否」\n    两条出边、以及步骤之间的顺序跳转。端点必须是**该阶段自己的节点 id**，\n    拿另一个阶段的节点、或者拿阶段 id，都会被硬拒。它画出来是阶段内部的一条\n    **细线**。\n\n为什么必须分成两个数组（而不是给端点加 `stage:` / `node:` 前缀，把边都塞进\n`FlowContent.edges`）：命名空间靠**位置**隔离时，校验是\"每条边的两个端点都在\n这个集合里\"——一次集合查表，且它天然排除了\"阶段内的边连到另一个阶段\"这种错；\n前缀方案要把每个端点都解析一遍，还会给 id 引入一个转义问题（节点 id 允许任意\n字符，写 `node:x` 的节点 id 和\"前缀表示法\"就分不开了）。代价是消费者要遍历\n`stages[i].edges`——而它本来就要遍历 `stages[i].root`。\n\n为什么要有这个字段（阶段 1 契约的真实空洞）：`role=\"decision\"` 的节点在阶段\n**内部**，而原来的 `FlowContent.edges` 端点只有阶段 → 模型标出来的判定节点，\n它的两条「是 / 否」出边**无处可写**。实测一份流程图 5 个判定节点、`branch_edges`\n恒为 0：不是模型没标，是契约没有位置。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与这两个阶段内数组引用。\n不合并是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画\n出来的东西完全不同（一条主轴 vs 一条细线）。"
+      },
+      "FlowStage-Output": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Output"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "root"
+        ],
+        "title": "FlowStage",
+        "description": "流程里的一个阶段：一个 id + 一棵步骤树 + **阶段内部**的附加边。\n\n`root: Node` 而不是 `steps: list[Node]`：与 `FishboneBone.root` 同一条理由——\n`Node` 带的东西（`detail` / `source_refs` / `expandable` / 颜色图标）一样都不少，\n而第一层\"步骤\"与第 N 层\"步骤\"在数据里本来就该是同一个东西。`steps` 就是\n`root.children`。\n\n## 两个数组、两个命名空间（这一节是这个结构最容易串的地方）\n\n模块里有**两处** `edges`，端点属于**两个互不相通的命名空间**：\n\n  - `FlowContent.edges` —— **阶段之间**的跳转（提交 → 审查、付款 → 提交驳回）。\n    端点必须是**阶段 id**（`stages[i].id`），拿一个真实存在的步骤 id 当端点会被\n    硬拒（`test_edge_endpoints_are_stages_not_nodes` 钉着）。它画出来是画布上的\n    那根**主轴**。\n  - `FlowStage.edges`（就是本字段）—— **这个阶段内部**的边：判定节点的「是 / 否」\n    两条出边、以及步骤之间的顺序跳转。端点必须是**该阶段自己的节点 id**，\n    拿另一个阶段的节点、或者拿阶段 id，都会被硬拒。它画出来是阶段内部的一条\n    **细线**。\n\n为什么必须分成两个数组（而不是给端点加 `stage:` / `node:` 前缀，把边都塞进\n`FlowContent.edges`）：命名空间靠**位置**隔离时，校验是\"每条边的两个端点都在\n这个集合里\"——一次集合查表，且它天然排除了\"阶段内的边连到另一个阶段\"这种错；\n前缀方案要把每个端点都解析一遍，还会给 id 引入一个转义问题（节点 id 允许任意\n字符，写 `node:x` 的节点 id 和\"前缀表示法\"就分不开了）。代价是消费者要遍历\n`stages[i].edges`——而它本来就要遍历 `stages[i].root`。\n\n为什么要有这个字段（阶段 1 契约的真实空洞）：`role=\"decision\"` 的节点在阶段\n**内部**，而原来的 `FlowContent.edges` 端点只有阶段 → 模型标出来的判定节点，\n它的两条「是 / 否」出边**无处可写**。实测一份流程图 5 个判定节点、`branch_edges`\n恒为 0：不是模型没标，是契约没有位置。\n\n`id` 与节点的 id 是**两个命名空间**：阶段 id 只被 `FlowContent.edges` 的端点\n引用（那是阶段之间的跳转），节点 id 只被 `relations` 与这两个阶段内数组引用。\n不合并是因为合并之后\"这条边连的是阶段还是步骤\"要靠形状猜，而两者在画布上画\n出来的东西完全不同（一条主轴 vs 一条细线）。"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -994,6 +2747,61 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "ImportResponse": {
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Output"
+              }
+            ],
+            "title": "Content"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/ImportWarningPayload"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "source_format": {
+            "type": "string",
+            "title": "Source Format"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content",
+          "warnings",
+          "source_format"
+        ],
+        "title": "ImportResponse"
+      },
+      "ImportWarningPayload": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ImportWarningPayload",
+        "description": "一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。"
       },
       "KnowledgeHit": {
         "properties": {
@@ -1022,6 +2830,40 @@
         "additionalProperties": false,
         "type": "object",
         "title": "KnowledgeHit"
+      },
+      "LabelShrunk": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "avg_before": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Before"
+          },
+          "avg_after": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg After"
+          }
+        },
+        "type": "object",
+        "title": "LabelShrunk",
+        "description": "标题被改短的统计，**只统计 `actor=\"user\"`**。\n\n过滤 actor 的理由：`agent` 的改动是\"模型自己又改了一遍\"（生成直接落画布时那批\n改动记在 `agent` 名下），它不反映用户的偏好。混进来时 `count` 会比用户的真实\n条数多（实测 B 图 3 条 user 的缩短被算成 4 条，多出来的那条是 agent 的 13→10\n字），而\"用户的缩短偏好\"正是这个数字要回答的东西。\n\n`avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。\n两个平均值的差（18.3 → 9.1）就是\"缩短了多少\"，比只看 count 有信息量得多：\n从 18 缩到 9 是\"太长了\"，从 18 缩到 17 只是\"改了个字\"。"
       },
       "LayoutKind": {
         "type": "string",
@@ -1172,7 +3014,18 @@
             "title": "Version"
           },
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Output"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Output"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Output"
+              }
+            ],
+            "title": "Content"
           },
           "updated_at": {
             "type": "string",
@@ -1186,7 +3039,154 @@
           "content",
           "updated_at"
         ],
-        "title": "MapRecord"
+        "title": "MapRecord",
+        "description": "一条落库的导图。`content` 与 `SaveRequest.content` 是同一个联合类型——\n写进来的是什么形状，读出去就是什么形状（JSON 里 `diagram_type` 与形状都在）。"
+      },
+      "MemoryHit": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "cosine": {
+            "type": "number",
+            "title": "Cosine"
+          },
+          "decay": {
+            "type": "number",
+            "title": "Decay"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "age_days": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age Days"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "formed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Formed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "kind",
+          "cosine",
+          "decay",
+          "score",
+          "created_at"
+        ],
+        "title": "MemoryHit",
+        "description": "一次命中的**全部**中间量。\n\n`score = cosine * decay`。三个数都给出，是为了让\"为什么排在这里\"可以当场读出来。"
+      },
+      "MemoryItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "formed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Formed At"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "has_vector": {
+            "type": "boolean",
+            "title": "Has Vector"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "text",
+          "kind",
+          "source",
+          "created_at",
+          "has_vector"
+        ],
+        "title": "MemoryItem",
+        "description": "列表里的一条。**不带向量**：1024 个 float 对读者没有意义，它是机器用的。"
       },
       "MindMapContent-Input": {
         "properties": {
@@ -1201,13 +3201,6 @@
             "maxLength": 200,
             "minLength": 1,
             "title": "Title"
-          },
-          "root": {
-            "$ref": "#/components/schemas/Node-Input"
-          },
-          "layout": {
-            "$ref": "#/components/schemas/LayoutKind",
-            "default": "tree"
           },
           "theme": {
             "$ref": "#/components/schemas/Theme"
@@ -1227,6 +3220,30 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Input"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/LayoutKind",
+            "default": "tree"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "diagram_type": {
+            "type": "string",
+            "enum": [
+              "tree",
+              "flowchart",
+              "fishbone"
+            ],
+            "title": "Diagram Type",
+            "default": "tree"
           }
         },
         "additionalProperties": false,
@@ -1251,13 +3268,6 @@
             "minLength": 1,
             "title": "Title"
           },
-          "root": {
-            "$ref": "#/components/schemas/Node-Output"
-          },
-          "layout": {
-            "$ref": "#/components/schemas/LayoutKind",
-            "default": "tree"
-          },
           "theme": {
             "$ref": "#/components/schemas/Theme"
           },
@@ -1276,6 +3286,30 @@
             "type": "array",
             "maxItems": 50,
             "title": "Source Usage"
+          },
+          "root": {
+            "$ref": "#/components/schemas/Node-Output"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/LayoutKind",
+            "default": "tree"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "diagram_type": {
+            "type": "string",
+            "enum": [
+              "tree",
+              "flowchart",
+              "fishbone"
+            ],
+            "title": "Diagram Type",
+            "default": "tree"
           }
         },
         "additionalProperties": false,
@@ -1347,6 +3381,39 @@
             "title": "Collapsed",
             "default": false
           },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
           "style": {
             "anyOf": [
               {
@@ -1356,6 +3423,25 @@
                 "type": "null"
               }
             ]
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "step",
+                  "decision",
+                  "start",
+                  "end",
+                  "data",
+                  "database"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
           },
           "source_refs": {
             "items": {
@@ -1445,6 +3531,39 @@
             "title": "Collapsed",
             "default": false
           },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "blue",
+                  "green",
+                  "amber",
+                  "red",
+                  "purple",
+                  "teal",
+                  "pink",
+                  "gray"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
           "style": {
             "anyOf": [
               {
@@ -1454,6 +3573,25 @@
                 "type": "null"
               }
             ]
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "step",
+                  "decision",
+                  "start",
+                  "end",
+                  "data",
+                  "database"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
           },
           "source_refs": {
             "items": {
@@ -1531,7 +3669,8 @@
         },
         "additionalProperties": false,
         "type": "object",
-        "title": "NodeStyle"
+        "title": "NodeStyle",
+        "description": "节点样式（v2 预留字段，界面对它只做透传保存）。\n\n`style.color` 与 `Node.color` **不是同一个东西**，两者的关系必须写清楚，\n否则下一个人会以为它们是\"新旧两版\"而随手改坏一处：\n\n  - `NodeStyle.color` 是 `#RRGGBB`，来源是导入/将来的取色器，**界面不渲染**。\n    它是\"用户画的那个色\"，逐像素还原用。\n  - `Node.color` 是**调色板键**（`blue`/`green`/…），界面按它渲染，能跟着\n    主题（暗色/亮色）自动适配。\n\n两个字段同时存在时 **`Node.color` 优先**：语义色是渲染意图，hex 是历史值。\n`Node.color` 为 `None` 时才回落到…也不回落——`style.color` 仍然不渲染，\n它只是被保留下来，免得用户点一次保存就把导入的颜色丢掉。"
       },
       "Position": {
         "properties": {
@@ -1556,6 +3695,72 @@
         ],
         "title": "Position",
         "description": "节点坐标。只有 `layout == \"manual\"` 时有意义——自动布局的坐标是算出来的，\n存进数据只会在下次换布局时被当成用户意图。"
+      },
+      "Pref": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope",
+            "default": "global"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "user_explicit",
+              "suggestion_accepted"
+            ],
+            "title": "Source",
+            "default": "user_explicit"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At",
+            "default": ""
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At",
+            "default": ""
+          },
+          "last_applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Applied At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "Pref",
+        "description": "一条偏好。\n\n`last_applied_at` 不是存在 `user_prefs` 里的列，是**反查**出来的：它来自\n`runs.request.prefs_applied`，也就是\"哪几次运行真的带着这条偏好跑过\"。\n这一位是这张表的死表探测器——写进去却从来没有任何一次运行报告它，就说明\n读路径根本没接上，而这件事不需要看日志，打开面板就能看出来。\n\n匹配键是 `key=value` 整串而不是 `key`：用户把鱼骨图改成流程图之后，旧值的\n生效记录不该继续挂在它身上，界面该如实回到\"尚未生效\"。"
       },
       "Relation": {
         "properties": {
@@ -1647,10 +3852,10 @@
           },
           "max_tool_calls": {
             "type": "integer",
-            "maximum": 50.0,
+            "maximum": 120.0,
             "minimum": 1.0,
             "title": "Max Tool Calls",
-            "default": 8
+            "default": 50
           },
           "max_seconds": {
             "type": "number",
@@ -1679,17 +3884,196 @@
         "title": "RunBudget",
         "description": "一次 run 的资源上限。\n\n`max_model_calls` 数的是**真实调用次数**，不是外层轮数：循环里每一轮 provider\n调用、以及工具内部的每一次 `chat_async` 调用都算一次，共用 `RunContext` 上\n同一个账本。默认值按最贵的一条路（六支分片）算，算式见字段注释：\n「查 → 建 → 改 → 修」这种多轮对话只用其中几次，多出来的余量不会被无故花掉。\n\n`max_output_tokens` 同时约束两条出口：provider 那一轮，以及工具内部每一次\n`chat_async`——参数由 `tools._max_tokens()` 夹到 provider 认的上限再发出去。\n只约束前者时，工具内这条出口等于没有边界。\n\n`max_repairs` 约束的是**工具执行失败次数**（`ToolResult.ok == False` 的次数），\n与模型调用次数无关：一次成功的模型响应里发三个工具、其中两个失败，只消耗\n这里两次。全轮共享而不是按轮重置——按轮重置等于给模型无限次重试，\n每次重试都照样计费。"
       },
+      "RunDetail": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          },
+          "candidate": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate"
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "intent",
+          "goal",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunDetail",
+        "description": "单条：带结果正文与失败原因。"
+      },
+      "RunSummary": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "applied_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "intent",
+          "goal",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunSummary",
+        "description": "列表里的一行：**不带结果正文**。\n\n结果是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句\n\"上次有一次生成还没保存\"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。"
+      },
       "SaveRequest": {
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Input"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              }
+            ],
+            "title": "Content"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EditEventIn"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Events"
+          },
+          "truncated": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Truncated",
+            "default": 0
           }
         },
         "type": "object",
         "required": [
           "content"
         ],
-        "title": "SaveRequest"
+        "title": "SaveRequest",
+        "description": "保存一份导图，**顺带提交这一次保存里攒下的改动日志**。\n\n事件为什么不走独立端点（`POST /mindmaps/{id}/edits`）：第一次保存之前根本\n没有 `map_id`。要么发不出去，要么必须先 create 再补发，于是多出一种半截状态\n——内容存了、事件没存——而统计从此只看见部分改动，且没有任何地方能察觉。\n放进同一个请求体，两者天然同成败：409 冲突时一起失败、重试就都补上。\n\n`events` 缺省是空列表而不是必填：一次没有改动的保存（改完再改回来、或只是\n重新点了一下保存）与上一版请求体逐字节相同。\n\n`content` 是**三种图型的联合**（`DiagramContent`），不是 `MindMapContent`：\n鱼骨图与流程图的顶层结构不同（`problem` + `bones` / `stages` + 阶段间跳转），\n用树那一套 `extra=\"forbid\"` 装不下。判别靠形状，所以旧前端（只发树形状）的\n请求与加这个联合之前逐字节相同。"
+      },
+      "Saved": {
+        "properties": {
+          "pref": {
+            "$ref": "#/components/schemas/Pref"
+          },
+          "changed": {
+            "type": "boolean",
+            "title": "Changed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "pref",
+          "changed"
+        ],
+        "title": "Saved",
+        "description": "`set()` 的结果。\n\n`changed=False` 是\"这次提交没有改变任何东西\"——同值重复提交不刷 `updated_at`。\n不返回这个布尔值，界面上就会出现\"我刚设过\"的假象：时间戳变了，实际什么都没变。"
       },
       "SearchRequest": {
         "properties": {
@@ -1731,6 +4115,78 @@
         },
         "type": "object",
         "title": "SearchResponse"
+      },
+      "SearchResult": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryHit"
+            },
+            "type": "array",
+            "title": "Hits"
+          },
+          "scanned": {
+            "type": "integer",
+            "title": "Scanned"
+          },
+          "top_k": {
+            "type": "integer",
+            "title": "Top K"
+          },
+          "min_cosine": {
+            "type": "number",
+            "title": "Min Cosine"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "query",
+          "hits",
+          "scanned",
+          "top_k",
+          "min_cosine"
+        ],
+        "title": "SearchResult"
+      },
+      "SetPrefRequest": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "user_explicit",
+              "suggestion_accepted"
+            ],
+            "title": "Source",
+            "default": "user_explicit"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "SetPrefRequest",
+        "description": "`PUT /prefs/{key}` 的请求体。\n\n`source` 允许调用方声明\"这条是我点了建议才写的\"：两种来源在界面上显示不同\n的标签（\"你设置的\" / \"系统建议（你已同意）\"），而那个区别只有写入的那一刻\n知道——事后再去猜\"这条是不是建议来的\"是猜不出来的。"
       },
       "Source": {
         "properties": {
@@ -1866,7 +4322,9 @@
           "markdown",
           "document",
           "image",
-          "audio"
+          "audio",
+          "web",
+          "paper"
         ],
         "title": "SourceKind"
       },
@@ -1922,6 +4380,29 @@
             },
             "type": "array",
             "title": "Tags"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "raw_chars": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Chars"
           }
         },
         "additionalProperties": false,
@@ -2061,6 +4542,17 @@
             "type": "integer",
             "minimum": 1.0,
             "title": "Char Count"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
           }
         },
         "additionalProperties": false,
@@ -2077,7 +4569,7 @@
         "properties": {
           "suggestions": {
             "items": {
-              "$ref": "#/components/schemas/Suggestion"
+              "$ref": "#/components/schemas/app__contracts__diagnostic__Suggestion"
             },
             "type": "array",
             "title": "Suggestions"
@@ -2092,63 +4584,6 @@
         },
         "type": "object",
         "title": "SuggestResponse"
-      },
-      "Suggestion": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/SuggestionKind"
-          },
-          "node_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Node Id"
-          },
-          "message": {
-            "type": "string",
-            "title": "Message"
-          },
-          "evidence": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Evidence"
-          },
-          "confidence": {
-            "anyOf": [
-              {
-                "type": "number",
-                "maximum": 1.0,
-                "minimum": 0.0
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Confidence"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "kind",
-          "message"
-        ],
-        "title": "Suggestion"
       },
       "SuggestionKind": {
         "type": "string",
@@ -2215,7 +4650,32 @@
       "UpdateRequest": {
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MindMapContent-Input"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MindMapContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FishboneContent-Input"
+              },
+              {
+                "$ref": "#/components/schemas/FlowContent-Input"
+              }
+            ],
+            "title": "Content"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EditEventIn"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Events"
+          },
+          "truncated": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Truncated",
+            "default": 0
           },
           "version": {
             "type": "integer",
@@ -2269,6 +4729,98 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "app__contracts__diagnostic__Suggestion": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SuggestionKind"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind",
+          "message"
+        ],
+        "title": "Suggestion"
+      },
+      "app__prefs__service__Suggestion": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "label",
+          "count",
+          "message"
+        ],
+        "title": "Suggestion",
+        "description": "一条**候选**建议。它不是偏好，落库必须经过用户点一次。"
       }
     }
   }

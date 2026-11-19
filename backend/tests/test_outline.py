@@ -327,7 +327,7 @@ class _Plan:
                     if system.startswith(PLAN_PROMPT))
 
 
-def _run_deep(sources: list[Source], *, mode: str = "rag"):
+def _run_deep(sources: list[Source]):
     request = AgentRunRequest(
         goal="整理管理办法", intent="create", sources=sources,
         budget=RunBudget(max_model_calls=20, max_tool_calls=8, max_output_tokens=32768),
@@ -335,9 +335,8 @@ def _run_deep(sources: list[Source], *, mode: str = "rag"):
     ctx = RunContext(request=request, candidate=None,
                      sources_by_id={source.id: source for source in sources})
     model = _Plan()
-    registry = build_registry("create", has_sources=True)
-    with patch("app.agent.tools.chat_async", new=model), \
-            patch("app.agent.tools.source_mode", new=lambda: mode):
+    registry = build_registry("create_deep", has_sources=True)
+    with patch("app.agent.tools.chat_async", new=model):
         result = asyncio.run(registry.execute(
             ToolCall(call_id="c-deep", name="mindmap_generate_deep",
                      arguments={"topic": "管理办法", "branches": 3,
@@ -400,23 +399,19 @@ def test_outline_is_absent_when_material_has_no_outline():
     assert model.plan_user.startswith("主题：管理办法\n根据内容实际包含的方面")
 
 
-def test_full_mode_never_builds_an_outline():
-    """`full` 下正文整份在 prompt 里，目录是同一份内容的第二份拷贝——不拼。"""
-    sources = [_source(HIGH_COVERAGE)]
-    with patch("app.agent.tools._skeleton_outline") as spy:
-        result, model = _run_deep(sources, mode="full")
-    assert result.ok, result.content
-    assert spy.call_count == 0
-    assert OUTLINE_HEADER not in model.plan_user
-
-
 def test_plan_ask_without_outline_is_unchanged():
-    """没有目录时 user 消息与加这个功能之前逐字相同（回归口径）。"""
+    """没有目录时 user 消息的形状不变（回归口径）。
+
+    「20 字」在 2026-11 这次改动里改成了 16：`PLAN_PROMPT` 一直说的是 16、
+    `_skeleton_titles` 也按 16 截，只有这一句 user 说 20——模型照 user 写，
+    写出来就被截，一级分支标题从中间断掉。三处现在都读
+    `GENERATED_LABEL_MAX_CHARS`。
+    """
     assert _plan_ask("管理办法", 3) == (
         "主题：管理办法\n"
         "根据内容实际包含的方面来定一级分支数量，最多 3 条。\n"
         "材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。\n"
-        "每条不超过 20 字，互不重叠，按逻辑顺序排列。"
+        "每条不超过 16 字，互不重叠，按逻辑顺序排列。"
     )
 
 
@@ -434,12 +429,21 @@ def test_skeleton_outline_reports_whole_material_shares():
     assert sum(shares) >= 95
 
 
-def test_skeleton_contract_is_still_a_branch_list():
-    """骨架的输出契约不变：`_skeleton_titles` 只认 `{"branches": [str]}`。"""
+def test_skeleton_contract_accepts_both_branch_shapes():
+    """骨架接受两种形状：带视觉元素的对象，以及纯字符串（旧模型/旧 mock）。
+
+    2026-11 这次改动把骨架从 `{"branches":[str]}` 扩成也收
+    `{"branches":[{"label","color","icon"}]}`——视觉元素只给一级分支。**纯字符串
+    必须继续被接受**：老模型、mock、以及"模型没照格式写"都会退化成它，硬拒等于
+    把一次已经花掉的骨架调用判死。
+    """
     assert _skeleton_titles({"branches": ["甲", "乙"]}) == ["甲", "乙"]
-    assert _skeleton_titles({"branches": [{"label": "甲"}]}) == []
+    assert _skeleton_titles({"branches": [{"label": "甲"}, {"label": "乙"}]}) == ["甲", "乙"]
+    # 没有 label 的对象不算一条分支；非 list 的 branches、非 dict 的响应一律空
+    assert _skeleton_titles({"branches": [{"name": "甲"}]}) == []
     assert _skeleton_titles(["甲"]) == []
-    # 目录进 prompt 之后，模型仍被要求只回这个形状
-    assert '{"branches":["分支一","分支二"]}' in PLAN_PROMPT
+    assert _skeleton_titles({"branches": "甲"}) == []
+    # 目录进 prompt 之后，模型仍被要求只回这个形状（带视觉元素的版本）
+    assert '{"branches":[{"label":"分支一","color":"blue","icon":"🎯"}' in PLAN_PROMPT
     assert "优先采用它们作为一级分支" in PLAN_PROMPT
     assert json.dumps({"branches": ["甲"]}, ensure_ascii=False) == '{"branches": ["甲"]}'

@@ -47,5 +47,21 @@ coverage.xml
 htmlcov/
 
 # AI Agent contracts
+# 规范要共享才有效：AGENTS.md 落到仓库里，两个人看到的才是同一份。
+# 各人的本地覆盖走 AGENTS.local.md（仍在忽略范围）。
 AGENTS.md
+!AGENTS.md
+AGENTS.local.md
 *.gz
+
+# codex 派活脚本的产物：报告与事件流都属于一次性排障材料
+codex-report-*.md
+codex-raw-*.log
+
+# 真浏览器验证的临时目录（截图、种子脚本、对比脚本）。产物值得留，但不该进版本库
+.visioncheck/
+
+# 鱼骨几何的一次性验证脚本与截图（.visioncheck 的兄弟目录，同样不进版本库）
+frontend/verify-fishbone.html
+frontend/verify-fishbone.ts
+frontend/verify-shots/

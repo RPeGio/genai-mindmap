@@ -10,3 +10,442 @@ body {
   margin: 0;
   font-family: system-ui, "Microsoft YaHei", sans-serif;
 }
+
+/*
+ * 节点语义色的调色板。
+ *
+ * 后端 `Node.color` 只存**键**（`blue` / `green` / …，见
+ * `backend/app/contracts/mindmap.py::NODE_COLORS`），色值全部在这里。
+ * 这样切一次主题只改这一块，导图数据一个字节都不用动：
+ *
+ *   - 亮色：下面的 `:root`；
+ *   - 暗色：在 `@media (prefers-color-scheme: dark)` 里重定义同一批变量。
+ *
+ * 若把色值写进节点样式（`style="border-color:#2563eb"`），暗色主题下就是一堆
+ * 刺眼的亮蓝——而那是**已经存进库里的数据**，改不回来。
+ *
+ * 命名与后端的 `NODE_COLOR_CSS_PREFIX` 对齐：`--mind-color-<key>`。
+ * `backend/tests/test_node_visuals.py` 会逐个比对调色板键与这里定义的变量，
+ * 漏一个就红——静默漏一个的表现是那个颜色画出来是默认灰，没有任何报错。
+ */
+:root {
+  --mind-color-blue: #2563eb;
+  --mind-color-green: #16a34a;
+  --mind-color-amber: #d97706;
+  --mind-color-red: #dc2626;
+  --mind-color-purple: #7c3aed;
+  --mind-color-teal: #0d9488;
+  --mind-color-pink: #db2777;
+  --mind-color-gray: #475569;
+
+  /* 节点底色 = 语义色与画布底色的混合比例（0–100%）。单独拎出来是因为它要在
+     暗色主题里调——同一个 10% 在深色底上会太脏，而那不该逼着人改色值。 */
+  --mind-color-tint: 10%;
+  --mind-color-surface: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mind-color-blue: #60a5fa;
+    --mind-color-green: #4ade80;
+    --mind-color-amber: #fbbf24;
+    --mind-color-red: #f87171;
+    --mind-color-purple: #a78bfa;
+    --mind-color-teal: #2dd4bf;
+    --mind-color-pink: #f472b6;
+    --mind-color-gray: #94a3b8;
+    --mind-color-tint: 22%;
+    --mind-color-surface: #1e293b;
+  }
+}
+
+/*
+ * 一个带语义色的节点。
+ *
+ * 键 → 变量的映射只有这一张表：`[data-node-color="blue"]` 把 `--mind-node-accent`
+ * 绑到 `--mind-color-blue`，样式规则只认 `--mind-node-accent`。加一个颜色只需要
+ * 上面一组变量 + 这里一行，不必再写一遍边框/底色的规则。
+ *
+ * 这些规则**不放进 `@layer`**：Tailwind 的工具类在 `utilities` 层里，而层外规则
+ * 一律优先。节点框身上还有 `bg-white` / `border-slate-300` 这些类，不压过它们的话
+ * 颜色就永远画不出来——而"加了字段但看不到效果"是最难查的一种。
+ */
+[data-node-color] {
+  border-color: var(--mind-node-accent);
+}
+
+[data-node-color="blue"] { --mind-node-accent: var(--mind-color-blue); }
+[data-node-color="green"] { --mind-node-accent: var(--mind-color-green); }
+[data-node-color="amber"] { --mind-node-accent: var(--mind-color-amber); }
+[data-node-color="red"] { --mind-node-accent: var(--mind-color-red); }
+[data-node-color="purple"] { --mind-node-accent: var(--mind-color-purple); }
+[data-node-color="teal"] { --mind-node-accent: var(--mind-color-teal); }
+[data-node-color="pink"] { --mind-node-accent: var(--mind-color-pink); }
+[data-node-color="gray"] { --mind-node-accent: var(--mind-color-gray); }
+
+[data-node-color]:not([data-node-depth="0"]) {
+  background-color: color-mix(
+    in srgb,
+    var(--mind-node-accent) var(--mind-color-tint),
+    var(--mind-color-surface)
+  );
+}
+
+/* 根节点是深色实底：语义色只染左边一道。给它铺一层淡色底，中心主题会变成一块
+   彩色积木，而它恰恰是该最"重"的那一个。 */
+[data-node-color][data-node-depth="0"] {
+  border-left-width: 4px;
+  border-left-color: var(--mind-node-accent);
+}
+
+/*
+ * 判定节点的菱形（`MindNode.vue` 的 `data-node-shape="diamond"`）。
+ *
+ * ## 为什么是三层同形的 clip-path，而不是 border
+ *
+ * `clip-path` 会把**整个元素的绘制内容**按路径裁掉：`border`、`border-radius`、
+ * `ring`（box-shadow）、`box-shadow` 一个都留不下。所以菱形不能靠 border 画描边——
+ * 那会得到"代码里写了边框，屏幕上什么都没有"。
+ *
+ * 这里的画法是三层同形状的路径叠出来：
+ *   - `.diamond-stroke`：整块背景 = **描边色**；
+ *   - `.diamond-fill`  ：`inset: var(--diamond-inset)`，收缩后同一形状 = **填充色**；
+ *   - `.diamond-glow`  ：向外撑开 `--diamond-glow-spread` = 悬停/改动的光晕。
+ * 中间那圈露出来的就是描边。**三态因此不各写一套结构**，只改三个变量。
+ * （选中要加粗？改 `--diamond-inset`。改动要琥珀色？改 `--diamond-stroke` + 光晕。）
+ *
+ * ## 顶点与句柄
+ *
+ * `polygon(50% 0, 100% 50%, 50% 100%, 0 50%)` 的四个顶点，正好落在**外接框四条边
+ * 的中点**上；而 Vue Flow 的 `Position.Top/Right/Bottom/Left` 也把句柄放在四条边的
+ * 中点。所以连线天然从菱形的顶点进出，不需要挪句柄、也不会落在看不见的棱上。
+ * （会落到棱上的是"旋转 45° 的正方形"——那里顶点在外接框的对角线上。方案 B 的
+ * 代价里唯一真正致命的其实是这一条，不是反向旋转。）
+ *
+ * ## 内容层不裁切
+ *
+ * 文字、图标、引用角标、悬停卡片、内联输入框全都在 `.diamond-content` 里，它是普通
+ * 盒子。宽度收到 68%：220×110 的菱形在中带（两行文字 ≈ 35px 高，即 y = ±17.5）处
+ * 的可用宽度是 `220 × (1 − 35/110) ≈ 150px`，而 `220 × 68% ≈ 150px`——正好贴住，
+ * 再多就会顶出斜边。
+ */
+.mind-diamond {
+  /* 缺省描边 = 矩形那一档的 `border-slate-300`：流程图里两种节点挨着站，
+     描边深浅不一致会看起来像两套组件。 */
+  --diamond-stroke: #cbd5e1;
+  --diamond-fill: var(--mind-color-surface);
+  --diamond-inset: 2px;
+  --diamond-glow: transparent;
+  --diamond-glow-spread: 0px;
+  --diamond-text: #334155;
+  position: relative;
+  /* 三层背景要压在内容下面，又要压在节点自己的背景上面：isolate 把它们关进
+     同一个层叠上下文，避免光晕渗到相邻节点上。 */
+  isolation: isolate;
+  text-align: center;
+}
+
+.mind-diamond .diamond-layer {
+  position: absolute;
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.mind-diamond .diamond-glow {
+  inset: calc(-1 * var(--diamond-glow-spread));
+  background: var(--diamond-glow);
+  transition: inset 120ms ease-out;
+}
+
+.mind-diamond .diamond-stroke {
+  inset: 0;
+  background: var(--diamond-stroke);
+}
+
+.mind-diamond .diamond-fill {
+  inset: var(--diamond-inset);
+  background: var(--diamond-fill);
+}
+
+/*
+ * 文字收到菱形中带，但**不新增一层 div**：内联输入框与标题仍然是这个盒子直接
+ * 的子元素（`margin: auto` 在 flex 容器里就能居中）。少一层容器的直接好处是矩形
+ * 节点的 DOM 结构与加菱形之前一模一样——`parentElement` 这种断言不用跟着改，
+ * "树一个像素都没变"也不只是推理出来的。
+ */
+.mind-diamond > .line-clamp-2,
+.mind-diamond > input {
+  position: relative;
+  z-index: 1;
+  max-width: 68%;
+  margin-inline: auto;
+  color: var(--diamond-text);
+}
+
+/* 语义色染描边。**不染填充**：菱形里要写字，淡底已经由渲染层的 tone 决定过，
+   再叠一层色会让判定节点的可读性跟着配色走。 */
+.mind-diamond[data-node-color] {
+  --diamond-stroke: var(--mind-node-accent);
+}
+
+/* 深度 0 = 根 / 流程图顶端：实心深底，与矩形根节点同一套语言。 */
+.mind-diamond[data-diamond-tone="root"] {
+  --diamond-stroke: #0f172a;
+  --diamond-fill: #0f172a;
+  --diamond-text: #ffffff;
+}
+
+/* 预览：草稿不该有实心描边，用虚线语言表达不了（clip-path 没有 stroke-dasharray），
+   所以用"更淡的描边 + 更透的整体"来对应矩形的 `border-dashed opacity-60`。 */
+.mind-diamond[data-diamond-tone="preview"] {
+  --diamond-stroke: #cbd5e1;
+  opacity: 0.6;
+}
+
+.mind-diamond[data-diamond-tone="preview-leaf"] {
+  --diamond-stroke: #e2e8f0;
+  opacity: 0.4;
+}
+
+/* 选中：描边变深、变粗（inset 变小 = 环变厚）。shadow-md 在菱形上会被裁掉，
+   所以"选中"这件事只能靠描边说清楚——这也是它必须够粗的原因。 */
+.mind-diamond[data-diamond-tone="selected"] {
+  --diamond-stroke: #0f172a;
+  --diamond-inset: 3px;
+}
+
+/* 改动过的节点：琥珀色描边 + 一圈琥珀光晕。光晕是 `ring-2 ring-amber-300` 在
+   菱形上的等价物（ring 会被裁掉）。 */
+.mind-diamond[data-diamond-tone="changed"] {
+  --diamond-stroke: #d97706;
+  --diamond-glow: rgba(251, 191, 36, 0.55);
+  --diamond-glow-spread: 5px;
+}
+
+/* 悬停：任何 tone 下都加一层灰光晕。**只改光晕不改描边色**——换色会和选中/
+   改动的颜色打架，而"悬停"是临时状态，不该盖掉一个持久状态。 */
+.mind-diamond:hover {
+  --diamond-glow: rgba(100, 116, 139, 0.35);
+  --diamond-glow-spread: 4px;
+}
+
+.mind-diamond[data-diamond-tone="changed"]:hover {
+  --diamond-glow: rgba(251, 191, 36, 0.75);
+  --diamond-glow-spread: 6px;
+}
+
+/* 暗色主题下描边要跟着底色走，否则白底一变，白色描边就消失了。 */
+@media (prefers-color-scheme: dark) {
+  .mind-diamond[data-diamond-tone="root"] {
+    --diamond-stroke: #e2e8f0;
+    --diamond-fill: #0f172a;
+  }
+
+  .mind-diamond[data-diamond-tone="selected"] {
+    --diamond-stroke: #e2e8f0;
+  }
+}
+
+
+/*
+ * 平行四边形的输入 / 输出节点（`MindNode.vue` 的 `data-node-shape="parallelogram"`）。
+ *
+ * 与菱形**同一个思路**：`clip-path` 会把 `border` / `border-radius` / `ring` /
+ * `box-shadow` 一起裁掉，所以框本身由三层同形状的路径叠出来（外环光晕、描边、
+ * 填充），三态只改变量、不换结构。差别只有那条 `polygon`：
+ *
+ *     polygon(20% 0%, 100% 0%, 80% 100%, 0% 100%)
+ *
+ * 斜边吃掉左右各 20% 的宽度，所以文字可用宽度必须重新算过，见
+ * `canvas/layout/flow.ts::DATA_SIZE`：220×48 时两行文字的可用宽度是
+ * `220 × (0.8 − 0.2×35/48) ≈ 143.9px`，这里取 64%（≈140.8px）留一档余量。
+ *
+ * ## 句柄与斜边
+ *
+ * 菱形的四个顶点正好落在外接框四条边的中点，所以连线天然从顶点进出。平行四边形
+ * 不是：它左右两条斜边的中点在 `x = 10%` / `90%`，而句柄在 `0%` / `100%`。上下
+ * 两个句柄仍然落在顶边（`x∈[20%,100%]`）与底边（`x∈[0%,80%]`）的实体内，而流程图
+ * 是 `rankdir: TB` 的（`layout/flow.ts` 报 `direction: 'down'`），父子线走上下句柄
+ * ——左右句柄只在跨阶段的回退边里出现，那一点点间隙不值得为它改 Vue Flow 的句柄
+ * 定位（改错了会让所有形状的连线一起偏）。
+ */
+.mind-parallelogram {
+  --shape-stroke: #cbd5e1;
+  --shape-fill: var(--mind-color-surface);
+  --shape-inset: 2px;
+  --shape-glow: transparent;
+  --shape-glow-spread: 0px;
+  --shape-text: #334155;
+  position: relative;
+  isolation: isolate;
+  text-align: center;
+}
+
+.mind-parallelogram .parallelogram-layer {
+  position: absolute;
+  clip-path: polygon(20% 0%, 100% 0%, 80% 100%, 0% 100%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.mind-parallelogram .parallelogram-glow {
+  inset: calc(-1 * var(--shape-glow-spread));
+  background: var(--shape-glow);
+  transition: inset 120ms ease-out;
+}
+
+.mind-parallelogram .parallelogram-stroke {
+  inset: 0;
+  background: var(--shape-stroke);
+}
+
+.mind-parallelogram .parallelogram-fill {
+  inset: var(--shape-inset);
+  background: var(--shape-fill);
+}
+
+.mind-parallelogram > .line-clamp-2,
+.mind-parallelogram > input {
+  position: relative;
+  z-index: 1;
+  max-width: 64%;
+  margin-inline: auto;
+  color: var(--shape-text);
+}
+
+/*
+ * 圆柱（数据库 / 存储）。轮廓与顶面弧线是**两条 SVG path**，不是 CSS 圆角：
+ * `border-radius: 50% / 12%` 能画出"上下是弧、两侧竖直"的轮廓，但画不出顶面椭圆
+ * 的下半弧——没有那道弧，它看起来只是个压扁的药丸，读者不会读成"存数据的框"。
+ *
+ * 三层语义与菱形一致，只是实现换了：
+ *   - 描边 = `stroke`（不再是"外框当描边色"），所以**加粗描边不需要 `inset`**；
+ *   - 光晕  = `filter: drop-shadow()`，它跟着形状轮廓走，而且**不会**被裁掉
+ *            （菱形那边 `box-shadow` 会被 `clip-path` 吃掉，这里没有这个问题）；
+ *   - 三态  = 只改 `--shape-stroke` / `--shape-width` / `--shape-glow`。
+ *
+ * `vector-effect: non-scaling-stroke` 是必须的：`viewBox="0 0 100 100"` 被拉伸到
+ * 220×68，不加这一条时描边在横向与纵向会得到两个不同的像素宽度（左右 1.5px、
+ * 上下 0.46px），上下两条边看着像没画。
+ */
+.mind-cylinder {
+  --shape-stroke: #cbd5e1;
+  --shape-fill: var(--mind-color-surface);
+  --shape-width: 1.5px;
+  --shape-glow: transparent;
+  --shape-glow-blur: 0px;
+  --shape-text: #334155;
+  position: relative;
+  isolation: isolate;
+  text-align: center;
+}
+
+.mind-cylinder .cylinder-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
+  overflow: visible;
+  /* 光晕挂在 **SVG 上**，不是挂在这个盒子上：`filter` 会把影子一起投给所有后代，
+     挂在盒子上时连标题文字都会带一圈琥珀色。 */
+  filter: drop-shadow(0 0 var(--shape-glow-blur) var(--shape-glow));
+  transition: filter 120ms ease-out;
+}
+
+.mind-cylinder .cylinder-body {
+  fill: var(--shape-fill);
+  stroke: var(--shape-stroke);
+  stroke-width: var(--shape-width);
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+/* 顶面椭圆的下半弧：圆柱的"盖沿"。它比轮廓细一点——那条线是**内部折线**，
+   与轮廓同粗细会让顶面看起来是两张纸叠在一起。 */
+.mind-cylinder .cylinder-lid {
+  fill: none;
+  stroke: var(--shape-stroke);
+  stroke-width: var(--shape-width);
+  vector-effect: non-scaling-stroke;
+  opacity: 0.75;
+}
+
+/* 文字落在两个椭圆之间的矩形带里。78% 的理由见 `flow.ts::DATABASE_SIZE`：
+   220 × 78% ≈ 171.6px（约 12 字/行），而且这个宽度在顶弧下沿处仍然安全。 */
+.mind-cylinder > .line-clamp-2,
+.mind-cylinder > input {
+  position: relative;
+  z-index: 1;
+  max-width: 78%;
+  margin-inline: auto;
+  color: var(--shape-text);
+}
+
+/* 语义色染描边（**不染填充**，理由与菱形一致：框里要写字，淡底由 tone 决定过）。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-node-color] {
+  --shape-stroke: var(--mind-node-accent);
+}
+
+/* 深度 0 = 根 / 流程图顶端：实心深底，与矩形、菱形同一套语言。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="root"] {
+  --shape-stroke: #0f172a;
+  --shape-fill: #0f172a;
+  --shape-text: #ffffff;
+}
+
+/* 预览草稿：`clip-path` / SVG 都没有 `stroke-dasharray` 的直接等价物（可以有，
+   但虚线框在预览里与矩形的 `border-dashed` 不同源），所以与菱形一样用"更淡的
+   描边 + 更透的整体"。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="preview"] {
+  --shape-stroke: #cbd5e1;
+  opacity: 0.6;
+}
+
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="preview-leaf"] {
+  --shape-stroke: #e2e8f0;
+  opacity: 0.4;
+}
+
+/* 选中：描边变深、变粗。平行四边形的"变粗"是 `--shape-inset` 变小（环变厚），
+   圆柱的是 `--shape-width` 变大——同一个语义，两种实现各用自己那套。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="selected"] {
+  --shape-stroke: #0f172a;
+  --shape-inset: 3px;
+  --shape-width: 2.5px;
+}
+
+/* 改动过的节点：琥珀色描边 + 一圈琥珀光晕（菱形那边是外扩层，这里用 drop-shadow）。 */
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="changed"] {
+  --shape-stroke: #d97706;
+  --shape-glow: rgba(251, 191, 36, 0.55);
+  --shape-glow-spread: 5px;
+  --shape-glow-blur: 5px;
+}
+
+/* 悬停：只加光晕、不换描边色——换色会和选中 / 改动的颜色打架，而悬停是临时状态。 */
+:is(.mind-parallelogram, .mind-cylinder):hover {
+  --shape-glow: rgba(100, 116, 139, 0.35);
+  --shape-glow-spread: 4px;
+  --shape-glow-blur: 4px;
+}
+
+:is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="changed"]:hover {
+  --shape-glow: rgba(251, 191, 36, 0.75);
+  --shape-glow-spread: 6px;
+  --shape-glow-blur: 6px;
+}
+
+/* 暗色主题：描边跟着底色走，否则白底一换，浅描边就消失了。 */
+@media (prefers-color-scheme: dark) {
+  :is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="root"] {
+    --shape-stroke: #e2e8f0;
+    --shape-fill: #0f172a;
+  }
+
+  :is(.mind-parallelogram, .mind-cylinder)[data-shape-tone="selected"] {
+    --shape-stroke: #e2e8f0;
+  }
+}

@@ -6,7 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
-from app.contracts.mindmap import MindMapContent
+from app.agent import shapes
+from app.contracts.mindmap import DiagramContent, Node
 from app.contracts.source import Source, SourceRef
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,16 @@ logger = logging.getLogger(__name__)
 # 每条引用都跑一遍能拖到几十秒，而用户只是点了「生成导图」。超出预算的
 # 引用静默跳过——它们是可选的附加评分，不是功能的必要条件。
 MAX_NLI_CHECKS = 100
+
+# 论断的拼接口径：`label` 与 `detail` 之间用句号。
+#
+# 不用换行：BERT/RoBERTa 的 WordPiece 把 `\n` 当空白吃掉，既不构成句子边界也不
+# 省 token（实测两种分隔符的 token 数相同）；而 NLI 的 hypothesis 本来就该是
+# 一句话，"标题。说明。"这个形态与 MNLI 训练数据里的人工 hypothesis 同构。
+CLAIM_JOINER = "。"
+# `detail` 截断的三级退让点，见 `_clip_detail`。
+_SENTENCE_END = "。！？；…!?"
+_CLAUSE_END = "，、：,;"
 
 
 @dataclass(frozen=True)
@@ -299,7 +310,7 @@ def _outside_evidence(ref: SourceRef, evidence: Sequence[EvidenceSpan]) -> bool:
                    for span in covering)
 
 
-def verify_source_refs(content: MindMapContent, sources: list[Source], *,
+def verify_source_refs(content: DiagramContent, sources: list[Source], *,
                        remove_invalid: bool = False,
                        evidence: Sequence[EvidenceSpan] | None = None,
                        ) -> list[Diagnostic]:
@@ -332,9 +343,10 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
     if len(by_id) != len(sources):
         raise ValueError("核验来源 ID 不能重复")
     diagnostics: list[Diagnostic] = []
-    stack = [content.root]
-    while stack:
-        node = stack.pop()
+    # 三套结构共用这一份遍历（`shapes.iter_nodes`）：鱼骨的六根骨、流程的各阶段
+    # 都是并列子树，节点藏在 `bones[i].root` / `stages[i].root` 下面。顺序与改动
+    # 之前逐字相同（前序，父在子前），所以诊断的先后也不变。
+    for node in shapes.iter_nodes(content):
         verified: list[SourceRef] = []
         for ref in node.source_refs:
             verdict = _check_reference(ref, by_id.get(ref.source_id), evidence=evidence)
@@ -382,11 +394,72 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
                 level=DiagnosticLevel.warn, code="UNSOURCED_NODE", node_id=node.id,
                 message=f"节点「{node.label}」没有可核验的原文引用；不代表节点内容错误",
             ))
-        stack.extend(reversed(node.children))
     return diagnostics
 
 
-def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnostic]:
+def _clip_detail(detail: str, budget: int) -> str:
+    """把 `detail` 截到 `budget` 字符，截点优先落在句子边界上。
+
+    三级退让，与切块那边是同一个思路（能用强边界就不用弱边界）：
+
+      1. **句子边界**：论断天然是一句话，切在句号后面留下的仍是一个完整论断；
+      2. **句内标点**（`，、：`）：第一句本身超预算时（`detail` 可能是一整段），
+         退到最后一个逗号——半句仍读得通；
+      3. **硬截**：连逗号都没有（一长串没有标点的字符），只能按字符数切。
+
+    不留半句是这里唯一的目的：`"五万元以内由财务经理核准，超过五十万元报"` 这种
+    残句在 NLI 上制造的是噪声——模型看到的是一个残缺的命题，它的三档概率与"这条
+    论断成不成立"无关。少一句真话，好过多半句假话。
+    """
+    if budget <= 0:
+        return ""
+    if len(detail) <= budget:
+        return detail
+    window = detail[:budget]
+    cut = max(window.rfind(char) for char in _SENTENCE_END)
+    if cut >= 0:
+        return window[:cut + 1]
+    cut = max(window.rfind(char) for char in _CLAUSE_END)
+    if cut >= 0:
+        return window[:cut + 1]
+    return window
+
+
+def _claim_of(node: Node) -> str:
+    """喂给 NLI 的 hypothesis：**节点论断**，不是节点标题。
+
+    `label` 是画布上放得下的短名（"预算审批流程"），单看它，NLI 能回答的只有
+    "这段引文提到这个短语了吗"——一个名词短语几乎不可能被一段话"否定"，它顶多
+    不被提及，所以判定只会落在 entailment / neutral，永远不是 contradiction。
+    真模型实测（Erlangshen int8，10 条与引文语义相反的论断）：只给 `label` 时
+    10 条全被判成 entailment，一条都没抓到。`detail` 才是可判真假的论断
+    （"五万元以内由财务经理核准，超过五十万元报总经理审批"）。两者拼起来才
+    等价于 MNLI 训练数据里的 hypothesis。
+
+    退回到 `label` 的两种情形都是**正常输入**，不是错误：
+      - 一级分支与旧图没有 `detail`（契约里它是 `str | None`）；
+      - `detail` 全是空白（`Node` 的 validator 会折成 `None`，但这一层不假设
+        调用方一定过过 validator）。
+
+    预算分配（`MAX_CLAIM_CHARS` 的来源见 `nli.MAX_CLAIM_CHARS`）：`label` **全留**，
+    `detail` 用剩下的额度按句边界截。反过来做（把 `label` 也截）会让 claim 与节点
+    在界面上对不上号——人核那条 contradiction 警告时找不到是哪个节点。
+    """
+    from app.optimization.nli import MAX_CLAIM_CHARS
+
+    label = " ".join((node.label or "").split())
+    detail = " ".join((node.detail or "").split())
+    if not detail:
+        return label[:MAX_CLAIM_CHARS]
+    joiner = "" if label.endswith(tuple(_SENTENCE_END)) else CLAIM_JOINER
+    clipped = _clip_detail(detail, MAX_CLAIM_CHARS - len(label) - len(joiner))
+    if not clipped:
+        # `label` 自己就吃满了额度：claim 只能是它。硬截兜底，保证不超过额度。
+        return label[:MAX_CLAIM_CHARS]
+    return f"{label}{joiner}{clipped}"[:MAX_CLAIM_CHARS]
+
+
+def annotate_nli(content: DiagramContent, sources: list[Source]) -> list[Diagnostic]:
     """可选层：对**已通过前两层**的引用跑语义蕴含打分。
 
     前两层是机械判据（字段合法、quote 逐字出现在原文里），它们管不住
@@ -396,8 +469,12 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
     只回答"一条已存在的引用在语义上站不站得住"。判定相反时引用留着、同时
     给一条 contradiction 警告，两边都保留由人判断——概率模型不该推翻确定性判据。
 
-    没有 quote 也没有字符区间的引用直接跳过：拿整篇原文去比一个节点标签，
-    NLI 只会给 neutral，没有信息量还白花时间。
+    hypothesis 用 `_claim_of(node)`（`label` + `detail`），**不是** `node.label`：
+    拿一个名词短语去当 hypothesis，这一层连"论断写反了"都判不出来（理由见
+    `_claim_of` 里的实测数字）。
+
+    没有 quote 也没有字符区间的引用直接跳过：拿整篇原文去比一句论断，NLI 只会
+    给 neutral，没有信息量还白花时间。
 
     模块未启用时立刻返回空列表，连 import 都不发生。
     """
@@ -410,9 +487,8 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
     diagnostics: list[Diagnostic] = []
     checked = 0
     skipped = 0
-    stack = [content.root]
-    while stack:
-        node = stack.pop()
+    # 与 `verify_source_refs` 同一份遍历（三套结构共用，前序）。
+    for node in shapes.iter_nodes(content):
         for ref in node.source_refs:
             evidence = ref.quote
             if not evidence and ref.start is not None and ref.end is not None:
@@ -427,7 +503,7 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
                 continue
             checked += 1
 
-            result = nli.judge(node.label, evidence)
+            result = nli.judge(_claim_of(node), evidence)
             if not result:
                 continue
 
@@ -448,7 +524,6 @@ def annotate_nli(content: MindMapContent, sources: list[Source]) -> list[Diagnos
                              f"{result['label']}（{result['score']:.2f}）"),
                     evidence=ref.quote,
                 ))
-        stack.extend(reversed(node.children))
 
     if skipped:
         logger.info("NLI 评估达到上限 %d 条，另有 %d 条引用跳过", MAX_NLI_CHECKS, skipped)

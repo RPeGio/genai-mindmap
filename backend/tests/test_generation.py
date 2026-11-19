@@ -10,7 +10,6 @@ from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
     MIN_BRANCHES,
-    SOURCED_DETAIL_PROMPT,
     THINKING_MODELS,
     GenerationError,
     _demo_content,
@@ -341,23 +340,21 @@ class BranchFloorTest(unittest.TestCase):
 
 
 class PromptQualityTest(unittest.TestCase):
-    """prompt 里的数量约束与引用正反例：模型只照字面执行，不写就是没有。"""
+    """prompt 里的数量约束：模型只照字面执行，不写就是没有。
 
-    # quote 示例段本身是「原文：…」引出的一句话。锚点落在这里而不是整段第一个
-    # ✅/❌：提示词里还有拆到底的形态对照（同样用 ❌/✅），按整段取首标记会被
-    # 那些行抢走，取出来的"引用"其实是结构示例。
-    QUOTE_ANCHOR = "原文：会议决定在十月十七日发布二点零版本。"
+    `DETAIL_PROMPT` 现在只在**没有可检索材料**时拼进分片生成的骨架
+    （`tools._generate_deep`）：它是这套树规则的唯一副本，所以用例只钉它。
+    有来源时用的是分片那三份提示词（`PLAN_PROMPT` / `BRANCH_EXPAND_PROMPT` /
+    `SUBNODE_EXPAND_PROMPT`），引用纪律在 `BRANCH_EVIDENCE_RULES` 里
+    （见 `tests/test_citation_contract.py`）。
+    """
 
-    def _quote_examples(self) -> str:
-        return SOURCED_DETAIL_PROMPT.split(self.QUOTE_ANCHOR, 1)[1]
-
-    def test_both_prompts_state_the_point_and_branch_floor(self):
-        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
-            self.assertIn("至少 2 个要点", prompt)
-            self.assertIn("不少于 3 条", prompt)
+    def test_prompt_states_the_point_and_branch_floor(self):
+        self.assertIn("至少 2 个要点", DETAIL_PROMPT)
+        self.assertIn("不少于 3 条", DETAIL_PROMPT)
 
     def test_material_branch_allows_expanding_beyond_the_material(self):
-        """带材料时**内容可以展开**，但出处必须标：这是这一轮改掉的旧要求。
+        """**内容可以展开**，但出处必须标：这是这一轮改掉的旧要求。
 
         上一版写的是"忠实整理、材料里没有的不要添加、依据不足宁可少给"，
         实测把整棵树压成了材料的目录（同一份 12392 字材料，全文可见 100%、
@@ -379,25 +376,6 @@ class PromptQualityTest(unittest.TestCase):
         """
         self.assertIn(f"节点不超过 {MAX_TREE_NODES}", DETAIL_PROMPT)
         self.assertIn(f"层级不超过 {MAX_TREE_DEPTH}", DETAIL_PROMPT)
-        self.assertIn(f"节点不超过 {MAX_TREE_NODES}", SOURCED_DETAIL_PROMPT)
-
-    def test_sourced_prompt_shows_verbatim_quote_example(self):
-        """`quote` 退化成概括是最常见的一种坏引用，必须有正反例压住。"""
-        original = "会议决定在十月十七日发布二点零版本。"
-        self.assertIn("❌", SOURCED_DETAIL_PROMPT)
-        self.assertIn("✅", SOURCED_DETAIL_PROMPT)
-        self.assertIn(original, SOURCED_DETAIL_PROMPT)
-
-        examples = self._quote_examples()
-        good_line = examples.split("✅", 1)[1].split("\n", 1)[0]
-        good_quote = good_line.split('quote="', 1)[1].split('"', 1)[0]
-        # 正向示例必须是原文里的连续片段，逐字可查
-        self.assertIn(good_quote, original)
-
-        bad_line = examples.split("❌", 1)[1].split("\n", 1)[0]
-        bad_quote = bad_line.split('quote="', 1)[1].split('"', 1)[0]
-        # 反向示例是概括出来的话，原文里逐字找不到
-        self.assertNotIn(bad_quote, original)
 
 
 class DepthPromptTest(unittest.TestCase):
@@ -409,41 +387,24 @@ class DepthPromptTest(unittest.TestCase):
     """
 
     def test_no_prompt_suggests_a_fixed_number_of_levels(self):
-        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT,
-                       THINKING_MODELS["default"]["prompt"]):
+        for prompt in (DETAIL_PROMPT, THINKING_MODELS["default"]["prompt"]):
             self.assertNotIn("2-4", prompt)
 
-    def test_both_prompts_carry_the_split_until_rule(self):
-        """两条出口共用同一套深度规则：有来源时只换判据，不换「要不要继续拆」。"""
-        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
-            self.assertIn("还能不能再拆", prompt)
-            self.assertIn("不要停在两级", prompt)
+    def test_prompt_carries_the_split_until_rule(self):
+        """深度规则只有一处：判据是「还能不能再拆」，不是固定层数。"""
+        self.assertIn("还能不能再拆", DETAIL_PROMPT)
+        self.assertIn("不要停在两级", DETAIL_PROMPT)
 
     def test_depth_ceiling_is_not_a_target(self):
         """上限继续取自契约常量，并且明确写成可读性上限——数字不是目标。"""
-        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
-            self.assertIn(f"层级上限 {MAX_TREE_DEPTH}", prompt)
-            self.assertIn("不是要拆到的目标", prompt)
+        self.assertIn(f"层级上限 {MAX_TREE_DEPTH}", DETAIL_PROMPT)
+        self.assertIn("不是要拆到的目标", DETAIL_PROMPT)
 
     def test_stop_condition_is_stated(self):
         """没有停止条件，「继续拆」就会变成造层级。"""
-        for prompt in (DETAIL_PROMPT, SOURCED_DETAIL_PROMPT):
-            self.assertIn("最小可执行单元", prompt)
-            self.assertIn("单一概念", prompt)
+        self.assertIn("最小可执行单元", DETAIL_PROMPT)
+        self.assertIn("单一概念", DETAIL_PROMPT)
 
-    def test_sourced_prompt_ties_depth_to_the_material_and_marks_the_rest_unsourced(self):
-        """有来源时「继续拆」可以越过材料，但越过的那一层不挂引用。
-
-        上一版的判据是"判据只看材料，材料没说到就停"，代价是整棵树变成材料的目录。
-        新判据保留"材料有更细的说法就照它拆"，材料没说的部分改为可以凭知识补——
-        同一句里必须把引用纪律钉上，否则"拆得深"会退化成"编得多"。
-        """
-        self.assertIn("原文里还有更具体的表述支撑", SOURCED_DETAIL_PROMPT)
-        self.assertIn("也可以按你的知识继续拆——只是那一层不挂引用", SOURCED_DETAIL_PROMPT)
-        self.assertIn("自己补的内容不要挂引用", SOURCED_DETAIL_PROMPT)
-        # 旧措辞必须消失：两句同时在场时模型只会执行更保守的那一句
-        self.assertNotIn("判据只看材料", SOURCED_DETAIL_PROMPT)
-        self.assertNotIn("宁可少给", SOURCED_DETAIL_PROMPT)
 
     def test_default_thinking_model_does_not_cap_depth(self):
         """思考模型拼在生成提示词后面，它若给了层数区间就会被模型当成硬指标。"""

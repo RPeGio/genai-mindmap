@@ -102,12 +102,19 @@ class ManualCase:
 
 
 MANUAL_SOURCE_HASHES: dict[str, str] = {
-    "docs/AGENT_PLAN.md": "1a06838dd1b45a98664c17d20db063cbb0427f9f4466b4ec28ac44f551f34393",
+    "docs/AGENT_PLAN.md": "bd5cecdff33fb17382d1ba0ba8e5d877f1cbd05dc3d07c402398f9f4e4fdd9ec",
     "docs/RAG-DECISIONS.md": "0a61ef1684479991fae70e9bba07d1ece3e0f0f0997feab9d5bbbda2b59bcfb8",
     "docs/PLAN.md": "34c6cbd6ea7ad495400b97cb9594e9dcd52285ffd7cdcd2ceaa01ada4b76c3ce",
-    "docs/ARCHITECTURE.md": "d95bd8455e094bb1def66018a3d6b8fb88a0939527bff3d1a49f35df135c426b",
+    "docs/ARCHITECTURE.md": "d5022f5907fec818f6bf91c3876fc45ae5a1b19d86fdb3b09a42c9beb6e07de8",
 }
-"""这四份材料的 `sha256(正文)`；对不上就是材料变了，整套标注要复核。"""
+"""这四份材料的 `sha256(正文)`；对不上就是材料变了，整套标注要复核。
+
+v1.26 更新（`acfdb5b` 之后那次候选层注释清理）：`AGENT_PLAN.md` 只在开头加了"这是历史
+设计稿"的方框，`ARCHITECTURE.md` 改的是 §数据与调用约定第 4 条与两处用词。**两套 case
+用到的章节与锚点一个字都没动**（`AGENT_PLAN.md` 用的是「真相、会话与编辑同步」等章，
+`ARCHITECTURE.md` 用的是「安全与部署边界」「数据与调用约定」），按文件头那条规矩——
+先分辨"标注过期"还是"只是追加"——这次属于后者，所以只把新指纹写回，不重新标注。
+"""
 
 
 # ---------------------------------------------------------------- 近：术语还在，句形变了

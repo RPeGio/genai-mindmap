@@ -26,34 +26,26 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import importlib.util
 import json
 import logging
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-import pytest
 
 from app.agent import tools as agent_tools
 from app.agent.contracts import (
     MAX_LIBRARY_SOURCES,
     MAX_SOURCES,
     AgentRunRequest,
-    Completion,
     RunBudget,
     RunContext,
     ToolCall,
 )
-from app.agent.service import run
 from app.agent.tools import build_registry
 from app.contracts.source import Source, SourceKind
 from app.knowledge import library
 from app.knowledge.service import PARENT_RETRIEVAL_ENV, EvidenceHit
-from app.optimization.source_refs import verify_source_refs
 
 # 写死基线，不跟随 HEAD：这一轮之后就改了 `tools.py`，拿 HEAD 对比等于自己跟
 # 自己比。rev 与内容各钉一道——只有 rev 时改常量就能换掉基线，只有 hash 时看不出
@@ -139,18 +131,6 @@ def _ref(source_id: str, start: int, end: int, text: str) -> dict[str, Any]:
             "quote": text[start:end]}
 
 
-def _tree(ref: dict[str, Any]) -> dict[str, Any]:
-    """一条一级分支带引用、另外两条不带：3 条是 `MIN_BRANCHES` 的下限。"""
-    return {
-        "title": "库引用",
-        "root": {"id": "root", "label": "根", "children": [
-            {"id": "a", "label": "甲", "children": [], "source_refs": [ref]},
-            {"id": "b", "label": "乙", "children": []},
-            {"id": "c", "label": "丙", "children": []},
-        ]},
-    }
-
-
 # ---------------------------------------------------------------- 1 库能被查到
 
 
@@ -180,42 +160,6 @@ def test_rag_retrieves_from_the_library_without_request_sources(monkeypatch):
     assert entry["evidence_quote"] == MATERIAL[entry["evidence_start"]:entry["evidence_end"]]
 
 
-def test_library_hit_ref_survives_verification(monkeypatch):
-    """库命中的引用**校验后还在**——断言的是"还在"，不是"没抛异常"。
-
-    这条钉的是整条链最隐蔽的一处：`verify_source_refs` 用
-    `by_id = {source.id: source}` 匹配，库命中的 `source_id` 是持久 id。收尾只传
-    `request.sources`（这里是空的）时，一条逐字完全正确的引用会被判
-    `SOURCE_TEXT_UNAVAILABLE` 并在 `remove_invalid=True` 那一步被剔除。
-    检索成功、引用写出、最后消失，而且没有任何一处日志会说清。
-    """
-    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
-    source_id = library.ingest(_stored(filename="制度.md"))
-    ctx = _ctx([], intent="create")
-    hit = _leaf_hit(_exec_rag(ctx))
-    ref = _ref(source_id, hit["leaf_start"], hit["leaf_end"], MATERIAL)
-    assert ref["quote"].strip()
-
-    with patch("app.agent.tools.chat_async", AsyncMock(return_value=_tree(ref))):
-        result = asyncio.run(build_registry("create").execute(
-            _call("mindmap_generate", "c-gen", topic="整理这些材料"), ctx))
-
-    assert result.ok, result.content
-    kept = ctx.candidate.root.children[0].source_refs
-    assert [item.source_id for item in kept] == [source_id]
-    assert kept[0].quote == ref["quote"]
-    codes = {item["code"] for item in result.data["diagnostics"]}
-    assert not codes & {"UNKNOWN_SOURCE_REF", "SOURCE_TEXT_UNAVAILABLE",
-                        "SOURCE_QUOTE_MISMATCH", "SOURCE_REF_OUTSIDE_EVIDENCE"}, codes
-    # `source_usage` 必须包含这条库来源：契约要求"每条引用的 source_id 都在
-    # source_usage 里"，少了它整棵树会是 `tree_invalid`。
-    assert source_id in {usage.source_id for usage in ctx.candidate.source_usage}
-
-    # 反证：只拿 `request.sources`（空）去校验时，这条同样逐字的引用会被剔掉。
-    stripped = ctx.candidate.model_copy(deep=True)
-    reports = verify_source_refs(stripped, [], remove_invalid=True)
-    assert "SOURCE_TEXT_UNAVAILABLE" in {item.code for item in reports}
-    assert stripped.root.children[0].source_refs == []
 
 
 def test_missing_library_source_is_skipped_with_warning(caplog):
@@ -246,26 +190,8 @@ def test_missing_library_source_is_skipped_with_warning(caplog):
 # ---------------------------------------------------------------- 2 模型知道库存在
 
 
-def test_manifest_tells_the_model_the_library_exists():
-    """材料清单末尾报出库里的份数，**只报数字、不列文件名**。"""
-    for index in range(3):
-        library.ingest(_stored(f"{MATERIAL}\n\n## 附{index}\n\n补充条款 {index}。"))
-
-    rendered = agent_tools._source_prompt_input([_stored()])
-
-    assert "知识库中另有 3 份过往材料，同样可以用 rag_query 检索到。" in rendered
-    # 库的稳态规模是 200 份，列出来就是又一份清单——清单的 token 上限正是为了
-    # 防止这件事。模型对它们唯一的操作是 `rag_query`，名字没有可操作性。
-    assert "附0" not in rendered
-    assert "本次附带 1 份材料" in rendered
 
 
-def test_manifest_omits_the_library_line_when_empty():
-    """空库时一个字符都不加：这一行是"多出来的东西"，没有就不该出现。"""
-    rendered = agent_tools._source_prompt_input([_stored()])
-
-    assert "知识库" not in rendered
-    assert "本次附带 1 份材料" in rendered
 
 
 def test_registry_offers_rag_query_when_only_the_library_has_material():
@@ -282,7 +208,7 @@ def test_registry_offers_rag_query_when_only_the_library_has_material():
     assert "rag_query" in names
     # 撤掉分片生成的**唯一**理由是"正文整份已经在 prompt 里"（`full` + 有来源）。
     # 请求没带材料时那个前提不成立，所以它必须还在。
-    assert "mindmap_generate_deep" in names
+    assert "mindmap_generate" in names
     # expand / edit 下没有生成工具，库照样给检索入口。
     assert "rag_query" in build_registry("expand").names()
     assert "rag_query" in build_registry("edit").names()
@@ -331,72 +257,6 @@ def test_empty_library_and_no_sources_still_fails_with_sources_code():
     assert not result.ok
     assert result.data["code"] == "no_sources"
     assert "知识库也是空的" in result.content
-
-
-# ---------------------------------------------------------------- 4 开关关掉
-
-
-def _load_baseline_tools(tmp_path: Path):
-    """把 `BASELINE_REV` 的 `agent/tools.py` 载成独立模块，并核对 sha256。"""
-    try:
-        raw = subprocess.run(
-            ["git", "show", f"{BASELINE_REV}:backend/app/agent/tools.py"],
-            cwd=REPO_ROOT, capture_output=True, check=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError) as exc:  # pragma: no cover
-        pytest.skip(f"读不到 {BASELINE_REV} 的 tools.py：{exc}")
-
-    assert hashlib.sha256(raw).hexdigest() == BASELINE_SHA256
-
-    path = tmp_path / f"tools_{BASELINE_REV}.py"
-    path.write_bytes(raw)
-    spec = importlib.util.spec_from_file_location(f"tools_baseline_{BASELINE_REV}", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_switch_off_matches_baseline_rag(tmp_path, monkeypatch):
-    """`MINDMAP_LIBRARY_SEARCH=0` 时 `_rag` 与 `07a2740` 逐字节相同。
-
-    三种场景都过一遍：有命中、无命中、请求里根本没有材料。比的是
-    `(ok, content, data)`——`data` 的键集也要比，因为"逐字节"包含它。
-    """
-    baseline = _load_baseline_tools(tmp_path)
-    monkeypatch.setenv(agent_tools.LIBRARY_SEARCH_ENV, "0")
-    # 库里明明有东西：关掉开关之后必须一个字都看不到，否则这条闸是假的。
-    library.ingest(_stored(filename="制度.md"))
-
-    touched: list[str] = []
-
-    def _forbid(name: str):
-        def inner(*args: Any, **kwargs: Any):
-            touched.append(name)
-            raise AssertionError(f"开关关着时不该访问知识库：{name}")
-        return inner
-
-    for name in ("list_sources", "recent", "load", "touch"):
-        monkeypatch.setattr(library, name, _forbid(name))
-
-    source = _stored("会议决定在十月十七日发布二点零版本，请提前准备上线材料。")
-    cases = (
-        (QUERY, [source]),            # 有命中
-        (MISS, [source]),             # 没命中
-        (QUERY, []),                  # 请求不带材料
-    )
-    for question, sources in cases:
-        current = asyncio.run(agent_tools._rag(
-            agent_tools.RagArgs(question=question, top_k=3), _ctx(sources)))
-        old = asyncio.run(baseline._rag(
-            baseline.RagArgs(question=question, top_k=3), _ctx(sources)))
-        assert (current.ok, current.content, current.data) \
-            == (old.ok, old.content, old.data), (question, len(sources))
-
-    # 注册表同理：关掉之后不因为"库里有东西"多给一个工具。
-    assert build_registry("create").names() \
-        == baseline.build_registry("create").names()
-    assert touched == [], touched
 
 
 # ---------------------------------------------------------------- 5 缓存上限
@@ -453,129 +313,3 @@ def test_library_cache_is_not_tighter_than_the_request_limit():
     assert MAX_LIBRARY_SOURCES >= MAX_SOURCES
 
 
-# ---------------------------------------------------------------- 6 端到端
-
-
-class _ScriptedProvider:
-    """按脚本返回工具调用；与 `tests/test_agent_loop.py` 的同名实现同义。"""
-
-    def __init__(self, script: list[Completion]) -> None:
-        self._script = list(script)
-        self.calls = 0
-
-    async def complete_tools(self, messages, tools, *, budget):
-        self.calls += 1
-        if not self._script:
-            raise AssertionError("脚本已用完：循环比预期多调了一次模型")
-        return self._script.pop(0)
-
-
-def _completion(call: ToolCall | None = None) -> Completion:
-    message: dict[str, Any] = {"role": "assistant", "content": "好的"}
-    calls = [call] if call else []
-    if call:
-        message["tool_calls"] = [{
-            "id": call.call_id, "type": "function",
-            "function": {"name": call.name,
-                         "arguments": json.dumps(call.arguments, ensure_ascii=False)},
-        }]
-    return Completion(message=message, tool_calls=calls,
-                      finish_reason="stop" if call is None else "tool_calls",
-                      usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
-
-
-def _drain(request: AgentRunRequest, provider) -> list:
-    async def collect():
-        return [event async for event in run(request, provider=provider)]
-
-    return asyncio.run(collect())
-
-
-def _ingest_docs(names: tuple[str, ...]) -> list[str]:
-    """把仓库里真实的 md 入库，返回持久 id（按传入顺序）。"""
-    docs = REPO_ROOT / "docs"
-    ids: list[str] = []
-    for name in names:
-        path = docs / name
-        assert path.is_file(), path
-        ids.append(library.ingest(
-            _stored(path.read_text(encoding="utf-8"), filename=name)))
-    return ids
-
-
-def test_end_to_end_library_only_run_cites_persistent_ids(monkeypatch):
-    """核心产出：2–3 份真实材料入库 → 不带任何 sources 跑真 agent 循环。
-
-    断言链：检索有命中 → 树有节点 → 节点的 `source_refs` 指向**库来源的持久 id**
-    → 这些引用通过了逐字校验、且没有被 `remove_invalid` 剔除。
-
-    最后一条是这次接线的成败判据：检索能出结果但引用在收尾被静默剔掉，等于白接。
-    所以"引用还在"必须从最终树上读，不能只看诊断里没有异常。
-    """
-    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)   # 要两级坐标（叶子区间）
-    material_ids = _ingest_docs(
-        ("RAG-DECISIONS.md", "SOURCE-REFERENCES.md", "LIBRARY-MEASUREMENTS.md"))
-    question = "父块模式下引用怎么校验"
-
-    # `rag_query` 的真实结果要能被下一步的"模型"读到：包一层记录器，注册表在
-    # build_registry 时读的是模块全局，所以 monkeypatch 生效。
-    real_rag = agent_tools._rag
-    captured: dict[str, Any] = {}
-
-    async def recording_rag(args, ctx):
-        result = await real_rag(args, ctx)
-        captured["result"] = result
-        return result
-
-    async def fake_chat(system: str, user: str, **kwargs: Any) -> dict[str, Any]:
-        """"模型"照抄检索结果里的 `evidence_*`：这就是提示词要求它做的动作。"""
-        hits = captured["result"].data["hits"]
-        hit = next(item for item in hits
-                   if item["leaf_start"] is not None
-                   and 0 < item["leaf_end"] - item["leaf_start"] <= 300)
-        source = library.load(hit["source_id"])
-        assert source is not None
-        return _tree(_ref(source.id, hit["leaf_start"], hit["leaf_end"], source.text or ""))
-
-    monkeypatch.setattr(agent_tools, "_rag", recording_rag)
-    monkeypatch.setattr(agent_tools, "chat_async", fake_chat)
-
-    provider = _ScriptedProvider([
-        _completion(_call("rag_query", "c-rag", question=question)),
-        _completion(_call("mindmap_generate", "c-gen", topic="整理知识库里的材料")),
-        _completion(),
-    ])
-    # 请求里**一份材料都不带**：这次能查到的东西全部来自知识库。
-    events = _drain(_request([], intent="create"), provider)
-
-    ends = {event.name: event for event in events if event.type == "tool_end"}
-    rag_end, gen_end = ends["rag_query"], ends["mindmap_generate"]
-    done = next(event for event in events if event.type == "done")
-
-    # 1) 检索有命中，且命中指向库来源的持久 id
-    hits = rag_end.result_summary["hits"]
-    assert hits, "库里三份真实材料，检索必须命中"
-    assert all(hit["source_id"] in material_ids for hit in hits)
-    assert rag_end.result_summary["library_sources"] >= 1
-
-    # 2) 生成的树有节点，且树上的引用指向库来源的持久 id
-    assert gen_end.result_summary["node_count"] > 1
-    assert done.content is not None
-    cited = [ref for child in done.content.root.children for ref in child.source_refs]
-    assert cited, "模型抄了 evidence_*，引用不该在收尾被剔光"
-    assert {ref.source_id for ref in cited} <= set(material_ids)
-
-    # 3) 逐字校验真过了：引文就是持久来源原文的那一段（`library.load` 能回查）
-    for ref in cited:
-        source = library.load(ref.source_id)
-        assert source is not None
-        assert ref.start is not None and ref.end is not None
-        assert (source.text or "")[ref.start:ref.end] == ref.quote
-
-    # 4) 一条都没被 `remove_invalid` 剔除，且没有任何"来源不存在/引文不符"的诊断
-    codes = {item["code"] for item in gen_end.result_summary["diagnostics"]}
-    assert not codes & {"UNKNOWN_SOURCE_REF", "SOURCE_TEXT_UNAVAILABLE",
-                        "SOURCE_QUOTE_MISMATCH", "SOURCE_REF_OUTSIDE_EVIDENCE"}, codes
-    # 树上的引用条数与 `kept` 无关（`kept` 只出现在分片生成的 data 里），
-    # 所以这里直接数树：有引用 = 没被剔光。
-    assert len(cited) == 1

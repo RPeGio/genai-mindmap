@@ -5,7 +5,7 @@
 >
 > **落地状态（2026-11-10）**：`backend/app/contracts/mindmap.py` 已实现本文件全部字段与校验；`frontend/src/api/types.ts` 已补 v2 字段，保存、打开、导出都按 v2 发（`frontend/src/api/client.ts` 里原有的 `toContractV1()` / `toExportV1()` 两个裁剪函数已删除）。因为新字段全有默认值，**旧前端发来的 v1 请求体照样可用**，后端也可以先上、前端后上。
 >
-> 逐字段状态：**已接线**（前端已在读或在写）= `schema_version`、`layout`、`theme.direction`、`note`（详情面板可编辑并随保存落库）、`source_refs`；**仅落库**（schema 里有、还没有界面读它；前端按"读到什么原样带回去"的方式透传，不会丢）= `relations`、`style`、`pos`、`collapsed`、`theme.preset / accent / font`。把它们现在写进契约的理由是"只加不删"：晚一次成本是一次 `schema_version` 升位 + 两端类型全改。
+> 逐字段状态：**已接线**（前端已在读或在写）= `schema_version`、`layout`、`theme.direction`、`note`（详情面板可编辑并随保存落库）、`source_refs`、`diagram_type`（决定「附加关系」区块是否显示，导出 PUML 的文件头也读它）；**仅落库**（schema 里有、还没有界面读它；前端按"读到什么原样带回去"的方式透传，不会丢）= `relations`、`style`、`pos`、`collapsed`、`theme.preset / accent / font`。把它们现在写进契约的理由是"只加不删"：晚一次成本是一次 `schema_version` 升位 + 两端类型全改。
 >
 > R2 画布已按 `node.note ?? node.label` 渲染正文（取值收敛在 `frontend/src/stores/mindmap.ts` 的 `displayBody()`）；v2 落地前前端保存时会裁掉 `note`（`src/api/client.ts::toContractV1()`），该函数已随 v2 一起删除，`toExportV1()` 也已删除——见 [交接文档](HANDOFF.md) H1。
 
@@ -107,7 +107,22 @@ class MindMapContent(BaseModel):
     theme: Theme = Field(default_factory=Theme)
     relations: list[Relation] = Field(default_factory=list, max_length=200)
     source_usage: list[SourceUsage] = Field(default_factory=list, max_length=50)
+    edges: list[Edge] = Field(default_factory=list)   # 附加边：流程图的条件分支 / 回退
+    diagram_type: DiagramKind = "tree"                # 这张图是什么图型（产物自证）
 ```
+
+**`diagram_type`**（`Literal["tree", "flowchart", "fishbone"]`，默认 `"tree"`）：与
+`layout` 不是一回事——`layout` 描述**排布**，它描述"这张图按什么读"（流程图要看条件
+分支与回退；鱼骨图的一级分支固定是人/机/料/法/环/测）。加它的理由是产物无法自证：
+一张六支的鱼骨图与一张六支的思维导图在树形状上可以完全一样，而"生成它时用了哪份
+提示词"那个信息随调用一起消失了。三个读者：前端据此决定要不要摆「附加关系」区块
+（`App.vue`）、导出时 PUML 文件头注明图型、以及排查"我要的鱼骨图怎么成了导图"。
+
+默认 `"tree"` 就是全部迁移成本：旧记录没有这个键，Pydantic 的字段默认值把缺的补成
+`tree`——**零迁移**（与 `edges` 同一条规矩），而"旧图本来就是思维导图"是真的，它们
+全部由 `tree` 那条提示词生成。请求层（`AgentRunRequest.diagram_type`）用同一个
+`DiagramKind`；`None` 表示"用户没说"，那时服务端会从 `goal` 的文字里认一次
+（`app/agent/diagram_intent.py`，`source` 记 `inferred`）。
 
 ## 3 校验规则（`model_validator(mode="after")`，任一不满足 → 422）
 

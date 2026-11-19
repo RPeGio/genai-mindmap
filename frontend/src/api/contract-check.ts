@@ -32,16 +32,22 @@
  */
 import type { components } from './schema';
 import type {
+  ImportResult,
+  ImportWarning,
   LibraryEntry,
   LibraryList,
   LibrarySource,
   MapRecord,
+  MindEdge,
   MindMapContent,
   MindMapTheme,
   MindNode,
   MindRelation,
   NodePosition,
   NodeStyle,
+  Pref,
+  PrefSuggestion,
+  SavedPref,
   Source,
   SourceRef,
   SourceSpan,
@@ -71,11 +77,22 @@ export const checks = {
   styleKeys: true satisfies SameKeys<NodeStyle, Schemas['NodeStyle']>,
   positionKeys: true satisfies SameKeys<NodePosition, Schemas['Position']>,
   relationKeys: true satisfies SameKeys<MindRelation, Schemas['Relation']>,
+  edgeKeys: true satisfies SameKeys<MindEdge, Schemas['Edge']>,
   sourceKeys: true satisfies SameKeys<Source, Schemas['Source']>,
   sourceRefKeys: true satisfies SameKeys<SourceRef, Schemas['SourceRef']>,
   sourceSpanKeys: true satisfies SameKeys<SourceSpan, Schemas['SourceSpan']>,
   sourceUsageKeys: true satisfies SameKeys<SourceUsage, Schemas['SourceUsage']>,
   recordKeys: true satisfies SameKeys<MapRecord, Schemas['MapRecord']>,
+  // 导入：`warnings` 里只有 code/message，多一个字段就要在这里红——那条契约是
+  // "定位信息写进 message"，加字段等于换一种约定。
+  importKeys: true satisfies SameKeys<ImportResult, Schemas['ImportResponse']>,
+  importWarningKeys: true satisfies SameKeys<ImportWarning, Schemas['ImportWarningPayload']>,
+  // 偏好：键集合必须与后端一致。`last_applied_at` 尤其不能漏——它是"这条偏好
+  // 到底有没有在工作"的唯一可见证据，漏掉它的镜像会让面板永远显示"尚未生效"。
+  prefKeys: true satisfies SameKeys<Pref, Schemas['Pref']>,
+  savedPrefKeys: true satisfies SameKeys<SavedPref, Schemas['Saved']>,
+  prefSuggestionKeys: true satisfies
+    SameKeys<PrefSuggestion, Schemas['app__prefs__service__Suggestion']>,
   libraryEntryKeys: true satisfies SameKeys<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListKeys: true satisfies SameKeys<LibraryList, Schemas['LibraryList']>,
   librarySourceKeys: true satisfies SameKeys<LibrarySource, Schemas['LibrarySource']>,
@@ -87,11 +104,22 @@ export const checks = {
   styleShape: true satisfies SameShape<NodeStyle, Schemas['NodeStyle']>,
   positionShape: true satisfies SameShape<NodePosition, Schemas['Position']>,
   relationShape: true satisfies SameShape<MindRelation, Schemas['Relation']>,
+  edgeShape: true satisfies SameShape<MindEdge, Schemas['Edge']>,
   sourceShape: true satisfies SameShape<Source, Schemas['Source']>,
   sourceRefShape: true satisfies SameShape<SourceRef, Schemas['SourceRef']>,
   sourceSpanShape: true satisfies SameShape<SourceSpan, Schemas['SourceSpan']>,
   sourceUsageShape: true satisfies SameShape<SourceUsage, Schemas['SourceUsage']>,
   recordShape: true satisfies SameShape<MapRecord, Schemas['MapRecord']>,
+  importShape: true satisfies SameShape<ImportResult, Schemas['ImportResponse']>,
+  importWarningShape: true satisfies
+    SameShape<ImportWarning, Schemas['ImportWarningPayload']>,
+  prefShape: true satisfies SameShape<Pref, Schemas['Pref']>,
+  savedPrefShape: true satisfies SameShape<SavedPref, Schemas['Saved']>,
+  // `source` 那条是靠契约对齐的：后端把它写成 `Literal` 而不是 `str`，所以 OpenAPI
+  // 里是枚举、镜像里是同两个字面量。写成 `str` 的话这条形状断言会红——那是对的，
+  // 因为"界面上能显示哪两种来源"这件事本来就不该只在镜像里知道。
+  prefSuggestionShape: true satisfies
+    SameShape<PrefSuggestion, Schemas['app__prefs__service__Suggestion']>,
   libraryEntryShape: true satisfies SameShape<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListShape: true satisfies SameShape<LibraryList, Schemas['LibraryList']>,
   librarySourceShape: true satisfies SameShape<LibrarySource, Schemas['LibrarySource']>,

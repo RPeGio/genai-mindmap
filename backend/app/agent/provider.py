@@ -25,6 +25,11 @@ from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     GenerationError,
     _config,
+    # 模型名的判定与「深度思考」那三档优先级只有一份实现，在 generation 那边：
+    # 工具内部的 `chat_async` 也要用同一套名字（两条出口同一个开关）。这里只是
+    # 复用，不重新定义——两处各写一份的结果已经出现过一次：勾上深度思考只换了
+    # 外层工具循环的模型，骨架/结构/说明仍是普通模型。
+    _model_for,
     context_overflow_error,
     estimate_input_tokens,
     max_tokens_cap,
@@ -46,6 +51,12 @@ _TIMEOUT_SECONDS = 600.0
 # 与服务端 400 里学到的上限取小）。写死一个数的后果是"换一个模型就整条链 400"，
 # 而 qwen 系只认 32768 这件事不该要求改代码。
 _MAX_TOKENS_CAP = 65536
+
+# 「深度思考」用的模型名判定（`_model_for`）与 `DEEP_MODEL_ENV` /
+# `DEEP_MODEL_FALLBACK` 两个常量都在 `generation/service.py`：那是模型出口的家，
+# 工具内部的 `chat_async` 也走同一份判定。要读那两个常量请从
+# `app.generation.service` 导入——`provider` 这边**不转发**，否则又会出现第二个
+# 可以 import 得到的位置。
 
 
 def _estimate_request_tokens(
@@ -74,7 +85,20 @@ def _estimate_request_tokens(
 
 
 class OpenAICompatibleProvider:
-    """走 OpenAI 兼容的 /chat/completions，带 tools 字段。"""
+    """走 OpenAI 兼容的 `/chat/completions`，带 tools 字段。
+
+    `deep_thinking` 是**实例**属性而不是 `complete_tools` 的参数：接口
+    （`contracts.ToolProvider`）保持原样，测试里那些按脚本回放的假 provider 一行都不用改，
+    真正要变的只有"这一次往上游发哪个 model 名"这一件事。一次运行一个 provider 实例
+    （`service._loop` 里按请求构造），所以它天然是"这一次"的语义。
+    """
+
+    def __init__(self, *, deep_thinking: bool = False) -> None:
+        self.deep_thinking = deep_thinking
+        # 上一次真正发出去的模型名。`_loop` 收尾时把它挂进 `done` 帧，
+        # 界面上"这次到底用了哪个模型"就有据可查——否则勾了「深度思考」而配置里
+        # 没给对名字时，用户只能看到一张图，看不出它走的哪条路。
+        self.model_name: str | None = None
 
     async def complete_tools(
         self,
@@ -84,6 +108,8 @@ class OpenAICompatibleProvider:
         budget: RunBudget,
     ) -> Completion:
         base, key, model = _config()
+        model = _model_for(base, model, self.deep_thinking)
+        self.model_name = model
         # 输入侧的物理边界。放在发请求之前：装不下的请求只会拿回一个 400，
         # 而 400 在事件流里只能被读成"模型服务出错"，用户无从知道该精简材料。
         used = _estimate_request_tokens(messages, tools)
@@ -176,5 +202,6 @@ def _parse_completion(buffer: bytearray) -> Completion:
     )
 
 
-def default_provider() -> OpenAICompatibleProvider:
-    return OpenAICompatibleProvider()
+def default_provider(*, deep_thinking: bool = False) -> OpenAICompatibleProvider:
+    """这一次运行要用的 provider。`deep_thinking` 缺省 `False`，与加它之前同一个调用。"""
+    return OpenAICompatibleProvider(deep_thinking=deep_thinking)

@@ -30,6 +30,14 @@ export interface ResolvedRef {
   where: string;
   /** 来源显示名，如"文档 · 线代第一章.pdf"。 */
   name: string;
+  /**
+   * 原文地址：非空时界面把它渲染成可点开的链接。
+   *
+   * 外部检索回来的来源（维基条目、arXiv 论文）才有这个值。没有它的引用仍然只能
+   * 看摘录——"这句话出自哪篇论文"必须能自己核对，否则"自动填充或验证节点内容"
+   * 只闭环了一半。
+   */
+  url: string | null;
 }
 
 /** UTF-16 下标 → 码点下标。 */
@@ -109,13 +117,54 @@ export function windowOf(
   };
 }
 
-/** 来源显示名：文件名优先，没有就用 kind 的中文名加序号。 */
-export function refName(ref: SourceRef | string, usage: SourceUsage[]): string {
+/**
+ * 来源显示名：文件名优先，没有就用 kind 的中文名加序号。
+ *
+ * 三级退让，顺序有理由：
+ *   1. `source_usage`——导图自己声明的来源清单，保存后重开也还在；
+ *   2. 本次会话里那份 `Source`——外部检索刚抓回来的来源可能还没进 `source_usage`
+ *      （比如生成失败但引用已经在树上），这时文件名比 `来源 s1a2b3c` 有用得多；
+ *   3. 只有 id 时退回 `来源 <前 8 位>`：不给一个看起来像名字的假名字。
+ */
+export function refName(
+  ref: SourceRef | string,
+  usage: SourceUsage[],
+  source: Source | null = null,
+): string {
   const sourceId = typeof ref === 'string' ? ref : ref.source_id;
   const found = usage.find(item => item.source_id === sourceId);
-  if (!found) return `来源 ${sourceId.slice(0, 8)}`;
-  const label = SOURCE_LABELS[found.kind] ?? '来源';
-  return found.filename ? `${label} · ${found.filename}` : label;
+  if (found) {
+    const label = SOURCE_LABELS[found.kind] ?? '来源';
+    return found.filename ? `${label} · ${found.filename}` : label;
+  }
+  if (source) {
+    const label = SOURCE_LABELS[source.kind] ?? '来源';
+    return source.filename ? `${label} · ${source.filename}` : label;
+  }
+  return `来源 ${sourceId.slice(0, 8)}`;
+}
+
+/**
+ * 引用能不能点回原文。
+ *
+ * 两个来源依次退让：本次会话里那份来源的 `metadata.url`（最完整），然后是摘要
+ * （`source_usage`）里的 `url`——保存过的旧图不带 `Source`，只把它留在 `metadata`
+ * 上等于"这次能点、下次打开就没了"。
+ *
+ * 再判一次 http/https：后端契约已经过滤过一遍，但手写或导入的导图不经过那一道，
+ * 而这个值会被直接塞进 `<a href>`。
+ */
+export function refUrl(
+  ref: SourceRef,
+  source: Source | null,
+  usage: SourceUsage[],
+): string | null {
+  const fromSource = source?.metadata?.url ?? null;
+  const candidate = fromSource
+    ?? usage.find(item => item.source_id === ref.source_id)?.url
+    ?? null;
+  if (!candidate) return null;
+  return /^https?:\/\//i.test(candidate) ? candidate : null;
 }
 
 /** 把一条引用解析成"能直接画"的形状。 */
@@ -137,7 +186,8 @@ export function resolveRef(ref: SourceRef, sources: Source[], usage: SourceUsage
     start: located?.start ?? null,
     end: located?.end ?? null,
     where: refWhere(ref),
-    name: refName(ref, usage),
+    name: refName(ref, usage, source),
+    url: refUrl(ref, source, usage),
   };
 }
 
@@ -172,10 +222,16 @@ export interface RefIndex {
  *
  * 正向链路（节点 → 引用）已经在详情面板里了；这里补反向，是因为用户读材料时
  * 更关心"这段话被用到哪去了"。按先序遍历建，列表顺序与大纲顺序一致。
+ *
+ * 第一参数吃**一个根或一组根**：鱼骨与流程是多棵并列子树（`shape.rootsOf` 给的就是
+ * 数组），而每条路径的起点是**它自己那棵子树的根**——一根骨里的引用不该在路径上
+ * 出现另一根骨的内容（与后端 `path_to` 同一条口径）。树那边传一个根，行为与以前
+ * 逐字节相同。
  */
-export function buildRefIndex(root: MindNode | null): RefIndex {
+export function buildRefIndex(root: MindNode | readonly MindNode[] | null): RefIndex {
   const index: RefIndex = { counts: {}, hits: {} };
   if (!root) return index;
+  const roots: readonly MindNode[] = Array.isArray(root) ? root : [root as MindNode];
 
   const walk = (node: MindNode, path: string[]) => {
     const trail = [...path, node.label];
@@ -189,6 +245,6 @@ export function buildRefIndex(root: MindNode | null): RefIndex {
     for (const child of node.children) walk(child, trail);
   };
 
-  walk(root, []);
+  for (const item of roots) walk(item, []);
   return index;
 }

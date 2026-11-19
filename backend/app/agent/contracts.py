@@ -13,17 +13,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, Protocol, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from app.contracts.mindmap import MindMapContent
+from app.contracts.diagnostic import Diagnostic
+from app.contracts.mindmap import DiagramContent, DiagramKind
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
-from app.generation.service import (
-    SOURCE_MODE_RAG,
-    GenerationError,
-    ensure_input_within_context,
-    source_mode,
-)
 from app.optimization.source_refs import EvidenceSpan
 
 logger = logging.getLogger(__name__)
@@ -51,6 +46,15 @@ MAX_EVIDENCE_SPANS = 200
 # 代价可控：一份典型材料 30 KB，50 份 1.5 MB，而一次运行只用一个进程。
 # 超了仍丢**最旧**的：模型先检索、后写引用，最旧那批的引用通常已经写完。
 MAX_LIBRARY_SOURCES = 50
+
+# 记住最近多少次成功调用，供"连续重复调用"判据回溯。
+#
+# 判定窗口（`service.REPEAT_CALL_WINDOW = 3`）比这个数小，是故意的：窗口是
+# **语义**（连续几次算重复），容量是**内存**。留出余量之后，将来把窗口调大
+# 不需要动这份状态，也不会出现"窗口 5 但只记了 3 条"的静默错判。
+# 内存量级：一条 = 一个 call_id + 一串参数 JSON。工具参数只有话题、节点 id、
+# label、问句这类短字段——材料正文在 `request.sources` 里，从不进工具参数。
+MAX_RECENT_CALLS = 8
 
 
 # ---------------------------------------------------------------- 预算
@@ -104,6 +108,14 @@ def _initial_call_plan() -> int:
 # 而失败的那次同样烧调用），之后还会点几次「展开这个节点」（每次 1 次调用）。
 # 3 倍覆盖"初次 + 重做一次 + 十几个扩展"，同时仍是一道能在跑飞的循环上刹住的闸。
 _INITIAL_CALL_PLANS_PER_RUN = 3
+
+
+# 工具调用额度的上界。装配在「一次工具调用 = 一次模型往返」这条算术上，而不是
+# 一个整数能写多大：`max_tool_calls` 每加一，`max_model_calls` 至少要跟得上一次
+# provider 请求，所以它必须留在模型额度之下（见 `max_tool_calls` 的字段注释）。
+# 120 是"够细粒度工具改一百来处"的量级，同时仍小于 `MAX_MODEL_CALLS_LIMIT`
+# 的 400——两者不是同一个量纲，不该共用一个天花板。
+MAX_TOOL_CALLS_LIMIT = 120
 
 
 def _default_max_model_calls() -> int:
@@ -163,7 +175,30 @@ class RunBudget(BaseModel):
     # 想再高就得重新算这条算式，而不是把数字调大。
     max_model_calls: int = Field(
         default=_default_max_model_calls(), ge=1, le=MAX_MODEL_CALLS_LIMIT)
-    max_tool_calls: int = Field(default=8, ge=1, le=50)
+    # 50 不是"容量"，是**给细粒度工具留的空间**。
+    #
+    # 8 在它被写下的那一年是对的：那时 `create` 只有一条路（一次
+    # `mindmap_generate_deep` 就是整张图），8 挡的是"查一下→再查一下"的死循环
+    # ——实测 10 次里 10 次都先检索一遍、把 8 次用光、一次生成都没调。那时的
+    # 8 是一道闸，不是一条容量线：正常路径只用 1–2 次。
+    #
+    # 现在 `edit` 意图有七个写工具（四个细粒度 + 两条边 + 批量），改 9 处以上
+    # 细粒度就**物理装不下**：第 9 次调用会被判 `budget_exhausted`，用户看到
+    # "工具调用次数已用完"而图只改了一半。所以闸门必须放开。
+    #
+    # 放开闸门就得补真防线（`service.REPEAT_CALL_WINDOW` / `NO_PROGRESS_*`）：
+    # 数字变大之后，"模型原地打转"不再会被次数上限自然掐断，只能靠
+    # 「连续重复调用」与「连续无进展」两条判据去认。上限 120 是同样的口径
+    # （够改一百多处），而不是把闸拆掉。
+    #
+    # **与 `max_model_calls` 的关系**：两者量纲不同——工具调用是"模型发来一个
+    # tool_call"，模型调用是"一次 provider 请求"。但每一次工具调用之后，模型都要
+    # 再看一眼结果才能决定下一步，所以 **50 次工具调用 ≈ 50 次模型往返**（一次
+    # completion 里并发发多个 tool_call 时才会少几次）。默认 `max_model_calls`
+    # 是 100，正好是"50 次工具 + 50 次收尾余量"的两倍，不会先撞上它。
+    # 反过来说：把 `max_tool_calls` 调到 100 以上而不动 `max_model_calls`，
+    # 就不再是工具额度先停，而是模型额度先停——两个上限必须一起看。
+    max_tool_calls: int = Field(default=50, ge=1, le=MAX_TOOL_CALLS_LIMIT)
     # 时间上限从 120 提到 600：120 秒是照「一句话主题」的短路径拍的，实测
     # 12106 字材料出 526 个节点要 48.6 秒，慢速档 97 tok/s 时同样的材料光是
     # 输出就要 136 秒，多轮工具循环必然超时。上限放到一小时：这是"卡住不动"
@@ -270,15 +305,43 @@ class ToolSpec:
     # 只读工具才允许按参数去重。写操作（改树）即使参数完全相同，第二次执行时
     # 树的状态已经变了，返回上次的结果等于谎报成功。
     readonly: bool = False
+    # 不给模型看的参数名：`schema()` 会把它们从 `properties` 里删掉。
+    #
+    # 用在"这个参数已经由请求层定死"的场合（比如用户在界面上选了图型）。
+    # **只是不给它看，不是不许它写**：`args_model` 里字段还在，模型凭老习惯补一个
+    # 也照样校验通过、随后被请求覆盖。反过来做（字段删掉 + `extra="forbid"`）的
+    # 代价是一次"参数不合法"，模型下一轮才改对——为一个我们本来就要覆盖的值
+    # 白烧一轮调用。
+    hidden_args: tuple[str, ...] = ()
 
     def schema(self) -> dict[str, Any]:
-        """转成 OpenAI tools 格式。"""
+        """转成 OpenAI tools 格式。
+
+        `hidden_args` 里的字段从这里抹掉：模型读的就是这份 JSON Schema，看不见的
+        参数它不会去填。`model_json_schema()` 每次返回新对象，就地删不会污染
+        别的 spec。
+
+        `required` 也一起清：隐藏一个必填字段等于让这个工具**永远**调不通
+        （模型不知道要填，服务端又要求它有），而那种失败在日志里长得像"模型不会
+        用工具"。当前唯一的隐藏字段是有默认值的，这一条是给将来的调用方留的护栏。
+        """
+        parameters = self.args_model.model_json_schema()
+        if self.hidden_args:
+            properties = parameters.get("properties")
+            if isinstance(properties, dict):
+                for key in self.hidden_args:
+                    properties.pop(key, None)
+            required = parameters.get("required")
+            if isinstance(required, list):
+                parameters["required"] = [
+                    key for key in required if key not in self.hidden_args
+                ]
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.args_model.model_json_schema(),
+                "parameters": parameters,
             },
         }
 
@@ -292,7 +355,10 @@ class RunContext:
     """
 
     request: "AgentRunRequest"
-    candidate: MindMapContent | None = None
+    # 这一轮正在长的那棵树。**名字是历史遗留**：候选层删掉（`acfdb5b`）之后，
+    # 它不再"等用户点应用"，`done` 帧一到就整树交给前端落进画布（前端标成未保存）。
+    # 改名成本高、收益低，所以字段名留着，读它时按"生成中的工作树"理解。
+    candidate: DiagramContent | None = None
     revision: int = 0
     batches: list[OpBatch] = field(default_factory=list)
     sources_by_id: dict[str, Source] = field(default_factory=dict)
@@ -301,6 +367,22 @@ class RunContext:
     executed: dict[str, tuple[str, "ToolResult"]] = field(default_factory=dict)
     # (工具名, 规范化参数) -> 结果。只对只读工具生效。
     dedupe: dict[str, "ToolResult"] = field(default_factory=dict)
+    # 最近若干次**成功执行**的 (call_id, 参数指纹)，供"连续重复调用"判据使用
+    # （`service._duplicate_anchor`）。
+    #
+    # 为什么记在 ctx 上而不是循环的局部变量里：判定点在 `_execute_once`（那里才
+    # 同时拿得到 call_id 幂等、只读缓存与工具注册表三样东西），而它是独立函数。
+    # 为什么只记成功的：一次失败的检索/写入之后，模型用**完全相同的参数**重试是
+    # 合法恢复动作；把它也算成"重复"等于在模型最需要重试时堵住它。
+    recent_calls: list[tuple[str, str]] = field(default_factory=list)
+    # 循环层自己产出、不来自任何一次工具调用的诊断。目前只有 `NO_PROGRESS`
+    # （连续多次工具调用没有改变候选树）。
+    #
+    # 与 `ToolResult.data["diagnostics"]` 并存而不是并进去：那一条路上诊断是
+    # **某次工具调用**的产物，随 `tool_end` 一帧落到前端；无进展是**跨调用**的
+    # 事实，不属于任何一次调用——硬塞进最后一次 `ToolResult` 会让"这条诊断说的是
+    # 哪一次"变成需要猜的事。
+    loop_diagnostics: list[Diagnostic] = field(default_factory=list)
     # 模型调用的**权威账本**：外层每一轮 provider 调用与工具内部每一次 chat_async
     # 调用共用这一个计数。额度必须在请求发出**之前**通过 `reserve_model_call()`
     # 占掉——事后记账等于先花钱后记账，工具执行期间预算就会被超支使用。
@@ -320,11 +402,11 @@ class RunContext:
     # 区分"引用落在命中的子块里"与"引用落在父块里与查询无关的一半"的东西。
     #
     # 为什么存在这里而不是 `ToolResult.data`：hits 只活在 `_rag` 的返回值里，而
-    # 校验发生在 `mindmap_generate` 收尾（`validate_generated_content`），中间隔着
-    # 整个循环。`ToolResult.data` 是**一次调用**的产物，循环从不汇总它；要汇总就得
-    # 在 `service.run()` 里按工具名特判 `data["hits"]` 的形状，等于让循环认识检索
-    # 工具的私有字段。`RunContext` 本来就是"跨轮存活的可变状态"，证据正好是这种
-    # 东西，且 `_rag` 与 `_generate` 拿的是同一个 ctx，不需要任何新管道。
+    # 校验发生在生成工具的收尾（`tools._generate_deep` 的 `verify_source_refs`），
+    # 中间隔着整个循环。`ToolResult.data` 是**一次调用**的产物，循环从不汇总它；
+    # 要汇总就得在 `service.run()` 里按工具名特判 `data["hits"]` 的形状，等于让循环
+    # 认识检索工具的私有字段。`RunContext` 本来就是"跨轮存活的可变状态"，证据正好
+    # 是这种东西，且 `_rag` 与 `_generate_deep` 拿的是同一个 ctx，不需要新管道。
     evidence: list[EvidenceSpan] = field(default_factory=list)
     # 本次运行里从知识库回查出来的来源（持久 id -> Source），`_rag` 命中后填入。
     #
@@ -337,6 +419,37 @@ class RunContext:
     # 只装**真的被本次检索命中过**的库来源，不是整库：校验的语义是"你引的东西
     # 这次确实查到过"，而不是"库里恰好有这份材料"。
     library_sources: dict[str, Source] = field(default_factory=dict)
+    # 「这次图型是怎么定的」以及从 `goal` 里剥掉的那一段（见 `diagram_intent`）。
+    #
+    # 默认 `None` = **这一层没跑**（单测与直接构造 `RunContext` 的代码就是这种）。
+    # 这个默认值是有用的：`tests/test_agent_diagram_type.py` / `test_edges.py` 用
+    # 旧模块钉着"请求不带图型时产出逐字节一致"，那些断言里 `data` 没有 `source`
+    # 与 `stripped` 两个键——工具只在**解析过**时才补它们（见 `_generate_deep` 的
+    # 「图型与附加边」那一段）。
+    diagram_source: str | None = None
+    diagram_stripped: str | None = None
+    # `audit_tree` 最后一次数出来"还有几条一级分支没有子节点"。0 表示上次体检
+    # 是干净的，`None` 表示这次运行**从没体检过**——两者必须分得开：没体检过时
+    # 循环不该替模型判断"它是不是漏了"，那是凭空多出来的停止条件。
+    #
+    # 谁写谁读：`tools._audit_tree_tool` 写（每次体检覆盖），`service._loop` 在
+    # 模型准备收尾时读。放在 ctx 上而不是 `ToolResult.data` 里，理由与
+    # `loop_diagnostics` 相同——它是**跨调用**的事实，不属于任何一次调用。
+    audit_missing: int | None = None
+    # 「已经提醒过模型一次了」。收尾提醒必须是一次性的：模型听完还是要停，
+    # 那是它的判断（或者它有自己的理由），再催就变成代码替它写这张图。
+    audit_nagged: bool = False
+    # 这次运行要在 system 里注入的**记忆那一段**（`app/memory/store.py` 检索出来的，
+    # 已经渲染成文本；没有命中时是空串）。
+    #
+    # 为什么是 `RunContext` 而不是 `_system_text` 里现算：那个函数**每一轮**都会被
+    # 调一次（`_refresh_outline`），检索放进去就是 N+4 次 embedding（骨架 1 次 +
+    # 结构 1 次 + detail 2 次 + 工具循环 N 轮），每次 0.3–1 秒，延迟翻几倍。算在
+    # `_loop` 开头、存在这里、之后所有段照抄——这是这次改动里最硬的一条性能约束。
+    #
+    # 默认空串是硬要求：单测与直接构造 `RunContext` 的代码没有检索过，注入的那一段
+    # 必须与加这个字段之前**逐字节相同**（`_system_text` 里那个 `if part` 过滤）。
+    memory_hints: str = ""
 
     def record_library_sources(self, sources: Iterable[Source]) -> None:
         """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。
@@ -390,6 +503,21 @@ class RunContext:
             logger.debug("证据区间达到 %d 条上限，丢弃最旧的 %d 条",
                          MAX_EVIDENCE_SPANS, overflow)
 
+    def record_call(self, call_id: str, fingerprint: str) -> None:
+        """记一次**成功执行**的调用，供"连续重复调用"判据回溯。
+
+        只由 `service._execute_once` 在工具真的返回 `ok=True` 之后调用。失败的
+        调用不进这里，理由写在 `recent_calls` 的字段注释里：用相同的参数重试一次
+        失败的检索/写入，是模型正常的恢复动作，不该被判成"重复"。
+
+        容量是 `MAX_RECENT_CALLS`（比判定窗口宽），超了丢最旧——判据只看最近几次，
+        更早的条目即使留着也不会被任何一次判定读到。
+        """
+        self.recent_calls.append((call_id, fingerprint))
+        overflow = len(self.recent_calls) - MAX_RECENT_CALLS
+        if overflow > 0:
+            del self.recent_calls[:overflow]
+
     def reserve_model_call(self) -> bool:
         """占掉一次模型调用额度，拿不到返回 False。
 
@@ -415,33 +543,107 @@ MAX_SOURCES = 50
 class AgentRunRequest(BaseModel):
     """一次 agent 运行。
 
-    `snapshot` 是前端当前的树。服务端**不**从数据库重读——用户可能有一堆没保存
+    `snapshot` 是前端当前的图。服务端**不**从数据库重读——用户可能有一堆没保存
     的编辑，重读数据库等于把它们丢掉。
     """
 
     model_config = ConfigDict(extra="forbid")
     goal: str = Field(min_length=1, max_length=1000)
     intent: Literal["create", "expand", "edit"] = "create"
+    # 这次运行的**身份**。带同一个 id 重复投递时，服务端据它决定"真跑 / 409 /
+    # 直接回放已有候选"，见 `app/agent/runs.py`。
+    #
+    # 由调用方给、可选，而不是服务端自己发一个再返回：服务端发的话，客户端要
+    # 先请求一次才能拿到 id，那一次请求本身就成了"第一次运行"——刷新重发时它
+    # 照样没有 id 可用，等于什么都没解决。老客户端不带也能跑（服务端补一个 uuid4），
+    # 只是拿不到幂等。
+    #
+    # 字符集收窄到 `[A-Za-z0-9_.-]`：这个值会进 `GET /api/agent/runs/{run_id}` 的
+    # 路径。放开 `/` 与 `..` 会先在路由层制造一串"看起来像另一个接口"的路径。
+    run_id: str | None = Field(default=None, min_length=1, max_length=64,
+                               pattern=r"^[A-Za-z0-9_.-]+$")
     # 同一句主题换一种拆解方法，结构就不同（表在 `generation.service.THINKING_MODELS`）。
     # 用 Literal 而不是自由字符串：拼错的值会被 `model_config` 挡在开流之前，
     # 否则它会静默退化成 default，用户在下拉里选的东西等于没生效。
     thinking_model: Literal[
         "default", "first-principles", "feynman", "systematic", "critical"
     ] = "default"
-    snapshot: MindMapContent | None = None
+    # 图型：界面上那个下拉里用户选的东西。**None = 让模型自己判断**，也就是
+    # "用户没说"——这一条是向后兼容的全部内容：老前端不带这个字段，走的就是
+    # `args.diagram_type` 那条老路，行为与加这个字段之前逐字节相同。
+    #
+    # 为什么必须有这一层：模型看不见界面。「画个流程图」这句话在 `goal` 里被它
+    # 当成主题描述消化掉之后，它不会再回头把工具参数设成 `flowchart`——实测三次
+    # 里三次都走 `GenerateDeepArgs.diagram_type` 的默认值 `tree`，用户看到的是
+    # 一张思维导图。只要"这个参数模型可以不填"，它就会不填；把它提到请求层，
+    # 「用户说了要流程图」这件事就不再依赖模型的记性。
+    #
+    # 用 Literal 而不是自由字符串，理由与 `thinking_model` 同：拼错的值在开流
+    # 之前就该被拒，而不是静默退化成"自动判断"。
+    diagram_type: DiagramKind | None = None
+    # 「这一次图型是怎么定的」，由 `diagram_intent.apply()` 在开流之前写：
+    # `request`（下拉）/ `inferred`（从 `goal` 的文字里读出来）/ `model`（两边都没说）。
+    # 附带的 `_diagram_stripped` 是那次从 `goal` 里真的剥走的那一段原文。
+    #
+    # **私有属性**（不是 pydantic 字段）：它不序列化、不进 OpenAPI、不进前端镜像，
+    # 也不该进——它是"这次请求内部发生的一件事"，对外面的契约面没有一个字的增加。
+    # 前端要的答案在别的两个地方：产物里的 `MindMapContent.diagram_type`（这张图
+    # 是什么），与工具结果的 `data["diagram"]`（它是怎么定下来的）。
+    _diagram_source: str | None = PrivateAttr(default=None)
+    _diagram_stripped: str | None = PrivateAttr(default=None)
+    # 这一次运行**实际带着哪些偏好**，形如 `["diagram_type.default=fishbone"]`。
+    #
+    # 由调用方（前端）标，不由后端补：只有前端知道"下拉里这个值是偏好预填的、
+    # 用户没动过"。后端开流前把偏好塞进 `diagram_type` 是不行的——那会让上面那条
+    # "`None` 与 `tree` 必须分得开"的性质失效，事后排查会看到"用户选了流程图"
+    # 而用户根本没选过。
+    #
+    # 它落进 `runs.request.prefs_applied`，是偏好面板上"上次生效"的**唯一**数据源。
+    # 少了它，一条偏好写进去之后没有任何办法证明它影响过任何一次生成——那正是
+    # "心里记着"与"真的在起作用"的区别。
+    prefs_applied: list[str] = Field(default_factory=list, max_length=50)
+    # 这张图**现在长什么样**：`expand` / `edit` 的输入，也是服务端唯一的形状来源。
+    #
+    # 三种图型共用这一份（`DiagramContent` 联合），与同一轮 `snapshot` / `done` 事件
+    # 的类型一致。收窄成 `MindMapContent` 时的后果是可复现的：鱼骨图与流程图发
+    # `expand` / `edit` 必然 422，而后端为它们写的 `_expand` / `_apply_ops_any`
+    # （按骨 / 阶段分片执行）对前端**不可达**——那两条路有实现、有用例，却没有人
+    # 能走到。
+    #
+    # 判别靠形状（`DiagramContent` 的 `union_mode="left_to_right"`，见
+    # `mindmap.DiagramContent` 的注释），不靠 `diagram_type`：库里与前端手里有一批
+    # "自述是鱼骨、形状是树"的旧记录，收窄会在它们下一次保存时 422。
+    #
+    # 三种形状以外的 payload 由 `snapshot_is_a_known_shape` 拦在 Pydantic 之前
+    # 并给人话——联合类型的默认报错是一棵 `anyOf` 错误树，用户从里面读不出
+    # "我该改什么"。
+    snapshot: DiagramContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
     sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)
     budget: RunBudget = Field(default_factory=RunBudget)
+    # 「这一次」要不要走推理模型（界面上那枚「深度思考」按钮）。
+    #
+    # 它是**这一次运行的开关，不是设置**：同一个用户会在"随便出一张图"和"这段逻辑
+    # 要拆准"之间来回切，写进偏好就把一次性的选择变成了永久状态。所以它不落库、
+    # 不进 `prefs_applied`，只活在这一次请求里。
+    #
+    # 缺省 `False` 与加这个字段之前逐字节相同：老前端不带，发出去的 model 名照旧
+    # 是 `MINDMAP_LLM_MODEL`。
+    #
+    # 它**不改任何生成链路**：三段式、两级骨架、每支检索全都不看这个字段。它只
+    # 决定 `provider.OpenAICompatibleProvider` 往上游发的 `model` 是哪一个
+    # （见 `provider._model_for`）——两个模型同一个 endpoint，差别只有名字。
+    deep_thinking: bool = False
 
     @model_validator(mode="before")
     @classmethod
     def sources_not_too_many(cls, data: Any) -> Any:
-        """份数上限：两种形态的"为什么不行"完全不同，文案必须分开。
+        """份数上限：正文不进 prompt，卡住的是**清单**。
 
-        - `rag`：正文不进 prompt，所以"材料字太多"根本不是问题；卡住的是**清单**。
-          清单列不下的材料，模型连"有这一份"都不知道——那比拒绝更糟，因为树看起来
-          是完整的，只是少了两块。
-        - `full`：每份正文都要进 prompt，份数上限与上下文是同一件事的两个方向。
+        清单列不下的材料，模型连"有这一份"都不知道——那比拒绝更糟，因为树看起来
+        是完整的，只是少了两块。原来的另一条测（`full` 形态下"正文合计装不装得进
+        上下文"）已随那个形态删除：正文从不进 prompt，那条预检量的是一个不存在的
+        对象（一份 25 万字材料现在只贡献一行清单，几十 token）。
 
         字段上的 `max_length` 仍然留着（OpenAPI 要有 `maxItems`，前端据此先拦一步），
         这里在它之前给出能照着做的文案：pydantic 的 "List should have at most 50
@@ -459,50 +661,51 @@ class AgentRunRequest(BaseModel):
         count = len(sources)
         if count <= MAX_SOURCES:
             return data
-        if source_mode() == SOURCE_MODE_RAG:
-            raise ValueError(
-                f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
-                f"rag 形态下正文不占上下文，卡住的是材料清单：清单只列得下 "
-                f"{MAX_SOURCES} 条，多出来的材料模型连存在都不知道。请分批生成。")
         raise ValueError(
             f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
-            "请分批生成。")
+            f"正文不占上下文，卡住的是材料清单：清单只列得下 "
+            f"{MAX_SOURCES} 条，多出来的材料模型连存在都不知道。请分批生成。")
 
-    @model_validator(mode="after")
-    def sources_within_context(self) -> "AgentRunRequest":
-        """`full` 形态下：来源正文合计要装得进模型上下文。
+    # 这里**没有**"来源正文合计装得进上下文"的预检：正文不进 prompt，没有可测量的
+    # 对象。留着它的后果不是"保守"，是错——一份 25 万字的材料只贡献一行清单
+    # （几十 token），却会在开流前被 422 拒掉，而它本来是能处理的。清单自己的
+    # token 上限由 `tools._material_manifest` 负责（超了截的是**清单项**，不是拒绝
+    # 整个请求）。
+    #
+    # 另两处 token 预检（`provider.complete_tools` 与 `generation.chat_async`）量的
+    # 是**实际要发出去的消息**，不是材料体积：那些消息里没有正文，自然不会被它们拦。
 
-        原先这里卡的是「合计 20000 字」。那个数按一句话主题拍的，没有实测依据，
-        而且与 pipeline 的同一口径互相抄写——两处一起错、一起被当成边界。真正
-        的边界只有一条：模型的上下文窗口装不装得下。所以改判 token，超了仍然
-        在开流之前拒绝，文案给出两条出路（精简 / 分批）。
+    @model_validator(mode="before")
+    @classmethod
+    def snapshot_is_a_known_shape(cls, data: Any) -> Any:
+        """`snapshot` 必须长得像三种图型之一，否则在 Pydantic 之前给一句人话。
 
-        **`rag` 形态下这条预检直接跳过**：正文根本不进 prompt，没有可测量的对象。
-        留着它的后果不是"保守"，是错——一份 25 万字的材料在 `rag` 形态下只贡献
-        一行清单（几十 token），却会在开流前被 422 拒掉，而它本来是能处理的。
-        清单自己的 token 上限由 `tools._material_manifest` 负责，超了截的是**清单项**，
-        不是拒绝整个请求：删掉两行索引，比劝用户去精简一份他并不需要精简的材料好。
+        为什么要有这一条：`snapshot` 是 `DiagramContent`（三个成员的联合），而
+        pydantic 对一个"哪个成员都不匹配"的 payload 会报一棵 `anyOf` 错误树——
+        三层 `loc`、每层一句"field required"，用户从里面读不出"我该改什么"。
+        这一条把最常见的那一类（**根本不是导图**，或者键名全错）提前拦成一句话。
 
-        份数上限是另一个量，见 `sources_not_too_many`（两种形态都要拦）。
+        判据是**形状**而不是 `diagram_type`（与 `DiagramContent` 的判别同一条规矩）：
+        树有 `root`，鱼骨有 `problem` + `bones`，流程有 `stages`。三个键都没出现时
+        这份 payload 一定不是导图，不必让联合类型去试。
 
-        另两处同名的 token 预检（`provider.complete_tools` 与
-        `generation.chat_async`）量的是**实际要发出去的消息**，不是材料体积：
-        `rag` 形态下那些消息里没有正文，自然不会被它们拦。
-
-        这里必须抛 `ValueError`：它发生在 FastAPI 解析请求体的时候，只有
-        ValidationError 才会被收成 422 并把文案带回前端；`GenerationError`
-        冒出去会变成 500，用户看到的是"服务器内部错误"。
+        不判得更细（比如"有 root 但 root 里没有 label"）：那些错**应该**由契约逐字段
+        报出来，它们的报错文案本来就能读。这里只兜"完全认不出形状"这一档。
         """
-        if not self.sources or source_mode() == SOURCE_MODE_RAG:
-            return self
-        text = "\n".join(source.text or "" for source in self.sources)
-        if not text:
-            return self
-        try:
-            ensure_input_within_context(text, label="来源正文合计")
-        except GenerationError as exc:
-            raise ValueError(str(exc)) from exc
-        return self
+        if not isinstance(data, dict):
+            return data
+        snapshot = data.get("snapshot")
+        # 只判"原始 dict"这一档：已经是模型实例时（内部调用、用例直接把
+        # `FlowContent` 传进来）它一定合法；是别的类型时该由字段校验报"类型不对"，
+        # 这里替它报"形状不对"只会把用户引到错的方向。
+        if not isinstance(snapshot, dict) or not snapshot:
+            return data
+        if {"root", "problem", "stages"} & set(snapshot):
+            return data
+        raise ValueError(
+            "snapshot 看起来不是一份导图：三种图型分别需要 "
+            "root（思维导图）/ problem + bones（鱼骨图）/ stages（流程图）"
+            "其中之一。请确认发的是当前这张图的内容，而不是别的对象。")
 
 
 # ---------------------------------------------------------------- 事件流
@@ -514,9 +717,22 @@ class _EventBase(BaseModel):
 
 
 class StageEvent(_EventBase):
+    """一句"现在在干什么"，以及（可选）这件事的条数结果。
+
+    `stage` 是**稳定标识**，`detail` 是给人看的那句话。前端只读 `detail`
+    （`store.runGeneration` 的 `case 'stage'`），`stage` 供日志、用例与"按阶段
+    换样式/抑制"用——所以它不必是人话，但**不能随手改**：`_stage_frame` 的用例
+    与遥测都按它对齐。
+
+    `count` 只在"这件事有个数量结果"的帧上出现：`external_search` 的结束帧带
+    命中条数，开始帧没有这个键（`exclude_none=True` 把它整条抹掉）。`0` 是有效
+    值，与"还没结束"必须分得开——"一条都没搜到"是用户要知道的正经结论。
+    """
+
     type: Literal["stage"] = "stage"
     stage: str
     detail: str = ""
+    count: int | None = Field(default=None, ge=0)
 
 
 class ToolStartEvent(_EventBase):
@@ -544,7 +760,10 @@ class OpsEvent(_EventBase):
 
 class SnapshotEvent(_EventBase):
     type: Literal["snapshot"] = "snapshot"
-    content: MindMapContent
+    # 三种形状的联合：鱼骨图与流程图现在是**真的**产出（见 `contracts.mindmap`
+    # 的 `DiagramContent`），这一帧要是只收树，一次成功的鱼骨生成会在发事件时
+    # 变成一个 500——而工具那边什么都没做错。
+    content: DiagramContent
 
 
 class NodeGrowEvent(_EventBase):
@@ -614,9 +833,9 @@ class HeartbeatEvent(_EventBase):
 
 class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
-    content: MindMapContent | None = None
+    content: DiagramContent | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
-    # 这棵树是怎么来的，前端接受候选时要照它标记来源，不能一律写成"模型生成"。
+    # 这棵树是怎么来的，前端落地时要照它标记来源，不能一律写成"模型生成"。
     # 缺省 None 而不是 "model"：没填的帧就是"没说"，把它默认成模型产出会让
     # 占位树继续冒充满分答案——缺省值只该表示未知。
     mode: Literal["demo", "model"] | None = None
@@ -627,7 +846,21 @@ class DoneEvent(_EventBase):
     # 可能让它消失）。把原话挂在这一帧上，页面上就能直接看到它到底说了什么。
     # 有产出时不填：那属于正常结果，不需要把整篇输出塞进事件流。
     text: str = ""
+    # 模型这一轮的思考过程（`reasoning_content`）。与 `text` 不同，它**成功时也填**：
+    # 走推理模型（`deep_thinking=True` → `deepseek-reasoner`）时，思考过程是用户
+    # 主动要看的东西——界面上那个折叠面板就是为它做的，成功时反而藏起来等于这个
+    # 开关白勾了。
+    #
+    # 上限见 `service.REASONING_BYTE_LIMIT`（按**编码后的字节**算，64 KiB；实测的
+    # 3000–8000 字连一半都用不到，等于"不截"）。
     reasoning: str = ""
+    # 这一轮真正发出去的模型名（`deepseek-chat` / `deepseek-reasoner` / 配置里的任意值）。
+    #
+    # 由 `_loop` 从 provider 上读，不另存一份：模型名是 provider 在**发请求那一刻**
+    # 决定的（配置缺失时还有回退），循环层再算一次就是两处真相。取不到（演示模式、
+    # 测试里按脚本回放的假 provider）时是 None，帧里整条不存在——"没说"不该长得
+    # 像"说了 chat"。
+    model: str | None = None
 
 
 class ErrorEvent(_EventBase):

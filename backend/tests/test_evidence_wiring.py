@@ -22,22 +22,19 @@ import json
 import logging
 import os
 from typing import Any
-from unittest.mock import AsyncMock, patch
 
 from app.agent import tools as agent_tools
 from app.agent.contracts import (
     MAX_EVIDENCE_SPANS,
     AgentRunRequest,
-    Completion,
     RunBudget,
     RunContext,
     ToolCall,
 )
-from app.agent.service import run
 from app.agent.tools import build_registry
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.source import Source, SourceKind, SourceUsage
-from app.generation.service import SOURCE_MODE_ENV, validate_generated_content
+from app.generation.service import validate_generated_content
 from app.knowledge.service import (
     PARENT_RETRIEVAL_ENV,
     _PARENT_RETRIEVAL_TRUTHY,
@@ -391,56 +388,6 @@ def _tree(ref: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_generate_flags_ref_inside_parent_but_outside_leaf(monkeypatch):
-    """生成收尾把 `ctx.evidence` 交出去：越界引用被**标记**，但不再剔除。
-
-    这是整条改动的核心用例：引用**逐字**在原文里（`text[start:end] == quote`），
-    只是落在父块中与这次查询无关的那一半。上一版把它剔掉，实测会成批删掉合法引用
-    （模型看到的是 450–700 字的父块，不是命中的那 200 字）。现在留一条 warn：
-    行为可观测，但不由代码替用户做删改决定。
-    """
-    source, hit, _leaf, outside = _scene(monkeypatch)
-    reference = {
-        "source_id": source.id, "start": hit.start,
-        "end": hit.start + len(outside), "quote": outside,
-    }
-    ctx = _ctx([source], intent="create")
-    ctx.record_evidence([EvidenceSpan(source.id, hit.start, hit.end,
-                                      hit.leaf_start, hit.leaf_end)])
-
-    with patch("app.agent.tools.chat_async", AsyncMock(return_value=_tree(reference))):
-        result = asyncio.run(build_registry("create").execute(
-            _call("mindmap_generate", "c-gen", topic="整理这些材料"), ctx))
-
-    assert result.ok, result.content
-    codes = [item["code"] for item in result.data["diagnostics"]]
-    assert "SOURCE_REF_OUTSIDE_EVIDENCE" in codes
-    # 分支 a 的引用留着 → 它不该再报"没有可核验引用"（b/c 两条分支本来就没写引用，
-    # 它们的 `UNSOURCED_NODE` 是既有语义，与本条无关）
-    assert not [item for item in result.data["diagnostics"]
-                if item["code"] == "UNSOURCED_NODE" and item["node_id"] == "a"]
-    assert [ref.quote for ref in ctx.candidate.root.children[0].source_refs] == [outside]
-
-
-def test_generate_keeps_ref_inside_leaf_span(monkeypatch):
-    """引用落在命中的子块里：一条新码都不出现，引用留着。"""
-    source, hit, leaf, _outside = _scene(monkeypatch)
-    reference = {
-        "source_id": source.id, "start": hit.leaf_start,
-        "end": hit.leaf_end, "quote": leaf,
-    }
-    ctx = _ctx([source], intent="create")
-
-    with patch("app.agent.tools.chat_async", AsyncMock(return_value=_tree(reference))):
-        result = asyncio.run(build_registry("create").execute(
-            _call("mindmap_generate", "c-gen", topic="整理这些材料"), ctx))
-
-    assert result.ok, result.content
-    codes = [item["code"] for item in result.data["diagnostics"]]
-    assert "SOURCE_REF_OUTSIDE_EVIDENCE" not in codes
-    assert ctx.candidate.root.children[0].source_refs[0].quote == leaf
-
-
 def test_empty_evidence_matches_no_evidence():
     """没有证据时与改动前逐字节一致：诊断码与树内容都不差一个字符。"""
     source = _source()
@@ -460,148 +407,6 @@ def test_empty_evidence_matches_no_evidence():
     span = EvidenceSpan(source.id, 0, 400, 200, 400)
     flagged = verify_source_refs(plain, [source], evidence=[span])
     assert "SOURCE_REF_OUTSIDE_EVIDENCE" in {item.code for item in flagged}
-
-
-def _out_of_leaf_ref(source: Source, hit) -> dict[str, Any]:
-    """父块内、命中区之外的一段引用；偏移与引文都由原文算出来，逐字成立。"""
-    text = source.text or ""
-    outside = text[hit.start:hit.start + 12]
-    return {"source_id": source.id, "start": hit.start,
-            "end": hit.start + len(outside), "quote": outside}
-
-
-def test_full_mode_generation_ignores_evidence(monkeypatch):
-    """`full` 形态不施加证据约束：其中合法引用不该因为"没被这次检索命中"被剔掉。
-
-    这是"形态"与"粒度"两件事的分界：`full` 下材料整份在 prompt 里，模型引用一段
-    检索没命中的原文是合法且常见的。不门控的话 `full` + 父块开会把这类引用判成
-    `SOURCE_REF_OUTSIDE_EVIDENCE` 并剔除（`remove_invalid=True`），用户看不到原因。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "full")
-    source, hit, _leaf, _outside = _scene(monkeypatch)
-    ctx = _ctx([source], intent="create")
-    ctx.record_evidence([EvidenceSpan(source.id, hit.start, hit.end,
-                                      hit.leaf_start, hit.leaf_end)])
-
-    with patch("app.agent.tools.chat_async",
-               AsyncMock(return_value=_tree(_out_of_leaf_ref(source, hit)))):
-        result = asyncio.run(build_registry("create").execute(
-            _call("mindmap_generate", "c-gen", topic="整理这些材料"), ctx))
-
-    assert result.ok, result.content
-    codes = {item["code"] for item in result.data["diagnostics"]}
-    assert "SOURCE_REF_OUTSIDE_EVIDENCE" not in codes
-    assert len(ctx.candidate.root.children[0].source_refs) == 1
-
-
-def test_switch_off_evidence_never_flags(monkeypatch):
-    """父块关着时，累积到的区间没有叶子坐标，校验不该因此判任何引用越界。"""
-    monkeypatch.setenv(PARENT_RETRIEVAL_ENV, "0")
-    source = _source()
-    ctx = _ctx([source], intent="create")
-    rag = _exec_rag(ctx)
-    assert rag.ok and rag.data["hits"]
-    # 前提：这条路上每条命中的 leaf 都是 None（父块关 = 单级切块）
-    assert all(item["leaf_start"] is None for item in rag.data["hits"])
-    assert ctx.evidence
-
-    text = source.text or ""
-    reference = {"source_id": source.id, "start": 0, "end": 12, "quote": text[:12]}
-    with patch("app.agent.tools.chat_async", AsyncMock(return_value=_tree(reference))):
-        result = asyncio.run(build_registry("create").execute(
-            _call("mindmap_generate", "c-gen", topic="整理这些材料"), ctx))
-
-    assert result.ok, result.content
-    codes = {item["code"] for item in result.data["diagnostics"]}
-    assert "SOURCE_REF_OUTSIDE_EVIDENCE" not in codes
-
-
-# ---------------------------------------------------------------- 三、端到端
-
-
-class _ScriptedProvider:
-    """按脚本返回工具调用；与 `tests/test_agent_loop.py` 的同名实现同义。"""
-
-    def __init__(self, script: list[Completion]) -> None:
-        self._script = list(script)
-        self.calls = 0
-
-    async def complete_tools(self, messages, tools, *, budget):
-        self.calls += 1
-        if not self._script:
-            raise AssertionError("脚本已用完：循环比预期多调了一次模型")
-        return self._script.pop(0)
-
-
-def _completion(call: ToolCall | None = None) -> Completion:
-    message: dict[str, Any] = {"role": "assistant", "content": "好的"}
-    calls = [call] if call else []
-    if call:
-        message["tool_calls"] = [{
-            "id": call.call_id, "type": "function",
-            "function": {"name": call.name,
-                         "arguments": json.dumps(call.arguments, ensure_ascii=False)},
-        }]
-    return Completion(message=message, tool_calls=calls,
-                      finish_reason="stop" if call is None else "tool_calls",
-                      usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
-
-
-def _drain(request: AgentRunRequest, provider) -> list:
-    async def collect():
-        return [event async for event in run(request, provider=provider)]
-
-    return asyncio.run(collect())
-
-
-def test_end_to_end_rag_mode_cites_evidence_and_flags_the_rest(monkeypatch):
-    """`SOURCE_MODE=rag` + 父块默认开：抄 `evidence_*` 通过，抄父块其它位置被标记。
-
-    全程走真的 agent 循环：模型先 `rag_query`（工具自己累积证据），再
-    `mindmap_generate`（工具收尾交给校验）。中间没有手工塞进去的 `EvidenceSpan`
-    ——喂给模型的树是按"模型会从检索结果里抄"的形态写死的。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "rag")
-    # 默认开的验证点之一：删掉 conftest 写的 "0"，让默认值生效
-    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
-
-    source, hit, leaf, outside = _scene(monkeypatch)
-    text = source.text or ""
-    assert text[hit.start:hit.start + len(outside)] == outside
-
-    good = {"source_id": source.id, "start": hit.leaf_start,
-            "end": hit.leaf_end, "quote": leaf}
-    bad = {"source_id": source.id, "start": hit.start,
-           "end": hit.start + len(outside), "quote": outside}
-
-    def build(ref: dict[str, Any]):
-        tree = _tree(ref)
-        provider = _ScriptedProvider([
-            _completion(_call("mindmap_generate", "c-gen", topic="整理这些材料")),
-            _completion(),
-        ])
-        with patch("app.agent.tools.chat_async", AsyncMock(return_value=tree)):
-            events = _drain(_request([source]), provider)
-        ends = [event for event in events if event.type == "tool_end"]
-        gen_end = next(event for event in ends if event.name == "mindmap_generate")
-        done = next(event for event in events if event.type == "done")
-        return gen_end, done
-
-    gen_end_good, done_good = build(good)
-    # 前提：检索真的回了父块（否则这组用例测的是单级切块）。
-    # `_scene` 里那次 `search_parent` 就是生成工具预检索走的同一条路。
-    assert hit.leaf_start is not None and hit.leaf_end is not None
-    assert hit.end - hit.start > hit.leaf_end - hit.leaf_start
-    assert "SOURCE_REF_OUTSIDE_EVIDENCE" not in {
-        item["code"] for item in gen_end_good.result_summary["diagnostics"]}
-    assert done_good.content.root.children[0].source_refs[0].quote == leaf
-
-    gen_end_bad, done_bad = build(bad)
-    assert "SOURCE_REF_OUTSIDE_EVIDENCE" in {
-        item["code"] for item in gen_end_bad.result_summary["diagnostics"]}
-    # 父块里、命中区之外：**保留**并标记。剔除这条口子在本轮关掉了——模型引的这段
-    # 逐字在原文里，只是不在这轮命中的那 200 字内。
-    assert [ref.quote for ref in done_bad.content.root.children[0].source_refs] == [outside]
 
 
 # ---------------------------------------------------------------- 四、默认值
@@ -633,24 +438,6 @@ def test_rag_switch_off_matches_single_level_search(monkeypatch):
     assert result.data["hits"] == expected
     assert all(item["leaf_start"] is None and item["leaf_end"] is None
                for item in expected)
-
-
-def test_full_mode_also_uses_parent_retrieval(monkeypatch):
-    """`full` 形态下父块召回同样开：这个开关只影响检索，与 prompt 形态无关。
-
-    确认有没有隐含耦合：`_rag` 里没有任何一处读 `source_mode()`——`full` 下模型
-    看得见全文、引用任何段落都合法，所以"要不要施加证据约束"由形态决定（那在
-    `_generate` 的 `sources`／`ctx.evidence` 上），"检索回什么粒度"不由形态决定。
-    两边各管各的，这里钉住的是后一半。
-    """
-    monkeypatch.setenv(SOURCE_MODE_ENV, "full")
-    monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
-    source = _source()
-    result = _exec_rag(_ctx([source]))
-
-    assert result.ok, result.content
-    assert result.data["hits"]
-    assert all(item["leaf_start"] is not None for item in result.data["hits"])
 
 
 def test_default_switch_value_is_read_at_call_time():

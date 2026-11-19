@@ -16,8 +16,8 @@ import {
  * 画布的渲染源。
  *
  * 用户的抱怨是「节点一个个到达，但画布中间始终是空的」：预览只长在右侧面板里。
- * 这组用例守的是画布的取数规则——三级优先级 content → candidate → agentPreview，
- * 以及「看得见」与「能采纳」这两件事始终分得开。
+ * 这组用例守的是画布的取数规则——两级优先级 content → agentPreview，
+ * 以及「看得见」与「已经在画布上」这两件事始终分得开。
  */
 
 /** 手动推进的 SSE 响应：生成中的状态只在流没结束时存在。 */
@@ -175,25 +175,27 @@ describe('渲染源：content 优先', () => {
     await running;
   });
 
-  it('已有内容时候选也不顶掉它', async () => {
+  it('已有内容时 snapshot 不顶掉它，done 才替换', async () => {
     const store = useMindMapStore();
     store.preview(content('旧图'), 'right');
 
     const { stream, running } = startStream();
-    stream.push({ type: 'snapshot', seq: 3, content: content('候选根') });
-    await vi.waitFor(() => expect(store.candidate).not.toBeNull());
+    stream.push({ type: 'snapshot', seq: 3, content: content('结果根') });
+    await vi.waitFor(() => expect(store.agentEvents.length).toBeGreaterThan(0));
 
+    // snapshot 只更新工作副本：画布上是用户打开的那张图
     expect(store.nodes.map(node => node.id)).toEqual(['root', 'a']);
     expect(store.nodes[0].data?.label).toBe('旧图');
 
     stream.push({ type: 'done', seq: 9 });
     stream.finish();
     await running;
+    expect(store.nodes[0].data?.label).toBe('结果根');
   });
 });
 
-describe('渲染源：候选接住预览清空的那一刻', () => {
-  it('snapshot 到达时画布不空一帧，直接换成候选', async () => {
+describe('渲染源：生成中画预览，done 之后画 content', () => {
+  it('snapshot 到达时画布不空一帧：预览一直撑到 done', async () => {
     const { stream, store, running } = startStream();
     stream.push(grow(null, '预览根'));
     stream.push(grow([], '预览分支'));
@@ -201,47 +203,44 @@ describe('渲染源：候选接住预览清空的那一刻', () => {
     expect(store.nodes[0].id.startsWith(PREVIEW_ID_PREFIX)).toBe(true);
 
     stream.push({ type: 'snapshot', seq: 8, content: content('快照根') });
-    await vi.waitFor(() => expect(store.candidate).not.toBeNull());
+    await vi.waitFor(() => expect(store.agentEvents.some(item => item.type === 'snapshot')).toBe(true));
 
-    // 预览这一刻被整棵作废了，但画布不能跟着掉回空态：这正是用户抱怨的那一帧
-    expect(store.agentPreview).toBeNull();
+    // 这一帧从前由候选层接住，候选层删掉之后由"预览继续撑"接住：
+    // 画布这一瞬间**不能**掉回空态，那正是用户抱怨过的那一帧。
+    expect(store.agentPreview).not.toBeNull();
     expect(store.nodes.length).toBeGreaterThan(0);
-    expect(store.nodes.map(node => node.id)).toEqual(['root', 'a']);
-    expect(store.nodes[0].data?.label).toBe('快照根');
-    // 候选只是"看得见"：节点仍然是不可选、不可编辑的草稿
+    // 但预览节点仍然不可选：它还没经过整树校验，没资格进画布
     expect(store.nodes.every(node => node.selectable === false)).toBe(true);
-    expect(store.nodes.every(node => node.data?.draft === 'candidate')).toBe(true);
 
     stream.push({ type: 'done', seq: 9 });
     stream.finish();
     await running;
+
+    // done 之后画的是真正落地的 content：可选、可编辑、没有草稿标记
+    expect(store.nodes.map(node => node.id)).toEqual(['root', 'a']);
+    expect(store.nodes[0].data?.label).toBe('快照根');
+    expect(store.nodes.every(node => node.selectable === true)).toBe(true);
+    expect(store.nodes.every(node => node.data?.draft === undefined)).toBe(true);
   });
 
-  it('候选能被应用，应用之后画布回到正常节点', async () => {
+  it('落地之后画布回到正常节点，且只压一步撤销', async () => {
     const { stream, store, running } = startStream();
     stream.push(grow(null, '预览根'));
     await vi.waitFor(() => expect(store.nodes).toHaveLength(1));
 
     stream.push({ type: 'snapshot', seq: 8, content: content('快照根') });
-    await vi.waitFor(() => expect(store.candidate).not.toBeNull());
-
-    // 渲染源变了，采纳语义一步没松：候选仍然要用户点「应用」才进 content
-    expect(store.content).toBeNull();
-    expect(store.acceptCandidate()).toBe('applied');
-
-    expect(store.content?.root.label).toBe('快照根');
-    expect(store.candidate).toBeNull();
-    expect(store.nodes.map(node => node.id)).toEqual(['root', 'a']);
-    expect(store.nodes.every(node => node.selectable === true)).toBe(true);
-    expect(store.nodes.every(node => node.data?.draft === undefined)).toBe(true);
-
     stream.push({ type: 'done', seq: 9 });
     stream.finish();
     await running;
+
+    expect(store.content?.root.label).toBe('快照根');
+    expect(store.undoDepth).toBe(1);
+    expect(store.nodes.map(node => node.id)).toEqual(['root', 'a']);
+    expect(store.nodes.every(node => node.selectable === true)).toBe(true);
   });
 });
 
-describe('预览与候选都不能编辑', () => {
+describe('预览不能编辑', () => {
   it('预览节点不可选中，选中请求被忽略', async () => {
     const { stream, store, running } = startStream();
     stream.push(grow(null, '根'));
@@ -288,17 +287,18 @@ describe('预览与候选都不能编辑', () => {
     await running;
   });
 
-  it('只有预览时 acceptCandidate 仍然返回 invalid', async () => {
+  it('只有预览时画布上那棵树一个字都没进 content', async () => {
     const { stream, store, running } = startStream();
     stream.push(grow(null, '预览根'));
     stream.push(grow([], '预览分支'));
     await vi.waitFor(() => expect(store.nodes).toHaveLength(2));
 
-    expect(store.candidate).toBeNull();
-    expect(store.acceptCandidate()).toBe('invalid');
-    // 画布上已经看得见这棵树，但它一个字都没进 content
     expect(store.content).toBeNull();
+    // 画布上已经看得见这棵树，但它既不是 content 也不是"一次生成的结果"——
+    // 它只是还在长的预览，`done` 一到就会被整树替换。
     expect(store.nodeCount).toBe(2);
+    expect(store.generatedSummary).toBeNull();
+    expect(store.canUndo).toBe(false);
 
     stream.push({ type: 'done', seq: 9 });
     stream.finish();
@@ -379,15 +379,17 @@ describe('画布 DOM', () => {
     // 有节点之后占位文案必须让位，否则它会盖在刚长出来的树上
     expect(wrapper.text()).not.toContain('还没有导图');
 
-    // 快照到达：预览作废、候选接手，画布上的节点数不能掉到 0
+    // 快照到达：预览继续撑住画布等 done，节点数不能掉到 0
     stream.push({ type: 'snapshot', seq: 8, content: content('快照根') });
-    await vi.waitFor(() => expect(store.candidate).not.toBeNull());
+    await vi.waitFor(() => expect(store.agentEvents.some(item => item.type === 'snapshot')).toBe(true));
     await vi.waitFor(() => expect(wrapper.findAll('.vue-flow__node')).toHaveLength(2));
     expect(wrapper.text()).not.toContain('还没有导图');
 
     stream.push({ type: 'done', seq: 9 });
     stream.finish();
     await running;
+    // done 之后画的是真正落地的树，节点数同样不能掉到 0（那一瞬间最刺眼）
+    expect(wrapper.findAll('.vue-flow__node')).toHaveLength(2);
     wrapper.unmount();
   });
 });
@@ -434,10 +436,11 @@ describe('节点样式', () => {
     expect(root.classes()).toContain('border-dashed');
   });
 
-  it('候选是实线草稿：比预览实，比已应用的图淡', () => {
-    const pending = box(nodeData({ draft: 'candidate', previewLeaf: true })).box;
-    expect(pending.classes()).toContain('border-slate-400');
-    expect(pending.classes()).toContain('opacity-80');
-    expect(pending.classes()).not.toContain('border-dashed');
+  it('生成改过的节点描一圈琥珀色：画布整棵换过，用户得看得出哪里动了', () => {
+    const changed = box(nodeData({ changed: true })).box;
+    expect(changed.classes()).toContain('border-amber-500');
+    expect(changed.classes()).toContain('ring-amber-300');
+    // 不是删除/新增那一档的红绿，也不是"还在长"的虚线
+    expect(changed.classes()).not.toContain('border-dashed');
   });
 });
