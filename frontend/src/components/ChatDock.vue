@@ -425,9 +425,14 @@ const resumableText = computed(() => {
     ? ''
     : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
   const when = clock ? `（${clock}）` : '';
+  // 第三种形态：跑完了但它只交出半棵树（`partial`）。说成"生成完的"是撒谎——用户
+  // 载入之后才发现某几支是空的，那时画布已经是他的作品了。`partial === true` 才
+  // 算数：缺字段是"这条记录没记过"，不是"确定完整"。
   const what = run.status === 'cancelled'
     ? `上次${when}那次生成被中断了，已经生成的部分还留着`
-    : `上次${when}生成完的导图还没保存`;
+    : run.partial === true
+      ? `上次${when}生成只完成了一部分，没长完的树还留着`
+      : `上次${when}生成完的导图还没保存`;
   return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
 });
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed } from 'vue';
 
 import { agentDetailVisible, runResultLine } from '../mindmap/run-status';
 import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
@@ -294,7 +294,6 @@ const hiddenDiagnostics = computed(() => diagnostics.value.length - shownDiagnos
  * 第一句话。
  */
 const guide = computed(() => store.failureGuide);
-const showRaw = ref(false);
 
 /** `agentRunning` 期间按钮要禁用：连点两次会开两轮生成（互相作废）。 */
 function actionDisabled(action: { disabledReason?: string }): boolean {
@@ -411,8 +410,11 @@ function cancel() {
         class="mt-1 text-[11px] text-rose-700"
         :data-test="`failure-why-${action.kind}`"
       >{{ action.disabledReason }}</p>
-      <!-- 原话与分类码：排障时唯一的线索，但不该是用户读到的第一句话。 -->
-      <details class="mt-1" :open="showRaw" @toggle="showRaw = ($event.target as HTMLDetailsElement).open">
+      <!-- 原话与分类码：排障时唯一的线索，但不该是用户读到的第一句话。
+           开关只交给 `<details>` 自己管：`:open` 绑一个 ref、`@toggle` 再写回这个
+           ref，等于两个源同时决定它开不开——点开一次会触发两轮更新，收起时浏览器
+           与状态还可能各说各话。默认收起本来就是我们要的初始态，不需要 ref 代劳。 -->
+      <details class="mt-1">
         <summary class="cursor-pointer text-[11px] text-slate-500">后端原话</summary>
         <p class="mt-1 whitespace-pre-wrap break-words text-[11px] text-slate-600">{{ rawFailure }}</p>
       </details>

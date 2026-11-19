@@ -1106,6 +1106,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 解释，而用户刚刚明明把结果接住了。
       agentErrorCode.value = '';
       agentErrorLimit.value = '';
+      // 半棵树被捡回来时也得说清它是半棵树。实时流那条路在 `done` 帧上写了告警，
+      // 载入这条路走的是台账接口——不在这里补一笔，同一份内容"刚生成时是半棵、
+      // 隔天载入就成了完整交付"，而 `finishStatus` 正是照告警决定状态行怎么写。
+      if (detail.partial === true) {
+        recordWarnings([
+          {
+            kind: 'partial',
+            code: 'PARTIAL',
+            message: detail.partial_reason || '有分支没能生成完整，结果可能缺内容。',
+          },
+        ]);
+      }
       clearAgentPreview();
       resetDraftOps();
       // 来历照原样带过来：占位树恢复成"模型生成"就是界面替它撒谎。
@@ -3081,7 +3093,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
       sources: sources && sources.length > 0 ? [...sources] : undefined,
       thinkingModel,
       diagramType,
-      options,
+      // `options` 要连里面的两个数组一起拷：直接存调用方那个对象，等于把"上一次重试
+      // 要用的参数"挂在界面的 ref 上——下一次它改 `selection`（比如用户又圈了几个
+      // 节点），这条记录会跟着变，重试就悄悄换成了另一批选区。`sources` 上面已经
+      // 这么拷贝了，这两个没有理由例外。
+      options: {
+        ...options,
+        selection: options.selection ? [...options.selection] : undefined,
+        prefsApplied: options.prefsApplied ? [...options.prefsApplied] : undefined,
+      },
     };
     agentEvents.value = [];
     // 上一轮的告警不能带到这一轮：面板里挂着旧告警，用户会以为这次又缺分支。

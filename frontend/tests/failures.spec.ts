@@ -5,6 +5,7 @@ import {
   guideForFailure,
   INVALID_SOURCES,
   NO_CONTENT,
+  STREAM_INTERRUPTED,
 } from '../src/mindmap/failures';
 
 /**
@@ -98,6 +99,18 @@ describe('失败分类', () => {
     expect(lost.title).toContain('连接中断');
     expect(empty.title).toContain('没有产出导图');
     expect(lost.next).not.toBe(empty.next);
+  });
+
+  it('读流途中断网（client 抛的 stream_interrupted）也是"连接中断"这一张', () => {
+    // 同一件事有两个来源：store 在 EOF 没等到终态帧时合成 connection_lost，
+    // client 在 reader.read() 抛错时抛 stream_interrupted。少了这条映射，
+    // 后面那种会掉进兜底的"这次运行没有成功"，把一句确定的判断说成含糊的失败。
+    const lost = guideForFailure({ code: CONNECTION_LOST, canRetry: true });
+    const cut = guideForFailure({ code: STREAM_INTERRUPTED, canRetry: true });
+
+    expect(cut.title).toBe(lost.title);
+    expect(cut.next).toBe(lost.next);
+    expect(cut.retryable).toBe(true);
   });
 
   it('未知错误码走兜底，不猜一个可能错的解释', () => {

@@ -54,6 +54,15 @@ export interface FailureInput {
 
 /** 前端自己合成的失败（后端不会发这几个 code）。 */
 export const CONNECTION_LOST = 'connection_lost';
+/**
+ * 读流途中抛了网络错，`api/client.ts` 抛的是这个 code。
+ *
+ * 它与 `CONNECTION_LOST` 是同一种处境："流还在、字不来了"。分两个名字只因为一个
+ * 是 store 合成的（EOF 没等到终态帧），一个是客户端抛的（`reader.read()` 失败）。
+ * 不给它一条映射的话，这类失败会落到兜底的"这次运行没有成功"——把一句确定的
+ * "连接断了、重试有意义"说成含糊的通用失败。
+ */
+export const STREAM_INTERRUPTED = 'stream_interrupted';
 export const NO_CONTENT = 'no_content';
 export const INVALID_SOURCES = 'invalid_sources';
 
@@ -176,6 +185,7 @@ function explain(input: FailureInput): FailureGuide {
         retryable: true,
       };
     case CONNECTION_LOST:
+    case STREAM_INTERRUPTED:
       return {
         title: '连接中断了',
         next:

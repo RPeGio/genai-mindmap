@@ -712,6 +712,14 @@ export interface RunSummary {
   updated_at: string;
   /** 这份结果后来被保存了。空值 = 生成过、还没存下来，下次进页面会提醒一次。 */
   applied_at?: string | null;
+  /**
+   * 这份结果是"跑到一半停下"交出来的半棵树。
+   *
+   * 判断一律写 `partial === true`：字段缺省 / `null` 表示**这条记录没记过**（老库、
+   * 或那一轮根本没走交付标记），不是"确定完整"。列表也带它，否则点「载入」时
+   * 半棵树与完整生成长得一模一样。
+   */
+  partial?: boolean | null;
 }
 
 /** 单条运行的详情（镜像后端 `RunDetail`）：多出结果正文、失败原因与来历。 */
@@ -720,6 +728,8 @@ export interface RunDetail extends RunSummary {
   failure?: { code?: string; message?: string } | null;
   /** `demo` 是占位树、`model` 是模型产出。重放时按它标来源，不能一律写成模型。 */
   mode?: 'demo' | 'model' | null;
+  /** 半棵树的来历：哪条闸把这一轮停下的那一句解释，与实时流上的 `partial_reason` 同源。 */
+  partial_reason?: string | null;
 }
 
 /**
