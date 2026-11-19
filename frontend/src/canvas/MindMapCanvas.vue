@@ -218,9 +218,21 @@ function setView(next: ViewMode): void {
     if (back) void setViewport(back, { duration: 250 });
     else applyView('fit-width', true);
   }
-  // 用户自己定了视图：之后图再长，不要再把它拽走（与手动平移同一条规矩）。
-  store.viewAdjusted = true;
+  // **不碰 `store.viewAdjusted`**：换档位是"我想怎么看"，不是"以后都别再自动适配"。
+  // 把它也当成手动调整，会得到一个很别扭的后果——点过「全图」之后再生成，
+  // 新图会停留在旧图那一屏上（`scheduleFit` 被这个标志挡住）。
+  // `setViewport` 本身不发 `moveEnd`，所以这里不动它，它就保持原样。
 }
+
+/**
+ * 换了一张图，之前存下的那一屏就作废了。
+ *
+ * 不复位的后果：在全图档下打开另一张图，再切回「适应宽度」，视口会被还回到**上一张
+ * 图**的某一屏——用户看到的是一片空白，而图其实在别处。
+ */
+watch(() => store.content, () => {
+  savedViewport = null;
+});
 
 let fitTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleFit() {
