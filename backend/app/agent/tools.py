@@ -579,6 +579,11 @@ def library_drop_external() -> bool:
 _EXTERNAL_KINDS = {
     "wikipedia": SourceKind.web,
     "baike": SourceKind.web,
+    # DeepSeek Search 的命中是**抓回来的网页正文**，不是论文条目：它可能来自
+    # `ccf.org.cn`、`cppinfo.cn`、专利库、厂商文档站——分类按内容给，所以是 `web`。
+    # 落 `paper` 会让 `EXTERNAL_TRUST_RULES` 对它说"这是一篇论文"，而它可能是一页
+    # 教材目录。
+    "deepseek": SourceKind.web,
     "arxiv": SourceKind.paper,
     "openalex": SourceKind.paper,
     "crossref": SourceKind.paper,
@@ -3835,8 +3840,21 @@ def _external_source(hit: external_knowledge.ExternalHit) -> Source:
     `fetched_at` 与 `language` **不进** `Source`：`SourceMetadata` 里没有对应字段，
     硬塞进 `tags` / `category` 会让过滤语义漂移（那两个字段的约定是"用户给的分类"）。
     它们是抓取过程的描述——与 `library.load` 不还原页数、截断标记是同一条取舍。
+
+    `authority` / `rerank_score` 进 `metadata` 的同名字段：那是 DeepSeek Search
+    自己给的排序元数据，**不参与检索打分**（理由见契约里的注释）。把它塞进 `tags`
+    会让它们跟着标签过滤漂；塞进 `category` 更糟——那个字段的约定是"用户给的业务
+    分类"，写进去之后用户按分类筛就会筛出两个他不认识的分类名。
+
+    `site`（搜索源给的站点名）进 `tags` 的**第二项**：`tags[0]` 仍然是抓取层的
+    `source_name`（`_external_source_names` 靠它拼"来自哪几个站"），站点名是附加
+    信息。空串不塞——`tags=["deepseek", ""]` 会让 `clean_tags` 之外的读者看到一项
+    空白标签。
     """
     text = external_knowledge.truncate_text(hit.text)
+    tags = [hit.source_name]
+    if hit.site:
+        tags.append(hit.site)
     return Source(
         kind=_EXTERNAL_KINDS.get(hit.source_name, SourceKind.web),
         # 外部标题可能很长（arXiv 的标题有 200 字以上的），文件名跟着长会把
@@ -3846,7 +3864,9 @@ def _external_source(hit: external_knowledge.ExternalHit) -> Source:
         status="parsed",
         metadata=SourceMetadata(
             url=hit.url, raw_chars=max(hit.raw_chars, len(text)),
-            tags=[hit.source_name],
+            tags=tags,
+            authority=hit.authority,
+            rerank_score=hit.rerank_score,
         ),
     )
 

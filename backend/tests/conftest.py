@@ -53,6 +53,11 @@ CREDENTIALS = (
     "MINDMAP_LLM_BASE_URL",
     "MINDMAP_LLM_API_KEY",
     "MINDMAP_LLM_MODEL",
+    # DeepSeek 的 tools API（`knowledge/external.py` 的 Search / Fetch）。key 与 base
+    # 都要清：它们**会回落**到上面那对 `MINDMAP_LLM_*`，只清专用的两个等于没清——
+    # 宿主机上配了 LLM key 时，Search 的用例会真的打出去。
+    "MINDMAP_DEEPSEEK_TOOLS_API_KEY",
+    "MINDMAP_DEEPSEEK_TOOLS_BASE_URL",
 )
 
 # 其余会改变行为的环境变量：开关、本地模型目录、外部程序路径。
@@ -100,7 +105,13 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # `external` 键——几百条断言一起变红。需要它的用例自己 `setenv(..., "1")`；
             # "默认开"这件事由 `test_external_knowledge.py` 的一条专门用例
             # （`delenv` + 直接问 `external_knowledge_enabled()`）钉着。
-            "MINDMAP_EXTERNAL_KNOWLEDGE")
+            "MINDMAP_EXTERNAL_KNOWLEDGE",
+            # DeepSeek 的第六个源与"按链接抓取"。两者**默认关**（成本 + query 出境，
+            # 理由见 `external.DEEPSEEK_SEARCH_ENV`），这里置 0 让每条既有生成用例都
+            # 停在"六源里的五个"——也就是 `3c40ba6` 的形状。要它们的用例自己
+            # `setenv(..., "1")`，并同时把 `_client` 换成假响应。
+            "MINDMAP_EXTERNAL_DEEPSEEK_SEARCH",
+            "MINDMAP_EXTERNAL_DEEPSEEK_FETCH")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。

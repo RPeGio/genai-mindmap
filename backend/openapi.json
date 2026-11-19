@@ -4403,6 +4403,29 @@
               }
             ],
             "title": "Raw Chars"
+          },
+          "authority": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authority"
+          },
+          "rerank_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rerank Score"
           }
         },
         "additionalProperties": false,

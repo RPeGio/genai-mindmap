@@ -2012,6 +2012,10 @@ export interface components {
             url?: string | null;
             /** Raw Chars */
             raw_chars?: number | null;
+            /** Authority */
+            authority?: number | null;
+            /** Rerank Score */
+            rerank_score?: number | null;
         };
         /**
          * SourceRef

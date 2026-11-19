@@ -5,6 +5,23 @@
 接了五个：中文维基（`wikipedia`，web）、快懂百科（`baike`，web）、arXiv（`arxiv`，
 paper）、OpenAlex（`openalex`，paper）、Crossref（`crossref`，paper）。
 
+还有一个**默认关**的第六个：DeepSeek 的 Search 工具 API（`deepseek`，web，见
+"DeepSeek Search / Fetch"一节）。它与上面五个**并列而不是替换**，理由是三件事：
+
+  - **强项不同**。中文维基对"人物 / 事件 / 这个名词是什么"更强（它给的是词条正文，
+    有定义、有沿革）；Search 对"技术方向 / 流程 / 方案 / 现状"更强（它一次就带回
+    带正文的站点页，实测中文主题 0.5–1.0 秒、3 条、正文 1.5k–21k 字）。用 Search
+    替换维基，`碳中和` 这类主题会拿到"某咨询公司的双碳方案 PPT"，而不是词条。
+  - **可用性不同**。五个源要么靠代理（维基 / arXiv / OpenAlex / Crossref），要么在
+    代理下 100% 失败（快懂百科）；Search 走国内直连、不吃代理。反过来，Search 要
+    key、要计费（0.005 元/次）、把 query 发到第三方——五源不要钱、不出境。
+  - **失败面不同**。五源全挂是"代理没开"这一种故障；Search 挂是"没 key / 额度没了 /
+    接口改了"另一种。两条链路同时挂的概率远低于各自挂的概率，而这正是"失败即空"
+    这条契约要的冗余。
+
+所以默认关：它是**可选的第六个**，不是新版默认行为。开关与判断见
+`DEEPSEEK_SEARCH_ENV`。
+
 **没接的那些，理由都是"过不去"而不是"没试"**：
 
   - 百度百科：`robots.txt` 的 `User-agent: *` 组是 `Disallow: /`（全站拒绝），
@@ -99,6 +116,24 @@ hit 形状、第二套引用格式、第二套校验。所以这个模块只做�
 「碳中和政策」这类组合短语，在它那里必然是 404——那一次请求是纯浪费，还会挤掉一个
 真能出结果的源。
 
+## DeepSeek Search：三个判断
+
+**`lang:zh` 写在 query 里，不是一个请求体字段**（实测：请求体加 `"lang": "zh"` 被
+静默忽略，不带 `lang:` 的 `机器学习的主要方向` 返回 3 条英文站）。判据复用
+`_query_language`——也就是"中文 query 时让中文桶先占名额"的同一份判断。两处必须
+同源：源侧过滤中文、排序侧偏好中文是同一件事，各写一份迟早分叉成"上游把中文滤掉、
+下游还在等中文命中"。
+
+**正文截到 `DEEPSEEK_TEXT_MAX_CHARS`（4000）**，而不是 `TEXT_MAX_CHARS`（8000）。
+一条 21470 字的网页按 300 字/子块切是 71 个 leaf chunk，五源里最长的一条（维基
+"碳中和" 2704 字）只有 9 个；4000 字是 13 个，与它同量级。切块数决定检索池的
+投票权，而"这条资料值不值得 21470 字"这件事我们没有证据支持（复现：`scripts/
+measure_external_deepseek.py --truncation`）。截断前的长度照旧进 `raw_chars`。
+
+**只占 1 个名额**（`_blend_deepseek`）。`_interleave` 按源的收集顺序轮流取，第六个
+桶排在最后——不特殊处理的话，前三轮永远轮不到它，等于白搜。所以单方向路径给
+Search 一个独立席位（`limit - 1` 给五源、1 给 Search），理由与取舍写在那函数里。
+
 ## 代理
 
 外网直连在本机不通（实测：`zh.wikipedia.org` 连不上、`export.arxiv.org` 的 https
@@ -106,10 +141,18 @@ hit 形状、第二套引用格式、第二套校验。所以这个模块只做�
 `127.0.0.1:7897`；`MINDMAP_EXTERNAL_PROXY=none` 是显式直连（给"机器上本来就有全局
 透明代理"那种环境留的出口）。
 
+**DeepSeek 的两个接口不走代理**（`_deepseek_client`，默认直连）。这是实测之后必须
+改的一处：`api.deepseek.com` 是国内端点，直连 0.47–1.13 秒；而经本机 Clash
+（`127.0.0.1:7897`）时 TLS 握手直接被掐——`SSL: UNEXPECTED_EOF_WHILE_READING`，
+两个接口 100% 失败。要给它单独指定出口时用 `MINDMAP_DEEPSEEK_TOOLS_PROXY`，
+缺省 `none`（直连）；给它是给"机器在海外、必须走代理才能到国内"那种环境留的出口。
+**这不是"给一个源单独一套网络策略"那种坑**：五个源共用代理是因为实测它们要代理才
+通，DeepSeek 反过来——共用代理等于让它永远失败。
+
 **国内源也走同一个代理**，这是实测之后的选择而不是偷懒：`baike.com`（字节的
 `volc-dcdn`）走代理 1.1 秒、直连 7.5 秒，反而代理更快。反过来 `baike.baidu.com`
 走代理直接被掐（TLS 握手 `UNEXPECTED_EOF` / 502），但那个站本来就不接（见上）。
-一个 `_client()` 覆盖全部五个源，比给每个源配一份代理策略少一处会配错的地方。
+一个 `_client()` 覆盖全部源，比给每个源配一份代理策略少一处会配错的地方。
 
 `trust_env=False` 是必须的：本机 `ProxyEnable=0`（系统代理开关是关的），让 httpx
 去读环境变量会拿到空值然后直连超时——那是最难解释的一种"外部源全挂"。
@@ -157,15 +200,20 @@ DEFAULT_PROXY = "http://127.0.0.1:7897"
 # 那种时刻的重试没有意义（同一个节点、同一个目标），所以要的是快速放弃。
 REQUEST_TIMEOUT = 10.0
 
-# 整次外部检索的总预算。两个数字一起构成"最坏情况下用户多等多久"：
+# 整次外部检索的总预算。两个数字一起构成"最坏情况下用户等多久"：
 #   - `DEADLINE_SECONDS`：整次调用的墙钟上限，20 秒后任何新请求都不再发；
-#   - `REQUEST_LIMIT`：请求次数上限。9 次正好是五个源的上界之和：
-#       维基 1（精确标题）+ 1（条目检索）+ 3（逐条抓 `limit` 条）
-#       arXiv 1 / OpenAlex 1 / Crossref 1 / 快懂百科 1
-#     = 5 + 1 + 1 + 1 + 1 = 9。没有次数上限时，源返回一个"下一条标题"的畸形响应
-#     就能把链路拖进无界循环；给多了则是"为几条候选把预算烧光"。
+#   - `REQUEST_LIMIT`：请求次数上限。**13**，构成是
+#       五源 9：维基 1（精确标题）+ 1（条目检索）+ 3（逐条抓 `limit` 条）
+#              + arXiv 1 / OpenAlex 1 / Crossref 1 / 快懂百科 1 = 9
+#       DeepSeek Search 1（一次往返换回最多 `count` 条，正文由它自己抓好）
+#       DeepSeek Fetch 最多 3（`content` 为空时按 `url` 补抓，条数 = `count`）
+#     Search 关着时上界仍是 9——那一支一次都不会走到（`_source_available`），
+#     所以"默认关 = 与 `3c40ba6` 逐字节相同"这条承诺不受这个数字影响。
+#     Search 打开时的 4 次额外请求与五源**并行**发，墙钟上界仍是 `DEADLINE_SECONDS`。
+# 没有次数上限时，源返回一个"下一条标题"的畸形响应就能把链路拖进无界循环；给多了
+# 则是"为几条候选把预算烧光"。
 DEADLINE_SECONDS = 20.0
-REQUEST_LIMIT = 9
+REQUEST_LIMIT = 13
 
 # 多方向检索的请求预算。15 = 3 个方向 × 5 次（每方向的次数构成见 `DIRECTION_SOURCES`
 # 与 `_wikipedia` 的 `exact_first` / `fetch_limit`）。**墙钟不放宽**：`DEADLINE_SECONDS`
@@ -186,6 +234,11 @@ DIRECTION_HIT_LIMIT = 2
 # 请求额度"，而维基的逐条抓取是这条链上唯一会随 `limit` 线性涨请求数的地方。
 DIRECTION_WIKI_FETCH = 1
 # 方向路径的源清单：**跳过 baike**（精确词条命中，组合短语必然 404），见模块 docstring。
+#
+# **也不含 deepseek**，虽然它对"组合短语"是强项。理由是预算而不是效果：每个方向只有
+# `DIRECTION_REQUEST_LIMIT=5` 次额度，五个源已经把它顶满（维基 2 + 三个论文源各 1），
+# 再加 Search 就得从某个论文源手里抢走一次。而整条方向路径默认关（实测负收益，见
+# `DIRECTIONS_ENV`），为一条关着的路径重新分配预算，调完也没有人跑。
 DIRECTION_SOURCES: tuple[str, ...] = ("wikipedia", "openalex", "crossref", "arxiv")
 
 # 拆方向的 LLM 调用：单次、8 秒、不重试。与 `query_plan.TIMEOUT_SECONDS` 同一个量级，
@@ -257,6 +310,48 @@ CROSSREF_API = "https://api.crossref.org/works"
 # `robots.txt` 明确 `Disallow: /search`，而 `/wiki/*` 在 `User-agent: *` 组下是
 # `Allow: /`。所以这个源只能做精确词条命中，拼不出候选（详见 `_baike`）。
 BAIKE_WIKI_URL = "https://www.baike.com/wiki/"
+
+# ---------------------------------------------------------------- DeepSeek 工具 API
+
+# 两个端点。基址默认 `https://api.deepseek.com/v1`（实测 `/v1/tools/search` 与
+# `/v1/tools/fetch` 都在它下面）。
+DEEPSEEK_DEFAULT_BASE = "https://api.deepseek.com/v1"
+DEEPSEEK_SEARCH_PATH = "/tools/search"
+DEEPSEEK_FETCH_PATH = "/tools/fetch"
+# 凭据：**先看专用的那个，再回落到 LLM 通道的 key**。理由很实际——本仓的
+# `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY` 通常就是指向 DeepSeek 的那一对，
+# 让用户把同一个 key 抄两遍只会多一处会过期的地方；而真的换供应商时（LLM 走别家、
+# tools 仍用 DeepSeek），专用变量是唯一的出口。
+DEEPSEEK_KEY_ENV = "MINDMAP_DEEPSEEK_TOOLS_API_KEY"
+DEEPSEEK_BASE_ENV = "MINDMAP_DEEPSEEK_TOOLS_BASE_URL"
+# 它自己的出口。缺省**直连**（`none`），理由见模块 docstring 的"代理"一节：经本机
+# Clash 时 TLS 握手被掐，两个接口 100% 失败；而直连 0.5–1.1 秒。给它是给"机器在
+# 海外、必须走代理才能到国内"那种环境留的出口。
+DEEPSEEK_PROXY_ENV = "MINDMAP_DEEPSEEK_TOOLS_PROXY"
+
+# 开关，**默认关**。三条理由按分量排序：
+#
+#   1. **数据出境**。Search 把主题原文发给第三方；五源里唯一带 query 出境的是 arXiv /
+#      OpenAlex / Crossref（英文学术库），而它们在默认路径上本来就发。多一路出境是
+#      部署方与用户都该知情之后才发生的事，不该由一次升级替他决定。
+#   2. **成本**。0.005 元/次。单看很小，但"每次生成都多搜一轮"是乘在生成次数上的。
+#   3. **够用**。五源实测 97.2% 的主题能拿到 ≥1 条、中位 4.3 秒。第六个源是**改进**，
+#      不是**修复**——改默认值的门槛应该比"实现做完了"高。
+#
+# 关着时它连 `DEFAULT_SOURCES` 都不会进（`_source_available`），所以行为与 `3c40ba6`
+# 逐字节相同：不发请求、不占预算、日志里不多一行。
+DEEPSEEK_SEARCH_ENV = "MINDMAP_EXTERNAL_DEEPSEEK_SEARCH"
+
+# 单次调用的超时。8 秒：实测 0.47–1.13 秒（20 个主题、每次 3 条、`need_content` 为真），
+# 8 秒是"抖动 5 倍也还能回来"的量级。**不能直接用 `REQUEST_TIMEOUT=10`**：那个数
+# 服务的是五源的 GET（含 GDPR 语料的自建索引），而这条是同一家公司的 JSON API，
+# 它慢起来通常是排队而不是传输——多等 2 秒没有信息增益。
+DEEPSEEK_TIMEOUT = 8.0
+
+# 一条正文的入库上限。4000 而不是 `TEXT_MAX_CHARS=8000`，理由见模块 docstring 的
+# "三个判断"。这个数只压 DeepSeek 的命中：五源的 `truncate_text` 仍按 8000 走，
+# 改那个数会同时改变五个源的既有行为。
+DEEPSEEK_TEXT_MAX_CHARS = 4000
 
 # 每个源向服务端要几条候选。给 5 而不是 `limit`：`_interleave` 从 5 个桶里轮取，
 # 只给 3 条的话，中文源一旦排在后面就一条都进不了结果（见 `_interleave` 的
@@ -353,6 +448,14 @@ class ExternalHit:
     raw_chars: int = 0
     # 这条命中来自哪个方向。空串 = 单方向检索（既有行为）。
     direction: str = ""
+    # 搜索源自己给的站点名（`ccf.org.cn` / `IEEE Xplore` …）。空串 = 这个源不提供。
+    # 它只用于 `Source.metadata.tags` 的附加项与日志，不参与排序——但"这条来自哪个
+    # 站"是用户判断可信度的第一手依据，而 `source_name="deepseek"` 本身不带这个信息。
+    site: str = ""
+    # 搜索源自己给的权威度与相关性分。语义与用途见 `SourceMetadata.authority` 那段：
+    # **不参与我们的打分**，只回答"源头为什么把它排在这里"。
+    authority: int | None = None
+    rerank_score: float | None = None
 
 
 class ExternalHits(list):
@@ -413,7 +516,7 @@ class _Slot:
 class _Budget:
     """这次外部检索的共享预算：请求次数 + 墙钟截止时间。
 
-    五个源在线程里并行跑，所以计数必须加锁——"两个线程各自读到 8、各自发第 9 次"
+    各源在线程里并行跑，所以计数必须加锁——"两个线程各自读到 8、各自发第 9 次"
     是典型的一读一写竞态，而它只在预算刚好用尽时出现，最难复现。
 
     多方向检索时这是**一份**全局预算（`MULTI_REQUEST_LIMIT`），另有一个按槽位
@@ -432,7 +535,7 @@ class _Budget:
         # 槽位名 → 已用次数。键是方向的序号（`str(index)`），不值钱。
         self._by_slot: dict[str, int] = {}
         # 源级失败次数。它记在这儿而不是另造一个对象，是因为"这次检索的共享状态"
-        # 已经只有这一份了（五个源在线程里跑，任何新对象都得自己带锁）；而
+        # 已经只有这一份了（各源在线程里跑，任何新对象都得自己带锁）；而
         # `note_failure()` 的调用点全在各源的 `except` 里，手里正好有这个 budget。
         self._failures = 0
         self._lock = threading.Lock()
@@ -554,15 +657,27 @@ def _wiki_markdown(text: str) -> str:
         lambda match: "#" * len(match.group(1)) + " " + match.group(2), text)
 
 
+def truncate_chars(text: str, limit: int) -> str:
+    """按 `limit` 截断，**结果长度不超上限**（省略号算在里面）。
+
+    单独成函数而不是只留 `truncate_text`：DeepSeek 的正文上限（4000）与五源的
+    （`TEXT_MAX_CHARS`）不是同一个数（理由见模块 docstring），而截断的写法必须
+    只有一份——两份的差异迟早会体现在"一条有省略号、一条没有"这种细节上。
+    """
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:max(limit - 1, 0)].rstrip() + "…"
+
+
 def truncate_text(text: str) -> str:
     """按 `TEXT_MAX_CHARS` 截断，**结果长度不超上限**（省略号算在里面）。
 
     省略号不是装饰：正文里出现"…"比出现一个看不出来的硬切口更诚实——用户会知道
     这里少了一截。截断位置先 `rstrip`，免得留半个空格在句尾。
     """
-    if len(text) <= TEXT_MAX_CHARS:
-        return text
-    return text[:max(TEXT_MAX_CHARS - 1, 0)].rstrip() + "…"
+    return truncate_chars(text, TEXT_MAX_CHARS)
 
 
 def _now() -> str:
@@ -1073,6 +1188,343 @@ def _baike(
         return []
 
 
+# ---------------------------------------------------------------- DeepSeek Search / Fetch
+#
+# 与上面五个源的关系是**并列**，不是替换：理由写在模块 docstring 的"外部源清单"
+# 与"DeepSeek Search：三个判断"两节里。这一段只放实现。
+
+# 这个源在 `source_name` / `_EXTERNAL_KINDS` / 缓存字段里的身份。取 `"deepseek"`
+# 而不是按站点名（`ccf.org.cn`）分桶：`_interleave` 按 `source_name` 建桶，按站点名
+# 分会让同一个源变成五六个桶，占满全部名额——那正是它当初要修的病。
+DEEPSEEK_SOURCE = "deepseek"
+
+
+def _deepseek_config() -> tuple[str, str]:
+    """`(base, key)`。base 去掉尾部斜杠；key 缺失时返回空串。
+
+    两级回落，顺序写死在这里（全仓只有这一处读这两个变量）：
+
+      1. `MINDMAP_DEEPSEEK_TOOLS_BASE_URL` / `MINDMAP_DEEPSEEK_TOOLS_API_KEY`；
+      2. `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY`（本仓通常就指向 DeepSeek）；
+      3. base 再缺省成 `DEEPSEEK_DEFAULT_BASE`。
+
+    **key 没有缺省值**：没有 key 时这个源不该发请求，返回空串让调用方走"配置缺失"
+    那条路——而不是拿一个空 Bearer 去换 401，那种日志看起来像"接口鉴权炸了"。
+    """
+    base = os.getenv(DEEPSEEK_BASE_ENV, "").strip().rstrip("/")
+    if not base:
+        base = os.getenv("MINDMAP_LLM_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        base = DEEPSEEK_DEFAULT_BASE
+    key = (os.getenv(DEEPSEEK_KEY_ENV, "").strip()
+           or os.getenv("MINDMAP_LLM_API_KEY", "").strip())
+    return base, key
+
+
+def deepseek_search_enabled() -> bool:
+    """第六个源（Search）的开关，**默认关**。三条理由见 `DEEPSEEK_SEARCH_ENV`。"""
+    return str(os.getenv(DEEPSEEK_SEARCH_ENV, "")).strip().lower() in _TRUTHY
+
+
+def _deepseek_client() -> httpx.Client:
+    """DeepSeek 专用的客户端：**默认直连**，与五源那个 `_client()` 分开。
+
+    单独一个工厂而不是复用 `_client()`，因为两边的出口必须相反：五源在本机只有经
+    Clash 才通，DeepSeek 只有直连才通（经 Clash 时 `SSL: UNEXPECTED_EOF_WHILE_
+    READING`，20/20 全失败）。`MINDMAP_DEEPSEEK_TOOLS_PROXY` 是唯一的覆盖口，
+    `none` / `off` / `direct` / 空 都表示直连。
+
+    `trust_env=False` 的理由与 `_client()` 相同：本机 `ProxyEnable=0`，让 httpx 去
+    读环境变量会拿到空值——那是最难解释的一种"所有源全挂"。
+    """
+    raw = os.getenv(DEEPSEEK_PROXY_ENV, "").strip()
+    proxy = None if raw.lower() in ("", "none", "off", "direct", "0") else raw
+    return httpx.Client(
+        proxy=proxy,
+        timeout=DEEPSEEK_TIMEOUT,
+        trust_env=False,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+    )
+
+
+def _deepseek_post(path: str, body: dict[str, Any], timeout: float) -> Any:
+    """POST 一次 + 两道基本校验，返回解析后的 JSON。**失败抛异常**。
+
+    不写进 `_request`：那个函数是 GET + `params`，五源的形状；给 DeepSeek 加 `json=`
+    参数会让它长成"按调用方分叉"的第四个分支。两道校验（状态码、响应体大小）照抄
+    ——那是外部数据的底线，不是因为换了家公司就可以省。
+    """
+    base, key = _deepseek_config()
+    if not key:
+        raise ValueError("没有配置 DeepSeek key")
+    with _deepseek_client() as client:
+        response = client.post(
+            base + path, json=body, timeout=timeout,
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    if response.status_code >= 400:
+        # 401/402/429 各自的下一步不同（换 key / 充值 / 等），但这一层只负责报出
+        # 状态码：正文里可能有服务端的错误说明，统一截下来交给日志。
+        detail = response.text[:160].replace("\n", " ")
+        raise ValueError(f"HTTP {response.status_code}: {detail}")
+    if len(response.content) > MAX_RESPONSE_BYTES:
+        raise ValueError(f"响应体 {len(response.content)} 字节，超过上限")
+    return response.json()
+
+
+def _deepseek_query(query: str) -> str:
+    """发给 Search 的 query：中文主题追加 `lang:zh`，其余原样。
+
+    **`lang:zh` 是 query 的一部分，不是请求体字段**。实测请求体加 `"lang": "zh"` 被
+    静默忽略（同一份 query 带不带那个字段，结果集完全相同），而写进 query 立刻改变
+    结果：`机器学习的主要方向` 不带时回 3 条英文站（`ieee.org` / `IEEE Xplore` /
+    一个印尼域名），带 `lang:zh` 时回 3 条中文站（`cppinfo.cn` / 中国计算机学会 /
+    Google Patents 的中文专利）。
+
+    判据复用 `_query_language`（有 CJK 就是 zh）。**两处必须同源**：那个函数决定
+    `_interleave` 要不要让中文桶先占名额，这里决定要不要让上游只回中文——一个中文
+    query 若在源侧被滤成英文结果、又在排序侧被压到后面，两条规则会互相抵消。
+    反过来，英文 query 不追加任何 `lang:`：那是没有证据支撑的偏好（同一批英文主题
+    带不带 `lang:en` 结果完全相同，实测）。
+    """
+    text = (query or "").strip()
+    if not text or "lang:" in text:
+        return text
+    if _query_language(text) != "zh":
+        return text
+    return f"{text} lang:zh"
+
+
+def _deepseek_float(value: Any) -> float | None:
+    """搜索源给的分数 → float 或 None。**NaN / inf / 字符串一律当没有**。
+
+    外部源不是可信的一端：一个 `"rerank_score": "1.9"` 或 `1e999` 进到 SQLite 之后，
+    下游 `max()` 与比较运算会在某个时刻抛 `TypeError`——那会把"少一个元数据"升级成
+    "整次生成失败"。`-1e6 < value < 1e6` 顺手把 NaN 挡掉（NaN 的任何比较都是 False）。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    score = float(value)
+    return score if -1e6 < score < 1e6 else None
+
+
+def _deepseek_count(value: Any) -> int | None:
+    """搜索源给的权威度 → 非负 int 或 None。`bool` 不是数字，负数当没有。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def _parse_deepseek_search(payload: Any, limit: int) -> list[ExternalHit]:
+    """`{"results": [...]}` → `ExternalHit`。**纯解析，不发请求**。
+
+    每个字段的取法都有实测形状兜着（`scripts/probe_deepseek_tools.py` 的原始响应）：
+
+      - `content` 才是正文（1.5k–21k 字）；`summary` 是**服务端生成的摘要**（0.8k–5.4k
+        字），`snippet` 是一句话。**不用 `summary` 顶替空 `content`**：我们的引用是
+        "逐字可校验"的，而摘要里那句话在原文页面上找不到——用户点开链接核对时会发现
+        对不上，那比"这条没有正文"更糟。空 `content` 交给 `_fill_missing_content`
+        按 `url` 补抓，抓不到就丢弃这条。
+      - `authority` / `rerank_score` 进 `ExternalHit` 的同名字段，最终落到
+        `Source.metadata`（那两个字段的语义见契约里的注释）。
+      - `date` **丢掉了**：实测一多半是 None，而且取值混合了"出版日期"与"站点更新
+        日期"（同一批里既有 2018-09-24 也有 2026-06-29）。把它塞进
+        `metadata.created_at` 会让 `since`/`until` 过滤静默误判——那是"看起来有时效
+        信息、其实不可信"的一类。
+      - 没有 `url` 的命中**直接丢弃**：既补抓不了正文，也没法在界面上点回原文，
+        而"点不开的引用"和"编的引用"在用户那里没有区别。
+
+    按 `rerank_score` 降序（缺失的排最后，保持原序）：实测它落在 1.75–2.02，越大越
+    相关；同一批里 `cppinfo.cn` 1.797 排在 `中国计算机学会` 1.750 之前。这个排序只
+    影响"哪条被我们留下"，不影响检索打分。
+    """
+    if not isinstance(payload, dict):
+        return []
+    results = payload.get("results")
+    if not isinstance(results, list) or limit <= 0:
+        return []
+    hits: list[ExternalHit] = []
+    for item in results:
+        if len(hits) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        title = clean_text(str(item.get("title") or "")).strip()
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        body = clean_text(str(item.get("content") or ""))
+        language = _guess_language(f"{title}\n{body[:200]}")
+        hits.append(ExternalHit(
+            title=title or url,
+            text=truncate_chars(body, DEEPSEEK_TEXT_MAX_CHARS),
+            url=url,
+            source_name=DEEPSEEK_SOURCE,
+            fetched_at=_now(),
+            language=language,
+            # `raw_chars` 记的是**截断前**的长度，与五源同口径；正文空时是 0，补抓
+            # 成功之后由 `_fill_missing_content` 换成补抓到的长度。
+            raw_chars=len(body),
+            site=str(item.get("site_name") or "").strip(),
+            authority=_deepseek_count(item.get("authority")),
+            rerank_score=_deepseek_float(item.get("rerank_score")),
+        ))
+    ranked = sorted(
+        hits, key=lambda hit: (-hit.rerank_score if hit.rerank_score is not None else 1e9))
+    return ranked
+
+
+def _deepseek_fetch(
+    url: str, *, budget: _Budget | None = None, slot: _Slot | None = None,
+    max_chars: int = DEEPSEEK_TEXT_MAX_CHARS,
+) -> ExternalHit | None:
+    """按 URL 抓一篇正文，失败返回 None（**永不抛**）。
+
+    两个调用方各用自己的上限：用途 B（补 Search 的空 `content`）用
+    `DEEPSEEK_TEXT_MAX_CHARS`，与 Search 的其它命中等长；用途 A（用户贴了一个链接）
+    用 `TEXT_MAX_CHARS`——那是用户明确指过来的一整篇材料，没有理由比他自己上传的
+    文档拿得更少。
+
+    `budget` 可选：用途 A 是用户的一次显式动作，它不在生成链路的预算里（那次生成还
+    没开始）；硬塞一个预算只会让"用户点了一下链接"和"生成时多搜一轮"共用一笔账。
+    """
+    target = (url or "").strip()
+    if not target.lower().startswith(("http://", "https://")):
+        return None
+    timeout = DEEPSEEK_TIMEOUT
+    if budget is not None:
+        granted = budget.take(slot)
+        if granted is None:
+            return None
+        timeout = min(timeout, granted)
+    try:
+        payload = _deepseek_post(DEEPSEEK_FETCH_PATH, {"url": target}, timeout)
+    except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        if budget is not None:
+            budget.note_failure()
+        logger.warning("外部检索：DeepSeek Fetch %r 失败（%s）：%s",
+                       target[:120], type(exc).__name__, str(exc)[:160])
+        return None
+    if not isinstance(payload, dict):
+        return None
+    body = clean_text(str(payload.get("content") or ""))
+    if not body:
+        return None
+    title = clean_text(str(payload.get("title") or "")).strip() or target
+    return ExternalHit(
+        title=title,
+        text=truncate_chars(body, max_chars),
+        url=target,
+        source_name=DEEPSEEK_SOURCE,
+        fetched_at=_now(),
+        language=_guess_language(f"{title}\n{body[:200]}"),
+        raw_chars=len(body),
+        site=_host_of(target),
+    )
+
+
+def _host_of(url: str) -> str:
+    """URL → 主机名（`https://www.ccf.org.cn/x` → `www.ccf.org.cn`）。取不出返回空串。
+
+    只用于 `ExternalHit.site`（进 `Source.metadata.tags`，让界面能显示"这条来自哪个
+    站"）。不引 `urllib.parse.urlsplit` 之外的任何东西，也不做任何规范化：这个值只
+    用于显示。
+    """
+    _, _, rest = (url or "").partition("://")
+    host = rest.split("/", 1)[0].split("?", 1)[0].strip()
+    return host[:120]
+
+
+def _fill_missing_content(
+    hits: Sequence[ExternalHit], budget: _Budget, slot: _Slot | None,
+) -> list[ExternalHit]:
+    """用途 B：`content` 为空的命中按 `url` 补抓一次，抓不到就丢掉。
+
+    为什么值得多一次请求：Search 的 `need_content` 大多数时候会给正文，但"给不出"
+    是有真实形态的（付费墙、纯 JS 渲染、PDF、robots 拦）。那时 `content` 是空串而
+    `url` / `title` / `authority` 都在——只差正文这一步，而 Fetch 正是补它的工具。
+
+    抓不到就丢弃：一条 `text` 为空的 `ExternalHit` 转成 `Source` 之后是一个
+    `status="parsed"`、正文为空的来源。它会进材料清单、看起来像依据、引用一条都生
+    不出来，并且 `sourceInputError` 那类检查在服务端没有对应物——静默的假来源比
+    少一条糟得多。
+    """
+    filled: list[ExternalHit] = []
+    for hit in hits:
+        if hit.text:
+            filled.append(hit)
+            continue
+        fetched = _deepseek_fetch(hit.url, budget=budget, slot=slot)
+        if fetched is None:
+            logger.info("外部检索：DeepSeek 命中 %r 正文为空且补抓失败，丢弃该条",
+                        hit.title[:60])
+            continue
+        # 保留 Search 给的标题与排序元数据：补抓回来的标题常常是站点名（`Example
+        # Domain`），而 Search 的标题更贴近这一条讲什么。
+        filled.append(replace(
+            fetched,
+            title=hit.title or fetched.title,
+            site=hit.site or fetched.site,
+            authority=hit.authority,
+            rerank_score=hit.rerank_score,
+            language=hit.language or fetched.language,
+        ))
+    return filled
+
+
+def _deepseek_search(
+    query: str, budget: _Budget, limit: int, *, slot: _Slot | None = None,
+) -> list[ExternalHit]:
+    """DeepSeek 的 Search 工具 API：一次往返换回最多 `limit` 条**已抓好正文**的命中。
+
+    与五源的形态差别是本函数存在的原因：维基要"检索 + 逐条抓正文"两三轮，这里一次
+    POST 就返回 `content`（实测 0.47–1.13 秒、3 条、正文 1.5k–21k 字）。所以它只花
+    1 次预算。
+
+    `count` 传 `limit` 而不是 `SOURCE_CANDIDATES=5`：我们最终只留 1 条（
+    `_blend_deepseek`），要 3 条是为了给 `_relevant_hits` 一点挑选余地（第 1 条被
+    门挡掉时还有替补）。要 5 条只会让响应体更大、延迟更高，换来的是两条我们不会用
+    的候选。
+
+    失败处理与五源同一套：`budget.note_failure()` + 返回已拿到的部分。**key 缺失也
+    走这一条**——它是配置错误，不是"这个源没有结果"，而 `_worth_caching` 靠这个计数
+    区分两者（空结果不该被缓存 24 小时，否则用户配好 key 之后一天内都不会重试）。
+    """
+    base, key = _deepseek_config()
+    if not key:
+        budget.note_failure()
+        logger.warning(
+            "外部检索：DeepSeek Search 开着但没有 key（%s 或 MINDMAP_LLM_API_KEY）",
+            DEEPSEEK_KEY_ENV)
+        return []
+    timeout = budget.take(slot)
+    if timeout is None:
+        return []
+    started = time.perf_counter()
+    try:
+        payload = _deepseek_post(
+            DEEPSEEK_SEARCH_PATH,
+            {"query": _deepseek_query(query), "count": max(limit, 1),
+             "need_content": True},
+            min(timeout, DEEPSEEK_TIMEOUT),
+        )
+    except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
+        budget.note_failure()
+        logger.warning("外部检索：DeepSeek Search 失败（%s）：%s",
+                       type(exc).__name__, str(exc)[:160])
+        return []
+    hits = _parse_deepseek_search(payload, limit)
+    hits = _fill_missing_content(hits, budget, slot)
+    logger.info(
+        "外部检索：DeepSeek Search %r 返回 %d 条（%s），耗时 %.2fs",
+        query[:40], len(hits),
+        ", ".join(f"{hit.site or '-'}/{len(hit.text)}字" for hit in hits[:3]),
+        time.perf_counter() - started,
+    )
+    return hits
+
+
 # ---------------------------------------------------------------- 聚合
 
 
@@ -1120,8 +1572,49 @@ def _query_language(query: str) -> str | None:
     回 "en" 意味着英文 query 时把中文源压到后面，而中文源在英文主题上经常也有
     结果（中文维基有"伦敦"、Crossref 有英文标题的中文期刊论文）。那是一种没有
     证据支撑的偏好。中文 query 相反：用户用中文问，就该先看到中文材料。
+
+    它同时是 `_deepseek_query` 的判据（决定要不要追加 `lang:zh`）：源侧过滤与排序侧
+    偏好必须由同一个函数回答，理由写在那函数的 docstring 里。
     """
     return "zh" if _CJK_RE.search(query or "") else None
+
+
+def _blend_deepseek(
+    relevant: Sequence[ExternalHit], limit: int, query: str,
+) -> list[ExternalHit]:
+    """五源交替取 `limit - 1` 条，DeepSeek 的命中单独占**最后 1 席**。
+
+    为什么需要这一层：`_interleave` 按源的收集顺序轮流取，`deepseek` 排在第六个桶
+    ——3 个名额在三轮之后就满了，它一条都进不来（实测：六源都在、顺序不动时，
+    `碳中和` 的结果是 `wikipedia, openalex, wikipedia` 三条，Search 的 3 条全部落选）。
+    换句话说，不特殊处理的话"接了第六个源"在 `limit=3` 上是零效果。
+
+    为什么是 1 席而不是更多：
+
+      - 五源是默认路径（默认开、不要钱、不出境），Search 是可选的补充（默认关、计费、
+        query 出境）。让它抢走一半名额，等于让一个默认关的功能决定默认输出的形状；
+      - `limit=3` 时 2+1 仍然是"多数来自免费源"，而 Search 那条通常是三者里最贴主题的
+        一条（它有 `rerank_score`，五源没有分数）。1 席刚好够"补上五源最弱的那一面"。
+
+    顺序是**五源在前、Search 在后**：这是材料的展示顺序，也是 `data.external_used`
+    里"本次依据来自外部检索的 N 条（wikipedia、openalex、deepseek）"的顺序。把补充
+    放在最后，用户看到的第一条仍然是维基/论文——那是默认路径该有的样子。
+
+    `limit < 2`（或 Search 没有命中）时**原样走 `_interleave`**：给不出一条的配额，
+    而"limit=1 时全是 Search"会让一次只想要一条依据的调用突然只拿到 Search 的东西。
+
+    开关关着时 `relevant` 里没有任何 `deepseek` 命中，这个函数退化成
+    `_interleave(relevant, limit)` —— 与 `3c40ba6` 逐字节相同（同一批命中、同一个
+    顺序、同一份 `prefer_language`）。
+    """
+    search_hits = [hit for hit in relevant if hit.source_name == DEEPSEEK_SOURCE]
+    if not search_hits or limit < 2:
+        return _interleave(relevant, limit, prefer_language=_query_language(query))
+    rest = [hit for hit in relevant if hit.source_name != DEEPSEEK_SOURCE]
+    picked = _interleave(rest, limit - 1, prefer_language=_query_language(query))
+    # Search 的桶内顺序已经是 `rerank_score` 降序（`_parse_deepseek_search`），
+    # 这里取第一条就是它自己排的第一名。
+    return picked + _interleave(search_hits, 1)
 
 
 def _run_source(name: str, fetch: Any, budget: _Budget | None = None) -> list[ExternalHit]:
@@ -1147,7 +1640,24 @@ def _run_source(name: str, fetch: Any, budget: _Budget | None = None) -> list[Ex
 
 # 单方向检索的源清单与顺序。**顺序不能改**：`_interleave` 按源的收集顺序建桶，
 # 而 `prefer_language` 用的是稳定排序——换了顺序，同一批命中会以另一种次序占名额。
-DEFAULT_SOURCES: tuple[str, ...] = ("wikipedia", "arxiv", "openalex", "crossref", "baike")
+#
+# `deepseek` 排在最后不是"它最不重要"，而是**它本来就没有轮到过**：`_interleave`
+# 从第一个桶开始轮流取，3 个名额在第六个桶之前就用完了。所以它需要一个独立席位，
+# 见 `_blend_deepseek`。
+DEFAULT_SOURCES: tuple[str, ...] = (
+    "wikipedia", "arxiv", "openalex", "crossref", "baike", DEEPSEEK_SOURCE)
+
+
+def _source_available(name: str) -> bool:
+    """这个源这次参不参加。
+
+    只有 DeepSeek 会被拦：它是唯一一个**默认关**的源（理由见 `DEEPSEEK_SEARCH_ENV`）。
+    拦在这里而不是拦在 `DEFAULT_SOURCES` 上，是因为那个元组同时是"顺序"的声明
+    ——按开关裁一个常量会让顺序变成运行时的，而 `_interleave` 的稳定性依赖它是常量。
+    """
+    if name == DEEPSEEK_SOURCE:
+        return deepseek_search_enabled()
+    return True
 
 
 def _search_one(
@@ -1157,15 +1667,20 @@ def _search_one(
 ) -> list[ExternalHit]:
     """打**一轮**源，返回全部候选：**不筛、不去重、不截断**。
 
-    这是两条路共用的那一轮（单方向 5 源、多方向的每个方向 4 源）。出口的三件事
+    这是两条路共用的那一轮（单方向 6 源、多方向的每个方向 4 源）。出口的三件事
     留给调用方，因为它们的位置不同：
 
-      - 单方向：先聚合 → 按 query 过门 → `_interleave` 取前 `limit`；
+      - 单方向：先聚合 → 按 query 过门 → `_blend_deepseek` 取前 `limit`；
       - 多方向：先按**方向**过门 → 跨方向合并去重 → 方向内按源交替 → 跨方向轮转。
 
-    并行在这里而不是在调用方：串行时最坏耗时是五个 10 秒超时相加，而它们都只是
+    并行在这里而不是在调用方：串行时最坏耗时是六个 10 秒超时相加，而它们都只是
     "多等一会儿"，没有任何顺序依赖。多方向时每个方向各有一个线程池，共享同一份
     `_Budget`（全局 + 槽位两个维度，见 `_Budget.take`）。
+
+    **DeepSeek 也在这一个线程池里**，所以六源是并行的、耗时取最慢的那个而不是相加。
+    它自己内部最多再发 3 次补抓（`_fill_missing_content`），那是**串行**的：一次
+    Search 的响应里有几条空正文，就依次补几次。串行的理由是它们共享 `limit` 条候选
+    的额度，并发补抓只会让"预算够几条"变成竞态。
     """
     registry: dict[str, Any] = {
         "wikipedia": lambda: _wikipedia(
@@ -1175,6 +1690,7 @@ def _search_one(
         "openalex": lambda: _openalex(query, budget, limit, slot=slot),
         "crossref": lambda: _crossref(query, budget, limit, slot=slot),
         "baike": lambda: _baike(query, budget, limit, slot=slot),
+        DEEPSEEK_SOURCE: lambda: _deepseek_search(query, budget, limit, slot=slot),
     }
     if slot is None and exact_first and fetch_limit is None:
         # 单方向路径：按**三个位置参数**调用，与 `3c40ba6` 的形态完全一样。
@@ -1187,8 +1703,13 @@ def _search_one(
             "openalex": lambda: _openalex(query, budget, limit),
             "crossref": lambda: _crossref(query, budget, limit),
             "baike": lambda: _baike(query, budget, limit),
+            # DeepSeek 在这里**保持带 kwarg 的形态**：它是这次新加的源，没有既有的
+            # `lambda q, budget, limit` 替身要迁就；而 `slot=None` 时 `slot=slot`
+            # 与不传是同一件事。
+            DEEPSEEK_SOURCE: lambda: _deepseek_search(query, budget, limit, slot=slot),
         }
-    planned = [(name, registry[name]) for name in sources if name in registry]
+    planned = [(name, registry[name]) for name in sources
+               if name in registry and _source_available(name)]
     collected: list[ExternalHit] = []
     if not planned:
         return collected
@@ -1540,14 +2061,16 @@ def search_external(
 
     这是整条外部检索的入口，两条路：
 
-      - **单方向**（默认；`directions` 只有一条，或开关关着，或拆方向失败）：五个源
-        并行打同一个 query，9 次请求 / 20 秒，出口一道按 query 的词面门 —— 与
-        `3c40ba6` 逐字节相同。
+      - **单方向**（默认；`directions` 只有一条，或开关关着，或拆方向失败）：五源
+        （外加默认关的第六个 `deepseek`）并行打同一个 query，9 + 4 次请求 / 20 秒，
+        出口一道按 query 的词面门。**第六个源关着时与 `3c40ba6` 逐字节相同**——
+        不发请求、不占预算、不改取样（`_blend_deepseek` 在无 Search 命中时退化成
+        `_interleave`，那条有专门用例钉着）。
       - **多方向**（`MINDMAP_EXTERNAL_DIRECTIONS=1` 且拆出 2-4 个方向）：每个方向各打
         一轮 `DIRECTION_SOURCES`，15 次请求 / 20 秒、每方向 5 次，门按**各自的方向**施加，
         合并去重后跨方向轮转。**默认关**，理由与实测见 `DIRECTIONS_ENV`。
 
-    五个源并行跑：串行时最坏耗时是五个 10 秒超时相加，而它们都只是"多等一会儿"，
+    源并行跑：串行时最坏耗时是六个 10 秒超时相加，而它们都只是"多等一会儿"，
     没有任何顺序依赖。并行之后墙钟上界由 `DEADLINE_SECONDS` 那一份预算兜住。
 
     源的分工（都是实测通过的，可抓性报告见模块 docstring 的"外部源清单"）：
@@ -1555,7 +2078,9 @@ def search_external(
       - `wikipedia` / `baike`：中文百科，给"这个词条是什么"；
       - `arxiv` / `openalex` / `crossref`：论文，给"这个方向研究到哪了"。
         其中 arXiv 对中文 query 基本 0 条（语料是英文），OpenAlex 与 Crossref
-        能吃中文 query 并返回中文论文——所以中文检索不靠翻译。
+        能吃中文 query 并返回中文论文——所以中文检索不靠翻译；
+      - `deepseek`（默认关）：Search 工具 API，一次往返带回整页正文，给"技术方向 /
+        流程 / 方案 / 现状"。它占 `limit` 里的 1 席，五源占其余。
 
     用时与条数各记一行 info：这是用户点"生成"之后**多出来的一次外网等待**，
     混在总耗时里就永远看不出"慢在哪"（与 `_retrieve_topic` 的同一条规矩）。
@@ -1639,7 +2164,7 @@ def _worth_caching(run: _SearchRun) -> bool:
         都没发出去（`limit <= 0` 之外的情况：预算被 `DEADLINE_SECONDS=0` 提前耗光）
         不能算"查过"。
 
-    反过来，**全源失败的空结果不写**：代理没开、外网被封时五个源一起超时，把它缓存
+    反过来，**全源失败的空结果不写**：代理没开、外网被封时所有源一起超时，把它缓存
     24 小时意味着"网络恢复了但一天没结果"——而用户重试的正是那一刻。部分失败但
     仍拿到了东西时会写（见上），代价是那几个失败源的内容在 TTL 内缺失；这个取舍的
     方向是明确的：宁可少一条资料，也不要让用户等两次一样长的等待。
@@ -1652,9 +2177,14 @@ def _worth_caching(run: _SearchRun) -> bool:
 # 缓存 ↔ `ExternalHit` 的字段转接。**只搬 `ExternalHit` 自己声明的字段**：`Source`
 # 的 id / content_hash / status 每次都重新生成（`library.ingest` 会重算），存下来下次
 # 也用不上，而存了它们会让"缓存里那份是不是就是库里那份"变成一个新问题。
+#
+# `site` / `authority` / `rerank_score` 必须在这里：它们只由 DeepSeek 的响应提供，
+# 缓存命中时**没有第二次机会**去问源站——漏一个字段，第二次生成的材料清单就少一个
+# "这条来自哪个站"与两个排序元数据，而界面上分不出"这条本来就没有"与"缓存吃掉了"。
+# 三个都有默认值，所以旧缓存行（没有这三个键）仍然解得出来。
 _HIT_FIELDS: tuple[str, ...] = (
     "title", "text", "url", "source_name", "fetched_at", "language", "raw_chars",
-    "direction",
+    "direction", "site", "authority", "rerank_score",
 )
 
 
@@ -1672,6 +2202,10 @@ def _record_hit(record: dict[str, Any]) -> ExternalHit | None:
     就过不了 `_hit_blob` 与 `_external_source`（`filename` 要拼字符串）；`raw_chars`
     给了个字符串会让 `max(hit.raw_chars, len(text))` 抛 `TypeError`——那会从
     "少一条资料"升级成"整次生成失败"，而这两件事没有因果关系。
+
+    三个新字段（`site` / `authority` / `rerank_score`）走**同一套宽容降级**而不是
+    整条作废：它们只影响显示与排障，缺了不影响这条命中能不能当依据。旧缓存行没有
+    这三个键，正是这条规则要接住的情形。
     """
     title = record.get("title")
     body = record.get("text")
@@ -1685,6 +2219,7 @@ def _record_hit(record: dict[str, Any]) -> ExternalHit | None:
     language = record.get("language")
     direction = record.get("direction")
     raw_chars = record.get("raw_chars")
+    site = record.get("site")
     if not isinstance(url, str):
         url = ""
     if not isinstance(fetched_at, str) or not fetched_at:
@@ -1693,10 +2228,15 @@ def _record_hit(record: dict[str, Any]) -> ExternalHit | None:
         language = _guess_language(title)
     if not isinstance(raw_chars, int) or isinstance(raw_chars, bool) or raw_chars < 0:
         raw_chars = len(body)
+    if not isinstance(site, str):
+        site = ""
     return ExternalHit(
         title=title, text=body, url=url, source_name=source_name,
         fetched_at=fetched_at, language=language, raw_chars=raw_chars,
         direction=direction if isinstance(direction, str) else "",
+        site=site[:120],
+        authority=_deepseek_count(record.get("authority")),
+        rerank_score=_deepseek_float(record.get("rerank_score")),
     )
 
 
@@ -1720,10 +2260,16 @@ def _plan_directions_sync(topic: str) -> list[str]:
 
 
 def _search_single(query: str, limit: int, started: float) -> _SearchRun:
-    """单方向检索：**这就是 `3c40ba6` 的 `search_external` 主体**，一行都没改。
+    """单方向检索：`3c40ba6` 的 `search_external` 主体 + 一个可选第六源。
 
     单独成函数是为了让"降级"有唯一的落点：`search_external` 里任何一条拆方向失败
     的支路都汇到这里，而不是各自复制一份预算与门。
+
+    **它与 `3c40ba6` 的差别只有一行**：出口的取样从 `_interleave` 换成
+    `_blend_deepseek`。那一行在第六个源关着（默认）时**逐字节退化成原样**——同一批
+    命中、同一个顺序、同一份 `prefer_language`，`test_blend_equals_interleave_when_
+    search_is_absent` 与 `test_default_is_off_and_no_request_is_sent` 两条用例钉着它。
+    其余每一行（预算、门、日志）都没动。
 
     返回 `_SearchRun` 而不是裸列表：`search_external` 要用后两个数判断"这个空结果
     该不该缓存"（`_worth_caching`），而预算对象里的两个计数只有这里拿得到。
@@ -1731,11 +2277,11 @@ def _search_single(query: str, limit: int, started: float) -> _SearchRun:
     budget = _Budget(REQUEST_LIMIT, DEADLINE_SECONDS)
     collected = _search_one(query, limit, budget=budget)
 
-    # 门在**聚合之后、截断之前**：先从五个源拿全部候选，再按词面相关性筛，最后才
+    # 门在**聚合之后、截断之前**：先从各源拿全部候选，再按词面相关性筛，最后才
     # 交替取前 `limit` 条。顺序不能换——先截断再过滤时，一个被滤掉的噪声槽位是
     # 空的（3 条变 2 条），而候选池里本来还有真相关的条目可以补位。
     relevant = _relevant_hits(query, collected)
-    hits = _interleave(relevant, limit, prefer_language=_query_language(query))
+    hits = _blend_deepseek(relevant, limit, query)
     logger.info(
         "外部检索：%r 命中 %d 条（%s），候选 %d 条过门 %d 条，请求 %d 次，耗时 %.2fs",
         query, len(hits), ", ".join(f"{hit.source_name}/{hit.title}" for hit in hits[:3]),
