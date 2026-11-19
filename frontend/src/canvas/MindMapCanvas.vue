@@ -9,6 +9,7 @@ import {
   MAX_ZOOM,
   MIN_ZOOM,
   contentBounds,
+  coverage,
   planView,
   type Point,
   type ViewMode,
@@ -68,6 +69,8 @@ onPaneClick(() => {
 // 用户手动平移或缩放后停止自动适配，否则每长一个节点视图就会被拽回全图。
 onMoveEnd(() => {
   store.viewAdjusted = true;
+  // 手动挪过之后"装不装得下"也变了：这句提示跟着真实视口走，不与某次适配绑定。
+  updateClippedHint();
 });
 
 /** 焦点在输入框里时不能抢键：那边的 Tab、Delete 归输入框自己管。 */
@@ -167,6 +170,24 @@ let savedViewport: { x: number; y: number; zoom: number } | null = null;
 const clipped = ref(false);
 
 /**
+ * 「装不下」这句话怎么说：看**真实的视口**，而不是某一次适配算出来的结论。
+ *
+ * 为什么不能只看 `planView().clipped`：切回「适应宽度」时是把存下的那一屏原样还回去，
+ * 根本没重算过视图；用户手动平移/缩放之后同理。用真实视口算，这句话就永远与屏幕上
+ * 看到的一致（`coverage` 也就是"宽度/高度各看得见多少"）。
+ */
+function updateClippedHint(): void {
+  const view = dimensions.value;
+  const bounds = contentBounds(store.nodes);
+  if (!view?.width || !view?.height || !bounds) {
+    clipped.value = false;
+    return;
+  }
+  const seen = coverage(bounds, view, getViewport());
+  clipped.value = seen.width < 0.999 || seen.height < 0.999;
+}
+
+/**
  * 局部聚焦的锚点：根节点的中心。
  *
  * 三种图型（树 / 鱼骨 / 流程）的根都被布局放在原点附近（`tidy` 把根平移到原点，
@@ -201,7 +222,9 @@ function applyView(mode: ViewMode, animate = false): void {
     maxZoom: MAX_ZOOM,
   });
   clipped.value = plan.clipped;
-  void setViewport({ x: plan.x, y: plan.y, zoom: plan.zoom }, { duration: animate ? 250 : 0 });
+  // 动画走完之后再按真实视口核一遍（动画期间 `getViewport()` 还是旧的）。
+  void setViewport({ x: plan.x, y: plan.y, zoom: plan.zoom }, { duration: animate ? 250 : 0 })
+    .then(updateClippedHint);
 }
 
 function setView(next: ViewMode): void {
@@ -215,8 +238,11 @@ function setView(next: ViewMode): void {
     const back = savedViewport;
     savedViewport = null;
     // 有存下来的那一屏就原样还回去（"切回来要回到原位"），没有才重新算。
-    if (back) void setViewport(back, { duration: 250 });
-    else applyView('fit-width', true);
+    if (back) {
+      void setViewport(back, { duration: 250 }).then(updateClippedHint);
+    } else {
+      applyView('fit-width', true);
+    }
   }
   // **不碰 `store.viewAdjusted`**：换档位是"我想怎么看"，不是"以后都别再自动适配"。
   // 把它也当成手动调整，会得到一个很别扭的后果——点过「全图」之后再生成，

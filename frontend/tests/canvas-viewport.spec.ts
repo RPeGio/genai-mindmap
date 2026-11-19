@@ -1,4 +1,4 @@
-﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { ref } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -29,10 +29,18 @@ import { useMindMapStore } from '../src/stores/mindmap';
  * 把视口尺寸给成真值、把 `setViewport` 的参数记下来。
  */
 
+/**
+ * 假画布记住**当前**视口：真 `setViewport` 之后 `getViewport()` 就返回新值，
+ * 而"装不下"那句提示是按真实视口算的（`updateClippedHint`），假件必须同形。
+ */
+let currentViewport = { x: 12, y: 34, zoom: 0.93 };
 const setViewport = vi.fn(
-  async (_transform: { x: number; y: number; zoom: number }, _options?: { duration?: number }) => true,
+  async (transform: { x: number; y: number; zoom: number }, _options?: { duration?: number }) => {
+    currentViewport = transform;
+    return true;
+  },
 );
-const getViewport = vi.fn(() => ({ x: 12, y: 34, zoom: 0.93 }));
+const getViewport = vi.fn(() => currentViewport);
 const dimensions = ref({ width: 1600, height: 852 });
 
 /** 最近一次真正写进画布的变换。 */
@@ -216,6 +224,8 @@ describe('画布上的两个按钮', () => {
     const bounds = contentBounds(store.nodes);
     expect(bounds).not.toBeNull();
     const allScale = fitAllScale(bounds!, dimensions.value);
+    // 切走之前那一屏（`mountWith` 之后画布停在首屏适配的位置上）。
+    const before = { ...currentViewport };
     setViewport.mockClear();
 
     await wrapper.get('[data-test="view-mode-all"]').trigger('click');
@@ -226,8 +236,25 @@ describe('画布上的两个按钮', () => {
 
     await wrapper.get('[data-test="view-mode-width"]').trigger('click');
     await flushPromises();
-    // 原样还回去的就是切走之前 `getViewport()` 那一份，不是"重新适配一次"。
-    expect(lastViewport()).toEqual(getViewport());
+    // 原样还回去的就是切走之前那一屏，不是"重新适配一次"。
+    expect(lastViewport()).toEqual(before);
+  });
+
+  it('切回「适应宽度」时"装不下"那句提示要重新算，不能沿用全图档的结论', async () => {
+    const wrapper = await mountWith(longTree());
+    const store = useMindMapStore();
+    // 全图档：整张都看得见 → 没有提示。
+    await wrapper.get('[data-test="view-mode-all"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="view-clipped"]').exists()).toBe(false);
+
+    // 切回来：视口还原成"高度只看得见一部分"的那一屏，提示必须回来。
+    await wrapper.get('[data-test="view-mode-width"]').trigger('click');
+    await flushPromises();
+    const bounds = contentBounds(store.nodes)!;
+    const seen = coverage(bounds, dimensions.value, currentViewport);
+    expect(seen.height).toBeLessThan(0.999);
+    expect(wrapper.get('[data-test="view-clipped"]').text()).toContain('拖动可平移');
   });
 
   it('装不下时说清楚"还能往哪看"', async () => {
