@@ -1,6 +1,6 @@
 """DeepSeek 的 Search / Fetch 接进外部检索链路：第六个源、`lang:zh`、截断、补抓、降级。
 
-七组断言，对着这次改动的七条要求：
+八组断言（1-7 是 Search，第 8 组是 `/fetch` 端点），对着这次改动的八条要求：
 
   1. **解析**：真实响应的形状（`scripts/probe_deepseek_tools.search.json`）→ `ExternalHit`
      每个字段都对：`content` 进 `text`、`site_name` 进 `site`、`authority` /
