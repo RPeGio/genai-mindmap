@@ -216,11 +216,21 @@ describe('画布节点', () => {
       const wrapper = mountNode({});
       await wrapper.trigger('mouseenter');
       vi.advanceTimersByTime(300);
+      // 两拍：第一拍跑 `scheduleCard` 里那个 `nextTick(placeCard)`，第二拍才是
+      // 位置算完之后的重新渲染（`cardAt` 变真，`v-if` 才会把卡片挂上去）。
       await wrapper.vm.$nextTick();
-      expect(wrapper.text()).toContain('部门先提交申请');
-      expect(wrapper.text()).toContain('生成时写的详情');
+      await wrapper.vm.$nextTick();
+      // 卡片被 `Teleport` 到 `body` 上（画布之外的独立一层，所以不随画布缩放），
+      // 断言只能看 `document.body`，而不是组件自己的 DOM。
+      const card = document.querySelector('[data-test="node-detail-card"]');
+      expect(card).not.toBeNull();
+      expect(card?.textContent).toContain('部门先提交申请');
+      expect(card?.textContent).toContain('生成时写的详情');
+      // 它也不该再挂在节点里：挂进去就会跟着 `transform: scale()` 一起缩。
+      expect(wrapper.find('[data-test="node-detail-card"]').exists()).toBe(false);
     } finally {
       vi.useRealTimers();
+      document.querySelectorAll('[data-test="node-detail-card"]').forEach(node => node.remove());
     }
   });
 

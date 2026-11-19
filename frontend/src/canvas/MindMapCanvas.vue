@@ -5,6 +5,14 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { useMindMapStore } from '../stores/mindmap';
 import { NODE_SIZE } from './layout/tidy';
+import {
+  MAX_ZOOM,
+  MIN_ZOOM,
+  contentBounds,
+  planView,
+  type Point,
+  type ViewMode,
+} from './viewport';
 import FishboneEdge from './FishboneEdge.vue';
 import MindEdge from './MindEdge.vue';
 import MindNode from './MindNode.vue';
@@ -19,8 +27,10 @@ import MindNode from './MindNode.vue';
  * `fishbone`（骨线）。
  */
 const store = useMindMapStore();
-const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
-  useVueFlow();
+const {
+  setCenter, setViewport, getViewport, dimensions,
+  onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals,
+} = useVueFlow();
 
 /**
  * 画布外壳。结构键（Tab / Enter / Delete / F2）只服务它，所以它必须能拿到焦点。
@@ -137,16 +147,94 @@ function onKeydown(event: KeyboardEvent) {
 
 onMounted(() => window.addEventListener('keydown', onKeydown));
 
+/**
+ * 视图档位。默认**适应宽度**：缩放下限由字号反推（`viewport.ts::MIN_READABLE_SCALE`），
+ * 于是"图大到装不下"时不再继续缩，而是只给一块能读的。
+ *
+ * 旧行为（整张图塞进视口）留给「全图」这一档。为什么默认值要换：43 个节点 × 1600 宽的
+ * 画布实测 `scale = 0.364`，节点正文 14px × 0.364 = **5.1 CSS 像素**——用户看到的是
+ * 一片灰，第一反应是"这次生成失败了"，而图其实是好的。
+ */
+const viewMode = ref<ViewMode>('fit-width');
+
+/**
+ * 切到「全图」之前那一屏。切回来要回到原位——那可能是用户手动平移、缩放到某一支之后
+ * 的位置，回到"重新适配"等于把他刚调好的视角扔掉一次。
+ */
+let savedViewport: { x: number; y: number; zoom: number } | null = null;
+
+/** 这一屏装不下整张图（只给了根附近的一块）：界面据此说一句"拖动可平移"。 */
+const clipped = ref(false);
+
+/**
+ * 局部聚焦的锚点：根节点的中心。
+ *
+ * 三种图型（树 / 鱼骨 / 流程）的根都被布局放在原点附近（`tidy` 把根平移到原点，
+ * 鱼骨的鱼头固定在 (0,0)，`layoutFlow` 也把根平移到原点），它是唯一的"入口"。
+ * 装不下时对到它，用户第一眼看到的是"这张图在讲什么"，而不是中间的某几格。
+ */
+function rootAnchor(): Point | null {
+  const root = store.nodes.find(node => node.data?.depth === 0);
+  if (!root) return null;
+  const width = root.data?.size?.width ?? NODE_SIZE.width;
+  const height = root.data?.size?.height ?? NODE_SIZE.height;
+  return { x: root.position.x + width / 2, y: root.position.y + height / 2 };
+}
+
+/** 按当前档位（或指定档位）把视图摆好。缩放与偏移的算术全在 `viewport.ts`。 */
+function applyView(mode: ViewMode, animate = false): void {
+  const view = dimensions.value;
+  // 还没量到画布大小（首帧、被折叠）：真算下去只会把视图搬到 (0,0)。
+  if (!view?.width || !view?.height) return;
+  const bounds = contentBounds(store.nodes);
+  if (!bounds) {
+    clipped.value = false;
+    return;
+  }
+  const plan = planView({
+    mode,
+    bounds,
+    viewport: view,
+    anchor: rootAnchor(),
+    // 与 `<VueFlow>` 上那两个属性同源，别在这里写第二份数字。
+    minZoom: mode === 'fit-width' ? undefined : MIN_ZOOM,
+    maxZoom: MAX_ZOOM,
+  });
+  clipped.value = plan.clipped;
+  void setViewport({ x: plan.x, y: plan.y, zoom: plan.zoom }, { duration: animate ? 250 : 0 });
+}
+
+function setView(next: ViewMode): void {
+  if (next === viewMode.value) return;
+  if (next === 'fit-all') {
+    savedViewport = getViewport();
+    viewMode.value = 'fit-all';
+    applyView('fit-all', true);
+  } else {
+    viewMode.value = 'fit-width';
+    const back = savedViewport;
+    savedViewport = null;
+    // 有存下来的那一屏就原样还回去（"切回来要回到原位"），没有才重新算。
+    if (back) void setViewport(back, { duration: 250 });
+    else applyView('fit-width', true);
+  }
+  // 用户自己定了视图：之后图再长，不要再把它拽走（与手动平移同一条规矩）。
+  store.viewAdjusted = true;
+}
+
 let fitTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleFit() {
   if (store.viewAdjusted) return;
   clearTimeout(fitTimer);
   // 增量节点到达很密，节流一下，避免每帧都重新适配。
-  fitTimer = setTimeout(() => fitView({ duration: 250, padding: 0.2 }), 150);
+  fitTimer = setTimeout(() => applyView(viewMode.value, true), 150);
 }
 
 watch(() => store.nodeCount, scheduleFit);
 watch(() => store.direction, scheduleFit);
+// 画布尺寸第一次量出来（以及窗口缩放）时补一次：`fit-view-on-init` 已经关掉，
+// 首屏的视图完全由这里给——不补这一枪，默认档位在"进来就有一张图"时不会生效。
+watch(() => [dimensions.value.width, dimensions.value.height] as const, scheduleFit);
 
 // 从引用列表跳过来时把目标挪到视野中心。位置就是布局算出的绝对坐标，
 // 中心点 = 左上角 + 半个节点；不需要访问 Vue Flow 内部的节点实例。
@@ -227,9 +315,9 @@ onBeforeUnmount(() => {
       :elements-selectable="true"
       :pan-on-drag="true"
       :zoom-on-scroll="true"
-      :min-zoom="0.2"
-      :max-zoom="1.6"
-      :fit-view-on-init="true"
+      :min-zoom="MIN_ZOOM"
+      :max-zoom="MAX_ZOOM"
+      :fit-view-on-init="false"
       class="h-full w-full"
     >
       <Background :gap="20" pattern-color="#e2e8f0" />
@@ -276,5 +364,46 @@ onBeforeUnmount(() => {
     >
       正在生成，稍候…
     </p>
+
+    <!--
+      视图档位。两档必须同时在场：默认档的可读字号下限意味着**一屏看不全**，
+      出路只有一条——让用户知道"还能看全"，以及怎么回去。所以不是一个开关，
+      是两个互斥按钮（当前档位亮着），切回去时回到切换之前那一屏（见 `setView`）。
+    -->
+    <div
+      v-if="store.nodeCount > 0"
+      class="absolute right-3 top-3 z-20 flex flex-col items-end gap-1"
+    >
+      <div
+        class="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white/95 p-0.5 text-[11px] shadow-sm"
+        role="group"
+        aria-label="视图范围"
+      >
+        <button
+          type="button"
+          data-test="view-mode-width"
+          class="rounded px-2 py-1"
+          :class="viewMode === 'fit-width' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'"
+          :aria-pressed="viewMode === 'fit-width'"
+          title="保证节点文字不小于 12 像素；装不下的部分拖动平移查看"
+          @click="setView('fit-width')"
+        >适应宽度</button>
+        <button
+          type="button"
+          data-test="view-mode-all"
+          class="rounded px-2 py-1"
+          :class="viewMode === 'fit-all' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'"
+          :aria-pressed="viewMode === 'fit-all'"
+          title="整张图塞进视口（节点多时字会很小）"
+          @click="setView('fit-all')"
+        >全图</button>
+      </div>
+      <!-- 装不下时说一句去哪儿看：这一档的代价必须写出来，而不是让用户猜。 -->
+      <p
+        v-if="clipped && viewMode === 'fit-width'"
+        data-test="view-clipped"
+        class="pointer-events-none rounded bg-white/80 px-1.5 py-0.5 text-[10px] text-slate-500 shadow-sm"
+      >只显示了一部分 · 拖动可平移</p>
+    </div>
   </div>
 </template>

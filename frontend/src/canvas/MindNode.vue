@@ -203,17 +203,73 @@ const colorAttrs = computed(() => {
 const card = ref(false);
 let timer: ReturnType<typeof setTimeout> | undefined;
 
+/**
+ * 悬停卡片的位置（视口坐标）。
+ *
+ * **卡片不在画布那层 DOM 里**：它被 `Teleport` 到 `body` 上，用 `position: fixed`
+ * 摆位。原因只有一个，但足够致命——画布是靠一句 `transform: scale(...)` 缩放的，
+ * 卡片如果还挂在节点内部，它就会跟着一起缩：默认档 `scale = 0.857` 时 12px 的正文
+ * 还能读，切到「全图」（0.364）就是 5px，点开一张"详情"看到的是一片灰。
+ *
+ * 悬停卡片是**读长文**的地方，它的字号不该由"图有多挤"决定。
+ */
+const cardAt = ref<{ x: number; y: number } | null>(null);
+const rootEl = ref<HTMLElement | null>(null);
+const cardRef = ref<HTMLElement | null>(null);
+
+/** 卡片与节点之间的缝，以及它离画布边缘至少留的空。 */
+const CARD_GAP = 8;
+const CARD_MARGIN = 8;
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.min(Math.max(value, low), Math.max(low, high));
+}
+
+/** 画布那块的边界：卡片待在里面，不压顶栏、也不飘出屏幕。 */
+function area(): { left: number; top: number; right: number; bottom: number } {
+  const rect = document.querySelector('main > section')?.getBoundingClientRect();
+  if (rect && rect.width > 0 && rect.height > 0) {
+    return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+  }
+  return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+}
+
+function placeCard(): void {
+  const node = rootEl.value?.getBoundingClientRect();
+  if (!node) return;
+  const box = cardRef.value?.getBoundingClientRect();
+  const width = box?.width ?? 288;
+  const height = box?.height ?? 0;
+  const bounds = area();
+
+  const x = clamp(
+    node.left + node.width / 2 - width / 2,
+    bounds.left + CARD_MARGIN,
+    bounds.right - CARD_MARGIN - width,
+  );
+  // 上方优先（不糊住节点）；放不下就翻到下方。
+  const above = node.top - CARD_GAP - height;
+  const y = above >= bounds.top + CARD_MARGIN ? above : node.bottom + CARD_GAP;
+  cardAt.value = { x, y: clamp(y, bounds.top + CARD_MARGIN, bounds.bottom - CARD_MARGIN - height) };
+}
+
 function scheduleCard() {
   clearTimeout(timer);
   // 200ms 延迟：鼠标扫过画布时不该到处弹卡片。
   timer = setTimeout(() => {
     card.value = true;
+    // 先量一次（卡片的宽高要等它挂上去才知道），下一帧再按真实尺寸摆正。
+    void nextTick(() => {
+      placeCard();
+      requestAnimationFrame(placeCard);
+    });
   }, 200);
 }
 
 function hideCard() {
   clearTimeout(timer);
   card.value = false;
+  cardAt.value = null;
 }
 
 const draft = ref('');
@@ -282,6 +338,7 @@ onBeforeUnmount(() => clearTimeout(timer));
 
 <template>
   <div
+    ref="rootEl"
     class="relative"
     @mouseenter="scheduleCard"
     @mouseleave="hideCard"
@@ -392,18 +449,31 @@ onBeforeUnmount(() => clearTimeout(timer));
       {{ data.refs ?? 0 }}
     </div>
 
-    <div
-      v-if="card && !editing"
-      class="absolute bottom-full left-1/2 z-30 mb-2 w-72 -translate-x-1/2 rounded-md border border-slate-300 bg-white p-3 text-left shadow-lg"
-    >
-      <p class="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-sm text-slate-700">
-        {{ data.body }}
-      </p>
-      <p v-if="hasMore" class="mt-2 text-xs text-slate-400">
-        <span v-if="data.bodySource === 'detail'">节点上只显示标题，这里是生成时写的详情</span>
-        <span v-else-if="data.bodySource === 'note'">节点上只显示标题，这里是你的备注</span>
-        <span v-else>节点上只显示前 24 个字，完整内容见此处或右侧详情面板</span>
-      </p>
-    </div>
+    <!--
+      悬停卡片：`Teleport` 到 `body`、`position: fixed`。
+      它必须是**画布缩放之外**的一层（理由见 `cardAt` 的注释）：卡片是读长文的地方，
+      字号与尺寸不跟着 `transform: scale()` 走。位置按节点的视口外接框算，
+      所以选中/悬停之后画布平移、缩放，它仍然贴在节点上方（`placeCard`）。
+    -->
+    <Teleport to="body">
+      <div
+        v-if="card && !editing && cardAt"
+        ref="cardRef"
+        data-test="node-detail-card"
+        class="fixed z-30 w-72 rounded-md border border-slate-300 bg-white p-3 text-left shadow-lg"
+        :style="{ left: `${cardAt.x}px`, top: `${cardAt.y}px` }"
+        @mouseenter="scheduleCard"
+        @mouseleave="hideCard"
+      >
+        <p class="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-sm text-slate-700">
+          {{ data.body }}
+        </p>
+        <p v-if="hasMore" class="mt-2 text-xs text-slate-400">
+          <span v-if="data.bodySource === 'detail'">节点上只显示标题，这里是生成时写的详情</span>
+          <span v-else-if="data.bodySource === 'note'">节点上只显示标题，这里是你的备注</span>
+          <span v-else>节点上只显示前 24 个字，完整内容见此处或右侧详情面板</span>
+        </p>
+      </div>
+    </Teleport>
   </div>
 </template>
