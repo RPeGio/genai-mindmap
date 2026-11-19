@@ -57,6 +57,7 @@ from app.generation.service import (
     GenerationError,
     _demo_content,
 )
+from app.memory import store as memory_store
 from app.prefs import service as prefs
 
 DEFAULT_STAGES = ["目标澄清", "要点拆解", "分支展开", "风险与验证"]
@@ -257,27 +258,43 @@ def _notes_text() -> str:
     return text
 
 
-def _system_text(request: AgentRunRequest, content: DiagramContent | None) -> str:
+def _system_text(
+    request: AgentRunRequest,
+    content: DiagramContent | None,
+    *,
+    memory: str = "",
+) -> str:
     """这次运行要下发的 system。
 
-    五段的顺序有讲究，不能随手调：
-    **身份 → 这个人是谁 → 这次做什么 → 这次对着哪儿 → 树**。
+    六段的顺序有讲究，不能随手调：
+    **身份 → 这个人写下的偏好 → 关于这个人的记忆 → 这次做什么 → 这次对着哪儿 → 树**。
 
     备注（C 类偏好）排在 `_SYSTEM_BASE` **之后**、意图规则**之前**：意图规则是
     "这次要做什么"的强约束，备注是"这个人是谁"的背景，**背景不该盖住这次的指令**。
     排在前面的原因不是重要性，是阅读顺序——模型先读到"这个人的习惯"，再读到"这次
     必须怎么做"，冲突时后者自然更近。备注那一段自己也写了让位的话（`NOTE_HEADER`）。
 
+    `memory`（检索出来的记忆条目，见 `app/memory/store.py`）排在备注**之后**、
+    意图规则之前，位置是有讲究的：**显式声明在前、系统推断在后**。手写的 `note.*`
+    是用户明确要的，检索出来的条目是系统猜的；两段挨着但分开，模型读到的优先级
+    顺序与事实一致。合成一段的后果是用户无法判断"哪几句话是我说的"——那正是这次
+    改动要避免的混乱。
+
+    `memory` 由调用方**已经检索好**再传进来，这个函数只负责拼接。原因见
+    `_loop` 里那段"一次生成只检索一次"：这个函数每一轮都会被调一次，检索放进来
+    就是 N+4 次 embedding。
+
     选区排在"当前导图"之前，因为它描述的是"接下来那句话指哪儿"，先读到它，
     后面那棵大纲才有一个"重点看这几支"的读法。
 
     空段整段跳过（`if part`）：没有选区时 `selection_text` 返回空串、没有备注时
-    `_notes_text` 也一样，直接 join 会在 system 里留一行空白，看起来像"这里本该有
-    东西但没填上"。
+    `_notes_text` 也一样、没有记忆时 `memory` 是空串——直接 join 会在 system 里留
+    一行空白，看起来像"这里本该有东西但没填上"。
     """
     return "\n".join(part for part in (
         _SYSTEM_BASE,
         _notes_text(),
+        memory,
         _intent_rule(request),
         selection_text(request, content),
         "当前导图：",
@@ -285,9 +302,9 @@ def _system_text(request: AgentRunRequest, content: DiagramContent | None) -> st
     ) if part).strip()
 
 
-def _initial_messages(request: AgentRunRequest) -> list[dict[str, Any]]:
+def _initial_messages(request: AgentRunRequest, memory: str = "") -> list[dict[str, Any]]:
     return [
-        {"role": "system", "content": _system_text(request, request.snapshot)},
+        {"role": "system", "content": _system_text(request, request.snapshot, memory=memory)},
         {"role": "user", "content": request.goal},
     ]
 
@@ -299,8 +316,12 @@ def _refresh_outline(messages: list[dict[str, Any]], ctx: RunContext) -> None:
     根本没有 id 可引用，于是下一轮只能整张重来——那正是这次改造要消灭的行为。
     原地替换而不是追加，是因为追加会让消息历史随轮数线性增长，几轮之后
     光大纲就把上下文吃满了。
+
+    记忆那一段从 `ctx.memory_hints` 读，**不重新检索**：它是这次运行开头算好的一份
+    常量，每一轮都照抄。理由见 `_loop` 里的那段注释。
     """
-    messages[0] = {"role": "system", "content": _system_text(ctx.request, ctx.candidate)}
+    messages[0] = {"role": "system", "content": _system_text(
+        ctx.request, ctx.candidate, memory=ctx.memory_hints)}
 
 
 def _nudge_text(registry: ToolRegistry) -> str:
@@ -972,6 +993,26 @@ async def run(
             on_close(ctx.candidate)
 
 
+async def _memory_hints(request: AgentRunRequest) -> str:
+    """这一次生成要注入的记忆那一段；没有命中或任何失败都返回**空串**。
+
+    三件事都在这里定死：
+
+      1. **进线程**：`store.prompt_for` 里有一次同步的 embedding HTTP（0.3–1 秒）。
+         直接 await 会把整个事件循环卡住——同一台服务器上别的用户那条已经在流的
+         SSE 会跟着停。
+      2. **失败不抛**：记忆检索是附属动作。它抛出去会让一次本来正常的生成变成
+         `agent_failed`，而用户要的是那张图。
+      3. **空串**：没有命中时返回空串而不是"（暂无记忆）"，调用方整段跳过。一个
+         空的小标题会让模型以为"这个人的记忆是空的"是一种需要它处理的输入。
+    """
+    try:
+        return await asyncio.to_thread(memory_store.prompt_for, request)
+    except Exception as exc:  # noqa: BLE001 — 见 docstring 第 2 条
+        logger.warning("记忆检索失败（%s），这次不注入记忆", type(exc).__name__)
+        return ""
+
+
 async def _loop(
     request: AgentRunRequest,
     ctx: RunContext,
@@ -1031,8 +1072,20 @@ async def _loop(
         request.intent, has_sources=bool(request.sources),
         diagram_type=request.diagram_type,
     )
+    # 记忆检索：**一次生成只检索一次**，就在这一行。
+    #
+    # 位置不能换到 `_system_text` 里：那个函数每一轮都会被 `_refresh_outline`
+    # 调一次，检索放进去就是 N+4 次 embedding（骨架 1 次 + 结构 1 次 + detail 2 次
+    # + 工具循环 N 轮）。每次 embedding 0.3–1 秒，10 轮的运行会因此多等好几秒，
+    # 而那几秒比这段记忆值钱得多。
+    #
+    # 也不能换到 `run()` 里：那里在 demo 模式分支之前（`_loop` 开头就 return 了），
+    # 演示模式不发 system，检索一次纯属浪费。
+    #
+    # query 是 `goal` + 材料标题（见 `store.query_text`），所以它天然是"这次的主题"。
+    ctx.memory_hints = await _memory_hints(request)
     budget = request.budget
-    messages = _initial_messages(request)
+    messages = _initial_messages(request, ctx.memory_hints)
     seq = itertools.count(first_seq)
     started = time.monotonic()
     tool_calls = 0

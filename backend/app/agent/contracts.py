@@ -439,6 +439,17 @@ class RunContext:
     # 「已经提醒过模型一次了」。收尾提醒必须是一次性的：模型听完还是要停，
     # 那是它的判断（或者它有自己的理由），再催就变成代码替它写这张图。
     audit_nagged: bool = False
+    # 这次运行要在 system 里注入的**记忆那一段**（`app/memory/store.py` 检索出来的，
+    # 已经渲染成文本；没有命中时是空串）。
+    #
+    # 为什么是 `RunContext` 而不是 `_system_text` 里现算：那个函数**每一轮**都会被
+    # 调一次（`_refresh_outline`），检索放进去就是 N+4 次 embedding（骨架 1 次 +
+    # 结构 1 次 + detail 2 次 + 工具循环 N 轮），每次 0.3–1 秒，延迟翻几倍。算在
+    # `_loop` 开头、存在这里、之后所有段照抄——这是这次改动里最硬的一条性能约束。
+    #
+    # 默认空串是硬要求：单测与直接构造 `RunContext` 的代码没有检索过，注入的那一段
+    # 必须与加这个字段之前**逐字节相同**（`_system_text` 里那个 `if part` 过滤）。
+    memory_hints: str = ""
 
     def record_library_sources(self, sources: Iterable[Source]) -> None:
         """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。
