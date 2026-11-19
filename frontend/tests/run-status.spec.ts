@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   UNKNOWN_MODEL,
+  agentDetailVisible,
   diagnosticCount,
   diagnosticsHint,
   hasModelInfo,
@@ -71,5 +72,24 @@ describe('落地那一行', () => {
     expect(runResultLine({ nodes: 12, changes: null })).toContain('整张新图');
     expect(runResultLine({ nodes: 12, changes: 0 })).toContain('一处都没改');
     expect(runResultLine({ nodes: 12, changes: 3 })).toContain('改了 3 处');
+  });
+});
+
+describe('「这次生成有 N 条诊断」也算有明细', () => {
+  const base = {
+    agentRunning: false,
+    generatedSummary: null,
+    conflictDraft: null,
+    agentEvents: [],
+    agentError: '',
+  };
+
+  it('有诊断、但别的信号都没有时，明细仍然要在场', () => {
+    // 状态行上写着「有 2 条诊断」，而这块不出现 → 那句话点开是空的。
+    // 生成成功那条路上 `generatedSummary` 恰好非空，所以这个空窗只在别的路径露头，
+    // 但判据不该依赖"另一件事恰好成立"。
+    expect(agentDetailVisible(base)).toBe(false);
+    expect(agentDetailVisible({ ...base, agentWarnings: [{ length: 2 }] })).toBe(true);
+    expect(agentDetailVisible({ ...base, agentWarnings: [] })).toBe(false);
   });
 });

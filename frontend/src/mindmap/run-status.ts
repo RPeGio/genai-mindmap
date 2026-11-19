@@ -29,6 +29,15 @@ export interface AgentVisibilityState {
   conflictDraft: unknown;
   agentEvents: { length: number };
   agentError: string;
+  /**
+   * 「这次生成有 N 条诊断」——**它也算有明细**。
+   *
+   * 漏掉它的后果是一个具体的空窗：`diagnosticCount(agentWarnings) > 0` 时状态行上
+   * 会写着「有 2 条诊断」，而这一块如果不出现，那句数字点开之后什么都没有。生成
+   * 成功那条路上 `generatedSummary` 恰好非空，所以漏了也看不出来——它是一条只在
+   * 别的路径上才露头的判据，而判据本身不该依赖"另一件事恰好成立"。
+   */
+  agentWarnings?: { length: number };
 }
 
 export function agentDetailVisible(state: AgentVisibilityState): boolean {
@@ -36,7 +45,8 @@ export function agentDetailVisible(state: AgentVisibilityState): boolean {
     || state.generatedSummary !== null
     || state.conflictDraft !== null
     || state.agentEvents.length > 0
-    || !!state.agentError;
+    || !!state.agentError
+    || (state.agentWarnings?.length ?? 0) > 0;
 }
 
 /**
