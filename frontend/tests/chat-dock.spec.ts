@@ -303,7 +303,8 @@ describe('底部对话框的状态机', () => {
     const store = useMindMapStore();
     store.preview(TREE, 'right');
 
-    // 半棵树：缺的是内容，补说明帮不上（结构本身没长完）
+    // 半棵树且已经 done：缺的是内容，补说明帮不上（结构本身没长完），而且 done
+    // 那一行 `begin()` 只会幂等重放，点了也不会真补。两次判据同向，按钮都不该有。
     store.resumableRun = {
       run_id: 'run-partial', status: 'done', intent: 'create', goal: '半棵',
       created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
@@ -319,6 +320,25 @@ describe('底部对话框的状态机', () => {
       checkpointed_at: '2024-01-01T03:05:00Z', node_count: 5,
     };
     await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="run-status-fill"]').exists()).toBe(true);
+  });
+
+  it('补说明失败一次之后，入口还在（时间戳被清掉不算"不用补了"）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+
+    // 这一行是「补说明」自己跑坏留下的：`begin()` 重开时清 `checkpointed_at`，
+    // `finish()` 又在交出候选（edit 的快照仍非空）时再清一次。树上还缺说明，
+    // 可那个时间戳已经没了 —— 用时间戳当判据，用户就永久失去了补救入口。
+    store.resumableRun = {
+      run_id: 'run-fill-failed', status: 'failed', intent: 'edit', goal: '补说明',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:20:00Z', applied_at: null,
+      checkpointed_at: null, node_count: null,
+    };
+    await wrapper.vm.$nextTick();
+
     expect(wrapper.find('[data-test="run-status-fill"]').exists()).toBe(true);
   });
 

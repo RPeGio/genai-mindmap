@@ -539,13 +539,22 @@ const statusActions = computed<StatusAction[]>(() => {
  * 检查点上多一个「补齐说明」：那种结果的结构是完整的、缺的只是节点说明，而补说明
  * 是一条独立的、更便宜的往返（只发写说明那几次调用，不重跑骨架与结构）。没有这个
  * 按钮，用户唯一的补救办法是重跑一次生成——既换出一棵可能不一样的树，也多花三倍
- * 的调用。它只在 `checkpointed_at` 有值时出现：别的形态没有"只缺说明"这件事。
+ * 的调用。
+ *
+ * **判据是"这行还能被重开"，不是 `checkpointed_at`**：那个时间戳只在收尾时交出
+ * 候选的那一刻被清（`runs.finish`），而补说明失败那一轮照样会交出 edit 的快照，
+ * 于是失败一次之后入口就永久消失了——用户明明还缺说明，按钮却没了，文案也退化成
+ * "生成完的导图还没保存"。能重开（cancelled / failed）才是"这次点下去真的会跑"的
+ * 判据：`runs.begin()` 对这两个状态是重开同一行，对 `done` 是幂等重放（点了也不会
+ * 补，只会把旧结果再放一遍）。何况树上没有可补的节点时，工具本身零调用返回
+ * `nothing_to_fill`，多摆一个按钮不花任何额度。
  */
 const resumableActions = computed<StatusAction[]>(() => {
   const actions: StatusAction[] = [
     { key: 'load', label: '载入', test: 'run-status-load', run: () => void store.resumeRun() },
   ];
-  if (resumable.value?.checkpointed_at) {
+  const status = resumable.value?.status;
+  if (status === 'cancelled' || status === 'failed') {
     actions.push({
       key: 'fill',
       label: '补齐说明',

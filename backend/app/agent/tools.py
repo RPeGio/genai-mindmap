@@ -8187,6 +8187,12 @@ async def _fill_details_tool(args: FillDetailsArgs, ctx: RunContext) -> ToolResu
     # 之后某条额度耗尽的路径就会把"什么都没发生"包装成一棵半成品交付。
     if applied:
         ctx.publish_tree(filled)
+        # 与 `_commit_drafts` / `_expand` 同一档：说明已经写进树了，就该落一份检查点。
+        # 这里尤其该落——补说明本身实测二十几秒（还要再等一次模型往返收尾），这段
+        # 窗口里进程没了，补好的说明全丢，库里退回"结构完整、说明为空"那一版，
+        # 恰好是这次要消灭的状态。写失败不影响这一轮（`on_checkpoint` 自己吞异常）。
+        if ctx.checkpoint is not None:
+            await ctx.checkpoint(filled)
     if skipped == "nothing_to_fill":
         summary = "这棵树的节点说明都不缺，没有需要补写的地方（没有调用模型）。"
     elif skipped == "budget":
@@ -8790,9 +8796,10 @@ def _scope_note(
 ) -> tuple[str, list[str]]:
     """`(追加到回给模型那句话末尾的提示, 越界的 id 列表)`；没越界时是 `("", [])`。
 
-    抽成一个函数是因为**七个写工具共用同一条口径**（批量 + 六个细粒度）。写成
-    "每个工具自己拼一句"，改一处忘一处时分叉的表现是"批量会提醒、细粒度不会"，
-    那看起来像 bug 而不像设计。
+    抽成一个函数是因为**七个会越界的写工具共用同一条口径**（批量 + 六个细粒度）。
+    写成"每个工具自己拼一句"，改一处忘一处时分叉的表现是"批量会提醒、细粒度不会"，
+    那看起来像 bug 而不像设计。（`mindmap_fill_details` 不在这里：它按整棵树扫目标，
+    没有"越界"这件事。）
 
     提示里要求模型"说明原因"，与 system 里 `service.SELECTION_RULE` 那句一一对应：
     提示词让它优先改选区、越界要交代；工具这里是它真的越界之后的**回声**，
@@ -9865,7 +9872,9 @@ def _batch_id(ctx: RunContext) -> str:
 #
 # 形态不再参与裁剪——有没有来源，模型看到的生成工具都是同一个。
 #
-# `edit` 给**七个**：六个细粒度（加/改/删/移 + 两条边）外加批量 `mindmap_edit`。
+# `edit` 给**八个**：六个细粒度（加/改/删/移 + 两条边）、批量 `mindmap_edit`，
+# 以及只补节点说明的 `mindmap_fill_details`（它不动结构，所以不参与下面这段
+# "为什么留两个入口"的权衡）。
 # 为什么不只留批量：批量的参数是一张 op 表，改一处也要写出 `[{"op":"update",
 # "id":…,"changes":{"label":…}}]` 这一串，而模型的失败模式恰恰在这里——少一个
 # 括号、把 label 写在 op 顶层、把 index 写成字符串。细粒度工具把这些自由度
@@ -10241,10 +10250,12 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
       - `expand` 给 `node_expand` + `audit_tree`（整图体检，用户要求"补完"时
         模型靠它知道还差哪几支；那条路上没有代码替它数），请求带来源时再加
         `rag_query`
-      - `edit` 给**七个**写工具（`add_node` / `update_node` / `remove_node` /
-        `move_node` / `add_edge` / `remove_edge` / `mindmap_edit`），请求带来源时
-        再加 `rag_query`。让模型自己选粒度：改一两处用细粒度的（参数扁平、报错更准），
-        改五处以上用批量（一次调用改十处，省下的是**模型往返**——每次调用都要一轮）
+      - `edit` 给**八个**写工具（`add_node` / `update_node` / `remove_node` /
+        `move_node` / `add_edge` / `remove_edge` / `mindmap_edit` /
+        `mindmap_fill_details`），请求带来源时再加 `rag_query`。让模型自己选粒度：
+        改一两处用细粒度的（参数扁平、报错更准），改五处以上用批量（一次调用改十处，
+        省下的是**模型往返**——每次调用都要一轮）；`mindmap_fill_details` 只补节点
+        说明、不动结构，用在"这棵树结构已定、说明还空着"的续写场景。
       - `expand` / `edit` 在请求带来源时加 `rag_query`：那两条路不读来源，
         模型只能自己查。
       - **不**给 `create`：生成工具在内部自己检索（骨架之后每支一次）。早先这里

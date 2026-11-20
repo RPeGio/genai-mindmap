@@ -1181,9 +1181,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *     第二个请求顶掉。
    *  2. **走 `edit` 意图**，不新增意图。后端 `mindmap_fill_details` 只注册给 `edit`，
    *     而 `edit` 本来就要求带 `snapshot`——补说明要的正是"在现有这棵树上改"。
-   *  3. **`goal` 是固定文案**：写说明那条路不吃用户的自由指令（`_detail_ask` 自己
-   *     按节点清单发问），模型看到的是工具描述与节点清单，不是这句话。留一句话只是
-   *     为了让台账里的 `goal` 与界面上做的事对得上。
+   *  3. **`goal` 是一句人话**：写说明那条路不吃用户的自由指令（`_detail_ask` 自己
+   *     按节点清单发问），模型看到的是工具描述与节点清单，不是这句话。它唯一的去处
+   *     是台账的 `goal`，而界面会把它念出来（`ChatDock` 的"上次…：「goal」"），
+   *     所以得写成一句像标题的话，不能写成对模型下的命令。
    *
    * `runId` 由调用方显式给：它是**载入之前**从那行记录上读到的值，而载入成功会把
    * `resumableRun` 清空——在这里回读只会拿到 null，然后悄悄新开一个身份。
@@ -1195,7 +1196,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
     await runGeneration(
-      '给这张导图里还缺说明的节点补写说明，结构不要动。',
+      '补齐这张图的节点说明',
       'edit',
       undefined,
       'default',
@@ -3465,18 +3466,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * **新开一个 run 身份**：重试是一次新的运行，不是"把上一次那个 run 接着跑"。
    * 沿用旧 id 会被后端按幂等判成"同一个 run 已经 done"，直接把旧结果重放回来——
    * 用户点「重试」却看到同一份失败，会以为按钮坏了。
+   *
+   * 这里必须把 `options.runId` 摘掉：它的语义是"续着那一行跑"（只有「补齐说明」
+   * 会传，见 `fillMissingDetails`），而重试恰恰要**换一行**。`lastAttempt` 是浅拷贝
+   * 进来的，不摘就会连着传回去，于是重试把上一行重开一遍——`runs.begin()` 顺手
+   * 清掉 `checkpointed_at`，补救入口就此消失。
    */
   async function retryLastRun(): Promise<void> {
     const attempt = lastAttempt.value;
     if (!attempt) return;
     if (agentRunning.value || busy.value) return;
+    const { runId: _continuation, ...options } = attempt.options;
     await runGeneration(
       attempt.goal,
       attempt.intent,
       attempt.sources,
       attempt.thinkingModel,
       attempt.diagramType,
-      attempt.options,
+      options,
     );
   }
 

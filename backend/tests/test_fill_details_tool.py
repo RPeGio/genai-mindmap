@@ -171,6 +171,51 @@ def test_filling_publishes_the_new_tree():
         [node.id for node in _walk(_tree().root)]
 
 
+def test_filling_lands_a_checkpoint_too():
+    """补完说明要落一次检查点：这一步之后还要等模型收尾，进程没了就全丢。
+
+    PR#23 给生成/展开/编辑三条产出路径都装了检查点，补说明是第四条——它花的
+    时间是同一量级（`_fill_details` 实测二十几秒），而且丢掉的恰恰是"这次好不容易
+    补上的说明"。
+    """
+    seen: list[tuple[str, str]] = []
+    landed: list = []
+
+    async def checkpoint(content) -> None:
+        landed.append(content)
+
+    ctx = _ctx(_tree())
+    ctx.checkpoint = checkpoint
+    result = _run(ctx, _chat(seen, lambda system, user: _answers(_ask_ids(user))))
+
+    assert result.ok, result.content
+    assert len(landed) == 1, "补上说明之后必须落一次检查点"
+    # 落下去的就是交付的那一棵：不能是补之前那份，也不能带别的形状
+    assert landed[0] is ctx.candidate
+    assert _detail_ids(landed[0].root), "检查点里得已经有这次补上的说明"
+
+
+def test_nothing_filled_lands_no_checkpoint():
+    """一个都没补上就不该打点：那一枪会让人以为"上一轮有东西可捡"。
+
+    与 `publish_tree` 同一判据——检查点也是一次"产出"，没产出就打点，等于给
+    下一轮的用户留一份和进来时一模一样的"成果"。
+    """
+    seen: list[tuple[str, str]] = []
+    landed: list = []
+
+    async def checkpoint(content) -> None:
+        landed.append(content)
+
+    ctx = _ctx(_tree())
+    ctx.checkpoint = checkpoint
+    result = _run(ctx, _chat(seen, {}))
+
+    assert result.ok, result.content
+    assert result.data["changes"] == 0
+    assert landed == []
+
+
 def test_a_failed_call_says_so_and_changes_nothing():
     """模型没返回可用内容 → 说清"这次没有改动任何内容"，且不置 `produced`。"""
     seen: list[tuple[str, str]] = []
