@@ -533,11 +533,48 @@ const statusActions = computed<StatusAction[]>(() => {
   }
 });
 
-/** 「上次没接住的结果」那两个动作：捡回来，或者这次会话里不要再问。 */
-const resumableActions = computed<StatusAction[]>(() => [
-  { key: 'load', label: '载入', test: 'run-status-load', run: () => store.resumeRun() },
-  { key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() },
-]);
+/**
+ * 「上次没接住的结果」那几个动作：捡回来，或者这次会话里不要再问。
+ *
+ * 检查点上多一个「补齐说明」：那种结果的结构是完整的、缺的只是节点说明，而补说明
+ * 是一条独立的、更便宜的往返（只发写说明那几次调用，不重跑骨架与结构）。没有这个
+ * 按钮，用户唯一的补救办法是重跑一次生成——既换出一棵可能不一样的树，也多花三倍
+ * 的调用。它只在 `checkpointed_at` 有值时出现：别的形态没有"只缺说明"这件事。
+ */
+const resumableActions = computed<StatusAction[]>(() => {
+  const actions: StatusAction[] = [
+    { key: 'load', label: '载入', test: 'run-status-load', run: () => void store.resumeRun() },
+  ];
+  if (resumable.value?.checkpointed_at) {
+    actions.push({
+      key: 'fill',
+      label: '补齐说明',
+      test: 'run-status-fill',
+      // 先载入再补：补说明要的是"画布上是这棵树"，而后端那条路要求带 `snapshot`。
+      // 载入失败（换过图 / 服务端没了）就不该继续发补写请求——那会在另一张图上跑。
+      run: () => void fillDetailsAfterLoad(),
+    });
+  }
+  actions.push({ key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() });
+  return actions;
+});
+
+/**
+ * 「补齐说明」：载入检查点，再让模型只补 `detail`。
+ *
+ * 两步而不是一步：补说明那条路的输入是**画布上的树**（后端按 `snapshot` 走
+ * `edit`），所以要先把检查点装进画布。`resumeRun()` 返回布尔——换图、服务端没
+ * 内容这两种情况它自己已经提示过，这里不该在同一件事上再叠一句。
+ *
+ * `run_id` 必须在载入**之前**取：载入成功会清 `resumableRun`，之后再读只会拿到
+ * null，于是补说明会悄悄新开一个身份，台账上同一次生成变成两次运行。
+ */
+async function fillDetailsAfterLoad(): Promise<void> {
+  const runId = resumable.value?.run_id;
+  const loaded = await store.resumeRun();
+  if (!loaded) return;
+  await store.fillMissingDetails(runId);
+}
 
 const statusTone = computed(() => {
   switch (statusKind.value) {
