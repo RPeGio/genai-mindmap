@@ -481,8 +481,9 @@ def test_run_id_is_validated_and_extra_fields_still_forbidden():
 def _routed_with(provider, registry):
     """把 `_frames` 调用的 `run` 换成"真循环 + 假 provider"。"""
 
-    def routed(request, *, on_close=None, first_seq=None):
-        return service_run(request, provider=provider, tools=registry, on_close=on_close)
+    def routed(request, *, on_close=None, on_checkpoint=None, first_seq=None):
+        return service_run(request, provider=provider, tools=registry,
+                           on_close=on_close, on_checkpoint=on_checkpoint)
 
     return routed
 
@@ -702,6 +703,166 @@ def test_dismissed_endpoint_is_gone():
     # 列表/详情里也不该再出现这个列：前端镜像着它，留着就会有人去读。
     schemas = document["components"]["schemas"]
     assert "dismissed_at" not in schemas["RunSummary"]["properties"]
+
+
+# ---------------------------------------------------------------- 检查点
+
+
+def test_checkpoint_saves_the_half_tree_while_running():
+    """跑到一半落的那棵树，收尾之前就能从台账里读回来。"""
+    runs.begin("cp-1", {"goal": "g", "intent": "create"})
+
+    assert runs.checkpoint("cp-1", CANDIDATE) is True
+
+    record = runs.get("cp-1")
+    assert record.status == runs.STATUS_RUNNING
+    assert record.candidate is not None
+    assert record.candidate.root.children[0].label == "甲"
+    assert record.checkpointed_at is not None
+
+
+def test_checkpoint_does_not_touch_a_finished_run():
+    """收尾之后迟到的检查点不许把成品盖成半棵树。
+
+    这是 `WHERE status = 'running'` 唯一的用途：写说明那 26 秒里进程可能刚好在被
+    取消之后，工具里的检查点调用会晚一步到达。
+    """
+    runs.begin("cp-2", {"goal": "g"})
+    full = MindMapContent.model_validate({**TREE,
+                                          "root": {**TREE["root"], "children": [
+                                              *TREE["root"]["children"],
+                                              {"id": "d", "label": "丁", "children": []}]}})
+    runs.finish("cp-2", runs.STATUS_DONE, candidate=full, mode="model")
+
+    assert runs.checkpoint("cp-2", CANDIDATE) is False
+    record = runs.get("cp-2")
+    assert record.status == runs.STATUS_DONE
+    assert record.checkpointed_at is None
+    assert len(record.candidate.root.children) == 4
+
+
+def test_finish_clears_the_checkpoint_mark():
+    """交出成品那一刻，"这只是半棵树"的标记要清掉。
+
+    不清的话，界面会一直按"说明还没写"提示一份完整的生成结果。
+    """
+    runs.begin("cp-3", {"goal": "g"})
+    runs.checkpoint("cp-3", CANDIDATE)
+    assert runs.get("cp-3").checkpointed_at is not None
+
+    runs.finish("cp-3", runs.STATUS_DONE, candidate=CANDIDATE, mode="model")
+
+    record = runs.get("cp-3")
+    assert record.checkpointed_at is None
+    assert record.status == runs.STATUS_DONE
+
+
+def test_finish_without_a_candidate_keeps_the_checkpoint():
+    """收尾没交出候选时，检查点那份要留着（`COALESCE`）。
+
+    取消路径就是这样：树还在生成，客户端断了，`finish(candidate=None)` 只写库状态，
+    这份检查点正是用户下次进来能捡到的东西。
+    """
+    runs.begin("cp-4", {"goal": "g"})
+    runs.checkpoint("cp-4", CANDIDATE)
+
+    runs.finish("cp-4", runs.STATUS_CANCELLED)
+
+    record = runs.get("cp-4")
+    assert record.candidate is not None
+    assert record.checkpointed_at is not None
+
+
+def test_sweep_turns_a_stale_running_row_into_a_recoverable_failure():
+    """崩溃留下的 `running` 化石要么永远 409、要么永远没人捡，必须清掉。
+
+    清成 `failed` 之后 `begin()` 才认领得动它，`pending()` 也才列得出来——清理的
+    意义不是"让表干净"，是让那棵树重新变成用户能看见的东西。
+    """
+    runs.begin("stale-1", {"goal": "g"})
+    runs.checkpoint("stale-1", CANDIDATE)
+    # 把 `updated_at` 推到很久以前，模拟"进程在那之后再没动过"。
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     "WHERE run_id = 'stale-1'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    swept = runs.sweep_abandoned()
+
+    assert "stale-1" in swept
+    record = runs.get("stale-1")
+    assert record.status == runs.STATUS_FAILED
+    assert record.failure["code"] == "run_abandoned"
+    # 检查点本身不动：清理的是状态，不是那棵树。
+    assert record.candidate is not None
+    assert record.checkpointed_at is not None
+
+
+def test_sweep_leaves_a_fresh_running_row_alone():
+    """刚开的那一轮不许被当成化石清掉。"""
+    runs.begin("fresh-1", {"goal": "g"})
+
+    assert runs.sweep_abandoned() == []
+    assert runs.get("fresh-1").status == runs.STATUS_RUNNING
+
+
+def test_abandoned_run_shows_up_in_the_list_with_its_node_count():
+    """被清掉的那一行要能在列表里看到，并且带上"已经存了多少节点"。"""
+    runs.begin("stale-2", {"goal": "崩溃前那次", "intent": "create"})
+    runs.checkpoint("stale-2", CANDIDATE)
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     "WHERE run_id = 'stale-2'")
+        conn.commit()
+    finally:
+        conn.close()
+    runs.sweep_abandoned()
+
+    rows = client.get("/api/agent/runs").json()
+
+    row = next(item for item in rows if item["run_id"] == "stale-2")
+    assert row["status"] == "failed"
+    assert row["checkpointed_at"] is not None
+    assert row["node_count"] == 4
+    # 它不是半棵树：结构是全的，缺的只是说明。
+    assert row["partial"] is None
+
+
+def test_begining_a_fresh_run_cleans_up_abandoned_ones():
+    """开新 run 时顺手清理，不需要后台任务也不需要启动钩子。"""
+    runs.begin("stale-3", {"goal": "g"})
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     "WHERE run_id = 'stale-3'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    runs.begin("brand-new", {"goal": "g"})
+
+    assert runs.get("stale-3").status == runs.STATUS_FAILED
+    assert runs.get("brand-new").status == runs.STATUS_RUNNING
+
+
+def test_reopening_a_run_clears_the_checkpoint_mark():
+    """用户重试同一轮时，上一轮留下的检查点标记不能再挂着。
+
+    不清的话，新一轮跑到收尾之前界面会按"说明是空的"提示，而那时的树是新一轮的。
+    """
+    runs.begin("cp-5", {"goal": "g"})
+    runs.checkpoint("cp-5", CANDIDATE)
+    runs.finish("cp-5", runs.STATUS_CANCELLED)
+
+    claim = runs.begin("cp-5", {"goal": "g"})
+
+    assert claim.claimed is True
+    assert claim.record.checkpointed_at is None
+    assert claim.record.status == runs.STATUS_RUNNING
 
 
 if __name__ == "__main__":

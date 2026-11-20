@@ -131,7 +131,8 @@ def _tree_for(user: str, *, roles: dict[str, str] | None = None) -> dict[str, An
 
 
 def _generate_with(plan: dict, *, diagram_type: str,
-                   structure: dict | None = None) -> tuple[Any, RunContext]:
+                   structure: dict | None = None,
+                   checkpoint: Any = None) -> tuple[Any, RunContext]:
     """跑一次完整的 `_generate`（骨架 / 结构 / 说明三段都 mock），返回工具结果。"""
     systems: list[str] = []
 
@@ -148,6 +149,7 @@ def _generate_with(plan: dict, *, diagram_type: str,
         return structure if structure is not None else _tree_for(user)
 
     ctx = _ctx(diagram_type)
+    ctx.checkpoint = checkpoint
     with patch("app.agent.tools.chat_async", new=fake_chat):
         result = asyncio.run(_generate(GenerateArgs(topic=TOPIC, branches=6), ctx))
     assert result.ok, result.content
@@ -689,3 +691,45 @@ class TestNonTreeEditing:
 
 def _edit_args(ops: list[dict]) -> EditArgs:
     return EditArgs.model_validate({"ops": ops})
+
+
+# ---------------------------------------------------------------- 检查点
+
+
+class TestCheckpoint:
+    """检查点要真的在"结构就绪、说明之前"那一刻被叫到。
+
+    它是本轮唯一一个**不在收尾**发生的落库动作，所以验的不是"函数能调"，而是
+    "在真跑一遍 `_generate` 的链路上，它被调到的时刻上那棵树是什么样"。
+    """
+
+    def test_checkpoint_sees_a_valid_tree_before_the_details_are_written(self):
+        """叫到检查点时，手里那棵是契约合法的完整树，只是 `detail` 还空着。"""
+        seen: list[Any] = []
+        _generate_with(TREE_PLAN, diagram_type=None, checkpoint=seen.append)
+
+        assert len(seen) == 1, "一轮生成只该打一个点"
+        checkpointed = seen[0]
+        # 那一刻它已经是契约类型（能过 `model_validate`），不是半截 JSON。
+        reround = MindMapContent.model_validate(checkpointed.model_dump(mode="json"))
+        assert shapes.count_nodes(reround) > 1
+        # 说明还没写：这正是"落在这里而不是收尾"的意义。
+        assert all(not node.detail for node in shapes.iter_nodes(reround))
+
+    def test_checkpoint_payload_is_the_structure_the_run_finally_delivers(self):
+        """检查点那份与最终交付的那份，**结构**必须一致（说明是之后才补的）。"""
+        seen: list[Any] = []
+        _result, ctx = _generate_with(TREE_PLAN, diagram_type=None, checkpoint=seen.append)
+
+        checkpointed, delivered = seen[0], ctx.candidate
+        assert [node.id for node in shapes.iter_nodes(checkpointed)] == [
+            node.id for node in shapes.iter_nodes(delivered)]
+        assert [node.label for node in shapes.iter_nodes(checkpointed)] == [
+            node.label for node in shapes.iter_nodes(delivered)]
+
+    def test_no_checkpoint_channel_means_no_call(self):
+        """没有通道时不发生任何额外动作（单测与直接调工具那条路）。"""
+        result, ctx = _generate_with(TREE_PLAN, diagram_type=None)
+
+        assert ctx.checkpoint is None
+        assert result.ok

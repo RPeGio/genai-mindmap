@@ -5118,6 +5118,20 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 ),
             ))
 
+    # ---- 检查点：树已经能读了，落一份再往下走 -------------------------------
+    #
+    # 从这里到 `publish_tree` 之间还要跑 `_fill_details`（实测 26 秒上下）与
+    # `check` / `annotate_nli` / `_cross_branch_duplicates`。那些时间里这棵树已经
+    # 过契约校验、已裁剪、骨架已套，**是合法的完整树，只是 detail 全空**——进程
+    # 被杀、重启、合盖，这一轮本该白跑，有了这一步至少留下结构。
+    #
+    # 更早不行：中途只有 `node_grow` 预览帧，那些节点只有 id 与 label，没有引用、
+    # 没有 `expandable`，写进库是一棵契约不合法的树，还得为它再写一套读取格式。
+    # 更晚不必：`publish_tree` 那一刻整棵树已经写进 `ctx.candidate`，`on_close`
+    # 兜得住。
+    if ctx.checkpoint is not None:
+        ctx.checkpoint(content)
+
     # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------
     #
     # 放在这里而不是更早：裁剪已经做完（被裁掉的节点不必为它付说明的 token），
