@@ -167,7 +167,7 @@ JSON 内自带的 id，只能由工具层带上路径。
 重建时那个 `finally` 根本不会跑，于是库里留下一条永远 `running` 的行，而它其实
 已经攒了大半棵树——只是没有任何一帧把它带出去。
 
-补的是一个**中途落库点**。它有三个位置，都在"下一段是长耗时模型调用"之前：
+补的是一个**中途落库点**。它有四个位置，都在"下一段是长耗时模型调用"之前：
 
 ```python
 # 创建（backend/app/agent/tools.py::_generate）—— 第四步（写说明）之前
@@ -180,7 +180,8 @@ if ctx.checkpoint is not None:
         raw_plan=raw_plan, diagnostics=[]))
 
 # 按支展开（::_expand）—— 批次落树之后、生长预览与写说明之前
-# 编辑（::_commit_drafts，`mindmap_edit` 与五个细粒度写工具共用）—— 同上
+# 编辑（::_commit_drafts，`mindmap_edit` 与六个细粒度写工具共用）—— 同上
+# 补说明（::_fill_details_tool）—— 补上之后、等模型收尾之前
 ctx.publish_tree(updated)
 ctx.batches.append(batch)
 if ctx.checkpoint is not None:
@@ -208,6 +209,11 @@ if ctx.checkpoint is not None:
 - **编辑 / 展开这两条路不需要折形**：`updated` 是 `_apply_ops_any` 的产物，本来就是最终
   图型（`_shape_output` 只服务创建那条路）。它们保的是"已经改完的那一批 op"——一次二十分钟
   的编辑在写完说明前崩掉，若不打这个点，用户重新打开看到的还是**编辑前**的树。
+- **补说明这一条路打点最划算**：它本身就要跑二十几秒（`_fill_details` 与创建那条路同一个
+  量级），跑完 `publish_tree` 之后还要再等一次模型往返收尾。这段窗口里进程没了，补好的说明
+  全丢，库里退回"结构完整、说明为空"——恰好是这条路要消灭的那个状态。判据与 `publish_tree`
+  一致：一个都没补上（`applied == 0`）就不打点，否则等于给下一轮留一份和进来时一模一样的
+  "成果"。
 
 `ctx.checkpoint` 是 `async` 的，回调实现方自己把阻塞的写交给线程池
 （`CheckpointFn = Callable[[DiagramContent], Awaitable[None]]`）。工具跑在事件循环上，
@@ -267,7 +273,7 @@ if ctx.checkpoint is not None:
 | 决定 | 理由 |
 | --- | --- |
 | **复用 `intent="edit"`**，不新增意图 | 它本来就要求带 `snapshot`、本来就是"在现有这棵树上改"，而补说明要的正是这两件事。多一个意图要同时改 `_validate`、前端三道闸门、按意图取选区的三处分支，换不来任何表达力 |
-| **沿用那条 `run_id`** | 服务端那一行还在（`cancelled` / `failed`），`begin()` 对这两种状态是**重开同一行**：只清 `partial` 标记、不动 `candidate`。补完的树落回同一行，台账上这是同一次生成的下半场。换新 id 会让一次生成变成两次运行，而用户看到的明明是同一张图。那一行若还在 `running`（进程没死、只是前端断过线），`begin()` 给 409——那也正是对的，真正在跑的那一轮不该被第二个请求顶掉 |
+| **沿用那条 `run_id`** | 服务端那一行还在（`cancelled` / `failed`），`begin()` 对这两种状态是**重开同一行**：清 `partial` 标记、换掉 `request` 摘要、不动 `candidate`。补完的树落回同一行，台账上这是同一次生成的下半场。换新 id 会让一次生成变成两次运行，而用户看到的明明是同一张图。那一行若还在 `running`（进程没死、只是前端断过线），`begin()` 给 409——那也正是对的，真正在跑的那一轮不该被第二个请求顶掉 |
 | **不给 `node_ids`** | 要补哪些由 `_detail_targets` 按 `DETAIL_FILL_FLOOR`（长度 < 40）数出来。模型看不到整棵树，让它圈只会漏；而"少写一个"没有任何兜底能发现 |
 | **只加 `instruction`** | 口吻/长度/侧重是模型真能做主的，给一个字符串就够。`count`、`max_tokens` 这类旋钮留给代码算 |
 | **不用 `_intake`** | 那条路在"没有材料"时会发起外部检索，等于给一棵按旧依据长出来的树塞新依据——写出来的说明与结构对不上。补说明改用 `_expand_sources`：按整棵树声称用过的 `source_refs` 从知识库把原文找回来，找不到就按"无原文"写 |
@@ -280,11 +286,17 @@ if ctx.checkpoint is not None:
   时逐字节相同，"产出过东西"若为真，之后某条额度耗尽的路径就会把"什么都没发生"
   包装成一棵半成品交付。
 
-界面上它不是一个单独入口，而是挂在那条「上次没接住的结果」提示上：**只有
-`checkpointed_at` 有值时才出现**（其它形态缺的不是说明，点了也没用），点它先载入
-检查点、再用同一条 `run_id` 发一轮 `edit`。顺序写死在
-`ChatDock.vue::fillDetailsAfterLoad` 里，`run_id` 必须在载入**之前**读——载入成功会清
-`resumableRun`，之后再读只会拿到 null，然后悄悄新开一个身份。
+界面上它不是一个单独入口，而是挂在那条「上次没接住的结果」提示上：**那一行能被重开
+（`cancelled` / `failed`）时就出现**，点它先载入检查点、再用同一条 `run_id` 发一轮
+`edit`。顺序写死在 `ChatDock.vue::fillDetailsAfterLoad` 里，`run_id` 必须在载入**之前**
+读——载入成功会清 `resumableRun`，之后再读只会拿到 null，然后悄悄新开一个身份。
+
+判据为什么不是 `checkpointed_at`：那个时间戳只在**收尾时交出候选**的那一刻被清，而
+"补说明"失败那一轮照样会交出 edit 的快照，于是失败一次之后按钮就永久消失了——用户明明
+还缺说明，文案却退化成"生成完的导图还没保存"。而"能被重开"才是"这次点下去真的会跑"的
+判据：`begin()` 对 `cancelled`/`failed` 是重开同一行，对 `done` 是幂等重放（点了也不会补，
+只会把旧结果再放一遍）。何况树上没有可补的节点时工具零调用返回 `nothing_to_fill`，多摆
+一个按钮不花任何额度。
 
 ## 错误码与界面的下一步
 
