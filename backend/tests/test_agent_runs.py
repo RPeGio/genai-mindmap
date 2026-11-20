@@ -211,6 +211,30 @@ def test_finish_rejects_non_terminal_status():
         runs.finish("r1", runs.STATUS_RUNNING)
 
 
+def test_reopening_a_run_clears_the_previous_partial_flag():
+    """重开一轮就把上一轮那个"没长完"擦掉：它说的是上一轮的产出。
+
+    不清的后果不是"多一个陈旧字段"这么轻：`finish` 用 `COALESCE` 写 partial，值一旦
+    留下就再也不会被 NULL 覆盖——这一轮如果完整跑完（正常收尾根本不传 partial），
+    记录里仍然是 `partial = 1`，前端据此把一次完整生成标成"部分分支未完成"，
+    而且下一次载入草稿也照着这个错标记渲染。
+    """
+    runs.begin("retry-1", {"goal": "再来一次"})
+    runs.finish("retry-1", runs.STATUS_CANCELLED, candidate=CANDIDATE,
+                partial=True, partial_reason="工具卡住了")
+
+    assert runs.get("retry-1").partial is True
+
+    runs.begin("retry-1", {"goal": "再来一次"})
+    record = runs.get("retry-1")
+    assert record.status == runs.STATUS_RUNNING
+    assert record.partial is None, "重开之后上一轮的标记必须消失"
+    assert record.partial_reason is None
+
+    runs.finish("retry-1", runs.STATUS_DONE, candidate=CANDIDATE)
+    assert runs.get("retry-1").partial is None, "完整跑完的那一轮不该带着旧标记"
+
+
 def test_pending_only_returns_done_runs_that_were_never_applied():
     """`pending()` 的字面含义：**done** 且没应用过。"""
     runs.begin("done-unapplied", {})
@@ -385,6 +409,50 @@ def test_replay_keeps_demo_mode():
     assert _frames(response.text)[-1]["mode"] == "demo"
 
 
+def test_replay_keeps_the_partial_flag():
+    """重放出来的帧要带原来那个"没长完"的标记与原因。
+
+    同一份产出，重连后若变成"完整生成"，用户会以为上一轮真的一次跑完了——
+    而他断开之前看到的明明是"部分完成"。标记必须落库，正是为了这一刻。
+    """
+    runs.begin("partial-1", {"goal": "g"})
+    runs.finish("partial-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model",
+                partial=True, partial_reason="模型调用次数已用完（已执行 6 次工具调用）")
+
+    def should_not_start(*_args, **_kwargs):
+        raise AssertionError("不该重新跑")
+
+    with patch("app.agent.router.run", new=should_not_start):
+        response = client.post(URL, json={"goal": "g", "intent": "create",
+                                          "run_id": "partial-1"})
+
+    done = _frames(response.text)[-1]
+    assert done["type"] == "done"
+    assert done["partial"] is True
+    assert done["partial_reason"] == "模型调用次数已用完（已执行 6 次工具调用）"
+
+
+def test_completed_run_replays_without_a_partial_flag():
+    """完整跑完的那次重放时不该凭空多出 `partial`。
+
+    正常收尾根本不传 `partial`（`DoneEvent.partial` 是 None），`COALESCE` 让它留
+    在 NULL 上；重放时读到 None，`exclude_none` 就把它抹掉——帧与加字段之前一样。
+    """
+    runs.begin("full-1", {"goal": "g"})
+    runs.finish("full-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model")
+
+    def should_not_start(*_args, **_kwargs):
+        raise AssertionError("不该重新跑")
+
+    with patch("app.agent.router.run", new=should_not_start):
+        response = client.post(URL, json={"goal": "g", "intent": "create",
+                                          "run_id": "full-1"})
+
+    done = _frames(response.text)[-1]
+    assert "partial" not in done
+    assert "partial_reason" not in done
+
+
 def test_cancelled_run_is_reopened_instead_of_being_replayed():
     """取消过的 run 允许用同一个 id 重跑：那是用户主动重试，不是重复投递。"""
     runs.begin("retry-1", {"goal": "g"})
@@ -451,7 +519,7 @@ def test_cancel_mid_run_still_writes_the_draft():
     ])
 
     def generate(_args, ctx):
-        ctx.candidate = CANDIDATE.model_copy(deep=True)
+        ctx.publish_tree(CANDIDATE.model_copy(deep=True))
         return ToolResult(ok=True, content="已生成")
 
     async def fake_chat(system, user, **kwargs):
@@ -484,7 +552,7 @@ def test_cancelled_edit_run_keeps_the_tree_that_only_the_context_knows():
         assert ctx.candidate is not None
         grown = ctx.candidate.model_copy(deep=True)
         grown.root.children.append(type(grown.root)(id="new", label="新加的一支", children=[]))
-        ctx.candidate = grown
+        ctx.publish_tree(grown)
         return ToolResult(ok=True, content="已改")
 
     request = AgentRunRequest(goal="改一下", intent="edit", snapshot=snapshot)
@@ -573,6 +641,40 @@ def test_detail_endpoint_returns_the_tree_and_the_failure_reason():
     assert body["intent"] == "expand"
     assert body["mode"] == "model"
     assert client.get("/api/agent/runs/nope").status_code == 404
+
+
+def test_detail_endpoint_carries_the_partial_flag():
+    """"半棵树"这个事实必须随台账一起下发，不能只在实时流里出现过一次。
+
+    `GET /agent/runs/{id}` 是前端点「载入」时唯一的信息来源。少了这个标记，一份
+    半棵树与一次完整生成在界面上完全同形：没有告警、状态行照旧写"记得保存"，
+    用户会以为上次真的跑完了。列表接口同理——它决定"要不要提示还有草稿可捡"。
+    """
+    runs.begin("half-1", {"goal": "跑到一半", "intent": "create"})
+    runs.finish("half-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model",
+                partial=True, partial_reason="模型调用次数已用完")
+
+    detail = client.get("/api/agent/runs/half-1").json()
+    assert detail["partial"] is True
+    assert detail["partial_reason"] == "模型调用次数已用完"
+
+    listed = client.get("/api/agent/runs").json()
+    assert [item["run_id"] for item in listed] == ["half-1"]
+    assert listed[0]["partial"] is True
+
+
+def test_detail_endpoint_leaves_partial_empty_for_a_finished_run():
+    """完整跑完的记录里 `partial` 是 null，不是 false：两者含义不同。
+
+    null = 这条记录没记过（老库、或那一轮没走交付标记），false 会被读成"确定是完整的"。
+    前端判断一律写 `partial === true`，所以这里只钉住"不该凭空变成 false"。
+    """
+    runs.begin("whole-1", {"goal": "跑完了", "intent": "create"})
+    runs.finish("whole-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model")
+
+    detail = client.get("/api/agent/runs/whole-1").json()
+    assert detail["partial"] is None
+    assert detail["partial_reason"] is None
 
 
 def test_applied_endpoint_is_idempotent_and_404_for_unknown():

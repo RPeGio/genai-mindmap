@@ -1814,6 +1814,8 @@ export interface components {
             updated_at: string;
             /** Applied At */
             applied_at?: string | null;
+            /** Partial */
+            partial?: boolean | null;
             /** Candidate */
             candidate?: unknown | null;
             /** Failure */
@@ -1822,6 +1824,8 @@ export interface components {
             } | null;
             /** Mode */
             mode?: string | null;
+            /** Partial Reason */
+            partial_reason?: string | null;
         };
         /**
          * RunSummary
@@ -1845,6 +1849,8 @@ export interface components {
             updated_at: string;
             /** Applied At */
             applied_at?: string | null;
+            /** Partial */
+            partial?: boolean | null;
         };
         /**
          * SaveRequest

@@ -119,6 +119,79 @@ JSON 内自带的 id，只能由工具层带上路径。
 5. 前端把 `reasoning` 放进悬浮球的消息时间线里，用 `<details>` 折叠展示全文——
    "模型当时在想什么"是这个开关唯一的可解释证据。
 
+## `done` 帧上的 `partial`：半棵树也是交付
+
+从前"没跑完"一律发 `error`：预算耗尽、工具超时、连续失败、空转收尾、意外收尾、
+工具次数到顶，六条路径各自写了一份收尾逻辑，其中只有两条按规矩交出手上的树。
+结果是用户看着它跑了三分钟，最后两手空空——而 `ctx.candidate` 里其实已经长出了
+大半棵树，只是前端收到 `error` 会清掉预览、`content` 又一点没动。
+
+现在统一走 `backend/app/agent/service.py::_deliver_or_fail`：
+**这一轮产出过树就交树，一棵都没长出来才报错。**
+
+"产出过"这个判据很具体，不是"候选位里有东西"：`edit` / `expand` 必须带
+`request.snapshot`，那份快照就是用户自己的树，构造 `RunContext` 时它直接落进
+`candidate`。按"候选非空"判的话，编辑意图下模型没配置、模型报错、工具全挂都会
+返回 `done(partial=true, content=用户原树)`——前端把它当新结果落进画布、记一条
+0 改动的生成事件，而"去配模型"那张卡片永远不会出现。所以判据是
+`RunContext.produced`，由 `publish_tree()` 在四处产出点（`_generate` /
+`_generate_deep` / `_expand` / `_commit_drafts`）统一置位。
+
+台账读取接口（`GET /api/agent/runs/{id}` 与列表）同样带 `partial` /
+`partial_reason`：只在实时流上说过一次的话，隔天点「载入」时那份半棵树与一次
+完整生成长得一模一样。重开同一个 `run_id` 时这两个字段会被清空——它们描述的是
+上一轮交付了什么，而 `finish` 的 `COALESCE` 会让旧值赖着不走。
+
+```json
+{"seq": 12, "type": "done", "content": {…}, "mode": "model",
+ "partial": true, "partial_reason": "模型调用次数已用完（已执行 6 次工具调用）"}
+```
+
+- `partial` 与 `error` 是**互斥的两种收尾**，不会同时出现：有 `content` 就一定有
+  `partial` 这条信息（要么缺字段，要么 `true`），没有 `content` 才走 `error`。
+- 缺字段 = **没说**，不是"完整"。老后端、`_replay` 之外的正常收尾都不带这两个键
+  （`exclude_none=True`，所以正常帧与加字段之前逐字节相同），**前端判断必须用
+  `=== true`**。把缺字段当成"不完整"会让每次生成都挂着一条"部分完成"。
+- `partial_reason` 与 `error.message` 同源（`_budget_message` 那一套），可以直接显示。
+  它说的是"为什么没长完"，而这决定了用户下一步该做什么：额度用完该把目标写小，
+  工具超时该等一会儿，两者不是一件事。
+- 前端把它收进 `agentWarnings`（`kind: 'partial'`），状态行据此说"已落到画布
+  （部分分支未完成）"。**不要改写成 `agentError`**：树已经在画布上、可以继续改，
+  弹一张"这次没成功"的卡片与用户眼前的事实矛盾。
+- 告警落地之后**不清**：用户改到一半才发现某几支是空的，那时比落地之前更需要这句话。
+
+## 错误码与界面的下一步
+
+`error` 帧的 `code` / `limit` 决定界面给什么按钮、按钮能不能点。映射是纯函数
+`frontend/src/mindmap/failures.ts::guideForFailure`（逐条有用例），文档这里只记**为什么**
+某个码必须给某一种下一步——这些理由丢了，后来的人会把它当成可以合并的文案分支。
+
+| `code` | `limit` | 用户能做什么 |
+| --- | --- | --- |
+| `model_not_configured` | — | 改服务端环境变量，**重试没用** |
+| `budget_exhausted` | `max_seconds` / `max_model_calls` / `max_tool_calls` / `max_repairs` | 把目标写小再试 |
+| `too_many_failures` | `max_repairs` | 先查材料，再把目标拆小 |
+| `unexpected_finish` | — | 说得更具体再试（被长度或内容过滤截断） |
+| `generation_failed` | — | 直接重试（上游限流/临时故障） |
+| `agent_failed` | — | 重试；反复出现就把原话发给维护的人 |
+| `no_progress` | `no_progress` | 把目标拆成几件小事 |
+| `run_in_progress` | — | 等这一轮结束（同一个 `run_id` 不能重叠跑） |
+| `invalid_sources`（前端合成） | — | 改输入：材料还没解析好 |
+| `no_content`（前端合成） | — | 重试；这也是最容易过去的一种 |
+| `connection_lost`（前端合成） | — | 重试，并提醒会再花一次额度 |
+
+三条硬规则：
+
+1. **`model_not_configured` 是唯一一个把重试按死的失败。** 其它 `GenerationError`
+   （上游 5xx、超时、响应不合规）重试有意义；配置没填时重试一百次也是同一个结果。
+   它在后端是 `backend/app/generation/service.py::ModelNotConfigured`（`GenerationError`
+   的子类，`_config()` 抛它），`except ModelNotConfigured` 必须排在 `except GenerationError`
+   之前——顺序写反就退回成"上游出错"，界面会给出一个骗人的重试按钮。
+2. **被禁用（`disabled`）的按钮必须写明原因。** 只置灰等于沉默：用户看着一个点不动的
+   「重试」，只能猜是自己点错了；而被禁用的按钮在多数浏览器里连 `title` 悬停提示都不弹。
+3. **后端原话折在 `<details>` 里，不当第一句话。** 那句话是写给写代码的人看的。
+   原话与 `code=` / `limit=` 一起保留，因为排障时它是唯一能与后端日志对上的线索。
+
 ## `heartbeat` 帧
 
 模型思考期间这条流会长时间一个字节都不发。线上实测（2026-11-16，GLM-5.3-Flash，

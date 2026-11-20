@@ -108,6 +108,20 @@ def connect() -> sqlite3.Connection:
     # 两列都可空：老行上是 NULL，意思是"当时没记"（那时 done 帧也没有这两个字段），
     # 比编一个空串诚实——重放时据此决定"这条帧不带 model/reasoning"。
     _ensure_columns(conn, "runs", {"model": "TEXT", "reasoning": "TEXT"})
+    # "这棵树没长完"（预算耗尽、工具超时、连续失败、空转收尾）。理由同上：表早就
+    # 建过，补列只能靠 `_ensure_columns`。
+    #
+    # 它必须落库而不是只在 `done` 帧里活着：同一个 run_id 第二次投递时走
+    # `_replay`，从库里读出来重放——不存这一位，重放出来的那一帧就成了"完整生成"，
+    # 而用户重连之前看到的是"部分完成"。同一个 run 两种结论比缺一个字段更糟。
+    #
+    # 用 INTEGER 而不是 TEXT：SQLite 没有布尔类型，`0/1` 与 `IS NULL` 三态
+    # （NULL = 老行，当时还没这个字段）分得开。
+    #
+    # `partial_reason` 是给人看的那句话（"模型调用次数已用完（已执行 6 次工具调用，
+    # 树上是 41 个节点）…"），与 `failure` 分开：`failure` 描述"这次失败了"，
+    # 而半棵树是**成功交付但内容不全**，混进同一个字段会让界面只能二选一。
+    _ensure_columns(conn, "runs", {"partial": "INTEGER", "partial_reason": "TEXT"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
     # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
     # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该
