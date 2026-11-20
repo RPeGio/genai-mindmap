@@ -160,6 +160,62 @@ JSON 内自带的 id，只能由工具层带上路径。
   弹一张"这次没成功"的卡片与用户眼前的事实矛盾。
 - 告警落地之后**不清**：用户改到一半才发现某几支是空的，那时比落地之前更需要这句话。
 
+## 检查点：写说明之前那一份
+
+`partial` 解决的是"收尾时手上还有树"，但它救不了一种更常见的失败：**进程根本没
+走到收尾**。`runs` 表的终态由 `_frames` 的 `finally` 写，进程被杀/机器重启/容器
+重建时那个 `finally` 根本不会跑，于是库里留下一条永远 `running` 的行，而它其实
+已经攒了大半棵树——只是没有任何一帧把它带出去。
+
+补的是一个**中途落库点**，在 `backend/app/agent/tools.py::_generate` 里：
+
+```python
+if ctx.checkpoint is not None:
+    ctx.checkpoint(content)   # 第四步（写说明）之前
+```
+
+选这一刻的理由是"只有此刻的树是契约合法的"：
+
+- **更早不行**：结构那段响应是流式解析的，中途的 `node_grow` 预览帧只有
+  `id`/`label`，没有 `detail`、没有 `source_refs`、没有 `expandable`。把它写成
+  `candidate` 就是往库里塞一棵 `model_validate` 过不了的树。
+- **更晚不必**：`publish_tree()` 那一刻 `on_close` 兜得住，那本来就是终态交付。
+
+而这一刻正好卡在整轮最长的一段前面：裁剪已做完、骨架的颜色与边已套上，接下来是
+两次并发调用写说明（56 节点实测 26 秒上下，见 `_fill_details` 的 docstring）。
+崩在这里等于白跑整轮，而崩点之前的树是完全能用的。
+
+三个约束：
+
+1. **只对 `running` 生效**（`WHERE status = 'running'`）。迟到的检查点不许把成品
+   盖成半棵树——取消路径上工具里的检查点调用可能晚一步到达。
+2. **交出成品时清掉标记**（`finish` 里的 `CASE WHEN ? IS NULL`）。`checkpointed_at`
+   有值 = "这份 `candidate` 是跑到一半截下来的"，成品带着标记会让界面一直提示
+   "说明还没写"。
+3. **写失败不抛**。检查点自己出问题不该让一轮本来能成功的生成失败。
+
+读侧两个字段（`GET /api/agent/runs` 与 `/{id}`）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `checkpointed_at` | 这份结果是检查点。**结构是全的，`detail` 是空的** |
+| `node_count` | 检查点里有多少节点。只在这些行上算一遍，列表 20 条不值得数 |
+
+它与 `partial` **是两件事**，不要合并：`partial` 说"树没长完"，`checkpointed_at`
+说"树长全了、描述没写"。用户下一步完全不同——前者要重跑或接着补，后者直接载入
+就能改。前端因此把它记成 `kind: 'diagnostic'` 而不是 `partial`。
+
+崩溃残留还有半个问题：那条 `running` 行会让同一个 `run_id` **永远 409**
+（`begin()` 见 `running` 就拒绝认领），而 `pending()` 只看终态，检查点存得再好
+也没人读。所以 `begin()` 在认领之前先跑一次 `runs.sweep_abandoned()`：
+`updated_at` 超过 `RUN_ABANDONED_SECONDS`（1800 秒，是线上默认 `max_seconds` 的
+两倍）的 `running` 判成 `failed` + `failure.code = "run_abandoned"`，**不动
+`candidate`**（清理的是状态，不是那棵树）。
+
+放在 `begin()` 里而不是启动钩子，是因为这台机器只有一个 worker、也可能长期不重启：
+启动时清一次，故障后第一批用户仍然会撞 409。判错的代价是自愈的——真正还活着的
+运行收尾时 `finish` 仍能改动（它只对 `done` 冻结）。
+
 ## 错误码与界面的下一步
 
 `error` 帧的 `code` / `limit` 决定界面给什么按钮、按钮能不能点。映射是纯函数
