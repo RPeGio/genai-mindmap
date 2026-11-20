@@ -510,14 +510,14 @@ def test_create_intent_still_gets_no_rag_query():
                                          has_library=False).names()
 
 
-def test_edit_intent_keeps_all_seven_tools():
-    """`edit` 的七个写工具一个都没少——提额度不是为了删工具。"""
+def test_edit_intent_keeps_all_eight_tools():
+    """`edit` 的八个写工具一个都没少——提额度不是为了删工具。"""
     names = build_registry("edit", has_library=False).names()
     assert set(names) == {
         "add_node", "update_node", "remove_node", "move_node",
-        "add_edge", "remove_edge", "mindmap_edit",
+        "add_edge", "remove_edge", "mindmap_fill_details", "mindmap_edit",
     }
-    assert len(names) == 7
+    assert len(names) == 8
 
 
 def test_expand_intent_keeps_its_tools():
