@@ -269,6 +269,14 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
     什么"，新一轮开始后就不再成立。不清的话，`finish` 的 `COALESCE` 会把上一轮的
     `partial` 保住，于是"这一轮什么都没产出、报错收尾"的台账上仍写着
     `partial=1`——前端点「载入」时按半棵树提示，而那份内容早就不是半棵树了。
+
+    **重开时还要换掉 `request`**：重开意味着**另一个请求**在用这行跑（「补齐说明」
+    就是拿检查点那行的 id 发 `intent="edit"`）。`request` 是台账上"这一行在做什么"
+    的唯一来源——`router._summary()` 的 `intent` / `goal` 都从它取，前端据此决定把
+    结果当"新作品"还是"改现有图"。不换的话，编辑一轮跑完，台账上还写着上一轮的
+    `{"intent": "create"}`，前端载入时按 create 重置 `mapId`，用户点保存会变成新建
+    一条而不是覆盖原记录。`candidate` 反过来**必须**留着：重开跑的是"在已有树上
+    继续"，抹掉它等于把这次续写的起点删了。
     """
     payload = None if not request else json.dumps(request, ensure_ascii=False)
     # 先把僵住的 `running` 行收掉，再认领。顺序不能反：这一行如果是上一次崩溃
@@ -292,9 +300,11 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
                 reopened = conn.execute(
                     f"UPDATE runs SET status = ?, failure = NULL, "
                     f"partial = NULL, partial_reason = NULL, checkpointed_at = NULL, "
-                    f"updated_at = {_NOW} "
+                    # 重开是**另一个请求**在用这行跑，`request` 必须换成这一轮的摘要；
+                    # 空摘要（内部调用方不传）用 COALESCE 保住旧值，等于"这次没带摘要"。
+                    f"request = COALESCE(?, request), updated_at = {_NOW} "
                     "WHERE run_id = ? AND status IN (?, ?)",
-                    (STATUS_RUNNING, run_id, *RESTARTABLE_STATUSES),
+                    (STATUS_RUNNING, payload, run_id, *RESTARTABLE_STATUSES),
                 )
                 claimed = reopened.rowcount == 1
             conn.execute("COMMIT")
