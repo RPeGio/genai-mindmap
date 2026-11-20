@@ -130,6 +130,15 @@ def _tree_for(user: str, *, roles: dict[str, str] | None = None) -> dict[str, An
     return _tree_from(_branches_in(user) or ["甲"], roles=roles)
 
 
+def _collect_into(seen: list[Any]) -> Any:
+    """检查点通道是 async 的（落库交给线程池），测试里用这个收集器接住。"""
+
+    async def collect(content: Any) -> None:
+        seen.append(content)
+
+    return collect
+
+
 def _generate_with(plan: dict, *, diagram_type: str,
                    structure: dict | None = None,
                    checkpoint: Any = None) -> tuple[Any, RunContext]:
@@ -706,7 +715,7 @@ class TestCheckpoint:
     def test_checkpoint_sees_a_valid_tree_before_the_details_are_written(self):
         """叫到检查点时，手里那棵是契约合法的完整树，只是 `detail` 还空着。"""
         seen: list[Any] = []
-        _generate_with(TREE_PLAN, diagram_type=None, checkpoint=seen.append)
+        _generate_with(TREE_PLAN, diagram_type=None, checkpoint=_collect_into(seen))
 
         assert len(seen) == 1, "一轮生成只该打一个点"
         checkpointed = seen[0]
@@ -719,7 +728,7 @@ class TestCheckpoint:
     def test_checkpoint_payload_is_the_structure_the_run_finally_delivers(self):
         """检查点那份与最终交付的那份，**结构**必须一致（说明是之后才补的）。"""
         seen: list[Any] = []
-        _result, ctx = _generate_with(TREE_PLAN, diagram_type=None, checkpoint=seen.append)
+        _result, ctx = _generate_with(TREE_PLAN, diagram_type=None, checkpoint=_collect_into(seen))
 
         checkpointed, delivered = seen[0], ctx.candidate
         assert [node.id for node in shapes.iter_nodes(checkpointed)] == [
@@ -733,3 +742,47 @@ class TestCheckpoint:
 
         assert ctx.checkpoint is None
         assert result.ok
+
+    def test_fishbone_checkpoint_is_a_fishbone_not_a_tree(self):
+        """要鱼骨图的那一轮，检查点存下来的也必须是鱼骨图。
+
+        收尾的折叠（`_shape_output`）原本发生在检查点之后，于是崩溃后捡回来的
+        是一棵 `MindMapContent`——用户当初明明说了要鱼骨图，捡回来的却是一张
+        思维导图，看起来像"这一轮连图型都没认对"。
+        """
+        seen: list[Any] = []
+        _result, ctx = _generate_with(FISHBONE_PLAN, diagram_type="fishbone",
+                                      checkpoint=_collect_into(seen))
+
+        assert len(seen) == 1
+        checkpointed = seen[0]
+        assert isinstance(checkpointed, FishboneContent)
+        assert isinstance(ctx.candidate, FishboneContent)
+        # 六根骨与最终交付的那份逐根同序：折叠是纯函数，折出来的形状不该与最终不同。
+        assert [bone.category for bone in checkpointed.bones] == [
+            bone.category for bone in ctx.candidate.bones]
+
+    def test_flow_checkpoint_is_a_flow_not_a_tree(self):
+        """要流程图的那一轮同理：检查点里得是阶段，不是一棵挂着 `diagram_type` 的树。"""
+        seen: list[Any] = []
+        _result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                      checkpoint=_collect_into(seen))
+
+        assert len(seen) == 1
+        checkpointed = seen[0]
+        assert isinstance(checkpointed, FlowContent)
+        assert isinstance(ctx.candidate, FlowContent)
+        assert [stage.root.label for stage in checkpointed.stages] == [
+            stage.root.label for stage in ctx.candidate.stages]
+
+    def test_checkpoint_does_not_disturb_the_tree_the_rest_of_the_run_uses(self):
+        """折叠只作用于副本：检查点之后 `_fill_details` / `check` 仍按一棵树工作。"""
+        seen: list[Any] = []
+        _result, ctx = _generate_with(FISHBONE_PLAN, diagram_type="fishbone",
+                                      checkpoint=_collect_into(seen))
+
+        # 交付的那份是鱼骨图，说明它与结构都来自同一棵树——若检查点那次折叠改坏了
+        # 原树，这里会缺骨或串形。
+        delivered = ctx.candidate
+        assert isinstance(delivered, FishboneContent)
+        assert len(delivered.bones) == len(FISHBONE_PLAN["branches"])

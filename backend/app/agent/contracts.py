@@ -276,10 +276,15 @@ EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 # 工具 -> 落库的检查点通道。参数是"那一刻已经长好的树"，调用方负责写进 `runs`。
 #
-# 与 `EmitFn` 一样是**同步**回调：写库是阻塞 IO，实现方自己交给线程池。用回调而不是
-# 让工具直接 import `app.agent.runs`，是为了让工具层不知道"运行台账"这件事——它只
-# 需要"我这儿有一棵可以交出去的树了"。
-CheckpointFn = Callable[[DiagramContent], None]
+# 与 `EmitFn` 一样是**异步**回调，理由却不是对称美学：落库要把整棵树序列化再写
+# SQLite，而这条调用发生在工具内部——工具本身是 async 的、跑在事件循环上。同步
+# 写库在这里等于拿整个循环去等一把写锁（`BEGIN IMMEDIATE` 撞上别的写入时最长
+# 等满 `sqlite3.connect` 的忙等上限），同一个进程里别的 SSE 流会跟着一帧都发不
+# 出来。交给线程池之后，阻塞被关在那个 worker 里。
+#
+# 用回调而不是让工具直接 import `app.agent.runs`，是为了让工具层不知道"运行台账"
+# 这件事——它只需要"我这儿有一棵可以交出去的树了"。
+CheckpointFn = Callable[[DiagramContent], Awaitable[None]]
 
 
 class ToolResult(BaseModel):

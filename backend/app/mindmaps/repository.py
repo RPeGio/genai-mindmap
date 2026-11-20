@@ -64,10 +64,16 @@ def _drop_columns(conn: sqlite3.Connection, table: str, columns: Sequence[str]) 
             logger.warning("%s.%s 应该删掉但没删成，代码已不再读写它", table, name)
 
 
-def connect() -> sqlite3.Connection:
+def connect(*, timeout: float = 10) -> sqlite3.Connection:
+    """开一条连接。`timeout` 是等写锁的上限，默认 10 秒。
+
+    写成形参是为了让"在事件循环上等锁"的那条路能自己调短：生成中途落检查点的
+    写库跑在线程池里，它等锁的每一秒都是这一轮生成在等，而检查点本身是"存不上
+    就算了"的东西——它不值得陪一把慢锁耗满默认的十秒。
+    """
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(path, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("""CREATE TABLE IF NOT EXISTS mindmaps (
         id TEXT PRIMARY KEY, version INTEGER NOT NULL,

@@ -190,6 +190,15 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     接不到；用帧作判据，取消、断开、超时被掐这三条路自动归进同一格。
     """
     seq = 0
+    # 登记"本进程正在跑这一轮"。`sweep_abandoned()` 靠它分清"活着但静默"与"进程
+    # 已经没了"：一轮生成长时间不出帧是正常的（单次模型调用最长能到 `max_seconds`
+    # 上限 3600 秒），只按 `updated_at` 判会把这种轮次误杀，而误杀之后它后面的
+    # `checkpoint()` 会因为 `WHERE status = 'running'` 全部静默失效。
+    #
+    # 登记点在本生成器的第一行、而不是 `stream_run()` 里：生成器要到第一次迭代才
+    # 执行，客户端在开流前断开时它一次都不跑——登记在这里就不会留下一条永远没人
+    # 注销的活跃记录。注销在 `finally` 里，紧挨着 `finish()`。
+    runs.active(run_id)
     # 只在正常收尾或已处理过的错误之后补 [DONE]。放在 finally 里会在 aclose()
     # 触发 GeneratorExit 时也去 yield，Python 直接抛
     # "async generator ignored GeneratorExit"，底层生成器的清理也被跳过。
@@ -216,14 +225,15 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         # 同步、只做赋值：取消路径上第一个 await 会立刻再抛一次 CancelledError。
         captured["ctx"] = candidate
 
-    def on_checkpoint(content: Any) -> None:
-        # 中途那次落库。同样是同步调用：工具到这里的整条链上（工具 -> `ctx.checkpoint`）
-        # 没有 await 的余地，而写的是本地 SQLite、微秒级。
+    async def on_checkpoint(content: Any) -> None:
+        # 中途那次落库。**异步**：工具是 async 的、跑在事件循环上，同步写 SQLite
+        # 会把整个循环拿去等写锁——同一个进程里别的 SSE 流会跟着一帧都发不出来。
+        # 交给线程池，阻塞关在那个 worker 里，这一轮生成照常推进。
         #
         # 写失败**不抛**：检查点是"跑不完时少丢一点"的补丁，它自己出错不该让一轮
         # 本来能成功的生成失败。真正常态收尾时 `finish()` 会再写一次并清掉这个标记。
         try:
-            runs.checkpoint(run_id, content)
+            await run_in_threadpool(runs.checkpoint, run_id, content)
         except Exception:
             logger.warning("run %s 的检查点没有落库", run_id, exc_info=True)
 
@@ -304,6 +314,9 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
                         partial=partial, partial_reason=partial_reason)
         except Exception:  # noqa: BLE001 — 见上
             logger.exception("run %s 的终态没有落库", run_id)
+        # 注销活跃登记：必须放在 `finish` 之后——先注销再落终态，中间那一瞬间
+        # 别的请求的 `sweep_abandoned()` 就有机会把这一行判成化石。
+        runs.inactive(run_id)
     if finished:
         yield DONE_FRAME
 

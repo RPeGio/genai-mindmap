@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -58,9 +59,42 @@ RESTARTABLE_STATUSES = (STATUS_CANCELLED, STATUS_FAILED)
 #: 还多一倍"：活着的运行在 10 分钟内一定已经写过检查点（`checkpoint()` 会顺手
 #: 刷新 `updated_at`），再往后还没有动静的，要么进程没了，要么前端早就放弃它了。
 #:
+#: 单靠这个数字**不足以**判定"活着"：一轮生成里最长的静默是**单次模型调用**，
+#: 它受 `max_seconds` 约束，最长能到 3600 秒——比这个阈值还长。所以真正的第一道
+#: 判据是本进程的活跃登记（`active()`）：自己还在跑的 run 一律不扫。1800 秒只对
+#: "登记表里没有、又很久没动"的行生效，那种行要么属于已经死掉的进程，要么属于
+#: 另一个进程——而部署是单 worker（见 `AGENTS.md`：不要引入多 worker 写假设）。
+#:
 #: 判错的代价是自愈的：把一个其实还活着的运行误判成 `failed` 之后，那一轮真正
 #: 收尾时 `finish` 仍能改动（它只对 `done` 冻结），终态与最终那棵树都会盖回来。
 RUN_ABANDONED_SECONDS = 1800
+
+#: 本进程里正在跑的 run_id。`sweep_abandoned()` 跳过它们。
+#:
+#: 没有这张表，"活跃"就只能靠 `updated_at` 猜，而猜错的代价很实：一轮正在写说明的
+#: 生成被判成 `failed` 之后，它后面的 `checkpoint()` 全部静默失效（那条 UPDATE 带
+#: `WHERE status = 'running'`），用户下次进来看到的是一棵不再更新的树。
+#:
+#: 加锁是因为 `sweep_abandoned()` 可能从线程池里被调用（检查点那条路就是这么做的），
+#: 而登记来自事件循环线程。
+_ACTIVE: set[str] = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+def active(run_id: str) -> None:
+    """登记一个正在跑的 run。调用方必须在 `finally` 里配 `inactive()`。"""
+    with _ACTIVE_LOCK:
+        _ACTIVE.add(run_id)
+
+
+def inactive(run_id: str) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.discard(run_id)
+
+
+def _active_ids() -> tuple[str, ...]:
+    with _ACTIVE_LOCK:
+        return tuple(_ACTIVE)
 
 #: 从检查点提起树来时的说明：那时结构已经长好，说明一句都还没写。
 CHECKPOINT_REASON = (
@@ -145,15 +179,23 @@ class Claim:
     claimed: bool
 
 
-def _connect() -> sqlite3.Connection:
+#: 落检查点时等写锁的上限（秒）。比默认的 10 秒短得多：检查点是"跑不完就少丢
+#: 一点"的东西，它等锁的每一秒都是这一轮真正在跑的时间。拿不到锁就放弃，本轮
+#: 照常往下走——收尾时 `finish()` 还会再写一次。
+CHECKPOINT_LOCK_TIMEOUT = 2.0
+
+
+def _connect(*, timeout: float = 10) -> sqlite3.Connection:
     """连接 + 关掉 Python 的隐式事务。
 
     `isolation_level=None` 是必需的：`begin()` 要显式开 `BEGIN IMMEDIATE` 才能让
     "读到的状态"和"写下的状态"在同一把写锁里。留在默认的隐式事务模式下，
     `BEGIN` 会撞上 Python 自己刚开的那条，抛 `cannot start a transaction within
     a transaction`——而那条错误只在并发时才出现，平时一点痕迹都没有。
+
+    `timeout` 透传给 `repository.connect()`：只有检查点那条路会调短它。
     """
-    conn = repository.connect()
+    conn = repository.connect(timeout=timeout)
     conn.isolation_level = None
     return conn
 
@@ -353,8 +395,13 @@ def checkpoint(run_id: str, content: DiagramContent) -> bool:
 
     返回这一行有没有真的被写。写不进去不抛异常——调用方在生成的中途，为了一个
     "存不上就算了"的保险不该让整轮失败。
+
+    等写锁的上限是 `CHECKPOINT_LOCK_TIMEOUT`（2 秒），不是默认的 10 秒：这条路上
+    的阻塞发生在事件循环里（调用方在线程池里跑它，但等的是这一轮生成的时间），
+    一把慢锁不值得陪满十秒。超时抛的 `sqlite3.OperationalError` 照常往外抛——由
+    调用方决定记日志还是继续，这里不替它吞。
     """
-    with closing(_connect()) as conn:
+    with closing(_connect(timeout=CHECKPOINT_LOCK_TIMEOUT)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             changed = conn.execute(
@@ -381,16 +428,27 @@ def sweep_abandoned(*, seconds: int = RUN_ABANDONED_SECONDS) -> list[str]:
     - **台账里那棵树没人能捡**：`pending()` 只看 `done` / `cancelled`，`running`
       不在其中，所以检查点存得再好也没人读得到。
 
-    判据只有 `updated_at`（表里没有心跳列，也不打算为它加一列）：活着的运行每打一次
-    检查点、每落一次终态都会刷新它，而 `checkpoint()` 之前的静默期最长是结构那一次
-    调用，实测远小于这个阈值。误判的代价自愈——真正还活着的那一轮收尾时 `finish()`
-    仍能改动（它只对 `done` 冻结），终态与最终的树都会盖回来。
+    判据是**两条**，缺一不可：
+
+    1. 不在本进程的活跃登记里（`_ACTIVE`）。自己还在跑的 run 一律不碰——这一条
+       才是"活着"的硬证据。
+    2. `updated_at` 比阈值更旧。
+
+    只靠第 2 条不够：一轮生成里最长的静默是**单次模型调用**，它受 `max_seconds`
+    约束（请求上限 3600 秒），比阈值还长。只按时间来猜，这种轮次会被判成 `failed`，
+    而它后面的 `checkpoint()` 带 `WHERE status = 'running'`，从此全部静默失效——
+    用户下次进来看到的是一棵停在某一刻、再也不会更新的树。
+
+    第 1 条只在单进程里有效，这与部署一致（`AGENTS.md`：不要引入多 worker 写假设）。
+    多 worker 部署时，另一进程的活跃 run 只能靠时间兜——那也正是阈值取到 1800 秒
+    这么宽的原因。
 
     截止时刻由 **SQLite 自己算**（`strftime(..., 'now', '-N seconds')`），不在这里
     用 Python 拼时间串：`updated_at` 是 SQLite 按 UTC 写下的同一格式，两边各算一次
     就有时区与精度两个地方会分叉，而分叉的表现是"清理要么一直不触发、要么清掉刚开
     的那一轮"，两种都很难从日志上认出来。
     """
+    protected = _active_ids()
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -399,7 +457,7 @@ def sweep_abandoned(*, seconds: int = RUN_ABANDONED_SECONDS) -> list[str]:
                 "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
                 (STATUS_RUNNING, f"-{max(1, seconds)} seconds"),
             ).fetchall()
-            swept = [row["run_id"] for row in rows]
+            swept = [row["run_id"] for row in rows if row["run_id"] not in protected]
             if swept:
                 placeholders = ", ".join("?" for _ in swept)
                 conn.execute(
@@ -491,6 +549,7 @@ def _mark(run_id: str, column: str) -> bool:
 
 __all__ = [
     "ABANDONED_FAILURE",
+    "CHECKPOINT_LOCK_TIMEOUT",
     "CHECKPOINT_REASON",
     "Claim",
     "RESTARTABLE_STATUSES",
@@ -501,10 +560,12 @@ __all__ = [
     "STATUS_FAILED",
     "STATUS_RUNNING",
     "TERMINAL_STATUSES",
+    "active",
     "begin",
     "checkpoint",
     "finish",
     "get",
+    "inactive",
     "mark_applied",
     "pending",
     "sweep_abandoned",

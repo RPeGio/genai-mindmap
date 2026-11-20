@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -863,6 +864,134 @@ def test_reopening_a_run_clears_the_checkpoint_mark():
     assert claim.claimed is True
     assert claim.record.checkpointed_at is None
     assert claim.record.status == runs.STATUS_RUNNING
+
+
+def _age(run_id: str) -> None:
+    """把一行推成"很久没动过"的化石（真按时间等是等不起的）。"""
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     f"WHERE run_id = '{run_id}'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sweep_leaves_an_active_run_alone():
+    """本进程还在跑的那一轮，`updated_at` 再旧也不许判成化石。
+
+    一轮生成长时间不出帧是正常的：单次模型调用受 `max_seconds` 约束（上限 3600
+    秒），比 `RUN_ABANDONED_SECONDS`(1800) 还长。只按时间判就会把这种轮次误杀，
+    而误杀之后它后面的 `checkpoint()` 带 `WHERE status = 'running'`，从此全部
+    静默失效——用户下次进来看到的是一棵停在某一刻、再也不会更新的树。
+    """
+    runs.begin("live-1", {"goal": "g"})
+    runs.active("live-1")
+    try:
+        _age("live-1")
+
+        assert runs.sweep_abandoned() == []
+        assert runs.get("live-1").status == runs.STATUS_RUNNING
+        # 误杀之后这一句会返回 False：检查点只能写 running 的行。
+        assert runs.checkpoint("live-1", CANDIDATE) is True
+    finally:
+        runs.inactive("live-1")
+
+    # 注销之后它就只是一行普通的化石，该被扫到。
+    # （先重新推老：上面那个成功的 `checkpoint()` 刚把 `updated_at` 刷新过。）
+    _age("live-1")
+    assert "live-1" in runs.sweep_abandoned()
+    assert runs.get("live-1").status == runs.STATUS_FAILED
+
+
+def test_sweep_keeps_cleaning_other_rows_while_one_is_active():
+    """排除活跃的只是那几行，不是整次清理——僵尸行仍要被收掉。"""
+    runs.begin("live-2", {"goal": "g"})
+    runs.begin("dead-1", {"goal": "g"})
+    runs.active("live-2")
+    try:
+        _age("live-2")
+        _age("dead-1")
+
+        assert runs.sweep_abandoned() == ["dead-1"]
+    finally:
+        runs.inactive("live-2")
+
+
+def test_the_stream_registers_the_run_and_unregisters_it_on_the_way_out():
+    """`_frames` 自己登记、自己注销：漏了注销，那一行就永远不会被清理。"""
+    request = AgentRunRequest(goal="g", intent="create")
+    seen_active: list[bool] = []
+
+    async def fake_run(body, *, on_close=None, on_checkpoint=None, first_seq=1):
+        # 跑到一半时应当已经登记过了——清扫正是可能在别处此刻发生的。
+        seen_active.append("stream-1" in runs._active_ids())
+        yield DoneEvent(seq=1, content=CANDIDATE, mode="model")
+
+    async def scenario() -> None:
+        agen = agent_router._frames(request, "stream-1")
+        async for _chunk in agen:
+            pass
+
+    _open_run("stream-1", request)
+    with patch("app.agent.router.run", new=fake_run):
+        asyncio.run(scenario())
+
+    assert seen_active == [True], "生成期间这一轮必须在活跃登记里"
+    assert "stream-1" not in runs._active_ids(), "收尾之后必须注销，否则永远不会被清理"
+    assert runs.get("stream-1").status == runs.STATUS_DONE
+
+
+def test_a_stream_that_never_starts_leaves_no_registration():
+    """开流前就断开时生成器一次都不跑，不能留下一条永远没人注销的登记。"""
+    request = AgentRunRequest(goal="g", intent="create")
+    _open_run("stream-2", request)
+
+    async def scenario() -> None:
+        agen = agent_router._frames(request, "stream-2")
+        # 一次都不迭代就直接关掉（uvicorn 收到断开时就是这样）。
+        await agen.aclose()
+
+    with patch("app.agent.router.run", new=lambda *a, **k: None):
+        asyncio.run(scenario())
+
+    assert "stream-2" not in runs._active_ids()
+
+
+def test_checkpoint_is_written_off_the_event_loop():
+    """检查点那次写库必须落在工作线程上。
+
+    工具是 async 的、跑在事件循环上；同步写 SQLite 等于拿整个循环去等一把写锁
+    （`BEGIN IMMEDIATE` 撞上别的写入时最长等满忙等上限），同一进程里别的 SSE 流
+    会跟着一帧都发不出来。这条用例钉的是"没在主线程写"，不是"写成功了"。
+    """
+    request = AgentRunRequest(goal="g", intent="create")
+    threads: list[str] = []
+    real_checkpoint = runs.checkpoint
+
+    def spy(run_id: str, content: Any) -> bool:
+        threads.append(threading.current_thread().name)
+        return real_checkpoint(run_id, content)
+
+    async def fake_run(body, *, on_close=None, on_checkpoint=None, first_seq=1):
+        assert on_checkpoint is not None, "路由层必须把检查点通道接上"
+        await on_checkpoint(CANDIDATE)
+        yield DoneEvent(seq=1, content=CANDIDATE, mode="model")
+
+    async def scenario() -> None:
+        agen = agent_router._frames(request, "cp-thread-1")
+        async for _chunk in agen:
+            pass
+
+    _open_run("cp-thread-1", request)
+    loop_thread = threading.current_thread().name
+    with patch("app.agent.router.run", new=fake_run), \
+            patch("app.agent.runs.checkpoint", new=spy):
+        asyncio.run(scenario())
+
+    assert len(threads) == 1
+    assert threads[0] != loop_thread, "检查点写库落在了事件循环线程上"
+    assert runs.get("cp-thread-1").status == runs.STATUS_DONE
 
 
 if __name__ == "__main__":

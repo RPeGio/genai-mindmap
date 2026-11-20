@@ -5129,8 +5129,19 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 没有 `expandable`，写进库是一棵契约不合法的树，还得为它再写一套读取格式。
     # 更晚不必：`publish_tree` 那一刻整棵树已经写进 `ctx.candidate`，`on_close`
     # 兜得住。
+    #
+    # **存下去的那一份必须是用户要的图型**：真正的折叠在出口那一步（`_shape_output`）
+    # 才做，所以那时 `content` 还是一棵内部树。直接把它存进库，崩溃后捡回来的就成
+    # 了一张思维导图——而用户当初要的是鱼骨图/流程图，他会以为这一轮连图型都没认对。
+    # 这里对**副本**先折一次：折叠是纯函数（`to_fishbone` / `to_flow` 都不就地改输入），
+    # 折的是副本，下游 `_fill_details` 等仍按一棵树工作。
+    #
+    # 诊断给一次性空表：那是**最终产物**的读数，一份快照不该替它提前报一遍，也不该
+    # 把同一批诊断算两次。
     if ctx.checkpoint is not None:
-        ctx.checkpoint(content)
+        await ctx.checkpoint(_shape_output(
+            content.model_copy(deep=True), diagram_type=diagram_type,
+            raw_plan=raw_plan, diagnostics=[]))
 
     # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------
     #
