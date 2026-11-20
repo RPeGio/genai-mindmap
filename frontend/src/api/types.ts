@@ -720,6 +720,16 @@ export interface RunSummary {
    * 半棵树与完整生成长得一模一样。
    */
   partial?: boolean | null;
+  /**
+   * 这份结果不是收尾交的，而是跑到一半截下来的检查点。
+   *
+   * 有值 = **结构长全了、说明还没写**（`detail` 是空的）。它与 `partial` 是两件事：
+   * `partial` 说"树没长完"，这一条说"树长全了、描述没来得及写"。下一步也不同——
+   * 前者要补内容，后者只是缺描述，直接载入接着改就行。
+   */
+  checkpointed_at?: string | null;
+  /** 检查点那份里有多少个节点。只为一句"已保存 N 个节点"，不值得再拉整棵树。 */
+  node_count?: number | null;
 }
 
 /** 单条运行的详情（镜像后端 `RunDetail`）：多出结果正文、失败原因与来历。 */

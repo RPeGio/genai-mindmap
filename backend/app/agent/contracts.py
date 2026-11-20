@@ -274,6 +274,19 @@ class ToolProvider(Protocol):
 EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+# 工具 -> 落库的检查点通道。参数是"那一刻已经长好的树"，调用方负责写进 `runs`。
+#
+# 与 `EmitFn` 一样是**异步**回调，理由却不是对称美学：落库要把整棵树序列化再写
+# SQLite，而这条调用发生在工具内部——工具本身是 async 的、跑在事件循环上。同步
+# 写库在这里等于拿整个循环去等一把写锁（`BEGIN IMMEDIATE` 撞上别的写入时最长
+# 等满 `sqlite3.connect` 的忙等上限），同一个进程里别的 SSE 流会跟着一帧都发不
+# 出来。交给线程池之后，阻塞被关在那个 worker 里。
+#
+# 用回调而不是让工具直接 import `app.agent.runs`，是为了让工具层不知道"运行台账"
+# 这件事——它只需要"我这儿有一棵可以交出去的树了"。
+CheckpointFn = Callable[[DiagramContent], Awaitable[None]]
+
+
 class ToolResult(BaseModel):
     """工具执行结果。
 
@@ -409,6 +422,15 @@ class RunContext:
     # 必须与加通道之前**逐字相同**（连流式请求都不发）。判空只在
     # `tools._emit_grow` 与 `tools._GrowStream` 的入口处做一次。
     emit: EmitFn | None = None
+    # 检查点通道。`service.run()` 在整轮运行期间挂上它，工具在"树已经能读了、但还要
+    # 接着跑很久"的那一刻调用一次，由循环写进 `runs` 表。
+    #
+    # 与 `emit` 同样默认 None、同样要求判空只在调用点做一次：单测与直接调工具的代码
+    # 没有台账可写，这条路上工具的行为必须与加通道之前逐字相同（连一次库调用都没有）。
+    #
+    # 为什么是"回调"而不是工具直接调 `runs.checkpoint()`：工具层不该知道运行台账的
+    # 存在。它只知道"我这儿有一棵可以交出去的树"，落不落库、落到哪由调用层决定。
+    checkpoint: CheckpointFn | None = None
     # 本次运行累积的命中区间（`tools._rag` 每检索一次并一批进来）。它是
     # `verify_source_refs(..., evidence=...)` 的唯一输入，也是"父块模式"下唯一能
     # 区分"引用落在命中的子块里"与"引用落在父块里与查询无关的一半"的东西。

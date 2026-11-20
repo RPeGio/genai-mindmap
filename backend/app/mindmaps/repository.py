@@ -64,10 +64,16 @@ def _drop_columns(conn: sqlite3.Connection, table: str, columns: Sequence[str]) 
             logger.warning("%s.%s 应该删掉但没删成，代码已不再读写它", table, name)
 
 
-def connect() -> sqlite3.Connection:
+def connect(*, timeout: float = 10) -> sqlite3.Connection:
+    """开一条连接。`timeout` 是等写锁的上限，默认 10 秒。
+
+    写成形参是为了让"在事件循环上等锁"的那条路能自己调短：生成中途落检查点的
+    写库跑在线程池里，它等锁的每一秒都是这一轮生成在等，而检查点本身是"存不上
+    就算了"的东西——它不值得陪一把慢锁耗满默认的十秒。
+    """
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(path, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("""CREATE TABLE IF NOT EXISTS mindmaps (
         id TEXT PRIMARY KEY, version INTEGER NOT NULL,
@@ -122,6 +128,17 @@ def connect() -> sqlite3.Connection:
     # 树上是 41 个节点）…"），与 `failure` 分开：`failure` 描述"这次失败了"，
     # 而半棵树是**成功交付但内容不全**，混进同一个字段会让界面只能二选一。
     _ensure_columns(conn, "runs", {"partial": "INTEGER", "partial_reason": "TEXT"})
+    # 这一行里的 `candidate` 是**跑到一半截下来的检查点**，不是收尾交出的成品。
+    #
+    # 补这一列而不是新建一张表，是因为检查点与终态结果是同一种东西（一棵合法的
+    # `DiagramContent`），区别只在"什么时候写的"。分成两张表，读的地方就要先问
+    # "成品在不在"，不在再去另一张表拼——而拼出来的树与成品树是同一种形状，分开
+    # 存只是把一次读变成两次读。`candidate` 本来就是"这次运行的那棵树"，检查点
+    # 只是它更早的一份快照。
+    #
+    # 写这一列的那一刻顺手刷新 `updated_at`，`sweep_abandoned()` 的超龄判据就靠它：
+    # 活着的运行最长的静默期是结构那一次调用，一定短于 `RUN_ABANDONED_SECONDS`。
+    _ensure_columns(conn, "runs", {"checkpointed_at": "TEXT"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
     # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
     # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该

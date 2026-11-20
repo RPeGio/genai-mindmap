@@ -428,11 +428,20 @@ const resumableText = computed(() => {
   // 第三种形态：跑完了但它只交出半棵树（`partial`）。说成"生成完的"是撒谎——用户
   // 载入之后才发现某几支是空的，那时画布已经是他的作品了。`partial === true` 才
   // 算数：缺字段是"这条记录没记过"，不是"确定完整"。
-  const what = run.status === 'cancelled'
-    ? `上次${when}那次生成被中断了，已经生成的部分还留着`
-    : run.partial === true
-      ? `上次${when}生成只完成了一部分，没长完的树还留着`
-      : `上次${when}生成完的导图还没保存`;
+  //
+  // 检查点（`checkpointed_at`）单独一档、排在 `partial` 前面：它交出来的**不是**
+  // 半棵树，是完整结构 + 空的说明。说成"只完成了一部分"会让用户以为要重跑，而实际
+  // 上他载入之后直接改就是一棵能用的树——两者下一步完全不同。
+  // `node_count` 用 `!= null` 判而不是真值判：0 个节点是**合法**的（检查点落在裁剪
+  // 之后、恰好一棵空树），`run.node_count ?` 会把它悄悄吞成"没存下节点"。
+  const count = run.node_count != null ? `，已保存 ${run.node_count} 个节点` : '';
+  const what = run.checkpointed_at
+    ? `上次${when}生成在写说明之前断了，结构还在${count}`
+    : run.status === 'cancelled'
+      ? `上次${when}那次生成被中断了，已经生成的部分还留着`
+      : run.partial === true
+        ? `上次${when}生成只完成了一部分，没长完的树还留着`
+        : `上次${when}生成完的导图还没保存`;
   return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
 });
 

@@ -258,6 +258,44 @@ describe('底部对话框的状态机', () => {
     await wrapper.vm.$nextTick();
     expect(wrapper.find('[data-test="resumable-notice"]').exists()).toBe(false);
   });
+
+  it('检查点说"结构还在、已存 N 个节点"，不说"只完成了一部分"', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.resumableRun = {
+      run_id: 'run-cp', status: 'failed', intent: 'create', goal: '崩掉的那张',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+      checkpointed_at: '2024-01-01T03:05:00Z', node_count: 37,
+    };
+    await wrapper.vm.$nextTick();
+
+    const notice = wrapper.get('[data-test="resumable-notice"]').text();
+    // 结构是完整的，缺的只是说明——说成"只完成了一部分"会让用户以为要重跑。
+    expect(notice).toContain('结构还在');
+    expect(notice).toContain('37 个节点');
+    expect(notice).not.toContain('只完成了一部分');
+    expect(notice).not.toContain('被中断');
+  });
+
+  it('检查点里是 0 个节点时照样说"0 个节点"，不吞成没存下', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.resumableRun = {
+      run_id: 'run-cp0', status: 'failed', intent: 'create', goal: '空树那张',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+      checkpointed_at: '2024-01-01T03:05:00Z', node_count: 0,
+    };
+    await wrapper.vm.$nextTick();
+
+    // 0 是合法读数（检查点落在裁剪之后、恰好空树）。`node_count ? ...` 会把它当成
+    // 「没存下节点」，于是用户看到一句"结构还在"，却不知道结构是空的。
+    const notice = wrapper.get('[data-test="resumable-notice"]').text();
+    expect(notice).toContain('0 个节点');
+  });
 });
 
 describe('材料缩略图', () => {

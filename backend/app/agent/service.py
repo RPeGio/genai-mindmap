@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.agent.contracts import (
     AgentEvent,
     AgentRunRequest,
+    CheckpointFn,
     DoneEvent,
     ErrorEvent,
     HeartbeatEvent,
@@ -1000,6 +1001,7 @@ async def run(
     provider: ToolProvider | None = None,
     tools: ToolRegistry | None = None,
     on_close: Callable[[DiagramContent | None], None] | None = None,
+    on_checkpoint: CheckpointFn | None = None,
     first_seq: int = 1,
 ) -> AsyncIterator[AgentEvent]:
     """跑一次多轮工具循环，边跑边发事件。
@@ -1024,6 +1026,15 @@ async def run(
 
     `on_close` 不传时行为与加它之前**逐字相同**（连一次库调用都没有），单测与
     直接调 `run()` 的代码不受影响。
+
+    `on_checkpoint` 是同一件事的**中途**版本：`on_close` 只在结束时有一次机会，
+    而一轮生成里有很长一段（写说明，实测 26 秒上下）是"树已经能读了但还没跑完"。
+    这段时间进程被杀 / 重启 / 合盖，`finally` 根本没跑到，那一轮连半棵树都不留。
+    工具在那一刻调一次 `ctx.checkpoint(...)`，这里把它交给调用方落库。
+
+    它**不走同步回调**：这里不是取消路径（工具正常跑到那一步才调），而落库要把整
+    棵树序列化再写 SQLite，同步做等于拿事件循环去等写锁——同进程的其它 SSE 流会
+    跟着卡住。所以它是 `async` 的，调用方（路由层）自己把阻塞的写交给线程池。
     """
     # 「这次图型是怎么定的」随请求一起进来（`diagram_intent.apply` 在开流前写好）。
     # 直接构造请求的调用方没经过那一层，两个私有属性都是 `None`——那表示"这一层
@@ -1035,6 +1046,7 @@ async def run(
         sources_by_id={source.id: source for source in request.sources},
         diagram_source=intent.source,
         diagram_stripped=intent.stripped,
+        checkpoint=on_checkpoint,
     )
     try:
         async with contextlib.aclosing(

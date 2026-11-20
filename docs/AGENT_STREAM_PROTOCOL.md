@@ -160,6 +160,102 @@ JSON 内自带的 id，只能由工具层带上路径。
   弹一张"这次没成功"的卡片与用户眼前的事实矛盾。
 - 告警落地之后**不清**：用户改到一半才发现某几支是空的，那时比落地之前更需要这句话。
 
+## 检查点：写说明之前那一份
+
+`partial` 解决的是"收尾时手上还有树"，但它救不了一种更常见的失败：**进程根本没
+走到收尾**。`runs` 表的终态由 `_frames` 的 `finally` 写，进程被杀/机器重启/容器
+重建时那个 `finally` 根本不会跑，于是库里留下一条永远 `running` 的行，而它其实
+已经攒了大半棵树——只是没有任何一帧把它带出去。
+
+补的是一个**中途落库点**。它有三个位置，都在"下一段是长耗时模型调用"之前：
+
+```python
+# 创建（backend/app/agent/tools.py::_generate）—— 第四步（写说明）之前
+if ctx.checkpoint is not None:
+    snapshot = content.model_copy(deep=True)
+    _stamp_expandable(snapshot, {node_id: "unknown" for node_id in cut_ids},
+                      max_depth=mindmap_contract.MAX_TREE_DEPTH)
+    await ctx.checkpoint(_shape_output(
+        snapshot, diagram_type=diagram_type,
+        raw_plan=raw_plan, diagnostics=[]))
+
+# 按支展开（::_expand）—— 批次落树之后、生长预览与写说明之前
+# 编辑（::_commit_drafts，`mindmap_edit` 与五个细粒度写工具共用）—— 同上
+ctx.publish_tree(updated)
+ctx.batches.append(batch)
+if ctx.checkpoint is not None:
+    await ctx.checkpoint(updated)
+```
+
+三个位置的选择理由各不相同：
+
+- **创建这条路**：只有此刻的树是契约合法的。**更早不行**——结构那段响应是流式解析的，
+  中途的 `node_grow` 预览帧只有 `id`/`label`，没有 `detail`、没有 `source_refs`、没有
+  `expandable`，把它写成 `candidate` 就是往库里塞一棵 `model_validate` 过不了的树。
+  **更晚不必**——`publish_tree()` 那一刻 `on_close` 兜得住，那本来就是终态交付。
+  而这一刻正好卡在整轮最长的一段前面：裁剪已做完、骨架的颜色与边已套上，接下来是两次
+  并发调用写说明（56 节点实测 26 秒上下，见 `_fill_details` 的 docstring）。
+- **创建这条路要多折一次形**：出口的 `_shape_output` 把内部树折成鱼骨/流程图，而检查点
+  在它之前。直接存内部 `MindMapContent`，崩溃后捡回来的是一张思维导图——用户当初明明说
+  要鱼骨图。所以落库前对**副本**先折一次（`to_fishbone`/`to_flow` 是纯函数，下游仍按一棵
+  树工作），`diagnostics=[]` 给一次性空表（`_shape_output` 会往传入的列表里 append，快照
+  不该替最终产物提前报诊断、更不该让同一批诊断算两遍）。
+- **创建这条路还要在快照上补一次 `expandable` 打标**：正式那一次 `_stamp_expandable` 在
+  检查点**之后**（它要用裁剪后的 `cut_ids`，位置由最终产物决定），所以快照里被裁掉子节点
+  的那些会带着缺省的 `yes`——用户点开以为还能长，点下去却报 `too_deep`，而被裁的恰好是
+  唯一还能继续长的地方。快照上按同一张表补成 `unknown`（"没长完，不是到底了"），与最终
+  交付那份的标记口径一致。
+- **编辑 / 展开这两条路不需要折形**：`updated` 是 `_apply_ops_any` 的产物，本来就是最终
+  图型（`_shape_output` 只服务创建那条路）。它们保的是"已经改完的那一批 op"——一次二十分钟
+  的编辑在写完说明前崩掉，若不打这个点，用户重新打开看到的还是**编辑前**的树。
+
+`ctx.checkpoint` 是 `async` 的，回调实现方自己把阻塞的写交给线程池
+（`CheckpointFn = Callable[[DiagramContent], Awaitable[None]]`）。工具跑在事件循环上，
+同步写库等于拿整个循环去等 SQLite 的写锁，同进程其它 SSE 会一帧都发不出来。
+
+三个约束：
+
+1. **只对 `running` 生效**（`WHERE status = 'running'`）。迟到的检查点不许把成品
+   盖成半棵树——取消路径上工具里的检查点调用可能晚一步到达。
+2. **交出成品时清掉标记**（`finish` 里的 `CASE WHEN ? IS NULL`）。`checkpointed_at`
+   有值 = "这份 `candidate` 是跑到一半截下来的"，成品带着标记会让界面一直提示
+   "说明还没写"。
+3. **写失败不抛**。检查点自己出问题不该让一轮本来能成功的生成失败。写锁等 2 秒
+   （`CHECKPOINT_LOCK_TIMEOUT`）就放弃：检查点是"少丢一点"的补丁，为它多等一秒都
+   是这一轮在等。
+
+读侧两个字段（`GET /api/agent/runs` 与 `/{id}`）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `checkpointed_at` | 这份结果是检查点。**结构是全的，`detail` 是空的** |
+| `node_count` | 检查点里有多少节点。只在这些行上算一遍，列表 20 条不值得数 |
+
+它与 `partial` **是两件事**，不要合并：`partial` 说"树没长完"，`checkpointed_at`
+说"树长全了、描述没写"。用户下一步完全不同——前者要重跑或接着补，后者直接载入
+就能改。前端因此把它记成 `kind: 'diagnostic'` 而不是 `partial`。
+
+**覆盖范围**：只有 `create` / `edit` / `expand` 三条产品意图。`create_deep`
+（`mindmap_generate_deep`）不打点——`_ALLOWED_BY_INTENT` 里它只挂在 `create_deep`
+下，而 `service.run` 永远不会把请求解析成它（那是"一次响应写不下 200+ 节点"的备用
+路径，未注册到任何入口），所以它在生产上不可达。
+
+崩溃残留还有半个问题：那条 `running` 行会让同一个 `run_id` **永远 409**
+（`begin()` 见 `running` 就拒绝认领），而 `pending()` 只看终态，检查点存得再好
+也没人读。所以 `begin()` 在认领之前先跑一次 `runs.sweep_abandoned()`，判据有两条，
+**缺一不可**：
+
+1. 不在本进程的活跃登记里（`runs._ACTIVE`，由 `_frames` 在生成器第一行 `active()`、
+   `finally` 里 `inactive()`）。单靠时间判不出来：一轮生成里最长的静默是**单次模型
+   调用**，它受 `max_seconds` 约束、上限 3600 秒，比下面那个阈值还长。
+2. `updated_at` 超过 `RUN_ABANDONED_SECONDS`（1800 秒，是线上默认 `max_seconds` 的
+   两倍）。自己还在跑的 run 一律不扫，1800 秒只对"登记表里没有、又很久没动"的行生效。
+
+判中的行变成 `failed` + `failure.code = "run_abandoned"`，**不动 `candidate`**（清理的是
+状态，不是那棵树）。放在 `begin()` 里而不是启动钩子，是因为这台机器只有一个 worker、
+也可能长期不重启：启动时清一次，故障后第一批用户仍然会撞 409。判错的代价是自愈的——
+真正还活着的运行收尾时 `finish` 仍能改动（它只对 `done` 冻结）。
+
 ## 错误码与界面的下一步
 
 `error` 帧的 `code` / `limit` 决定界面给什么按钮、按钮能不能点。映射是纯函数

@@ -5118,6 +5118,38 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 ),
             ))
 
+    # ---- 检查点：树已经能读了，落一份再往下走 -------------------------------
+    #
+    # 从这里到 `publish_tree` 之间还要跑 `_fill_details`（实测 26 秒上下）与
+    # `check` / `annotate_nli` / `_cross_branch_duplicates`。那些时间里这棵树已经
+    # 过契约校验、已裁剪、骨架已套，**是合法的完整树，只是 detail 全空**——进程
+    # 被杀、重启、合盖，这一轮本该白跑，有了这一步至少留下结构。
+    #
+    # 更早不行：中途只有 `node_grow` 预览帧，那些节点只有 id 与 label，没有引用、
+    # 没有 `expandable`，写进库是一棵契约不合法的树，还得为它再写一套读取格式。
+    # 更晚不必：`publish_tree` 那一刻整棵树已经写进 `ctx.candidate`，`on_close`
+    # 兜得住。
+    #
+    # **存下去的那一份必须是用户要的图型**：真正的折叠在出口那一步（`_shape_output`）
+    # 才做，所以那时 `content` 还是一棵内部树。直接把它存进库，崩溃后捡回来的就成
+    # 了一张思维导图——而用户当初要的是鱼骨图/流程图，他会以为这一轮连图型都没认对。
+    # 这里对**副本**先折一次：折叠是纯函数（`to_fishbone` / `to_flow` 都不就地改输入），
+    # 折的是副本，下游 `_fill_details` 等仍按一棵树工作。
+    #
+    # 诊断给一次性空表：那是**最终产物**的读数，一份快照不该替它提前报一遍，也不该
+    # 把同一批诊断算两次。
+    #
+    # `expandable` 要在快照上补一次：正式那一次打标在这条线之后（`_stamp_expandable`），
+    # 快照里被裁掉子节点的那些因此还是缺省的 `yes`——用户点开它以为还能长，点下去
+    # 却报 `too_deep`。这里对副本按同一张表补成 `unknown`（"没长完，不是到底了"）。
+    if ctx.checkpoint is not None:
+        snapshot = content.model_copy(deep=True)
+        _stamp_expandable(snapshot, {node_id: "unknown" for node_id in cut_ids},
+                          max_depth=mindmap_contract.MAX_TREE_DEPTH)
+        await ctx.checkpoint(_shape_output(
+            snapshot, diagram_type=diagram_type,
+            raw_plan=raw_plan, diagnostics=[]))
+
     # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------
     #
     # 放在这里而不是更早：裁剪已经做完（被裁掉的节点不必为它付说明的 token），
@@ -7961,6 +7993,12 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     ctx.publish_tree(updated)
     ctx.batches.append(batch)
 
+    # 检查点：与 `_commit_drafts` 同一个理由。位置在这两行之后而不是更晚——后面
+    # 还要发一串 `node_grow` 预览帧，再来一次模型调用写说明；那几十秒里进程没了，
+    # 这一支新长的节点本可以留下却会整批消失。`updated` 已是最终图型，直接交。
+    if ctx.checkpoint is not None:
+        await ctx.checkpoint(updated)
+
     # ---- 生长预览：落在**被展开的那个节点**下面 ----
     #
     # `path` 是父节点的子索引链，而这里的父节点就是被展开的节点本身。写成 `[]`
@@ -8833,7 +8871,7 @@ def _is_container_root(content: DiagramContent, node_id: str) -> bool:
     return any(root.id == node_id for root in shapes.roots(content))
 
 
-def _commit_drafts(
+async def _commit_drafts(
     ctx: RunContext, content: DiagramContent, drafts: list[dict[str, Any]],
 ) -> tuple[DiagramContent, OpBatch, dict[str, str]] | ToolResult:
     """把一批草案落成工作树 `ctx.candidate`：规范化 id → 建批次 → 原子执行 → 记账。
@@ -8847,6 +8885,12 @@ def _commit_drafts(
     返回值三态：成功是 `(树, 批次, id 映射)`，失败是 `ToolResult(ok=False)`。
     用返回值而不是抛异常，是因为失败信息要**原样回给模型**（`exc.path` 指到具体
     字段），而它本来就该是一条正常的工具结果。
+
+    它是 `async` 的**只因为检查点**：落树之后要把这一批结果写进台账（见那条
+    `await ctx.checkpoint`）。除此之外整段是纯计算，`_apply_ops_any` 不 await 任何
+    东西。注册表本来就两种都收（`ToolRegistry.execute` 里 `inspect.isawaitable`），
+    所以改这一处不会波及契约；代价是六个同步写工具也跟着变成 `async def`——它们
+    本来就是"调一次写一把"的形状，加个 `async` 只是让这一条路能被 await 完。
     """
     try:
         ops, id_map = normalize_ops(drafts, shapes.node_ids(content))
@@ -8866,6 +8910,15 @@ def _commit_drafts(
 
     ctx.publish_tree(updated)
     ctx.batches.append(batch)
+    # 检查点：这一批 op 已经把树落到 `ctx.candidate` 了，趁它还和台账里那棵同形，
+    # 立刻让后台存一份。edit 路**不需要**像 `_generate` 那样再折一次形——`updated`
+    # 是 `_apply_ops_any` 的产物，本来就是最终图型（`_shape_output` 只在创建那条路上
+    # 才需要把内部树折成骨图/流程图）。
+    #
+    # 失败不抛：检查点自带"存不上就算了"的语义（`runs.checkpoint` 不抛出，
+    # 路由层那份回调还兜了一层 warning），不该让它把一次本来能成功的编辑弄失败。
+    if ctx.checkpoint is not None:
+        await ctx.checkpoint(updated)
     return updated, batch, id_map
 
 
@@ -8948,7 +9001,7 @@ def _check_icon_arg(value: str | None) -> str | None:
     return text[:MAX_NODE_ICON_CHARS]
 
 
-def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
+async def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
     """在父节点下加**一个**子节点。
 
     与 `mindmap_edit` 的 `add` 是同一条落树路（`_commit_drafts` → `apply_ops`），
@@ -9022,7 +9075,7 @@ def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
         "color": args.color,
         "icon": args.icon,
     }
-    committed = _commit_drafts(ctx, content, [draft])
+    committed = await _commit_drafts(ctx, content, [draft])
     if isinstance(committed, ToolResult):
         return committed
     updated, batch, id_map = committed
@@ -9043,7 +9096,7 @@ def _add_node(args: AddNodeArgs, ctx: RunContext) -> ToolResult:
     )
 
 
-def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
+async def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
     """改**一个**节点的字段（至少给一个）。
 
     `None` = 这一项不动、空串 = 清空该项，两件事必须分开（理由见
@@ -9082,7 +9135,7 @@ def _update_node(args: UpdateNodeArgs, ctx: RunContext) -> ToolResult:
             changes[name] = value
     draft = {"op": "update", "id": args.node_id, "changes": changes}
 
-    committed = _commit_drafts(ctx, content, [draft])
+    committed = await _commit_drafts(ctx, content, [draft])
     if isinstance(committed, ToolResult):
         return committed
     updated, batch, id_map = committed
@@ -9119,7 +9172,7 @@ def _edges_endpointed_in(content: DiagramContent, doomed: set[str]) -> list[Edge
             if edge.source in doomed or edge.target in doomed]
 
 
-def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
+async def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
     """删一个节点——**连同它的整棵子树**（级联）。
 
     子树策略为什么是级联，而不是"子节点提升到父节点"或"有子节点就拒绝"：
@@ -9167,7 +9220,7 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
                          if relation.source in doomed or relation.target in doomed]
     draft = {"op": "remove", "id": args.node_id}
 
-    committed = _commit_drafts(ctx, content, [draft])
+    committed = await _commit_drafts(ctx, content, [draft])
     if isinstance(committed, ToolResult):
         return committed
     updated, batch, id_map = committed
@@ -9198,7 +9251,7 @@ def _remove_node(args: RemoveNodeArgs, ctx: RunContext) -> ToolResult:
     )
 
 
-def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
+async def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
     """把一个节点连同子树挂到另一个父节点下。
 
     两道结构检查在这里（环由 `apply_ops` 兜底，那一条不需要看深度）：
@@ -9270,7 +9323,7 @@ def _move_node(args: MoveNodeArgs, ctx: RunContext) -> ToolResult:
 
     draft = {"op": "move", "id": args.node_id,
              "new_parent_id": args.new_parent_id, "index": index}
-    committed = _commit_drafts(ctx, content, [draft])
+    committed = await _commit_drafts(ctx, content, [draft])
     if isinstance(committed, ToolResult):
         return committed
     updated, batch, id_map = committed
@@ -9358,7 +9411,7 @@ def _flow_endpoint_label(content: FlowContent, endpoint_id: str) -> str:
     return node.label.strip() if node is not None else endpoint_id
 
 
-def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
+async def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     """在**两个已有节点**之间连一条附加边。
 
     与 `add_node` 是同一条落树路（`_commit_drafts` → `apply_ops`）：整批原子，
@@ -9444,7 +9497,7 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
         "label": args.label,
         "kind": args.kind,
     }
-    committed = _commit_drafts(ctx, content, [draft])
+    committed = await _commit_drafts(ctx, content, [draft])
     if isinstance(committed, ToolResult):
         return committed
     updated, batch, id_map = committed
@@ -9473,7 +9526,7 @@ def _add_edge(args: AddEdgeArgs, ctx: RunContext) -> ToolResult:
     )
 
 
-def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
+async def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
     """删一条附加边。**不动节点**：删线不改结构，所以不检查节点数/层数。
 
     存在的边才删得掉：给一个不存在的 id 直接报 `edge_not_found`，而不是
@@ -9500,7 +9553,7 @@ def _remove_edge(args: RemoveEdgeArgs, ctx: RunContext) -> ToolResult:
     if edge is None:
         return _fail("edge_not_found", f"边 {args.edge_id} 不存在。")
 
-    committed = _commit_drafts(ctx, content, [{"op": "remove_edge", "id": args.edge_id}])
+    committed = await _commit_drafts(ctx, content, [{"op": "remove_edge", "id": args.edge_id}])
     if isinstance(committed, ToolResult):
         return committed
     updated, batch, id_map = committed
@@ -9626,7 +9679,7 @@ async def _edit(args: EditArgs, ctx: RunContext) -> ToolResult:
 
         drafts.append(draft)
 
-    committed = _commit_drafts(ctx, content, drafts)
+    committed = await _commit_drafts(ctx, content, drafts)
     if isinstance(committed, ToolResult):
         return committed
     updated, batch, id_map = committed
