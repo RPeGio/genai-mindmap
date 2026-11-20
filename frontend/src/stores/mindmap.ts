@@ -1118,6 +1118,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
           },
         ]);
       }
+      // 检查点也要说清。它**不是**半棵树（结构是完整的），缺的是每个节点的说明——
+      // 不补这一笔，用户载入后会以为"模型这次什么都没写"，然后重跑一遍，
+      // 而他手上那棵树其实已经能用了。用 `diagnostic` 而不是新增一种 `kind`：
+      // 告警区的两种样式已经够用，"这是一条附注"正是它的位置。
+      if (detail.checkpointed_at) {
+        recordWarnings([
+          {
+            kind: 'diagnostic',
+            code: 'CHECKPOINT',
+            message: '这份结果是在写说明之前保住的结构，节点说明还没生成；结构可以照常用。',
+          },
+        ]);
+      }
       clearAgentPreview();
       resetDraftOps();
       // 来历照原样带过来：占位树恢复成"模型生成"就是界面替它撒谎。

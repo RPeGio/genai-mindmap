@@ -632,6 +632,31 @@ describe('生成结果与换图', () => {
     expect(store.content).toBeNull();
     expect(store.status).toContain('换了一张图');
   });
+
+  it('载入一份检查点时，说清它缺的是说明而不是结构', async () => {
+    const store = useMindMapStore();
+    store.newMap();
+    store.resumableRun = {
+      run_id: 'cp-1', status: 'failed', intent: 'create', goal: '崩掉那张',
+      created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z',
+      checkpointed_at: '2024-01-01T00:01:00Z', node_count: 12,
+    };
+    stubFetch(() => jsonReply({
+      run_id: 'cp-1', status: 'failed', intent: 'create', goal: '崩掉那张',
+      created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z',
+      checkpointed_at: '2024-01-01T00:01:00Z', node_count: 12,
+      candidate: content('崩之前长的树'), failure: null, mode: 'model',
+    }));
+
+    await store.resumeRun();
+
+    // 树装进来了（结构是完整的）。
+    expect(store.content?.root.label).toBe('崩之前长的树');
+    const warning = store.agentWarnings.find(item => item.code === 'CHECKPOINT');
+    expect(warning?.message).toContain('说明');
+    // 而且不能被记成"半棵树"：那会让状态行按"分支没长完"提示。
+    expect(store.agentWarnings.some(item => item.kind === 'partial')).toBe(false);
+  });
 });
 
 describe('撤销 / 重做与生成落地', () => {
