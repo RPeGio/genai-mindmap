@@ -644,7 +644,7 @@ class TestNonTreeEditing:
         """`add_node` 能在骨下面加节点，产物仍然是 `FishboneContent`。"""
         ctx = _fishbone_ctx()
 
-        result = _add_node(AddNodeArgs(parent_id="h1-1", label="新原因"), ctx)
+        result = asyncio.run(_add_node(AddNodeArgs(parent_id="h1-1", label="新原因"), ctx))
 
         assert result.ok, result.content
         assert isinstance(ctx.candidate, FishboneContent)
@@ -786,3 +786,90 @@ class TestCheckpoint:
         delivered = ctx.candidate
         assert isinstance(delivered, FishboneContent)
         assert len(delivered.bones) == len(FISHBONE_PLAN["branches"])
+
+
+# ---------------------------------------------------------------- 编辑侧的检查点
+
+
+class TestEditCheckpoint:
+    """edit / expand 也要打检查点。
+
+    创建那条路的检查点保的是"结构长好了、说明还没写"；编辑这条路保的是**已经改完
+    的那一批 op**——同样是一大段模型调用之前能救回来的东西。少了它，一次二十分钟的
+    编辑在写完说明前崩掉，用户重新打开看到的还是编辑前的树。
+    """
+
+    def test_edit_batch_lands_a_checkpoint(self):
+        """一批 op 落树之后立刻打点，内容就是改完的那棵树。"""
+        ctx = _fishbone_ctx()
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        args = _edit_args([{"op": "update", "id": "h1-1", "changes": {"label": "审批人已排班"}}])
+        result = asyncio.run(_edit(args, ctx))
+
+        assert result.ok, result.content
+        assert len(seen) == 1, "一批 op 只该打一个点"
+        checkpointed = seen[0]
+        # 图型必须是用户原来那张：edit 路不经过 `_shape_output`，交出去的本来就是
+        # 最终形状（`_apply_ops_any` 保持容器类型）。
+        assert isinstance(checkpointed, FishboneContent)
+        assert shapes.find(checkpointed, "h1-1").label == "审批人已排班"
+
+    def test_single_node_tool_lands_a_checkpoint_too(self):
+        """细粒度的 `add_node` 与 `mindmap_edit` 共用 `_commit_drafts`，也要打点。"""
+        ctx = _fishbone_ctx()
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        result = asyncio.run(_add_node(AddNodeArgs(parent_id="l1-1", label="只是打点"), ctx))
+
+        assert result.ok, result.content
+        assert len(seen) == 1
+        assert isinstance(seen[0], FishboneContent)
+        assert [child.label for child in shapes.find(seen[0], "l1-1").children] == ["只是打点"]
+
+    def test_failed_batch_does_not_land_a_checkpoint(self):
+        """op 被拒时树一个字都没动，那就没有什么可存的——不打点。"""
+        ctx = _fishbone_ctx()
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        args = _edit_args([{"op": "update", "id": "没有这个节点", "changes": {"label": "甲"}}])
+        result = asyncio.run(_edit(args, ctx))
+
+        assert not result.ok
+        assert seen == []
+
+    def test_expand_lands_a_checkpoint(self):
+        """`node_expand` 在批次落树之后打点：新长的这一支不该等到写说明才安全。"""
+        ctx = _fishbone_ctx()
+        ctx.request = AgentRunRequest(
+            goal="展开", intent="expand", selected_ids=["h1-1"],
+            budget=RunBudget(max_model_calls=4, max_output_tokens=32768),
+        )
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        async def fake_chat(system: str, user: str, *, max_tokens: int | None = None,
+                            on_delta: Any = None) -> dict:
+            return {"children": [{"label": "排班表缺失", "expandable": False}]}
+
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            result = asyncio.run(_expand(ExpandArgs(node_id="h1-1", count=2), ctx))
+
+        assert result.ok, result.content
+        assert len(seen) == 1
+        assert isinstance(seen[0], FishboneContent)
+        assert [child.label for child in shapes.find(seen[0], "h1-1").children] == [
+            "排班表缺失"]
+
+    def test_edit_without_a_checkpoint_channel_is_fine(self):
+        """没有通道时（单测、脚本、直接调工具）不能因为缺回调而失败。"""
+        ctx = _fishbone_ctx()
+        assert ctx.checkpoint is None
+
+        args = _edit_args([{"op": "update", "id": "h1-1", "changes": {"label": "甲"}}])
+        result = asyncio.run(_edit(args, ctx))
+
+        assert result.ok, result.content
