@@ -17,6 +17,7 @@ import {
 import FishboneEdge from './FishboneEdge.vue';
 import MindEdge from './MindEdge.vue';
 import MindNode from './MindNode.vue';
+import MindRelation from './MindRelation.vue';
 
 /**
  * 画布是**纯渲染**：节点坐标、连线句柄、鱼骨的骨线折线都由 store 算好
@@ -377,6 +378,13 @@ onBeforeUnmount(() => {
       -->
       <template #edge-mindEdge="edgeProps">
         <MindEdge v-bind="edgeProps" />
+      </template>
+      <!--
+        跨节点关系线（`relations`）。第三种渲染器，理由见 `MindRelation.vue`：
+        它的两个端点没有共同父节点，折线会从中间的节点上拐直角。
+      -->
+      <template #edge-mindRelation="edgeProps">
+        <MindRelation v-bind="edgeProps" />
       </template>
       <!--
         鱼骨图的骨线（主骨段 + 60° 斜骨、以及原因那截水平短线）。点的来源是

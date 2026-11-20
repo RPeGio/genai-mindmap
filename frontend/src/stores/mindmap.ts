@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
+import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, MindRelation, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { applyOps } from '../mindmap/ops';
@@ -49,6 +49,7 @@ import {
   findNode,
   LIMITS,
   removeEdge as removeEdgeFromContent,
+  removeRelation as removeRelationFromContent,
   removeNode,
   renameNode,
   setNodeNote,
@@ -1544,6 +1545,35 @@ export const useMindMapStore = defineStore('mindmap', () => {
   });
 
   /**
+   * 跨节点关系线（`ContentBase.relations`）的几何：端点落在哪两个节点、走哪两个句柄。
+   *
+   * 与 `attachEdges` 分开而不是合并成一个数组：两者的画法、数据形状、删除入口都不同
+   * （关系线读 `kind` / `why`，附加边读 `kind` / `label` / `back` / `inner`）。合起来
+   * 会让 `edges` 那个 computed 里出现一堆"这条到底是哪种"的判别。
+   *
+   * 端点找不到就跳过（契约层硬拒 dangling，这里只是兜底）：Vue Flow 拿到
+   * `source: undefined` 会抛错，整张画布白屏。
+   */
+  const relationEdges = computed(() => {
+    const current = layout.value;
+    const source = content.value;
+    if (!current || !source) return [];
+
+    const out: Array<{
+      relation: MindRelation; side: ChildSide; targetSide: ChildSide;
+    }> = [];
+    for (const relation of source.relations ?? []) {
+      const from = current.positions.get(relation.source);
+      const to = current.positions.get(relation.target);
+      if (!from || !to) continue;
+      const side = childSide(from, to, current.direction);
+      const targetSide: ChildSide = side === 'left' ? 'right' : side === 'right' ? 'left' : 'top';
+      out.push({ relation, side, targetSide });
+    }
+    return out;
+  });
+
+  /**
    * 每个节点要为附加边多开哪几个句柄。
    *
    * `MindNode.vue` 只渲染 `data.in` / `data.out` 里列出的句柄，而那两个数组原本只
@@ -1564,6 +1594,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const from = ensure(edge.source);
       if (!from.out.includes(side)) from.out.push(side);
       const to = ensure(edge.target);
+      if (!to.in.includes(targetSide)) to.in.push(targetSide);
+    }
+    // 跨节点关系线与附加边走**同一套端点约定**：一条关系线的两端也可能是两个叶子，
+    // 不为它们开句柄，Vue Flow 同样会把线从节点中心乱连。这一段是"关系能画出来"
+    // 的必要条件，不是优化。
+    for (const { relation, side, targetSide } of relationEdges.value) {
+      const from = ensure(relation.source);
+      if (!from.out.includes(side)) from.out.push(side);
+      const to = ensure(relation.target);
       if (!to.in.includes(targetSide)) to.in.push(targetSide);
     }
     return index;
@@ -1776,6 +1815,29 @@ export const useMindMapStore = defineStore('mindmap', () => {
         },
       });
     }
+
+    // 跨节点关系线（`relations`）。第三类线，用**第三种**渲染器：它的两个端点没有
+    // 共同的父节点，走 `mindEdge` 那套贴边的折线会从中间节点上拐直角，看起来像
+    // "穿过"了某个节点（见 `canvas/MindRelation.vue` 的注释）。
+    //
+    // id 前缀 `relation:`：同一个节点对上可以同时存在父子线（`A->B`）、附加边
+    // （`attach:…`）与关系线，三条的 id 必须分得开。
+    for (const { relation, side, targetSide } of relationEdges.value) {
+      out.push({
+        id: `relation:${relation.id}`,
+        source: relation.source,
+        sourceHandle: `out-${side}`,
+        target: relation.target,
+        targetHandle: `in-${targetSide}`,
+        type: 'mindRelation',
+        data: {
+          // 渲染只读 `kind`：后端 `_sync_kind` 保证它有值，`type` 是旧名的回声。
+          kind: relation.kind ?? 'references',
+          why: relation.why ?? undefined,
+          relationId: relation.id,
+        },
+      });
+    }
     return out;
   });
 
@@ -1868,6 +1930,29 @@ export const useMindMapStore = defineStore('mindmap', () => {
     return contentEdges.value.filter(edge => (
       edge.source === id || edge.target === id
       || (stage !== null && (edge.source === stage || edge.target === stage))
+    ));
+  });
+
+  /**
+   * 已应用内容里的**全部**跨节点关系线。
+   *
+   * 三种形状的顶层都有这个字段（契约 `ContentBase`），所以不需要像边那样按图型分派。
+   */
+  const contentRelations = computed<MindRelation[]>(() => (
+    content.value?.relations ?? []
+  ));
+
+  /**
+   * 与选中节点相关的关系线（源或目标命中它）。详情面板用它列"这个节点参与的关系"。
+   *
+   * 判据只有节点 id，没有 `selectedEdges` 那一层"阶段放宽"：关系线的端点永远
+   * 是节点 id（见契约 `_validate_relations`），不存在第二种命名空间。
+   */
+  const selectedRelations = computed<MindRelation[]>(() => {
+    const id = selectedId.value;
+    if (!id) return [];
+    return contentRelations.value.filter(relation => (
+      relation.source === id || relation.target === id
     ));
   });
 
@@ -2445,6 +2530,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (!known) return false;
     if (!applyContent(removeEdgeFromContent(content.value, edgeId), true)) return false;
     status.value = '已删除这条附加关系，可撤销。';
+    return true;
+  }
+
+  /**
+   * 删一条跨节点关系线。
+   *
+   * 与 `deleteEdge` 分开的理由见 `edits.removeRelation`：两套字段、两套 id 命名空间。
+   * 这里不做"未知 id 直接 false"之外的校验——关系线不参与布局，删它不改变任何节点
+   * 的坐标，所以不需要重排。
+   */
+  function deleteRelation(relationId: string): boolean {
+    const current = content.value;
+    if (!current) return false;
+    if (!(current.relations ?? []).some(relation => relation.id === relationId)) return false;
+    if (!applyContent(removeRelationFromContent(current, relationId), true)) return false;
+    status.value = '已删除这条关系线，可撤销。';
     return true;
   }
 
@@ -3606,6 +3707,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     edgeNameOf,
     connectNodes,
     deleteEdge,
+    // 跨节点关系线：**画布上画出来**（`edges` 里的 `relation:` 通道）与**详情里能看见**
+    // （`selectedRelations`）是同一个能力的两半——只画不列，用户看到一根虚线却找不到
+    // 它是从哪来的；只列不画，那就还是改动之前那副"界面不渲染 relations"的样子。
+    contentRelations,
+    selectedRelations,
+    deleteRelation,
     selectedNode,
     selectedRefs,
     refIndex,
