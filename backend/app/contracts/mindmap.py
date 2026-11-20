@@ -288,27 +288,136 @@ class NodeStyle(BaseModel):
 
 
 class RelationType(str, Enum):
+    """跨节点关系的**旧四值**。
+
+    这是这张图从 v1 起就有的取值集合，库里的老图、导入的老 JSON、前端历史类型
+    全都按它写。它**不再是生成侧要写的字段名**（那件事现在是 `Relation.kind`），
+    留着是因为"读得回旧数据"与"写得出新数据"是两件必须同时成立的事：删掉它等于
+    让所有存量导图在下一次保存时 422，而用户什么都没改。
+    """
+
     cause = "cause"        # A 导致 B
     ref = "ref"            # A 引用/参见 B
     conflict = "conflict"  # A 与 B 冲突
     depends = "depends"    # A 依赖 B
 
 
+class RelationKind(str, Enum):
+    """跨节点关系的语义种类——**规范名**，生成侧只写这一个字段。
+
+    为什么在 `RelationType` 之外另立一套，而不是把它扩成十个值：旧四值是按
+    "这句话怎么说"命名的（`cause` / `ref`），而图谱两段式要表达的是"两个概念在
+    结构上是什么关系"（`part_of` / `refines` 在旧集合里根本无处安放）。两套混在
+    一个枚举里，读代码的人永远分不清哪个值是给旧数据用的、哪个是新生成用的。
+
+    **六个值**对应六种真的会出现在材料里的关系，每一种都有画法上的区别（见
+    `frontend/src/canvas/MindRelation.vue` 的虚线样式与标签）：
+
+      - `depends_on`：A 依赖 B（B 是 A 的前提）。有方向，箭头指向 B；
+      - `causes`：A 导致 B（因果）。有方向，箭头指向 B；
+      - `conflicts`：A 与 B 冲突/互斥。无方向语义，画成不带箭头的虚线；
+      - `part_of`：A 是 B 的组成部分（A ⊂ B）。有方向，箭头指向 B；
+      - `refines`：A 细化/具体化 B（A 是 B 的一个下位说法）。有方向，箭头指向 B；
+      - `references`：A 引用/参见 B（材料里明说"见 X"）。有方向，箭头指向 B。
+
+    为什么是 `Literal` 而不是自由字符串：颜色/线型要按它选，而自由字符串的意思
+    是"每一个没见过的值都渲染成默认样式"——那六个值就白定义了。与 `EdgeKind`
+    同一条理由。
+    """
+
+    depends_on = "depends_on"
+    causes = "causes"
+    conflicts = "conflicts"
+    part_of = "part_of"
+    refines = "refines"
+    references = "references"
+
+
+# 六个值的字符串集合。给"拿到的是任意 JSON，先判合法再构造"的那类调用方用
+# （`agent.tools._relations_from`）：直接 `Relation(kind=...)` 撞上非法值时抛的是
+# `ValidationError`，那会把"模型写错一个词"升级成整张图 500。判一次再构造，错的那条
+# 丢掉、其余照收。派生自枚举而不是另写一份字面量——两处迟早分叉。
+RELATION_KIND_VALUES = frozenset(item.value for item in RelationKind)
+
+
+# 旧值 → 新值的唯一映射。放在模块级而不是 validator 里，是因为**三处**要读它：
+# `Relation` 的同步器、导入层（老 JSON 只有 `type`）、以及测试里"每一种旧值都能
+# 读得回来"的那条断言。写在 validator 内部就成了第二份口径。
+LEGACY_TO_KIND: dict[RelationType, RelationKind] = {
+    RelationType.cause: RelationKind.causes,
+    RelationType.ref: RelationKind.references,
+    RelationType.conflict: RelationKind.conflicts,
+    RelationType.depends: RelationKind.depends_on,
+}
+
+# 关系理由的字数上限。300 与 `evidence` 同口径：`why` 是一句话（"B 是 A 的输入，
+# 原文第 3 段把两者并列写出"），不是一段论证——超过 300 字说明模型在写解读而不是
+# 在说这条边为什么成立。
+MAX_RELATION_WHY_CHARS = 300
+
+
 class Relation(BaseModel):
-    """跨节点的关系线。来源与目标是节点 id，必须都在树里。"""
+    """跨节点的关系线。来源与目标是节点 id，必须都在树里。
+
+    **两个语义字段并存**，这是本轮改动的核心，得一句话说清谁管什么：
+
+      - `kind` 是**规范名**，六个值见 `RelationKind`。生成路径只写它。
+      - `type` 是**旧名**，四个值见 `RelationType`。它继续存在是为了读得回存量
+        数据（库里的图、导入的老 JSON、前端历史类型），**不许**在新代码里当输入。
+
+    两者由 `_sync_kind` 单向同步：只给 `type` 时按 `LEGACY_TO_KIND` 推出 `kind`；
+    只给 `kind` 时 `type` **保持 None**，不做反向映射。
+
+    为什么反向不映射：六个新值里有 `part_of` / `refines` 两个在旧四值里**没有对应**
+    ——多对一的映射写出来只能靠猜（`part_of` 该叫 `ref` 还是 `depends`？），而猜错的
+    后果是"画布按 kind 渲染、导出按 type 渲染"两条路给出不同的标签。所以规矩定成
+    "`type` 是输入的回声，`kind` 是唯一的规范值"：渲染、去重、导出全部读 `kind`，
+    `type` 只保证老数据读得回来、老前端读得到它认识的那四个值。
+    """
+
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=100)
     source: str = Field(min_length=1, max_length=100)
     target: str = Field(min_length=1, max_length=100)
-    type: RelationType
+    # 规范名。`None` 只在"这是老数据、它只给了 type"时出现，由同步器补齐。
+    kind: RelationKind | None = None
+    # 旧名。**只反映输入给了什么**，不由 `kind` 反推（理由见类 docstring）。
+    type: RelationType | None = None
     label: str | None = Field(default=None, max_length=100)
+    # 这条边成立的**理由**（一句话）。与 `evidence` 分工不同：
+    #
+    #   - `why`：为什么把这两个节点连起来——读图的人不看材料也能判断这条线对不对；
+    #   - `evidence`：材料里的原话（逐字），用来回查。
+    #
+    # 契约层允许 `None`（老数据没有它），**生成侧不许**：`agent.tools._relations_from`
+    # 把没有 `why` 的边直接丢掉并记诊断。没有理由的边在画布上就是一根说不出来由的
+    # 虚线，它带来的信息是负的。
+    why: str | None = Field(default=None, max_length=MAX_RELATION_WHY_CHARS)
     evidence: str | None = Field(default=None, max_length=300)
     provenance: Literal["user", "ai", "import"] = "user"
 
-    @field_validator("evidence")
+    @field_validator("evidence", "why")
     @classmethod
     def blank_evidence_as_none(cls, value: str | None) -> str | None:
         return value if value and value.strip() else None
+
+    @model_validator(mode="after")
+    def _sync_kind(self) -> Relation:
+        """把老数据的 `type` 升成 `kind`。**只有这一个方向**。
+
+        三种输入都要能读：
+
+          - 新数据只给 `kind`（生成路径）：`type` 留 None，没有旧消费者需要它；
+          - 老数据只给 `type`（库里的图、导入的老 JSON）：`kind` 按 `LEGACY_TO_KIND`
+            补上，画布因此能按新标签渲染老图；
+          - 两个都给：`kind` 赢，`type` 原样留着。**不报错**——报错会让"模型多写了
+            一个字段"变成整棵树 422，而这件事的正确处理是"以规范名为准"。
+        """
+        if self.kind is None:
+            if self.type is None:
+                raise ValueError("跨节点关系必须给出 kind（六个值之一）")
+            self.kind = LEGACY_TO_KIND[self.type]
+        return self
 
 
 class Theme(BaseModel):
@@ -534,7 +643,10 @@ def _scan_tree(
 def _validate_relations(relations: Sequence[Relation], node_ids: set[str]) -> None:
     """跨节点关系线的四条约束。三种图型共用：`relations` 落在 `ContentBase` 上。"""
     relation_ids: set[str] = set()
-    relation_keys: set[tuple[str, str, RelationType]] = set()
+    # 去重键读 `kind`（规范名）而不是 `type`：`type` 只在老数据上有值，新生成的关系
+    # 全是 None——按它去重时，同一对节点上的两条 `part_of` 会双双通过，画布上
+    # 出现两条完全重叠的虚线。
+    relation_keys: set[tuple[str, str, RelationKind | None]] = set()
     for relation in relations:
         if relation.id in relation_ids:
             raise ValueError("关系 ID 必须唯一")
@@ -545,7 +657,7 @@ def _validate_relations(relations: Sequence[Relation], node_ids: set[str]) -> No
             raise ValueError(f"关系 {relation.id} 的终点节点 {relation.target} 不在导图中")
         if relation.source == relation.target:
             raise ValueError(f"关系 {relation.id} 的起点与终点不能是同一个节点")
-        key = (relation.source, relation.target, relation.type)
+        key = (relation.source, relation.target, relation.kind)
         if key in relation_keys:
             raise ValueError("同一对节点之间的同类关系不能重复添加")
         relation_keys.add(key)

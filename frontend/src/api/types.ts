@@ -403,13 +403,39 @@ export interface NodePosition {
   y: number;
 }
 
-/** 与后端 `Relation` 一致。界面不渲染，原样透传。 */
+/**
+ * 跨节点关系的语义种类。与后端 `RelationKind` 一致（六个值）。
+ *
+ * 为什么单独起一套而不复用 `RelationType` 的四个旧值：`part_of` / `refines` 在旧集合
+ * 里根本无处安放，而混成一个联合类型会让"这个值是给老数据用的、那个是新生成用的"
+ * 永远分不清。渲染一律读 `kind`。
+ */
+export type RelationKind =
+  | 'depends_on'
+  | 'causes'
+  | 'conflicts'
+  | 'part_of'
+  | 'refines'
+  | 'references';
+
+/**
+ * 与后端 `Relation` 一致。**画布上画成虚线**（`canvas/MindRelation.vue`）。
+ *
+ * 两个语义字段并存，分工是死的：
+ *  - `kind` 是规范名，六个值，后端 `_sync_kind` 保证它一定有值；
+ *  - `type` 是旧名，四个值，只为读回存量数据存在——**不要**用它做判断。
+ *
+ * `why` 是这条边成立的理由（一句话）。生成侧把没有 `why` 的边直接丢掉，所以画布上
+ * 每一根虚线都答得上来"为什么这两个节点有关"。
+ */
 export interface MindRelation {
   id: string;
   source: string;
   target: string;
-  type: 'cause' | 'ref' | 'conflict' | 'depends';
+  kind?: RelationKind | null;
+  type?: 'cause' | 'ref' | 'conflict' | 'depends' | null;
   label?: string | null;
+  why?: string | null;
   evidence?: string | null;
   provenance?: 'user' | 'ai' | 'import';
 }
