@@ -151,10 +151,11 @@ import os
 import threading
 import time
 import unicodedata
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 from neo4j import READ_ACCESS as _READ, WRITE_ACCESS as _WRITE
 from neo4j import Driver, GraphDatabase
@@ -1244,6 +1245,177 @@ def neighbors(name: str, *, hops: int = 2, limit: int = 50) -> list[GraphPath]:
         seen.add(key)
         paths.append(path)
     return paths
+
+
+# ------------------------------------------------------------ 子图（生成侧取数）
+#
+# 三段式改两段式之后，**骨架不再由章节标题定**，改由这张图定：模型看到的输入是
+# "哪些概念重要（度数）+ 它们之间是什么关系（边上的短语）+ 这条关系的原文位置"。
+#
+# 三条语句各管一件事，都在同一个只读事务里跑（分三次事务会出现"实体表按旧图算、
+# 边按新图走"的半数一致）。
+
+
+@dataclass(frozen=True)
+class GraphEntity:
+    """子图里的一个实体。`degree` 是它在**整张图**上的边数，不是子图内的。"""
+
+    name: str
+    type: str | None
+    degree: int
+
+
+@dataclass(frozen=True)
+class GraphLink:
+    """子图里的一条有向边：两个实体 + 关系短语 + 一处证据定位。
+
+    `weight` 是这条 `(src, dst, relation)` 在材料里被**几段独立抽到**——它是生成侧
+    唯一可用的置信度信号（抽取层不给分数），也是"超了上限按置信度取"里那个置信度。
+    `source_id` / `start` / `end` 取其中第一处，用来让模型写 `source_refs` 时能
+    逐字回到原文。
+    """
+
+    src: str
+    dst: str
+    relation: str
+    source_id: str
+    start: int
+    end: int
+    weight: int
+
+
+# 头部实体。`-[r:REL]-` 无向计度：一条边对两端都算连接，孤立实体的度是 0、不会
+# 进来（它们对结构没有贡献，只占提示词）。
+#
+# 名字级去重（`WITH e.name AS name, count(r)`）：同名不同类型的两个节点（"苹果"
+# 公司与水果）在提示词里是同一行——生成侧只关心"这个词在这个材料集里重要"。
+#
+# **`$source_ids` 是"只看这批材料"的闸**（`null` = 看全图）：图是**跨材料共享**的，
+# 同一台机器上放过一批外卖报销的材料再生成"机器学习"，全图取头部会取到报销实体。
+# 所以生成侧一律带 scope，取"本次这几份材料自己的图"。判据写成一句 `IS NULL OR`，
+# 而不是两条语句：两条语句迟早分叉（一条改了这个条件、另一条没改）。
+CYPHER_TOP_ENTITIES = (
+    f"MATCH (e:{ENTITY_LABEL})-[r:{EDGE_TYPE}]-()\n"
+    "WHERE $source_ids IS NULL OR r.source_id IN $source_ids\n"
+    "WITH e.name AS name, count(r) AS degree\n"
+    "ORDER BY degree DESC, name ASC\n"
+    "LIMIT $limit\n"
+    "RETURN name, degree"
+)
+
+# 这批实体内部的关系。三个约束各有理由：
+#
+#   - **两端都必须在头部集合里**（`WHERE b.name IN $names`）：只有一端在的边会
+#     把提示词引到一批没被选中的实体上，模型于是为它们编节点——那是"图说了一件事、
+#     树写了另一件事"的来源；
+#   - **同一条 scope**（`r.source_id IN $source_ids`）：头部实体是按这批材料选的，
+#     边也必须按这批材料选，否则提示词里会出现"这两个实体有关系"而那条关系出自
+#     另一本书；
+#   - 按 `weight` 降序：`weight` 是**这条关系在材料里被几段独立抽到**。出现三次的
+#     "A 依赖 B"比出现一次的值得占提示词。
+#
+# `sources` 收成 list 而不是留重复行：同一条边在多段材料里出现时，`UNIQUE` 里带着
+# `chunk_start`，库里本来就是多行。这里给 Python 侧的是"一条关系 + 它的证据条数"。
+CYPHER_SUBGRAPH_LINKS = (
+    "UNWIND $names AS src\n"
+    f"MATCH (a:{ENTITY_LABEL} {{name: src}})-[r:{EDGE_TYPE}]->(b:{ENTITY_LABEL})\n"
+    "WHERE b.name IN $names\n"
+    "AND ($source_ids IS NULL OR r.source_id IN $source_ids)\n"
+    "WITH a.name AS src, b.name AS dst, r.relation AS relation,\n"
+    "     collect(DISTINCT r.source_id) AS sources, count(r) AS weight,\n"
+    "     min(r.chunk_start) AS start, min(r.chunk_end) AS end\n"
+    "RETURN src, dst, relation, sources, weight, start, end\n"
+    "ORDER BY weight DESC, src ASC, dst ASC, relation ASC\n"
+    "LIMIT $limit"
+)
+
+# 这批实体的类型。同名不同类型取任意一个（`head`）：提示词里那一行只是给模型一个
+# "这是概念还是人名"的提示，不是分类学。
+CYPHER_SUBGRAPH_TYPES = (
+    f"UNWIND $names AS name\n"
+    f"MATCH (e:{ENTITY_LABEL} {{name: name}})\n"
+    "RETURN name, head(collect(DISTINCT e.type)) AS type"
+)
+
+
+def subgraph(
+    *, entities: int = 60, links: int = 120, scope: Sequence[str] | None = None,
+) -> tuple[list[GraphEntity], list[GraphLink]]:
+    """取一张"重要实体 + 它们之间的关系"的子图，给生成侧当结构骨架的输入。
+
+    **为什么要截取**：全图上千个实体、上千条边塞不进提示词（那是十几万 token），
+    塞进去模型也只会盯着前几行看。截取的口径是**度数**：在材料里被反复连接的概念
+    才撑得起一级分支，只出现一次的名字是长尾。
+
+    `scope` 是**材料范围**（`source_id` 列表）：给了就只看这批材料抽出来的边，不给
+    就看全图。生成侧一律给——图是跨材料共享的，"上次那批报销材料"的实体不该出现在
+    这一次的主题里（理由见 `CYPHER_TOP_ENTITIES`）。
+
+    `scope` 一条都对不上（材料没入过图、或者 id 是请求级的临时 id）时**回退全图**
+    而不是返回空：那种情况下"取到别的材料的实体"仍好过"两段式直接降级成三段式"
+    ——后者会让用户以为开关没生效。回退由调用方从 `stats()` 里看不出来，所以这个
+    行为必须写在这里。
+
+    `entities` / `links` 都夹在 `MAX_LIMIT` 内——与 `neighbors` 同一条理由，这里多
+    一层：这个函数的输出会变成提示词，无上限等于让一次生成请求花掉几十万 token。
+
+    返回 `(实体, 关系)`，两个列表都按重要性降序。图没建（没配密码 / 连不上 / 空图）
+    时返回两个空列表——调用方只需要判 `if not entities`，不必为"图没建好"写第二个
+    分支（与 `stats()` / `neighbors` 一致的读接口约定）。
+    """
+    entity_cap = _clamp_limit(entities)
+    link_cap = _clamp_limit(links)
+    names_scope = list(scope) if scope else None
+
+    def _read(source_ids: list[str] | None) -> tuple[list[Any], dict[str, Any], list[Any]]:
+        with _transaction(read_only=True) as transaction:
+            top = list(transaction.run(
+                CYPHER_TOP_ENTITIES, {"limit": entity_cap, "source_ids": source_ids}))
+            if not top:
+                return [], {}, []
+            names = [str(record["name"]) for record in top]
+            types = {
+                str(record["name"]): (record["type"] or None)
+                for record in transaction.run(CYPHER_SUBGRAPH_TYPES, {"names": names})
+            }
+            rows = list(transaction.run(
+                CYPHER_SUBGRAPH_LINKS,
+                {"names": names, "limit": link_cap, "source_ids": source_ids}))
+        return top, types, rows
+
+    try:
+        top, types, rows = _read(names_scope)
+        if not top and names_scope:
+            top, types, rows = _read(None)
+    except (GraphStoreError, OSError) as exc:
+        logger.warning("图谱子图不可用：%s", type(exc).__name__)
+        return [], []
+    if not top:
+        return []
+
+    found: list[GraphEntity] = []
+    for record in top:
+        name = str(record["name"])
+        kind = types.get(name)
+        found.append(GraphEntity(
+            name=name,
+            type=str(kind) if kind else None,
+            degree=int(record["degree"]),
+        ))
+    linked: list[GraphLink] = []
+    for record in rows:
+        sources = record["sources"] or []
+        source_id = str(sources[0]) if sources else ""
+        linked.append(GraphLink(
+            src=str(record["src"]),
+            dst=str(record["dst"]),
+            relation=str(record["relation"]),
+            source_id=source_id,
+            start=int(record["start"] or 0),
+            end=int(record["end"] or 0),
+            weight=int(record["weight"]),
+        ))
+    return found, linked
 
 
 def stats() -> dict:
