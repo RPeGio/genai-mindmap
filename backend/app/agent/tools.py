@@ -5138,9 +5138,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     #
     # 诊断给一次性空表：那是**最终产物**的读数，一份快照不该替它提前报一遍，也不该
     # 把同一批诊断算两次。
+    #
+    # `expandable` 要在快照上补一次：正式那一次打标在这条线之后（`_stamp_expandable`），
+    # 快照里被裁掉子节点的那些因此还是缺省的 `yes`——用户点开它以为还能长，点下去
+    # 却报 `too_deep`。这里对副本按同一张表补成 `unknown`（"没长完，不是到底了"）。
     if ctx.checkpoint is not None:
+        snapshot = content.model_copy(deep=True)
+        _stamp_expandable(snapshot, {node_id: "unknown" for node_id in cut_ids},
+                          max_depth=mindmap_contract.MAX_TREE_DEPTH)
         await ctx.checkpoint(_shape_output(
-            content.model_copy(deep=True), diagram_type=diagram_type,
+            snapshot, diagram_type=diagram_type,
             raw_plan=raw_plan, diagnostics=[]))
 
     # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------

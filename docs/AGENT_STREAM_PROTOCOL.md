@@ -172,8 +172,11 @@ JSON 内自带的 id，只能由工具层带上路径。
 ```python
 # 创建（backend/app/agent/tools.py::_generate）—— 第四步（写说明）之前
 if ctx.checkpoint is not None:
+    snapshot = content.model_copy(deep=True)
+    _stamp_expandable(snapshot, {node_id: "unknown" for node_id in cut_ids},
+                      max_depth=mindmap_contract.MAX_TREE_DEPTH)
     await ctx.checkpoint(_shape_output(
-        content.model_copy(deep=True), diagram_type=diagram_type,
+        snapshot, diagram_type=diagram_type,
         raw_plan=raw_plan, diagnostics=[]))
 
 # 按支展开（::_expand）—— 批次落树之后、生长预览与写说明之前
@@ -197,6 +200,11 @@ if ctx.checkpoint is not None:
   要鱼骨图。所以落库前对**副本**先折一次（`to_fishbone`/`to_flow` 是纯函数，下游仍按一棵
   树工作），`diagnostics=[]` 给一次性空表（`_shape_output` 会往传入的列表里 append，快照
   不该替最终产物提前报诊断、更不该让同一批诊断算两遍）。
+- **创建这条路还要在快照上补一次 `expandable` 打标**：正式那一次 `_stamp_expandable` 在
+  检查点**之后**（它要用裁剪后的 `cut_ids`，位置由最终产物决定），所以快照里被裁掉子节点
+  的那些会带着缺省的 `yes`——用户点开以为还能长，点下去却报 `too_deep`，而被裁的恰好是
+  唯一还能继续长的地方。快照上按同一张表补成 `unknown`（"没长完，不是到底了"），与最终
+  交付那份的标记口径一致。
 - **编辑 / 展开这两条路不需要折形**：`updated` 是 `_apply_ops_any` 的产物，本来就是最终
   图型（`_shape_output` 只服务创建那条路）。它们保的是"已经改完的那一批 op"——一次二十分钟
   的编辑在写完说明前崩掉，若不打这个点，用户重新打开看到的还是**编辑前**的树。

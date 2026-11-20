@@ -833,7 +833,7 @@ def test_abandoned_run_shows_up_in_the_list_with_its_node_count():
     assert row["partial"] is None
 
 
-def test_begining_a_fresh_run_cleans_up_abandoned_ones():
+def test_beginning_a_fresh_run_cleans_up_abandoned_ones():
     """开新 run 时顺手清理，不需要后台任务也不需要启动钩子。"""
     runs.begin("stale-3", {"goal": "g"})
     conn = runs._connect()

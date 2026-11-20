@@ -96,10 +96,6 @@ def _active_ids() -> tuple[str, ...]:
     with _ACTIVE_LOCK:
         return tuple(_ACTIVE)
 
-#: 从检查点提起树来时的说明：那时结构已经长好，说明一句都还没写。
-CHECKPOINT_REASON = (
-    "这一次生成在写完说明之前被打断了，交出来的是那时已经长好的结构，说明是空的。"
-)
 
 #: 进程没了的那种收尾。它只进台账（`failure`），不会作为 SSE 帧发给浏览器——
 #: 断掉的那条连接早就没有读者了。
@@ -550,7 +546,6 @@ def _mark(run_id: str, column: str) -> bool:
 __all__ = [
     "ABANDONED_FAILURE",
     "CHECKPOINT_LOCK_TIMEOUT",
-    "CHECKPOINT_REASON",
     "Claim",
     "RESTARTABLE_STATUSES",
     "RUN_ABANDONED_SECONDS",

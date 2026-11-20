@@ -461,7 +461,7 @@ def _summary(record: runs.RunRecord) -> RunSummary:
 def list_runs(
     status_filter: Literal["done", "cancelled", "failed", "running"] | None = Query(
         default=None, alias="status",
-        description="只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。",
+        description="只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled + failed）。",
     ),
     unapplied: bool = Query(
         default=True,

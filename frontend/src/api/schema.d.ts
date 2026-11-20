@@ -2761,7 +2761,7 @@ export interface operations {
     list_runs_api_agent_runs_get: {
         parameters: {
             query?: {
-                /** @description 只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。 */
+                /** @description 只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled + failed）。 */
                 status?: ("done" | "cancelled" | "failed" | "running") | null;
                 /** @description 只列有结果、且后来没被保存过的；置 false 则把这段台账原样列出来。 */
                 unapplied?: boolean;

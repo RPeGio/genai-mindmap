@@ -432,7 +432,9 @@ const resumableText = computed(() => {
   // 检查点（`checkpointed_at`）单独一档、排在 `partial` 前面：它交出来的**不是**
   // 半棵树，是完整结构 + 空的说明。说成"只完成了一部分"会让用户以为要重跑，而实际
   // 上他载入之后直接改就是一棵能用的树——两者下一步完全不同。
-  const count = run.node_count ? `，已保存 ${run.node_count} 个节点` : '';
+  // `node_count` 用 `!= null` 判而不是真值判：0 个节点是**合法**的（检查点落在裁剪
+  // 之后、恰好一棵空树），`run.node_count ?` 会把它悄悄吞成"没存下节点"。
+  const count = run.node_count != null ? `，已保存 ${run.node_count} 个节点` : '';
   const what = run.checkpointed_at
     ? `上次${when}生成在写说明之前断了，结构还在${count}`
     : run.status === 'cancelled'

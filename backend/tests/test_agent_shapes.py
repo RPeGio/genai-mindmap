@@ -775,6 +775,31 @@ class TestCheckpoint:
         assert [stage.root.label for stage in checkpointed.stages] == [
             stage.root.label for stage in ctx.candidate.stages]
 
+    def test_checkpoint_stamps_cut_nodes_as_unknown(self):
+        """被裁掉子节点的那些，快照里必须是 `unknown` 而不是缺省的 `yes`。
+
+        正式打标（`_stamp_expandable`）在检查点后面，所以快照里那些节点还是 `yes`。
+        用户点开它以为还能长，点下去却报 `too_deep`——被裁的恰好是唯一能再长的地方。
+
+        上限压到 5 是为了真的触发裁剪：`GenerateArgs.branches=6` 决定骨架清单的
+        条数，光给 plan 更多分支不会让树变大。
+        """
+        seen: list[Any] = []
+        with patch("app.agent.tools.INITIAL_MAX_NODES", 5):
+            _result, ctx = _generate_with(TREE_PLAN, diagram_type=None,
+                                          checkpoint=_collect_into(seen))
+
+        assert len(seen) == 1
+        checkpointed = seen[0]
+        assert isinstance(checkpointed, MindMapContent)
+        stamped = {node.id: node.expandable for node in shapes.iter_nodes(checkpointed)}
+        assert "unknown" in stamped.values(), "被裁的节点在快照里必须标成没长完"
+        # 交付的那份与快照的标记口径一致：两边都说"没长完"，用户不会因为载入的是
+        # 检查点而看到一个不同的可展开状态。
+        delivered = {node.id: node.expandable for node in shapes.iter_nodes(ctx.candidate)}
+        assert {key for key, value in delivered.items() if value == "unknown"} == {
+            key for key, value in stamped.items() if value == "unknown"}
+
     def test_checkpoint_does_not_disturb_the_tree_the_rest_of_the_run_uses(self):
         """折叠只作用于副本：检查点之后 `_fill_details` / `check` 仍按一棵树工作。"""
         seen: list[Any] = []
