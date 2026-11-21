@@ -12,13 +12,18 @@ import type {
   LibrarySource,
   MapRecord,
   DiagramContent,
+  ModelSettings,
   Pref,
   PrefSuggestion,
   RunDetail,
   RunSummary,
+  SaveModelSettingsRequest,
+  SaveModelSettingsResponse,
   SavedPref,
   Source,
   SuggestResponse,
+  TestModelSettingsRequest,
+  TestModelSettingsResponse,
 } from './types';
 import type { EditEvent } from '../mindmap/edit-log';
 
@@ -481,6 +486,49 @@ export function deletePref(key: string): Promise<void> {
  */
 export function listPrefSuggestions(): Promise<PrefSuggestion[]> {
   return request<PrefSuggestion[]>('/prefs/suggestions');
+}
+
+// ---- 模型设置 ----
+
+/**
+ * 当前生效的模型配置与每一项的来源。
+ *
+ * **响应里没有明文密钥**，只有 `api_key_masked`（`…abcd`）。面板打开时调一次，
+ * 之后每次保存都拿响应就地更新，不重拉——重拉会多一次"刚存的值还没刷新到界面"
+ * 的窗口。
+ */
+export function getModelSettings(): Promise<ModelSettings> {
+  return request<ModelSettings>('/settings/model');
+}
+
+/**
+ * 保存。**改完立即生效，不用重启后端**：所有模型出口每次调用都重新解析配置。
+ *
+ * 空串的语义按字段不同（见 `SaveModelSettingsRequest`）：`api_key` 空串 = 不改，
+ * `base_url` / `model` 空串 = 回落环境变量。
+ */
+export function saveModelSettings(
+  body: SaveModelSettingsRequest,
+): Promise<SaveModelSettingsResponse> {
+  return request<SaveModelSettingsResponse>('/settings/model', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * 发一次最小 chat 请求（`max_tokens=1`）验证地址 / 密钥 / 模型名。
+ *
+ * `ok=false` 时**不是异常**：它是"这次连不上"的结论，HTTP 状态仍是 200，调用方
+ * 把 `message` 直接显示在面板里。只有三项都没配才会抛 `ApiError`（400）。
+ */
+export function testModelSettings(
+  body: TestModelSettingsRequest = {},
+): Promise<TestModelSettingsResponse> {
+  return request<TestModelSettingsResponse>('/settings/model/test', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 }
 
 // ---- 知识库 ----
