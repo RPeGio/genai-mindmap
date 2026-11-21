@@ -635,6 +635,18 @@ export interface RunOptions {
    * 出口的全局状态。缺省 `false`，发出去的请求与加它之前逐字节相同。
    */
   deepThinking?: boolean;
+  /**
+   * 沿用哪一次运行的 `run_id`。
+   *
+   * 只有一个调用方需要它：把一份检查点补完说明。那次生成在写说明之前断了，服务端
+   * `runs` 里那一行的状态是 `cancelled` / `failed`；`begin()` 对这两种状态是**重开**
+   * 同一行（只清 `partial` 标记，不动 `candidate`），于是补完的树会覆盖同一行，
+   * 台账上这是"同一次生成的下半场"而不是凭空多出来的一次。
+   *
+   * 换一个新 id 的代价不是多一行记录：`resumeRun()` 捡回来的东西会被记成两次运行，
+   * 而用户看到的明明是同一张图。缺省 `undefined` = 老行为（每次点击新开一个身份）。
+   */
+  runId?: string;
 }
 
 /**
@@ -1072,9 +1084,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 已经表达过的意图问第二遍。但**仍然走 `commitGenerated`**：撤销栈、`generate`
    * 事件、身份重置、冲突判定一步都不少——不是另开一条"恢复"的旁路。
    */
-  async function resumeRun(): Promise<void> {
+  async function resumeRun(): Promise<boolean> {
     const target = resumableRun.value;
-    if (!target) return;
+    if (!target) return false;
     // 进这一步之前的画布与版本：下面那趟请求在途时用户可能已经改了画布、或切了图，
     // 两种都得判（判据与生成落地完全同一套，见 `commitGenerated`）。
     const session = mapSession;
@@ -1087,7 +1099,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
           // 等网络这段时间用户切了图：这份结果属于上一张，装上去就是把 A 写进 B。
           resumableRun.value = null;
           status.value = '载入期间已经换了一张图，上次的结果没有装进来。';
-          return;
+          return false;
         }
         generationBase = base;
         generationBaseRevision = baseRevision;
@@ -1097,7 +1109,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       if (!detail.candidate) {
         resumableRun.value = null;
         status.value = '那次运行没有留下可用的内容。';
-        return;
+        return false;
       }
       agentEvents.value = [];
       agentWarnings.value = [];
@@ -1148,10 +1160,51 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 这张图算的，而不是相对那次运行开始时的某个已不存在的状态。
         base,
       });
+      return true;
     } catch (error) {
       resumableRun.value = null;
       status.value = error instanceof ApiError ? error.message : '读取上次的结果失败，请重试。';
+      return false;
     }
+  }
+
+  /**
+   * 把刚载入的这份检查点**补完说明**：同一棵树上再跑一轮，只补 `detail`。
+   *
+   * 三个决定：
+   *
+   *  1. **沿用那条 `run_id`**。服务端那一行还在（状态是 `cancelled` / `failed`），
+   *     `runs.begin()` 对这两种状态是"重开同一行"，只清半棵树标记、不动 `candidate`。
+   *     补完的树落回同一行，台账上这是同一次生成的下半场；换新 id 会让一次生成变成
+   *     两次运行，而用户看到的明明是同一张图。那一行若还在 `running`（进程没死、
+   *     只是前端断过线），服务端会 409 —— 那也正是对的：真正在跑的那一轮不该被
+   *     第二个请求顶掉。
+   *  2. **走 `edit` 意图**，不新增意图。后端 `mindmap_fill_details` 只注册给 `edit`，
+   *     而 `edit` 本来就要求带 `snapshot`——补说明要的正是"在现有这棵树上改"。
+   *  3. **`goal` 是一句人话**：写说明那条路不吃用户的自由指令（`_detail_ask` 自己
+   *     按节点清单发问），模型看到的是工具描述与节点清单，不是这句话。它唯一的去处
+   *     是台账的 `goal`，而界面会把它念出来（`ChatDock` 的"上次…：「goal」"），
+   *     所以得写成一句像标题的话，不能写成对模型下的命令。
+   *
+   * `runId` 由调用方显式给：它是**载入之前**从那行记录上读到的值，而载入成功会把
+   * `resumableRun` 清空——在这里回读只会拿到 null，然后悄悄新开一个身份。
+   */
+  async function fillMissingDetails(runId?: string): Promise<void> {
+    if (busy.value || agentRunning.value) return;
+    if (!content.value || !isTree(content.value)) {
+      status.value = '只有思维导图能单独补说明。';
+      return;
+    }
+    await runGeneration(
+      '补齐这张图的节点说明',
+      'edit',
+      undefined,
+      'default',
+      'auto',
+      // 选区显式给空：补说明是"整棵树按长度数一遍"，不是"改我圈的这几个"，
+      // 静默带上画布上圈的节点会让解释变成"只在范围内补"，而实际不是。
+      { selection: [], runId },
+    );
   }
 
   /** 本会话内不再提这件事。**不写库**——理由见 `resumableSettled`。 */
@@ -3183,7 +3236,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 每次点击一个新的身份：幂等只在"带同一个 run_id"时生效，而"点了两次生成"
       // 本来就是两次运行（按钮禁用与 busy 闸门管那个）。真正需要同一个 id 的场景
       // 是刷新重发、换标签页、客户端重试——那时服务端能认出这是同一次运行。
-      const runId = newRunId();
+      // 唯一例外是"把检查点补完说明"：那条路显式给 `options.runId`，因为服务端
+      // 那一行还在（`cancelled` / `failed`），补完的树该覆盖同一行而不是多记一次。
+      const runId = options.runId ?? newRunId();
       const body: AgentRunRequest = {
         goal: prompt,
         intent,
@@ -3411,18 +3466,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * **新开一个 run 身份**：重试是一次新的运行，不是"把上一次那个 run 接着跑"。
    * 沿用旧 id 会被后端按幂等判成"同一个 run 已经 done"，直接把旧结果重放回来——
    * 用户点「重试」却看到同一份失败，会以为按钮坏了。
+   *
+   * 这里必须把 `options.runId` 摘掉：它的语义是"续着那一行跑"（只有「补齐说明」
+   * 会传，见 `fillMissingDetails`），而重试恰恰要**换一行**。`lastAttempt` 是浅拷贝
+   * 进来的，不摘就会连着传回去，于是重试把上一行重开一遍——`runs.begin()` 顺手
+   * 清掉 `checkpointed_at`，补救入口就此消失。
    */
   async function retryLastRun(): Promise<void> {
     const attempt = lastAttempt.value;
     if (!attempt) return;
     if (agentRunning.value || busy.value) return;
+    const { runId: _continuation, ...options } = attempt.options;
     await runGeneration(
       attempt.goal,
       attempt.intent,
       attempt.sources,
       attempt.thinkingModel,
       attempt.diagramType,
-      attempt.options,
+      options,
     );
   }
 
@@ -3843,6 +3904,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     resumableRun,
     probeResumableRun,
     resumeRun,
+    fillMissingDetails,
     ignoreResumable,
     // 刚落进画布、还没保存的那个 run：界面据此把"上次没保存"与"刚刚这一次"分开
     pendingRunId: pendingSaveRunId,

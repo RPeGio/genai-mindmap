@@ -733,6 +733,25 @@ class ExpandArgs(BaseModel):
     instruction: str | None = Field(default=None, max_length=300, description="可选的补充要求")
 
 
+class FillDetailsArgs(BaseModel):
+    """`mindmap_fill_details` 的参数：**只有一个可选的补充要求**。
+
+    刻意**不给 `node_ids`**：要补哪些节点由代码按 `_detail_targets` 算
+    （判据是"说明短于 `DETAIL_FILL_FLOOR`"，不是"空"）。让模型自己圈目标，
+    它就会漏——它看不到整棵树（大纲只列前 200 个节点），而"漏掉的那几个"
+    恰好是它以为自己写完了的那几个。这与 `audit_tree` 不接受任何参数是同一条理由：
+    读的必须是服务端那棵真树。
+
+    `count` / `max_tokens` 之类也不给：切几半、花几次调用由 `_fill_details` 按
+    节点数与额度决定，多一个旋钮就多一种模型能把自己调进死路的方式。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    instruction: str | None = Field(
+        default=None, max_length=300,
+        description="可选的补充要求（口吻、长度、侧重哪一面），会拼进写说明的提示词")
+
+
 class AuditTreeArgs(BaseModel):
     """`audit_tree` 没有参数：它数的是**当前这棵树**，不是模型描述的那棵树。
 
@@ -3361,7 +3380,7 @@ def _split_nodes(
 
 def _detail_ask(
     topic: str, targets: Sequence[tuple[Node, tuple[str, ...]]],
-    sections: Sequence[str],
+    sections: Sequence[str], instruction: str | None = None,
 ) -> str:
     """第三段的 user 消息：主题 + 节点清单（id / label / 位置）+ 可选的原文。
 
@@ -3385,6 +3404,14 @@ def _detail_ask(
     if sections:
         user += ("\n\n结构那一轮用过的原文（按一级分支分组；写说明时以本组为准）：\n\n"
                  + "\n\n".join(sections))
+    # 补充要求挨着清单、在自查句**之前**（与 `_expand_ask` 同一个位置）：它约束的是
+    # "这些段话怎么写"，自查句约束的是"写完有没有漏"。放在自查句之后会被读成
+    # 自查的一部分（模型已经在准备输出了，那行字只当成格式提醒）。
+    #
+    # 只在调用方给了非空串时才出现：这一段为空时，user 与加这个参数之前逐字节相同
+    # ——单条生成路径（`_generate` 永远不传）的回归断言比的就是这个。
+    if instruction and instruction.strip():
+        user += f"\n\n补充要求（写说明时遵守）：{instruction.strip()}"
     # 自查句放在**最末尾**：它紧挨着模型开始输出的位置。上面每一条规则都在 system 里，
     # 而实测"每段至少 3 句"这一条只有写在最后才会被逐条执行（见 `DETAIL_ONLY_PROMPT`
     # 的注释——前两轮有 1–3 个节点只写了一句）。
@@ -3506,6 +3533,7 @@ async def _fill_details_half(
     topic: str,
     sections: Sequence[str],
     external_rules: str,
+    instruction: str | None = None,
 ) -> _DetailHalf:
     """发这一次「只写说明」的请求并解析。**预算是调用方的事**（见 `_fill_details`）。
 
@@ -3528,7 +3556,7 @@ async def _fill_details_half(
     started = time.perf_counter()
     try:
         raw = await _chat(
-            ctx, system, _detail_ask(topic, targets, sections),
+            ctx, system, _detail_ask(topic, targets, sections, instruction),
             max_tokens=_max_tokens(ctx))
     except GenerationError as exc:
         half.skipped = "error"
@@ -3627,6 +3655,7 @@ async def _fill_details(
     content: MindMapContent, *, ctx: RunContext, topic: str,
     sections: Sequence[str], external_rules: str,
     diagnostics: list[Diagnostic], skip_ids: Collection[str] = (),
+    instruction: str | None = None,
 ) -> tuple[MindMapContent, dict[str, Any]]:
     """第三段：给缺说明的节点补 detail。**只读结构、只写 detail**。
 
@@ -3650,6 +3679,10 @@ async def _fill_details(
     引用在这条路上**不可能被改动**：函数只从返回值里读 `id → 字符串`，写回的字段
     只有 `detail`。`source_refs` 仍然是结构那一轮的产物（`EVIDENCE_UNUSED` 的分母
     也因此不受影响）。
+
+    `instruction` 是**从检查点续写**那条路专用的（`_fill_details_tool`）：用户在
+    界面上说"说明写长一点/口语一点"时，它进 `_detail_ask` 的补充要求那一段。生成
+    路径永远不传，所以那条路上的 user 与加这个参数之前逐字节相同。
     """
     targets = _detail_targets(content.root, skip=skip_ids)
     report: dict[str, Any] = {
@@ -3693,7 +3726,7 @@ async def _fill_details(
     await _emit_stage(ctx, DETAIL_STAGE, f"正在给 {len(targets)} 个节点写说明…")
     results = await asyncio.gather(*(
         _fill_details_half(half, ctx=ctx, topic=topic, sections=sections,
-                           external_rules=external_rules)
+                           external_rules=external_rules, instruction=instruction)
         for half in pending
     ), return_exceptions=True)
     settled = _settle_halves(results, pending)
@@ -8073,6 +8106,122 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     )
 
 
+async def _fill_details_tool(args: FillDetailsArgs, ctx: RunContext) -> ToolResult:
+    """给已经长好、但说明还空着的树补 `detail`。**只写说明，不动结构**。
+
+    它存在的原因是"检查点"那条路：生成在写完说明之前被打断时，库里留下的是
+    **合法完整、`detail` 全空**的树（`runs.checkpoint` 的 docstring）。用户把它
+    载回画布之后，唯一的缺口就是每个节点的说明——补它不需要重新生成一遍结构，
+    而那正是从前唯一的选择（重跑一次 = 再花十几秒与三次模型调用，还可能换出
+    一棵不一样的树）。
+
+    复用 `_fill_details`：切半、五条兜底、按 id 对号、诊断这五件事在那里已经
+    调好了（`docs/ONE-CALL.md` 的实测数字也是按它量的）。这里只补三件它不知道
+    的事——**主题从哪来、原文从哪来、以及这不是生成**。
+
+      - **不给 `node_ids`**：要补哪些由 `_detail_targets` 按长度判（见
+        `FillDetailsArgs` 的 docstring）。
+      - **原文按 `source_refs` 回查**（`_expand_sources`）：旧图重新打开时
+        `request.sources` 是空的，正文只活在当次会话的内存里。用 `_intake`
+        不行——它会在"没有材料"时**发起外部检索**，那等于给一棵按旧依据长出来
+        的树塞一份新依据，写出的说明与结构对不上，还白等 6 秒。`_expand_sources`
+        只做"找回这条链上声称用过的那些来源"，找不到就降级成无证据补写。
+      - **没有原文也必须能补**：`_fill_details` 在 `sections` 为空时走
+        `DETAIL_NO_SOURCE_RULES`，与生成时"一句话主题"那条路完全一样。
+
+    返回的 `content` 是给模型看的下一步（"补了几个、还缺几个"），`data` 里是
+    `_fill_details` 的原账与诊断——诊断由调用方（`service._loop`）转成告警。
+    """
+    current = _require_candidate(ctx)
+    if isinstance(current, ToolResult):
+        return current
+    if not isinstance(current, MindMapContent):
+        # `_fill_details` 的签名只接树（它遍历 `content.root`）。鱼骨与流程的说明
+        # 在折叠那一步就已经跟着节点走了，真要补得另写一套遍历——在那之前给一句
+        # 说得清的话，好过让模型看到一个它一调就崩的工具。
+        return _fail(
+            "not_tree",
+            "只有思维导图能单独补说明；鱼骨图与流程图的说明在生成时就跟着节点写好了，"
+            "现在改不了。",
+        )
+
+    diagnostics: list[Diagnostic] = []
+    sources, material = _expand_sources(ctx, current.root)
+    titles = [branch.label for branch in shapes.top_branches(current)]
+    sections: list[str] = []
+    evidence_total = 0
+    if sources and titles:
+        expansions = await _expand_branches(sources, titles)
+        hits_by_branch = await _retrieve_branches(sources, titles, expansions=expansions)
+        for title, hits in zip(titles, hits_by_branch):
+            evidence = _branch_evidence(hits, sources) if hits else None
+            if evidence is None:
+                continue
+            # 与生成那条路同一件事：命中要并进本次运行的证据集，否则模型照它抄的
+            # 引用在收尾校验时会被判成编的（`verify_source_refs` 只认见过的父块）。
+            ctx.record_evidence(evidence.spans)
+            sections.append(
+                EVIDENCE_SECTION_HEADER.format(index=len(sections) + 1, title=title)
+                + "\n" + evidence.text)
+            evidence_total += len(evidence.payload)
+    external_rules = (
+        EXTERNAL_TRUST_RULES
+        if sections and any(source.kind in (SourceKind.web, SourceKind.paper)
+                            for source in sources)
+        else "")
+
+    # 主题优先取树上那个标题：它是这次结构的主题，而 `goal` 是"补齐说明"那句操作
+    # 指令（前端点按钮时发的固定文案），拿它当主题等于让模型给一棵"关于补齐说明"
+    # 的图写说明。`goal` 只在前者为空时兜底。
+    topic = (current.title or "").strip() or ctx.request.goal
+    filled, report = await _fill_details(
+        current, ctx=ctx, topic=topic, sections=sections,
+        external_rules=external_rules, diagnostics=diagnostics,
+        instruction=args.instruction)
+    requested = int(report.get("requested") or 0)
+    applied = int(report.get("filled") or 0)
+    skipped = report.get("skipped")
+    # 说明变了就是内容变了：`publish_tree` 会同时置 `produced`、推进 `revision`，
+    # 收尾的 `DoneEvent` 才带得回这份新树（`_deliver_or_fail` 判的正是 `produced`）。
+    # 一个都没补上时不发这一枪：那棵树与进来时逐字节相同，"产出过东西"若为真，
+    # 之后某条额度耗尽的路径就会把"什么都没发生"包装成一棵半成品交付。
+    if applied:
+        ctx.publish_tree(filled)
+        # 与 `_commit_drafts` / `_expand` 同一档：说明已经写进树了，就该落一份检查点。
+        # 这里尤其该落——补说明本身实测二十几秒（还要再等一次模型往返收尾），这段
+        # 窗口里进程没了，补好的说明全丢，库里退回"结构完整、说明为空"那一版，
+        # 恰好是这次要消灭的状态。写失败不影响这一轮（`on_checkpoint` 自己吞异常）。
+        if ctx.checkpoint is not None:
+            await ctx.checkpoint(filled)
+    if skipped == "nothing_to_fill":
+        summary = "这棵树的节点说明都不缺，没有需要补写的地方（没有调用模型）。"
+    elif skipped == "budget":
+        summary = (f"模型调用额度已用完，{requested} 个节点的说明一个都没能补上；"
+                   "结构没动，可以下一轮再试。")
+    elif applied:
+        summary = f"已给 {applied} 个节点补写了说明（共 {requested} 个待补）。"
+        if int(report.get("missing") or 0):
+            summary += f"还有 {report['missing']} 个没写回来，说明保持为空。"
+    else:
+        summary = (f"补写说明的模型调用没有返回可用的说明（{requested} 个节点），"
+                   "这次没有改动任何内容。")
+    if sources and not evidence_total:
+        summary += "这次没在原始材料里找到相关原文，说明是凭主题写的，没有新增引用。"
+    elif material.get("mode") == "missing":
+        summary += "原始材料在知识库里已经找不到了，这次是无证据补写。"
+
+    return ToolResult(
+        ok=True,
+        content=summary,
+        data={
+            "detail": report,
+            "changes": int(applied),
+            "materials": material,
+            "diagnostics": [item.model_dump() for item in diagnostics],
+        },
+    )
+
+
 def _rag_filters(raw: dict[str, Any] | None) -> SourceFilter | None:
     """把模型给的过滤条件解析成 `SourceFilter`；坏输入一律当成"没给"。
 
@@ -8647,9 +8796,10 @@ def _scope_note(
 ) -> tuple[str, list[str]]:
     """`(追加到回给模型那句话末尾的提示, 越界的 id 列表)`；没越界时是 `("", [])`。
 
-    抽成一个函数是因为**七个写工具共用同一条口径**（批量 + 六个细粒度）。写成
-    "每个工具自己拼一句"，改一处忘一处时分叉的表现是"批量会提醒、细粒度不会"，
-    那看起来像 bug 而不像设计。
+    抽成一个函数是因为**七个会越界的写工具共用同一条口径**（批量 + 六个细粒度）。
+    写成"每个工具自己拼一句"，改一处忘一处时分叉的表现是"批量会提醒、细粒度不会"，
+    那看起来像 bug 而不像设计。（`mindmap_fill_details` 不在这里：它按整棵树扫目标，
+    没有"越界"这件事。）
 
     提示里要求模型"说明原因"，与 system 里 `service.SELECTION_RULE` 那句一一对应：
     提示词让它优先改选区、越界要交代；工具这里是它真的越界之后的**回声**，
@@ -9722,7 +9872,9 @@ def _batch_id(ctx: RunContext) -> str:
 #
 # 形态不再参与裁剪——有没有来源，模型看到的生成工具都是同一个。
 #
-# `edit` 给**七个**：六个细粒度（加/改/删/移 + 两条边）外加批量 `mindmap_edit`。
+# `edit` 给**八个**：六个细粒度（加/改/删/移 + 两条边）、批量 `mindmap_edit`，
+# 以及只补节点说明的 `mindmap_fill_details`（它不动结构，所以不参与下面这段
+# "为什么留两个入口"的权衡）。
 # 为什么不只留批量：批量的参数是一张 op 表，改一处也要写出 `[{"op":"update",
 # "id":…,"changes":{"label":…}}]` 这一串，而模型的失败模式恰恰在这里——少一个
 # 括号、把 label 写在 op 顶层、把 index 写成字符串。细粒度工具把这些自由度
@@ -9750,7 +9902,7 @@ _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
     "expand": ("node_expand", "audit_tree"),
     "edit": (
         "add_node", "update_node", "remove_node", "move_node",
-        "add_edge", "remove_edge", "mindmap_edit",
+        "add_edge", "remove_edge", "mindmap_fill_details", "mindmap_edit",
     ),
 }
 
@@ -9781,6 +9933,7 @@ _TOOL_ORDER = (
     "move_node",
     "add_edge",
     "remove_edge",
+    "mindmap_fill_details",
     "mindmap_edit",
 )
 
@@ -10014,6 +10167,29 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
         args_model=MoveNodeArgs,
         fn=_move_node,
     ),
+    # 补说明：管理"结构已经长好、每个节点的说明还空着"这种状态。
+    #
+    # 描述里必须写清两件模型自己看不出来的事：①**它只写说明、不动结构**（不说的话
+    # 模型会以为这是"再生成一遍"而先调它再调批量，白烧两轮）；②**什么时候该用**
+    # （用户说"说明太短/把说明补上/这些节点没有介绍"）。这两条写在描述里而不是
+    # system 里：模型是逐个读工具决定下一步的，写在 system 里它读完就忘。
+    "mindmap_fill_details": lambda: ToolSpec(
+        name="mindmap_fill_details",
+        description=(
+            "给当前导图里**说明为空或太短**的节点补写 detail。只写说明，"
+            "**不改任何结构**：节点、层级、颜色、引用一个字节都不动。"
+            "补哪些节点由代码自己数（它读的是服务端那棵真树，不看你记不记得），"
+            "所以没有 node_id 参数，也不要把节点清单写进 instruction。"
+            "**什么时候用它**：用户说「说明太短」「给这些节点补上介绍」"
+            "「载入的图没有说明」；或者这张图是从检查点载回来的"
+            "（结构完整、说明全空）。"
+            "**不要用它**加节点或改标题——那些用 add_node / update_node / "
+            "mindmap_edit。"
+            "节点说明都已经写满时它不会调用模型，直接返回「没有需要补写的地方」。"
+        ),
+        args_model=FillDetailsArgs,
+        fn=_fill_details_tool,
+    ),
     "mindmap_edit": lambda: ToolSpec(
         name="mindmap_edit",
         description=(
@@ -10074,10 +10250,12 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
       - `expand` 给 `node_expand` + `audit_tree`（整图体检，用户要求"补完"时
         模型靠它知道还差哪几支；那条路上没有代码替它数），请求带来源时再加
         `rag_query`
-      - `edit` 给**七个**写工具（`add_node` / `update_node` / `remove_node` /
-        `move_node` / `add_edge` / `remove_edge` / `mindmap_edit`），请求带来源时
-        再加 `rag_query`。让模型自己选粒度：改一两处用细粒度的（参数扁平、报错更准），
-        改五处以上用批量（一次调用改十处，省下的是**模型往返**——每次调用都要一轮）
+      - `edit` 给**八个**写工具（`add_node` / `update_node` / `remove_node` /
+        `move_node` / `add_edge` / `remove_edge` / `mindmap_edit` /
+        `mindmap_fill_details`），请求带来源时再加 `rag_query`。让模型自己选粒度：
+        改一两处用细粒度的（参数扁平、报错更准），改五处以上用批量（一次调用改十处，
+        省下的是**模型往返**——每次调用都要一轮）；`mindmap_fill_details` 只补节点
+        说明、不动结构，用在"这棵树结构已定、说明还空着"的续写场景。
       - `expand` / `edit` 在请求带来源时加 `rag_query`：那两条路不读来源，
         模型只能自己查。
       - **不**给 `create`：生成工具在内部自己检索（骨架之后每支一次）。早先这里

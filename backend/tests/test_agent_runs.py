@@ -236,6 +236,37 @@ def test_reopening_a_run_clears_the_previous_partial_flag():
     assert runs.get("retry-1").partial is None, "完整跑完的那一轮不该带着旧标记"
 
 
+def test_reopening_a_run_swaps_in_the_new_request_summary():
+    """重开要换掉 `request`：台账上"这一行在做什么"只有这一列说得清。
+
+    「补齐说明」就是拿检查点那行的 id 发一次 `intent="edit"`（见
+    `stores/mindmap.ts` 的 `fillMissingDetails`）。如果重开不改 `request`，
+    `router._summary()` 返回的 `intent` 仍是上一轮的 `create`，前端
+    `commitGenerated` 据此走"重置身份"分支——用户在改一张已保存的图，载入结果后
+    再点保存就变成新建一条。
+    """
+    runs.begin("resume-1", {"goal": "原来的主题", "intent": "create"})
+    runs.finish("resume-1", runs.STATUS_FAILED,
+                candidate=CANDIDATE, failure={"code": "agent_failed", "message": "断了"})
+
+    claim = runs.begin("resume-1", {"goal": "给这张导图补说明", "intent": "edit"})
+
+    assert claim.claimed is True
+    assert claim.record.request == {"goal": "给这张导图补说明", "intent": "edit"}
+    assert claim.record.candidate is not None, "续写的起点不能被抹掉"
+
+
+def test_reopening_with_an_empty_summary_keeps_the_old_request():
+    """内部调用方传空摘要时保留旧值：那表示"这次没带摘要"，不是"摘要为空"。"""
+    runs.begin("keep-req", {"goal": "原来的主题", "intent": "create"})
+    runs.finish("keep-req", runs.STATUS_FAILED, failure={"code": "agent_failed", "message": "断了"})
+
+    claim = runs.begin("keep-req", {})
+
+    assert claim.claimed is True
+    assert claim.record.request == {"goal": "原来的主题", "intent": "create"}
+
+
 def test_pending_only_returns_done_runs_that_were_never_applied():
     """`pending()` 的字面含义：**done** 且没应用过。"""
     runs.begin("done-unapplied", {})
