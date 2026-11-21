@@ -1,0 +1,167 @@
+"""「测试连接」那一次最小请求：发一条最短的 chat，只看它通不通。
+
+**为什么值得一个接口**：三层配置（地址、密钥、模型名）里任何一层错了，症状在
+生成侧都是同一种——"模型服务出错了"，而那要等到一次几十秒的生成跑完、烧掉一次
+调用才看得到，且看不出错在哪一层。这里用 `max_tokens=1` 发一次请求，把三层各自
+的判据分开：连不上 = 地址；401/403 = 密钥；404 = 地址路径或模型名；其余按状态码
+带一句原话。
+
+**它不写库、不改任何状态**：面板上的流程是"填 → 测 → 存"，测试用面板里**当前
+输入框**的值（`router` 那层把空字段填成已生效值），所以"我还没存但想先验一下"
+是走得通的。
+
+**密钥不进日志、不进错误文案**：上游的 401 正文常常带一段 key（OpenAI 系列会写
+`Incorrect API key provided: sk-abc***`）。`_redact()` 把出现的明文 key 换成打码值，
+再把正文截到 200 字——既留下能查的信息，又不把密钥写进响应体（界面会显示它，
+用户一截图就出去了）。
+"""
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass
+
+import httpx
+
+#: 测试请求的超时。比生成侧（600 秒）短得多：这里的目的是"通不通"，等 10 秒还
+#: 没有回包，用户已经可以判断是地址或网络的问题了。
+TIMEOUT_SECONDS = 15.0
+
+#: `max_tokens=1`：只要能拿到一个 200 就证明三层都对。多花一个 token 没有任何
+#: 额外信息，而推理模型的 thinking 段也会被这个上限压住。
+PROBE_MAX_TOKENS = 1
+
+#: 错误正文最多回多少字。够看清"model not found"这类原话，又不至于把一页 HTML
+#: 错误页塞进界面。
+_SNIPPET_CHARS = 200
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """一次测试连接的结论。`message` 是直接给用户看的中文。"""
+
+    ok: bool
+    message: str
+    model: str
+    status: int | None = None
+    latency_ms: int = 0
+
+
+def _redact(text: str, key: str) -> str:
+    """把正文里出现的明文密钥换成打码值，并截断。
+
+    替换的是**整串**而不是"看起来像 key 的部分"：只有我们自己知道这次用的是哪
+    把密钥，靠模式匹配（`sk-…`）会漏掉自建端点的口令。空 key 时不做替换（替换空
+    串会在每个字符之间插入打码值）。
+    """
+    snippet = (text or "").strip()
+    if key and snippet:
+        snippet = snippet.replace(key, "…")
+    if len(snippet) > _SNIPPET_CHARS:
+        snippet = snippet[:_SNIPPET_CHARS] + "…"
+    return snippet
+
+
+def _body_snippet(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        return (getattr(response, "text", "") or "").strip()
+    # OpenAI 兼容的错误体是 `{"error": {"message": "..."}}`；有的端点直接给
+    # `{"message": "..."}`。两种都取，取不到就把整段 JSON 字面量截断显示。
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            return error["message"]
+        if isinstance(payload.get("message"), str):
+            return payload["message"]
+        return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _message_for_status(status: int, snippet: str) -> str:
+    """状态码 → 一句能指导下一步的话。原话附在后面，不吞掉。"""
+    tail = f"（服务端原话：{snippet}）" if snippet else ""
+    if status in (401, 403):
+        return f"密钥被拒绝（HTTP {status}），请检查密钥是否正确、是否有该模型的权限。{tail}"
+    if status == 404:
+        return (f"地址或模型名不对（HTTP 404）。检查地址是否包含 /v1，"
+                f"以及模型名是否是这个端点认识的。{tail}")
+    if status == 429:
+        return f"被限流了（HTTP 429），地址与密钥是通的，稍后再试。{tail}"
+    if status >= 500:
+        return f"模型服务自己出错了（HTTP {status}），地址与密钥大概率是通的。{tail}"
+    return f"模型服务返回 HTTP {status}。{tail}"
+
+
+def _client() -> httpx.AsyncClient:
+    """造一个客户端。**抽成函数是为了让用例能替换它**。
+
+    与 `knowledge/external.py` 的 `_client()` 同一手法：单测一律替换这个函数，
+    不去 patch `httpx` 模块本身——那是全局副作用，会影响同一次用例里别的请求。
+    """
+    return httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=True)
+
+
+async def probe(base_url: str, api_key: str, model: str) -> ProbeResult:
+    """发一次最小 chat，返回结论。**不抛异常**：失败也是一种结论。
+
+    401 / 连接失败 / 超时都要变成一句中文，而不是冒到统一错误出口变成 500——
+    那会让"我填错了一个字符"看起来像"服务器坏了"。
+    """
+    started = time.monotonic()
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": PROBE_MAX_TOKENS,
+        "temperature": 0,
+        "stream": False,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        async with _client() as client:
+            response = await client.post(base_url + "/chat/completions", json=body,
+                                         headers=headers)
+    except httpx.TimeoutException:
+        return ProbeResult(
+            ok=False, model=model,
+            message=f"连接超时（{TIMEOUT_SECONDS:.0f} 秒没有响应），请检查地址是否可达。",
+            latency_ms=int((time.monotonic() - started) * 1000))
+    except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
+        return ProbeResult(
+            ok=False, model=model,
+            message=f"连不上这个地址：{type(exc).__name__}。请检查地址与网络。",
+            latency_ms=int((time.monotonic() - started) * 1000))
+
+    latency = int((time.monotonic() - started) * 1000)
+    if response.status_code != 200:
+        snippet = _redact(_body_snippet(response), api_key)
+        return ProbeResult(ok=False, model=model, status=response.status_code,
+                           message=_message_for_status(response.status_code, snippet),
+                           latency_ms=latency)
+
+    # 200 就够了吗？不够——有的兼容端点在模型名不认识时会回 200 + 空 choices。
+    # 那种响应在生成侧会变成"模型返回内容里没有可解析的 JSON"，用户完全没有线索。
+    try:
+        payload = response.json()
+        choices = payload.get("choices") or []
+    except (ValueError, json.JSONDecodeError, AttributeError):
+        return ProbeResult(ok=False, model=model, status=200,
+                           message="服务返回 200，但正文不是 JSON——这个地址可能不是 "
+                                   "OpenAI 兼容端点（少了 /v1 是常见原因）。",
+                           latency_ms=latency)
+    if not choices:
+        return ProbeResult(ok=False, model=model, status=200,
+                           message="服务返回 200，但没有 choices——模型名可能不被这个端点认识。",
+                           latency_ms=latency)
+
+    served = payload.get("model") if isinstance(payload, dict) else None
+    detail = f"服务端回报的模型是 {served}" if isinstance(served, str) and served else ""
+    message = f"连接正常（{latency} 毫秒）。"
+    if detail:
+        message += f"{detail}。"
+    return ProbeResult(ok=True, model=model, status=200, message=message,
+                       latency_ms=latency)
+
+
+__all__ = ["PROBE_MAX_TOKENS", "ProbeResult", "TIMEOUT_SECONDS", "probe"]

@@ -261,6 +261,19 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
 
     ensure_style_schema(conn)
     ensure_profile_schema(conn)
+    # 模型服务配置（`app/settings/store.py`）。这张表存的是"这台机器用哪个模型
+    # 服务"——端点、密钥、模型名、深度思考模型，单行 `id = 1`。
+    #
+    # 为什么建在这里而不是让 `settings` 自己在第一次读写时建：读它的路径在**每一次
+    # 模型调用的开头**（`generation.service._config`），多一个"发现表不存在 → 建表"
+    # 的分支，只会在最不该出错的地方多一条可能出错的路径。与 `library` / `store` /
+    # `prefs` 同一条理由。
+    #
+    # import 同样放在函数内：`settings.store` 顶层要 `from app.mindmaps import
+    # repository` 拿 `connect`，模块顶层反向 import 回去就成环。
+    from app.settings.store import ensure_schema as ensure_settings_schema
+
+    ensure_settings_schema(conn)
     return conn
 
 
