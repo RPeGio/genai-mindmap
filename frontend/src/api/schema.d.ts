@@ -650,6 +650,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/knowledge/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fetch Url Source
+         * @description 把一个 URL 读成一份材料。**用户在粘贴框里贴链接**走的就是这里。
+         *
+         *     四种结果分开说，因为用户的下一步各不相同：
+         *
+         *       - 开关关着（409 `fetch_disabled`）：去把它打开，重试同一个链接；说成"抓取
+         *         失败"会让他反复试一个永远不会成功的东西；
+         *       - 没配置 key（503 `fetch_unconfigured`）：这是部署问题，用户改不了；
+         *       - 抓取失败 / 正文为空（502 `fetch_failed`）：换一个链接，或者直接把正文贴进来；
+         *       - 成功：返回 `Source`，前端把它当材料（与"粘贴长正文"完全同一条路）。
+         *
+         *     **失败不抛裸异常**：`_deepseek_fetch` 自己吞掉一切并返回 None，所以这里只判
+         *     返回值。外部抓取是这个接口唯一的目的，拿不到就是失败，没有"部分成功"可报。
+         */
+        post: operations["fetch_url_source_api_knowledge_fetch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -1031,6 +1062,22 @@ export interface components {
              * @default 0
              */
             untouched_runs: number;
+        };
+        /**
+         * FetchUrlRequest
+         * @description 按 URL 读一篇网页 → 变成一份材料（`POST /api/knowledge/fetch`）。
+         *
+         *     `url` 的上限 2000：实测正常的落地页地址在 100–300 字符，2000 是"带一长串
+         *     query 参数的搜索页"的量级；再长就不是一个能读的地址了。`min_length=1` 让空串
+         *     在契约层 422，而不是穿过校验去发一个必然失败的请求。
+         *
+         *     这里**不校验 scheme**：`safe_http_url` 那条规矩是"只往 `<a href>` 里放"，而
+         *     这个字段是**要去请求的地址**——判据在服务层（`external._deepseek_fetch` 只收
+         *     http/https），两处各判一次会让"哪一层负责拒绝"变含糊。
+         */
+        FetchUrlRequest: {
+            /** Url */
+            url: string;
         };
         /**
          * FishboneBone
@@ -1732,6 +1779,21 @@ export interface components {
         /**
          * Relation
          * @description 跨节点的关系线。来源与目标是节点 id，必须都在树里。
+         *
+         *     **两个语义字段并存**，这是本轮改动的核心，得一句话说清谁管什么：
+         *
+         *       - `kind` 是**规范名**，六个值见 `RelationKind`。生成路径只写它。
+         *       - `type` 是**旧名**，四个值见 `RelationType`。它继续存在是为了读得回存量
+         *         数据（库里的图、导入的老 JSON、前端历史类型），**不许**在新代码里当输入。
+         *
+         *     两者由 `_sync_kind` 单向同步：只给 `type` 时按 `LEGACY_TO_KIND` 推出 `kind`；
+         *     只给 `kind` 时 `type` **保持 None**，不做反向映射。
+         *
+         *     为什么反向不映射：六个新值里有 `part_of` / `refines` 两个在旧四值里**没有对应**
+         *     ——多对一的映射写出来只能靠猜（`part_of` 该叫 `ref` 还是 `depends`？），而猜错的
+         *     后果是"画布按 kind 渲染、导出按 type 渲染"两条路给出不同的标签。所以规矩定成
+         *     "`type` 是输入的回声，`kind` 是唯一的规范值"：渲染、去重、导出全部读 `kind`，
+         *     `type` 只保证老数据读得回来、老前端读得到它认识的那四个值。
          */
         Relation: {
             /** Id */
@@ -1740,9 +1802,12 @@ export interface components {
             source: string;
             /** Target */
             target: string;
-            type: components["schemas"]["RelationType"];
+            kind?: components["schemas"]["RelationKind"] | null;
+            type?: components["schemas"]["RelationType"] | null;
             /** Label */
             label?: string | null;
+            /** Why */
+            why?: string | null;
             /** Evidence */
             evidence?: string | null;
             /**
@@ -1753,7 +1818,38 @@ export interface components {
             provenance: "user" | "ai" | "import";
         };
         /**
+         * RelationKind
+         * @description 跨节点关系的语义种类——**规范名**，生成侧只写这一个字段。
+         *
+         *     为什么在 `RelationType` 之外另立一套，而不是把它扩成十个值：旧四值是按
+         *     "这句话怎么说"命名的（`cause` / `ref`），而图谱两段式要表达的是"两个概念在
+         *     结构上是什么关系"（`part_of` / `refines` 在旧集合里根本无处安放）。两套混在
+         *     一个枚举里，读代码的人永远分不清哪个值是给旧数据用的、哪个是新生成用的。
+         *
+         *     **六个值**对应六种真的会出现在材料里的关系，每一种都有画法上的区别（见
+         *     `frontend/src/canvas/MindRelation.vue` 的虚线样式与标签）：
+         *
+         *       - `depends_on`：A 依赖 B（B 是 A 的前提）。有方向，箭头指向 B；
+         *       - `causes`：A 导致 B（因果）。有方向，箭头指向 B；
+         *       - `conflicts`：A 与 B 冲突/互斥。无方向语义，画成不带箭头的虚线；
+         *       - `part_of`：A 是 B 的组成部分（A ⊂ B）。有方向，箭头指向 B；
+         *       - `refines`：A 细化/具体化 B（A 是 B 的一个下位说法）。有方向，箭头指向 B；
+         *       - `references`：A 引用/参见 B（材料里明说"见 X"）。有方向，箭头指向 B。
+         *
+         *     为什么是 `Literal` 而不是自由字符串：颜色/线型要按它选，而自由字符串的意思
+         *     是"每一个没见过的值都渲染成默认样式"——那六个值就白定义了。与 `EdgeKind`
+         *     同一条理由。
+         * @enum {string}
+         */
+        RelationKind: "depends_on" | "causes" | "conflicts" | "part_of" | "refines" | "references";
+        /**
          * RelationType
+         * @description 跨节点关系的**旧四值**。
+         *
+         *     这是这张图从 v1 起就有的取值集合，库里的老图、导入的老 JSON、前端历史类型
+         *     全都按它写。它**不再是生成侧要写的字段名**（那件事现在是 `Relation.kind`），
+         *     留着是因为"读得回旧数据"与"写得出新数据"是两件必须同时成立的事：删掉它等于
+         *     让所有存量导图在下一次保存时 422，而用户什么都没改。
          * @enum {string}
          */
         RelationType: "cause" | "ref" | "conflict" | "depends";
@@ -2033,6 +2129,10 @@ export interface components {
             url?: string | null;
             /** Raw Chars */
             raw_chars?: number | null;
+            /** Authority */
+            authority?: number | null;
+            /** Rerank Score */
+            rerank_score?: number | null;
         };
         /**
          * SourceRef
@@ -2088,9 +2188,16 @@ export interface components {
         };
         /**
          * SuggestionKind
+         * @description 建议的**动作**名词，不是诊断码。
+         *
+         *     用户看到的是"点一下会发生什么"，所以值域按动作分，不按诊断分：同一个
+         *     `NEAR_DUPLICATE_LABEL` 与 `DUPLICATE_LABEL` 都是 `dedupe`，因为对用户来说
+         *     要做的是同一件事。`expand` / `add_detail` 是 F15 那一轮补的——`fill` 说的是
+         *     "整张图缺了哪一块"（结构级），而"这一支没展开"与"这几个节点没有说明"是
+         *     节点级的两件事，混进 `fill` 会让按钮文案说不清要点哪里。
          * @enum {string}
          */
-        SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop";
+        SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop" | "expand" | "add_detail";
         /** Theme */
         Theme: {
             /**
@@ -3185,6 +3292,53 @@ export interface operations {
             };
             /** @description 知识库暂时读不出来（`code=library_unavailable`） */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    fetch_url_source_api_knowledge_fetch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchUrlRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateTextSourceResponse"];
+                };
+            };
+            /** @description 这个功能没打开（`code=fetch_disabled`） */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description 抓取失败：地址打不开、正文为空（`code=fetch_failed`） */
+            502: {
                 headers: {
                     [name: string]: unknown;
                 };

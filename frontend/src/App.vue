@@ -8,6 +8,7 @@ import ChatDock from './components/ChatDock.vue';
 import HistoryDrawer from './components/HistoryDrawer.vue';
 import MessageFab from './components/MessageFab.vue';
 import NodeToolbar from './components/NodeToolbar.vue';
+import StructureCheck from './components/StructureCheck.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
 import type { LibraryEntry, LibrarySource } from './api/types';
@@ -20,7 +21,7 @@ import { usePrefsStore } from './stores/prefs';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 import { agentDetailVisible } from './mindmap/run-status';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
-import type { DiagramContent, EdgeKind } from './api/types';
+import type { DiagramContent, EdgeKind, RelationKind } from './api/types';
 import { containerNoun, kindOf, topBranchesOf } from './mindmap/shape';
 
 const store = useMindMapStore();
@@ -225,6 +226,45 @@ const selectedInnerEdgeRows = computed(() => store.selectedInnerEdges.map(edgeRo
 const selectedEdgeTotal = computed(
   () => selectedEdgeRows.value.length + selectedInnerEdgeRows.value.length,
 );
+
+/**
+ * 六种关系的中文短标签。与 `canvas/MindRelation.vue` 里那张表**必须一致**：
+ * 画布上的虚线写「依赖」，侧栏里也必须是「依赖」——两处各写一套的话，用户会以为
+ * 它们是两个不同的字段。
+ */
+const RELATION_KIND_LABELS: Record<RelationKind, string> = {
+  depends_on: '依赖',
+  causes: '因果',
+  conflicts: '冲突',
+  part_of: '属于',
+  refines: '细化',
+  references: '引用',
+};
+
+/**
+ * 选中节点参与的关系，拼成"谁 → 谁（kind）+ why"给列表用。
+ *
+ * `why` 一起列出来是这个区块与「附加关系」最大的差别：附加边只需要一句"哪到哪"，
+ * 而关系线的价值全在理由上——没有 `why` 的那一条，读者看不出凭什么把它们连起来。
+ * 生成侧已经把没有理由的边丢掉了，所以这里列出来的每一条都有话可说。
+ */
+const selectedRelationRows = computed(() => store.selectedRelations.map((relation) => {
+  const kind = relation.kind ?? 'references';
+  return {
+    id: relation.id,
+    text: `${edgeNodeName.value(relation.source)} → ${edgeNodeName.value(relation.target)}`,
+    kind,
+    label: RELATION_KIND_LABELS[kind],
+    why: (relation.why ?? '').trim(),
+  };
+}));
+
+/** 只要这张图有跨分支关系就摆出这个区块：没有的话它只是一个占位。 */
+const showRelationSection = computed(() => store.contentRelations.length > 0);
+
+function disconnectRelation(relationId: string) {
+  store.deleteRelation(relationId);
+}
 
 const edgeHint = computed(() => {
   if (!selected.value) return '';
@@ -898,6 +938,7 @@ watch(
         text: `这次没成：${store.agentError}`,
         kind: 'error',
         model: store.runModel,
+        servedModel: store.runServedModel,
         reasoning: store.lastReasoning || undefined,
       });
       return;
@@ -911,6 +952,7 @@ watch(
       text: bits.join(' · '),
       kind: partial ? 'partial' : 'done',
       model: store.runModel,
+      servedModel: store.runServedModel,
       reasoning: store.lastReasoning || undefined,
       nodes: summary.nodes,
       changes: summary.changes,
@@ -1153,6 +1195,22 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
             <div class="mt-2"><AgentPanel /></div>
           </details>
 
+          <!--
+            结构检查（`/optimization/check` + `/suggest`）：诊断逐条 + 候选建议。
+
+            **放在右抽屉里，不给它自己的浮层**。上一轮刚解决的是"诊断/建议不许挡住
+            画布"：抽屉是覆盖式的（`absolute` 挂在 `<main>` 上，不参与主区 flex），
+            它开合时画布宽度一个像素都没变，也不会触发一次自动 fitView。
+
+            它排在上面那块「本次生成明细」之后：明细是"刚才那 25 秒发生了什么"的日志，
+            结构检查是"这张图现在有什么问题"的结论——后者常常在生成之后很久才被点开，
+            所以不该把它压在一份长日志的下方，也不该顶在节点详情前面。
+
+            自己判可见性（没跑过、没有发现、没有错误时整块不渲染），这里不再套一层
+            `v-if`——那会让"有没有东西可说"这件事在 App 与组件里各写一遍。
+          -->
+          <StructureCheck />
+
           <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
           <!-- 标题：与画布上那颗节点是同一段文字（双击节点改的就是它） -->
@@ -1380,7 +1438,6 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
             <p v-if="!selectedEdgeTotal" class="text-xs text-slate-400">
               这个节点没有附加关系。流程图里的条件分支与回退线都记在这里。
             </p>
-
             <div class="flex items-center gap-1">
               <select
                 v-model="edgeTarget"
@@ -1420,6 +1477,57 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               </button>
             </div>
             <p class="text-[11px] leading-relaxed text-slate-400">{{ edgeHint }}</p>
+          </section>
+          <!--
+            跨分支关系（`ContentBase.relations`）。与上面「附加关系」**分成两块**，
+            理由与那里两层边分开列同源：这是两种不同的东西——附加边是这张图的主干
+            走向，关系线是"树表达不了的那部分语义"（依赖 / 因果 / 冲突 / 属于）。
+
+            这一块同时承担一个诊断职责：`why` 一起列出来，读的人不必回到材料就能判断
+            这条线对不对。没有它，虚线在画布上只是一根看不出所以然的弧。
+          -->
+          <section
+            v-if="showRelationSection"
+            class="flex flex-col gap-2 border-t border-slate-200 pt-3"
+            aria-label="跨分支关系"
+          >
+            <h3 class="text-xs font-medium text-slate-500">
+              跨分支关系（{{ selectedRelationRows.length }} / 全图 {{ store.contentRelations.length }}）
+            </h3>
+            <ul v-if="selectedRelationRows.length" class="flex flex-col gap-1">
+              <li
+                v-for="row in selectedRelationRows"
+                :key="row.id"
+                class="flex flex-col gap-0.5 rounded-md border border-dashed border-slate-300 px-2 py-1"
+              >
+                <div class="flex items-center gap-2">
+                  <span
+                    class="shrink-0 rounded border border-slate-300 px-1 text-[10px] text-slate-600"
+                    :title="row.kind"
+                  >
+                    {{ row.label }}
+                  </span>
+                  <span class="min-w-0 flex-1 truncate text-xs text-slate-700" :title="row.text">
+                    {{ row.text }}
+                  </span>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                    :title="`删除这条跨分支关系（${row.id}）`"
+                    @click="disconnectRelation(row.id)"
+                  >
+                    删除
+                  </button>
+                </div>
+                <p v-if="row.why" class="text-[11px] leading-relaxed text-slate-500">
+                  {{ row.why }}
+                </p>
+              </li>
+            </ul>
+            <p v-else class="text-xs text-slate-400">
+              这个节点没有跨分支关系。关系线只在**不同一级分支**之间连——同一父节点下的
+              关系由树本身表达。
+            </p>
           </section>
           <div class="grid grid-cols-2 gap-2">
             <button

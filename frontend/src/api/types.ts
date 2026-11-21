@@ -403,13 +403,39 @@ export interface NodePosition {
   y: number;
 }
 
-/** 与后端 `Relation` 一致。界面不渲染，原样透传。 */
+/**
+ * 跨节点关系的语义种类。与后端 `RelationKind` 一致（六个值）。
+ *
+ * 为什么单独起一套而不复用 `RelationType` 的四个旧值：`part_of` / `refines` 在旧集合
+ * 里根本无处安放，而混成一个联合类型会让"这个值是给老数据用的、那个是新生成用的"
+ * 永远分不清。渲染一律读 `kind`。
+ */
+export type RelationKind =
+  | 'depends_on'
+  | 'causes'
+  | 'conflicts'
+  | 'part_of'
+  | 'refines'
+  | 'references';
+
+/**
+ * 与后端 `Relation` 一致。**画布上画成虚线**（`canvas/MindRelation.vue`）。
+ *
+ * 两个语义字段并存，分工是死的：
+ *  - `kind` 是规范名，六个值，后端 `_sync_kind` 保证它一定有值；
+ *  - `type` 是旧名，四个值，只为读回存量数据存在——**不要**用它做判断。
+ *
+ * `why` 是这条边成立的理由（一句话）。生成侧把没有 `why` 的边直接丢掉，所以画布上
+ * 每一根虚线都答得上来"为什么这两个节点有关"。
+ */
 export interface MindRelation {
   id: string;
   source: string;
   target: string;
-  type: 'cause' | 'ref' | 'conflict' | 'depends';
+  kind?: RelationKind | null;
+  type?: 'cause' | 'ref' | 'conflict' | 'depends' | null;
   label?: string | null;
+  why?: string | null;
   evidence?: string | null;
   provenance?: 'user' | 'ai' | 'import';
 }
@@ -857,6 +883,14 @@ export type AgentEvent =
        * 而"额度用完"与"工具卡死"对用户意味着完全不同的下一步。
        */
       partial_reason?: string | null;
+      /**
+       * 服务端在响应体 `model` 里回报的名字——**它实际跑的是哪个**。
+       *
+       * 与上面那个 `model` 是两件事：那是我们发出去的意图，这是对面的回答。
+       * 两者不同不是异常（别名、路由、灰度都会让它们不同）。缺字段＝服务端没说，
+       * 界面写"未知"，不拿请求名冒充答案。
+       */
+      served_model?: string | null;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
 
@@ -992,6 +1026,55 @@ export interface EditSummary {
    * `removed_depth`——否则那次"每层都在被删"的污染还在。
    */
   removed_subtree: Record<string, number>;
+}
+
+// ---- 结构诊断与建议（`POST /api/optimization/check` / `suggest`）----
+//
+// 镜像 `backend/app/contracts/diagnostic.py`。两个端点都**只读**：不落库、不改任何
+// 东西（后端 docstring 的原话是"只读诊断""用户确认后才能应用"）。所以"生成完成后
+// 自动跑一次 check"是零成本的——它既不会改用户的作品，也不会有模型调用。
+//
+// `code` / `kind` / `level` 一律声明成 `string`，**不是**字面量联合。这是刻意的：
+// 后端正在持续加新的诊断码（近义冗余、缺失环节…），写成 `"SINGLE_CHILD" | …` 之后
+// 每来一个新码前端都要跟着改类型；而界面要的只是"把不认识的东西原样显示出来"。
+// 人话映射在 `mindmap/diagnostics.ts`，认不出来的码就显示码本身。
+
+/** 一条诊断。`level` 目前是 info / warn / error；未知值按 info 画。 */
+export interface Diagnostic {
+  level: string;
+  code: string;
+  /** 指向哪个节点；`null` 表示这条诊断不针对单个节点（如整图层面的问题）。 */
+  node_id?: string | null;
+  message: string;
+  /** 原文片段或相似节点 id。界面原样展示，不解释。 */
+  evidence?: string | null;
+}
+
+/**
+ * 一条**候选**修改。必须由用户确认才应用——后端没有自动应用接口。
+ *
+ * `kind` 决定"应用"这个动作到底做什么（`structure.ts::applySuggestion`）。只有
+ * `dedupe` 有定义（删掉那个重复节点）；其余 kind 后端还没给出对应的操作，界面
+ * 只显示不给按钮——摆一个点了不知道会发生什么的按钮比不摆更糟。
+ */
+export interface Suggestion {
+  /** 每次请求都会变（后端 `uuid4` 默认值）。**不要**拿它当"忽略过"的键。 */
+  id?: string;
+  kind: string;
+  node_id?: string | null;
+  message: string;
+  evidence?: string | null;
+  /** 规则建议没有经过概率校准；`null` = 未评估，与"置信 0"不是一回事。 */
+  confidence?: number | null;
+}
+
+export interface CheckResponse {
+  diagnostics: Diagnostic[];
+}
+
+export interface SuggestResponse {
+  suggestions: Suggestion[];
+  diagnostics: Diagnostic[];
 }
 
 /**

@@ -3,12 +3,13 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
-import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
+import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, MindRelation, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { CONNECTION_LOST, guideForFailure, INVALID_SOURCES, NO_CONTENT, type FailureGuide } from '../mindmap/failures';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
+import { diagnosticCount, diagnosticsHint } from '../mindmap/run-status';
 import {
   canvasEdgesOf,
   canvasStageEdgesOf,
@@ -49,6 +50,7 @@ import {
   findNode,
   LIMITS,
   removeEdge as removeEdgeFromContent,
+  removeRelation as removeRelationFromContent,
   removeNode,
   renameNode,
   setNodeNote,
@@ -1030,6 +1032,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 两者都随每次运行清空：上一轮的思考过程挂在这一次的结果上是纯粹的误读。
    */
   const runModel = ref<string | null>(null);
+  /**
+   * 服务端在响应里回报的模型名（`done` 帧的 `served_model`）。
+   *
+   * 与 `runModel` **不是**一个东西：`runModel` 是这次请求写出去的名字（我们的意图），
+   * 这个是对方说它实际跑的那个。实测请求写 `deepseek-chat`、响应回 `deepseek-flash`
+   * （两个名字是同一模型的两个别名，区别只在思不思考）。只显示请求名时，
+   * "服务端把请求路由到了别处"这件事在界面上根本看不出来。
+   */
+  const runServedModel = ref<string | null>(null);
   const lastReasoning = ref('');
 
   /**
@@ -1509,12 +1520,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 结果不完整时必须和全部成功区分开：只写「已落到画布」，用户改到一半才发现某几支
    * 是空的，而那时画布已经是他的作品了。partial 与"只有诊断"分开说——「分支未完成」
    * 这种话放在一棵只是有重复节点待合并的树上并不成立。
+   *
+   * **诊断要带数量**：原来只写「有诊断提示」，而界面上没有任何地方写着"诊断"两个字，
+   * 用户不知道该去哪儿看（实测：生成完在界面上找了半天）。`有 2 条诊断` 是能对上的；
+   * 数量与状态行上的入口按钮同一个来源（`diagnosticCount`）。
    */
   function finishStatus(base: string): string {
+    const diagnostics = diagnosticCount(agentWarnings.value);
+    const tail = diagnostics > 0 ? `，${diagnosticsHint(diagnostics)}` : '';
     if (agentWarnings.value.some(item => item.kind === 'partial')) {
-      return `${base}（部分分支未完成），可以直接改，也可以撤销回生成前。`;
+      return `${base}（部分分支未完成${tail}），可以直接改，也可以撤销回生成前。`;
     }
-    if (agentWarnings.value.length) return `${base}（有诊断提示），可以直接改，也可以撤销回生成前。`;
+    if (diagnostics > 0) {
+      return `${base}（${diagnosticsHint(diagnostics)}），可以直接改，也可以撤销回生成前。`;
+    }
     return `${base}，记得保存。`;
   }
 
@@ -1649,6 +1668,35 @@ export const useMindMapStore = defineStore('mindmap', () => {
   });
 
   /**
+   * 跨节点关系线（`ContentBase.relations`）的几何：端点落在哪两个节点、走哪两个句柄。
+   *
+   * 与 `attachEdges` 分开而不是合并成一个数组：两者的画法、数据形状、删除入口都不同
+   * （关系线读 `kind` / `why`，附加边读 `kind` / `label` / `back` / `inner`）。合起来
+   * 会让 `edges` 那个 computed 里出现一堆"这条到底是哪种"的判别。
+   *
+   * 端点找不到就跳过（契约层硬拒 dangling，这里只是兜底）：Vue Flow 拿到
+   * `source: undefined` 会抛错，整张画布白屏。
+   */
+  const relationEdges = computed(() => {
+    const current = layout.value;
+    const source = content.value;
+    if (!current || !source) return [];
+
+    const out: Array<{
+      relation: MindRelation; side: ChildSide; targetSide: ChildSide;
+    }> = [];
+    for (const relation of source.relations ?? []) {
+      const from = current.positions.get(relation.source);
+      const to = current.positions.get(relation.target);
+      if (!from || !to) continue;
+      const side = childSide(from, to, current.direction);
+      const targetSide: ChildSide = side === 'left' ? 'right' : side === 'right' ? 'left' : 'top';
+      out.push({ relation, side, targetSide });
+    }
+    return out;
+  });
+
+  /**
    * 每个节点要为附加边多开哪几个句柄。
    *
    * `MindNode.vue` 只渲染 `data.in` / `data.out` 里列出的句柄，而那两个数组原本只
@@ -1669,6 +1717,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
       const from = ensure(edge.source);
       if (!from.out.includes(side)) from.out.push(side);
       const to = ensure(edge.target);
+      if (!to.in.includes(targetSide)) to.in.push(targetSide);
+    }
+    // 跨节点关系线与附加边走**同一套端点约定**：一条关系线的两端也可能是两个叶子，
+    // 不为它们开句柄，Vue Flow 同样会把线从节点中心乱连。这一段是"关系能画出来"
+    // 的必要条件，不是优化。
+    for (const { relation, side, targetSide } of relationEdges.value) {
+      const from = ensure(relation.source);
+      if (!from.out.includes(side)) from.out.push(side);
+      const to = ensure(relation.target);
       if (!to.in.includes(targetSide)) to.in.push(targetSide);
     }
     return index;
@@ -1881,6 +1938,29 @@ export const useMindMapStore = defineStore('mindmap', () => {
         },
       });
     }
+
+    // 跨节点关系线（`relations`）。第三类线，用**第三种**渲染器：它的两个端点没有
+    // 共同的父节点，走 `mindEdge` 那套贴边的折线会从中间节点上拐直角，看起来像
+    // "穿过"了某个节点（见 `canvas/MindRelation.vue` 的注释）。
+    //
+    // id 前缀 `relation:`：同一个节点对上可以同时存在父子线（`A->B`）、附加边
+    // （`attach:…`）与关系线，三条的 id 必须分得开。
+    for (const { relation, side, targetSide } of relationEdges.value) {
+      out.push({
+        id: `relation:${relation.id}`,
+        source: relation.source,
+        sourceHandle: `out-${side}`,
+        target: relation.target,
+        targetHandle: `in-${targetSide}`,
+        type: 'mindRelation',
+        data: {
+          // 渲染只读 `kind`：后端 `_sync_kind` 保证它有值，`type` 是旧名的回声。
+          kind: relation.kind ?? 'references',
+          why: relation.why ?? undefined,
+          relationId: relation.id,
+        },
+      });
+    }
     return out;
   });
 
@@ -1973,6 +2053,29 @@ export const useMindMapStore = defineStore('mindmap', () => {
     return contentEdges.value.filter(edge => (
       edge.source === id || edge.target === id
       || (stage !== null && (edge.source === stage || edge.target === stage))
+    ));
+  });
+
+  /**
+   * 已应用内容里的**全部**跨节点关系线。
+   *
+   * 三种形状的顶层都有这个字段（契约 `ContentBase`），所以不需要像边那样按图型分派。
+   */
+  const contentRelations = computed<MindRelation[]>(() => (
+    content.value?.relations ?? []
+  ));
+
+  /**
+   * 与选中节点相关的关系线（源或目标命中它）。详情面板用它列"这个节点参与的关系"。
+   *
+   * 判据只有节点 id，没有 `selectedEdges` 那一层"阶段放宽"：关系线的端点永远
+   * 是节点 id（见契约 `_validate_relations`），不存在第二种命名空间。
+   */
+  const selectedRelations = computed<MindRelation[]>(() => {
+    const id = selectedId.value;
+    if (!id) return [];
+    return contentRelations.value.filter(relation => (
+      relation.source === id || relation.target === id
     ));
   });
 
@@ -2550,6 +2653,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (!known) return false;
     if (!applyContent(removeEdgeFromContent(content.value, edgeId), true)) return false;
     status.value = '已删除这条附加关系，可撤销。';
+    return true;
+  }
+
+  /**
+   * 删一条跨节点关系线。
+   *
+   * 与 `deleteEdge` 分开的理由见 `edits.removeRelation`：两套字段、两套 id 命名空间。
+   * 这里不做"未知 id 直接 false"之外的校验——关系线不参与布局，删它不改变任何节点
+   * 的坐标，所以不需要重排。
+   */
+  function deleteRelation(relationId: string): boolean {
+    const current = content.value;
+    if (!current) return false;
+    if (!(current.relations ?? []).some(relation => relation.id === relationId)) return false;
+    if (!applyContent(removeRelationFromContent(current, relationId), true)) return false;
+    status.value = '已删除这条关系线，可撤销。';
     return true;
   }
 
@@ -3222,6 +3341,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 上一轮的模型名与思考过程在**这一次开始的那一刻**就作废：它们描述的是另一个
     // 运行。留到这一次的 done 帧才清，中间那段时间面板会挂着一个已经不对的模型名。
     runModel.value = null;
+    runServedModel.value = null;
     lastReasoning.value = '';
 
     // 流只在 done / error 帧上才算有了明确结局；两者都没到就 EOF，说明连接被掐断了，
@@ -3354,6 +3474,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
             // `model` 缺字段 = 对面没说（演示模式 / 旧后端 / 测试里的假 provider），
             // 不替它认成 `deepseek-chat`——界面据此只说"模型没说"，不说谎。
             runModel.value = event.model ?? null;
+            // 服务端回报的那个名字。缺字段＝服务端没说（演示模式 / 旧后端 / 本地假件），
+            // 界面据此写"未知"，不拿请求名冒充答案——那正是这个字段要拆开的原因。
+            runServedModel.value = event.served_model ?? null;
             lastReasoning.value = event.reasoning ?? '';
             // 半棵树也是交付：后端在预算耗尽、工具超时、连续失败、空转收尾时不发
             // `error` 了，而是交出手上那棵树，用 `partial` 标明它没长完。**必须收进
@@ -3818,6 +3941,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     edgeNameOf,
     connectNodes,
     deleteEdge,
+    // 跨节点关系线：**画布上画出来**（`edges` 里的 `relation:` 通道）与**详情里能看见**
+    // （`selectedRelations`）是同一个能力的两半——只画不列，用户看到一根虚线却找不到
+    // 它是从哪来的；只列不画，那就还是改动之前那副"界面不渲染 relations"的样子。
+    contentRelations,
+    selectedRelations,
+    deleteRelation,
     selectedNode,
     selectedRefs,
     refIndex,
@@ -3895,6 +4024,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     runIntent,
     // 这一次真正发出去的模型名 + 模型的思考过程（`done` 帧的两条）
     runModel,
+    // 服务端回报的模型名（同一条帧的另一个字段）：与请求名分开，才能看出路由。
+    runServedModel,
     lastReasoning,
     expanding,
     generating,

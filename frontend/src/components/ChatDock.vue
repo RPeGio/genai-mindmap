@@ -9,8 +9,10 @@ import { useChatStore } from '../stores/chat';
 import { useGenerationOptions, DIAGRAM_TYPE_OPTIONS, THINKING_MODEL_OPTIONS } from '../stores/options';
 import { usePrefsStore, DIAGRAM_PREF_KEY, EXTERNAL_SEARCH_PREF_KEY, THINKING_PREF_KEY } from '../stores/prefs';
 import { useSourcesStore } from '../stores/sources';
+import { useStructureStore } from '../stores/structure';
 import type { DiagramTypeChoice } from '../api/types';
-import { agentDetailVisible } from '../mindmap/run-status';
+import { agentDetailVisible, diagnosticCount, diagnosticsHint } from '../mindmap/run-status';
+import { structureHint } from '../mindmap/diagnostics';
 
 /**
  * 底部对话框：**唯一**说一句话的地方。
@@ -35,6 +37,7 @@ const sources = useSourcesStore();
 const options = useGenerationOptions();
 const prefs = usePrefsStore();
 const chat = useChatStore();
+const structure = useStructureStore();
 
 const emit = defineEmits<{ detail: []; submit: [goal: string] }>();
 
@@ -148,18 +151,41 @@ const externalSearchApplies = computed(
   () => intentState.value === 'create' && !materialLongEnough.value,
 );
 
-const externalSearchHint = computed(() => {
+/**
+ * 联网检索这一次会怎么走：**判据与文案都只有这一份**。
+ *
+ * 这件事原先在两处各写一遍——勾选框旁的提示，与提交行下面那句"没传材料，会先去
+ * 外部搜资料"。开关关掉之后，前者说"不会联网"、后者仍然说"会去搜"，两行同时挂在
+ * 一个面板上互相打脸，而后端（`tools.external_knowledge_off_reason`）只认开关：
+ * 错的是后者。
+ *
+ * 所以判据只留这里：三态（关闭 / 材料太短 / 材料充足）外加"这次是改图"那一态，
+ * 两个渲染点都读同一句 `line`。
+ */
+type SearchState = {
+  kind: 'edit' | 'off' | 'short' | 'enough';
+  line: string;
+};
+
+const externalSearchState = computed<SearchState>(() => {
   // edit / expand 这条路不生成骨架、也不发检索请求：灰着就得说明原因，
   // 否则用户会以为"勾了没反应"是坏了。
-  if (intentState.value !== 'create') return '这次是改图，不走联网检索';
+  if (intentState.value !== 'create') {
+    return { kind: 'edit', line: '这次是改图，不走联网检索' };
+  }
   if (materialLongEnough.value) {
     // 置灰的原因必须写出来。灰着不解释，用户只会以为功能坏了。
-    return '这次带材料，不走联网检索';
+    // 这一态排在开关之前：材料够长时开关本来就不起作用，说"已关闭"会让人
+    // 以为关掉它是这次不联网的原因。
+    return { kind: 'enough', line: '这次带材料，不走联网检索' };
   }
-  return prefs.externalSearchEnabled
-    ? '没材料时先联网搜一轮资料，命中会变成能点回原文的引用（约 4 秒）'
-    : '已关闭：没材料时直接按主题生成，节点上不会有引用';
+  if (!prefs.externalSearchEnabled) {
+    return { kind: 'off', line: '已关闭：没材料时直接按主题生成，节点上不会有引用' };
+  }
+  return { kind: 'short', line: '会先去外部搜一轮资料，命中会变成能点回原文的引用（约 4 秒）' };
 });
+
+const externalSearchHint = computed(() => externalSearchState.value.line);
 
 /**
  * 勾选即落库。写失败时把勾**拨回去**：`:checked` 绑的是 store，而 store 没变就等于
@@ -218,9 +244,12 @@ const intentHint = computed(() => {
   }
   if (intentState.value === 'create') {
     if (typed.value) {
+      // 「会不会联网」与勾选框旁那句读的是**同一份判据**（`externalSearchState`）。
+      // 这里曾自己写了一句"没传材料，会先去外部搜资料"，开关关掉之后它还在说会搜，
+      // 与旁边那行正好相反；两份文案各自演化过一次就足够了。
       return sources.items.length
-        ? '会带上这里附的材料一起生成。'
-        : '没传材料，会先去外部搜资料。';
+        ? `会带上这里附的材料一起生成。${externalSearchHint.value}`
+        : externalSearchHint.value;
     }
     if (materialTopicChoice.value.topic) {
       return `没写主题：用材料标题「${materialTopicChoice.value.topic}」当中心主题。`;
@@ -311,18 +340,64 @@ function onIntentKeydown(event: KeyboardEvent) {
 /** 粘到主题框里的正文多长就不再当"主题"。 */
 const PASTE_AS_MATERIAL_CHARS = 120;
 
-/** 刚被自动分流的那一段正文（记着它落在哪一份材料里，才能撤回）。 */
-const pastedMaterial = ref<{ key: string; text: string; chars: number } | null>(null);
+/**
+ * 整段只有一个 http(s) 链接时的形状。
+ *
+ * 不允许任何空白：主题框里的粘贴是**整段**内容，含空格的多半是"标题 + 链接"或一整句
+ * 话，那些该按原来的规则走。尾部标点是常见的复制残留（`…/a。`），剥掉再判一次。
+ */
+const URL_ONLY = /^https?:\/\/[^\s<>"']+$/i;
+
+/** 这段粘贴是一个链接就返回它（已去首尾空白与尾部标点），否则 null。 */
+function pastedLink(text: string): string | null {
+  const trimmed = text.trim().replace(/[，。、；：）】」』]+$/u, '');
+  if (!trimmed || /\s/.test(trimmed)) return null;
+  return URL_ONLY.test(trimmed) ? trimmed : null;
+}
+
+/** 刚被自动分流的那一段正文 / 那一个链接（记着它落在哪一份材料里，才能撤回）。 */
+const pastedMaterial = ref<{
+  key: string; text: string; chars: number; link: boolean;
+} | null>(null);
 
 function onIntentPaste(event: ClipboardEvent): void {
   const text = event.clipboardData?.getData('text/plain') ?? '';
+  // **链接优先于"长正文"**，理由是三件事叠在一起：
+  //   1. 把 URL 当**主题**去生成一棵树是这份输入最坏的归宿——树会长成一棵以网址为
+  //      中心的图，用户要的那篇内容一个字都没进来；
+  //   2. 而 URL 通常不到 120 字，正好落进"当主题"那一支；
+  //   3. 带一长串查询参数的 URL 会落进"当材料"那一支，那同样是一份没有内容的材料
+  //      （正文就是一串百分号编码）。
+  // 所以判据放在最前面、且与长度无关。读不到正文时**回退**到原来的分流，不吞内容。
+  const link = pastedLink(text);
+  if (link) {
+    event.preventDefault();
+    void attachLink(link);
+    return;
+  }
   const chars = text.trim().length;
   if (chars < PASTE_AS_MATERIAL_CHARS) return;   // 短的就是主题，照常粘进输入框
   event.preventDefault();
   const key = sources.addPastedText(text);
   // 加不进去（超上限、合并后超长）时 store 里已经有错误提示；正文没丢，仍在剪贴板。
   if (!key) return;
-  pastedMaterial.value = { key, text, chars };
+  pastedMaterial.value = { key, text, chars, link: false };
+}
+
+/**
+ * 把一个链接读成材料，成功之后给一条可撤回的提示。
+ *
+ * **失败不弹提示条**：那一行材料自己的 `error` 里已经是后端给的原因（没打开 / 没配
+ * key / 抓不到），再在输入框下面重复一句会让用户以为发生了两件事。同时这个链接
+ * **不回填输入框**——它读不出来，放回去也还是读不出来；用户该做的是换一个链接或者
+ * 直接贴正文，而那正是错误提示在那一行上说的话。
+ */
+async function attachLink(url: string): Promise<void> {
+  const key = await sources.addFetchedUrl(url);
+  if (!key) return;
+  const item = sources.items.find(entry => entry.key === key);
+  if (!item || item.state !== 'ready') return;
+  pastedMaterial.value = { key, text: url, chars: url.length, link: true };
 }
 
 /** 把这段正文放回输入框，并撤掉刚建的那份材料。 */
@@ -363,6 +438,93 @@ type StatusKind = 'running' | 'error' | 'warn' | 'ok' | 'conflict';
 const agentPartial = computed(
   () => store.agentWarnings.find(item => item.kind === 'partial') ?? null,
 );
+
+/**
+ * 这次有几条诊断。
+ *
+ * 判据与抽屉里那份明细共用（`run-status.ts`）：状态行说"有 2 条诊断"、按钮上写着
+ * "2 条诊断"，点开必须正好是那两条。两处各数一次的话，某一天它们会开始不一样。
+ */
+const diagnostics = computed(() => diagnosticCount(store.agentWarnings));
+
+/**
+ * 结构检查（`/optimization/check`）的那半句结论。
+ *
+ * 它与上面那个 `diagnostics` **不是同一个东西**：那个来自生成链上工具回的
+ * `result_summary.diagnostics`（说的是"这次产出缺了什么"），这个来自只读的
+ * `/optimization/check`（说的是"这棵树现在有什么结构问题"）。两个来源各自演化，
+ * 合并成一个会立刻出现"这句话到底在说哪一次"的问题。
+ */
+const structureLine = computed(() => structureHint(structure.counts));
+
+/**
+ * 结构检查那边**需要人动手**的条数：warn / error 诊断 + 候选建议。
+ *
+ * **不含 info**。这一条同时决定两件事：状态行上显不显示数字，以及对话框会不会淡出。
+ * 让 info 参与任何一件，"生成完只剩下画布"这条性质就当场失效——`SINGLE_CHILD` 在
+ * 一棵正常的树上恒有十几条（任何链式子结构都命中），对话框将永远淡不出去。
+ * 判据在 `mindmap/diagnostics.ts::structureHint`，这里只是取那个数。
+ */
+const structureAlert = computed(
+  () => structure.counts.attention + structure.counts.suggestions,
+);
+
+/**
+ * 状态行上那个按钮的文字。
+ *
+ * 优先说生成链自己的诊断（那是"这次生成有问题"），其次说结构检查的条数，都没有时
+ * 退回「明细」——按钮本身仍然要在场，抽屉里还有改动清单与生成中的预览。
+ */
+const detailLabel = computed(() => {
+  if (diagnostics.value > 0) return `${diagnostics.value} 条诊断`;
+  if (structure.counts.suggestions > 0) return `${structure.counts.suggestions} 条建议`;
+  if (structure.counts.attention > 0) return `${structure.counts.attention} 处要注意`;
+  return '明细';
+});
+
+const detailTitle = computed(() => {
+  if (diagnostics.value > 0) return `打开右侧抽屉：${diagnostics.value} 条诊断逐条列出`;
+  if (structureAlert.value > 0) {
+    return '打开右侧抽屉：结构检查的建议与诊断逐条列出（建议可以「应用」或「忽略」）';
+  }
+  return '打开右侧抽屉：改动清单、结构与诊断逐条、生成中的预览';
+});
+
+/**
+ * 生成落地 → **自动跑一次只读结构检查**。
+ *
+ * 为什么自动：它零成本（后端 docstring：“只读诊断”，不落库、不改树、不调模型），
+ * 而"检查"一旦变成一件用户要记得去做的事，就等于没做。结果只并进状态行的一句话，
+ * 点进去才看详情——不新增任何常驻界面，也不挡画布。
+ *
+ * 它**只跑 check，不跑 suggest**：suggest 现在是纯规则，但后端正在给它加模型层，
+ * 那时"每次生成完自动跑"就变成"每次生成完自动花一次模型调用"。界线画在"用户点了
+ * 才发"，后端加成本时前端不用改。
+ *
+ * 新一轮开始（`generatedSummary` 被置回 null——`runGeneration` 开头、换图、撤销生成
+ * 都走这一步）时整份报告作废：它说的还是上一棵树。
+ */
+watch(() => store.generatedSummary, (now, before) => {
+  if (now && !before) {
+    structure.checkAfterGenerate();
+    return;
+  }
+  if (!now && before) structure.reset();
+});
+
+/**
+ * 「检查结构」按钮：手动跑一次 `check` + `suggest`，**带上材料**。
+ *
+ * 只有这条路径带 sources：后端拿到原文才会跑第三层引用核验（"点引用跳回原文"的依据
+ * 就是它），而材料全文可能上万字——用户没点的时候不该发这么大的请求体。自动那次
+ * 不带，只做结构三件套。
+ */
+function runStructureCheck(): void {
+  structure.runFull(sources.readySources);
+  // 结果在右抽屉里，所以顺手把它打开：点了按钮却什么都不出现，用户只会以为坏了。
+  // 抽屉是覆盖式浮层，开合不改画布宽度（与 `emit('detail')` 走同一个出口）。
+  emit('detail');
+}
 
 /**
  * 输入法组合中 / 焦点在主题框里。
@@ -501,7 +663,11 @@ const statusText = computed(() => {
       if (!summary) return '';
       const nodes = summary.nodes ? `${summary.nodes} 个节点` : '';
       const changes = summary.changes == null ? '' : `，改了 ${summary.changes} 处`;
-      return `已落到画布${nodes ? `（${nodes}${changes}）` : changes} · 还没保存`;
+      // 两处结论共用**一个**提示位：状态行只有一行，两段同时挂上去就是一句读不完的
+      // 话。生成链自己的诊断优先（"这次产出不完整"更紧急），没有它才轮到结构检查。
+      const hint = diagnosticsHint(diagnostics.value) || structureLine.value;
+      const tail = hint ? ` · ${hint}` : '';
+      return `已落到画布${nodes ? `（${nodes}${changes}）` : changes}${tail} · 还没保存`;
     }
     default:
       return '';
@@ -660,6 +826,14 @@ const shouldKeep = computed(() => {
   const kind = statusKind.value;
   if (kind && kind !== 'ok' && kind !== 'running') return true;
   if (kind === 'running') return true;
+  // 有诊断＝**该看的东西还没看**。它是第 4 条刹车（失败 / 部分完成 / 冲突）的延伸：
+  // 结果是成功了，但有几条"某支没展开 / 有重复节点"等着人处理，两秒后连入口一起
+  // 淡掉就是把它变成一句谁也找不到的提示（实测：用户找不到"诊断"在哪）。
+  if (diagnostics.value > 0) return true;
+  // 结构检查的 warn / 建议同理，但**只认需要人动手的那一档**：info 不刹车。
+  // 让它刹车的话，任何一张正常的树上都有十几条 `SINGLE_CHILD`，对话框将永远淡不出去
+  // ——那正是"生成完只剩画布"这条产品性质的反面。
+  if (structureAlert.value > 0) return true;
   return false;
 });
 
@@ -675,7 +849,11 @@ const canFade = computed(() => statusKind.value === 'ok'
   && !typed.value
   && !composing.value
   && !focused.value
-  && !sources.draftText.trim());
+  && !sources.draftText.trim()
+  // 有诊断就不安排淡出（同 `shouldKeep` 最后那条）：这一轮的结论里还有一笔没算完。
+  && diagnostics.value === 0
+  // 结构检查同理，且同样**只认 warn / 建议**（见 `structureAlert`）。
+  && structureAlert.value === 0);
 
 watch(
   () => [canFade.value, store.nodeCount] as const,
@@ -696,7 +874,14 @@ watch(
 const running = computed(() => statusKind.value === 'running');
 /** 生成中：整块收成一条细进度。 */
 const compact = computed(() => running.value);
-/** 生成完淡出：**opacity 归零而不是 v-if**，DOM 留着，测试与键盘用户都还找得到它。 */
+/**
+ * 生成完淡出：**opacity 归零而不是 v-if**，DOM 留着——「继续说一句」要能把它原样
+ * 叫回来，`v-if` 会把材料面板、输入框状态一起扔掉。
+ *
+ * 但"留着"不等于"还能操作"：淡出时整块要 `inert`。只给 `opacity-0` +
+ * `pointer-events-none` + `aria-hidden` 挡得住鼠标和读屏，挡不住 Tab——焦点会走进
+ * 一个用户根本看不见的对话框，接着再按 Enter 就是对着空气提交。
+ */
 const faded = computed(() => dismissed.value && !shouldKeep.value && !compact.value);
 
 function openComposer(prefill?: string): void {
@@ -789,6 +974,7 @@ defineExpose({
       class="pointer-events-auto w-full max-w-[760px] transition-all duration-300"
       :class="faded ? 'pointer-events-none translate-y-2 opacity-0' : 'translate-y-0 opacity-100'"
       :aria-hidden="faded ? 'true' : undefined"
+      :inert="faded ? true : undefined"
     >
       <!-- 生成中：一条细进度。它取代了整个对话框（不是叠在上面）——两处都说"正在生成"
            只会互相削弱，而画布此刻正是用户想看的东西。 -->
@@ -927,7 +1113,12 @@ defineExpose({
             class="flex items-center gap-2 rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] text-sky-900"
           >
             <span class="min-w-0 flex-1">
-              这段正文（{{ pastedMaterial.chars }} 字）已经放进材料，主题框留给"要它做什么"。
+              <template v-if="pastedMaterial.link">
+                这个链接已经读成一份材料，主题框留给"要它做什么"。
+              </template>
+              <template v-else>
+                这段正文（{{ pastedMaterial.chars }} 字）已经放进材料，主题框留给"要它做什么"。
+              </template>
             </span>
             <button
               type="button"
@@ -1055,13 +1246,37 @@ defineExpose({
               />
               智能搜索
             </label>
-            <p class="order-3 min-w-0 flex-1 truncate text-right leading-tight text-slate-400" data-test="external-search-hint">
+            <!--
+              「检查结构」：手动跑一次 `/optimization/check` + `/suggest`。
+
+              自动那次（生成落地之后）只跑 check、不带材料；这里**带上材料**，所以后端
+              会连第三层引用核验一起做——那是"点引用能跳回原文"的依据。
+
+              **只在画布上有图时出现**：没有图就没有检查对象，摆一个点了没反应的按钮
+              比不摆更糟。数字只在有 warn / 建议时出现（info 那一档不进这里，理由见
+              `structureAlert`）。
+            -->
+            <button
+              v-if="store.content"
+              type="button"
+              data-test="structure-check-run"
+              class="order-3 shrink-0 rounded-full border px-2 py-0.5"
+              :class="structureAlert > 0
+                ? 'border-amber-300 bg-amber-50 text-amber-800'
+                : 'border-slate-200 text-slate-500 hover:bg-slate-50'"
+              :disabled="runBlocked || structure.busy"
+              :title="structureAlert > 0
+                ? `这张图有 ${structureAlert} 处值得看一眼的地方；打开右侧抽屉逐条看`
+                : '检查这张图的结构：单子节点、深度上限、同级重名、引用能不能核验。只读，不改任何东西。'"
+              @click="runStructureCheck"
+            >{{ structure.busy ? '检查中…' : structureAlert > 0 ? `检查 · ${structureAlert}` : '检查' }}</button>
+            <p class="order-4 min-w-0 flex-1 truncate text-right leading-tight text-slate-400" data-test="external-search-hint">
               {{ externalSearchHint }}
             </p>
             <button
               type="button"
               data-test="attach"
-              class="order-4 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+              class="order-5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
               :disabled="runBlocked"
               aria-label="添加材料"
               title="添加材料（文档 / 图片 / 粘贴文字 / 录音）"
@@ -1070,7 +1285,7 @@ defineExpose({
             <button
               type="button"
               data-test="voice-toggle"
-              class="order-5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+              class="order-6 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
               :class="voiceMode ? 'border-slate-900 bg-slate-100 text-slate-900' : ''"
               :disabled="runBlocked"
               :aria-pressed="voiceMode"
@@ -1081,6 +1296,7 @@ defineExpose({
           </div>
 
           <p
+            data-test="intent-hint"
             class="text-[11px] leading-tight"
             :class="intentHintWarn ? 'text-amber-700' : 'text-slate-400'"
           >{{ intentHint }}</p>
@@ -1110,9 +1326,9 @@ defineExpose({
               type="button"
               data-test="run-status-detail"
               class="shrink-0 rounded-md px-2 py-0.5 text-xs underline decoration-dotted underline-offset-2 hover:bg-white/60"
-              title="打开右侧抽屉：改动清单、诊断逐条、生成中的预览"
+              :title="detailTitle"
               @click="emit('detail')"
-            >明细</button>
+            >{{ detailLabel }}</button>
           </div>
 
           <!--

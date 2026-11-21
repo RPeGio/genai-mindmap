@@ -267,6 +267,21 @@ export function removeEdge(content: DiagramContent, edgeId: string): DiagramCont
 }
 
 /**
+ * 删一条**跨节点关系线**。只动 `relations`，树与两个边数组一个字节都不变。
+ *
+ * 为什么单独一个函数而不是让 `removeEdge` 顺着查：`edges` 与 `relations` 是两套字段
+ * （同一条 dangling 判据，见 `dropDanglingEdges` 的注释），而 id 也是两套命名空间。
+ * 混在一个函数里，调用方就得先判断"这个 id 是哪一类的"——那件事在界面上没有意义
+ * （用户在详情面板里点的就是"删掉这条关系"）。
+ */
+export function removeRelation(content: DiagramContent, relationId: string): DiagramContent {
+  const relations = content.relations ?? [];
+  const kept = relations.filter(relation => relation.id !== relationId);
+  if (kept.length === relations.length) return content;
+  return { ...content, relations: kept } as DiagramContent;
+}
+
+/**
  * 删掉一批节点之后，把端点已经不存在的边**与关系**一起清掉。三张表都清。
  *
  * 与后端 `ops::_apply_remove` 同一语义（"删节点连带删边/关系"）：留着悬空项，下一次

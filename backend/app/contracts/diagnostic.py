@@ -27,11 +27,22 @@ class Diagnostic(BaseModel):
 
 
 class SuggestionKind(str, Enum):
+    """建议的**动作**名词，不是诊断码。
+
+    用户看到的是"点一下会发生什么"，所以值域按动作分，不按诊断分：同一个
+    `NEAR_DUPLICATE_LABEL` 与 `DUPLICATE_LABEL` 都是 `dedupe`，因为对用户来说
+    要做的是同一件事。`expand` / `add_detail` 是 F15 那一轮补的——`fill` 说的是
+    "整张图缺了哪一块"（结构级），而"这一支没展开"与"这几个节点没有说明"是
+    节点级的两件事，混进 `fill` 会让按钮文案说不清要点哪里。
+    """
+
     dedupe = "dedupe"          # 合并重复分支
     merge = "merge"            # 层级归并
     link = "link"              # 补跨节点关系
     fill = "fill"              # 补缺失环节
     drop = "drop"              # 剔除无依据节点
+    expand = "expand"          # 把这一支再展开一层
+    add_detail = "add_detail"  # 给节点补说明
 
 
 class Suggestion(BaseModel):

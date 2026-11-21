@@ -142,7 +142,12 @@ class SkeletonTest(unittest.TestCase):
         ]}}
         status, raw = request("POST", "/api/optimization/suggest", {"content": content})
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(raw)["suggestions"], [])
+        # 这条用例只回答"重复"这件事：不同父节点下的两个「应用」不是重复。
+        # 断言从 `suggestions == []` 收窄成"没有 dedupe"，因为 `suggest()`
+        # 现在也把结构诊断（这里是一级分支只有一条子支）转成 expand 建议了——
+        # "一条建议都没有"在树上还有别的毛病时本来就不该成立。
+        kinds = [item["kind"] for item in json.loads(raw)["suggestions"]]
+        self.assertNotIn("dedupe", kinds)
 
     def test_export_puml(self):
         status, raw = request("POST", "/api/export/puml", {"content": MAP})

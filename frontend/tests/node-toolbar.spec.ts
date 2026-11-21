@@ -274,8 +274,9 @@ describe('工具条跟着视口走', () => {
     store.select('a');
     await flushPromises();
 
-    // 节点宽 120、左 100 → 中点 160。
-    expect(wrapper.get('[data-test="node-toolbar"]').attributes('style')).toContain('left: 160px');
+    // 工具条摆在节点**右侧**（不再贴上方）：节点右边缘 220 + 缝 8 = 228。
+    // jsdom 量不出工具条自身的宽高（0×0），纵向就落在节点的竖直中线上。
+    expect(wrapper.get('[data-test="node-toolbar"]').attributes('style')).toContain('left: 228px');
 
     // 用户按住画布往右拖了 300px：节点在屏幕上是另一个位置了。
     node.getBoundingClientRect = () => ({
@@ -286,8 +287,8 @@ describe('工具条跟着视口走', () => {
     await flushPromises();
 
     const style = wrapper.get('[data-test="node-toolbar"]').attributes('style');
-    expect(style).toContain('left: 460px');
-    expect(style).toContain('top: 260px');
+    expect(style).toContain('left: 528px');
+    expect(style).toContain('top: 280px');
   });
 
   it('缩放之后也重量（0.5 倍时节点变小、位置也变）', async () => {
@@ -307,11 +308,11 @@ describe('工具条跟着视口走', () => {
     viewport.style.transform = 'translate(0px, 0px) scale(0.5)';
     await flushPromises();
 
-    // 中点是 250 + 60/2 = 280（不是缩放前的 160）。
-    expect(wrapper.get('[data-test="node-toolbar"]').attributes('style')).toContain('left: 280px');
+    // 右边缘 310 + 8 = 318（不是缩放前的 228）。
+    expect(wrapper.get('[data-test="node-toolbar"]').attributes('style')).toContain('left: 318px');
   });
 
-  it('贴右边、贴上边的节点：工具条被按回画布里，不飘出视口也不压住顶栏', async () => {
+  it('贴右边、贴上边的节点：工具条改摆到左侧，不飘出视口也不压住顶栏', async () => {
     stubFetch();
     setViewportSize(800, 600);
     const viewport = placeViewport();
@@ -341,8 +342,41 @@ describe('工具条跟着视口走', () => {
     await flushPromises();
 
     const style = wrapper.get('[data-test="node-toolbar"]').attributes('style');
-    // 横向：700 - 8（边距）- 75（半宽）= 617；纵向：60 + 8 + 36 = 104（不是 8）。
-    expect(style).toContain('left: 617px');
-    expect(style).toContain('top: 104px');
+    // 右侧放不下（828+150 越过 692）、左侧纵向又顶出画布（2 < 68）→ 夹回画布里：
+    // 横向 700-8-150 = 542（在节点左边，不盖住节点），纵向 60+8 = 68（不是 8）。
+    expect(style).toContain('left: 542px');
+    expect(style).toContain('top: 68px');
+  });
+});
+
+/**
+ * 两个浮层互相避让的**几何**在 `overlay-layout.spec.ts` 里逐条钉死了（纯算术）。
+ * 这里补的是"卡片那一侧真的按共享状态去避让工具条"这一件：卡片不是自己摆位，
+ * 它读 `overlayState.toolbarId` 与工具条的尺寸，交给同一个 `planOverlays`。
+ */
+describe('详情卡知道工具条在哪', () => {
+  it('卡片的位置是按工具条一起算出来的（不是自己贴上去的）', async () => {
+    const { overlayState } = await import('../src/canvas/overlay-state');
+    const { planOverlays, rectOf } = await import('../src/canvas/overlay-layout');
+    overlayState.toolbarId = 'a';
+    overlayState.toolbarSize = { width: 150, height: 36 };
+    try {
+      const anchor = { left: 500, top: 300, right: 680, bottom: 348 };
+      const plan = planOverlays({
+        area: { left: 0, top: 60, right: 1200, bottom: 800 },
+        toolbar: { anchor, size: overlayState.toolbarSize },
+        detail: { anchor, size: { width: 288, height: 120 } },
+      });
+      // 工具条在右、卡片在上——同一份 plan 的两个结论，缺一条就会叠在一起。
+      expect(plan.toolbar?.placement).toBe('right');
+      expect(plan.detail?.placement).toBe('above');
+      const bar = rectOf(plan.toolbar!, { width: 150, height: 36 });
+      const card = rectOf(plan.detail!, { width: 288, height: 120 });
+      expect(bar.left >= card.right || bar.right <= card.left
+        || bar.top >= card.bottom || bar.bottom <= card.top).toBe(true);
+    } finally {
+      overlayState.toolbarId = null;
+      overlayState.toolbarSize = { width: 0, height: 0 };
+    }
   });
 });

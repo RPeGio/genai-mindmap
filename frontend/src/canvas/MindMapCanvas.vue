@@ -1,13 +1,23 @@
 <script setup lang="ts">
 import { Background } from '@vue-flow/background';
 import { VueFlow, useVueFlow } from '@vue-flow/core';
-import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
 import { NODE_SIZE } from './layout/tidy';
+import {
+  MAX_ZOOM,
+  MIN_ZOOM,
+  contentBounds,
+  coverage,
+  planView,
+  type Point,
+  type ViewMode,
+} from './viewport';
 import FishboneEdge from './FishboneEdge.vue';
 import MindEdge from './MindEdge.vue';
 import MindNode from './MindNode.vue';
+import MindRelation from './MindRelation.vue';
 
 /**
  * 画布是**纯渲染**：节点坐标、连线句柄、鱼骨的骨线折线都由 store 算好
@@ -19,8 +29,25 @@ import MindNode from './MindNode.vue';
  * `fishbone`（骨线）。
  */
 const store = useMindMapStore();
-const { fitView, setCenter, onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals } =
-  useVueFlow();
+const {
+  setCenter, setViewport, getViewport, dimensions,
+  onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals,
+} = useVueFlow();
+
+/**
+ * 画布外壳。结构键（Tab / Enter / Delete / F2）只服务它，所以它必须能拿到焦点。
+ *
+ * **为什么要有这一层**：这些键原先挂在 `window` 上，只排除了输入框。于是选中一个
+ * 节点之后，焦点随便落在哪个按钮上，按 Tab（想切到下一个控件）都会往图里加一个子
+ * 节点、按 Enter 会加一个兄弟节点——用户以为自己只是在用键盘导航，图已经被改了。
+ * 这不是"少一次校验"，是数据损坏。
+ */
+const shell = ref<HTMLElement | null>(null);
+
+function focusCanvas(): void {
+  // `preventScroll`：画布可能比视口大，聚焦外壳时页面跳一下会让人以为图动了。
+  shell.value?.focus({ preventScroll: true });
+}
 
 // 预览节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
 // 画布这边不必自己判断来源，点不中就是点不中。
@@ -32,12 +59,19 @@ onNodeClick(({ node, event }) => {
   const additive = event.ctrlKey || event.metaKey || event.shiftKey;
   if (additive) store.toggleSelect(node.id);
   else store.select(node.id);
+  // 点了节点就把焦点交给画布：接下来按 Tab / Enter 是要改图，不是去别处。
+  focusCanvas();
 });
 onNodeDoubleClick(({ node }) => store.beginEdit(node.id));
-onPaneClick(() => store.clearSelection());
+onPaneClick(() => {
+  store.clearSelection();
+  focusCanvas();
+});
 // 用户手动平移或缩放后停止自动适配，否则每长一个节点视图就会被拽回全图。
 onMoveEnd(() => {
   store.viewAdjusted = true;
+  // 手动挪过之后"装不装得下"也变了：这句提示跟着真实视口走，不与某次适配绑定。
+  updateClippedHint();
 });
 
 /** 焦点在输入框里时不能抢键：那边的 Tab、Delete 归输入框自己管。 */
@@ -45,6 +79,36 @@ function isTyping(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   if (!el) return false;
   return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
+}
+
+/**
+ * 控件：它们的 Enter 是"点一下"，Tab 是"去下一个"，都不归画布。
+ *
+ * 节点卡片自己也带 `tabindex="0"`（可聚焦、可读屏），那是**画布内**的焦点，
+ * 结构键归画布——所以这里只排除真正的交互控件。
+ */
+function isControl(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || tag === 'A') {
+    return true;
+  }
+  const role = el.getAttribute('role');
+  return role === 'button' || role === 'link' || role === 'textbox' || role === 'menuitem';
+}
+
+/**
+ * 这一下按键该不该归画布：焦点必须在画布里，且不落在控件上。
+ *
+ * 撤销 / 重做（Ctrl+Z）不在这条判据里——那是全局操作，焦点在哪都该生效。
+ */
+function ownsStructureKeys(event: KeyboardEvent): boolean {
+  if (isTyping(event.target)) return false;
+  const el = shell.value;
+  if (!el) return false;
+  const active = document.activeElement;
+  if (!active || !el.contains(active)) return false;
+  return !isControl(active as HTMLElement);
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -56,6 +120,10 @@ function onKeydown(event: KeyboardEvent) {
     else store.undo();
     return;
   }
+
+  // 焦点不在画布里就到此为止：Tab 要能继续在表单控件之间走，Enter 要能按下那个
+  // 按钮。这一步之前漏了，选中节点后在别处按 Tab / Enter 会改图。
+  if (!ownsStructureKeys(event)) return;
 
   const id = store.selectedId;
   if (!id) return;
@@ -83,16 +151,129 @@ function onKeydown(event: KeyboardEvent) {
 
 onMounted(() => window.addEventListener('keydown', onKeydown));
 
+/**
+ * 视图档位。默认**适应宽度**：缩放下限由字号反推（`viewport.ts::MIN_READABLE_SCALE`），
+ * 于是"图大到装不下"时不再继续缩，而是只给一块能读的。
+ *
+ * 旧行为（整张图塞进视口）留给「全图」这一档。为什么默认值要换：43 个节点 × 1600 宽的
+ * 画布实测 `scale = 0.364`，节点正文 14px × 0.364 = **5.1 CSS 像素**——用户看到的是
+ * 一片灰，第一反应是"这次生成失败了"，而图其实是好的。
+ */
+const viewMode = ref<ViewMode>('fit-width');
+
+/**
+ * 切到「全图」之前那一屏。切回来要回到原位——那可能是用户手动平移、缩放到某一支之后
+ * 的位置，回到"重新适配"等于把他刚调好的视角扔掉一次。
+ */
+let savedViewport: { x: number; y: number; zoom: number } | null = null;
+
+/** 这一屏装不下整张图（只给了根附近的一块）：界面据此说一句"拖动可平移"。 */
+const clipped = ref(false);
+
+/**
+ * 「装不下」这句话怎么说：看**真实的视口**，而不是某一次适配算出来的结论。
+ *
+ * 为什么不能只看 `planView().clipped`：切回「适应宽度」时是把存下的那一屏原样还回去，
+ * 根本没重算过视图；用户手动平移/缩放之后同理。用真实视口算，这句话就永远与屏幕上
+ * 看到的一致（`coverage` 也就是"宽度/高度各看得见多少"）。
+ */
+function updateClippedHint(): void {
+  const view = dimensions.value;
+  const bounds = contentBounds(store.nodes);
+  if (!view?.width || !view?.height || !bounds) {
+    clipped.value = false;
+    return;
+  }
+  const seen = coverage(bounds, view, getViewport());
+  clipped.value = seen.width < 0.999 || seen.height < 0.999;
+}
+
+/**
+ * 局部聚焦的锚点：根节点的中心。
+ *
+ * 三种图型（树 / 鱼骨 / 流程）的根都被布局放在原点附近（`tidy` 把根平移到原点，
+ * 鱼骨的鱼头固定在 (0,0)，`layoutFlow` 也把根平移到原点），它是唯一的"入口"。
+ * 装不下时对到它，用户第一眼看到的是"这张图在讲什么"，而不是中间的某几格。
+ */
+function rootAnchor(): Point | null {
+  const root = store.nodes.find(node => node.data?.depth === 0);
+  if (!root) return null;
+  const width = root.data?.size?.width ?? NODE_SIZE.width;
+  const height = root.data?.size?.height ?? NODE_SIZE.height;
+  return { x: root.position.x + width / 2, y: root.position.y + height / 2 };
+}
+
+/** 按当前档位（或指定档位）把视图摆好。缩放与偏移的算术全在 `viewport.ts`。 */
+function applyView(mode: ViewMode, animate = false): void {
+  const view = dimensions.value;
+  // 还没量到画布大小（首帧、被折叠）：真算下去只会把视图搬到 (0,0)。
+  if (!view?.width || !view?.height) return;
+  const bounds = contentBounds(store.nodes);
+  if (!bounds) {
+    clipped.value = false;
+    return;
+  }
+  const plan = planView({
+    mode,
+    bounds,
+    viewport: view,
+    anchor: rootAnchor(),
+    // 与 `<VueFlow>` 上那两个属性同源，别在这里写第二份数字。
+    minZoom: mode === 'fit-width' ? undefined : MIN_ZOOM,
+    maxZoom: MAX_ZOOM,
+  });
+  clipped.value = plan.clipped;
+  // 动画走完之后再按真实视口核一遍（动画期间 `getViewport()` 还是旧的）。
+  void setViewport({ x: plan.x, y: plan.y, zoom: plan.zoom }, { duration: animate ? 250 : 0 })
+    .then(updateClippedHint);
+}
+
+function setView(next: ViewMode): void {
+  if (next === viewMode.value) return;
+  if (next === 'fit-all') {
+    savedViewport = getViewport();
+    viewMode.value = 'fit-all';
+    applyView('fit-all', true);
+  } else {
+    viewMode.value = 'fit-width';
+    const back = savedViewport;
+    savedViewport = null;
+    // 有存下来的那一屏就原样还回去（"切回来要回到原位"），没有才重新算。
+    if (back) {
+      void setViewport(back, { duration: 250 }).then(updateClippedHint);
+    } else {
+      applyView('fit-width', true);
+    }
+  }
+  // **不碰 `store.viewAdjusted`**：换档位是"我想怎么看"，不是"以后都别再自动适配"。
+  // 把它也当成手动调整，会得到一个很别扭的后果——点过「全图」之后再生成，
+  // 新图会停留在旧图那一屏上（`scheduleFit` 被这个标志挡住）。
+  // `setViewport` 本身不发 `moveEnd`，所以这里不动它，它就保持原样。
+}
+
+/**
+ * 换了一张图，之前存下的那一屏就作废了。
+ *
+ * 不复位的后果：在全图档下打开另一张图，再切回「适应宽度」，视口会被还回到**上一张
+ * 图**的某一屏——用户看到的是一片空白，而图其实在别处。
+ */
+watch(() => store.content, () => {
+  savedViewport = null;
+});
+
 let fitTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleFit() {
   if (store.viewAdjusted) return;
   clearTimeout(fitTimer);
   // 增量节点到达很密，节流一下，避免每帧都重新适配。
-  fitTimer = setTimeout(() => fitView({ duration: 250, padding: 0.2 }), 150);
+  fitTimer = setTimeout(() => applyView(viewMode.value, true), 150);
 }
 
 watch(() => store.nodeCount, scheduleFit);
 watch(() => store.direction, scheduleFit);
+// 画布尺寸第一次量出来（以及窗口缩放）时补一次：`fit-view-on-init` 已经关掉，
+// 首屏的视图完全由这里给——不补这一枪，默认档位在"进来就有一张图"时不会生效。
+watch(() => [dimensions.value.width, dimensions.value.height] as const, scheduleFit);
 
 // 从引用列表跳过来时把目标挪到视野中心。位置就是布局算出的绝对坐标，
 // 中心点 = 左上角 + 半个节点；不需要访问 Vue Flow 内部的节点实例。
@@ -154,7 +335,17 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="relative h-full w-full">
+  <!--
+    画布要能拿到焦点：`tabindex="0"` 让它进 Tab 序列，也让"点了画布 → 键盘改图"
+    这条链成立。焦点环只在键盘走到这里时出现（`focus-visible`），鼠标点画布不长出
+    一圈框。
+  -->
+  <div
+    ref="shell"
+    tabindex="0"
+    aria-label="导图画布（选中节点后 Tab 加子节点、Enter 加兄弟节点、Delete 删除、F2 改名）"
+    class="relative h-full w-full outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-300"
+  >
     <VueFlow
       :nodes="store.nodes"
       :edges="store.edges"
@@ -163,9 +354,9 @@ onBeforeUnmount(() => {
       :elements-selectable="true"
       :pan-on-drag="true"
       :zoom-on-scroll="true"
-      :min-zoom="0.2"
-      :max-zoom="1.6"
-      :fit-view-on-init="true"
+      :min-zoom="MIN_ZOOM"
+      :max-zoom="MAX_ZOOM"
+      :fit-view-on-init="false"
       class="h-full w-full"
     >
       <Background :gap="20" pattern-color="#e2e8f0" />
@@ -187,6 +378,13 @@ onBeforeUnmount(() => {
       -->
       <template #edge-mindEdge="edgeProps">
         <MindEdge v-bind="edgeProps" />
+      </template>
+      <!--
+        跨节点关系线（`relations`）。第三种渲染器，理由见 `MindRelation.vue`：
+        它的两个端点没有共同父节点，折线会从中间的节点上拐直角。
+      -->
+      <template #edge-mindRelation="edgeProps">
+        <MindRelation v-bind="edgeProps" />
       </template>
       <!--
         鱼骨图的骨线（主骨段 + 60° 斜骨、以及原因那截水平短线）。点的来源是
@@ -212,5 +410,46 @@ onBeforeUnmount(() => {
     >
       正在生成，稍候…
     </p>
+
+    <!--
+      视图档位。两档必须同时在场：默认档的可读字号下限意味着**一屏看不全**，
+      出路只有一条——让用户知道"还能看全"，以及怎么回去。所以不是一个开关，
+      是两个互斥按钮（当前档位亮着），切回去时回到切换之前那一屏（见 `setView`）。
+    -->
+    <div
+      v-if="store.nodeCount > 0"
+      class="absolute right-3 top-3 z-20 flex flex-col items-end gap-1"
+    >
+      <div
+        class="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white/95 p-0.5 text-[11px] shadow-sm"
+        role="group"
+        aria-label="视图范围"
+      >
+        <button
+          type="button"
+          data-test="view-mode-width"
+          class="rounded px-2 py-1"
+          :class="viewMode === 'fit-width' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'"
+          :aria-pressed="viewMode === 'fit-width'"
+          title="保证节点文字不小于 12 像素；装不下的部分拖动平移查看"
+          @click="setView('fit-width')"
+        >适应宽度</button>
+        <button
+          type="button"
+          data-test="view-mode-all"
+          class="rounded px-2 py-1"
+          :class="viewMode === 'fit-all' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'"
+          :aria-pressed="viewMode === 'fit-all'"
+          title="整张图塞进视口（节点多时字会很小）"
+          @click="setView('fit-all')"
+        >全图</button>
+      </div>
+      <!-- 装不下时说一句去哪儿看：这一档的代价必须写出来，而不是让用户猜。 -->
+      <p
+        v-if="clipped && viewMode === 'fit-width'"
+        data-test="view-clipped"
+        class="pointer-events-none rounded bg-white/80 px-1.5 py-0.5 text-[10px] text-slate-500 shadow-sm"
+      >只显示了一部分 · 拖动可平移</p>
+    </div>
   </div>
 </template>

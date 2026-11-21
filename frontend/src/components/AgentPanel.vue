@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 
 import { agentDetailVisible, runResultLine } from '../mindmap/run-status';
 import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
@@ -254,19 +254,54 @@ function jumpTo(id: string) {
 }
 
 /**
- * 收尾那一帧带回来的模型原话（后端只在没产出导图时填）。
+ * 收尾那一帧（最后一个 `done`）带回来的模型原话与思考过程。
  *
  * 取最后一个 `done`：一轮里可能有多帧，只有最后一帧是"这次结束的样子"。
+ * 这里**只负责取**，怎么解释由下面两个判据决定。
  */
-const modelText = computed(() => {
+interface RunTail {
+  text: string;
+  reasoning: string;
+  /** 这一帧自己带了导图内容没有。 */
+  hasContent: boolean;
+}
+
+const runTail = computed<RunTail | null>(() => {
   const events = store.agentEvents;
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i];
     if (event.type !== 'done') continue;
-    if (!event.text && !event.reasoning) return null;
-    return { text: event.text ?? '', reasoning: event.reasoning ?? '' };
+    return {
+      text: event.text ?? '',
+      reasoning: event.reasoning ?? '',
+      hasContent: !!event.content,
+    };
   }
   return null;
+});
+
+/** 这一轮真的产出导图了吗。 */
+const produced = computed(() => runTail.value?.hasContent === true
+  || !!store.generatedSummary
+  // 生成中的预览帧本身也是产出：模型已经把那棵树写出来了，只是还在收尾。
+  || store.agentEvents.some(event => event.type === 'snapshot' || event.type === 'ops'));
+
+/**
+ * 「模型只回了文字」那条提示的判据。
+ *
+ * **三个条件缺一不可**：没产出、没有任何工具调用记录、而且它确实说了/想了点什么。
+ * 只按"有思考内容"判会误伤最深的一种成功：勾了「深度思考」之后，收尾帧成功时
+ * 也带 `reasoning`，导图明明已经落到画布上了，面板却宣布"没有调用工具"——
+ * 用户会以为这次白跑了。
+ *
+ * 有工具调用记录却仍没产出时同样不显示这句：那时它是"调了但没成"，失败原因在
+ * 上面那几行工具进度里，说"没调用工具"是把用户引到错的方向。
+ */
+const textOnlyNote = computed<RunTail | null>(() => {
+  const tail = runTail.value;
+  if (!tail || produced.value || calls.value.length) return null;
+  if (!tail.text && !tail.reasoning) return null;
+  return tail;
 });
 
 /**
@@ -282,8 +317,20 @@ const diagnostics = computed(() => store.agentWarnings.filter(item => item.kind 
 
 /** 最多列三条诊断：再往下列就不是提个醒，而是让用户读长文了。 */
 const DIAGNOSTIC_LIMIT = 3;
-const shownDiagnostics = computed(() => diagnostics.value.slice(0, DIAGNOSTIC_LIMIT));
+
+/**
+ * 「展开全部」。
+ *
+ * 前三条足够让人判断"要不要现在处理"，但**不是**全部真相：4 条以上时原来只写
+ * 「还有 N 条」，没有展开入口——用户知道有东西却看不到（实测：状态行说"有诊断提示"，
+ * 界面上找不到那 N 条在哪）。折叠的默认值不变，缺的只是那条出路。
+ */
+const allDiagnosticsOpen = ref(false);
+const shownDiagnostics = computed(() => (
+  allDiagnosticsOpen.value ? diagnostics.value : diagnostics.value.slice(0, DIAGNOSTIC_LIMIT)
+));
 const hiddenDiagnostics = computed(() => diagnostics.value.length - shownDiagnostics.value.length);
+const canExpandDiagnostics = computed(() => diagnostics.value.length > DIAGNOSTIC_LIMIT);
 
 /**
  * 失败卡片：标题 + 下一步 + 按钮（判据在 `mindmap/failures.ts`）。
@@ -420,24 +467,34 @@ function cancel() {
       </details>
     </div>
 
-    <!-- 模型只回了文字、没产出导图：把它的原话摆出来。线上排障时日志未必捞得到，
-         这里是唯一能看到"它到底说了什么"的地方。 -->
+    <!--
+      模型的思考过程：**与有没有产出无关**，独立成块。
+      走推理模型时它就是用户勾「深度思考」要看的东西，成功时反而藏起来等于那个开关
+      白勾了；而无产出时它是排障的唯一现场（日志未必捞得到）。
+    -->
+    <details
+      v-if="runTail?.reasoning"
+      data-test="run-reasoning"
+      class="mt-2 rounded border border-slate-200 bg-white px-2 py-1.5"
+    >
+      <summary class="cursor-pointer text-[11px] text-slate-500">模型当时在想什么</summary>
+      <p class="mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-600">
+        {{ runTail.reasoning }}
+      </p>
+    </details>
+
+    <!-- 模型只回了文字、没调工具、也没产出导图：把它的原话摆出来。线上排障时日志
+         未必捞得到，这里是唯一能看到"它到底说了什么"的地方。 -->
     <div
-      v-if="modelText"
+      v-if="textOnlyNote"
       role="status"
       class="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 leading-relaxed text-amber-900"
     >
       <p class="font-medium">模型这次只回了文字，没有调用工具</p>
-      <p v-if="modelText.text" class="mt-1 whitespace-pre-wrap break-words text-[11px]">
-        {{ modelText.text }}
+      <p v-if="textOnlyNote.text" class="mt-1 whitespace-pre-wrap break-words text-[11px]">
+        {{ textOnlyNote.text }}
       </p>
       <p v-else class="mt-1 text-[11px]">（回复里没有正文）</p>
-      <details v-if="modelText.reasoning" class="mt-1">
-        <summary class="cursor-pointer text-[11px] text-slate-500">模型当时在想什么</summary>
-        <p class="mt-1 whitespace-pre-wrap break-words text-[11px] text-slate-500">
-          {{ modelText.reasoning }}
-        </p>
-      </details>
     </div>
 
     <!-- 部分完成与诊断：放在结果上方，用户先看到"这棵树不完整"，再去改。 -->
@@ -449,15 +506,23 @@ function cancel() {
       <p v-if="partialWarning" class="font-medium">
         部分完成<span class="font-normal">：{{ partialWarning.message }}</span>
       </p>
-      <p v-else class="font-medium">这次生成有诊断提示</p>
+      <p v-else class="font-medium">
+        这次生成有 {{ diagnostics.length }} 条诊断提示
+      </p>
       <ul v-if="shownDiagnostics.length" class="mt-1 flex flex-col gap-0.5 text-[11px]">
         <li v-for="item in shownDiagnostics" :key="`${item.code}|${item.message}`" class="break-words">
           {{ item.message }}
         </li>
       </ul>
-      <p v-if="hiddenDiagnostics > 0" class="mt-1 text-[11px]">
-        还有 {{ hiddenDiagnostics }} 条
-      </p>
+      <!-- 折叠之后必须留一条**能走到全部**的路：只写"还有 N 条"等于把后几条锁起来。 -->
+      <button
+        v-if="canExpandDiagnostics"
+        type="button"
+        data-test="diagnostics-expand"
+        class="mt-1 text-[11px] underline decoration-dotted underline-offset-2 hover:text-amber-900"
+        :aria-expanded="allDiagnosticsOpen"
+        @click="allDiagnosticsOpen = !allDiagnosticsOpen"
+      >{{ allDiagnosticsOpen ? '收起' : `展开全部 ${diagnostics.length} 条（还有 ${hiddenDiagnostics} 条）` }}</button>
     </div>
 
     <!-- 生成中的预览：节点边跑边上屏，用户先看清树在往哪个方向长。

@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-20，从检查点续写补说明之后）：后端 2187 个测试（pytest，另有 29 个 subtest）、前端 926 个 vitest 用例（57 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-21，合入队友 41 个提交、发布 v0.5.0 之后）：后端 2380 个测试（pytest，另有 29 个 subtest）、前端 999 个 vitest 用例（63 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 8 组路由（30 个路径 / 34 个端点）
+    main.py            应用装配，注册 9 组路由（31 个路径 / 35 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       ContentBase 与三个子类（树 / 流程图 / 鱼骨图）、Node、请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -102,7 +102,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               2187 个测试（另有 29 个 subtest）
+  tests/               2380 个测试（另有 29 个 subtest）
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -131,7 +131,7 @@ frontend/
     stores/prefs.ts    Pinia：用户偏好
     demo/presets.ts    三张预置演示导图（生产也带，点按钮才加载）
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               926 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型）
+  tests/               999 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -173,7 +173,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（30 个路径 / 34 个端点）
+## 5 接口一览（31 个路径 / 35 个端点）
 
 ```
 基础
@@ -225,6 +225,7 @@ DELETE /api/memory/{item_id}       删除一条记忆
 
 检索与知识库
 POST /api/knowledge/search         检索（桩，返回空）
+POST /api/knowledge/fetch          贴一个 URL，抓回正文变成一份材料（受 MINDMAP_EXTERNAL_DEEPSEEK_FETCH 约束）
 GET  /api/knowledge/library        知识库列表（含被引用次数）
 GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）
 ```

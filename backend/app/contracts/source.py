@@ -153,6 +153,19 @@ class SourceMetadata(BaseModel):
     # `knowledge.external.TEXT_MAX_CHARS`），没有这个数字，"模型只看了开头"与
     # "这条本来就短"在界面上长得一模一样。
     raw_chars: int | None = Field(default=None, ge=0)
+    # 外部搜索源**自己给的**两个排序元数据。只有 DeepSeek Search 会填，其余五源
+    # （维基 / 快懂百科 / arXiv / OpenAlex / Crossref）留 None——它们不提供可信的
+    # 相关性分（见 `knowledge.external.ExternalHit` 的 docstring）。
+    #
+    # 两者**都不参与我们的检索打分**：那条路是 BM25 + 向量 + RRF，跨查询不可比的外部
+    # 分数混进去只会让名次变成两种口径的混合。它们的用途只有两个——界面上回答"这条
+    # 为什么排在前面"，以及排障时区分"我们筛错了"与"源头就给了这一条"。
+    #
+    # `authority` 是搜索侧对**站点**的权威度评级（实测取值 4，量程未知，所以只校验
+    # 非负），`rerank_score` 是它对**这一条与 query** 的相关性分（实测 1.75–2.02，
+    # 同一个 query 内可比、跨 query 不可比）。
+    authority: int | None = Field(default=None, ge=0)
+    rerank_score: float | None = None
 
     @field_validator("created_at", "modified_at")
     @classmethod
@@ -310,3 +323,18 @@ class CreateTextSourceRequest(BaseModel):
 
 class CreateTextSourceResponse(BaseModel):
     source: Source
+
+
+class FetchUrlRequest(BaseModel):
+    """按 URL 读一篇网页 → 变成一份材料（`POST /api/knowledge/fetch`）。
+
+    `url` 的上限 2000：实测正常的落地页地址在 100–300 字符，2000 是"带一长串
+    query 参数的搜索页"的量级；再长就不是一个能读的地址了。`min_length=1` 让空串
+    在契约层 422，而不是穿过校验去发一个必然失败的请求。
+
+    这里**不校验 scheme**：`safe_http_url` 那条规矩是"只往 `<a href>` 里放"，而
+    这个字段是**要去请求的地址**——判据在服务层（`external._deepseek_fetch` 只收
+    http/https），两处各判一次会让"哪一层负责拒绝"变含糊。
+    """
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=1, max_length=2000)

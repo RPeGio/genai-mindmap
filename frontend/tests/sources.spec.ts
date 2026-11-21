@@ -431,3 +431,76 @@ describe('材料是可选的，不是必需的', () => {
     expect(store.materialProblem).toContain('重试或移除');
   });
 });
+
+/**
+ * 链接材料是唯一一条"异步而且没有本地文件"的输入路径。
+ *
+ * 它出过一次会永久卡住的 bug：行先以 `parsing` 插进列表，响应回来之后改的却是
+ * push 进去的**原始对象**。原始对象不在响应式图里，`parsing` 这个 computed 的依赖
+ * 一点没脏——行自己（经由代理读到同一份 target）已经是 `ready`，而界面上的
+ * "解析中"再也不消失，重试又按本地文件处理、同样永远不动。
+ */
+describe('链接材料', () => {
+  it('抓取完成之后 parsing 跟着变成 false（要改列表里那一行，不是原始对象）', async () => {
+    const pending = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(pending.promise));
+    const store = useSourcesStore();
+
+    const task = store.addFetchedUrl('https://example.com/a');
+    // 先读一次：`parsing` 在这里被求值并缓存。此后那一行若不是响应式代理，
+    // 它再也不会重算——这条断言就是那个 bug 的现场。
+    expect(store.parsing).toBe(true);
+    expect(store.items.map(item => item.state)).toEqual(['parsing']);
+
+    pending.resolve(json({
+      source: parsed('web-1', { kind: 'web', filename: 'deepseek: 示例页' }),
+    }));
+    await task;
+
+    expect(store.items[0].state).toBe('ready');
+    expect(store.items[0].label).toBe('deepseek: 示例页');
+    expect(store.parsing).toBe(false);
+  });
+
+  it('失败后重试按原链接重抓，不会去等一个没有文件的任务', async () => {
+    const first = deferred<Response>();
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(json({
+        source: parsed('web-2', { kind: 'web', filename: 'deepseek: 回来了' }),
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const store = useSourcesStore();
+
+    const task = store.addFetchedUrl('https://example.com/b');
+    // 后端对"抓不到"给的是 502 + 一句人话，前端直接把它写在那一行上。
+    first.resolve(json({ detail: '抓不到这个页面' }, 502));
+    await task;
+    expect(store.items[0].state).toBe('failed');
+    expect(store.items[0].error).toBe('抓不到这个页面');
+    expect(store.parsing).toBe(false);
+
+    await store.retry(store.items[0].key);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/knowledge/fetch');
+    expect(String(fetchMock.mock.calls[1][1].body)).toContain('https://example.com/b');
+    expect(store.items[0].state).toBe('ready');
+    expect(store.parsing).toBe(false);
+    expect(store.readySources.map(source => source.id)).toEqual(['web-2']);
+  });
+
+  it('抓取途中被删掉：迟到的响应不复活那一行', async () => {
+    const pending = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(pending.promise));
+    const store = useSourcesStore();
+
+    const task = store.addFetchedUrl('https://example.com/c');
+    store.remove(store.items[0].key);
+    pending.resolve(json({ source: parsed('web-3', { kind: 'web' }) }));
+    await task;
+
+    expect(store.items).toEqual([]);
+    expect(store.parsing).toBe(false);
+  });
+});
