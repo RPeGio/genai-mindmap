@@ -944,6 +944,86 @@ export interface PrefSuggestion {
   message: string;
 }
 
+// ---- 模型设置（`/api/settings/model`）----
+//
+// 镜像 `backend/app/settings/router.py`。这一组类型里没有**一个**明文字段——
+// 密钥只有 `api_key_masked`（`…abcd`）。这不是风格问题：`GET` 的响应会出现在
+// devtools 的 Network 面板里，也会被用户截图发到群里。
+
+/**
+ * 当前生效的模型配置（镜像后端 `ModelSettings`）。
+ *
+ * `*_source` 是 `saved` / `env` / `unset` 三个值之一，界面据此标注每一项
+ * 「面板里设的」「来自环境变量」。**不返回明文密钥**是这张契约的硬约束。
+ */
+export interface ModelSettings {
+  /** OpenAI 兼容端点，已去掉末尾斜杠（否则拼出来是 `//chat/completions`）。 */
+  base_url: string;
+  base_url_source: string;
+  /** 打码后的密钥：`…abcd`（只露末 4 位）；没配时是空串。**永远不是明文**。 */
+  api_key_masked: string;
+  api_key_source: string;
+  /** 有没有密钥。界面用它决定"清除密钥"按钮可不可点。 */
+  api_key_set: boolean;
+  model: string;
+  model_source: string;
+  /** 显式配的「深度思考」模型名；空串 = 没配，走 `_model_for` 的启发式。 */
+  deep_model: string;
+  deep_model_source: string;
+  /** 勾了深度思考时**实际会发出去**的名字（可能来自启发式，如 `deepseek-reasoner`）。 */
+  deep_model_effective: string;
+  /** `MINDMAP_LLM_MODE` 的原值。`demo` 表示"配好了也不会调模型"，**只读**。 */
+  llm_mode: string;
+  /** 地址 / 密钥 / 模型名三项齐了没有。判据与后端 `_config()` 一致。 */
+  configured: boolean;
+  /** 库里那一行最后保存的时刻；没保存过是 `null`。 */
+  updated_at?: string | null;
+}
+
+/** `PUT /settings/model` 的请求体。**每个字段的"空"含义不同**。 */
+export interface SaveModelSettingsRequest {
+  /** 省略 = 不改；空串 = 清掉覆盖、回落环境变量。 */
+  base_url?: string | null;
+  /**
+   * 省略或**空串** = 不改。界面上那个框显示打码值，用户不动它时提交的就是空串。
+   * 要清空必须 `clear_api_key: true`——把空串当"清空"，等于每次改模型名就抹一次密钥。
+   */
+  api_key?: string | null;
+  /** 省略 = 不改；空串 = 清掉覆盖、回落环境变量。 */
+  model?: string | null;
+  deep_model?: string | null;
+  /** 显式清除已保存的密钥。与同时提交 `api_key` 冲突（400 `settings_clear_conflict`）。 */
+  clear_api_key: boolean;
+}
+
+/** `PUT` 的响应：写入后的生效配置 + 这次有没有真的改变（同值重复保存是 `false`）。 */
+export interface SaveModelSettingsResponse extends ModelSettings {
+  changed: boolean;
+}
+
+/** `POST /settings/model/test` 的请求体：可选的临时覆盖，空字段 = 用当前生效值。 */
+export interface TestModelSettingsRequest {
+  base_url?: string | null;
+  api_key?: string | null;
+  model?: string | null;
+}
+
+/**
+ * 一次测试连接的结论。`ok=false` 也是 **200**——它是结论，不是 HTTP 失败。
+ *
+ * 真正的业务错误（三项都没配）才走 400：那时连测都没法测。
+ */
+export interface TestModelSettingsResponse {
+  ok: boolean;
+  /** 可直接显示的一句中文，例如「密钥被拒绝（401）」或「连接正常（320 毫秒）」。 */
+  message: string;
+  /** 这次真正拿去测的模型名。 */
+  model: string;
+  /** 对端 HTTP 状态码；超时/连不上时是 `null`。 */
+  status?: number | null;
+  latency_ms: number;
+}
+
 // ---- 编辑日志（统计"用户最常改什么"）----
 //
 // 这几个类型是**日志载荷**，不是导图契约：它们的形状由 `POST/PUT /mindmaps` 的

@@ -36,9 +36,9 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MINDMAP_LLM_MODE` | `demo`（仅 PDF 视觉这条） | `demo` 不联网走本地占位；`model` 才调模型。**PDF 视觉提取只在 `model` 下工作**。agent 生成只认显式的 `demo`：不设这个变量不会自动降级成占位图，缺模型配置会直接报错 |
-| `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
-| `MINDMAP_LLM_API_KEY` | — | 密钥，只从环境变量读 |
-| `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（经 `https://api.commandcode.ai/provider/v1`），先前用 `deepseek-flash` |
+| `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头。**可被页面内的设置面板覆盖**（见下） |
+| `MINDMAP_LLM_API_KEY` | — | 密钥。**可被页面内的设置面板覆盖**（落库为明文，与 `EnvironmentFile` 同一信任边界） |
+| `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（经 `https://api.commandcode.ai/provider/v1`），先前用 `deepseek-flash`。**可被设置面板覆盖** |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径 |
 | `MINDMAP_SOFFICE_CMD` | 自动探测 | 可选，LibreOffice 可执行文件路径 |
 | `DASHSCOPE_API_KEY` | — | 语音转写用。阿里云百炼控制台创建，`sk-` 开头 |
@@ -47,6 +47,8 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
 | `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
+
+**四个 `MINDMAP_LLM_*` 的优先级：页面设置面板（`/api/settings/model`，落 SQLite）> 环境变量 > 未配置。** 回落是**逐字段**的——只改了模型名、地址与密钥仍从环境变量来。面板保存后立即生效（1 秒 TTL 的进程内缓存，单 worker 下等于即时；多 worker 时另一个进程最多滞后 1 秒）。`MINDMAP_LLM_MODE` **不进库**：它是部署方定的"这台机器要不要联网"，面板只显示、不能改。面板只接受 OpenAI 兼容接口（实际请求的是"地址 + `/chat/completions`"）。密钥只回打码值（`…abcd`），要清空必须显式声明。**打码值不是密钥**：把它原样 `PUT` 回去会被拒（400 `settings_api_key_masked`）而不是当成新密钥存下来——否则库里那把真密钥会被字面量顶掉，而接口照旧说"已配置"、之后每次调用都 401。这条对直接调接口的人尤其重要：界面上那个值只出现在 placeholder 里，正常点击不会提交它。
 
 ## 4. 各格式的依赖与耗时
 

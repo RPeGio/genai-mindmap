@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-21，合入队友 41 个提交、发布 v0.5.0 之后）：后端 2380 个测试（pytest，另有 29 个 subtest）、前端 999 个 vitest 用例（63 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-21，四个并行任务落地、打码值防线补上之后）：后端 2430 个测试（pytest，另有 29 个 subtest）、前端 1027 个 vitest 用例（64 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 9 组路由（31 个路径 / 35 个端点）
+    main.py            应用装配，注册 10 组路由（33 个路径 / 38 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       ContentBase 与三个子类（树 / 流程图 / 鱼骨图）、Node、请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -99,10 +99,11 @@ backend/
     knowledge/         切块 / 混合检索 / rerank / 知识库（只读入口 + 生成时入库）/ 外部检索
     memory/            记忆模块（生成时注入相关记忆、会话结束总结）
     prefs/             用户偏好（读写 + 从历史推建议）
+    settings/          模型服务配置（页面内改地址/密钥/模型，落 SQLite 单行表，回落环境变量）
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               2380 个测试（另有 29 个 subtest）
+  tests/               2430 个测试（另有 29 个 subtest）
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -124,14 +125,15 @@ frontend/
     mindmap/run-status.ts 运行台账的状态映射
     sources/input.ts   来源收集常量与校验（格式白名单、字数与大小上限）
     audio/             浏览器录音（16kHz WAV）与 WAV 头处理
-    components/        AgentPanel / RecordButton / SourceInputs / ChatDock / MessageFab / NodeToolbar / VoicePress / HistoryDrawer / PrefsPanel
+    components/        AgentPanel / RecordButton / SourceInputs / ChatDock / MessageFab / NodeToolbar / VoicePress / HistoryDrawer / PrefsPanel / SettingsPanel
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 生成落地、运行台账
     stores/sources.ts  Pinia：来源列表
     stores/chat.ts     Pinia：对话消息
     stores/prefs.ts    Pinia：用户偏好
+    stores/settings.ts Pinia：模型服务配置（读 / 存 / 测试连接）
     demo/presets.ts    三张预置演示导图（生产也带，点按钮才加载）
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               999 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检）
+  tests/               1027 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -173,7 +175,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（31 个路径 / 35 个端点）
+## 5 接口一览（33 个路径 / 38 个端点）
 
 ```
 基础
@@ -228,6 +230,11 @@ POST /api/knowledge/search         检索（桩，返回空）
 POST /api/knowledge/fetch          贴一个 URL，抓回正文变成一份材料（受 MINDMAP_EXTERNAL_DEEPSEEK_FETCH 约束）
 GET  /api/knowledge/library        知识库列表（含被引用次数）
 GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）
+
+模型服务（页面内配置，改完立即生效）
+GET  /api/settings/model           当前生效值 + 每个字段的来源（库 / 环境变量 / 未配）
+PUT  /api/settings/model           改地址 / 密钥 / 模型名（密钥只回打码值，清空要显式声明）
+POST /api/settings/model/test      测试连接（失败也是 200 + 结论，不是 5xx）
 ```
 
 ---

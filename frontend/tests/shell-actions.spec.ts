@@ -83,9 +83,16 @@ describe('瘦顶栏', () => {
     await flushPromises();
 
     const header = wrapper.get('header');
-    expect(header.findAll('button')).toHaveLength(2);
+    // 数的是**顶栏有哪些动作**，不是"实现里有几个 button 标签"。
+    // 这两种口径在加一个入口时会分叉：前者要问"这个新动作该不该在顶栏"，
+    // 后者只会变成一条"数目变了，改数字"的噪音。所以按 `data-test` 数。
+    const actions = header.findAll('[data-test="history-toggle"], '
+      + '[data-test="open-settings"], [data-test="new-run"]');
+    expect(actions).toHaveLength(3);
+    expect(header.findAll('button')).toHaveLength(3);
     expect(header.find('input#title').exists()).toBe(true);
     expect(wrapper.find('[data-test="history-toggle"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="open-settings"]').exists()).toBe(true);
     expect(wrapper.get('[data-test="new-run"]').text()).toBe('+');
 
     // 原来那一排一个都不在顶栏里了（它们进了抽屉，见下一组用例）
