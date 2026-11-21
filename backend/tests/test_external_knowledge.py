@@ -685,14 +685,18 @@ def test_oversized_response_is_rejected(monkeypatch):
 
 
 def test_kind_table_is_the_only_thing_tools_gained():
-    """这次改 `tools.py` **只多了归类表里的三行**，别的一律是注释。
+    """`tools.py` 因为外部源而改的就只有归类表，别的一律是注释。
 
     开关关闭时的行为没变，靠的不是"我记得没改"，而是把"改了什么"钉成一条可执行的
-    断言：`_EXTERNAL_KINDS` 的键集合必须正好是五个源，多一个少一个都失败。
-    新增源时这条会红——那正是它的用途。
+    断言：`_EXTERNAL_KINDS` 的键集合必须正好是抓取层产出的那几个源，多一个少一个
+    都失败。新增源时这条会红——那正是它的用途（`deepseek` 就是加源时红过一次的那个）。
+
+    它与下一条 `test_every_fetched_source_has_a_kind` 的区别：这条**是**当"改动
+    清单"用的（"tools.py 只多了这一处"），下一条才是"表全不全"。两者都留着，是因为
+    它们未来红的时机不同——加第七个源时两条一起红，而"改了别的东西"只有这条会红。
     """
     assert set(agent_tools._EXTERNAL_KINDS) == {
-        "wikipedia", "baike", "arxiv", "openalex", "crossref"}
+        "wikipedia", "baike", "arxiv", "openalex", "crossref", "deepseek"}
     # 默认值：表里没有的名字落 `web`，不是 `paper`。默认必须是"最弱的那一类"，
     # 否则一个新源会因为没人想起它而被当成学术论文引用。
     assert agent_tools._external_source(external.ExternalHit(
@@ -861,6 +865,7 @@ def test_every_fetched_source_has_a_kind():
     produced = {
         "wikipedia", "baike",   # 百科
         "arxiv", "openalex", "crossref",   # 论文
+        "deepseek",   # DeepSeek Search（默认关，但产出的 source_name 是这一个）
     }
     assert produced == set(agent_tools._EXTERNAL_KINDS)
 

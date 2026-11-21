@@ -53,6 +53,11 @@ CREDENTIALS = (
     "MINDMAP_LLM_BASE_URL",
     "MINDMAP_LLM_API_KEY",
     "MINDMAP_LLM_MODEL",
+    # DeepSeek 的 tools API（`knowledge/external.py` 的 Search / Fetch）。key 与 base
+    # 都要清：它们**会回落**到上面那对 `MINDMAP_LLM_*`，只清专用的两个等于没清——
+    # 宿主机上配了 LLM key 时，Search 的用例会真的打出去。
+    "MINDMAP_DEEPSEEK_TOOLS_API_KEY",
+    "MINDMAP_DEEPSEEK_TOOLS_BASE_URL",
 )
 
 # 其余会改变行为的环境变量：开关、本地模型目录、外部程序路径。
@@ -83,6 +88,11 @@ BEHAVIOUR = (
     # 谁在本地设过 `MINDMAP_LIBRARY_REMEMBER=0`，"入库后换 id"那批用例就会集体变红
     # ——一个只在某些机器上出现的绿/红。
     "MINDMAP_LIBRARY_REMEMBER",
+    # 风格画像要不要拼进 user 末尾（`prefs/style.PROMPT_SWITCH_ENV`）。**清空而不是
+    # 置 0**：它默认**开**（代价只有几十个汉字），而"默认开 + 临时库的 style_profile
+    # 是空表 = 拼出来是空串 = 既有断言逐字节不变"正是接线时要验的那条前提。
+    # 置 0 会让所有生成用例都不经过"读了画像表但没读到"那条路。
+    "MINDMAP_STYLE_PROMPT",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
@@ -100,7 +110,18 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # `external` 键——几百条断言一起变红。需要它的用例自己 `setenv(..., "1")`；
             # "默认开"这件事由 `test_external_knowledge.py` 的一条专门用例
             # （`delenv` + 直接问 `external_knowledge_enabled()`）钉着。
-            "MINDMAP_EXTERNAL_KNOWLEDGE")
+            "MINDMAP_EXTERNAL_KNOWLEDGE",
+            # DeepSeek 的第六个源与"按链接抓取"。两者**默认关**（成本 + query 出境，
+            # 理由见 `external.DEEPSEEK_SEARCH_ENV`），这里置 0 让每条既有生成用例都
+            # 停在"六源里的五个"——也就是 `3c40ba6` 的形状。要它们的用例自己
+            # `setenv(..., "1")`，并同时把 `_client` 换成假响应。
+            "MINDMAP_EXTERNAL_DEEPSEEK_SEARCH",
+            "MINDMAP_EXTERNAL_DEEPSEEK_FETCH",
+            # 画像加权（`prefs/profile.SWITCH_ENV`）。**置 0**：它默认关（打开之后
+            # 每条命中要多一次 embedding，见 `profile.SWITCH_ENV`），而这里的用例
+            # 全部走 `no_real_http`——清空会让"默认开"那一侧的用例真的去 embed。
+            # 需要它的用例自己 `setenv(..., "1")` 并替换 `embed_texts`。
+            "MINDMAP_PROFILE_RERANK")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。
@@ -120,6 +141,27 @@ def clean_env(monkeypatch, tmp_path):
     for name in SWITCHES:
         monkeypatch.setenv(name, "0")
     monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "mindmaps.db"))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def full_text_material_off(monkeypatch):
+    """把"装得下的材料直接塞进 prompt"这条路**置关**（`FULL_TEXT_MATERIAL_CHARS=0`）。
+
+    与 `SWITCHES` 里那几项同一个理由：它线上默认是**开**（5 万字，依据见
+    `tools.FULL_TEXT_MATERIAL_CHARS` 的注释），而绝大多数既有用例钉的是"带材料 →
+    按支检索"那条路——它们的模型替身（`test_one_path._tree_chat`）就是按 user 里的
+    "第 N 支「标题」的检索结果"分组造引用的，全塞一开、那些分组不在 user 里了，
+    引用自然造不出来，断言会以"引用被剔掉了"的形式失败，而真正的原因是这次请求
+    走了另一条路。
+
+    需要它的用例自己 `monkeypatch.setattr(tools, "FULL_TEXT_MATERIAL_CHARS", ...)`
+    （见 `tests/test_full_text_material.py`）；"默认值是 50_000"这件事由那个文件里
+    的一条专门用例钉着——放这里等于把产品口径藏进测试配置。
+    """
+    from app.agent import tools
+
+    monkeypatch.setattr(tools, "FULL_TEXT_MATERIAL_CHARS", 0)
     yield
 
 

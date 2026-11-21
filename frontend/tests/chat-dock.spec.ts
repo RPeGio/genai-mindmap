@@ -9,6 +9,7 @@ import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 import { textSource } from '../src/sources/input';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
+import { isOptimizationRequest, optimizationReply } from './helpers/optimization-stub';
 
 /**
  * 底部对话框的状态机、语音态、材料缩略图与悬浮球。
@@ -47,6 +48,8 @@ function stubFetch(stream: unknown[] = []) {
   const mock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = String(input);
     if (isPrefsRequest(url)) return prefsReply(url);
+    // 生成落地后自动跑的只读结构检查：背景请求，不进"最后一条请求"的断言。
+    if (isOptimizationRequest(url)) return optimizationReply();
     if (url.endsWith('/health')) return { ok: true, status: 200, json: async () => ({ version: 'test' }) } as unknown as Response;
     return streamReply(stream);
   });
@@ -146,6 +149,44 @@ describe('底部对话框的状态机', () => {
     expect(dockFaded(wrapper)).toBe(false);
     expect(wrapper.get('[data-test="run-status"]').text()).toContain('生成失败');
     expect(wrapper.find('textarea#intent').exists()).toBe(true);
+  });
+
+  it('有诊断：成功那行写着条数，按钮能直达明细，而且不淡出', async () => {
+    // 后端分片生成的真实形态：ok=true，但两条诊断。
+    stubFetch([
+      {
+        type: 'tool_end',
+        seq: 1,
+        call_id: 'c1',
+        name: 'mindmap_generate',
+        ok: true,
+        result_summary: {
+          diagnostics: [
+            { level: 'warn', code: 'D1', message: '分支「a」展开失败，已留空' },
+            { level: 'warn', code: 'D2', message: '分支「b」只有 2 个要点' },
+          ],
+        },
+      },
+      { type: 'done', seq: 2, content: TREE, mode: 'model' },
+    ]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    await store.runGeneration('做一张导图', 'edit');
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+
+    // 1) 成功那行里留着可核对的**数量**
+    expect(wrapper.get('[data-test="run-status-text"]').text()).toContain('有 2 条诊断');
+    // 2) 入口就在同一行，写着同一个数
+    expect(wrapper.get('[data-test="run-status-detail"]').text()).toBe('2 条诊断');
+    // 3) `store.status` 那句（对话框淡出之后唯一还看得见的结论）也带数量
+    expect(store.status).toContain('有 2 条诊断');
+
+    // 4) 有诊断＝该看的东西还没看：两秒过去也不淡出
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+    expect(dockFaded(wrapper)).toBe(false);
   });
 
   it('输入框里还有没发出去的字时，成功也不淡出', async () => {
@@ -347,6 +388,10 @@ describe('底部对话框的状态机', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (isPrefsRequest(url)) return prefsReply(url);
+      // 补完说明落地之后前端会自动跑一次只读结构检查。它是背景请求，不是"点这个
+      // 入口发出了什么"——`stubFetch()` 里拦的就是同一件事，这里的 mock 是自己写的，
+      // 一并拦住，否则 `calls` 会多出几条与断言无关的 POST。
+      if (isOptimizationRequest(url)) return optimizationReply();
       if (url.endsWith('/health')) {
         return { ok: true, status: 200, json: async () => ({ version: 'test' }) } as unknown as Response;
       }
@@ -716,8 +761,42 @@ describe('悬浮球与消息时间线', () => {
     expect(wrapper.find('[data-test="message-badge"]').exists()).toBe(true);
   });
 
-  it('失败也进时间线，写成一条错误（而不是静默消失）', async () => {
-    stubFetch();
+  it('模型名写成「请求 X → 服务 Y」：服务端把请求路由到别处要看得出', async () => {
+    // 这一帧就是线上的形状：请求 deepseek-chat，响应回 deepseek-flash。
+    stubFetch([{
+      type: 'done', seq: 2, content: TREE, mode: 'model',
+      model: 'deepseek-chat', served_model: 'deepseek-flash',
+    }]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    await store.runGeneration('再加一支', 'edit');
+    await flushPromises();
+
+    expect(store.runModel).toBe('deepseek-chat');
+    expect(store.runServedModel).toBe('deepseek-flash');
+
+    await wrapper.get('[data-test="message-fab"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    const chip = wrapper.get('[data-test="message-model"]');
+    expect(chip.text()).toBe('请求 deepseek-chat → 服务 deepseek-flash');
+  });
+
+  it('服务端没回报模型名时写"未知"，不拿请求名冒充', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model', model: 'deepseek-chat' }]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    await store.runGeneration('再加一支', 'edit');
+    await flushPromises();
+
+    await wrapper.get('[data-test="message-fab"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get('[data-test="message-model"]').text()).toBe('请求 deepseek-chat → 服务 未知');
+  });
+
+
+  it('失败也进时间线，写成一条错误（而不是静默消失）', async () => {    stubFetch();
     const wrapper = mountApp();
     const store = useMindMapStore();
     store.preview(TREE, 'right');
@@ -778,6 +857,63 @@ describe('悬浮球与消息时间线', () => {
     const chat = useChatStore();
     expect(chat.messages[0].role).toBe('user');
     expect(chat.messages[0].text).toBe('把报销流程画清楚');
+  });
+
+  /**
+   * 用户那条消息的时间是 `NaN:NaN`，模型那条正常。
+   *
+   * 两条路各自漏一次：`said(text, at?)` 把 `at: undefined` 显式传进 `push`，而
+   * `push` 先写默认时间、再展开 `message`，展开把它覆盖成 `undefined`；显示层又
+   * 没判无效日期。写入与显示都得挡住——只修一个，另一条路照样把 `NaN:NaN` 摆上屏。
+   */
+  it('用户消息也带有效时间（NaN 不再来自默认值被覆盖）', async () => {
+    stubFetch();
+    mountApp();
+    const chat = useChatStore();
+
+    const said = chat.said('第一句');
+    expect(Number.isFinite(said.at)).toBe(true);
+    expect(said.at).toBeGreaterThan(0);
+    // 显式给时间时用给的，不要一律改写成 now。
+    expect(chat.said('第二句', 1700000000000).at).toBe(1700000000000);
+  });
+
+  it('时间无效时显示占位，不把 NaN:NaN 摆出来', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const chat = useChatStore();
+    // 绕过 push 直接塞一条脏数据：显示层必须自己挡得住（历史数据、回放都可能带）。
+    chat.messages = [{ id: 'm1', at: Number.NaN, role: 'user', text: '嗨' }];
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[data-test="message-fab"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    const item = wrapper.get('[data-test="message-item"]');
+    expect(item.text()).not.toContain('NaN');
+    expect(item.text()).toContain('--:--');
+  });
+
+  /**
+   * 淡出的对话框仍然在 DOM 里（「继续说一句」要靠它叫回来），但它不该再吃键盘。
+   *
+   * 只设透明 + `pointer-events-none` + `aria-hidden` 只挡住鼠标和读屏：按 Tab 焦点
+   * 照样会走进那个看不见的框，接着按 Enter 就是对着空气提交。
+   */
+  it('淡出之后整块是 inert：键盘焦点进不去', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
+    const wrapper = mountApp();
+    await wrapper.get('textarea#intent').setValue('机器学习');
+    await wrapper.get(SUBMIT).trigger('click');
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(2100);
+    await wrapper.vm.$nextTick();
+
+    const dock = wrapper.get('[data-test="chat-dock"]');
+    expect(dock.attributes('data-faded')).toBe('true');
+    expect(dock.attributes('inert')).toBeDefined();
+    // 另一半没丢：DOM 还在，叫得回来。
+    expect(wrapper.find('textarea#intent').exists()).toBe(true);
   });
 });
 
@@ -851,7 +987,13 @@ describe('材料参与生成', () => {
     await wrapper.get(SUBMIT).trigger('click');
     await flushPromises();
 
-    const body = JSON.parse(String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1]?.[1]?.body ?? '{}'));
+    // 按 URL 找那条**生成**请求，不取"最后一条"：生成落地之后前端还会自动跑一次
+    // 只读结构检查（`/optimization/check`），它才是最后一条。断言要钉的是"材料进了
+    // 生成请求体"，所以定位方式必须说清是哪一个请求。
+    const streamCall = [...fetchMock.mock.calls]
+      .reverse()
+      .find(([input]) => String(input).includes('/agent/runs/stream'));
+    const body = JSON.parse(String(streamCall?.[1]?.body ?? '{}'));
     expect(body.sources).toHaveLength(1);
   });
 });

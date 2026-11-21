@@ -163,12 +163,14 @@ async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
         seq += 1
         yield encode_event(DoneEvent(
             seq=seq, content=record.candidate, mode=mode,
-            model=record.model, reasoning=record.reasoning or "",
+            model=record.model, served_model=record.served_model,
+            reasoning=record.reasoning or "",
             partial=record.partial, partial_reason=record.partial_reason))
     else:
         yield encode_event(DoneEvent(
             seq=1, content=None, mode=mode,
-            model=record.model, reasoning=record.reasoning or "",
+            model=record.model, served_model=record.served_model,
+            reasoning=record.reasoning or "",
             partial=record.partial, partial_reason=record.partial_reason))
     yield DONE_FRAME
 
@@ -210,6 +212,9 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     # 同一个 run_id 第二次投递（`_replay`）拿到的帧就少了 model/reasoning，
     # 而第一次是有的——同一个 run 两种结果，用户会以为重放丢了东西。
     model: str | None = None
+    # 服务端回报的模型名（与请求名分开记）。理由同上：重放要还原「请求 X → 服务 Y」
+    # 的整句，少一半等于同一个 run 两条路径给两种说法。
+    served_model: str | None = None
     reasoning: str | None = None
     # "这棵树没长完"（预算耗尽、工具超时、连续失败、空转收尾）与原因。同上，
     # 落库是为了让重放与第一次同形：不存它，重连后拿到的帧会说"完整生成"。
@@ -265,6 +270,7 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
                     resolved = runs.STATUS_DONE
                     mode = event.mode
                     model = event.model
+                    served_model = event.served_model
                     # 空串按"没说"落库：`runs.finish()` 用 COALESCE，写成空串会把
                     # 上一轮已经记下的思考过程盖成空。
                     reasoning = event.reasoning or None
@@ -310,7 +316,7 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         # 拦下它并留下日志，用户至少还能从 done 帧拿到候选。
         try:
             runs.finish(run_id, resolved, candidate=candidate, failure=failure, mode=mode,
-                        model=model, reasoning=reasoning,
+                        model=model, served_model=served_model, reasoning=reasoning,
                         partial=partial, partial_reason=partial_reason)
         except Exception:  # noqa: BLE001 — 见上
             logger.exception("run %s 的终态没有落库", run_id)

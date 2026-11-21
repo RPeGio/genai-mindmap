@@ -142,6 +142,11 @@ class RunRecord:
     #:
     #: 老行上两者都是 None（那时还没这两列），重放时整条字段不存在，与"没说"同义。
     model: str | None = None
+    #: 服务端在响应体 `model` 里回报的名字（**它实际跑的**），与上面那个请求名分开存。
+    #:
+    #: 落库理由与 `model` 一样是重放：同一个 run_id 再投一次，界面上的
+    #: 「请求 X → 服务 Y」不能只剩半句。老行上它是 NULL，重放时字段整条不存在。
+    served_model: str | None = None
     reasoning: str | None = None
     #: 这次收尾**交出的树没长完**（预算耗尽、工具超时、连续失败、空转），以及为什么。
     #:
@@ -245,6 +250,7 @@ def _record(row: sqlite3.Row) -> RunRecord:
         applied_at=row["applied_at"],
         mode=row["mode"],
         model=row["model"],
+        served_model=row["served_model"],
         reasoning=row["reasoning"],
         partial=None if raw_partial is None else bool(raw_partial),
         partial_reason=row["partial_reason"] if "partial_reason" in row.keys() else None,
@@ -325,6 +331,7 @@ def finish(
     failure: dict[str, Any] | None = None,
     mode: str | None = None,
     model: str | None = None,
+    served_model: str | None = None,
     reasoning: str | None = None,
     partial: bool | None = None,
     partial_reason: str | None = None,
@@ -343,9 +350,9 @@ def finish(
     `failure` 反过来是直接赋值：它是"这一次的终态为什么是这样"，属于最新事实，
     上一次的失败原因留在上面只会让人读错。
 
-    `model` / `reasoning` 用 `COALESCE`，与 `mode` 同一档：它们是**观察值**，缺了
-    只说明这次没收尾到那一步（比如取消），不该把上一轮已经记下的值抹成 NULL——
-    那一行代表的始终是同一次运行的结果。
+    `model` / `served_model` / `reasoning` 用 `COALESCE`，与 `mode` 同一档：它们是
+    **观察值**，缺了只说明这次没收尾到那一步（比如取消），不该把上一轮已经记下的值
+    抹成 NULL——那一行代表的始终是同一次运行的结果。
 
     `partial` / `partial_reason` 也走 `COALESCE`：同一次运行的终态只可能写一次
     （`done` 之后冻结），传 None 的含义是"这次没说"，不是"这次是完整的"。
@@ -362,7 +369,8 @@ def finish(
             changed = conn.execute(
                 "UPDATE runs SET status = ?, candidate = COALESCE(?, candidate), "
                 "failure = ?, mode = COALESCE(?, mode), "
-                "model = COALESCE(?, model), reasoning = COALESCE(?, reasoning), "
+                "model = COALESCE(?, model), served_model = COALESCE(?, served_model), "
+                "reasoning = COALESCE(?, reasoning), "
                 "partial = COALESCE(?, partial), "
                 "partial_reason = COALESCE(?, partial_reason), "
                 "checkpointed_at = CASE WHEN ? IS NULL THEN checkpointed_at ELSE NULL END, "
@@ -370,7 +378,7 @@ def finish(
                 " WHERE run_id = ? AND status <> ?",
                 (status, dumped,
                  None if failure is None else json.dumps(failure, ensure_ascii=False),
-                 mode, model, reasoning,
+                 mode, model, served_model, reasoning,
                  None if partial is None else int(partial),
                  partial_reason,
                  dumped,

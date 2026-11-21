@@ -1,6 +1,7 @@
 import type {
   AgentEvent,
   AgentRunRequest,
+  CheckResponse,
   CreateTextSourceResponse,
   EditEventPayload,
   EditEventRow,
@@ -17,6 +18,7 @@ import type {
   RunSummary,
   SavedPref,
   Source,
+  SuggestResponse,
 } from './types';
 import type { EditEvent } from '../mindmap/edit-log';
 
@@ -327,6 +329,66 @@ export function markRunSaved(runId: string): Promise<void> {
   });
 }
 
+// ---- 结构诊断与建议（两个都只读）----
+
+/**
+ * `POST /optimization/*` 的请求体。
+ *
+ * `sources` 为空时**不发这个字段**：与保存请求同一条约定——"这次没带材料"与"这个
+ * 字段不存在"对读的人来说是同一件事，而少发一个字段让一次不带材料的体检与上一版
+ * 逐字节相同。后端两个端点共用 `CheckRequest`，`sources=None` 就是"不做引用核验"。
+ */
+function optimizationBody(
+  content: DiagramContent,
+  sources?: Source[],
+): { content: DiagramContent; sources?: Source[] } {
+  const body: { content: DiagramContent; sources?: Source[] } = { content };
+  if (sources && sources.length) body.sources = sources;
+  return body;
+}
+
+/**
+ * 只读诊断：单子节点 / 深度上限 / 同级重名，给了 `sources` 时还会按原文核验引用。
+ *
+ * **它不改任何东西**（后端 docstring：“只读诊断”）：不落库、不写回树、不调模型。
+ * 所以"生成完成之后自动跑一次"是安全的，也可以放心重跑——重跑一百次与一次等价。
+ *
+ * 形状做了一次归一（`Array.isArray`）：后端换版本、或者测试替身回了个空对象时，
+ * 界面拿到的是"零条诊断"，而不是一个 undefined 崩在半路。诊断是附加信息，
+ * 拿不到就当没有——它不该把生成结果的成功态弄成失败态。
+ */
+export async function checkOptimization(
+  content: DiagramContent,
+  sources?: Source[],
+): Promise<CheckResponse> {
+  const body = await request<Partial<CheckResponse>>('/optimization/check', {
+    method: 'POST',
+    body: JSON.stringify(optimizationBody(content, sources)),
+  });
+  return { diagnostics: Array.isArray(body?.diagnostics) ? body.diagnostics : [] };
+}
+
+/**
+ * 候选修改（**用户确认后才应用**；后端目前没有自动应用接口）。
+ *
+ * 与 `checkOptimization` 分成两个函数，不是把两者合并成一次往返：`suggest` 现在还是
+ * 纯规则（把 `DUPLICATE_LABEL` 翻成 `dedupe`），但后端正在给它加模型层——那时它就有
+ * 成本了。分开之后"免费的自动体检"与"点了才发的建议"各走各的路径。
+ */
+export async function suggestOptimization(
+  content: DiagramContent,
+  sources?: Source[],
+): Promise<SuggestResponse> {
+  const body = await request<Partial<SuggestResponse>>('/optimization/suggest', {
+    method: 'POST',
+    body: JSON.stringify(optimizationBody(content, sources)),
+  });
+  return {
+    suggestions: Array.isArray(body?.suggestions) ? body.suggestions : [],
+    diagnostics: Array.isArray(body?.diagnostics) ? body.diagnostics : [],
+  };
+}
+
 // ---- 文档上传 ----
 
 /**
@@ -353,6 +415,25 @@ export async function uploadDocument(file: File, signal?: AbortSignal): Promise<
   if (!body?.source?.id) {
     // 契约里解析失败一定走 422；拿到空壳说明后端出了问题，别把 undefined 传给下一步。
     throw new ApiError(response.status, 'empty_source', '后端没有返回解析结果，请重试。');
+  }
+  return body.source;
+}
+
+/**
+ * 按 URL 读一篇网页 → 一份材料（`POST /api/knowledge/fetch`）。
+ *
+ * 与 `uploadDocument` 共用同一套错误处理：后端已经把三种失败分成了三种状态码
+ * （409 没打开 / 503 没配 key / 502 抓不到），`ApiError.message` 里就是给人看的那句话，
+ * 调用方**直接显示**，不要再拼一层"抓取失败"——那会把"去把开关打开"盖成一句废话。
+ */
+export async function fetchUrlSource(url: string, signal?: AbortSignal): Promise<Source> {
+  const body = await request<CreateTextSourceResponse>('/knowledge/fetch', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+    signal,
+  });
+  if (!body?.source?.id) {
+    throw new ApiError(0, 'empty_source', '后端没有返回抓取结果，请重试。');
   }
   return body.source;
 }

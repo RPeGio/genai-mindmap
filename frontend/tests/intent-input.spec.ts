@@ -8,6 +8,7 @@ import { textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
+import { isOptimizationRequest, optimizationReply } from './helpers/optimization-stub';
 
 /**
  * 画布右上角那个框（合并后的 #2）：**唯一**说一句话的地方。
@@ -46,6 +47,8 @@ function stubFetch(reply: () => Response) {
     const url = String(input);
     // 偏好是挂载时的背景请求，不属于"点这个按钮发出了什么"，不进 calls。
     if (isPrefsRequest(url)) return prefsReply(url);
+    // 落地之后自动跑一次只读结构检查（`ChatDock` 那条 watch）：同上，不进 calls。
+    if (isOptimizationRequest(url)) return optimizationReply();
     if (url.endsWith('/health')) {
       // 挂载时探一次版本号。它是背景请求，和"点这个入口发出了什么"无关。
       return new Response(JSON.stringify({ status: 'ok', version: 'test' }), {

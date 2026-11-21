@@ -61,6 +61,7 @@ from app.generation.service import (
 )
 from app.memory import store as memory_store
 from app.prefs import service as prefs
+from app.prefs import style as prefs_style
 
 DEFAULT_STAGES = ["目标澄清", "要点拆解", "分支展开", "风险与验证"]
 logger = logging.getLogger(__name__)
@@ -304,10 +305,50 @@ def _system_text(
     ) if part).strip()
 
 
-def _initial_messages(request: AgentRunRequest, memory: str = "") -> list[dict[str, Any]]:
+def _style_text() -> str:
+    """用户风格画像那一段（读 `style_profile` 表算出来的一句形状描述）。
+
+    **拼在 user 末尾，不在 system 里**，所以这个函数只负责取文本、不负责拼接
+    （拼接在 `_initial_messages`）。位置的理由见 `_initial_messages` 的 docstring。
+
+    失败一律返回空串：画像是附属信息，它读不出来（表被删、字段是上一版实现的、
+    库锁住）不该让一次生成失败。这与 `_notes_text` 里"超限只记日志"同一条方向
+    ——降级的方向永远是"这次少一句个性化"。
+
+    同步调用而不是 `to_thread`：这是一次本地 sqlite 查询（8 行），微秒级，
+    与 `_intent_rule` 每轮读一次库同一个理由。
+    """
+    if not prefs_style.enabled():
+        return ""
+    try:
+        return prefs_style.prompt_block()
+    except Exception as exc:  # noqa: BLE001 — 见 docstring 第 2 段
+        logger.warning("风格画像读取失败（%s），这次不注入", type(exc).__name__)
+        return ""
+
+
+def _initial_messages(
+    request: AgentRunRequest, memory: str = "", style: str = "",
+) -> list[dict[str, Any]]:
+    """开头的两条消息。`style` 拼在 **user 末尾**。
+
+    三条规律叠加起来决定了这个位置，不是随手放的：
+
+      1. **不进 system**。本仓库已经验证过三次（`role=decision`、`_detail_ask`
+         的自查句、全塞模式下的引用规则），写在 system 里的具体指令会被那一段
+         长且稳定的背景稀释；挪到 user 里才生效。
+      2. **在 user 的末尾，不在开头**。开头是用户这次的原话，它的权重最高；
+         把画像插在它前面等于替用户改写了需求陈述。
+      3. **只拼一次，不每轮刷新**。`_refresh_outline` 每轮只换 system[0]，
+         user 那条从头到尾不变——画像也该是这次运行的一份常量。
+
+    `style` 为空串时返回的消息与加这个参数之前**逐字节相同**（`{"role": "user",
+    "content": request.goal}`），这是既有 2162 条用例的前提。
+    """
+    goal = request.goal if not style else f"{request.goal}\n\n{style}"
     return [
         {"role": "system", "content": _system_text(request, request.snapshot, memory=memory)},
-        {"role": "user", "content": request.goal},
+        {"role": "user", "content": goal},
     ]
 
 
@@ -504,6 +545,7 @@ def _no_progress_stop(
     no_progress: int,
     *,
     model: str | None = None,
+    served_model: str | None = None,
     reasoning: str = "",
 ) -> DoneEvent | ErrorEvent:
     """连续无进展到硬阈值：收尾。
@@ -511,15 +553,16 @@ def _no_progress_stop(
     与 `_budget_stop` 走同一个出口（`_deliver_or_fail`）：已经有候选就当作完成
     （那棵树是能用的，报成失败只会让用户不知道该不该用），一份都没有才报错。
 
-    `model` / `reasoning` 也要带上：这一帧和"模型自己收尾"那一条在界面上是同一种
-    成功（都落进了画布），少两字段就会出现"同样是生成成功，一次看得到模型名与
-    思考过程，另一次什么都没有"——而用户完全不知道差别来自哪种收尾。
+    `model` / `served_model` / `reasoning` 也要带上：这一帧和"模型自己收尾"那一条在
+    界面上是同一种成功（都落进了画布），少字段就会出现"同样是生成成功，一次看得到
+    模型名与思考过程，另一次什么都没有"——而用户完全不知道差别来自哪种收尾。
     """
     message = (f"连续 {no_progress} 次工具调用没有改动导图，模型在原地打转，已停止。")
     return _deliver_or_fail(
         ctx, seq, usage_total,
         code="no_progress", message=message, limit="no_progress",
-        tool_calls=tool_calls, model=model, reasoning=reasoning,
+        tool_calls=tool_calls, model=model, served_model=served_model,
+        reasoning=reasoning,
     )
 
 
@@ -650,6 +693,7 @@ def _deliver_or_fail(
     tool_calls: int,
     call: ToolCall | None = None,
     model: str | None = None,
+    served_model: str | None = None,
     reasoning: str = "",
     log_code: str | None = None,
 ) -> DoneEvent | ErrorEvent:
@@ -677,8 +721,9 @@ def _deliver_or_fail(
     `message` 在两条分支上都要用：作为 `partial_reason` 显示在结果旁边，或作为
     error 帧的 `message`。所以它必须是人能读的一句话，不能只是错误码。
 
-    `model` / `reasoning` 只在成功分支带（与"模型自己收尾"那一帧同形）：同一份
-    产出，不该因为停的原因不同，一次看得到模型名与思考过程、另一次什么都没有。
+    `model` / `served_model` / `reasoning` 只在成功分支带（与"模型自己收尾"那一帧
+    同形）：同一份产出，不该因为停的原因不同，一次看得到模型名与思考过程、另一次
+    什么都没有。`served_model` 是服务端回报的那个名字，与请求名分开。
 
     `log_code` 只在**日志**与出站 `code` 不一致时才传（现在只有工具超时这一条：
     帧上仍是 `budget_exhausted`/`max_seconds`，而日志要写 `tool_timeout`）。把它
@@ -689,7 +734,8 @@ def _deliver_or_fail(
     if ctx.produced and ctx.candidate is not None:
         return DoneEvent(
             seq=next(seq), content=ctx.candidate, usage=usage_total,
-            mode="model", model=model, reasoning=_reasoning_text(reasoning),
+            mode="model", model=model, served_model=served_model,
+            reasoning=_reasoning_text(reasoning),
             partial=True, partial_reason=message,
         )
     return ErrorEvent(
@@ -706,6 +752,7 @@ def _budget_stop(
     call: ToolCall | None = None,
     *,
     model: str | None = None,
+    served_model: str | None = None,
     reasoning: str = "",
 ) -> DoneEvent | ErrorEvent:
     """预算用尽时的收尾帧：树上已经有东西就当作完成，空树才算失败。
@@ -718,18 +765,20 @@ def _budget_stop(
     真的一棵树都没有（第一轮就没额度、工具失败前没产出）时仍然报错，
     那种情况下用户确实什么都没拿到。
 
-    `model` / `reasoning` 是**成功分支**必须带的两个字段（与模型自己收尾那一帧同形）：
-    预算耗尽只是"没继续花钱"，不代表这一次的产出不该被当作一次正常完成。少了它们，
-    "预算到点交付"与"模型主动交付"在界面上长得不一样，而用户看不出为什么。
+    `model` / `served_model` / `reasoning` 是**成功分支**必须带的字段（与模型自己收尾
+    那一帧同形）：预算耗尽只是"没继续花钱"，不代表这一次的产出不该被当作一次正常完成。
+    少了它们，"预算到点交付"与"模型主动交付"在界面上长得不一样，而用户看不出为什么。
     `reasoning` 取**最后一次模型响应**的思考过程——那是这一轮真正决定"可以收尾了"
     的那次思考，前面的轮次属于过程。
     """
+    message = _budget_message(ctx, limit, tool_calls)
     return _deliver_or_fail(
         ctx, seq, usage_total,
         code="budget_exhausted",
-        message=_budget_message(ctx, limit, tool_calls),
+        message=message,
         limit=limit,
-        tool_calls=tool_calls, call=call, model=model, reasoning=reasoning,
+        tool_calls=tool_calls, call=call, model=model, served_model=served_model,
+        reasoning=reasoning,
     )
 
 
@@ -1150,8 +1199,18 @@ async def _loop(
     #
     # query 是 `goal` + 材料标题（见 `store.query_text`），所以它天然是"这次的主题"。
     ctx.memory_hints = await _memory_hints(request)
+    # 风格画像：**一次运行读一次**，拼进 user 末尾（见 `_initial_messages`）。
+    #
+    # 它不进 `_system_text`：那个函数每轮被 `_refresh_outline` 调一次，而 user
+    # 那条从头到尾不变——画像也是这样一份常量。放进 system 还会顺带每轮多查一次库。
+    #
+    # 位置在这一行（`_memory_hints` 之后）只是顺序：两者互不依赖，检索是会等的
+    # 那次（0.3–1 秒），读表是立即的。
+    ctx.style_hints = _style_text()
+    if ctx.style_hints:
+        logger.info("风格画像已注入 user 末尾（%d 字）", len(ctx.style_hints))
     budget = request.budget
-    messages = _initial_messages(request, ctx.memory_hints)
+    messages = _initial_messages(request, ctx.memory_hints, ctx.style_hints)
     seq = itertools.count(first_seq)
     started = time.monotonic()
     tool_calls = 0
@@ -1167,6 +1226,10 @@ async def _loop(
     #     "同样是成功，一次有思考过程一次没有"，而用户不知道差别来自哪种收尾。
     model_name: str | None = None
     last_reasoning = ""
+    # 服务端回报的模型名，与 `model_name` 不是一回事：一个是请求里写出去的意图，
+    # 一个是响应体 `model` 说它实际跑的（实测请求 `deepseek-chat`、服务 `deepseek-flash`）。
+    # 一路带着的理由与 `model_name` 相同：预算/空转那两条收尾路径上没有"当前 provider"可问。
+    served_model: str | None = None
     # 防线二的状态：树的内容指纹 + 连续多少次调用没让它变。
     #
     # 初值在**进入循环之前**取，而不是在第一轮之后：`request.snapshot` 是用户
@@ -1185,7 +1248,7 @@ async def _loop(
         if limit is not None:
             yield _budget_stop(
                 ctx, seq, usage_total, limit, tool_calls, last_call,
-                model=model_name, reasoning=last_reasoning)
+                model=model_name, served_model=served_model, reasoning=last_reasoning)
             return
 
         # 先占额度、再发请求。反过来做（调用成功后才记账）时，一旦工具内部
@@ -1193,7 +1256,7 @@ async def _loop(
         if not ctx.reserve_model_call():
             yield _budget_stop(
                 ctx, seq, usage_total, "max_model_calls", tool_calls, last_call,
-                model=model_name, reasoning=last_reasoning)
+                model=model_name, served_model=served_model, reasoning=last_reasoning)
             return
 
         # 每轮刷新大纲：模型必须看到上一轮产出节点的真实 id，否则它无法精确改
@@ -1222,7 +1285,7 @@ async def _loop(
         except (asyncio.TimeoutError, TimeoutError):
             yield _budget_stop(
                 ctx, seq, usage_total, "max_seconds", tool_calls,
-                model=model_name, reasoning=last_reasoning)
+                model=model_name, served_model=served_model, reasoning=last_reasoning)
             return
         except ModelNotConfigured as exc:
             # 单独一条：这一类失败重试没有意义，界面要给的是"去配模型"而不是
@@ -1254,6 +1317,10 @@ async def _loop(
         usage_total = _merge_usage(usage_total, completion.usage)
         # 每一轮都覆盖：收尾帧要的是**最后一次**响应，不是第一次。
         model_name = getattr(active_provider, "model_name", None)
+        # 服务端回报的名字同样取最后一次。两条来源都试（provider 记的与 Completion 带的），
+        # 哪个有值用哪个：假 provider 不会记在实例上，真 provider 两个都有。
+        served_model = (getattr(active_provider, "served_model", None)
+                        or completion.served_model)
         last_reasoning = str(completion.message.get("reasoning_content") or "").strip()
 
         if not completion.tool_calls:
@@ -1314,6 +1381,9 @@ async def _loop(
                     # 与两条收尾路径（预算耗尽 / 空转停止）同一个来源：`model_name`
                     # 是这一轮 provider 真正发出去的名字。
                     model=model_name,
+                    # 服务端回报的那个名字（实测请求 chat、服务 flash）。两个都带上：
+                    # 只有请求名时，用户看不出这次被路由到了别处。
+                    served_model=served_model,
                 )
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
@@ -1495,7 +1565,7 @@ async def _loop(
             if no_progress >= NO_PROGRESS_ABORT:
                 yield _no_progress_stop(
                     ctx, seq, usage_total, tool_calls, no_progress,
-                    model=model_name, reasoning=last_reasoning)
+                    model=model_name, served_model=served_model, reasoning=last_reasoning)
                 return
 
             # 候选树从"没有"变成"有"（只可能是 mindmap_generate_deep 成功）时补一帧

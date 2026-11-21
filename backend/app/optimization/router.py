@@ -1,12 +1,30 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
 from app.contracts.diagnostic import Diagnostic, SuggestResponse
-from app.contracts.mindmap import SaveRequest
+from app.contracts.mindmap import DiagramContent, MindMapContent, SaveRequest
 from app.contracts.source import Source
 from app.optimization.service import check, suggest
 
 router = APIRouter(prefix="/optimization", tags=["逻辑优化"])
+
+# 体检只支持树型。**这条闸在路由层，不在 `check()` 里**：`check()` 与
+# `suggest()` 的判据是按树的形状写的（"只有一个子节点""分支深度对比"），
+# 鱼骨的六根骨是并列类别、流程的阶段是独立的命名空间，那些判据搬过去会
+# 变成噪声而不是错误 —— 所以不是"泛化一下"，是"这里不适用"。
+#
+# 失败形态值得记：在此之前传鱼骨/流程会 `AttributeError: ... has no attribute
+# 'root'`（`service.py` 里 `_iter_nodes(content.root)`），也就是 **500**。前端
+# `stores/structure.ts` 已经在发请求前拦住了，所以这个雷只在接口层可见 ——
+# 换一个客户端（curl、将来的移动端）就会踩。422 比 500 诚实：`500` 说的是
+# "服务器坏了"，而事实是"这个输入不在这个接口的服务范围里"。
+_TREE_ONLY = "结构体检只支持树型导图（鱼骨与流程的判据不同，暂不支持）"
+
+
+def _tree_content(content: DiagramContent) -> MindMapContent:
+    if not isinstance(content, MindMapContent):
+        raise HTTPException(status_code=422, detail=_TREE_ONLY)
+    return content
 
 
 class CheckResponse(BaseModel):
@@ -26,11 +44,12 @@ class CheckRequest(SaveRequest):
 @router.post("/check", response_model=CheckResponse)
 def check_map(body: CheckRequest):
     """只读诊断；可传 sources，按原文核验节点引用。"""
-    return CheckResponse(diagnostics=check(body.content, body.sources))
+    return CheckResponse(diagnostics=check(_tree_content(body.content), body.sources))
 
 
 @router.post("/suggest", response_model=SuggestResponse)
 def suggest_for_map(body: CheckRequest):
     """给出候选修改列表。用户确认后才能应用（当前无自动应用接口）。"""
-    return SuggestResponse(suggestions=suggest(body.content),
-                           diagnostics=check(body.content, body.sources))
+    content = _tree_content(body.content)
+    return SuggestResponse(suggestions=suggest(content),
+                           diagnostics=check(content, body.sources))

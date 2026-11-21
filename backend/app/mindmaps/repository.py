@@ -29,11 +29,16 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
     不做数据回填：新列在老行上是 NULL，而 NULL 在这里有确切含义（"当时没记"），
     比一个编出来的 0 诚实。
 
-    "先查再补"不是原子的：两个连接同时第一次打开一个新库，都读到缺列，于是各发一条
-    `ALTER TABLE ADD COLUMN`，后到的那条抛 `duplicate column name`。这条错误恰好说明
-    想要的结果已经发生，所以吞掉；不吞的话，第一个访问新库的并发请求会莫名其妙失败
-    一次（线上是 `/runs/stream` 的八路并发认领，它本来就靠写锁串行，不该被一个建列
-    动作带崩）。
+    **`PRAGMA` 与 `ALTER` 之间有一个竞态**，而 SQLite 没有 `ADD COLUMN IF NOT EXISTS`：
+    两个连接同时进来时，两边都查到"列不存在"，然后一个成功、另一个抛
+    `duplicate column name`。本地单线程跑不出来，但 `test_agent_runs` 那条
+    "八个并发 `begin()`" 在 Linux 上必红（CI 就是这么红的）。
+
+    所以这里 catch 住"列已经存在"这一种失败并当作成功 —— 它要达成的事已经达成了。
+    **只吞这一个错误码**：`ALTER` 还可能因为表名拼错、声明非法而失败，那些要继续抛，
+    否则迁移出问题时会被静默跳过，而缺列的后果是"事件全部静默丢失"（见上）。
+    吞掉整个 `OperationalError` 也不可以：那会把 `database is locked` 变成"列没补上
+    还装作补上了"。
     """
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     for name, declaration in columns.items():
@@ -41,8 +46,8 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
             continue
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
-        except sqlite3.OperationalError as error:
-            if "duplicate column name" not in str(error):
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
                 raise
 
 
@@ -128,6 +133,14 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     # 树上是 41 个节点）…"），与 `failure` 分开：`failure` 描述"这次失败了"，
     # 而半棵树是**成功交付但内容不全**，混进同一个字段会让界面只能二选一。
     _ensure_columns(conn, "runs", {"partial": "INTEGER", "partial_reason": "TEXT"})
+    # `served_model` 是第三个观察列（服务端回报的模型名）。理由同上：缺列时
+    # `runs.finish()` 的 UPDATE 抛 `no such column` 并被自己的日志吞掉，
+    # 结果是**每次运行的终态都不落库**，而现象只是 `pending()` 少返回几条。
+    #
+    # 与 `model` 分开：`model` 是**请求**里写的那个名字，`served_model` 是服务端
+    # 实际回报的。两者不同不是异常（别名、路由、灰度都会让它们不同），但"哪一次
+    # 请求被换到了哪个模型"要能从台账上答出来。
+    _ensure_columns(conn, "runs", {"served_model": "TEXT"})
     # 这一行里的 `candidate` 是**跑到一半截下来的检查点**，不是收尾交出的成品。
     #
     # 补这一列而不是新建一张表，是因为检查点与终态结果是同一种东西（一棵合法的
@@ -240,6 +253,14 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     from app.memory.store import ensure_schema as ensure_memory_schema
 
     ensure_memory_schema(conn)
+    # 风格画像（`app/prefs/style.py` 的统计层 + `app/prefs/profile.py` 的向量层）。
+    # import 放在函数内：两个模块顶层都要 `from app.mindmaps import repository`
+    # 拿 `connect`，模块顶层反向 import 回去就成环。与 `library` / `store` 同一条理由。
+    from app.prefs.profile import ensure_schema as ensure_profile_schema
+    from app.prefs.style import ensure_schema as ensure_style_schema
+
+    ensure_style_schema(conn)
+    ensure_profile_schema(conn)
     return conn
 
 

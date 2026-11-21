@@ -973,6 +973,30 @@ class ProviderParsingTest(unittest.TestCase):
         self.assertEqual(completion.tool_calls[0].arguments["text"], "中文")
         self.assertEqual(completion.usage["total_tokens"], 3)
 
+    def test_served_model_is_read_from_the_response_top_level(self):
+        """响应体顶层的 `model` 要留下来：它是"服务端实际跑了哪个"的唯一证据。
+
+        实测同一把 key、同一个地址：请求写 `deepseek-chat`，响应回 `deepseek-flash`
+        （两个名字是同一模型的两个别名，区别只在思不思考）。丢掉这一位，界面上就
+        只能显示我们发出去的那个名字，用户永远看不出请求被路由到了别处。
+        """
+        payload = {
+            "model": "deepseek-flash",
+            "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "好"}}],
+            "usage": {},
+        }
+        completion = _parse_completion(bytearray(json.dumps(payload).encode()))
+        self.assertEqual(completion.served_model, "deepseek-flash")
+
+    def test_served_model_is_none_when_the_response_omits_it(self):
+        """没有 `model` 就是"没说"：None，不是空串、也不是请求名。"""
+        payload = {
+            "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "好"}}],
+            "usage": {},
+        }
+        completion = _parse_completion(bytearray(json.dumps(payload).encode()))
+        self.assertIsNone(completion.served_model)
+
 
 class CancelTest(unittest.TestCase):
     def test_cancelled_error_propagates(self):

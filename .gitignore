@@ -65,3 +65,7 @@ codex-raw-*.log
 frontend/verify-fishbone.html
 frontend/verify-fishbone.ts
 frontend/verify-shots/
+
+# 本地启动脚本：里面是真实的 API key（DeepSeek + 阿里 MaaS）。
+# 启动方式见文件本身；要给别人用就照 .env.example 另写一份带占位符的。
+run-backend.bat

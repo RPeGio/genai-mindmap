@@ -1,9 +1,17 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { Handle, Position } from '@vue-flow/core';
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
 import type { ChildSide } from '../canvas/layout/tidy';
 import { NODE_SIZE } from '../canvas/layout/tidy';
+import {
+  DETAIL_WIDTH,
+  canvasArea,
+  nodeRect,
+  planOverlays,
+  sizeOf,
+} from '../canvas/overlay-layout';
+import { overlayState } from '../canvas/overlay-state';
 import type { MindNodeData } from '../stores/mindmap';
 
 const props = defineProps<{
@@ -201,19 +209,79 @@ const colorAttrs = computed(() => {
 });
 
 const card = ref(false);
-let timer: ReturnType<typeof setTimeout> | undefined;
+let showTimer: ReturnType<typeof setTimeout> | undefined;
+let hideTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * 悬停卡片的位置（视口坐标）。
+ *
+ * **卡片不在画布那层 DOM 里**：它被 `Teleport` 到 `body` 上，用 `position: fixed`
+ * 摆位。原因只有一个，但足够致命——画布是靠一句 `transform: scale(...)` 缩放的，
+ * 卡片如果还挂在节点内部，它就会跟着一起缩：默认档 `scale = 0.857` 时 12px 的正文
+ * 还能读，切到「全图」（0.364）就是 5px，点开一张"详情"看到的是一片灰。
+ *
+ * 悬停卡片是**读长文**的地方，它的字号不该由"图有多挤"决定。
+ *
+ * **位置不由这里决定**：和工具条一起在 `overlay-layout.ts::planOverlays` 里摆。
+ * 原先两者都贴节点上方，于是"选中一个节点"再"悬停它"时，工具条正好压在正文上。
+ */
+const cardAt = ref<{ x: number; y: number } | null>(null);
+const rootEl = ref<HTMLElement | null>(null);
+const cardRef = ref<HTMLElement | null>(null);
+
+function placeCard(): void {
+  const node = rootEl.value?.getBoundingClientRect();
+  if (!node) return;
+  const box = cardRef.value?.getBoundingClientRect();
+  // 卡片自己多大要记进共享状态：工具条拿它避让（"一处算"的另一半输入）。
+  if (box) overlayState.detailSize = { width: box.width, height: box.height };
+
+  const toolbarNode = overlayState.toolbarId ? nodeRect(overlayState.toolbarId) : null;
+  const plan = planOverlays({
+    area: canvasArea(),
+    detail: {
+      anchor: { left: node.left, top: node.top, right: node.right, bottom: node.bottom },
+      size: box ? sizeOf(box) : { width: DETAIL_WIDTH, height: 0 },
+    },
+    toolbar: toolbarNode ? { anchor: toolbarNode, size: overlayState.toolbarSize } : null,
+  });
+  if (plan.detail) cardAt.value = { x: plan.detail.x, y: plan.detail.y };
+}
 
 function scheduleCard() {
-  clearTimeout(timer);
+  clearTimeout(showTimer);
+  clearTimeout(hideTimer);
   // 200ms 延迟：鼠标扫过画布时不该到处弹卡片。
-  timer = setTimeout(() => {
+  showTimer = setTimeout(() => {
+    overlayState.detailId = props.id;
     card.value = true;
+    // 先量一次（卡片的宽高要等它挂上去才知道），下一帧再按真实尺寸摆正。
+    void nextTick(() => {
+      placeCard();
+      requestAnimationFrame(placeCard);
+    });
   }, 200);
 }
 
+/**
+ * 离开节点之后**晚一点**再收卡片。
+ *
+ * 卡片是 `Teleport` 出去的独立一层，与节点之间隔着 `OVERLAY_GAP` 那么一条缝：
+ * 立刻收的话，鼠标朝卡片移过去的第一步就已经把卡片关掉了——而卡片里那段长正文
+ * 是 `max-h-56 overflow-y-auto`，滚不动等于白给。这 120ms 就是穿过那条缝的时间，
+ * 鼠标真的进了卡片（`@mouseenter="scheduleCard"`）就把这次收起取消。
+ */
+function hideCardSoon() {
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(hideCard, 120);
+}
+
 function hideCard() {
-  clearTimeout(timer);
+  clearTimeout(showTimer);
+  clearTimeout(hideTimer);
   card.value = false;
+  cardAt.value = null;
+  if (overlayState.detailId === props.id) overlayState.detailId = null;
 }
 
 const draft = ref('');
@@ -277,14 +345,19 @@ function finishAndNext() {
   emit('next', draft.value);
 }
 
-onBeforeUnmount(() => clearTimeout(timer));
+onBeforeUnmount(() => {
+  clearTimeout(showTimer);
+  clearTimeout(hideTimer);
+  if (overlayState.detailId === props.id) overlayState.detailId = null;
+});
 </script>
 
 <template>
   <div
+    ref="rootEl"
     class="relative"
     @mouseenter="scheduleCard"
-    @mouseleave="hideCard"
+    @mouseleave="hideCardSoon"
     @focusin="scheduleCard"
     @focusout="hideCard"
   >
@@ -392,18 +465,31 @@ onBeforeUnmount(() => clearTimeout(timer));
       {{ data.refs ?? 0 }}
     </div>
 
-    <div
-      v-if="card && !editing"
-      class="absolute bottom-full left-1/2 z-30 mb-2 w-72 -translate-x-1/2 rounded-md border border-slate-300 bg-white p-3 text-left shadow-lg"
-    >
-      <p class="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-sm text-slate-700">
-        {{ data.body }}
-      </p>
-      <p v-if="hasMore" class="mt-2 text-xs text-slate-400">
-        <span v-if="data.bodySource === 'detail'">节点上只显示标题，这里是生成时写的详情</span>
-        <span v-else-if="data.bodySource === 'note'">节点上只显示标题，这里是你的备注</span>
-        <span v-else>节点上只显示前 24 个字，完整内容见此处或右侧详情面板</span>
-      </p>
-    </div>
+    <!--
+      悬停卡片：`Teleport` 到 `body`、`position: fixed`。
+      它必须是**画布缩放之外**的一层（理由见 `cardAt` 的注释）：卡片是读长文的地方，
+      字号与尺寸不跟着 `transform: scale()` 走。位置按节点的视口外接框算，
+      所以选中/悬停之后画布平移、缩放，它仍然贴在节点上方（`placeCard`）。
+    -->
+    <Teleport to="body">
+      <div
+        v-if="card && !editing && cardAt"
+        ref="cardRef"
+        data-test="node-detail-card"
+        class="fixed z-30 w-72 rounded-md border border-slate-300 bg-white p-3 text-left shadow-lg"
+        :style="{ left: `${cardAt.x}px`, top: `${cardAt.y}px` }"
+        @mouseenter="scheduleCard"
+        @mouseleave="hideCardSoon"
+      >
+        <p class="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-sm text-slate-700">
+          {{ data.body }}
+        </p>
+        <p v-if="hasMore" class="mt-2 text-xs text-slate-400">
+          <span v-if="data.bodySource === 'detail'">节点上只显示标题，这里是生成时写的详情</span>
+          <span v-else-if="data.bodySource === 'note'">节点上只显示标题，这里是你的备注</span>
+          <span v-else>节点上只显示前 24 个字，完整内容见此处或右侧详情面板</span>
+        </p>
+      </div>
+    </Teleport>
   </div>
 </template>

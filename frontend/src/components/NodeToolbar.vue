@@ -3,6 +3,15 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { NODE_COLORS, NODE_COLOR_LABELS } from '../mindmap/edits';
 import { useMindMapStore } from '../stores/mindmap';
+import {
+  DETAIL_WIDTH,
+  canvasArea,
+  canvasWatcher,
+  nodeRect,
+  planOverlays,
+  sizeOf,
+} from '../canvas/overlay-layout';
+import { overlayState } from '../canvas/overlay-state';
 
 /**
  * 选中节点旁边浮出的小工具条：`[改][展开][删][色]`。
@@ -11,9 +20,10 @@ import { useMindMapStore } from '../stores/mindmap';
  * 抽屉、对话框生成完就淡出），"选中一个节点"于是需要一个**就地**的入口——用户此刻
  * 的眼睛在节点上，不在屏幕边缘。
  *
- * **定位靠读 DOM**，不靠布局：节点坐标在 `stores/mindmap` 里算好、由 Vue Flow 画到
- * `.vue-flow__node[data-id]` 上。这里只 `getBoundingClientRect()`，一个像素都不改渲染。
- * 平移/缩放/长出新节点之后位置会变，所以 resize、节点数、方向、选中变化都要重算。
+ * **位置不由这里决定**：它和详情卡都在 `overlay-layout.ts::planOverlays` 里一起摆。
+ * 原先它贴在节点上方，而详情卡也是从节点上方弹出来的——实测「明确目标分数」那一支，
+ * 工具条正好压住正文；贴到画布上沿时还会被 clamp 回节点里，把节点自己糊住。
+ * 现在候选顺序是**侧面 → 下方 → 上方**，并且躲开详情卡已经占下的那块矩形。
  */
 const store = useMindMapStore();
 
@@ -29,11 +39,8 @@ const emit = defineEmits<{ edit: [label: string]; expand: [] }>();
 
 const anchor = ref<{ x: number; y: number } | null>(null);
 const paletteOpen = ref(false);
-/** 工具条自己，用来量它有多大——贴边时要靠这个尺寸把它按回视口里。 */
+/** 工具条自己，用来量它有多大——躲开详情卡要靠这个尺寸。 */
 const barRef = ref<HTMLElement | null>(null);
-
-/** 工具条离视口边缘至少留这么多像素：贴边节点的工具条也不该压在屏幕边上。 */
-const VIEWPORT_MARGIN = 8;
 
 const selected = computed(() => store.selectedNode);
 const visible = computed(() => !!selected.value && !!anchor.value);
@@ -43,52 +50,37 @@ const deleteDisabled = computed(
   () => (selected.value ? store.isContainerRootId(selected.value.node.id) : true),
 );
 
-function clamp(value: number, low: number, high: number): number {
-  return Math.min(Math.max(value, low), Math.max(low, high));
-}
-
-/**
- * 工具条允许待的区域：**画布那块**（`main > section`），不是整个视口。
- *
- * 用视口的话，一个被平移到屏幕外的节点会把工具条按在 (8, 8)——正好压在顶栏上，
- * "没飘出去"变成了"盖住了返回键"。量不到画布（jsdom、还没布局）时退回整个视口。
- */
-function bounds(): { left: number; top: number; right: number; bottom: number } {
-  const rect = document.querySelector('main > section')?.getBoundingClientRect();
-  if (rect && rect.width > 0 && rect.height > 0) {
-    return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
-  }
-  return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
-}
-
 function measure(): void {
   const id = selected.value?.node.id;
   if (!id) {
     anchor.value = null;
     return;
   }
-  const el = document.querySelector(`.vue-flow__node[data-id="${CSS.escape(id)}"]`);
-  if (!(el instanceof HTMLElement)) {
+  const node = nodeRect(id);
+  if (!node) {
     // 画布还没画出这个节点（刚落地、还没测量）：保持原位，别把它甩到左上角。
     anchor.value = null;
     return;
   }
-  const rect = el.getBoundingClientRect();
-  // 工具条是 `-translate-x-1/2 -translate-y-full`：锚点就是它自己的**下边中点**。
-  // 所以横向按半个宽度让位，纵向整块高度都得在锚点上方。
+  // 自己的尺寸先记下来：详情卡要用它来给工具条让路（"一处算"的另一半输入）。
   const bar = barRef.value?.getBoundingClientRect();
-  const halfWidth = (bar?.width ?? 0) / 2;
-  const height = bar?.height ?? 0;
-  const area = bounds();
-  anchor.value = {
-    x: clamp(
-      rect.left + rect.width / 2,
-      area.left + VIEWPORT_MARGIN + halfWidth,
-      area.right - VIEWPORT_MARGIN - halfWidth,
-    ),
-    // 节点顶到画布上沿时往下让：宁可压在节点上，也不飘出屏幕（或压住顶栏）。
-    y: clamp(rect.top, area.top + VIEWPORT_MARGIN + height, area.bottom - VIEWPORT_MARGIN),
-  };
+  if (bar) overlayState.toolbarSize = sizeOf(bar);
+
+  const hovering = overlayState.detailId;
+  const detailNode = hovering ? nodeRect(hovering) : null;
+
+  const plan = planOverlays({
+    area: canvasArea(),
+    toolbar: { anchor: node, size: overlayState.toolbarSize },
+    detail: detailNode
+      ? { anchor: detailNode, size: { ...overlayState.detailSize, width: DETAIL_WIDTH } }
+      : null,
+  });
+  if (!plan.toolbar) {
+    anchor.value = null;
+    return;
+  }
+  anchor.value = { x: plan.toolbar.x, y: plan.toolbar.y };
 }
 
 let frame = 0;
@@ -100,42 +92,27 @@ function schedule(): void {
   });
 }
 
-/**
- * 盯住 Vue Flow 那个**真正承载平移/缩放**的元素。
- *
- * 平移与缩放不是 window 事件：Vue Flow 把整张图挂在一个元素上，用一句
- * `transform: translate(...) scale(...)` 挪它——既不发 scroll 也不发 resize。
- * 只听 window 的 resize/scroll 时，用户按住画布一拖，工具条就停在拖之前的坐标，
- * 而节点早就跟着走了；缩放到 0.5 倍之后同样对不上。
- *
- * 注意落点：`@vue-flow/core` 1.x 的 DOM 是
- * `.vue-flow__viewport > .vue-flow__pane > .vue-flow__transformationpane`，那句
- * transform 写在**最里面**那个 `transformationpane` 上（`viewport` 只是外框，
- * 它身上只有 `-webkit-tap-highlight-color`）。盯错了元素，监听装得上、一次都不响。
- * 两个都盯：将来搬回外层也不会悄悄失效。
- */
-const VIEWPORT_SELECTORS = ['.vue-flow__transformationpane', '.vue-flow__viewport'];
-
-let viewportObserver: MutationObserver | null = null;
-
-function watchViewport(): void {
-  if (viewportObserver) return;
-  const targets = document.querySelectorAll(VIEWPORT_SELECTORS.join(', '));
-  if (!targets.length) return;  // 画布还没渲染完：下一次 watch 触发时会再试
-  viewportObserver = new MutationObserver(schedule);
-  targets.forEach(target =>
-    viewportObserver?.observe(target, { attributes: true, attributeFilter: ['style'] }));
-}
+const watcher = canvasWatcher(schedule);
 
 watch(
   () => [selected.value?.node.id, store.nodeCount, store.direction, store.focusTick] as const,
   async () => {
     paletteOpen.value = false;
+    overlayState.toolbarId = selected.value?.node.id ?? null;
     await nextTick();
-    watchViewport();
+    watcher.ensure();
     schedule();
   },
   { immediate: true },
+);
+
+/** 详情卡出现/消失、换尺寸时也要重摆：它是本组件"让路"的对象。 */
+watch(
+  () => [overlayState.detailId, overlayState.detailSize.height] as const,
+  async () => {
+    await nextTick();
+    schedule();
+  },
 );
 
 /**
@@ -152,17 +129,13 @@ watch(visible, async on => {
 });
 
 onMounted(() => {
-  window.addEventListener('resize', schedule);
-  window.addEventListener('scroll', schedule, true);
-  watchViewport();
+  watcher.ensure();
 });
 
 onBeforeUnmount(() => {
   if (frame) cancelAnimationFrame(frame);
-  viewportObserver?.disconnect();
-  viewportObserver = null;
-  window.removeEventListener('resize', schedule);
-  window.removeEventListener('scroll', schedule, true);
+  overlayState.toolbarId = null;
+  watcher.dispose();
 });
 
 function edit(): void {
@@ -195,7 +168,7 @@ function setColor(value: string): void {
     v-if="visible && anchor"
     ref="barRef"
     data-test="node-toolbar"
-    class="fixed z-40 flex -translate-x-1/2 -translate-y-full flex-col items-center gap-1 pb-2"
+    class="fixed z-40 flex flex-col items-center gap-1"
     :style="{ left: `${anchor.x}px`, top: `${anchor.y}px` }"
     role="toolbar"
     aria-label="节点操作"
