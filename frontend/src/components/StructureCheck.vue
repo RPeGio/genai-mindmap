@@ -149,7 +149,7 @@ const visible = computed(
     </div>
 
     <p v-if="check.neverRun" data-test="structure-empty" class="leading-relaxed text-slate-400">
-      还没检查过这张图。点「检查结构」跑一次：它只读诊断，不改任何东西。
+      还没检查过。点「检查结构」跑一次：只读，不改任何东西。
     </p>
     <p v-else-if="check.ran && !attention.length && !hints.length && !check.visibleSuggestions.length"
       data-test="structure-clean" class="leading-relaxed text-slate-400">
@@ -163,7 +163,7 @@ const visible = computed(
       data-test="structure-stale"
       class="rounded border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] leading-relaxed text-slate-500"
     >
-      这张图在检查之后又改过，下面这份结论可能已经不准了。
+      这张图在检查之后又改过，下面的结论可能不准了。
     </p>
 
     <p v-if="check.error" data-test="structure-error" role="alert"

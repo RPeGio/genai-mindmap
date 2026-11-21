@@ -1287,7 +1287,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               选择没生效。说清"下级选默认 = 继承"比让那条下拉自己解释要省事。
             -->
             <p class="text-[11px] leading-relaxed text-slate-400">
-              一级分支定了颜色，它的所有下级都跟着用这个色（在这里改一级分支，整支一起变）；下级节点选「默认」表示继承上级。
+              一级分支定了颜色，整支都跟着用这个色；下级选「默认」表示继承上级。
             </p>
           </section>
 
@@ -1574,7 +1574,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
         <template v-else>
           <h2 class="text-sm font-semibold">节点详情</h2>
           <p class="text-xs leading-relaxed text-slate-500">
-            点击画布上的任意节点查看完整内容与它所在的层级路径；双击节点可以直接改文字。
+            点击画布上的任意节点查看完整内容与层级；双击节点可以直接改文字。
           </p>
         </template>
         <!-- 本图来源：整图口径的来源清单，与各节点自己的引用互为对照。
@@ -1591,7 +1591,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               <span v-else class="text-amber-700">· 没有节点引用</span>
             </li>
           </ul>
-          <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源（整图口径），具体出处见各节点的引用；原文未随导图保存。</p>
+          <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源；具体出处见各节点引用，原文未随导图保存。</p>
         </details>
         </div>
       </aside>
