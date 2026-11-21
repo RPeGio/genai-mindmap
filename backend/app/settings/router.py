@@ -186,6 +186,15 @@ async def test_model_settings(
     model = (overrides.model or "").strip() or resolved.model
     if not base_url or not api_key or not model:
         _raise_incomplete()
+    if api_key in (store.mask_api_key(resolved.api_key), store.mask_api_key(store.saved().api_key)):
+        # 提交的是打码值（`…abcd`）。真拿去发请求，上游会 401，而这里会把它翻译成
+        # "密钥被拒"——用户于是去供应商后台换密钥，而他手里那把其实一直是好的。
+        # 与 `save()` 里那条判据同一个理由：打码值不是密钥，任何一次都不能当密钥用。
+        raise store.SettingsError(
+            "settings_api_key_masked",
+            "提交的是打码后的密钥（形如 …abcd），不是密钥本身；"
+            "要测连接请重新粘贴完整的值，或者留空直接用已保存的那把。",
+            status=400)
     result = await probe_module.probe(base_url, api_key, model)
     return TestModelSettingsResponse(
         ok=result.ok, message=result.message, model=result.model,

@@ -404,6 +404,24 @@ def save(
         next_key = current.api_key
     else:
         next_key = _check_text(api_key, label="密钥", limit=MAX_KEY_CHARS)
+        effective_key, _ = _pick(current.api_key, API_KEY_ENV, normalize=_norm_text)
+        if next_key and next_key in (mask_api_key(current.api_key),
+                                     mask_api_key(effective_key)):
+            # 提交的是**打码后的样子**（`…abcd`），不是密钥本身。把它当新密钥存下去，
+            # 库里那把真密钥就被这个字面量顶掉了：接口照旧回 `api_key_set: true`、
+            # 来源显示"你在面板里设的"，而之后每一次模型调用都 401——坏在"看起来
+            # 刚配好"上。静默当成"没改"也不行：用户以为保存成功，实际什么都没发生。
+            # 宁可 400 说清楚，与 `clear_api_key` 撞车时同一条规矩。
+            #
+            # 两个比法都要：`current.api_key` 是库里那一行，密钥只来自环境变量时它
+            # 是空的，而界面上那段打码值正是从环境变量那把算出来的——只比库会在
+            # "密钥来自环境变量"这一路上漏掉，而这一路最疼：打码值一旦落库，就
+            # 顶掉了环境变量里那把真密钥，且 `api_key_source` 会说"你在面板里设的"。
+            raise SettingsError(
+                "settings_api_key_masked",
+                "提交的是打码后的密钥（形如 …abcd），不是密钥本身；"
+                "要改密钥请重新粘贴完整的值，不改就别动这一栏。",
+                status=400)
     next_model = (current.model if model is None
                   else _check_text(model, label="模型名", limit=MAX_MODEL_CHARS))
     next_deep = (current.deep_model if deep_model is None

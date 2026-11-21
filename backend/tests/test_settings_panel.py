@@ -162,6 +162,48 @@ def test_empty_api_key_means_keep_the_saved_one():
     assert store.saved().api_key == SECRET
 
 
+def test_posting_the_masked_key_back_is_rejected_not_saved():
+    """**语义 1 的第三条边界**：把界面上看到的打码值原样提交，不许当密钥存。
+
+    界面把 `…1234` 放在 placeholder 里，用户不填就不会提交它；但**接口**不设防时，
+    任何直接调后端的人（或将来把 placeholder 换成 value 的改动）都会踩到：库里
+    那把真密钥被字面量 `…1234` 顶掉，而响应照旧 `api_key_set: true`、来源写
+    "你在面板里设的"——之后每一次模型调用都 401，界面却显示"刚配好"。
+    """
+    client.put("/api/settings/model", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat"))
+    masked = client.get("/api/settings/model").json()["api_key_masked"]
+    assert masked == "…" + SECRET_TAIL
+
+    response = client.put("/api/settings/model", json=_body(api_key=masked))
+    assert response.status_code == 400
+    assert response.json()["code"] == "settings_api_key_masked"
+    # 真的没被改：库里的密钥还是原来那把。
+    assert store.saved().api_key == SECRET
+
+
+def test_posting_the_mask_of_an_env_key_is_rejected_too(monkeypatch):
+    """密钥只在环境变量里时，打码值来自环境变量——这一段最疼，也必须挡住。
+
+    只比"库里那一行"会漏掉这条路：库是空的，`mask_api_key("")` 是空串，判据
+    不成立；于是 `…1234` 被存进库，**顶掉了环境变量里那把真密钥**，而且
+    `api_key_source` 从 `env` 翻成 `saved`——用户以为"我什么都没改"。
+    """
+    monkeypatch.setenv(store.BASE_URL_ENV, "https://env.example/v1")
+    monkeypatch.setenv(store.API_KEY_ENV, SECRET)
+    monkeypatch.setenv(store.MODEL_ENV, "env-model")
+    masked = client.get("/api/settings/model").json()["api_key_masked"]
+    assert masked == "…" + SECRET_TAIL
+    assert store.saved().api_key == ""
+
+    response = client.put("/api/settings/model", json=_body(api_key=masked))
+    assert response.status_code == 400
+    assert response.json()["code"] == "settings_api_key_masked"
+    # 环境变量那把仍然是生效值，来源还是 env。
+    assert store.resolve().api_key == SECRET
+    assert store.resolve().api_key_source == store.SOURCE_ENV
+
+
 def test_clear_api_key_requires_the_explicit_flag():
     """**语义 1 的另一半**：要清密钥必须显式 `clear_api_key: true`。"""
     client.put("/api/settings/model", json=_body(
@@ -431,6 +473,21 @@ def test_probe_empty_overrides_fall_back_to_effective_values(monkeypatch):
     assert sent[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
     assert sent[0]["json"]["model"] == "other-model"
     assert sent[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
+
+
+def test_probe_with_the_masked_key_is_refused_before_the_request(monkeypatch):
+    """打码值不许拿去发真请求：上游会 401，界面就会把"你手里那把是好的"说成
+    "密钥被拒"，用户于是去换一把本来没问题的密钥。
+    """
+    sent = _use_fake(monkeypatch, response=_FakeResponse(200, {"choices": [{"message": {}}]}))
+    client.put("/api/settings/model", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat"))
+    masked = client.get("/api/settings/model").json()["api_key_masked"]
+
+    response = client.post("/api/settings/model/test", json=_body(api_key=masked))
+    assert response.status_code == 400
+    assert response.json()["code"] == "settings_api_key_masked"
+    assert sent == []
 
 
 def test_probe_rejects_a_wrong_key_with_a_readable_message(monkeypatch):
