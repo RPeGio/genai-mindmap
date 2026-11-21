@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import dataclass
 
@@ -86,6 +87,34 @@ _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
 #: 降级只告警一次。库坏了（文件被删、权限变了、盘满）时每一次模型调用都会走到
 #: 这里，逐次 `warning` 会把日志刷满，反而看不出"从哪一刻开始坏的"。
 _DEGRADED_WARNED = False
+
+# ---------------------------------------------------------------- 读缓存
+#
+# **为什么需要**：`saved()` 在每一次模型调用的开头被 `resolve()` 调到（见
+# `generation.service._config`）。实测一次生成里的调用次数：
+#
+#   - 整树生成（`mindmap_generate`，骨架 + 结构 + 说明 3 次工具内调用，加外层
+#     provider 2 轮）= **5 次**；
+#   - 分片生成（`mindmap_generate_deep`，4 支 × 3 点展开 = 25 次工具内调用，加
+#     外层 2 轮）= **27 次**。
+#
+# 每次都要 `repository.connect()`，而那个函数开头有十条 `CREATE TABLE IF NOT
+# EXISTS`——代价不在那条 `SELECT` 上，在这十条 DDL 上。27 次乘以十条 DDL 是每次
+# 大图生成白付的开销，而这份配置在一次生成期间根本不会变。
+#
+# **为什么不是纯 TTL**：`save()` 之后必须立刻生效（这是这个功能的整个卖点）。所以
+# 写入侧（`save` / `clear`）会 `_invalidate()`，**同进程内保存 → 下一次读到新值**。
+# TTL（1 秒）只兜住另一种情况：多 worker 部署时另一个进程改了库，本进程看不到那次
+# `_invalidate`。本仓的目标形态是单机单 worker，1 秒是给"以后有人加了 worker"留的
+# 上限，不是给正常路径延迟的。
+#
+# 键里带 `db_path()`：测试每个用例换一个 `MINDMAP_DB_PATH`，不带路径的缓存会让
+# 前一个用例的行漏到后一个用例里——那种"随机绿"最难查。
+_CACHE_TTL_SECONDS = 1.0
+_CACHE: dict[str, tuple[float, "Ready"]] = {}
+#: 写入计数器。`save()` / `clear()` 加一，缓存项随之作废。用它而不是清空字典，
+#: 是为了让"进程内写过的次数"本身成为一个可断言的事实（见测试）。
+_WRITES = 0
 
 
 class SettingsError(AppError):
@@ -163,14 +192,34 @@ def _norm_text(text: str | None) -> str:
     return (text or "").strip()
 
 
+def _cache_key() -> str:
+    """缓存键：库路径 + 写入计数。
+
+    带路径的理由见 `_CACHE` 的注释（测试每个用例换一个库）。带写入计数的理由：
+    `save()` 之后即使 TTL 还没到也必须作废，所以键里直接含"写过几次"——写一次，
+    键就变了，旧项自然不再命中，不需要额外的失效逻辑去和并发读抢。
+    """
+    from app.mindmaps import repository
+
+    return f"{repository.db_path()}::{_WRITES}"
+
+
 def saved() -> Ready:
     """库里那一行。没有行、或者库读不出来，都返回全空。
 
     **读失败时降级而不是抛**：这条路径在每一次模型调用的开头，让它因为一个读不到
     的配置表把整次生成打成失败，比"回落到环境变量"糟糕得多——后者在绝大多数部署
     上恰好是正确的行为（环境变量本来就配好了）。降级会留一条 warning，不静默。
+
+    **降级的结果不进缓存**：库坏掉是一个可能被修好的状态（盘满了、权限改回来），
+    把"读不到"缓存一秒会让修好之后的第一秒继续走环境变量。代价是坏库时每次都真的
+    去试一次——那本来就该被看见。
     """
     global _DEGRADED_WARNED
+    key = _cache_key()
+    cached = _CACHE.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _CACHE_TTL_SECONDS:
+        return cached[1]
     try:
         with closing(_connect()) as conn:
             row = conn.execute(
@@ -183,15 +232,23 @@ def saved() -> Ready:
                 "读不到 %s 表（%s），模型配置整体回落到环境变量；后续同类错误不再重复告警",
                 TABLE, type(exc).__name__)
         return Ready()
-    if row is None:
-        return Ready()
-    return Ready(
+    ready = Ready() if row is None else Ready(
         base_url=row["base_url"] or "",
         api_key=row["api_key"] or "",
         model=row["model"] or "",
         deep_model=row["deep_model"] or "",
         updated_at=row["updated_at"],
     )
+    _CACHE[key] = (time.monotonic(), ready)
+    return ready
+
+
+def _invalidate() -> None:
+    """写完之后让缓存作废。由 `save()` / `clear()` 调用，别处不要碰。"""
+    global _WRITES
+
+    _WRITES += 1
+    _CACHE.clear()
 
 
 def _pick(stored: str, env_name: str, *, normalize) -> tuple[str, str]:
@@ -368,6 +425,9 @@ def save(
                         updated_at = excluded.updated_at""",
                 (ROW_ID, next_base, next_key, next_model, next_deep),
             )
+        # 写完立刻作废：这个功能的整个卖点是"保存即生效"，TTL 只能兜跨进程，
+        # 不能给同进程的正常路径加延迟。
+        _invalidate()
     return resolve(), changed
 
 
@@ -376,7 +436,9 @@ def clear() -> int:
     global _DEGRADED_WARNED
     _DEGRADED_WARNED = False
     with closing(_connect()) as conn, conn:
-        return conn.execute(f"DELETE FROM {TABLE}").rowcount
+        rowcount = conn.execute(f"DELETE FROM {TABLE}").rowcount
+    _invalidate()
+    return rowcount
 
 
 __all__ = [

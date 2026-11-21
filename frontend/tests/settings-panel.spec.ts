@@ -152,7 +152,7 @@ function mountApp(): VueWrapper {
 
 /** 打开面板并等它的 `GET` 落地。 */
 async function openPanel(wrapper: VueWrapper): Promise<void> {
-  await wrapper.get('[data-test="settings-toggle"]').trigger('click');
+  await wrapper.get('[data-test="open-settings"]').trigger('click');
   await flushPromises();
 }
 
@@ -178,37 +178,41 @@ afterEach(() => {
 });
 
 describe('顶栏入口', () => {
-  it('齿轮在顶栏里，但**不是** `<button>`：顶栏仍然只有两个按钮', async () => {
+  it('齿轮是顶栏里一个真按钮，带 `aria-label` 与 `data-test`', async () => {
     stubBackend();
     const wrapper = mountApp();
     await flushPromises();
 
     const header = wrapper.get('header');
-    // 这条口径由 `shell-actions.spec.ts` 钉着（"瘦顶栏只有三件东西"）。齿轮要是写成
-    // button，那条用例会红——所以这里换个标签表达同一个语义，并在自己这份用例里确认
-    // 换个标签没把可达性丢掉。
-    expect(header.findAll('button')).toHaveLength(2);
-    expect(wrapper.find('[data-test="settings-toggle"]').exists()).toBe(true);
-    expect(wrapper.get('[data-test="settings-toggle"]').element.tagName).not.toBe('BUTTON');
+    // 顶栏现在有三个动作：`☰`、齿轮、`+`。这条口径在 `shell-actions.spec.ts` 里按
+    // `data-test` 数（数的是"有哪些动作"，不是"有几个 button 标签"）。
+    expect(header.findAll('button')).toHaveLength(3);
+    const toggle = wrapper.get('[data-test="open-settings"]');
+    expect(toggle.element.tagName).toBe('BUTTON');
+    expect(toggle.attributes('aria-label')).toBe('模型设置');
+    expect(toggle.attributes('aria-haspopup')).toBe('dialog');
+    // 齿轮没有可见文字：顶栏的可见文字仍是"☰ / 图名 / +"（见 shell-actions 那条
+    // `not.toContain('知识库')` 一类断言）。
+    expect(toggle.text()).toBe('');
   });
 
-  it('键盘可达：回车与空格都能打开（换成 div 之后最容易丢的就是这个）', async () => {
+  it('点击打开，再点关闭；`aria-expanded` 跟着变', async () => {
     stubBackend();
     const wrapper = mountApp();
     await flushPromises();
 
-    const toggle = wrapper.get('[data-test="settings-toggle"]');
-    expect(toggle.attributes('role')).toBe('button');
-    expect(toggle.attributes('tabindex')).toBe('0');
-    expect(toggle.attributes('aria-label')).toBe('模型设置');
+    const toggle = wrapper.get('[data-test="open-settings"]');
+    expect(toggle.attributes('aria-expanded')).toBe('false');
 
-    await toggle.trigger('keydown', { key: 'Enter' });
+    await toggle.trigger('click');
     await flushPromises();
     expect(has(wrapper, PANEL)).toBe(true);
+    expect(toggle.attributes('aria-expanded')).toBe('true');
 
-    await toggle.trigger('keydown', { key: ' ' });
+    await toggle.trigger('click');
     await flushPromises();
     expect(has(wrapper, PANEL)).toBe(false);
+    expect(toggle.attributes('aria-expanded')).toBe('false');
   });
 
   it('不打开面板时不请求 `/settings/model`：不该为一次没点的功能付一次往返', async () => {
@@ -277,6 +281,22 @@ describe('打开面板：读的是"当前生效值"，密钥只有打码值', ()
     expect(has(wrapper, '[data-test="settings-clear-key"]')).toBe(false);
     // 三项不齐：右侧要给一句结论，而不是让人对着空表猜。
     expect(wrapper.get(PANEL).text()).toContain('三项填齐后');
+  });
+
+  it('地址框下面写明「只支持 OpenAI 兼容格式」：不做 provider 下拉的代价要说出来', async () => {
+    stubBackend();
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    // 用户要的是"自由填"，那这一行就是唯一的护栏：填了原生协议的地址时，
+    // 报错会以"不是合法的 Chat Completions 响应"的形式出现在生成阶段——
+    // 不指着地址这一行的话，没有人会想到是地址的问题。
+    const hint = wrapper.get('[data-test="settings-base-url-hint"]');
+    expect(hint.text()).toContain('OpenAI 兼容');
+    expect(hint.text()).toContain('/chat/completions');
+    // 提示属于地址框那个 label，位置对了才读得懂。
+    expect(hint.element.closest('label')?.querySelector('[data-test="settings-base-url"]'))
+      .not.toBeNull();
   });
 
   it('读取失败要说出来，而不是显示一张空表', async () => {

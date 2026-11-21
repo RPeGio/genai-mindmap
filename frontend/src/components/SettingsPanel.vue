@@ -187,6 +187,15 @@ const resultTone = computed(() => {
             placeholder="https://api.deepseek.com/v1"
             class="rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
           />
+          <!-- 这句是给"填了另一家原生 API"的人看的：不做 provider 下拉就意味着用户
+               可以填任意地址，而生成侧只会一种协议。不写这一句，非 OpenAI 兼容的
+               服务会以"模型返回的不是合法的 Chat Completions 响应"的形式炸在生成
+               阶段——那句话不指向地址这一行。 -->
+          <span class="text-[11px] leading-relaxed text-slate-500" data-test="settings-base-url-hint">
+            只支持 OpenAI 兼容格式：实际请求的是「地址 + <code class="text-slate-600">/chat/completions</code>」，
+            所以填到 <code class="text-slate-600">/v1</code> 那一层即可。各家原生协议（Gemini、Anthropic Messages、
+            部分国产厂商的自有 API）填进来会连不通。
+          </span>
         </label>
 
         <label class="flex flex-col gap-1">

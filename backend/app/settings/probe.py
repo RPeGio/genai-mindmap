@@ -147,12 +147,13 @@ async def probe(base_url: str, api_key: str, model: str) -> ProbeResult:
         choices = payload.get("choices") or []
     except (ValueError, json.JSONDecodeError, AttributeError):
         return ProbeResult(ok=False, model=model, status=200,
-                           message="服务返回 200，但正文不是 JSON——这个地址可能不是 "
-                                   "OpenAI 兼容端点（少了 /v1 是常见原因）。",
+                           message="服务返回 200，但正文不是 JSON——这个地址返回的不是 "
+                                   "OpenAI 兼容格式（少了 /v1 是常见原因）。",
                            latency_ms=latency)
     if not choices:
         return ProbeResult(ok=False, model=model, status=200,
-                           message="服务返回 200，但没有 choices——模型名可能不被这个端点认识。",
+                           message="服务返回 200，但没有 choices——这个地址返回的不是完整的 "
+                                   "OpenAI 兼容格式，也可能是模型名不被这个端点认识。",
                            latency_ms=latency)
 
     served = payload.get("model") if isinstance(payload, dict) else None

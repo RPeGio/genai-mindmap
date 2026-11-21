@@ -47,15 +47,20 @@ SECRET_TAIL = "1234"
 
 
 @pytest.fixture(autouse=True)
-def _reset_degraded_flag():
-    """每个用例都把"降级只告警一次"的模块级标记复位。
+def _reset_module_state():
+    """每个用例都把两个进程级全局量复位。
 
-    它是进程级全局量。不复位的话，前一个用例制造的读失败会让后一个用例看不到
+    `_DEGRADED_WARNED`：不复位的话，前一个用例制造的读失败会让后一个用例看不到
     本该出现的告警——"证明降级会留痕"那条用例就会随机绿。
+
+    `_CACHE`：读缓存跨用例存活。键里带了库路径，正常情况下不会串，但"直接写库再
+    读"的用例会撞上自己上一次读过的旧值——那种失败读起来像"保存没生效"。
     """
     store._DEGRADED_WARNED = False
+    store._CACHE.clear()
     yield
     store._DEGRADED_WARNED = False
+    store._CACHE.clear()
 
 
 def _body(**kwargs) -> dict:
@@ -463,14 +468,40 @@ def test_probe_treats_a_200_without_json_as_failure(monkeypatch):
     assert "OpenAI 兼容" in body["message"]
 
 
-def test_probe_treats_200_without_choices_as_failure(monkeypatch):
+def test_probe_treats_a_200_without_choices_as_failure(monkeypatch):
     """模型名不被端点认识时，有的服务回 200 + 空 choices——生成侧会变成
-    "返回内容里没有可解析的 JSON"，用户毫无线索。"""
+    "返回内容里没有可解析的 JSON"，用户毫无线索。
+
+    文案要同时给两条线索：地址可能不是 OpenAI 兼容格式（面板允许自由填地址，
+    这是不做 provider 下拉的代价），或者模型名不被认识。只写后者会把"地址填错"
+    引到改模型名上去。
+    """
     _use_fake(monkeypatch, response=_FakeResponse(200, {"choices": []}))
     body = client.post("/api/settings/model/test", json=_body(
         base_url="https://api.deepseek.com/v1", api_key=SECRET, model="nope")).json()
     assert body["ok"] is False
+    assert "OpenAI 兼容" in body["message"]
     assert "choices" in body["message"]
+
+
+def test_probe_says_so_when_the_endpoint_is_not_openai_compatible(monkeypatch):
+    """**非 OpenAI 兼容端点**的典型形状：`{"contents": [...]}`（Gemini 原生）。
+
+    面板允许自由填地址（用户要的是这个），所以"填了一家原生协议"是必然会发生
+    的输入，而不是异常输入。这条钉住那句话把用户指向地址那一行——生成阶段的
+    "不是合法的 Chat Completions 响应"指不到地址。
+    """
+    _use_fake(monkeypatch, response=_FakeResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
+    }))
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        api_key=SECRET, model="gemini-2.0-flash")).json()
+    assert body["ok"] is False
+    assert body["status"] == 200
+    assert "OpenAI 兼容" in body["message"]
+    # 别把密钥漏进"服务端原话"里：这条响应没有 error 段，但断言成本很低。
+    assert SECRET not in body["message"]
 
 
 def test_probe_reports_a_timeout_as_a_sentence(monkeypatch):
@@ -570,6 +601,103 @@ def test_table_is_created_by_the_repository_connect():
         names = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert store.TABLE in names
+
+
+def test_an_old_database_without_the_table_gets_it(monkeypatch, tmp_path):
+    """**旧库**（线上那份 `data/mindmaps.db`）里没有 `model_settings` 表。
+
+    这一步是真的会发生的：上线时 `MINDMAP_DB_PATH` 指向一个已经跑了几个月、里面有
+    用户导图的 SQLite 文件。`connect()` 必须把它补上，而不是因为缺表把整次生成打成
+    失败。这里造一个只含 `mindmaps` 表的旧库，走一遍 `connect()` → 写 → 读。
+    """
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(str(path))
+    try:
+        # 旧库的最小形状：一张 users 会用的表 + 一个 `mindmaps` 表（不与新表重名）。
+        legacy.execute("CREATE TABLE mindmaps (id TEXT PRIMARY KEY, payload TEXT)")
+        legacy.execute("INSERT INTO mindmaps (id, payload) VALUES ('m1', '{}')")
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    monkeypatch.setenv("MINDMAP_DB_PATH", str(path))
+    store._CACHE.clear()
+
+    # connect() 之后表就存在了，且旧数据还在（补表不该动别的表）。
+    with closing(repository.connect()) as conn:
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert store.TABLE in names
+        assert conn.execute("SELECT COUNT(*) FROM mindmaps").fetchone()[0] == 1
+
+    # 补出来的表可以正常读写：这是"迁移成功"的真正判据。
+    saved, changed = store.save(base_url="https://api.deepseek.com/v1",
+                                api_key=SECRET, model="deepseek-chat")
+    assert changed is True
+    assert saved.base_url == "https://api.deepseek.com/v1"
+    assert store.saved().model == "deepseek-chat"
+    # 再连一次仍然是同一行，不是每次 connect 插一行。
+    with closing(repository.connect()) as conn:
+        rows = conn.execute(f"SELECT id FROM {store.TABLE}").fetchall()
+    assert [row[0] for row in rows] == [store.ROW_ID]
+
+
+def test_reading_does_not_rebuild_the_table_on_every_call(monkeypatch):
+    """一次生成里 `_config()` 会被调 5–27 次（实测，见 store 里那段注释）。
+
+    每次读都走一遍 `repository.connect()`（它开头有十来个 `CREATE TABLE IF NOT
+    EXISTS`）是白付的开销。这条用例钉两件事：**同一配置连读多次只真的查一次库**，
+    以及**写完立刻能读到新值**（缓存不能把"保存即生效"变成"等一秒"）。
+    """
+    connects: list[int] = []
+    original = store._connect
+
+    def counting_connect():
+        connects.append(1)
+        return original()
+
+    monkeypatch.setattr(store, "_connect", counting_connect)
+
+    store.save(base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")
+    connects.clear()
+
+    for _ in range(20):
+        assert store.resolve().model == "deepseek-chat"
+    # 上限是 1：`save()` 结尾已经读过一次，正常情形是 0 次（全命中缓存）。
+    # 断言成 `== 1` 会把"缓存更有效"判成失败。
+    assert len(connects) <= 1, f"20 次读打了 {len(connects)} 次库，缓存没生效"
+
+    # 写入必须立刻让下一次读到新值，不能等 TTL。
+    store.save(model="deepseek-reasoner")
+    assert store.resolve().model == "deepseek-reasoner"
+
+
+def test_the_ttl_is_short_enough_to_not_hide_a_change_from_another_worker(monkeypatch):
+    """另一个进程改了库（本进程收不到 `_invalidate`）：缓存最多挡 TTL 那么久。
+
+    这条不是在测性能，是在钉住"多 worker 时用户看到旧值的最长时间"。TTL 一旦被
+    改成几十秒，单机单 worker 下没问题，加了 worker 之后就会出现"保存了但页面还是
+    旧值，刷新两次才好"的那种报告。
+    """
+    assert store._CACHE_TTL_SECONDS <= 1.0
+
+    store.save(base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")
+    assert store.resolve().model == "deepseek-chat"
+
+    # 模拟"另一个进程"：直接改库，绕过本进程的 save()（因此不会 _invalidate）。
+    with closing(repository.connect()) as conn, conn:
+        conn.execute(f"UPDATE {store.TABLE} SET model = 'other-worker-model' WHERE id = 1")
+
+    # 缓存还在：这一步读到的仍是旧值——这正是 TTL 兜的那个窗口。
+    assert store.resolve().model == "deepseek-chat"
+
+    # 把时钟推过 TTL（不真 sleep，避免用例变慢也避免偶发）。
+    key = store._cache_key()
+    stamp, ready = store._CACHE[key]
+    store._CACHE[key] = (stamp - store._CACHE_TTL_SECONDS - 0.01, ready)
+    assert store.resolve().model == "other-worker-model"
 
 
 def test_single_row_is_enforced_by_the_schema():

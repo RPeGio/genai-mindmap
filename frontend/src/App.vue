@@ -1072,30 +1072,25 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
       </div>
       <!--
         模型设置入口：一个齿轮。
-        **刻意不是 `<button>`**：顶栏"只有三件东西"是被 `frontend/tests/shell-actions.spec.ts`
-        钉住的口径（`header.findAll('button')` 恰好 2 个），而这条口径对应的是一个真实的
-        取舍——顶栏不许再被一格格按钮撑长。这里用 `role="button"` 的 div 表达同一个语义：
-        键盘可聚焦、回车/空格可触发，外观尺寸与左边 `☰` 一致，不占额外宽度。
-        图标不带文字，所以顶栏的可见文字仍是"☰ / 图名 / +"。
+        图标不带文字，顶栏的可见文字仍是"☰ / 图名 / +"——顶栏不能被一格格按钮撑长
+        这个取舍没变，见 `frontend/tests/shell-actions.spec.ts` 里按 `data-test` 数
+        "顶栏有哪些动作"的那条用例。
       -->
-      <div
-        role="button"
-        tabindex="0"
-        data-test="settings-toggle"
-        class="shrink-0 cursor-pointer rounded-md border border-slate-200 px-2 py-1 text-slate-600 hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+      <button
+        type="button"
+        data-test="open-settings"
+        class="shrink-0 rounded-md border border-slate-200 px-2 py-1 text-slate-600 hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
         :aria-expanded="settingsOpen"
         aria-haspopup="dialog"
         aria-label="模型设置"
         title="模型设置（服务地址 / 密钥 / 模型名，改完立即生效）"
         @click="settingsOpen = !settingsOpen"
-        @keydown.enter.prevent="settingsOpen = !settingsOpen"
-        @keydown.space.prevent="settingsOpen = !settingsOpen"
       >
         <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
           <circle cx="12" cy="12" r="3" />
           <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.11a1.7 1.7 0 0 0-1.11-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.11a1.7 1.7 0 0 0 1.55-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.11a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.11a1.7 1.7 0 0 0-1.49 1z" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
-      </div>
+      </button>
       <button
         type="button"
         data-test="new-run"
