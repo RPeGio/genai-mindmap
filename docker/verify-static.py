@@ -189,6 +189,26 @@ check("nginx: 每条指令以 ; 或 { 结尾", not bad, "可疑行: %s" % bad[:5
 check("nginx: 配了 resolver（proxy_pass 用变量时必需）", "resolver 127.0.0.11" in nginx_code, "")
 check("nginx: set $backend 位于 server 块内", re.search(r"server\s*\{[^}]*set\s+\$backend", nginx_code, re.S) is not None, "")
 
+# ---------------------------------------------------------------- 设置面板的鉴权（P0-1）
+# 这一段**必须**只护住 /api/settings/，且必须 fail closed：能改 base_url 的接口
+# 等于能把已存的密钥送到任意地址，不能靠"部署方记得加密码文件"来防。
+settings_block = re.search(r"location\s+/api/settings/\s*\{(.*?)\n    \}", nginx_code, re.S)
+check("nginx: /api/settings/ 有独立 location（否则落进匿名的 /api/）",
+      settings_block is not None)
+if settings_block:
+    block = settings_block.group(1)
+    check("nginx(/api/settings/): 挂了 auth_basic", re.search(r"auth_basic\s+\"[^\"]+\"\s*;", block) is not None)
+    check("nginx(/api/settings/): 指了 user_file（缺文件时 nginx 会拒绝这一段而不是放行）",
+          re.search(r"auth_basic_user_file\s+\S+\s*;", block) is not None)
+    check("nginx(/api/settings/): 没有 auth_basic off（那等于把兜底关掉）",
+          re.search(r"auth_basic\s+off\s*;", block) is None)
+    check("nginx(/api/settings/): 仍然反代到同一个后端", "$backend$request_uri" in block)
+
+# 反过来：匿名的 /api/ 段里不该有 auth_basic（那会连静态页面一起挡住）。
+plain_api = re.search(r"location\s+/api/\s*\{(.*?)\n    \}", nginx_code, re.S)
+check("nginx(/api/): 仍然匿名（auth_basic 只在 settings 那一段）",
+      plain_api is not None and "auth_basic" not in (plain_api.group(1) if plain_api else "x"))
+
 # 只看指令行：文件头注释里逐条**解释**了"去掉了 __DOMAIN__ 那一套"，
 # 那是说明文字，不是残留。用剥掉注释后的 nginx_code 判断才准。
 placeholders = [p for p in ("__DOMAIN__", "__WEB_ROOT__", "__CERT_DIR__", "__LISTEN6__") if p in nginx_code]

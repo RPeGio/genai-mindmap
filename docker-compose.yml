@@ -106,6 +106,17 @@ services:
     # 唯一的公网入口。要换成 8080 就写 "8080:80"。
     ports:
       - "${WEB_PORT:-80}:80"
+    volumes:
+      # 模型设置面板（`/api/settings/`）的 Basic Auth 密码文件，只读挂载。
+      #
+      # **这个文件必须先手工建出来**（见 docs/DOCKER.md 第 11 节）：
+      #   htpasswd -c docker/.htpasswd admin
+      # 缺了它 nginx 会对 `/api/settings/` 一律回 500——**fail closed 是有意的**，
+      # 不能改回"没有密码文件就匿名放行"，那等于安全兜底在某些部署上静默消失。
+      # 代价是容器版首次启动后设置面板不可用，直到把这个文件建出来；这是刻意的
+      # 取舍：面板能改 base_url，而"改地址 + 点一次测试连接"就是把已存密钥送到
+      # 任意地址的路。
+      - "${HTPASSWD_FILE:-./docker/.htpasswd}:/etc/nginx/.htpasswd-mindmap:ro"
     depends_on:
       backend:
         # 等 /api/health 真返回 ok 再起 nginx 的健康探针意义上的"就绪"。

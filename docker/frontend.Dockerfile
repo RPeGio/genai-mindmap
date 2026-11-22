@@ -46,8 +46,10 @@ FROM nginx:1.27-alpine
 
 # 站点配置整份替换掉官方镜像的 default.conf：默认那份监听 80、root 指向
 # /usr/share/nginx/html，但没有 /api 反代，也没有 SSE 需要的关缓冲。
-# 容器版**不做 Basic Auth**（线上那套靠 /etc/nginx/.htpasswd-mindmap），
-# 理由见 docs/DOCKER.md 的"和现有 systemd 部署的差别"。
+# 容器版只给 `/api/settings/` 那一段挂了 Basic Auth（能改 base_url 的接口等于
+# 能把已存密钥送到任意地址），其余 `/api/` 保持匿名；密码文件由 compose 只读
+# 挂进 /etc/nginx/.htpasswd-mindmap，缺文件时那一段 fail closed（回 500），
+# 不会悄悄退回匿名。理由见 docs/DOCKER.md 第 11 节。
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 
