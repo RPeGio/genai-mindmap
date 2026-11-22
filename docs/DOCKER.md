@@ -467,7 +467,7 @@ backend/.venv/Scripts/python.exe docker/verify-static.py .    # Windows
 .venv/bin/python docker/verify-static.py .                    # Linux
 ```
 
-只读脚本，**95 项断言，当前全部 PASS**（需要 PyYAML；`backend/.venv` 里有）。它检查的是"文件之间是否自洽"，不检查"能不能跑"。
+只读脚本，**96 项断言，当前全部 PASS**（需要 PyYAML；`backend/.venv` 里有）。它检查的是"文件之间是否自洽"，不检查"能不能跑"。
 
 ### 10.1 覆盖的十三类
 
@@ -485,7 +485,7 @@ backend/.venv/Scripts/python.exe docker/verify-static.py .    # Windows
 12. **依赖清单与脚本名**：`requirements.txt` 包名可解析（`docling, fastapi, httpx, pydantic, pymupdf, python-multipart, uvicorn[standard], xlrd, neo4j`）；含 `docling` 与 `uvicorn[standard]`；`package.json` 的 `build` 恰为 `vue-tsc --noEmit && vite build`；`package-lock.json` 的 `lockfileVersion == 3`（`npm ci` 的前提）；`tsconfig.json` 的 `include` 含 `"tests"`
 13. **卷属主与非 root 可写（第 9.5 节那条）**：`mkdir -p /data /models` 存在；`chown -R app:app /data /models` 存在；**`chown` 的行号在 `USER app` 之前**（放到之后等于没做）；`chown` 与 `mkdir` 在同一条 `RUN` 内（相差 ≤3 行，防止中间插层把属主盖掉）；root 侧断言用的是 `stat` 比数字属主而不是 `test -w`（后者对 root 恒真，是假断言）；`USER app` **之后**还有一条真探针；探针覆盖 `/data` 与 `/models` 两个落点；探针失败会 `exit 1`
 
-这一类的断言做过**变异测试**：在临时副本里分别把 `chown` 删掉、把 `chown` 挪到 `USER app` 之后、把 `stat` 断言退化成 `test -w`、把探针改成只测 `/tmp`、把探针里的 `exit 1` 去掉——5 种改法全部被脚本抓到（exit 1），还原后回到 95/0。没做变异测试的断言不能算"在检查"，只能算"恰好没报错"。
+这一类的断言做过**变异测试**：在临时副本里分别把 `chown` 删掉、把 `chown` 挪到 `USER app` 之后、把 `stat` 断言退化成 `test -w`、把探针改成只测 `/tmp`、把探针里的 `exit 1` 去掉——5 种改法全部被脚本抓到（exit 1），还原后回到 96/0。没做变异测试的断言不能算"在检查"，只能算"恰好没报错"。
 
 ### 10.2 核验过程中真的抓到过两个问题
 
@@ -511,7 +511,11 @@ backend/.venv/Scripts/python.exe docker/verify-static.py .    # Windows
 
    > **⚠️ 容器版默认没有任何鉴权。直接把它暴露到公网，等于把模型额度送人。** 任何人扫到 `IP:WEB_PORT` 就能用你的 `MINDMAP_LLM_API_KEY` 跑生成、烧配额，也能读到你所有已保存的导图。
    >
+   > **而且不只是"送额度"。** `/api/settings/model` 没有任何鉴权，`PUT` 能把模型地址改指向任意主机、`POST /api/settings/model/test` 会带着**已存的那把密钥**去请求那个地址（`backend/app/settings/probe.py`）。两步就能把密钥明文送到攻击者手上，不需要知道它是什么。同一个面还能改成内网地址（`http://169.254.169.254/…`、`http://redis:6379/`）当探针用。
+   >
    > 要暴露到公网**必须**在它前面加一层鉴权：宿主机的 nginx/caddy 上加 Basic Auth 或 SSO，或者把 htpasswd 挂进来再改 `docker/nginx.conf`。`location = /api/health` 在线上那套里是 `auth_basic off`，如果加认证记得保持健康检查可达（否则 compose 的 healthcheck 与 `depends_on` 会一起失效）。内网自用 / 只监听 `127.0.0.1` 时不开也可以。
+   >
+   > 加认证时**别只护住 `/api/`**：`/api/settings/` 是配置面，泄漏面比生成接口大。要么整站护住，要么至少给 `/api/settings/` 单独加一条 `auth_basic`。
 3. **`--workers 1` 写死。** 不是性能调优：状态全在一个 SQLite 文件里（`backend/app/mindmaps/repository.py::connect()`），多 worker 就是多个写者，会偶发 `database is locked` 的 500。2C2G 上也吃不起多进程内存。**不要为了"多用几个核"去改这个值。**
 4. **后端不发布 8000。** 只有前端容器在宿主机上开 `WEB_PORT`。要本机调后端就临时加 `ports: ["127.0.0.1:8000:8000"]`，调完删掉——线上形态是"后端只听内网"。
 5. **`MINDMAP_EXTERNAL_PROXY` 必须显式设。** 代码缺省值是 `http://127.0.0.1:7897`（作者本机的 Clash，`backend/app/knowledge/external.py:196`）。**容器里的 `127.0.0.1` 是容器自己**，写它等于"哪都连不上"，而且失败是 5–6 秒后静默返回空。compose 已默认成 `none`（直连）。要走宿主机代理：
