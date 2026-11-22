@@ -47,8 +47,13 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
 | `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
+| `MINDMAP_SETTINGS_ALLOW_PRIVATE` | 空（关） | 允不允许把模型地址指向本机 / 内网。关着时"测试连接"与生成都会拒（`probe._refuse()`），因为**这个面能用已存密钥当内网探针**。要连 Ollama / LM Studio / 同机自建端点就设 `1`；它同时放开本机与内网，没有更细的粒度 |
 
 **四个 `MINDMAP_LLM_*` 的优先级：页面设置面板（`/api/settings/model`，落 SQLite）> 环境变量 > 未配置。** 回落是**逐字段**的——只改了模型名、地址与密钥仍从环境变量来。面板保存后立即生效（1 秒 TTL 的进程内缓存，单 worker 下等于即时；多 worker 时另一个进程最多滞后 1 秒）。`MINDMAP_LLM_MODE` **不进库**：它是部署方定的"这台机器要不要联网"，面板只显示、不能改。面板只接受 OpenAI 兼容接口（实际请求的是"地址 + `/chat/completions`"）。密钥只回打码值（`…abcd`），要清空必须显式声明。**打码值不是密钥**：把它原样 `PUT` 回去会被拒（400 `settings_api_key_masked`）而不是当成新密钥存下来——否则库里那把真密钥会被字面量顶掉，而接口照旧说"已配置"、之后每次调用都 401。这条对直接调接口的人尤其重要：界面上那个值只出现在 placeholder 里，正常点击不会提交它。
+
+**改地址之后保存会带一句 `notice`**："上次「测试连接」的结论对新地址不成立，建议现在点一次"。只提醒不阻拦——"先把地址填好、等供应商开白名单"是正常操作，强制先测通会把这条路堵死。同值重复保存、以及从"什么都没配"到"填了个地址"的首次配置都不提醒（没有旧结论可作废）。
+
+**地址不许指向本机 / 内网 / 云元数据地址。** 这个面最贵的失误不是"填错"，是"被改写"：无鉴权时 `PUT` 换掉 `base_url`、再 `POST /model/test`（空 body 走回落生效值这条免费路径），已存密钥就随 `Authorization` 头送到了那个地址——攻击者既不需要知道密钥，也不需要读得到响应。所以现在有两道：`docker/nginx.conf` 与 `deploy/nginx.conf` 把 `/api/settings/` 挡在 Basic Auth 后面；`backend/app/settings/probe.py::_refuse()` 在发请求**之前**拒掉本机、内网、链路本地、保留地址与云元数据地址（`MINDMAP_SETTINGS_ALLOW_PRIVATE=1` 可放开，见上表）。它不是"防住内网"的完整方案（DNS rebinding、302 跳内网、公网域名解析到私网都挡不住），挡的是成本最低的那一步。
 
 ## 4. 各格式的依赖与耗时
 

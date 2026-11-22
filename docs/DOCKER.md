@@ -507,15 +507,18 @@ backend/.venv/Scripts/python.exe docker/verify-static.py .    # Windows
 ## 11. 已知限制
 
 1. **不内置 TLS。** `docker/nginx.conf` 只 `listen 80`。要 HTTPS 就在宿主机再架一层 nginx/caddy 反代到这个容器的 80，或者上 `deploy/nginx-tls.conf` 那套（但那套是给 systemd 部署的）。参考 `deploy/nginx-tls.conf` 的 443 配法，注意里面同样有三条 SSE 配置与 900s 超时，别在搬的时候漏掉。
-2. **不做 Basic Auth。** `deploy/nginx.conf` 全站有 `auth_basic`（密码文件 `/etc/nginx/.htpasswd-mindmap`）。容器版默认关掉——单机自用，而且密码文件需要额外挂载。
+2. **只有 `/api/settings/` 挂了 Basic Auth，其它接口没有。** `deploy/nginx.conf` 全站有 `auth_basic`（密码文件 `/etc/nginx/.htpasswd-mindmap`）；容器版只给模型设置面板挂了这一段，其余接口仍然匿名。这是刻意的取舍：单机自用要先能跑起来，而配置面是被攻击时"密钥会出门"的那一面，先护它。
 
-   > **⚠️ 容器版默认没有任何鉴权。直接把它暴露到公网，等于把模型额度送人。** 任何人扫到 `IP:WEB_PORT` 就能用你的 `MINDMAP_LLM_API_KEY` 跑生成、烧配额，也能读到你所有已保存的导图。
+   > **⚠️ 容器版的生成接口仍然没有鉴权。直接把它暴露到公网，等于把模型额度送人。** 任何人扫到 `IP:WEB_PORT` 就能用你的 `MINDMAP_LLM_API_KEY` 跑生成、烧配额，也能读到你所有已保存的导图。
    >
-   > **而且不只是"送额度"。** `/api/settings/model` 没有任何鉴权，`PUT` 能把模型地址改指向任意主机、`POST /api/settings/model/test` 会带着**已存的那把密钥**去请求那个地址（`backend/app/settings/probe.py`）。两步就能把密钥明文送到攻击者手上，不需要知道它是什么。同一个面还能改成内网地址（`http://169.254.169.254/…`、`http://redis:6379/`）当探针用。
+   > **设置面板那一段为什么单独护住。** `/api/settings/model` 曾经完全没有鉴权时，`PUT` 能把模型地址改指向任意主机、`POST /api/settings/model/test` 会带着**已存的那把密钥**去请求那个地址（`backend/app/settings/probe.py`）。两步就能把密钥明文送到攻击者手上，不需要知道它是什么；同一个面还能改成内网地址（`http://169.254.169.254/…`、`http://redis:6379/`）当探针用。现在两层都收了：nginx 这一段拦住未认证的调用，`probe._refuse()` 在代码层拒本机/内网/保留地址（要连本机模型得显式设 `MINDMAP_SETTINGS_ALLOW_PRIVATE=1`）。
    >
-   > 要暴露到公网**必须**在它前面加一层鉴权：宿主机的 nginx/caddy 上加 Basic Auth 或 SSO，或者把 htpasswd 挂进来再改 `docker/nginx.conf`。`location = /api/health` 在线上那套里是 `auth_basic off`，如果加认证记得保持健康检查可达（否则 compose 的 healthcheck 与 `depends_on` 会一起失效）。内网自用 / 只监听 `127.0.0.1` 时不开也可以。
+   > **密码文件必须自己建**（`htpasswd -c docker/.htpasswd admin`，见 `docker/.env.example`）。没建时设置面板一律 500——**这是有意的 fail closed**：缺文件时退回匿名放行，等于把这一层做成"忘了配就等于没配"，而忘了配正是最常发生的事。
    >
-   > 加认证时**别只护住 `/api/`**：`/api/settings/` 是配置面，泄漏面比生成接口大。要么整站护住，要么至少给 `/api/settings/` 单独加一条 `auth_basic`。
+   > 要整站暴露到公网**必须**再在它前面加一层鉴权：宿主机的 nginx/caddy 上加 Basic Auth 或 SSO，或者把 `docker/nginx.conf` 里 `location /api/settings/` 的 `auth_basic` 提到 `location /api/`。`location = /api/health` 在线上那套里是 `auth_basic off`，如果加认证记得保持健康检查可达（否则 compose 的 healthcheck 与 `depends_on` 会一起失效）。
+   >
+   > 只在本机玩：把 compose 里那行 `.htpasswd` 挂载与 `docker/nginx.conf` 里那段 `location /api/settings/` **一起**删掉（只删一处会得到一个永远 500 的面板或一段无人消费的密码文件）。
+
 3. **`--workers 1` 写死。** 不是性能调优：状态全在一个 SQLite 文件里（`backend/app/mindmaps/repository.py::connect()`），多 worker 就是多个写者，会偶发 `database is locked` 的 500。2C2G 上也吃不起多进程内存。**不要为了"多用几个核"去改这个值。**
 4. **后端不发布 8000。** 只有前端容器在宿主机上开 `WEB_PORT`。要本机调后端就临时加 `ports: ["127.0.0.1:8000:8000"]`，调完删掉——线上形态是"后端只听内网"。
 5. **`MINDMAP_EXTERNAL_PROXY` 必须显式设。** 代码缺省值是 `http://127.0.0.1:7897`（作者本机的 Clash，`backend/app/knowledge/external.py:196`）。**容器里的 `127.0.0.1` 是容器自己**，写它等于"哪都连不上"，而且失败是 5–6 秒后静默返回空。compose 已默认成 `none`（直连）。要走宿主机代理：
