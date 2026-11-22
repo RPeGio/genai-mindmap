@@ -115,6 +115,39 @@ const resultTone = computed(() => {
   if (!result) return '';
   return result.ok ? 'text-emerald-700' : 'text-rose-700';
 });
+
+/** 面板根节点，给焦点圈定用。 */
+const panel = ref<HTMLElement | null>(null);
+
+/**
+ * 把 Tab 圈在面板里。
+ *
+ * `role="dialog" aria-modal="true"` 告诉读屏"这之外的东西不可达"，但键盘 Tab 不会
+ * 读 aria：不接住的话焦点会跑到遮罩背后的画布与顶栏，用户看着面板还在、按键却已
+ * 经操作别处了。与知识库抽屉（`App.vue` 的 `trapLibraryFocus`）同一套做法。
+ */
+function trapFocus(event: KeyboardEvent): void {
+  if (event.key !== 'Tab') return;
+  const root = panel.value;
+  if (!root) return;
+  const focusable = Array.from(root.querySelectorAll<HTMLElement>(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+  )).filter(element => !element.hasAttribute('disabled'));
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  const inside = active instanceof HTMLElement && root.contains(active);
+  if (event.shiftKey && (!inside || active === first)) {
+    event.preventDefault();
+    last.focus();
+    return;
+  }
+  if (!event.shiftKey && (!inside || active === last)) {
+    event.preventDefault();
+    first.focus();
+  }
+}
 </script>
 
 <template>
@@ -128,12 +161,14 @@ const resultTone = computed(() => {
     @click.self="emit('close')"
   >
     <section
+      ref="panel"
       role="dialog"
       aria-modal="true"
       aria-label="模型设置"
       data-test="settings-panel"
       class="max-h-full w-full max-w-lg overflow-auto rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-xl"
       @click.stop
+      @keydown="trapFocus"
     >
       <header class="mb-3 flex items-start justify-between gap-2">
         <div>

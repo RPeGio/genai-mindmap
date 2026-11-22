@@ -526,6 +526,38 @@ describe('关闭', () => {
     expect(has(wrapper, PANEL)).toBe(false);
   });
 
+  it('Tab 圈在面板里：走到最后一个再按 Tab 回到第一个', async () => {
+    // `aria-modal` 对读屏有效，对键盘无效：不接住的话 Tab 会跑到遮罩背后的画布上，
+    // 用户看着面板还在、按键却已经操作别处了（与知识库抽屉同一套做法）。
+    //
+    // 这条用例要真的 `focus()`，所以必须挂到 document 上——`@vue/test-utils` 默认
+    // 的游离节点里 `document.activeElement` 永远是 `body`。
+    stubBackend();
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const wrapper = mount(App, { attachTo: document.body, global: { plugins: [pinia] } });
+    wrappers.push(wrapper);
+    await openPanel(wrapper);
+
+    const panel = wrapper.get(PANEL);
+    const focusable = panel.findAll<HTMLElement>(
+      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    expect(focusable.length).toBeGreaterThan(2);
+
+    const last = focusable[focusable.length - 1];
+    const first = focusable[0];
+    last.element.focus();
+    expect(document.activeElement).toBe(last.element);
+
+    await panel.trigger('keydown', { key: 'Tab' });
+    expect(document.activeElement).toBe(first.element);
+
+    // 反向：从第一个按 Shift+Tab 回到最后一个。
+    await panel.trigger('keydown', { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(last.element);
+  });
+
   it('再打开会重拉一次：别的标签页刚改过的值不该被上一次的快照盖住', async () => {
     const backend = stubBackend();
     const wrapper = mountApp();
