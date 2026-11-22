@@ -15,7 +15,7 @@ import {
  * 下要给出相反的建议（重试 / 别重试），那正是从前把后端原话直接显示时丢掉的信息。
  */
 describe('失败分类', () => {
-  it('没配置模型时按死重试，并说清该去改哪个环境变量', () => {
+  it('没配置模型时按死重试，并先指页面上的「模型设置」', () => {
     const guide = guideForFailure({
       code: 'model_not_configured',
       message: '请在后端环境变量中配置模型地址、密钥和模型名称',
@@ -24,7 +24,10 @@ describe('失败分类', () => {
 
     expect(guide.retryable).toBe(false);
     expect(guide.title).toContain('模型还没配置好');
-    // 用户真正能做的事必须写出来，光说"配置有问题"他还是不知道找谁。
+    // 首选路径必须是面板：这个功能本身就是为了"不用登服务器改环境变量再重启"。
+    // 只说环境变量会把有面板入口的用户指去找运维。
+    expect(guide.next).toContain('模型设置');
+    // 面板没开时环境变量仍是兜底，三个名字要留着（那是他唯一能给运维的话）。
     expect(guide.next).toContain('MINDMAP_LLM_BASE_URL');
     expect(guide.next).toContain('MINDMAP_LLM_API_KEY');
     expect(guide.next).toContain('MINDMAP_LLM_MODEL');
@@ -104,7 +107,7 @@ describe('失败分类', () => {
   it('读流途中断网（client 抛的 stream_interrupted）也是"连接中断"这一张', () => {
     // 同一件事有两个来源：store 在 EOF 没等到终态帧时合成 connection_lost，
     // client 在 reader.read() 抛错时抛 stream_interrupted。少了这条映射，
-    // 后面那种会掉进兜底的"这次运行没有成功"，把一句确定的判断说成含糊的失败。
+    // 后面那种会掉进兜底的"这次生成没有成功"，把一句确定的判断说成含糊的失败。
     const lost = guideForFailure({ code: CONNECTION_LOST, canRetry: true });
     const cut = guideForFailure({ code: STREAM_INTERRUPTED, canRetry: true });
 
@@ -116,7 +119,7 @@ describe('失败分类', () => {
   it('未知错误码走兜底，不猜一个可能错的解释', () => {
     const guide = guideForFailure({ code: 'something_new', message: '后端新加的错误', canRetry: true });
 
-    expect(guide.title).toBe('这次运行没有成功');
+    expect(guide.title).toBe('这次生成没有成功');
     // 原话要能透出来，否则排障时只能看网络面板。
     expect(guide.next).toContain('发给维护的人');
   });

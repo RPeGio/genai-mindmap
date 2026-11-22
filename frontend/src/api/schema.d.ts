@@ -681,6 +681,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Model Settings
+         * @description 当前生效的配置 + 每一项的来源。
+         *
+         *     `changed` 之类的写入信息不在这里——`GET` 只回答"现在是什么"。
+         */
+        get: operations["read_model_settings_api_settings_model_get"];
+        /**
+         * Save Model Settings
+         * @description 保存。**改完立即生效**：所有出口每次调用都重新 `resolve()`，没有进程内缓存。
+         *
+         *     `store.SettingsError`（`AppError` 子类）由 `core/errors.py` 的统一出口转成
+         *     `{code, message, detail, request_id}`——错误码分得开，界面才能说清"是地址不合法
+         *     还是密钥太长"。
+         */
+        put: operations["save_model_settings_api_settings_model_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/model/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test Model Settings
+         * @description 发一次最小 chat 请求，验证地址 / 密钥 / 模型名。
+         *
+         *     **为什么是 200 而不是 4xx**：失败原因分成"地址不通""密钥被拒""模型不存在"
+         *     三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成"请求
+         *     没发出去"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。
+         */
+        post: operations["test_model_settings_api_settings_model_test_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -1616,6 +1670,38 @@ export interface components {
              */
             diagram_type: "tree" | "flowchart" | "fishbone";
         };
+        /**
+         * ModelSettings
+         * @description 生效的模型配置。**密钥只有打码值**。
+         */
+        ModelSettings: {
+            /** Base Url */
+            base_url: string;
+            /** Base Url Source */
+            base_url_source: string;
+            /** Api Key Masked */
+            api_key_masked: string;
+            /** Api Key Source */
+            api_key_source: string;
+            /** Api Key Set */
+            api_key_set: boolean;
+            /** Model */
+            model: string;
+            /** Model Source */
+            model_source: string;
+            /** Deep Model */
+            deep_model: string;
+            /** Deep Model Source */
+            deep_model_source: string;
+            /** Deep Model Effective */
+            deep_model_effective: string;
+            /** Llm Mode */
+            llm_mode: string;
+            /** Configured */
+            configured: boolean;
+            /** Updated At */
+            updated_at?: string | null;
+        };
         /** Node */
         "Node-Input": {
             /** Id */
@@ -1964,6 +2050,76 @@ export interface components {
             node_count?: number | null;
         };
         /**
+         * SaveModelSettingsRequest
+         * @description `PUT /settings/model` 的请求体。**每个字段的"空"含义不同**（见 `store.save`）。
+         *
+         *       - `api_key` 省略或空串 → **不改**（界面上那个框显示打码值，用户不动它就发空串）；
+         *         要清空必须 `clear_api_key: true`。
+         *       - `base_url` / `model` / `deep_model` 省略 → 不改；空串 → 清掉库里的覆盖，
+         *         回落到环境变量。
+         *
+         *     `extra="forbid"` 是仓库的默认风格：拼错字段名时宁可 422，也不要静默忽略——
+         *     "我把密钥填进 `apikey` 了，保存成功但没生效"是最难自查的一类失败。
+         */
+        SaveModelSettingsRequest: {
+            /** Base Url */
+            base_url?: string | null;
+            /** Api Key */
+            api_key?: string | null;
+            /** Model */
+            model?: string | null;
+            /** Deep Model */
+            deep_model?: string | null;
+            /**
+             * Clear Api Key
+             * @default false
+             */
+            clear_api_key: boolean;
+        };
+        /**
+         * SaveModelSettingsResponse
+         * @description 保存的结果：写入后的生效配置 + 这次有没有真的改变。
+         *
+         *     `changed=False` 是"这次提交没有改变任何东西"（同值重复保存不刷 `updated_at`）。
+         *     不返回这个布尔值，界面上就会出现"我刚存过"的假象。
+         *
+         *     `notice` 是**改了地址之后要额外说的一句话**：地址一变，之前那次连接成功的结论
+         *     就不再证明这个新地址通得过了。这里不强制先测通再落库（那会让"我想先填好、等
+         *     供应商开白名单"这种正常操作变成不可能），但要让界面有机会提醒一句。
+         */
+        SaveModelSettingsResponse: {
+            /** Base Url */
+            base_url: string;
+            /** Base Url Source */
+            base_url_source: string;
+            /** Api Key Masked */
+            api_key_masked: string;
+            /** Api Key Source */
+            api_key_source: string;
+            /** Api Key Set */
+            api_key_set: boolean;
+            /** Model */
+            model: string;
+            /** Model Source */
+            model_source: string;
+            /** Deep Model */
+            deep_model: string;
+            /** Deep Model Source */
+            deep_model_source: string;
+            /** Deep Model Effective */
+            deep_model_effective: string;
+            /** Llm Mode */
+            llm_mode: string;
+            /** Configured */
+            configured: boolean;
+            /** Updated At */
+            updated_at?: string | null;
+            /** Changed */
+            changed: boolean;
+            /** Notice */
+            notice?: string | null;
+        };
+        /**
          * SaveRequest
          * @description 保存一份导图，**顺带提交这一次保存里攒下的改动日志**。
          *
@@ -2198,6 +2354,41 @@ export interface components {
          * @enum {string}
          */
         SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop" | "expand" | "add_detail";
+        /**
+         * TestModelSettingsRequest
+         * @description `POST /settings/model/test` 的请求体：可选的临时覆盖。
+         *
+         *     空字段 = 用**当前生效**的值。这样面板可以"先测再存"：用户在输入框里改了地址
+         *     或模型名，不必先落库就能验一次。密钥同样：不填就用已保存/环境变量里那把，
+         *     所以"我只改模型名"的场景不需要再手打一遍 key。
+         */
+        TestModelSettingsRequest: {
+            /** Base Url */
+            base_url?: string | null;
+            /** Api Key */
+            api_key?: string | null;
+            /** Model */
+            model?: string | null;
+        };
+        /**
+         * TestModelSettingsResponse
+         * @description 一次测试连接的结论。`ok=false` 也是 200——它是结论，不是 HTTP 失败。
+         */
+        TestModelSettingsResponse: {
+            /** Ok */
+            ok: boolean;
+            /** Message */
+            message: string;
+            /** Model */
+            model: string;
+            /** Status */
+            status?: number | null;
+            /**
+             * Latency Ms
+             * @default 0
+             */
+            latency_ms: number;
+        };
         /** Theme */
         Theme: {
             /**
@@ -3343,6 +3534,92 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    read_model_settings_api_settings_model_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSettings"];
+                };
+            };
+        };
+    };
+    save_model_settings_api_settings_model_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveModelSettingsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SaveModelSettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    test_model_settings_api_settings_model_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["TestModelSettingsRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestModelSettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };

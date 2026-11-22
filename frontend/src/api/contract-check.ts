@@ -47,11 +47,16 @@ import type {
   NodeStyle,
   Pref,
   PrefSuggestion,
+  ModelSettings,
+  SaveModelSettingsRequest,
+  SaveModelSettingsResponse,
   SavedPref,
   Source,
   SourceRef,
   SourceSpan,
   SourceUsage,
+  TestModelSettingsRequest,
+  TestModelSettingsResponse,
 } from './types';
 
 type Schemas = components['schemas'];
@@ -96,6 +101,18 @@ export const checks = {
   libraryEntryKeys: true satisfies SameKeys<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListKeys: true satisfies SameKeys<LibraryList, Schemas['LibraryList']>,
   librarySourceKeys: true satisfies SameKeys<LibrarySource, Schemas['LibrarySource']>,
+  // 模型设置：这五条是密钥保护契约的编译期一半。`ModelSettings` 里若出现任何
+  // 明文字段（`api_key` 而不是 `api_key_masked`），这里会红——比 code review 可靠，
+  // 因为加字段的人往往只是想"顺手把值也带出来"。
+  modelSettingsKeys: true satisfies SameKeys<ModelSettings, Schemas['ModelSettings']>,
+  saveModelSettingsRequestKeys: true satisfies
+    SameKeys<SaveModelSettingsRequest, Schemas['SaveModelSettingsRequest']>,
+  saveModelSettingsResponseKeys: true satisfies
+    SameKeys<SaveModelSettingsResponse, Schemas['SaveModelSettingsResponse']>,
+  testModelSettingsRequestKeys: true satisfies
+    SameKeys<TestModelSettingsRequest, Schemas['TestModelSettingsRequest']>,
+  testModelSettingsResponseKeys: true satisfies
+    SameKeys<TestModelSettingsResponse, Schemas['TestModelSettingsResponse']>,
 
   // ---- 字段形状 ----
   contentShape: true satisfies SameShape<MindMapContent, Schemas['MindMapContent-Output']>,
@@ -123,4 +140,9 @@ export const checks = {
   libraryEntryShape: true satisfies SameShape<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListShape: true satisfies SameShape<LibraryList, Schemas['LibraryList']>,
   librarySourceShape: true satisfies SameShape<LibrarySource, Schemas['LibrarySource']>,
+  modelSettingsShape: true satisfies SameShape<ModelSettings, Schemas['ModelSettings']>,
+  saveModelSettingsResponseShape: true satisfies
+    SameShape<SaveModelSettingsResponse, Schemas['SaveModelSettingsResponse']>,
+  testModelSettingsResponseShape: true satisfies
+    SameShape<TestModelSettingsResponse, Schemas['TestModelSettingsResponse']>,
 };

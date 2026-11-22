@@ -33,6 +33,12 @@ from app.contracts.mindmap import (
 from app.contracts.source import Source, SourceUsage
 from app.generation.budget import INITIAL_MAX_DEPTH, INITIAL_MAX_NODES
 from app.optimization.source_refs import EvidenceSpan, verify_source_refs
+# 模型配置的唯一读取处（库里保存的 ＞ 环境变量）。`_config()` 与 `_model_for()`
+# 都从这里取，绝不自己 `os.getenv` 那三个名字——见 `app/settings/store.py` 的文件头。
+# import 放在顶层而不是函数内：`app.settings.store` 顶层只依赖 `app.core.errors`，
+# 反向 import 回到本模块的是 `app/settings/router.py`（它要 `_model_for`），
+# 而 `store` 不 import `router`，所以没有环。
+from app.settings import store as _settings_store
 
 # 单次模型调用的超时（秒）与响应体上限（字节）：超时避免请求无限挂起，
 # 上限避免异常响应把内存读满。
@@ -803,14 +809,28 @@ def _choice_message(body: Any) -> tuple[str, bool]:
 def _config() -> tuple[str, str, str]:
     """读模型配置。缺失或格式不对时抛 GenerationError，让上层给出可读文案。
 
+    **回落顺序只有一份实现，在 `app/settings/store.py:resolve()`**：库里的值（页面
+    上的「模型设置」保存过）→ 环境变量（`MINDMAP_LLM_BASE_URL` / `_API_KEY` /
+    `_MODEL`）→ 空。这里刻意不再自己 `os.getenv` 这三个名字：只要有一处出口还直接
+    读环境变量，用户在面板里改完就会出现"生成换了、视觉提取没换"这种半生效状态。
+
+    没有进程内缓存——每次调用重新读一行 SQLite。这是「改完立即生效、不重启」的
+    代价，也是它的实现：缓存一旦存在，就要回答"什么时候失效"，而那个答案永远比
+    "不缓存"更容易错。
+
     抛的是 `ModelNotConfigured` 而不是基类：这条错误的下一步不是"重试"，
-    是"去把环境变量填上"（见那个类的 docstring）。上层按类型分开给文案。
+    是"去把配置填上"（见那个类的 docstring）。上层按类型分开给文案。文案里保留
+    "环境变量"这个词——它同时也是给部署方的提示（用 EnvironmentFile 的部署不必
+    进页面）。
     """
-    base = os.getenv("MINDMAP_LLM_BASE_URL", "").strip().rstrip("/")
-    key = os.getenv("MINDMAP_LLM_API_KEY", "").strip()
-    model = os.getenv("MINDMAP_LLM_MODEL", "").strip()
+    resolved = _settings_store.resolve()
+    base = resolved.base_url
+    key = resolved.api_key
+    model = resolved.model
     if not base.startswith(("https://", "http://")) or not key or not model:
-        raise ModelNotConfigured("请在后端环境变量中配置模型地址、密钥和模型名称")
+        raise ModelNotConfigured(
+            "请在后端环境变量中配置模型地址、密钥和模型名称，"
+            "或在页面右上角的「模型设置」里填写")
     return base, key, model
 
 
@@ -825,7 +845,8 @@ def _config() -> tuple[str, str, str]:
 #
 # 三档取值，顺序就是优先级：
 #
-#   1. `MINDMAP_LLM_MODEL_DEEP`（显式配置）——换供应商时唯一该改的地方；
+#   1. 显式配置的深度模型名（`MINDMAP_LLM_MODEL_DEEP`，或页面「模型设置」里那份
+#      保存过的值）——换供应商时唯一该改的地方；
 #   2. 什么都没配、但端点/模型名里带 `deepseek` → `deepseek-reasoner`；
 #   3. 否则**沿用原模型名**。
 #
@@ -833,12 +854,16 @@ def _config() -> tuple[str, str, str]:
 # 一个 400/404，而错误文案只能读成"模型服务出错"——用户不知道是自己没配
 # `MINDMAP_LLM_MODEL_DEEP`。宁可这一次退化成普通模型（`done` 帧上如实显示发出去的
 # 名字），也不要整条链路报废。
-DEEP_MODEL_ENV = "MINDMAP_LLM_MODEL_DEEP"
+#
+# 第 1 档的取值走 `app/settings/store.deep_override()`（库 → 环境变量），与其余三个
+# 字段同源：面板里填了深度模型却对工具内部那几次调用无效，就会变成"外层换了模型、
+# 写内容的没换"——又是只剩一半链路生效。
+DEEP_MODEL_ENV = _settings_store.DEEP_MODEL_ENV
 DEEP_MODEL_FALLBACK = "deepseek-reasoner"
 
 
 def _model_for(base: str, model: str, deep_thinking: bool) -> str:
-    """这一次真正要发出去的模型名。纯函数，便于单独测。
+    """这一次真正要发出去的模型名。**除了读一次配置，其余是纯的**。
 
     调用方只有两个：`app/agent/provider.py`（外层工具循环）与本文件的
     `chat_async`（工具内部的每一次生成）。任何新增的模型出口都必须过它，
@@ -846,7 +871,7 @@ def _model_for(base: str, model: str, deep_thinking: bool) -> str:
     """
     if not deep_thinking:
         return model
-    explicit = os.getenv(DEEP_MODEL_ENV, "").strip()
+    explicit, _source = _settings_store.deep_override()
     if explicit:
         return explicit
     if "deepseek" in base.lower() or "deepseek" in model.lower():

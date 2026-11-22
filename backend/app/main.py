@@ -13,6 +13,7 @@ from app.memory.router import router as memory_router
 from app.mindmaps.router import router as mindmap_router
 from app.optimization.router import router as optimization_router
 from app.prefs.router import router as prefs_router
+from app.settings.router import router as settings_router
 
 def _app_version() -> str:
     """线上版本号。
@@ -55,6 +56,10 @@ app.include_router(memory_router, prefix="/api")
 
 # 已规划、接口已固定、实现待补
 app.include_router(knowledge_router, prefix="/api")    # 知识检索（返回空）
+# 模型服务配置：面板读（密钥只有打码值）/ 存 / 测一次连接。改完**立即生效**——
+# 三个模型出口每次都重新解析（见 `app/settings/store.py` 的回落顺序），没有进程内
+# 缓存，所以不需要重启，也就不会打断正在跑的长图。
+app.include_router(settings_router, prefix="/api")
 
 # 生成只留 agent 这一条出口。旧的 `POST /api/generations`（同步、单段文本）与
 # `POST /api/pipeline/generate`（多来源、返回阶段轨迹）已删除：前端默认走 agent，
