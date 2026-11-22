@@ -116,6 +116,11 @@ check("compose[backend]: healthcheck 打 /api/health", "/api/health" in hc, "")
 
 check("compose[backend]: env_file 指向根上的 .env", be.get("env_file") == [".env"], str(be.get("env_file")))
 
+# docling 会拉起 python 子进程做格式转换，而容器的 PID 1 是 uvicorn——它不 reap。
+# 少了 init 就是"跑久了进程表里全是 defunct"这种只能在现场查的事，代价却是一行。
+check("compose[backend]: init: true（PID 1 不是 tini 时僵尸子进程没人收）",
+      be.get("init") is True, "init=%r" % be.get("init"))
+
 # 只看真的会被插值的行：注释里出现的 ${VAR} 是行文示例，不是配置项。
 compose_text = "\n".join(
     l for l in compose_path.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#")

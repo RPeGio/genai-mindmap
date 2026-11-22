@@ -70,6 +70,10 @@ services:
     expose:
       - "8000"
     restart: unless-stopped
+    # 一个最小 init 进程兜底僵尸进程。容器里 PID 1 是 uvicorn，它不 reap 别人
+    # （docling 会把 python 子进程拉起来做格式转换）。`--workers 1` 时影响有限，
+    # 但代价为零，且少了它会变成"跑久了进程表全是 defunct"这种只能在现场查的事。
+    init: true
     # 生成预算最长 600 秒（RunBudget.max_seconds）。`docker compose down` /
     # 重启时给正在收尾的 SSE 连接一点时间，与 systemd 的 TimeoutStopSec=90 同量级。
     stop_grace_period: 90s
