@@ -69,6 +69,13 @@ export const useSettingsStore = defineStore('settings', () => {
   const error = ref('');
   /** 上一次测试连接的结论；面板把它显示成一行，`null` = 还没测过。 */
   const result = ref<TestModelSettingsResponse | null>(null);
+  /**
+   * 保存后后端要提醒的一句话，例如"地址改了，之前那次测试的结论不再成立"。
+   *
+   * 与 `error` 分开：这不是失败，保存是成功的，只是有件事用户该知道。混进 `error`
+   * 会让界面上出现"红色的成功"。
+   */
+  const notice = ref('');
 
   /** 三项齐了没有。判据在后端，这里只是把它的答案拿出来。 */
   const configured = computed(() => settings.value?.configured ?? false);
@@ -110,6 +117,7 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       const saved = await saveModelSettings(body);
       apply(saved);
+      notice.value = saved.notice ?? '';
       return saved;
     } catch (caught) {
       error.value = caught instanceof Error ? caught.message : '保存模型设置失败。';
@@ -130,6 +138,9 @@ export const useSettingsStore = defineStore('settings', () => {
     testing.value = true;
     error.value = '';
     result.value = null;
+    // 测完就不再是"没测过"了：那句"地址改了、建议测一次"的提醒到此为止。
+    // 否则用户点完测试，提醒还挂在旁边，读起来像测试没生效。
+    notice.value = '';
     try {
       result.value = await testModelSettings(body);
       return result.value;
@@ -158,6 +169,7 @@ export const useSettingsStore = defineStore('settings', () => {
     testing,
     error,
     result,
+    notice,
     configured,
     isDemoMode,
     load,

@@ -203,6 +203,16 @@ function trapFocus(event: KeyboardEvent): void {
         {{ settingsStore.error }}
       </p>
 
+      <!-- 保存成功、但有件事该说：通常是地址刚被改过，上次「测试连接」的结论
+           对新地址不成立。用中性色而不是红色——保存本身是成功的。 -->
+      <p
+        v-if="settingsStore.notice"
+        data-test="settings-notice"
+        class="mb-3 rounded-md bg-sky-50 px-2 py-1.5 text-xs leading-relaxed text-sky-800"
+      >
+        {{ settingsStore.notice }}
+      </p>
+
       <p v-if="settingsStore.loading" class="mb-3 text-xs text-slate-400">正在读取当前配置…</p>
 
       <div class="flex flex-col gap-3">

@@ -66,6 +66,8 @@ interface StubOptions {
   current?: Partial<ModelSettings>;
   /** `PUT /settings/model` 的响应覆盖（`changed` 默认 true）。 */
   saved?: Partial<ModelSettings>;
+  /** `PUT` 响应里的 `notice`：改了地址时后端会带一句提醒。 */
+  notice?: string | null;
   /** `POST /settings/model/test` 的响应。 */
   probe?: Partial<TestModelSettingsResponse>;
   /** 让某一个动词返回业务错误（`{status, code, message}`）。 */
@@ -126,7 +128,7 @@ function stubBackend(options: StubOptions = {}) {
         return {
           ok: true,
           status: 200,
-          json: async () => ({ ...saved, changed: true }),
+          json: async () => ({ ...saved, changed: true, notice: options.notice ?? null }),
         } as unknown as Response;
       }
       gets.push({ url, method, body: null });
@@ -380,6 +382,50 @@ describe('保存：只发用户真改过的字段', () => {
     await flushPromises();
 
     expect(text(wrapper, '[data-test="settings-error"]')).toContain('http://');
+  });
+
+  it('改了地址：保存成功但要提醒"上次测试的结论不成立了"', async () => {
+    // P0-1 的第二层。第一层（拒内网）挡不住"改指向一个公网攻击者地址"——那一跳
+    // 每一处看起来都合法。提醒不拦人，但它让"我刚改过地址"出现在保存的那一刻。
+    stubBackend({ notice: '地址改了。之前那次「测试连接」的结论对新地址不成立，建议现在点一次「测试连接」。' });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-base-url"]').setValue('https://api.moonshot.cn/v1');
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
+    await flushPromises();
+
+    expect(text(wrapper, '[data-test="settings-notice"]')).toContain('测试连接');
+    // 提醒是中性色，不能长成红色的失败——保存确实成功了。
+    expect(has(wrapper, '[data-test="settings-error"]')).toBe(false);
+  });
+
+  it('没改地址时不弹那句提醒：提醒一多就成了噪声', async () => {
+    stubBackend({ notice: null });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-model"]').setValue('deepseek-reasoner');
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
+    await flushPromises();
+
+    expect(has(wrapper, '[data-test="settings-notice"]')).toBe(false);
+  });
+
+  it('点一次「测试连接」之后那句提醒就该消失', async () => {
+    stubBackend({ notice: '地址改了。…建议现在点一次「测试连接」。' });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-base-url"]').setValue('https://api.moonshot.cn/v1');
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
+    await flushPromises();
+    expect(has(wrapper, '[data-test="settings-notice"]')).toBe(true);
+
+    await wrapper.get('[data-test="settings-test"]').trigger('click');
+    await flushPromises();
+    // 测过就不再是"还没验证过的新地址"。留着会让人以为测试没生效。
+    expect(has(wrapper, '[data-test="settings-notice"]')).toBe(false);
   });
 });
 

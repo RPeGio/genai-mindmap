@@ -999,6 +999,13 @@ export interface SaveModelSettingsRequest {
 /** `PUT` 的响应：写入后的生效配置 + 这次有没有真的改变（同值重复保存是 `false`）。 */
 export interface SaveModelSettingsResponse extends ModelSettings {
   changed: boolean;
+  /**
+   * 需要提醒用户的一句话，通常是"地址改了，之前那次连接成功的结论不再成立"。
+   *
+   * 空值 = 没什么要说的。**只提醒不阻止**：合法用法里有"先填地址、等供应商开白名单"，
+   * 强制当场测通会把这条路堵死。
+   */
+  notice?: string | null;
 }
 
 /** `POST /settings/model/test` 的请求体：可选的临时覆盖，空字段 = 用当前生效值。 */
