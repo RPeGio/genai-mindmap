@@ -274,6 +274,16 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     from app.settings.store import ensure_schema as ensure_settings_schema
 
     ensure_settings_schema(conn)
+    # 账号与会话（`app/auth/store.py`）。建在这里的**真正理由与上面几张表不同**：
+    # 那几张是"读得太频繁，不能多一个建表分支"，而 `users` / `sessions` 被读得更
+    # 频繁——**每一个请求的中间件**都会按 cookie 查一次会话。它在整条链的最前面，
+    # 在那里发现"表不存在"再建表，等于每次冷启动第一条请求都要多付十条 DDL。
+    #
+    # import 同样放在函数内：`auth.store` 顶层要 `from app.mindmaps import
+    # repository` 拿 `connect`，模块顶层反向 import 回去就成环。
+    from app.auth.store import ensure_schema as ensure_auth_schema
+
+    ensure_auth_schema(conn)
     return conn
 
 

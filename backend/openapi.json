@@ -5,6 +5,162 @@
     "version": "dev"
   },
   "paths": {
+    "/api/auth/me": {
+      "get": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Who Am I",
+        "description": "当前是谁。顺便补发游客 cookie（全站唯一发它的地方）。",
+        "operationId": "who_am_i_api_auth_me_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoAmI"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/register": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Register",
+        "description": "注册并**直接登录**（返回 201 + 会话 cookie）。\n\n注册完不自动登录的话，用户要在同一个页面上把刚敲的密码再敲一遍——那不是安全，\n那只是让第一次使用的体验变差。注册成功意味着这条口令刚刚被验证过（是我们\n亲手 hash 的），没有额外的信任问题。",
+        "operationId": "register_api_auth_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Login",
+        "description": "登录。账号或密码不对统一 401 `auth_bad_credentials`（理由见 `store.authenticate`）。",
+        "operationId": "login_api_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Logout",
+        "description": "登出：撤销这次会话并清 cookie。\n\n幂等：没登录、或者 cookie 已经无效，也返回 204。界面上的\"退出登录\"点两次\n不该第二次报错——它不是\"删除资源\"，是\"让这台浏览器变成未登录\"。\n\n响应对象在这里**新建**而不是复用注入的那个：注入的 `Response` 是给\n\"在返回模型的同时补 header\"用的，而这条路由的返回体就是它自己。",
+        "operationId": "logout_api_auth_logout_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/api/auth/password": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Change Password",
+        "description": "改密码。**需要已经登录**，并且要再输一次旧密码。\n\n两道都是必要的：只凭会话就能改密码，意味着一次 XSS（拿到会话）就能永久接管\n账号；只凭旧密码不看会话，等于把\"知道你密码的人\"和\"已经登录的人\"混为一谈。\n\n改完撤销全部会话（含当前这条），然后清 cookie：用户要在所有设备上重新登录。\n这不是\"顺手多做一步\"——改密码最常见的动机就是\"我怀疑有人进过我的号\"。",
+        "operationId": "change_password_api_auth_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/mindmaps": {
       "get": {
         "tags": [
@@ -1796,6 +1952,29 @@
         ],
         "title": "Body_import_mindmap_api_mindmaps_import_post"
       },
+      "ChangePasswordRequest": {
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Current Password"
+          },
+          "new_password": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "New Password"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "ChangePasswordRequest"
+      },
       "CheckRequest": {
         "properties": {
           "content": {
@@ -1901,6 +2080,30 @@
           "source"
         ],
         "title": "CreateTextSourceResponse"
+      },
+      "Credentials": {
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Username"
+          },
+          "password": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Password"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "Credentials",
+        "description": "注册与登录共用的请求体。\n\n字段给 `min_length` 是为了让\"空密码\"在 Pydantic 这一层就被 422 拦住，而不是\n落到 `store` 里再抛业务错——两种错误在界面上都是红字，但前者不需要一次\n数据库往返。真正的长度规则仍在 `store` 里（8–200），这里只是挡明显空的。"
       },
       "Diagnostic": {
         "properties": {
@@ -5328,6 +5531,31 @@
         ],
         "title": "UpdateRequest"
       },
+      "UserView": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "username": {
+            "type": "string",
+            "title": "Username"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "username",
+          "created_at"
+        ],
+        "title": "UserView",
+        "description": "对外的账号形状。**不含 `password_hash`，也不含任何 id 之外的东西**。"
+      },
       "ValidationError": {
         "properties": {
           "loc": {
@@ -5367,6 +5595,45 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WhoAmI": {
+        "properties": {
+          "user": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guest_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guest Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "guest",
+              "anonymous"
+            ],
+            "title": "Kind",
+            "default": "anonymous"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "WhoAmI",
+        "description": "`GET /me` 的响应：当前是谁。\n\n`kind` 是三种状态的名字，不是调试信息：界面上\"未登录 / 游客 / 已登录\"要显示\n不同的东西，而由后端算比前端自己拼（`user ? 'user' : guest_id ? 'guest' : ...`）\n更不容易在一处漏掉。"
       },
       "app__contracts__diagnostic__Suggestion": {
         "properties": {
