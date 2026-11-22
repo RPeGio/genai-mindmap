@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-22，P0-1 密钥外送防线补上之后）：后端 2456 个测试（pytest，另有 29 个 subtest）、前端 1031 个 vitest 用例（64 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-23，账号身份层落地之后）：后端 2496 个测试（pytest，另有 29 个 subtest）、前端 1031 个 vitest 用例（64 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 10 组路由（33 个路径 / 38 个端点）
+    main.py            应用装配，注册 11 组路由（38 个路径 / 43 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       ContentBase 与三个子类（树 / 流程图 / 鱼骨图）、Node、请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -100,16 +100,17 @@ backend/
     memory/            记忆模块（生成时注入相关记忆、会话结束总结）
     prefs/             用户偏好（读写 + 从历史推建议）
     settings/          模型服务配置（页面内改地址/密钥/模型，落 SQLite 单行表，回落环境变量）
+    auth/              账号与会话（scrypt 口令、sessions 表、HttpOnly cookie、身份中间件；暂不拦请求）
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               2456 个测试（另有 29 个 subtest）
+  tests/               2496 个测试（另有 29 个 subtest）
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
     main.ts            入口（挂 Pinia 与 Vue Flow 样式，启动时探测上次未收尾的运行）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、导入 1 个、改动日志 3 个、上传 1 个、导出 4 个、agent 流与台账 4 个、偏好 4 个、记忆 4 个、知识库 2 个）
+    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、导入 1 个、改动日志 3 个、上传 1 个、导出 4 个、agent 流与台账 4 个、偏好 4 个、记忆 4 个、知识库 2 个、账号 5 个）
     api/types.ts       契约 v2 的 TS 镜像（手写，读起来比生成类型省事）
     api/schema.d.ts    openapi-typescript 从 backend/openapi.json 生成，勿手改
     api/contract-check.ts 编译期断言：镜像与生成类型的键集合、形状必须一致
@@ -175,7 +176,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（33 个路径 / 38 个端点）
+## 5 接口一览（38 个路径 / 43 个端点）
 
 ```
 基础
@@ -235,6 +236,13 @@ GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）
 GET  /api/settings/model           当前生效值 + 每个字段的来源（库 / 环境变量 / 未配）
 PUT  /api/settings/model           改地址 / 密钥 / 模型名（密钥只回打码值，清空要显式声明）
 POST /api/settings/model/test      测试连接（失败也是 200 + 结论，不是 5xx）
+
+账号与会话（这一批只有身份层，**还没上任何门禁**）
+GET  /api/auth/me                  当前是谁（永远 200）；全站唯一发游客 cookie 的地方
+POST /api/auth/register            注册并直接登录（重名 409，不区分大小写）
+POST /api/auth/login               登录（账号或密码不对统一 401，不区分是哪一项）
+POST /api/auth/logout              登出（幂等，本来没登录也是 204）
+POST /api/auth/password            改密码（需已登录 + 旧密码；改完撤销全部会话）
 ```
 
 ---

@@ -106,6 +106,21 @@
 | `GET /api/settings/model` | 无 | `ModelSettings` 13 字段：`base_url` / `base_url_source` / `api_key_masked` / `api_key_source` / `api_key_set` / `model` / `model_source` / `deep_model` / `deep_model_source` / `deep_model_effective` / `llm_mode` / `configured` / `updated_at`。`*_source` 是逐字段的来源（`db` / `env` / 空），**密钥只回打码值**（≤8 字符只给 `…`，否则 `…` + 末 4 位） | — |
 | `PUT /api/settings/model` | `{"base_url?","api_key?","model?","deep_model?","clear_api_key":false}` | `ModelSettings` + `changed: bool` + `notice: str \| null`。`api_key` 传空或省略 = **不改**；要清必须 `clear_api_key: true`；`base_url`/`model`/`deep_model` 的空串 = 清掉覆盖、回落环境变量。`notice` 只在**地址真的变了**（规范化之后）且原来有地址时非空，是一句"上次测试的结论对新地址不成立"——只提醒不阻拦，因为"先填地址、等供应商开白名单"是合法用法 | `settings_incomplete` 400（缺必填）/ `settings_base_url_invalid` 400（不是 http(s) 或不是 OpenAI 兼容）/ `settings_clear_conflict` 400（同时给 `api_key` 与 `clear_api_key`）/ `settings_api_key_masked` 400（`api_key` 传的是响应里那个打码值 `…abcd`，不是密钥本身） |
 | `POST /api/settings/model/test` | `{"base_url?","api_key?","model?"}`（空字段回落当前生效值） | 200 一律返回 `{"ok","message","model","status","latency_ms"}`——发一次 `max_tokens=1` 的最小请求；**失败也是结论不是 5xx**，上游错误体里的密钥会被替换成 `…` 再截 200 字 | `settings_incomplete` 400（三项不齐）/ `settings_api_key_masked` 400（`api_key` 传的是打码值，不发请求就拒）/ `settings_base_url_refused` 400（地址指向本机、内网、云元数据或保留地址，**一个字节都不发**；要连自建端点得在后端设 `MINDMAP_SETTINGS_ALLOW_PRIVATE=1`） |
+| `GET /api/auth/me` | 无 | `{"user":{…}\|null,"guest_id":str\|null,"kind":"user"\|"guest"\|"anonymous"}`，**永远 200** | — |
+| `POST /api/auth/register` | `{"username","password"}` | 201 + `{"id","username","created_at"}`，**直接登录**（同时下发会话 cookie） | 账号名不合规 `auth_username_invalid` 400；密码不足 8 位 `auth_password_too_short` 400；超 200 位 `auth_password_too_long` 400；重名 `auth_username_taken` 409（**不区分大小写**） |
+| `POST /api/auth/login` | `{"username","password"}` | `{"id","username","created_at"}` + 会话 cookie | `auth_bad_credentials` 401——**不区分"没这个人"与"密码错"**，那是账号枚举信道 |
+| `POST /api/auth/logout` | 无 | 204，**幂等**（本来就没登录也是 204）；撤销这一次会话并清 cookie | — |
+| `POST /api/auth/password` | `{"current_password","new_password"}` | 204，清 cookie。需要**已登录 + 旧密码**；改完撤销这个人的**全部**会话 | 未登录 `auth_required` 401；旧密码不对 `auth_bad_credentials` 401；新密码长度不合规同上 |
+
+**账号这一批只有身份层，还没上任何门禁。** 五个接口之外，33 条业务路径**一条都没有被拦**——身份中间件只回答"当前是谁"，`kind` 可能是 `user` / `guest` / `anonymous`，但没有一条路径因为身份而 401。这是刻意的顺序：一次把门禁与身份一起翻掉，合并当天所有人（包括自己和队友）都进不去，而"进不去"没有旁路可验证。门禁按接口逐个打开，判据是 `tests/test_auth.py::test_business_endpoints_are_still_open_in_this_batch`——等它红了，说明有人开始合闸，那条用例该被改成"该 401 的 401、该放行的放行"，而不是删掉。
+
+**会话是 HttpOnly cookie，不是 JWT，也不出现在任何响应体里。** cookie 名 `mm_session`，属性 `Path=/; HttpOnly; SameSite=Strict`（走 https 才加 `Secure`，本机 http 不加——否则部分浏览器直接不收）。库里存的是 `sha256(token)`：库文件泄漏时拿到的是哈希，不是一串能直接用的 cookie。**可撤销**是这次整改的硬要求，无状态 token 只能等它自己过期，所以没用 JWT（详见 `backend/app/auth/store.py` 的文件头）。
+
+**游客 cookie（`mm_guest`）只由 `GET /api/auth/me` 下发**，`Max-Age` 一年。它的语义是"这台浏览器"而不是"这次登录"，免费额度那一批会按它计数；放在别的接口上（每次生成、每次保存）会让"我到底发过几个游客 id"变成无法回答的问题。
+
+**口令用标准库 `hashlib.scrypt`**（`n=2^14, r=8, p=1`，实测一次 36 毫秒 / 16 MB），不引 `passlib` / `bcrypt` / `python-jose`——这台机器是 2C2G，少一个依赖少一份部署风险。哈希串是 `scrypt$n$r$p$<salt_hex>$<hash_hex>`，**参数写进串里**，所以将来调参不会让老密码全部失效；校验时按串里那组参数重算，并对 `n/r/p` 设上限（一行被改成 `n=2^30` 的记录会让进程申请几百 GB，那是拒绝服务）。
+
+**没有"找回密码"**：仓库里没有 SMTP，发不出任何邮件；假装有这个流程（"我们会给你发一封邮件"）比没有它更糟。真要做，入口是部署方直接改库。
 
 
 **流式接口只有一套帧格式**，就是 `/api/agent/runs/stream` 的这套；旧的 `/api/generations/stream`（`stage` / `skeleton` / `node` / `done` / `error` + 末尾 `data: [DONE]`）已连路由一起删除。`backend/app/generation/stream_partial.py` 现在只剩增量解析器（`parse_partial` / `collect_new_nodes`），供 agent 的 `node_grow` 预览调用，不再有帧拼装。
