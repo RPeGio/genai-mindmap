@@ -15,7 +15,7 @@ import {
  * 下要给出相反的建议（重试 / 别重试），那正是从前把后端原话直接显示时丢掉的信息。
  */
 describe('失败分类', () => {
-  it('没配置模型时按死重试，并说清该去改哪个环境变量', () => {
+  it('没配置模型时按死重试，并先指页面上的「模型设置」', () => {
     const guide = guideForFailure({
       code: 'model_not_configured',
       message: '请在后端环境变量中配置模型地址、密钥和模型名称',
@@ -24,7 +24,10 @@ describe('失败分类', () => {
 
     expect(guide.retryable).toBe(false);
     expect(guide.title).toContain('模型还没配置好');
-    // 用户真正能做的事必须写出来，光说"配置有问题"他还是不知道找谁。
+    // 首选路径必须是面板：这个功能本身就是为了"不用登服务器改环境变量再重启"。
+    // 只说环境变量会把有面板入口的用户指去找运维。
+    expect(guide.next).toContain('模型设置');
+    // 面板没开时环境变量仍是兜底，三个名字要留着（那是他唯一能给运维的话）。
     expect(guide.next).toContain('MINDMAP_LLM_BASE_URL');
     expect(guide.next).toContain('MINDMAP_LLM_API_KEY');
     expect(guide.next).toContain('MINDMAP_LLM_MODEL');

@@ -107,11 +107,15 @@ function explain(input: FailureInput): FailureGuide {
   switch (input.code) {
     case 'model_not_configured':
       // 唯一一个"重试一百次也是同一个结果"的失败，所以它是唯一一个把重试按死的。
+      //
+      // 指引必须**先指面板**：这个功能本身就是为了"不用登服务器改环境变量再重启"。
+      // 只说环境变量会把有面板入口的用户指去找运维，而他要找的那个开关就在页面上。
       return {
         title: '模型还没配置好',
         next:
-          '不是网络或额度问题。让部署的人把 MINDMAP_LLM_BASE_URL、'
-          + 'MINDMAP_LLM_API_KEY、MINDMAP_LLM_MODEL 填进服务端环境变量并重启。',
+          '不是网络或额度问题。打开页面右上角的「模型设置」，填好地址、密钥和模型名，'
+          + '保存后直接重试，不用重启。没有那个入口说明这个部署没开面板，'
+          + '让部署的人配 MINDMAP_LLM_BASE_URL / MINDMAP_LLM_API_KEY / MINDMAP_LLM_MODEL。',
         actions: [retryAction(retryBlocker(input, '配置没改之前，重试还是同一个结果。')), COPY_ACTION],
         retryable: false,
       };
