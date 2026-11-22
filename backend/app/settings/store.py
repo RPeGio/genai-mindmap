@@ -71,6 +71,14 @@ MAX_URL_CHARS = 200
 MAX_MODEL_CHARS = 200
 MAX_KEY_CHARS = 500
 
+#: 生成侧与 probe 拼请求时一律用 `base + "/chat/completions"`，所以库里存的必须是
+#: **前缀**。用户粘完整端点时由 `_check_base_url` 剥掉这一段。
+_ENDPOINT_SUFFIX = "/chat/completions"
+
+#: 写配置时等写锁的上限。这是面板里人手点的一个动作：让他看着转圈等十秒，不如
+#: 立刻告诉他"正被占用，过几秒重试"（与 `agent/runs.py` 的检查点同一个理由）。
+SETTINGS_LOCK_TIMEOUT = 2.0
+
 #: 时间格式与 `mindmaps` / `runs` / `user_prefs` 完全一致。三处格式不同会在
 #: "谁更晚"上错一天（`app/agent/runs.py:_NOW` 写过这条教训）。
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
@@ -170,12 +178,14 @@ class Resolved:
     deep_model_source: str = SOURCE_UNSET
 
 
-def _connect() -> sqlite3.Connection:
+def _connect(*, timeout: float | None = None) -> sqlite3.Connection:
     # 函数内 import：`repository.connect()` 里要用本模块的 `ensure_schema`，模块顶层
     # 反向 import 回去就成环。与 `app/prefs/style.py` / `app/memory/store.py` 同一手法。
     from app.mindmaps import repository
 
-    return repository.connect()
+    if timeout is None:
+        return repository.connect()
+    return repository.connect(timeout=timeout)
 
 
 def _norm_base(text: str | None) -> str:
@@ -241,6 +251,35 @@ def saved() -> Ready:
     )
     _CACHE[key] = (time.monotonic(), ready)
     return ready
+
+
+def _read_strict(*, timeout: float | None = None) -> Ready | None:
+    """像 `saved()` 一样读那一行，但**读失败时抛、不降级**。只有写路径用。
+
+    `saved()` 的降级是给**生成路径**准备的：读不到就回落环境变量，那在绝大多数
+    部署上恰好是对的，绝不能因为一个读不出来的配置表把整次生成打成失败。
+
+    写路径不能复用那个返回值。`save()` 拿它当"库里现在那一行"去做差量与合并
+    （`next_base = current.base_url if base_url is None else ...`），降级返回的空
+    `Ready()` 会被当成真值：只改一个模型名，`base_url` 与 `api_key` 就一起被写成
+    空串，接口还回 `changed: true`。用户看到的是一次"保存成功"，丢掉的是密钥。
+
+    降级读在写锁竞争下真会发生：`repository.connect(timeout=10)` 忙等十秒之后
+    `saved()` 返回空 `Ready()` 并只打一条 warning，而那次写照样成功。
+    """
+    with closing(_connect(timeout=timeout)) as conn:
+        row = conn.execute(
+            f"SELECT base_url, api_key, model, deep_model, updated_at "
+            f"FROM {TABLE} WHERE id = ?", (ROW_ID,)).fetchone()
+    if row is None:
+        return None
+    return Ready(
+        base_url=row["base_url"] or "",
+        api_key=row["api_key"] or "",
+        model=row["model"] or "",
+        deep_model=row["deep_model"] or "",
+        updated_at=row["updated_at"],
+    )
 
 
 def _invalidate() -> None:
@@ -340,6 +379,18 @@ def _check_base_url(text: str) -> str:
     value = _norm_base(text)
     if not value:
         return ""
+    # 用户常常从厂商文档里**连端点一起**复制过来（`https://x/v1/chat/completions`）。
+    # 留着它请求会变成 `.../chat/completions/chat/completions`，404 在界面上只能
+    # 读成"模型名不对"，于是人被引去改一个没问题的地方。入库前剥掉，probe 与
+    # 生成两条路同时受益，面板回显的也是剥完的值。
+    if value.endswith(_ENDPOINT_SUFFIX):
+        value = value[: -len(_ENDPOINT_SUFFIX)].rstrip("/")
+    if not value:
+        # 只填了 `/chat/completions`：剥完是空串，那是"没填地址"，不是"清掉覆盖"。
+        raise SettingsError(
+            "settings_base_url_invalid",
+            "模型地址只填了 /chat/completions，前面还差主机名，例如 https://api.deepseek.com/v1。",
+            status=400)
     if len(value) > MAX_URL_CHARS:
         raise SettingsError(
             "settings_base_url_invalid",
@@ -360,6 +411,24 @@ def _check_text(value: str, *, label: str, limit: int) -> str:
         raise SettingsError(
             "settings_value_too_long", f"{label}最多 {limit} 个字符。", status=400)
     return text
+
+
+def _read_strict_for_save() -> Ready:
+    """`save()` 专用的读：**读不到就拒写**，绝不返回"空值"。
+
+    与 `_read_strict()` 分开只是为了把"没有行"折成空 `Ready`——第一次保存时
+    本来就没有行，那不是错误；而"读不出来"必须抛。
+    """
+    try:
+        row = _read_strict(timeout=SETTINGS_LOCK_TIMEOUT)
+    except sqlite3.Error as exc:
+        # 宁可这次保存失败，也不能把"读不到"当成"是空的"：那会把用户已存的
+        # base_url 与密钥一起写成空串，还回 200「保存成功」。
+        raise SettingsError(
+            "settings_db_unavailable",
+            "读不到配置表，这次没有保存（继续下去会把你已存的值写成空）。请过几秒重试。",
+            status=503) from exc
+    return Ready() if row is None else row
 
 
 def save(
@@ -393,7 +462,7 @@ def save(
             "settings_clear_conflict",
             "不能同时提交新密钥和「清除密钥」；请只留一个。", status=400)
 
-    current = saved()
+    current = _read_strict_for_save()
     next_base = current.base_url if base_url is None else _check_base_url(base_url)
     if clear_api_key:
         next_key = ""
@@ -430,19 +499,28 @@ def save(
     changed = (next_base, next_key, next_model, next_deep) != (
         current.base_url, current.api_key, current.model, current.deep_model)
     if changed:
-        with closing(_connect()) as conn, conn:
-            conn.execute(
-                f"""INSERT INTO {TABLE}
-                        (id, base_url, api_key, model, deep_model, updated_at)
-                    VALUES (?, ?, ?, ?, ?, {_NOW})
-                    ON CONFLICT(id) DO UPDATE SET
-                        base_url   = excluded.base_url,
-                        api_key    = excluded.api_key,
-                        model      = excluded.model,
-                        deep_model = excluded.deep_model,
-                        updated_at = excluded.updated_at""",
-                (ROW_ID, next_base, next_key, next_model, next_deep),
-            )
+        try:
+            with closing(_connect(timeout=SETTINGS_LOCK_TIMEOUT)) as conn, conn:
+                conn.execute(
+                    f"""INSERT INTO {TABLE}
+                            (id, base_url, api_key, model, deep_model, updated_at)
+                        VALUES (?, ?, ?, ?, ?, {_NOW})
+                        ON CONFLICT(id) DO UPDATE SET
+                            base_url   = excluded.base_url,
+                            api_key    = excluded.api_key,
+                            model      = excluded.model,
+                            deep_model = excluded.deep_model,
+                            updated_at = excluded.updated_at""",
+                    (ROW_ID, next_base, next_key, next_model, next_deep),
+                )
+        except sqlite3.Error as exc:
+            # 与 `_read_strict_for_save` 同一条规矩：写不进去也要给出能读的 code。
+            # 裸 `OperationalError` 冒到 FastAPI 会变 500 + 一段 traceback，面板
+            # 只能显示一句通用错误——而这条路上最可能发生的事恰恰是"过几秒就好了"。
+            raise SettingsError(
+                "settings_db_unavailable",
+                "配置表正被占用，这次没有保存。请过几秒重试。",
+                status=503) from exc
         # 写完立刻作废：这个功能的整个卖点是"保存即生效"，TTL 只能兜跨进程，
         # 不能给同进程的正常路径加延迟。
         _invalidate()
@@ -471,6 +549,7 @@ __all__ = [
     "SOURCE_FALLBACK",
     "SOURCE_SAVED",
     "SOURCE_UNSET",
+    "SETTINGS_LOCK_TIMEOUT",
     "SettingsError",
     "TABLE",
     "clear",

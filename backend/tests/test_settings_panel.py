@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from contextlib import closing
 
 import httpx
@@ -639,6 +640,74 @@ def test_a_broken_db_degrades_to_env_instead_of_failing_generation(
     assert any("回落" in record.getMessage() for record in caplog.records)
 
 
+def test_saving_while_the_db_cannot_be_read_does_not_wipe_the_row(monkeypatch):
+    """读不出来时**拒写**，不能把降级返回的空值当成真值写回去。
+
+    `saved()` 的降级是给生成路径准备的（读不到就回落环境变量，那在绝大多数部署
+    上恰好是对的）。`save()` 如果复用同一个返回值做差量与合并，就会把空串当成
+    "用户现在存的就是空"，于是只改一个模型名，`base_url` 与密钥一起被写没。
+
+    实测过的触发方式：写锁被占时 `repository.connect(timeout=10)` 忙等到超时，
+    `saved()` 返回空 `Ready()` 并只打一条 warning，而那次写照样成功。
+    """
+    client.put("/api/settings/model", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat"))
+    original = store._read_strict
+
+    def unreadable(**kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_read_strict", unreadable)
+
+    response = client.put("/api/settings/model", json=_body(model="deepseek-reasoner"))
+    assert response.status_code == 503
+    assert response.json()["code"] == "settings_db_unavailable"
+    # 响应里不能带密钥，也不能说"保存成功"。
+    assert SECRET not in response.text
+
+    monkeypatch.setattr(store, "_read_strict", original)
+    store._CACHE.clear()
+    ready = store.saved()
+    assert ready.base_url == "https://api.deepseek.com/v1"
+    assert ready.api_key == SECRET
+    assert ready.model == "deepseek-chat"
+
+
+def test_full_endpoint_pasted_from_the_docs_is_stripped(monkeypatch):
+    """用户常把厂商文档里那条完整 URL 粘进来，入库前要剥成前缀。
+
+    不剥的话请求会打到 `.../chat/completions/chat/completions`，404 在界面上
+    只能读成"模型名不对"——把人引去改一个没问题的地方。
+    """
+    body = client.put("/api/settings/model", json=_body(
+        base_url="https://api.deepseek.com/v1/chat/completions")).json()
+    assert body["base_url"] == "https://api.deepseek.com/v1"
+    assert store.saved().base_url == "https://api.deepseek.com/v1"
+
+    # 只填端点、没有主机名：这是"没填对"，不是"清掉覆盖"。
+    bad = client.put("/api/settings/model", json=_body(base_url="/chat/completions"))
+    assert bad.status_code == 400
+    assert bad.json()["code"] == "settings_base_url_invalid"
+
+
+def test_saving_while_the_write_lock_is_held_is_a_readable_503(monkeypatch):
+    """写不进去时给业务 code，不是裸 `OperationalError` → 500 + traceback。
+
+    面板对 `error` 字段有渲染，对 500 只能显示一句通用错误；而这条路上最可能
+    发生的事恰恰是"过几秒就好了"。
+    """
+    original = store._connect
+
+    def locked(**kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_connect", locked)
+    response = client.put("/api/settings/model", json=_body(model="deepseek-reasoner"))
+    assert response.status_code == 503
+    assert response.json()["code"] == "settings_db_unavailable"
+    monkeypatch.setattr(store, "_connect", original)
+
+
 def test_clear_resets_the_row():
     """`store.clear()` 只在用例与本地调试用：删掉行之后一切回到环境变量。"""
     client.put("/api/settings/model", json=_body(
@@ -711,9 +780,9 @@ def test_reading_does_not_rebuild_the_table_on_every_call(monkeypatch):
     connects: list[int] = []
     original = store._connect
 
-    def counting_connect():
+    def counting_connect(**kwargs):
         connects.append(1)
-        return original()
+        return original(**kwargs)
 
     monkeypatch.setattr(store, "_connect", counting_connect)
 
