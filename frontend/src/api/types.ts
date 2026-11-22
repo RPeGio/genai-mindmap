@@ -1031,6 +1031,41 @@ export interface TestModelSettingsResponse {
   latency_ms: number;
 }
 
+// ---- 账号与会话（`/api/auth/*`）----
+//
+// 会话本身是 **HttpOnly cookie**，所以这里的类型里没有 token 字段——浏览器替我们
+// 保管，JS 拿不到（那正是它防 XSS 的方式）。前端只需要知道"现在是谁"。
+//
+// `kind` 由后端算而不是前端拼：`user ? 'user' : guest_id ? 'guest' : 'anonymous'`
+// 三个分支写在界面里，迟早会在某处漏掉一个，而漏掉的表现是"游客被当成已登录"。
+
+/** 对外的账号形状。**不含任何口令相关字段**。 */
+export interface AuthUser {
+  id: string;
+  username: string;
+  created_at: string;
+}
+
+/** `GET /api/auth/me` 的响应：当前是谁。未登录时 `user` 为 `null`，**永远是 200**。 */
+export interface WhoAmI {
+  user?: AuthUser | null;
+  /** 这台浏览器的游客编号。已登录时可能为 `null`（登录请求不一定带游客 cookie）。 */
+  guest_id?: string | null;
+  kind: 'user' | 'guest' | 'anonymous';
+}
+
+/** 注册与登录共用的请求体。 */
+export interface Credentials {
+  username: string;
+  password: string;
+}
+
+/** 改密码：需要旧密码，并且需要已经登录。 */
+export interface ChangePasswordRequest {
+  current_password: string;
+  new_password: string;
+}
+
 // ---- 编辑日志（统计"用户最常改什么"）----
 //
 // 这几个类型是**日志载荷**，不是导图契约：它们的形状由 `POST/PUT /mindmaps` 的

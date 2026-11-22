@@ -4,6 +4,122 @@
  */
 
 export interface paths {
+    "/api/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Who Am I
+         * @description 当前是谁。顺便补发游客 cookie（全站唯一发它的地方）。
+         */
+        get: operations["who_am_i_api_auth_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register
+         * @description 注册并**直接登录**（返回 201 + 会话 cookie）。
+         *
+         *     注册完不自动登录的话，用户要在同一个页面上把刚敲的密码再敲一遍——那不是安全，
+         *     那只是让第一次使用的体验变差。注册成功意味着这条口令刚刚被验证过（是我们
+         *     亲手 hash 的），没有额外的信任问题。
+         */
+        post: operations["register_api_auth_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Login
+         * @description 登录。账号或密码不对统一 401 `auth_bad_credentials`（理由见 `store.authenticate`）。
+         */
+        post: operations["login_api_auth_login_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description 登出：撤销这次会话并清 cookie。
+         *
+         *     幂等：没登录、或者 cookie 已经无效，也返回 204。界面上的"退出登录"点两次
+         *     不该第二次报错——它不是"删除资源"，是"让这台浏览器变成未登录"。
+         *
+         *     响应对象在这里**新建**而不是复用注入的那个：注入的 `Response` 是给
+         *     "在返回模型的同时补 header"用的，而这条路由的返回体就是它自己。
+         */
+        post: operations["logout_api_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change Password
+         * @description 改密码。**需要已经登录**，并且要再输一次旧密码。
+         *
+         *     两道都是必要的：只凭会话就能改密码，意味着一次 XSS（拿到会话）就能永久接管
+         *     账号；只凭旧密码不看会话，等于把"知道你密码的人"和"已经登录的人"混为一谈。
+         *
+         *     改完撤销全部会话（含当前这条），然后清 cookie：用户要在所有设备上重新登录。
+         *     这不是"顺手多做一步"——改密码最常见的动机就是"我怀疑有人进过我的号"。
+         */
+        post: operations["change_password_api_auth_password_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/mindmaps": {
         parameters: {
             query?: never;
@@ -859,6 +975,13 @@ export interface components {
             /** File */
             file: string;
         };
+        /** ChangePasswordRequest */
+        ChangePasswordRequest: {
+            /** Current Password */
+            current_password: string;
+            /** New Password */
+            new_password: string;
+        };
         /** CheckRequest */
         CheckRequest: {
             /** Content */
@@ -895,6 +1018,20 @@ export interface components {
         /** CreateTextSourceResponse */
         CreateTextSourceResponse: {
             source: components["schemas"]["Source"];
+        };
+        /**
+         * Credentials
+         * @description 注册与登录共用的请求体。
+         *
+         *     字段给 `min_length` 是为了让"空密码"在 Pydantic 这一层就被 422 拦住，而不是
+         *     落到 `store` 里再抛业务错——两种错误在界面上都是红字，但前者不需要一次
+         *     数据库往返。真正的长度规则仍在 `store` 里（8–200），这里只是挡明显空的。
+         */
+        Credentials: {
+            /** Username */
+            username: string;
+            /** Password */
+            password: string;
         };
         /** Diagnostic */
         Diagnostic: {
@@ -2426,6 +2563,18 @@ export interface components {
             /** Version */
             version: number;
         };
+        /**
+         * UserView
+         * @description 对外的账号形状。**不含 `password_hash`，也不含任何 id 之外的东西**。
+         */
+        UserView: {
+            /** Id */
+            id: string;
+            /** Username */
+            username: string;
+            /** Created At */
+            created_at: string;
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -2438,6 +2587,25 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /**
+         * WhoAmI
+         * @description `GET /me` 的响应：当前是谁。
+         *
+         *     `kind` 是三种状态的名字，不是调试信息：界面上"未登录 / 游客 / 已登录"要显示
+         *     不同的东西，而由后端算比前端自己拼（`user ? 'user' : guest_id ? 'guest' : ...`）
+         *     更不容易在一处漏掉。
+         */
+        WhoAmI: {
+            user?: components["schemas"]["UserView"] | null;
+            /** Guest Id */
+            guest_id?: string | null;
+            /**
+             * Kind
+             * @default anonymous
+             * @enum {string}
+             */
+            kind: "user" | "guest" | "anonymous";
         };
         /** Suggestion */
         app__contracts__diagnostic__Suggestion: {
@@ -2478,6 +2646,141 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    who_am_i_api_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhoAmI"];
+                };
+            };
+        };
+    };
+    register_api_auth_register_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Credentials"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    login_api_auth_login_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Credentials"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    logout_api_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    change_password_api_auth_password_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_maps_api_mindmaps_get: {
         parameters: {
             query?: never;

@@ -32,6 +32,9 @@
  */
 import type { components } from './schema';
 import type {
+  AuthUser,
+  ChangePasswordRequest,
+  Credentials,
   ImportResult,
   ImportWarning,
   LibraryEntry,
@@ -57,6 +60,7 @@ import type {
   SourceUsage,
   TestModelSettingsRequest,
   TestModelSettingsResponse,
+  WhoAmI,
 } from './types';
 
 type Schemas = components['schemas'];
@@ -114,6 +118,16 @@ export const checks = {
   testModelSettingsResponseKeys: true satisfies
     SameKeys<TestModelSettingsResponse, Schemas['TestModelSettingsResponse']>,
 
+  // 账号：这三条守的是"`AuthUser` 里不许出现口令相关字段"。后端 `UserView` 刻意
+  // 不含 `password_hash`，镜像若为了显示方便顺手加一个（或加个 `token`，因为
+  // "cookie 看不见所以想自己留一份"），这里会红。会话走 HttpOnly cookie 就是为了
+  // 让 JS 拿不到它，多一个 token 字段等于把那道防线绕开。
+  authUserKeys: true satisfies SameKeys<AuthUser, Schemas['UserView']>,
+  whoAmIKeys: true satisfies SameKeys<WhoAmI, Schemas['WhoAmI']>,
+  credentialsKeys: true satisfies SameKeys<Credentials, Schemas['Credentials']>,
+  changePasswordKeys: true satisfies
+    SameKeys<ChangePasswordRequest, Schemas['ChangePasswordRequest']>,
+
   // ---- 字段形状 ----
   contentShape: true satisfies SameShape<MindMapContent, Schemas['MindMapContent-Output']>,
   nodeShape: true satisfies SameShape<MindNode, Schemas['Node-Output']>,
@@ -145,4 +159,6 @@ export const checks = {
     SameShape<SaveModelSettingsResponse, Schemas['SaveModelSettingsResponse']>,
   testModelSettingsResponseShape: true satisfies
     SameShape<TestModelSettingsResponse, Schemas['TestModelSettingsResponse']>,
+  authUserShape: true satisfies SameShape<AuthUser, Schemas['UserView']>,
+  whoAmIShape: true satisfies SameShape<WhoAmI, Schemas['WhoAmI']>,
 };
