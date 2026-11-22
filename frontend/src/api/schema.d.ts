@@ -2082,6 +2082,10 @@ export interface components {
          *
          *     `changed=False` 是"这次提交没有改变任何东西"（同值重复保存不刷 `updated_at`）。
          *     不返回这个布尔值，界面上就会出现"我刚存过"的假象。
+         *
+         *     `notice` 是**改了地址之后要额外说的一句话**：地址一变，之前那次连接成功的结论
+         *     就不再证明这个新地址通得过了。这里不强制先测通再落库（那会让"我想先填好、等
+         *     供应商开白名单"这种正常操作变成不可能），但要让界面有机会提醒一句。
          */
         SaveModelSettingsResponse: {
             /** Base Url */
@@ -2112,6 +2116,8 @@ export interface components {
             updated_at?: string | null;
             /** Changed */
             changed: boolean;
+            /** Notice */
+            notice?: string | null;
         };
         /**
          * SaveRequest

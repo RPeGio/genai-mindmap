@@ -4515,6 +4515,17 @@
           "changed": {
             "type": "boolean",
             "title": "Changed"
+          },
+          "notice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notice"
           }
         },
         "additionalProperties": false,
@@ -4535,7 +4546,7 @@
           "changed"
         ],
         "title": "SaveModelSettingsResponse",
-        "description": "保存的结果：写入后的生效配置 + 这次有没有真的改变。\n\n`changed=False` 是\"这次提交没有改变任何东西\"（同值重复保存不刷 `updated_at`）。\n不返回这个布尔值，界面上就会出现\"我刚存过\"的假象。"
+        "description": "保存的结果：写入后的生效配置 + 这次有没有真的改变。\n\n`changed=False` 是\"这次提交没有改变任何东西\"（同值重复保存不刷 `updated_at`）。\n不返回这个布尔值，界面上就会出现\"我刚存过\"的假象。\n\n`notice` 是**改了地址之后要额外说的一句话**：地址一变，之前那次连接成功的结论\n就不再证明这个新地址通得过了。这里不强制先测通再落库（那会让\"我想先填好、等\n供应商开白名单\"这种正常操作变成不可能），但要让界面有机会提醒一句。"
       },
       "SaveRequest": {
         "properties": {

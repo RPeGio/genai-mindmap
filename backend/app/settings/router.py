@@ -115,9 +115,15 @@ class SaveModelSettingsResponse(ModelSettings):
 
     `changed=False` 是"这次提交没有改变任何东西"（同值重复保存不刷 `updated_at`）。
     不返回这个布尔值，界面上就会出现"我刚存过"的假象。
+
+    `notice` 是**改了地址之后要额外说的一句话**：地址一变，之前那次连接成功的结论
+    就不再证明这个新地址通得过了。这里不强制先测通再落库（那会让"我想先填好、等
+    供应商开白名单"这种正常操作变成不可能），但要让界面有机会提醒一句。
     """
 
     changed: bool
+    #: 需要用户看一眼的提醒。`None` = 没什么要额外说的（绝大多数保存都是这样）。
+    notice: str | None = None
 
 
 @router.put("/model", response_model=SaveModelSettingsResponse)
@@ -128,6 +134,7 @@ def save_model_settings(body: SaveModelSettingsRequest) -> SaveModelSettingsResp
     `{code, message, detail, request_id}`——错误码分得开，界面才能说清"是地址不合法
     还是密钥太长"。
     """
+    before = store.resolve().base_url
     resolved, changed = store.save(
         base_url=body.base_url,
         api_key=body.api_key,
@@ -138,6 +145,7 @@ def save_model_settings(body: SaveModelSettingsRequest) -> SaveModelSettingsResp
     return SaveModelSettingsResponse(
         **_view(resolved, updated_at=store.saved().updated_at).model_dump(),
         changed=changed,
+        notice=_notice_for(before, resolved.base_url),
     )
 
 
@@ -195,11 +203,35 @@ async def test_model_settings(
             "提交的是打码后的密钥（形如 …abcd），不是密钥本身；"
             "要测连接请重新粘贴完整的值，或者留空直接用已保存的那把。",
             status=400)
+    # 地址不合法要在**发请求之前**说成 400，而不是让 `probe()` 返回一句
+    # `ok=false` 的结论。两种情况都想拦，但给人的信号不同：400 是"这个地址不许
+    # 填"，`ok=false` 是"这个地址填了但不通"。`probe()` 里那道同样的检查是给
+    # 直接调它的人兜底的（比如将来的后台任务），不是重复。
+    refusal = probe_module._refuse(base_url)
+    if refusal is not None:
+        raise store.SettingsError("settings_base_url_refused", refusal, status=400)
     result = await probe_module.probe(base_url, api_key, model)
     return TestModelSettingsResponse(
         ok=result.ok, message=result.message, model=result.model,
         status=result.status, latency_ms=result.latency_ms,
     )
+
+
+def _notice_for(before: str, after: str) -> str | None:
+    """改了地址要不要提醒一句。没改就返回 `None`（绝大多数保存都是这样）。
+
+    为什么只提醒、不强制"先测通才能存"：这条接口的合法用法里有一种是"先把地址
+    填上，等供应商开完白名单再试"——强制联网才能存，等于逼用户把一个还没生效的
+    配置留在输入框里，刷新页面就丢了。提醒放在保存的**响应**里，是因为界面上只有
+    那一刻能确定"地址真的变了"（同值重复保存 `changed=False`，也不该唠叨）。
+
+    `before` 是空串时同样不提醒：从"什么都没配"到"填了一个地址"是首次配置，
+    没有任何一次旧的成功可以作废。那时弹"之前那次测试的结论不成立"会让人去找
+    一次并不存在的测试。
+    """
+    if not before or before == after:
+        return None
+    return "地址改了。之前那次「测试连接」的结论对新地址不成立，建议现在点一次「测试连接」。"
 
 
 def _raise_incomplete() -> None:

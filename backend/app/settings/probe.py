@@ -17,9 +17,12 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -46,6 +49,72 @@ class ProbeResult:
     model: str
     status: int | None = None
     latency_ms: int = 0
+
+
+#: 允许把模型地址指向内网 / 本机。**默认关**。
+#:
+#: 默认关的理由不是"内网不安全"，是这条路的代价不对称：放行一个内网地址，能让
+#: 任何碰到这个接口的人拿**已存的密钥**当探针去扫内网（`http://redis:6379/`、
+#: `http://169.254.169.254/…`），而密钥是明文塞在 `Authorization` 头里的。反过来，
+#: 拒绝内网只是让"用本机 Ollama 当模型"这一类部署需要显式开一下开关。
+#:
+#: 需要它的部署（Ollama / LM Studio / 同机自建端点）在环境里设
+#: `MINDMAP_SETTINGS_ALLOW_PRIVATE=1`。注意它**同时放开本机与内网**：没有更细的
+#: 粒度是有意的——真要连本机模型的人，通常也要连宿主机的 `host.docker.internal`
+#: 或局域网里的另一台机器，两档分不开就没必要假装分得开。
+ALLOW_PRIVATE_ENV = "MINDMAP_SETTINGS_ALLOW_PRIVATE"
+
+
+def _allow_private() -> bool:
+    """这个开关**每次现读**环境变量，不是模块级常量。
+
+    为了让用例能逐条改它（`monkeypatch.setenv` 对导入期常量无效），也为了让"改了
+    开关要重启"这件事不变成一个隐蔽前提：进程环境本来就在启动时定死。
+    """
+    return os.getenv(ALLOW_PRIVATE_ENV, "").strip() == "1"
+
+
+def _refuse(base_url: str) -> str | None:
+    """发请求之前先挡一道。返回拒绝理由，`None` = 放行。
+
+    这不是"防住内网"的完整方案（DNS rebinding、302 到内网、以及公网域名解析到
+    私网地址都挡不住）。它挡的是**成本最低的那一步**：在页面上填一个内网地址，
+    然后让服务端带着已存的密钥去请求它。把这一步的成本从"零"抬到"要先能改配置"，
+    剩下的交给鉴权（`docker/nginx.conf` 那一层与后续的账号系统）。
+
+    也顺手挡了非 http(s) 协议：`file:///etc/passwd` 拼上 `/chat/completions` 之后
+    行为完全取决于 httpx 的版本，不该由它决定。
+    """
+    try:
+        parts = urlsplit((base_url or "").strip())
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        # 端口不是数字之类。当成"没有主机名"处理：再往下构请求也只会得到一句
+        # 更难读的 httpx 异常。
+        return "地址解析不出来，检查一下端口和协议头。"
+    if parts.scheme not in ("http", "https"):
+        return "地址必须以 http:// 或 https:// 开头。"
+    if not host:
+        return "地址里没有主机名。"
+    if _allow_private():
+        return None
+    if host in {"localhost", "::1"} or host.endswith(".local"):
+        return (f"不允许把模型地址指向本机（{host}）。"
+                f"确实要连本机模型的话，在后端环境变量里设 {ALLOW_PRIVATE_ENV}=1。")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # 是域名，不是 IP 字面量。解析结果不在这里看（见 docstring）。
+        return None
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        return (f"不允许把模型地址指向内网 / 保留地址（{host}）。"
+                f"确实要连内网模型的话，在后端环境变量里设 {ALLOW_PRIVATE_ENV}=1。")
+    if ip.is_unspecified or ip.is_multicast:
+        # `0.0.0.0` / `::` 在多数系统上连的是本机，`is_private` 并不覆盖它们——
+        # 这一条是上面那组的补洞，不是多余的谨慎。
+        return (f"不允许把模型地址指向 {host}。"
+                f"确实要连本机模型的话，在后端环境变量里设 {ALLOW_PRIVATE_ENV}=1。")
+    return None
 
 
 def _redact(text: str, key: str) -> str:
@@ -109,7 +178,16 @@ async def probe(base_url: str, api_key: str, model: str) -> ProbeResult:
 
     401 / 连接失败 / 超时都要变成一句中文，而不是冒到统一错误出口变成 500——
     那会让"我填错了一个字符"看起来像"服务器坏了"。
+
+    地址被 `_refuse()` 挡下时也走这条"结论"通道（`ok=False`、零延迟），与 401、
+    超时的形状一样。调用方若想把它区分成 400，那是对"地址本身不合法"的判断，得
+    自己在调用之前问 `_refuse()`（`router.py` 就是这么做的）。
     """
+    refusal = _refuse(base_url)
+    if refusal is not None:
+        # 一条字节都不发。**密钥绝不出门**——这个函数唯一会带密钥的动作就是下面
+        # 那次 `client.post`，所以挡在它前面就够了。
+        return ProbeResult(ok=False, model=model, message=refusal)
     started = time.monotonic()
     body = {
         "model": model,
@@ -166,4 +244,5 @@ async def probe(base_url: str, api_key: str, model: str) -> ProbeResult:
                        latency_ms=latency)
 
 
-__all__ = ["PROBE_MAX_TOKENS", "ProbeResult", "TIMEOUT_SECONDS", "probe"]
+__all__ = ["ALLOW_PRIVATE_ENV", "PROBE_MAX_TOKENS", "ProbeResult", "TIMEOUT_SECONDS",
+           "probe"]
