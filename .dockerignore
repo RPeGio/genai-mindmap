@@ -88,3 +88,9 @@ run-backend.bat
 .DS_Store
 Thumbs.db
 .visioncheck
+
+# 设置面板的 Basic Auth 密码文件（`htpasswd -c docker/.htpasswd admin`）。
+# 里面有密码哈希；镜像不需要它——compose 是从宿主机**只读挂载**进去的，
+# 不是 COPY 进镜像的。
+.htpasswd
+**/.htpasswd

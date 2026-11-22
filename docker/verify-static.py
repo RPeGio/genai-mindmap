@@ -318,6 +318,21 @@ for must in (".git", "backend/.venv", "frontend/node_modules", "frontend/dist", 
     hit = ignored(must)
     check(".dockerignore 排除了 %s" % must, hit is not None, ("规则 %r" % hit) if hit else "未命中")
 
+# 设置面板的密码文件：compose 从宿主机只读挂载它，既不该进镜像也不该进版本库。
+# 两处都断言，因为它们服务两个不同的目的——只加一处会得到"镜像干净但仓库里有
+# 口令哈希"或反过来。
+for hidden in ("docker/.htpasswd", ".htpasswd"):
+    hit = ignored(hidden)
+    check(".dockerignore 排除了 %s" % hidden, hit is not None, ("规则 %r" % hit) if hit else "未命中")
+
+gitignore_lines = [l.strip() for l in read(".gitignore").splitlines()]
+gitignore_lines = [l for l in gitignore_lines if l and not l.startswith("#")]
+check(
+    ".gitignore 排除了密码文件（否则 htpasswd 建出来的哈希会被顺手提交）",
+    any("htpasswd" in line for line in gitignore_lines),
+    str([line for line in gitignore_lines if "htpasswd" in line]),
+)
+
 reqs = [l.split("=")[0].split(">")[0].split("<")[0].strip() for l in read("backend/requirements.txt").splitlines() if l.strip() and not l.strip().startswith("#")]
 pkg = json.loads(read("frontend/package.json"))
 check("requirements.txt: 包名可解析（无脏行）", bool(reqs) and all(re.match(r"^[A-Za-z0-9_.\-\[\]]+$", r) for r in reqs), str(reqs))
