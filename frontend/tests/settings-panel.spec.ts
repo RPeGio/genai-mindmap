@@ -729,10 +729,13 @@ describe('关闭', () => {
 });
 
 describe('store 与纯函数', () => {
-  it('来源标签五档：saved / instance / env / unset / unbound', () => {
+  it('来源标签六档：saved / instance / free / env / unset / unbound', () => {
     expect(settingSourceLabel('saved')).toBe('我的设置');
     // 借用共享配置是独立一档：清掉自己那行会回到它，用户得知道这件事。
     expect(settingSourceLabel('instance')).toBe('本站共享配置');
+    // 免费档也单独一档：模型名会变成一个不认识的 id，得能分辨这是部署方开的功能
+    // 还是自己配错了。
+    expect(settingSourceLabel('free')).toBe('免费模型');
     expect(settingSourceLabel('env')).toBe('环境变量');
     expect(settingSourceLabel('unset')).toBe('未设置');
     // `unbound` 必须自己一档：它与 `unset` 的下一句完全不同（重贴一次 vs 去配一把）。

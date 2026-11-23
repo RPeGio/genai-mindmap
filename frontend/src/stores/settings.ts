@@ -49,11 +49,23 @@ export const SETTING_SOURCE_UNBOUND = 'unbound';
  * 按钮——用户不知道点下去会发生什么。
  */
 export const SETTING_SOURCE_INSTANCE = 'instance';
+/**
+ * 这次生成走的是**免费模型**（部署方那台端点上当前标 `:free` 的那些）。
+ *
+ * 只出现在 `model_source` / `deep_model_source` 上，不涉及密钥：免费模型也要密钥
+ * （不带 key 直接 401），只是那次调用不收费。所以这一档的语义是"用部署方那把钥匙
+ * 走不收费的模型"，而不是"不用密钥"。
+ *
+ * 界面上必须说出来：免费档是慢的（实测约 24.6 tok/s），而且受每日次数限制。用户
+ * 看到模型名变成一个不认识的 id 时，得能分辨这是"部署方开了免费档"还是"我配错了"。
+ */
+export const SETTING_SOURCE_FREE = 'free';
 
 /** 来源标签。界面要能分辨"我在面板里设的"与"部署方在环境变量里设的"。 */
 export function settingSourceLabel(source: string): string {
   if (source === SETTING_SOURCE_SAVED) return '我的设置';
   if (source === SETTING_SOURCE_INSTANCE) return '本站共享配置';
+  if (source === SETTING_SOURCE_FREE) return '免费模型';
   if (source === SETTING_SOURCE_ENV) return '环境变量';
   if (source === SETTING_SOURCE_UNBOUND) return '地址换过，待重填';
   return '未设置';
