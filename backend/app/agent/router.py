@@ -552,7 +552,10 @@ def list_runs(
 
 @router.get("/runs/{run_id}", response_model=RunDetail)
 def get_run(run_id: str) -> RunDetail:
-    record = runs.get(run_id)
+    # `get_for` 而不是 `get`：`run_id` 是客户端自己生成并传上来的，猜中一个就等于
+    # 读到别人还没保存的那棵树。别人的 id 一律 404——"这个 id 存在但不属于你"
+    # 本身就是一条不该给的信息。
+    record = runs.get_for(run_id)
     if record is None:
         raise HTTPException(status_code=404,
                             detail={"code": "run_not_found", "message": "没有这次运行的记录"})
@@ -572,6 +575,9 @@ def mark_run_applied(run_id: str) -> Response:
     "生成过但没保存"与"生成过、也存下来了"只能靠这个时间戳分开：那份内容可能被
     PUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`
     表反推，得到的全是猜。
+
+    按 owner 过滤：否则知道别人 `run_id` 的人能替他标掉这一位，那条记录再也不会
+    出现在他的「上次的结果」里——一条安静的数据丢失。
     """
     if not runs.mark_applied(run_id):
         raise HTTPException(status_code=404,

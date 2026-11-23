@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,12 +15,19 @@ from app.main import app
 
 BACKEND = Path(__file__).resolve().parents[1]
 
+#: 门禁要求"有身份"，而这里手写 ASGI scope、不经过 `TestClient` 的 cookie 罐。
+#: 直接给一个合法的游客 id（32 位小写十六进制，同 `app/auth/identity.py` 的
+#: `_GUEST_PATTERN`）。**整个文件共用一个**：换来换去会让"上一段存下的图"
+#: 在下一段变成别人的，而报错看起来像隔离逻辑坏了。
+GUEST_ID = uuid.uuid4().hex
+
 
 def request(method: str, path: str, body=None, headers=None):
     """最小 ASGI 调用器（写法同 test_skeleton.request，额外回传响应头）。"""
     payload = b"" if body is None else json.dumps(body, ensure_ascii=False).encode()
     path_only, _, query = path.partition("?")
-    raw_headers = [(b"content-type", b"application/json")]
+    raw_headers = [(b"content-type", b"application/json"),
+                   (b"cookie", f"mm_guest={GUEST_ID}".encode())]
     for key, value in (headers or {}).items():
         raw_headers.append((key.lower().encode(), value.encode()))
 

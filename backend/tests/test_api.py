@@ -4,11 +4,19 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 from app.main import app
 
 BACKEND = Path(__file__).resolve().parents[1]
+
+#: 门禁要求"有身份"，而这个文件手写 ASGI scope、不经过 `TestClient` 的 cookie 罐。
+#: 直接给一个合法的游客 id 当 cookie：格式与 `app/auth/identity.py` 的
+#: `_GUEST_PATTERN`（32 位小写十六进制）一致，中间件认它，且**同一个测试类里
+#: 所有请求共用这一个 id**——不共用的话第二次 `PUT` 会撞上 `map_forbidden`
+#: （图归上一个游客所有），那看起来像隔离出了 bug，其实是测试自己换了个人。
+GUEST_ID = uuid.uuid4().hex
 
 
 class ApiTest(unittest.TestCase):
@@ -45,7 +53,8 @@ class ApiTest(unittest.TestCase):
             scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
                      "method": method, "scheme": "http", "path": "/api" + path,
                      "raw_path": ("/api" + path).encode(), "query_string": b"",
-                     "headers": [(b"content-type", b"application/json")],
+                     "headers": [(b"content-type", b"application/json"),
+                                 (b"cookie", f"mm_guest={GUEST_ID}".encode())],
                      "client": ("127.0.0.1", 1), "server": ("test", 80)}
             await app(scope, receive, send)
             status = next(m["status"] for m in messages if m["type"] == "http.response.start")

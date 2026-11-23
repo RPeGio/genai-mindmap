@@ -16,6 +16,12 @@ from app.contracts.source import SourceKind
 
 BACKEND = Path(__file__).resolve().parents[1]
 
+#: 门禁要求"有身份"。本文件手写 ASGI scope、不经过 `TestClient` 的 cookie 罐，
+#: 所以给一个固定的游客 id（32 位小写十六进制，同 `app/auth/identity.py` 的
+#: `_GUEST_PATTERN`）。写死常量而不是 `uuid4()`：出错时日志里那个 id 每次都一样，
+#: 能一眼看出"是同一个人"还是"换了人"。
+GUEST_ID = "0123456789abcdef0123456789abcdef"
+
 MAP = {
     "title": "测试导图",
     "root": {
@@ -32,6 +38,7 @@ MAP = {
 def request(method: str, path: str, body=None):
     """最小 ASGI 调用器，避免额外依赖。"""
     import json as _json
+    import uuid
 
     payload = b"" if body is None else _json.dumps(body, ensure_ascii=False).encode()
     path_only, _, query = path.partition("?")
@@ -49,7 +56,10 @@ def request(method: str, path: str, body=None):
             "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
             "method": method, "path": path_only, "raw_path": path_only.encode(),
             "query_string": query.encode(), "root_path": "", "scheme": "http",
-            "headers": [(b"content-type", b"application/json")],
+            # 门禁要求"有身份"。这里手写 scope、不经过 TestClient 的 cookie 罐，
+            # 所以直接给一个合法游客 id（32 位小写十六进制）。
+            "headers": [(b"content-type", b"application/json"),
+                        (b"cookie", f"mm_guest={GUEST_ID}".encode())],
             "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 8000),
         }
         await app(scope, receive, send)

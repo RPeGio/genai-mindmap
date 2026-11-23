@@ -84,6 +84,16 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
         id TEXT PRIMARY KEY, version INTEGER NOT NULL,
         content TEXT NOT NULL, updated_at TEXT NOT NULL
     )""")
+    # 这张图归谁（`app/auth/store.py` 的 owner 字符串：`user:<id>` / `guest:<id>` /
+    # 空串＝无主）。
+    #
+    # **读共享、写限主的边界就落在这一列上**：`list_maps` / `get_map` 不看它，
+    # `update_map` 看。这是产品口径"任何有身份的人都能看，只有创建者能改"的直接实现。
+    #
+    # 迁移前的老行补成空串，**不编一个 owner 出来**——那等于假装知道是谁创建的。
+    # 空串的语义是"无主"，只有部署方能改（见 `update_map` 的判据）：这台机器上第一个
+    # 注册的人只可能是部署它的人，把无主的历史内容交给他，是唯一能自洽的答案。
+    _ensure_columns(conn, "mindmaps", {"owner": "TEXT NOT NULL DEFAULT ''"})
     # `runs` 是 agent 运行的身份行（见 `app/agent/runs.py`）。它必须与 `mindmaps`
     # 同一时刻建好：那张表的写入方是 SSE 生成器的 `finally`，而那条路上**不允许**
     # 再有一次"发现表不存在 → 建表"的分支——被取消时多一个可能抛错的分支，就等于
@@ -152,6 +162,17 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     # 写这一列的那一刻顺手刷新 `updated_at`，`sweep_abandoned()` 的超龄判据就靠它：
     # 活着的运行最长的静默期是结构那一次调用，一定短于 `RUN_ABANDONED_SECONDS`。
     _ensure_columns(conn, "runs", {"checkpointed_at": "TEXT"})
+    # 这次生成是谁发起的（owner 字符串，与 `mindmaps.owner` 同一套口径）。
+    #
+    # **`runs` 与 `mindmaps` 的可见性口径不一样，这是刻意的**：导图的读是共享的
+    # （"任何有身份的人都能看"，团队协作的用法依赖它），而 `runs` 是**过程记录**——
+    # 里面是还没保存的树、模型的思考过程、失败原因。那些东西属于发起它的那个人，
+    # 别人没有理由看到。所以 `runs` 是"读也限主"，导图是"读共享、写限主"。
+    #
+    # 老行补空串：那是加账号之前生成的记录，没有主人可考。空串在这里的语义与
+    # `mindmaps` 不同——`runs` 不提供"接管无主数据"的操作（没有这个需求），
+    # 所以老行对所有人都不可见，等于沉在库里。
+    _ensure_columns(conn, "runs", {"owner": "TEXT NOT NULL DEFAULT ''"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at)")
     # 用户偏好（`app/prefs/service.py`）。与上面两张表建在同一时刻、同一个连接上，
     # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该
@@ -354,20 +375,60 @@ def get_map(map_id: str) -> MapRecord | None:
     return _record(row) if row else None
 
 
-def create_map(content: DiagramContent) -> MapRecord:
+def create_map(content: DiagramContent, *, owner: str | None = None) -> MapRecord:
+    """建一张图并记下它归谁。
+
+    `owner=None` 时按当前身份算（`store.owner_of`）：登录用户是 `user:<id>`，游客是
+    `guest:<cookie>`。**游客的图跟着那台浏览器的 cookie 走**——清掉 cookie 或换浏览器
+    就找不回来了。这是"游客"这个词本身的含义，不是缺陷；登录之后要保住它得重新保存一次。
+
+    直接传 `owner=""` 只在测试与迁移脚本里出现，表示"无主"。
+    """
     map_id = str(uuid4())
+    if owner is None:
+        from app.settings.store import owner_of  # 函数内 import：避开 auth↔settings 的环
+
+        from app.auth.identity import current_identity
+
+        owner = owner_of(current_identity())
     with closing(connect()) as conn, conn:
-        conn.execute("INSERT INTO mindmaps VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                     (map_id, content.model_dump_json()))
+        conn.execute(
+            "INSERT INTO mindmaps (id, version, content, updated_at, owner) "
+            "VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)",
+            (map_id, content.model_dump_json(), owner))
     return get_map(map_id)  # type: ignore[return-value]
 
 
-def update_map(map_id: str, version: int, content: DiagramContent) -> str:
+def update_map(
+    map_id: str,
+    version: int,
+    content: DiagramContent,
+    *,
+    owner: str | None = None,
+    allow_unowned: bool = False,
+) -> str:
+    """保存。返回值多了一个 `"forbidden"`：这张图不是你的。
+
+    **判据顺序是刻意的**：先看存在、再看归属、最后才比版本。反过来会出现"版本不符"
+    与"不是你的"两种拒绝混在一起，而后者不该向非创建者透露这张图现在是什么版本——
+    那本身就是一条信息。
+
+    `allow_unowned` 只给部署方：`owner = ''` 是迁移前的老行（那时还没有账号这件事），
+    把无主的历史内容交给这台机器上第一个注册的人，是唯一能自洽的归属答案。
+    """
+    if owner is None:
+        from app.auth.identity import current_identity
+        from app.settings.store import owner_of
+
+        owner = owner_of(current_identity())
     with closing(connect()) as conn, conn:
+        row = conn.execute("SELECT owner FROM mindmaps WHERE id = ?", (map_id,)).fetchone()
+        if row is None:
+            return "missing"
+        holder = row["owner"] or ""
+        if holder != owner and not (allow_unowned and holder == ""):
+            return "forbidden"
         result = conn.execute("""UPDATE mindmaps SET content = ?, version = version + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             WHERE id = ? AND version = ?""", (content.model_dump_json(), map_id, version))
-        if result.rowcount:
-            return "updated"
-        exists = conn.execute("SELECT 1 FROM mindmaps WHERE id = ?", (map_id,)).fetchone()
-        return "conflict" if exists else "missing"
+        return "updated" if result.rowcount else "conflict"

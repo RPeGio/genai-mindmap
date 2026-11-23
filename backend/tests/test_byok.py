@@ -46,6 +46,22 @@ def _register(username: str) -> TestClient:
     return client
 
 
+def _new_guest() -> TestClient:
+    """一台新的浏览器：先 `GET /api/auth/me` 拿游客 cookie。
+
+    门禁上线之后，"没有 cookie 的客户端"已经进不了 `/api/settings/*`（会 401，
+    那是 `tests/test_gate.py` 的地盘）。这里要的是另一台**有身份但不同**的浏览器，
+    所以走游客身份——游客有自己那一行配置（`guest:<id>`）。
+    """
+    from fastapi.testclient import TestClient  # noqa: PLC0415
+
+    client = TestClient(app)
+    response = client.get("/api/auth/me")
+    assert response.status_code == 200, response.text
+    assert client.cookies.get(auth_store.GUEST_COOKIE), "拿不到游客 cookie，后面每条请求都会 401"
+    return client
+
+
 def _save(client: TestClient, **kwargs):
     return client.put("/api/settings/model", json=kwargs)
 
@@ -110,14 +126,12 @@ def test_a_guest_key_stays_in_the_browser_that_made_it():
     这不叫丢失，叫做"那台机器的身份没了"。真丢了密钥的游客重新填一次即可，而
     免费额度那 3 次本来也是按同一台机器算的。
     """
-    guest = TestClient(app)
-    # 先拿一个游客 cookie（全站只有 `/auth/me` 会发它）。
-    assert guest.get("/api/auth/me").json()["kind"] == "guest"
+    guest = _new_guest()
     assert _save(guest, base_url="https://g.example/v1",
                  api_key=KEY_A, model="model-g").status_code == 200
     assert _read(guest)["api_key_source"] == "saved"
 
-    other_browser = TestClient(app)
+    other_browser = _new_guest()
     body = _read(other_browser)
     assert body["api_key_source"] == "unset"
     assert body["api_key_masked"] == ""
@@ -270,11 +284,11 @@ def test_the_shared_row_reports_what_it_stores_not_the_effective_value():
 
 
 def test_an_anonymous_request_cannot_be_the_deployer():
-    """没有 cookie 的请求不是部署方——注册开放之后，"匿名"是最容易伪造的身份。"""
+    """一个游客不是部署方——注册开放之后，只要清一次 cookie 就能换个身份。"""
     _register("deployer")
-    anonymous = TestClient(app)
-    assert _read(anonymous)["can_edit_instance"] is False
-    refused = _save(anonymous, scope="instance", base_url="https://attacker.example/v1")
+    guest = _new_guest()
+    assert _read(guest)["can_edit_instance"] is False
+    refused = _save(guest, scope="instance", base_url="https://attacker.example/v1")
     assert refused.status_code == 403
 
 

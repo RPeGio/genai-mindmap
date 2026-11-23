@@ -193,6 +193,36 @@ def reset_graph_driver():
     graph_store.close_driver()
 
 
+#: 门禁（`app/auth/gate.py`）打开之后，任何走 HTTP 的写法都必须先"有身份"。
+#:
+#: 测试里没有浏览器，所以 `guest_client()` 就是"拿到一个游客身份"的全部——它等价于
+#: 前端启动时调的那次 `GET /api/auth/me`。**不要**为了省事把门禁在测试里关掉：那会让
+#: 几千条断言里没有一条覆盖到"门禁真的在拦人"，而这条口径出错的后果是整站 401 或者
+#: 整站敞着，两种都只有在线上才看得见。
+def guest_client():
+    """起一个**带游客身份**的 `TestClient`：先 `GET /api/auth/me` 拿 cookie。
+
+    绝大多数既有 HTTP 用例都该用它。它们的断言关心的从来不是"没有身份能不能访问"
+    （那是 `tests/test_gate.py` 的事），而是"有身份时这个接口对不对"——所以这里
+    自动补上身份，而不是给它们逐个加断言。
+
+    用法与 `TestClient(app)` 相同：`with guest_client() as api:` 或 `client = guest_client()`。
+    需要"匿名"的用例直接 `TestClient(app)`（见 `tests/test_gate.py`）。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    # `/api/auth/me` 是全站唯一发游客 cookie 的地方（见 `app/auth/router.py`）。
+    # 断言它 200 是必要的：如果它哪天变成了需要身份，这一层会静默地什么 cookie
+    # 都拿不到，然后所有用例都以"401"的形式失败，而真正的原因在另一个文件里。
+    response = client.get("/api/auth/me")
+    assert response.status_code == 200, f"游客身份拿不到：{response.status_code} {response.text}"
+    assert client.cookies.get("mm_guest"), "`/api/auth/me` 没发游客 cookie，门禁会挡住后面每一条请求"
+    return client
+
+
 @pytest.fixture(autouse=True)
 def no_real_http(monkeypatch):
     """真发到传输层的请求一律失败，并指出目标 URL。"""

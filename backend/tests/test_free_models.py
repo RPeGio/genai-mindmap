@@ -281,11 +281,11 @@ def test_resolve_does_not_touch_a_users_own_key(monkeypatch, llm_env):
     """用户自己填了密钥就按他的意思走——免费档与他的钱无关。"""
     monkeypatch.setenv(free_models.ENABLED_ENV, "1")
     _put_cache(["recursive/flint-v1.0:free"])
-    from fastapi.testclient import TestClient
+    from conftest import guest_client
 
-    from app.main import app
-
-    client = TestClient(app)
+    # 门禁上线后 `/api/settings/*` 要身份；这条用例关心的是"自己填的密钥优先"，
+    # 与"谁有资格访问设置面板"无关，所以用游客身份（它有自己那一行配置）。
+    client = guest_client()
     response = client.put("/api/settings/model", json={
         "base_url": "https://api.deepseek.com/v1",
         "api_key": "sk-mine-0000",

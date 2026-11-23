@@ -415,18 +415,29 @@ def test_changing_the_password_requires_both_old_password_and_a_session():
 # ---------------------------------------------------------------- 现在还没上门禁
 
 
-def test_business_endpoints_are_still_open_in_this_batch():
-    """这一批只做身份层，**不拦任何请求**。
+def test_the_gate_is_now_closed_for_anonymous_callers():
+    """**这一刻到了**：门禁已经合闸，匿名请求一律 401。
 
-    这条用例的存在意义是"别提前合闸"：等门禁真的按接口打开时，这里会先红一次，
-    提醒改的人把断言改成"该 401 的 401、该放行的放行"，而不是让一次静默的
-    合闸在合并当天把所有人挡在外面。
+    这条用例原来是 `test_business_endpoints_are_still_open_in_this_batch`，钉的是
+    "这一批只做身份层、不拦任何请求"。它的存在意义就是"别提前合闸"——现在合闸了，
+    于是它按当初写下的约定红了，改法也正是当初写明的那一种：**把断言改成"该 401 的
+    401、该放行的放行"**，而不是删掉。删掉它等于把"合闸这件事没人验证过"重新变成
+    默认状态。
+
+    这里只验四件事，更细的白名单判定在 `tests/test_gate.py`。
     """
+    # 放行的：健康检查（部署脚本与容器 healthcheck 依赖）与身份接口本身。
+    # **这两条各用一个新 client**：`/api/auth/me` 的响应里带 `Set-Cookie`，在同一个
+    # client 上调用它就会给这个 client 装上游客身份，后面再断言"匿名被拦"必然落空
+    # （第一次踩到就是这么来的：自己把自己变成了有身份的人）。
+    assert _fresh().get("/api/health").status_code == 200
+    assert _fresh().get("/api/auth/me").status_code == 200
+    # 拦住的：业务路径，用一个从没调过 `/api/auth/me` 的 client。
     anonymous = _fresh()
-    assert anonymous.get("/api/health").status_code == 200
-    assert anonymous.get("/api/mindmaps").status_code == 200
-    assert anonymous.get("/api/prefs").status_code == 200
-    assert anonymous.get("/api/settings/model").status_code == 200
+    for path in ("/api/mindmaps", "/api/prefs", "/api/settings/model"):
+        response = anonymous.get(path)
+        assert response.status_code == 401, f"{path} 应当要身份，实得 {response.status_code}"
+        assert response.json()["code"] == "auth_required"
 
 
 def test_the_identity_middleware_is_installed():
