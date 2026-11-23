@@ -255,7 +255,7 @@ git describe --tags # 本方案第一次上线后才会打第一个部署 tag；
 
    ```bash
    # 本机：从要部署的 tag 导出（自动排除 .git / node_modules）
-   git archive --format=tar.gz -o genai-mindmap.tar.gz v0.4.0-deploy
+   git archive --format=tar.gz -o genai-mindmap.tar.gz v0.5.0
    scp genai-mindmap.tar.gz root@<ECS_IP>:/root/
 
    # 服务器
@@ -508,7 +508,7 @@ gh api -X POST repos/RPeGio/genai-mindmap/actions/runners/registration-token --j
 mkdir -p /root/genai-mindmap-src
 tar -xzf /root/genai-mindmap-vX.Y.Z.tar.gz -C /root/genai-mindmap-src
 cd /root/genai-mindmap-src
-sudo bash deploy/install.sh --domain genai-mindmap.rpegio.top --version vX.Y.Z-deploy
+sudo bash deploy/install.sh --domain genai-mindmap.rpegio.top --version vX.Y.Z
 sudo bash deploy/install-runner.sh --token <上一步拿到的 token>
 ```
 
@@ -535,13 +535,18 @@ gh api repos/RPeGio/genai-mindmap/actions/runners --jq '.runners[] | "\(.name) \
 
 ### 12.3 日常发布
 
+**tag 命名：纯版本号，不带后缀。** 早期几个 tag 叫 `v0.4.9-deploy`（那阵子既有前端发布又有部署，
+想用后缀区分），后来发现后缀没有区分到任何东西——一个 tag 就是一次发布，两种都发。两种都
+能部署（`cd-apply.sh` 只要求 `[A-Za-z0-9._-]`），但**新 tag 一律用纯版本号**，否则
+`git tag --sort=v:refname` 排出来的顺序会是错的（`v0.4.9-deploy` 与 `v0.4.10` 谁新要人算）。
+
 本地是 Windows PowerShell，一行一条，别用 `&&`（PowerShell 5.1 不支持）：
 
 ```powershell
 git switch main
 git pull --ff-only
-git tag -a v0.4.9-deploy -m "v0.4.9: 这次改了什么"
-git push origin v0.4.9-deploy     # ← 这一步触发部署
+git tag -a v0.5.0 -m "release: v0.5.0（这次改了什么）"
+git push origin v0.5.0            # ← 这一步触发部署
 gh run watch                      # 看着它跑完（Ctrl+C 只退出观察，不会取消 job）
 ```
 
@@ -563,7 +568,7 @@ gh run watch                      # 看着它跑完（Ctrl+C 只退出观察，�
 用 `workflow_dispatch` 指定一个旧 tag 重跑即可（tag 必须存在）：
 
 ```bash
-gh workflow run deploy.yml -f version=v0.4.8-deploy
+gh workflow run deploy.yml -f version=v0.5.0
 ```
 
 它走的是同一条路径：解包旧代码 → `install.sh`（快照当前版本）→ 换回旧 dist。前端与后端
