@@ -74,13 +74,38 @@ def _allow_private() -> bool:
     return os.getenv(ALLOW_PRIVATE_ENV, "").strip() == "1"
 
 
+#: 云厂商的实例元数据服务地址。**任何情况下都不许填**，开关也打不开。
+#:
+#: 与下面那组"内网地址"分开的理由：内网模型是一个真实需求（同机 Ollama、局域网
+#: 里的推理机），所以内网友好开关；而元数据服务上没有任何模型，它只提供临时凭证。
+#: 允许它唯一的用途就是让服务端带着已存的密钥去访问一个能反过来签出云账号的接口，
+#: 用户没有任何理由需要这个能力——开关放开的应该是"我要连自己的模型"，不是
+#: "我要连任何东西"。
+_METADATA_HOSTS = frozenset({
+    "metadata",
+    "metadata.google.internal",
+    "metadata.goog",
+    "instance-data",
+    "169.254.169.254",       # AWS / GCP / Azure / 阿里云共用的链路本地地址
+    "100.100.100.200",       # 阿里云专有的元数据地址
+    "fd00:ec2::254",         # AWS IPv6 元数据
+})
+
+
 def _refuse(base_url: str) -> str | None:
     """发请求之前先挡一道。返回拒绝理由，`None` = 放行。
+
+    **三条规则，按判断顺序**：
+
+      1. **云元数据地址永远拒**，`ALLOW_PRIVATE_ENV` 也打不开（见 `_METADATA_HOSTS`）；
+      2. **内网 / 本机地址**：开关关着就拒，开关开着放行（Ollama、局域网推理机）；
+      3. **公网地址必须 https**：明文发出去，密钥在链路上是原文。
 
     这不是"防住内网"的完整方案（DNS rebinding、302 到内网、以及公网域名解析到
     私网地址都挡不住）。它挡的是**成本最低的那一步**：在页面上填一个内网地址，
     然后让服务端带着已存的密钥去请求它。把这一步的成本从"零"抬到"要先能改配置"，
-    剩下的交给鉴权（`docker/nginx.conf` 那一层与后续的账号系统）。
+    剩下的交给鉴权（`docker/nginx.conf` 那一层与 `auth/`）与密钥绑定
+    （`store.resolve()` 里那条 host 判定）。
 
     也顺手挡了非 http(s) 协议：`file:///etc/passwd` 拼上 `/chat/completions` 之后
     行为完全取决于 httpx 的版本，不该由它决定。
@@ -96,24 +121,37 @@ def _refuse(base_url: str) -> str | None:
         return "地址必须以 http:// 或 https:// 开头。"
     if not host:
         return "地址里没有主机名。"
-    if _allow_private():
-        return None
-    if host in {"localhost", "::1"} or host.endswith(".local"):
-        return (f"不允许把模型地址指向本机（{host}）。"
-                f"确实要连本机模型的话，在后端环境变量里设 {ALLOW_PRIVATE_ENV}=1。")
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        # 是域名，不是 IP 字面量。解析结果不在这里看（见 docstring）。
-        return None
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-        return (f"不允许把模型地址指向内网 / 保留地址（{host}）。"
-                f"确实要连内网模型的话，在后端环境变量里设 {ALLOW_PRIVATE_ENV}=1。")
-    if ip.is_unspecified or ip.is_multicast:
-        # `0.0.0.0` / `::` 在多数系统上连的是本机，`is_private` 并不覆盖它们——
-        # 这一条是上面那组的补洞，不是多余的谨慎。
-        return (f"不允许把模型地址指向 {host}。"
-                f"确实要连本机模型的话，在后端环境变量里设 {ALLOW_PRIVATE_ENV}=1。")
+
+    # --- 规则 1：元数据地址，开关也不放行 ---------------------------------
+    if host in _METADATA_HOSTS:
+        return (f"不允许把模型地址指向云平台的元数据服务（{host}）。"
+                f"那里没有模型，只有临时凭证。")
+
+    private = host in {"localhost", "::1"} or host.endswith(".local")
+    if not private:
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            # 是域名，不是 IP 字面量。解析结果不在这里看（见 docstring）。
+            ip = None
+        if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local
+                               or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
+            # `0.0.0.0` / `::` 在多数系统上连的是本机，`is_private` 并不覆盖它们；
+            # `is_unspecified` / `is_multicast` 是这条的补洞，不是多余的谨慎。
+            private = True
+
+    # --- 规则 2：内网 / 本机，开关决定 -------------------------------------
+    if private:
+        if _allow_private():
+            return None
+        where = "本机" if host in {"localhost", "::1"} or host.endswith(".local") else "内网 / 保留地址"
+        return (f"不允许把模型地址指向{where}（{host}）。"
+                f"确实要连本机或内网模型的话，在后端环境变量里设 {ALLOW_PRIVATE_ENV}=1。")
+
+    # --- 规则 3：公网必须 https -------------------------------------------
+    if parts.scheme != "https":
+        return ("公网地址必须用 https://。http:// 会把密钥明文发出去，"
+                "中间任何一跳都能读到它。")
     return None
 
 

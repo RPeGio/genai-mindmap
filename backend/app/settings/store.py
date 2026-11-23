@@ -37,6 +37,7 @@ import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from app.core.errors import AppError
 
@@ -64,6 +65,11 @@ SOURCE_SAVED = "saved"
 SOURCE_ENV = "env"
 SOURCE_UNSET = "unset"
 SOURCE_FALLBACK = "fallback"
+#: 库里有密钥，但它绑定的那台地址已经不是当前生效的地址了。**这时不交出密钥**。
+#:
+#: 它不是"没配"：面板要能说清"你换过地址，密钥需要重新填一次"，而 `unset` 那句话
+#: （去配一个）会让用户以为密钥丢了。见 `resolve()` 里那段判定。
+SOURCE_UNBOUND = "unbound"
 
 #: 长度上限。base_url / model 各 200，密钥 500：它们进 SQLite、进日志、进
 #: 界面输入框，超长的值只会在排查时变成噪音（也顺手挡住"把整份证书贴进来"）。
@@ -84,12 +90,13 @@ SETTINGS_LOCK_TIMEOUT = 2.0
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
-    id         INTEGER PRIMARY KEY CHECK (id = 1),
-    base_url   TEXT NOT NULL DEFAULT '',
-    api_key    TEXT NOT NULL DEFAULT '',
-    model      TEXT NOT NULL DEFAULT '',
-    deep_model TEXT NOT NULL DEFAULT '',
-    updated_at TEXT
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    base_url     TEXT NOT NULL DEFAULT '',
+    api_key      TEXT NOT NULL DEFAULT '',
+    model        TEXT NOT NULL DEFAULT '',
+    deep_model   TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT,
+    api_key_host TEXT NOT NULL DEFAULT ''
 )"""
 
 #: 降级只告警一次。库坏了（文件被删、权限变了、盘满）时每一次模型调用都会走到
@@ -144,7 +151,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_CREATE)
     from app.mindmaps.repository import _ensure_columns
 
-    _ensure_columns(conn, TABLE, {"deep_model": "TEXT", "updated_at": "TEXT"})
+    _ensure_columns(conn, TABLE, {
+        "deep_model": "TEXT",
+        "updated_at": "TEXT",
+        # 密钥绑定在哪台主机上。老库补这一列时全部是空串 = "没绑定过"，
+        # 那种行按"绑定校验不生效"处理（见 `resolve()`），不会在升级后
+        # 突然把所有已存配置打成未配置。
+        "api_key_host": "TEXT NOT NULL DEFAULT ''",
+    })
 
 
 @dataclass(frozen=True)
@@ -156,6 +170,9 @@ class Ready:
     model: str = ""
     deep_model: str = ""
     updated_at: str | None = None
+    #: 这把密钥当初是在哪台主机上填进去的。空串 = 没有记录（老行，或从没换过地址）。
+    #: 它是"密钥不出门"那条防线的锚点：地址一变，锚点对不上就不交密钥。
+    api_key_host: str = ""
 
 
 @dataclass(frozen=True)
@@ -202,6 +219,24 @@ def _norm_text(text: str | None) -> str:
     return (text or "").strip()
 
 
+def _host_of(base_url: str) -> str:
+    """端点里的主机名（小写）。空串 = 地址为空或解析不出来。
+
+    **只取主机名，不取端口、不取路径**。绑定要回答的问题是"这把密钥属于哪一台
+    主机"，不是"属于哪个 URL"：同一台机器上 `/v1` 换成 `/v2`、Ollama 从 11434
+    挪到 11435，密钥都还是同一把，为这些变动逼人重填只会训练出"随手再粘一次"的
+    习惯——而那正是这道防线要避免的输入。反过来，换主机就意味着换了一个"会收到
+    这把密钥的对方"，那才是要重新确认的事。
+
+    解析失败（端口不是数字之类）返回空串：那种地址连 `_check_base_url` 都过不了，
+    这里不必再抛一次。
+    """
+    try:
+        return (urlsplit(_norm_base(base_url)).hostname or "").strip().lower()
+    except ValueError:
+        return ""
+
+
 def _cache_key() -> str:
     """缓存键：库路径 + 写入计数。
 
@@ -233,7 +268,7 @@ def saved() -> Ready:
     try:
         with closing(_connect()) as conn:
             row = conn.execute(
-                f"SELECT base_url, api_key, model, deep_model, updated_at "
+                f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host "
                 f"FROM {TABLE} WHERE id = ?", (ROW_ID,)).fetchone()
     except sqlite3.Error as exc:
         if not _DEGRADED_WARNED:
@@ -248,9 +283,21 @@ def saved() -> Ready:
         model=row["model"] or "",
         deep_model=row["deep_model"] or "",
         updated_at=row["updated_at"],
+        api_key_host=_row_host(row),
     )
     _CACHE[key] = (time.monotonic(), ready)
     return ready
+
+
+def _row_host(row: sqlite3.Row) -> str:
+    """兼容"还没补上 `api_key_host` 列"的库。
+
+    `_ensure_columns` 会让新库与新连接都带上这一列，但降级路径（`saved()` 读失败
+    返回 `Ready()`）与"读到一半被别的进程改成老结构"这类边角不值得一次 500：
+    缺列就当"没有绑定记录"，走的是与老行相同的"不校验"分支。用 `row.keys()`
+    判而不是 try/except，是为了让 `IndexError` 真的冒出来——那是真 bug。
+    """
+    return (row["api_key_host"] or "") if "api_key_host" in row.keys() else ""
 
 
 def _read_strict(*, timeout: float | None = None) -> Ready | None:
@@ -269,7 +316,7 @@ def _read_strict(*, timeout: float | None = None) -> Ready | None:
     """
     with closing(_connect(timeout=timeout)) as conn:
         row = conn.execute(
-            f"SELECT base_url, api_key, model, deep_model, updated_at "
+            f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host "
             f"FROM {TABLE} WHERE id = ?", (ROW_ID,)).fetchone()
     if row is None:
         return None
@@ -279,6 +326,7 @@ def _read_strict(*, timeout: float | None = None) -> Ready | None:
         model=row["model"] or "",
         deep_model=row["deep_model"] or "",
         updated_at=row["updated_at"],
+        api_key_host=_row_host(row),
     )
 
 
@@ -305,6 +353,28 @@ def _pick(stored: str, env_name: str, *, normalize) -> tuple[str, str]:
     return "", SOURCE_UNSET
 
 
+def _binding_of(stored: Ready, api_key_source: str) -> str:
+    """这把密钥**被谁验证过**：能交出密钥的主机名。空串 = 没有锚点（见 `resolve()`）。
+
+    两个来源，对应密钥的两个来处：
+
+      - 面板里存的密钥 → `api_key_host` 列。老行（这一列还没有时写的）兜底用
+        **那一行自己的 `base_url`**：同一行、同一次写入，地址与密钥本来就是一对。
+        这个兜底只在读取时算，不写库——写库的时机是 `save()`，而 `save()` 在
+        "地址变了但密钥没重填"时会把这个旧锚点**如实写下来**，于是敏感的那一步
+        （换地址）立刻变成"锚点对不上"。
+      - 环境变量里的密钥 → 同一组环境变量里那个 `MINDMAP_LLM_BASE_URL` 的主机名。
+        部署方把两者写在一起，那一次写入就是它们的绑定动作。**只给了密钥没给地址**
+        时无从校验（返回空串），这种情况下"谁配的地址谁说了算"，而那种部署本来
+        就把密钥放在一台谁能改地址谁就能读环境变量的机器上。
+    """
+    if api_key_source == SOURCE_SAVED:
+        return _norm_text(stored.api_key_host).lower() or _host_of(stored.base_url)
+    if api_key_source == SOURCE_ENV:
+        return _host_of(os.getenv(BASE_URL_ENV, ""))
+    return ""
+
+
 def resolve() -> Resolved:
     """生效的模型配置。**全仓唯一一处定义"库 > 环境变量"的地方**。
 
@@ -312,6 +382,16 @@ def resolve() -> Resolved:
     `ingestion.vision_pdf._config()`（视觉提取）、`settings.router`（面板与测试连接）。
     三处都从这里取，口径才不会分叉——AGENTS.md 那条"改一个能力的入口，要检查所有
     会走到它的路径"在这里的落法就是：**别的出口不许自己 `os.getenv` 这三个名字**。
+
+    **密钥与地址是绑定的**（P0-1 的第二层）：这一函数是明文密钥的唯一出口，
+    所以"这个地址配得上用这把钥匙吗"必须也在这里回答。地址的主机名与密钥的锚点
+    不一致时，密钥**不交出去**，来源标记成 `unbound`——界面据此说"你换过地址，
+    密钥需要重新填一次"，而不是悄悄把旧密钥发到新地址。
+
+    为什么这才是那条攻击的真正止损点：`PUT /settings/model` 改地址本身不需要密钥，
+    `POST /settings/model/test` 会带着**已存的**密钥去请求。绑定的判据不放在
+    `probe()` 里，是因为发送点不止一个——生成、视觉提取、外部检索全都从这里取
+    密钥，把判据放在出口上，所有路径一起受保护（放进入口就得记住每一个入口）。
     """
     stored = saved()
     base_url, base_url_source = _pick(stored.base_url, BASE_URL_ENV, normalize=_norm_base)
@@ -319,6 +399,16 @@ def resolve() -> Resolved:
     model, model_source = _pick(stored.model, MODEL_ENV, normalize=_norm_text)
     deep_model, deep_model_source = _pick(
         stored.deep_model, DEEP_MODEL_ENV, normalize=_norm_text)
+    # 只在这个地址**真的存在**时校验：没有地址就无从"发错地方"，而那时
+    # `configured` 已经是 False，界面上说的是另一个问题（去填地址）。
+    # 锚点为空串 = 无从判断（环境里只给了密钥、没给地址），那时不拦——
+    # 拦住它只会让这种部署升级后直接不可用，而它本来就把密钥交给了一台
+    # "谁能改配置谁就能读环境变量"的机器。
+    host = _host_of(base_url)
+    if api_key and host:
+        bound = _binding_of(stored, api_key_source)
+        if bound and bound != host:
+            api_key, api_key_source = "", SOURCE_UNBOUND
     return Resolved(
         base_url=base_url,
         api_key=api_key,
@@ -496,22 +586,50 @@ def save(
     next_deep = (current.deep_model if deep_model is None
                  else _check_text(deep_model, label="深度思考模型名", limit=MAX_MODEL_CHARS))
 
-    changed = (next_base, next_key, next_model, next_deep) != (
-        current.base_url, current.api_key, current.model, current.deep_model)
+    # 密钥的锚点。三种情形，对应三件不同的事，与上面 `next_key` 那三段一一对应：
+    #
+    #   - 提交了新密钥 → 锚点就是**这次一起生效的那个地址**。用户粘贴密钥的那一刻
+    #     已经认可了"这把钥匙给这台机器"。
+    #   - 没提交新密钥 → 锚点**原样保留**。老行没有锚点时用旧地址算出来再写下来
+    #     （`_binding_of` 的兜底），刻意落库而不是每次读时算：地址一变，落库的旧锚点
+    #     就与新地址对不上，密钥自动不再交出。若把兜底留在读侧算，它用的会是
+    #     **已经改过的新地址**，锚点跟着地址一起漂，绑定等于不存在。
+    #   - 清空密钥 → 锚点一起清掉。留着它会让将来新填的密钥"继承"一个它没被验证过
+    #     的地址。
+    #
+    # 判据是"**这次请求提交了密钥**"，不是"提交的密钥与库里那把不同"：`unbound` 的
+    # 恢复动作就是"重新粘贴一次"，而用户粘回来的极可能就是同一把（他没换过供应商，
+    # 只是换了地址）。拿 `next_key != current.api_key` 当判据时，这种最正常的恢复
+    # 姿势会静默失败——界面提示"重新粘贴一次即可"，粘完仍是 `unbound`，而那时
+    # 用户唯一能想到的解释是"这个功能坏了"。提交了密钥就是一次明确的"我认可这个
+    # 地址"，与它是否等于旧值无关。攻击者这边不受影响：他改地址只能不带密钥，
+    # 带密钥得先有密钥，而打码值那一道已经在上面挡掉了。
+    old_host = _norm_text(current.api_key_host).lower() or _host_of(current.base_url)
+    if clear_api_key:
+        next_host = ""
+    elif (api_key or "").strip():
+        next_host = _host_of(next_base) or _host_of(os.getenv(BASE_URL_ENV, ""))
+    else:
+        next_host = old_host
+
+    changed = (next_base, next_key, next_model, next_deep, next_host) != (
+        current.base_url, current.api_key, current.model, current.deep_model,
+        _norm_text(current.api_key_host).lower())
     if changed:
         try:
             with closing(_connect(timeout=SETTINGS_LOCK_TIMEOUT)) as conn, conn:
                 conn.execute(
                     f"""INSERT INTO {TABLE}
-                            (id, base_url, api_key, model, deep_model, updated_at)
-                        VALUES (?, ?, ?, ?, ?, {_NOW})
+                            (id, base_url, api_key, model, deep_model, updated_at, api_key_host)
+                        VALUES (?, ?, ?, ?, ?, {_NOW}, ?)
                         ON CONFLICT(id) DO UPDATE SET
-                            base_url   = excluded.base_url,
-                            api_key    = excluded.api_key,
-                            model      = excluded.model,
-                            deep_model = excluded.deep_model,
-                            updated_at = excluded.updated_at""",
-                    (ROW_ID, next_base, next_key, next_model, next_deep),
+                            base_url     = excluded.base_url,
+                            api_key      = excluded.api_key,
+                            model        = excluded.model,
+                            deep_model   = excluded.deep_model,
+                            updated_at   = excluded.updated_at,
+                            api_key_host = excluded.api_key_host""",
+                    (ROW_ID, next_base, next_key, next_model, next_deep, next_host),
                 )
         except sqlite3.Error as exc:
             # 与 `_read_strict_for_save` 同一条规矩：写不进去也要给出能读的 code。

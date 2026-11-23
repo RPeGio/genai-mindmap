@@ -192,6 +192,16 @@ async def test_model_settings(
     base_url = (overrides.base_url or "").strip().rstrip("/") or resolved.base_url
     api_key = (overrides.api_key or "").strip() or resolved.api_key
     model = (overrides.model or "").strip() or resolved.model
+    if not api_key and resolved.api_key_source == store.SOURCE_UNBOUND:
+        # 库里有密钥，但它是给**另一个地址**存下的（`store._binding_of` 那条判定
+        # 把生效值清空了）。这里必须与"三项没填齐"分开说：那句话会让人以为密钥
+        # 丢了，于是去供应商后台重开一把——而库里那把一直是好的，只是不能发给新
+        # 地址。也不该默默用新地址加旧密钥去试：那正是这套绑定要禁止的事。
+        raise store.SettingsError(
+            "settings_key_unbound",
+            "地址换过了，而库里那把密钥是为旧地址保存的。确认新地址可信之后，"
+            "重新粘贴一次密钥再测试连接。",
+            status=400)
     if not base_url or not api_key or not model:
         _raise_incomplete()
     if api_key in (store.mask_api_key(resolved.api_key), store.mask_api_key(store.saved().api_key)):

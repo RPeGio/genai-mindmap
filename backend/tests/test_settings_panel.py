@@ -313,8 +313,30 @@ def test_saved_value_wins_over_env(monkeypatch):
     assert (resolved.base_url, resolved.base_url_source) == (
         "https://panel.example/v1", store.SOURCE_SAVED)
     assert (resolved.model, resolved.model_source) == ("panel-model", store.SOURCE_SAVED)
-    # 逐字段回落：只改了端点和模型名，密钥仍是环境变量里那把。
-    assert (resolved.api_key, resolved.api_key_source) == ("env-key-0000", store.SOURCE_ENV)
+    # 逐字段回落 **有例外**：环境变量那把密钥是连同 `https://env.example/v1` 一起
+    # 给的，等于"只允许发给 env.example"。现在生效地址已经换成 panel.example，
+    # 那把密钥不能跟着过去——它从未属于这台主机。判据在 `store._binding_of`。
+    assert (resolved.api_key, resolved.api_key_source) == ("", store.SOURCE_UNBOUND)
+
+
+def test_a_saved_key_travels_only_with_the_address_it_was_saved_for(monkeypatch):
+    """两个地址都是环境变量给的：密钥锚在 env 那个地址上，不会被带到第三个地址。
+
+    这条补的是 `test_saved_value_wins_over_env` 的另一半——那里只改了端点、没给
+    密钥；这里**先存一把密钥**（此时绑定到 A），再从面板把地址改成 B，密钥就不能
+    跟着走，`api_key_source` 会说 `unbound` 而不是 `saved`。
+    """
+    monkeypatch.setenv(store.BASE_URL_ENV, "https://env.example/v1")
+    client.put("/api/settings/model",
+               json=_body(base_url="https://a.example/v1", api_key=SECRET))
+    resolved = store.resolve()
+    assert (resolved.api_key, resolved.api_key_source) == (SECRET, store.SOURCE_SAVED)
+
+    client.put("/api/settings/model", json=_body(base_url="https://b.example/v1"))
+    resolved = store.resolve()
+    assert (resolved.base_url, resolved.base_url_source) == (
+        "https://b.example/v1", store.SOURCE_SAVED)
+    assert (resolved.api_key, resolved.api_key_source) == ("", store.SOURCE_UNBOUND)
 
 
 def test_partial_save_keeps_the_other_fields(monkeypatch):
@@ -899,16 +921,18 @@ def test_saved_row_is_readable_as_json_shape():
         "http://10.0.0.5/v1",
         "http://172.16.3.4/v1",
         "http://192.168.1.1/v1",
-        "http://169.254.169.254/latest/meta-data",
         "http://0.0.0.0:8000/v1",
         "http://model.local/v1",
     ],
 )
 def test_private_and_loopback_addresses_are_refused(url):
-    """本机 / 内网 / 云元数据 / 链路本地 / `0.0.0.0` 全部拒。
+    """本机 / 内网 / 链路本地 / `0.0.0.0` 全拒，但**开关能放开**。
 
     `0.0.0.0` 单列一条：它在多数系统上连的是本机，而 `ip.is_private` **不覆盖**
     它——只写 `is_private` 的实现会把它放过去。
+
+    `169.254.169.254`（云元数据）**不在这张表里**：它与内网地址分开处理，开关也
+    打不开，见下一条。
     """
     reason = probe_module._refuse(url)
     assert reason, f"{url} 被放行了，密钥可以被送到这里"
@@ -919,15 +943,54 @@ def test_private_and_loopback_addresses_are_refused(url):
 @pytest.mark.parametrize(
     "url",
     [
+        "http://169.254.169.254/latest/meta-data",
+        "https://169.254.169.254/latest/meta-data",
+        "http://metadata.google.internal/v1",
+        "http://100.100.100.200/latest/meta-data",
+    ],
+)
+def test_metadata_endpoints_are_refused_even_with_the_switch_on(url, monkeypatch):
+    """云元数据地址**永远**拒，开关也打不开。
+
+    与内网地址分开的理由：内网模型是真实需求（Ollama、自建网关），所以给它留了
+    开关；元数据服务上没有任何模型，只有临时凭证。用户没有任何理由需要连它，
+    所以"允许连我自己的模型"不该顺手允许"连任何东西"。
+
+    断言里**不**出现开关名，是与上一条的区别——这条路的正确答案不是"打开开关"。
+    """
+    monkeypatch.setenv(probe_module.ALLOW_PRIVATE_ENV, "1")
+    reason = probe_module._refuse(url)
+    assert reason, f"{url} 被放行了，那台机器上有的是凭证不是模型"
+    assert probe_module.ALLOW_PRIVATE_ENV not in reason
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "https://api.deepseek.com/v1",
         "https://api.openai.com/v1",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "http://1.2.3.4/v1",  # 公网 IP 字面量：允许（有人的自建端点在公网 IP 上）
+        "https://1.2.3.4/v1",  # 公网 IP 字面量：允许（有人的自建端点在公网 IP 上）
     ],
 )
 def test_public_addresses_are_allowed(url):
     """公网地址一律放行——这个校验不是白名单，别把它做成"只许几家厂商"。"""
     assert probe_module._refuse(url) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://api.example.com/v1", "http://1.2.3.4/v1"],
+)
+def test_public_addresses_must_use_https(url):
+    """公网 `http://` 拒：密钥写在 `Authorization` 头里，明文过中间每一跳。
+
+    私网不查这一条（规则 ② 已经提前返回）：本机 Ollama 常开在
+    `http://127.0.0.1:11434`，要求它上 https 等于让人没法用。
+    """
+    reason = probe_module._refuse(url)
+    assert reason, f"{url} 被放行了，密钥会明文过网"
+    assert "https" in reason.lower()
 
 
 @pytest.mark.parametrize(
@@ -986,4 +1049,133 @@ def test_probe_itself_refuses_without_opening_a_connection(monkeypatch):
     assert result.latency_ms == 0
     assert SECRET not in result.message
     assert sent == [], "请求发出去了，密钥已经出门"
+
+
+# ---------------------------------------------------------------- 密钥只认那台主机
+#
+# P0-1 的第二层：地址与密钥**绑定**。第一层（`probe._refuse`）挡住"填个地址就把
+# 已存密钥送出去"这条最便宜的路；这一层挡的是"地址已经改好了、密钥还留在库里"
+# 这种更安静的形状——它不经过测试连接，是每一次正常生成都会走的路。
+
+
+def test_the_panel_says_unbound_instead_of_unset(monkeypatch):
+    """界面拿到的 `api_key_source` 必须是 `unbound`，不能是 `unset`。
+
+    两者的话术完全不同：`unset` = "去配一把密钥"，`unbound` = "你换过地址，把原来
+    那把再填一次"。混成一句会让用户去供应商后台重开密钥——而库里那把一直是好的。
+    """
+    client.put("/api/settings/model",
+               json=_body(base_url="https://a.example/v1", api_key=SECRET, model="m"))
+    client.put("/api/settings/model", json=_body(base_url="https://b.example/v1"))
+    body = client.get("/api/settings/model").json()
+    assert body["api_key_source"] == store.SOURCE_UNBOUND
+    assert body["api_key_masked"] == ""
+    assert body["api_key_set"] is False
+    # 还有一个更硬的后果：`configured` 必须跟着变 False。否则界面显示"配好了"
+    # 而生成一路 401，坏在"看起来没问题"上。
+    assert body["configured"] is False
+
+
+def test_retyping_the_key_binds_it_to_the_new_address(monkeypatch):
+    """重新贴一次密钥，绑定就跟着新地址走——这是唯一的恢复方式。"""
+    client.put("/api/settings/model",
+               json=_body(base_url="https://a.example/v1", api_key=SECRET, model="m"))
+    client.put("/api/settings/model", json=_body(base_url="https://b.example/v1"))
+    client.put("/api/settings/model", json=_body(api_key=SECRET + "x"))
+    resolved = store.resolve()
+    assert resolved.api_key == SECRET + "x"
+    assert resolved.api_key_source == store.SOURCE_SAVED
+    # 回头改地址，又该失效：绑的是 b，不是"永远有效"。
+    client.put("/api/settings/model", json=_body(base_url="https://c.example/v1"))
+    assert store.resolve().api_key_source == store.SOURCE_UNBOUND
+
+
+def test_changing_only_the_path_keeps_the_key(monkeypatch):
+    """同主机换路径不算换对方：`/v1` → `/v2` 是同一台机器，密钥还是同一把。
+
+    绑定只认主机名（`store._host_of`）。把端口/路径也算进去，会为一次无关紧要的
+    改动逼人重填密钥，而那恰好训练出"看到提示就再粘一次"的习惯——这条防线最怕
+    的输入。
+    """
+    client.put("/api/settings/model",
+               json=_body(base_url="https://api.example.com/v1", api_key=SECRET, model="m"))
+    client.put("/api/settings/model", json=_body(base_url="https://api.example.com/v2"))
+    resolved = store.resolve()
+    assert resolved.api_key == SECRET
+    assert resolved.api_key_source == store.SOURCE_SAVED
+
+
+def test_an_old_row_without_a_host_column_still_works(monkeypatch):
+    """升级前写下的行（`api_key_host` 为空）按老地址兜底，不误伤。
+
+    `_binding_of` 用**那一行自己的 base_url** 兜底：同一行的地址与密钥本来就是
+    同一次写入的一对。没有这条兜底，升级之后所有已存配置会在第一次读时被判成
+    `unbound`，所有人一起"密钥丢了"。
+    """
+    resolved, _ = store.save(base_url="https://old.example/v1", api_key=SECRET,
+                             model="m", deep_model=None, clear_api_key=False)
+    with closing(repository.connect()) as conn:
+        conn.execute(f"UPDATE {store.TABLE} SET api_key_host = ''")
+        conn.commit()
+    store._invalidate()
+    resolved = store.resolve()
+    assert (resolved.api_key, resolved.api_key_source) == (SECRET, store.SOURCE_SAVED)
+
+
+def test_clearing_the_key_clears_the_anchor(monkeypatch):
+    """清密钥时锚点一起清掉。
+
+    留着它，将来新填的密钥会"继承"一个它从未被验证过的地址——那等于给下一次
+    "换个地址 + 用旧密钥"留了一条后门。
+    """
+    client.put("/api/settings/model",
+               json=_body(base_url="https://a.example/v1", api_key=SECRET, model="m"))
+    client.put("/api/settings/model", json=_body(clear_api_key=True))
+    row = store.saved()
+    assert row.api_key == ""
+    assert row.api_key_host == ""
+
+
+def test_the_same_key_retyped_rebinds_to_the_current_address(monkeypatch):
+    """恢复动作里最正常的那一种：**粘回同一把密钥**，绑定跟着新地址走。
+
+    这条补的是 `test_retyping_the_key_binds_it_to_the_new_address` 漏掉的路——那里
+    提交的是 `SECRET + "x"`，值变了。而真实用户换地址时多半没换供应商，粘回来的
+    就是同一把：判据若写成"提交的密钥与库里那把不同"，这种恢复会**静默失败**，
+    界面说"重新粘贴一次即可"、粘完仍是 `unbound`，用户只能认为功能坏了。
+    """
+    client.put("/api/settings/model",
+               json=_body(base_url="https://a.example/v1", api_key=SECRET, model="m"))
+    client.put("/api/settings/model", json=_body(base_url="https://b.example/v1"))
+    assert store.resolve().api_key_source == store.SOURCE_UNBOUND
+
+    # 完全相同的值，只是重新提交了一次。
+    client.put("/api/settings/model", json=_body(api_key=SECRET))
+    resolved = store.resolve()
+    assert (resolved.api_key, resolved.api_key_source) == (SECRET, store.SOURCE_SAVED)
+    assert store.saved().api_key_host == "b.example"
+
+    # 绑定跟着走了：再换主机仍然失效，不是"一旦重贴就永久放行"。
+    client.put("/api/settings/model", json=_body(base_url="https://c.example/v1"))
+    assert store.resolve().api_key_source == store.SOURCE_UNBOUND
+
+
+def test_testing_a_connection_after_the_address_moved_says_what_to_do(monkeypatch):
+    """这时点「测试连接」不能回"三项要先填齐"。
+
+    密钥还在库里，只是不属于新地址。要求重贴是正确答案（`settings_key_unbound`），
+    而"三项要先填齐"会让人以为密钥丢了。更要紧的是**请求一次都不许发**：拿新地址
+    配旧密钥去试，正是这套绑定要禁止的行为。
+    """
+    sent = _use_fake(monkeypatch, response=_FakeResponse(200, {
+        "model": "m", "choices": [{"message": {"content": "p"}}],
+    }))
+    client.put("/api/settings/model",
+               json=_body(base_url="https://a.example/v1", api_key=SECRET, model="m"))
+    client.put("/api/settings/model", json=_body(base_url="https://b.example/v1"))
+    body = client.post("/api/settings/model/test", json=_body())
+    assert body.status_code == 400
+    assert body.json()["code"] == "settings_key_unbound"
+    assert SECRET not in body.text
+    assert sent == [], "旧密钥被发到新地址去了"
 
