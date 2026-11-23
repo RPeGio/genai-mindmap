@@ -60,6 +60,10 @@ export interface paths {
         /**
          * Login
          * @description 登录。账号或密码不对统一 401 `auth_bad_credentials`（理由见 `store.authenticate`）。
+         *
+         *     **限速在哈希之前**：先问 `throttle.retry_after()`，被限就直接 429，连那次
+         *     36 毫秒的 scrypt 都不花。顺序反过来的话，限速本身成了新的放大器——攻击者
+         *     用被拒的请求把服务器算力耗光。
          */
         post: operations["login_api_auth_login_post"];
         delete?: never;
