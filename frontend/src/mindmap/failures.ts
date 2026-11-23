@@ -119,6 +119,26 @@ function explain(input: FailureInput): FailureGuide {
         actions: [retryAction(retryBlocker(input, '配置没改之前，重试还是同一个结果。')), COPY_ACTION],
         retryable: false,
       };
+    case 'free_quota_exhausted':
+      // 第二个"重试一百次也是同一个结果"的失败，而且它比 `model_not_configured`
+      // 更容易被当成网络问题：错误发生在一个正常工作的服务上，只是今天这一格用完了。
+      //
+      // 指引必须给出**两条都能立刻走的路**，而不是只说"等明天"：填自己的密钥是
+      // 当场就能解决的动作，而且正好把这个用户从"蹭公共额度"变成"花自己的钱"，
+      // 那对他和对部署方都更好。顺序上先说"明天会自己恢复"，因为那是零成本的那条。
+      return {
+        title: '今天的免费次数用完了',
+        next:
+          '免费额度每天零点恢复，明天再来就行。想现在继续，'
+          + '打开页面右上角的「模型设置」填自己的密钥——填了就不再受这个限制。',
+        actions: [
+          retryAction(
+            retryBlocker(input, '免费额度今天已经用完了，重试不会多出次数。'),
+          ),
+          COPY_ACTION,
+        ],
+        retryable: false,
+      };
     case 'budget_exhausted':
       return explainBudget(input);
     case 'too_many_failures':

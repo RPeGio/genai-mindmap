@@ -60,11 +60,20 @@ export const SETTING_SOURCE_INSTANCE = 'instance';
  * 看到模型名变成一个不认识的 id 时，得能分辨这是"部署方开了免费档"还是"我配错了"。
  */
 export const SETTING_SOURCE_FREE = 'free';
+/**
+ * 生效密钥是**本站的公共免费密钥**（`MINDMAP_FREE_TIER_API_KEY`），不是任何人的私钥。
+ *
+ * 与 `instance`/`env` 必须分开，理由只有一个：这是唯一一档**有次数上限**的来源。
+ * 用户看到"本站共享配置"会以为可以随便用，看到这一档才该知道"每天几次，用完就没了"。
+ * 合并来源会让"这次要不要扣次数"在界面上无从解释。
+ */
+export const SETTING_SOURCE_PUBLIC = 'public';
 
 /** 来源标签。界面要能分辨"我在面板里设的"与"部署方在环境变量里设的"。 */
 export function settingSourceLabel(source: string): string {
   if (source === SETTING_SOURCE_SAVED) return '我的设置';
   if (source === SETTING_SOURCE_INSTANCE) return '本站共享配置';
+  if (source === SETTING_SOURCE_PUBLIC) return '本站免费额度';
   if (source === SETTING_SOURCE_FREE) return '免费模型';
   if (source === SETTING_SOURCE_ENV) return '环境变量';
   if (source === SETTING_SOURCE_UNBOUND) return '地址换过，待重填';

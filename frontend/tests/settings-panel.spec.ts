@@ -729,10 +729,13 @@ describe('关闭', () => {
 });
 
 describe('store 与纯函数', () => {
-  it('来源标签六档：saved / instance / free / env / unset / unbound', () => {
+  it('来源标签七档：saved / instance / public / free / env / unset / unbound', () => {
     expect(settingSourceLabel('saved')).toBe('我的设置');
     // 借用共享配置是独立一档：清掉自己那行会回到它，用户得知道这件事。
     expect(settingSourceLabel('instance')).toBe('本站共享配置');
+    // 公共免费密钥也只能自己一档：它是唯一一档"有次数上限"的来源，混进
+    // `instance` 会让用户以为可以随便用。
+    expect(settingSourceLabel('public')).toBe('本站免费额度');
     // 免费档也单独一档：模型名会变成一个不认识的 id，得能分辨这是部署方开的功能
     // 还是自己配错了。
     expect(settingSourceLabel('free')).toBe('免费模型');

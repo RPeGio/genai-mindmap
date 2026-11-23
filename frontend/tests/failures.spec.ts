@@ -116,6 +116,29 @@ describe('失败分类', () => {
     expect(cut.retryable).toBe(true);
   });
 
+  it('免费额度用完时按死重试，并给出"明天恢复"与"填自己的密钥"两条路', () => {
+    const guide = guideForFailure({
+      code: 'free_quota_exhausted',
+      message: '今天的免费生成次数用完了。',
+      canRetry: true,
+      running: false,
+    });
+
+    // 与 `model_not_configured` 一样是"重试一百次同一个结果"——但成因完全不同，
+    // 所以标题与下一步都必须另写一份：一个是没配，一个是今天用完了。
+    expect(guide.retryable).toBe(false);
+    expect(guide.title).toContain('免费次数');
+    expect(guide.title).not.toContain('还没配置');
+    // 两条路都要给：等明天是零成本的，填密钥是当场能解决的。
+    expect(guide.next).toContain('零点');
+    expect(guide.next).toContain('模型设置');
+    expect(guide.next).toContain('密钥');
+    const retry = guide.actions.find(item => item.kind === 'retry');
+    expect(retry?.disabledReason).toContain('用完');
+    // 复制仍然在：这张卡片出现时用户往往要去问维护的人。
+    expect(guide.actions.some(item => item.kind === 'copy')).toBe(true);
+  });
+
   it('未知错误码走兜底，不猜一个可能错的解释', () => {
     const guide = guideForFailure({ code: 'something_new', message: '后端新加的错误', canRetry: true });
 
@@ -127,6 +150,7 @@ describe('失败分类', () => {
   it('每个分支都给得出一个可点的按钮，不会出现"什么也做不了"的卡片', () => {
     const codes = [
       'model_not_configured',
+      'free_quota_exhausted',
       'budget_exhausted',
       'too_many_failures',
       'unexpected_finish',
