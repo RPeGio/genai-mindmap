@@ -58,6 +58,10 @@ CREDENTIALS = (
     # 宿主机上配了 LLM key 时，Search 的用例会真的打出去。
     "MINDMAP_DEEPSEEK_TOOLS_API_KEY",
     "MINDMAP_DEEPSEEK_TOOLS_BASE_URL",
+    # 公共免费密钥（`generation/quota.PUBLIC_KEY_ENV`）。**必须清**：它的存在本身就是
+    # "免费额度开了"这个开关（`quota.enabled()` 就是 `bool(public_key())`），宿主机上
+    # 配过它会让几百条生成用例的 `api_key_source` 一起变成 `public`。
+    "MINDMAP_FREE_TIER_API_KEY",
 )
 
 # 其余会改变行为的环境变量：开关、本地模型目录、外部程序路径。
@@ -93,6 +97,9 @@ BEHAVIOUR = (
     # 是空表 = 拼出来是空串 = 既有断言逐字节不变"正是接线时要验的那条前提。
     # 置 0 会让所有生成用例都不经过"读了画像表但没读到"那条路。
     "MINDMAP_STYLE_PROMPT",
+    # 每人每天的公共免费次数（`generation/quota.LIMIT_ENV`）。清空 = 用默认的 3。
+    # 不清的话宿主机上为了压测把它调成 100，会让断言"第三次之后 429"整批变绿。
+    "MINDMAP_FREE_QUOTA_LIMIT",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",

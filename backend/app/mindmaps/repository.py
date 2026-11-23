@@ -290,6 +290,15 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     from app.auth.throttle import ensure_schema as ensure_throttle_schema
 
     ensure_throttle_schema(conn)
+    # 公共免费额度的记账（`app/generation/quota.py`）。它的读写点在**每一次生成
+    # 开流之前**（`agent/router.py::stream_run`），那里是"要么放行要么 429"的判断，
+    # 同样不该多一条"发现表不存在 → 建表"的分支。
+    #
+    # import 放在函数内：`generation.quota` 顶层要 `from app.mindmaps import
+    # repository` 拿 `connect`，模块顶层反向 import 回去就成环。
+    from app.generation.quota import ensure_schema as ensure_quota_schema
+
+    ensure_quota_schema(conn)
     return conn
 
 
