@@ -2,7 +2,12 @@
 import { computed, nextTick, onMounted, ref } from 'vue';
 
 import type { SaveModelSettingsRequest, TestModelSettingsRequest } from '../api/types';
-import { apiKeyPlaceholder, settingSourceLabel, useSettingsStore } from '../stores/settings';
+import {
+  SETTING_SOURCE_UNBOUND,
+  apiKeyPlaceholder,
+  settingSourceLabel,
+  useSettingsStore,
+} from '../stores/settings';
 
 /**
  * 模型设置面板：在页面里配好模型服务，**不碰环境变量、不重启**。
@@ -46,6 +51,14 @@ const baseUrlInput = ref<HTMLInputElement | null>(null);
 const view = computed(() => settingsStore.settings);
 
 const canClearKey = computed(() => view.value?.api_key_set === true);
+
+/**
+ * 密钥还在库里，但它是给**旧地址**存的（后端判据在 `store._binding_of`）。
+ *
+ * 这时后端不交出这把密钥，`api_key_set` 是 `false`、占位符里也没有打码值。界面上
+ * 如果只说"未配置"，用户会去供应商后台重开密钥。要在这里说清"重新粘一次就行"。
+ */
+const keyUnbound = computed(() => view.value?.api_key_source === SETTING_SOURCE_UNBOUND);
 
 /** 有哪几个字段真被改过。空对象 = 什么都不用发。 */
 const dirty = computed(() => {
@@ -271,6 +284,19 @@ function trapFocus(event: KeyboardEvent): void {
               :disabled="settingsStore.saving"
               @click="clearKey"
             >清除已保存的密钥</button>
+          </span>
+          <!--
+            密钥与地址是绑定的：库里那把只为**存它时的那个地址**保存。地址一改，
+            那把密钥就不再交出——这时的正确动作是重新粘一次，而不是去供应商后台
+            重开一把（库里那把一直是好的）。这句话必须说在这里，因为界面上别的
+            地方只会显示"未配置"，那读起来像密钥丢了。
+          -->
+          <span
+            v-if="keyUnbound"
+            data-test="settings-key-unbound"
+            class="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-relaxed text-amber-800"
+          >
+            你换过服务地址，而库里那把密钥是为旧地址保存的。确认新地址可信之后，把密钥重新粘贴一次即可。
           </span>
         </label>
 

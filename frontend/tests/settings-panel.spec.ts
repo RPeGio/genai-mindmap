@@ -285,6 +285,39 @@ describe('打开面板：读的是"当前生效值"，密钥只有打码值', ()
     expect(wrapper.get(PANEL).text()).toContain('三项填齐后');
   });
 
+  it('地址换过之后，密钥那一栏要自己说清「重贴一次」，不能只显示「未设置」', async () => {
+    // 后端此刻的状态：库里那把密钥仍在，但它绑定的是旧主机，所以 `store.resolve()`
+    // 已经把生效值清空（`api_key_set: false`、`api_key_masked: ''`）。界面上如果
+    // 只说"未设置"，用户会去供应商后台重开一把——而库里那把一直是好的。
+    stubBackend({
+      current: {
+        base_url: 'https://new.example.com/v1',
+        api_key_masked: '',
+        api_key_source: 'unbound',
+        api_key_set: false,
+        configured: false,
+      },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    const hint = wrapper.get('[data-test="settings-key-unbound"]').text();
+    expect(hint).toContain('重新粘贴');
+    expect(hint).toContain('旧地址');
+    // 来源标签也得说这一档，而不是退回"未设置"。
+    expect(wrapper.get(PANEL).text()).toContain('地址换过，待重填');
+    // 没有可清的密钥，所以"清除"按钮不该出现。
+    expect(has(wrapper, '[data-test="settings-clear-key"]')).toBe(false);
+  });
+
+  it('没换过地址时不该出现那条提示：绝大多数打开都是正常状态', async () => {
+    stubBackend();
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-key-unbound"]')).toBe(false);
+  });
+
   it('地址框下面写明「只支持 OpenAI 兼容格式」：不做 provider 下拉的代价要说出来', async () => {
     stubBackend();
     const wrapper = mountApp();
@@ -617,10 +650,12 @@ describe('关闭', () => {
 });
 
 describe('store 与纯函数', () => {
-  it('来源标签三档：saved / env / unset', () => {
+  it('来源标签四档：saved / env / unset / unbound', () => {
     expect(settingSourceLabel('saved')).toBe('面板设置');
     expect(settingSourceLabel('env')).toBe('环境变量');
     expect(settingSourceLabel('unset')).toBe('未设置');
+    // `unbound` 必须自己一档：它与 `unset` 的下一句完全不同（重贴一次 vs 去配一把）。
+    expect(settingSourceLabel('unbound')).toBe('地址换过，待重填');
     // 后端加了新的来源值时不能炸，退回"未设置"比显示 `undefined` 诚实。
     expect(settingSourceLabel('future')).toBe('未设置');
   });
@@ -629,6 +664,15 @@ describe('store 与纯函数', () => {
     expect(apiKeyPlaceholder(settingsPayload())).toBe(`${MASKED}（留空＝不改）`);
     expect(apiKeyPlaceholder(settingsPayload({ api_key_set: false, api_key_masked: '' }))).toBe('sk-…');
     expect(apiKeyPlaceholder(null)).toBe('sk-…');
+  });
+
+  it('地址换过之后，占位符不能还是打码值——那会让人以为配好了', () => {
+    // 库里那把密钥仍然存在（`mask_api_key` 拿得到），但它属于旧地址。
+    // 只要 placeholder 还在显示 `…1234`，用户就不会去重贴，而生成一路 401。
+    expect(apiKeyPlaceholder(settingsPayload({
+      api_key_source: 'unbound',
+      api_key_set: false,
+    }))).toBe('地址换过了，请重新粘贴密钥');
   });
 
   it('store 的 `isDemoMode` 只认 `demo`，空串不算', async () => {
