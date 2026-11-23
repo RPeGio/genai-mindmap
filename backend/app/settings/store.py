@@ -98,12 +98,27 @@ SOURCE_INSTANCE = "instance"
 #: 它不是"没配"：面板要能说清"你换过地址，密钥需要重新填一次"，而 `unset` 那句话
 #: （去配一个）会让用户以为密钥丢了。见 `resolve()` 里那段判定。
 SOURCE_UNBOUND = "unbound"
+#: 借用**免费档**：自己和部署方那行都没有密钥，但部署方配了 Command Code 的端点，
+#: 而那份 coding plan 里此刻有标 `:free` 的模型。
+#:
+#: 与 `instance` 分开是必须的：`instance` 说的是"部署方付这笔钱"，而这一档
+#: **不花钱**、有每日次数上限、而且模型名不是用户在面板里填的那个——它是运行时
+#: 现问列表选出来的。合并成一个来源会让面板显示一个用户从没填过的模型名，
+#: 而且额度用完之后那句"次数用完了"就无处可挂。
+SOURCE_FREE = "free"
 
 #: 长度上限。base_url / model 各 200，密钥 500：它们进 SQLite、进日志、进
 #: 界面输入框，超长的值只会在排查时变成噪音（也顺手挡住"把整份证书贴进来"）。
 MAX_URL_CHARS = 200
 MAX_MODEL_CHARS = 200
 MAX_KEY_CHARS = 500
+
+#: 走免费档时固定发这个思考档位。理由见 `Resolved.reasoning_effort`：不发它，
+#: 免费模型会把整个 `max_tokens` 烧在 reasoning 上、正文一个字都不写、
+#: `finish_reason` 变成 `length`，而那条路是直接判失败的。
+#:
+#: `"low"` 是实测出来的下限：两个免费模型都拒绝 `"off"`（400）。
+FREE_REASONING_EFFORT = "low"
 
 #: 生成侧与 probe 拼请求时一律用 `base + "/chat/completions"`，所以库里存的必须是
 #: **前缀**。用户粘完整端点时由 `_check_base_url` 剥掉这一段。
@@ -292,6 +307,16 @@ class Resolved:
     api_key_source: str = SOURCE_UNSET
     model_source: str = SOURCE_UNSET
     deep_model_source: str = SOURCE_UNSET
+    #: 走免费档时要一起发出去的思考档位；其余情况是 None（= 不传这个字段，
+    #: 请求体与加这个字段之前逐字节相同）。
+    #:
+    #: 免费模型实测**会把 max_tokens 全部烧在 reasoning 上**：`max_tokens=1400`
+    #: 的一次调用用了 56.9 秒、`completion_tokens=1400` 其中 `reasoning_tokens=1311`、
+    #: 正文是空串、`finish_reason=length`——而 provider 对 length 是直接判失败。
+    #: 发 `reasoning_effort="low"` 之后同一次调用 8.9 秒、正文正常、还调了工具。
+    #:
+    #: 不能发 `"off"`：两个免费模型都明确拒绝（400，只接受 low/medium/high/xhigh/max）。
+    reasoning_effort: str | None = None
 
 
 def _connect(*, timeout: float | None = None) -> sqlite3.Connection:
@@ -545,6 +570,35 @@ def _binding_of(stored: Ready, api_key_source: str) -> str:
     return ""
 
 
+def _free_model(base_url: str) -> str:
+    """当前首选的免费模型名；`MINDMAP_FREE_TIER` 没开或一个都没有时返回空串。
+
+    这层薄封装的唯一作用是**把 import 放在函数里**：`generation.free_models` 要
+    回来读本模块（`free_tier_endpoint()`），模块顶层互相 import 就成环。
+    """
+    from app.generation import free_models
+
+    if not free_models.enabled():
+        return ""
+    return free_models.current(base_url) or ""
+
+
+def free_tier_endpoint() -> tuple[str, str]:
+    """免费档用的那台端点与密钥：**部署方那一份**，不做任何免费档替换。
+
+    给 `generation.free_models._fetch()` 用。它不能用 `resolve()`——那条路上
+    `resolve()` 会反过来调 `free_models`，直接无限递归。
+
+    取值口径就是实例行 → 环境变量（跳过当前用户那一行）：免费模型是"部署方的
+    coding plan 里那些"，与某个用户自己填的供应商无关。用户填了自己的密钥时
+    `resolve()` 根本不会走免费档，所以这里也不需要关心他。
+    """
+    instance = saved(INSTANCE_OWNER)
+    base = _norm_base(instance.base_url) or _norm_base(os.getenv(BASE_URL_ENV, ""))
+    key = _norm_text(instance.api_key) or _norm_text(os.getenv(API_KEY_ENV, ""))
+    return base, key
+
+
 def resolve() -> Resolved:
     """生效的模型配置。**全仓唯一一处定义"库 > 环境变量"的地方**。
 
@@ -598,6 +652,28 @@ def resolve() -> Resolved:
         bound = _binding_of(anchor_row, api_key_source)
         if bound and bound != host:
             api_key, api_key_source = "", SOURCE_UNBOUND
+
+    # 免费档：**自己没有密钥、借的是部署方的**时候，把模型名换成当前免费的那个。
+    #
+    # 判据是 `api_key_source` 落在 `instance` / `env` 上，而不是"没有密钥"：免费模型
+    # 也一样要 key（实测无 key 401 `UNAUTHORIZED`），只是那次调用不收费。所以这一档
+    # 的语义是"用部署方那把 Command Code 的钥匙、但走它不收费的模型"。
+    #
+    # 什么时候不换：
+    #   - `saved`：用户填了自己的密钥，按用户的意思走，免费档与他的钱无关；
+    #   - `unset` / `unbound`：连端点或密钥都没有，免费档也发不出请求，此时该报的
+    #     是"去配模型"，不是"换一个免费模型试试"。
+    #
+    # **免费档是慢的**（实测吞吐约 24.6 tok/s，一张四十节点的图要几分钟），所以
+    # 打开它是一次明确的行为选择：部署方用自己的行填密钥就能退出这一档。
+    reasoning_effort: str | None = None
+    if api_key and api_key_source in (SOURCE_INSTANCE, SOURCE_ENV):
+        free_model = _free_model(base_url)
+        if free_model:
+            model, model_source = free_model, SOURCE_FREE
+            reasoning_effort = FREE_REASONING_EFFORT
+            deep_model, deep_model_source = "", SOURCE_FREE
+
     return Resolved(
         base_url=base_url,
         api_key=api_key,
@@ -607,6 +683,7 @@ def resolve() -> Resolved:
         api_key_source=api_key_source,
         model_source=model_source,
         deep_model_source=deep_model_source,
+        reasoning_effort=reasoning_effort,
     )
 
 

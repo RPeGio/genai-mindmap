@@ -121,7 +121,13 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # 每条命中要多一次 embedding，见 `profile.SWITCH_ENV`），而这里的用例
             # 全部走 `no_real_http`——清空会让"默认开"那一侧的用例真的去 embed。
             # 需要它的用例自己 `setenv(..., "1")` 并替换 `embed_texts`。
-            "MINDMAP_PROFILE_RERANK")
+            "MINDMAP_PROFILE_RERANK",
+            # 免费档（`generation/free_models.ENABLED_ENV`）。**置 0**：它默认关，
+            # 而打开之后 `resolve()` 会把模型名换成 `:free` 那个、并给请求体加
+            # `reasoning_effort`——既有那几百条断言钉的都是"模型名来自配置"，
+            # 在这里清空等于让它们全部走部署方那把钥匙的免费档。
+            # 需要它的用例自己 `setenv(..., "1")` 并替换 `free_models` 的缓存。
+            "MINDMAP_FREE_TIER")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。
