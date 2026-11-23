@@ -707,7 +707,7 @@ def test_saving_while_the_db_cannot_be_read_does_not_wipe_the_row(monkeypatch):
         base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat"))
     original = store._read_strict
 
-    def unreadable(**kwargs):
+    def unreadable(owner, **kwargs):
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(store, "_read_strict", unreadable)
@@ -819,8 +819,8 @@ def test_an_old_database_without_the_table_gets_it(monkeypatch, tmp_path):
     assert store.saved().model == "deepseek-chat"
     # 再连一次仍然是同一行，不是每次 connect 插一行。
     with closing(repository.connect()) as conn:
-        rows = conn.execute(f"SELECT id FROM {store.TABLE}").fetchall()
-    assert [row[0] for row in rows] == [store.ROW_ID]
+        rows = conn.execute(f"SELECT owner FROM {store.TABLE}").fetchall()
+    assert [row[0] for row in rows] == [store.INSTANCE_OWNER]
 
 
 def test_reading_does_not_rebuild_the_table_on_every_call(monkeypatch):
@@ -867,26 +867,39 @@ def test_the_ttl_is_short_enough_to_not_hide_a_change_from_another_worker(monkey
 
     # 模拟"另一个进程"：直接改库，绕过本进程的 save()（因此不会 _invalidate）。
     with closing(repository.connect()) as conn, conn:
-        conn.execute(f"UPDATE {store.TABLE} SET model = 'other-worker-model' WHERE id = 1")
+        conn.execute(
+            f"UPDATE {store.TABLE} SET model = 'other-worker-model' WHERE owner = ?",
+            (store.INSTANCE_OWNER,))
 
     # 缓存还在：这一步读到的仍是旧值——这正是 TTL 兜的那个窗口。
     assert store.resolve().model == "deepseek-chat"
 
     # 把时钟推过 TTL（不真 sleep，避免用例变慢也避免偶发）。
-    key = store._cache_key()
+    key = store._cache_key(store.INSTANCE_OWNER)
     stamp, ready = store._CACHE[key]
     store._CACHE[key] = (stamp - store._CACHE_TTL_SECONDS - 0.01, ready)
     assert store.resolve().model == "other-worker-model"
 
 
-def test_single_row_is_enforced_by_the_schema():
-    """多行并存 = "到底哪一行生效"要靠 `ORDER BY` 猜。约束钉在 DDL 里。"""
+def test_one_row_per_owner_and_no_more():
+    """同一个 owner 不可能有两行——那是"哪一行生效"要靠 `ORDER BY` 猜的状态。
+
+    改成 `owner TEXT PRIMARY KEY` 之后这条约束由 DDL 承担；不同 owner 各有各的
+    一行则是这一版的正常形态（那是多用户，不是重复）。
+    """
     import sqlite3
 
     with closing(repository.connect()) as conn, conn:
-        conn.execute(f"INSERT INTO {store.TABLE} (id, base_url) VALUES (1, 'https://a/v1')")
+        conn.execute(
+            f"INSERT INTO {store.TABLE} (owner, base_url) VALUES (?, 'https://a/v1')",
+            (store.INSTANCE_OWNER,))
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(f"INSERT INTO {store.TABLE} (id, base_url) VALUES (2, 'https://b/v1')")
+            conn.execute(
+                f"INSERT INTO {store.TABLE} (owner, base_url) VALUES (?, 'https://b/v1')",
+                (store.INSTANCE_OWNER,))
+        # 换个 owner 就该成功：多用户不是"重复行"。
+        conn.execute(
+            f"INSERT INTO {store.TABLE} (owner, base_url) VALUES ('user:1', 'https://c/v1')")
 
 
 def test_saved_row_is_readable_as_json_shape():
@@ -899,6 +912,7 @@ def test_saved_row_is_readable_as_json_shape():
         "base_url", "base_url_source", "api_key_masked", "api_key_source", "api_key_set",
         "model", "model_source", "deep_model", "deep_model_source",
         "deep_model_effective", "llm_mode", "configured", "updated_at",
+        "can_edit_instance", "instance",
     }
     # 打码值能被 JSON 序列化（省略号是普通字符，不是控制字符）。
     json.dumps(body, ensure_ascii=False)

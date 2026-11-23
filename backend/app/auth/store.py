@@ -484,6 +484,23 @@ def count_users() -> int:
     return int(row["total"])
 
 
+def first_user() -> User | None:
+    """最早注册的那个人。**部署方**就是它，这不是一个额外的概念。
+
+    为什么用"第一个注册的账号"而不是 `MINDMAP_ADMIN` 之类的环境变量：这台机器上
+    第一个注册的人只可能是部署它的人（别人还没拿到地址）。一个环境变量会多一个
+    "忘了设 / 设错了"的故障形态，而"谁是第一个"是库里已经有的、不会撒谎的事实。
+
+    排序带上 `id` 兜底：`created_at` 的精度是毫秒，同一毫秒注册两个人时让结果
+    稳定（否则"谁是部署方"会在两次调用之间摇摆，而那决定谁能改公共配置）。
+    """
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            f"SELECT id, username, created_at, updated_at FROM {USER_TABLE} "
+            f"ORDER BY created_at ASC, id ASC LIMIT 1").fetchone()
+    return None if row is None else _user(row)
+
+
 __all__ = [
     "AuthError",
     "GUEST_COOKIE",
@@ -501,6 +518,7 @@ __all__ = [
     "create_user",
     "ensure_schema",
     "find_user",
+    "first_user",
     "get_user",
     "hash_password",
     "open_session",

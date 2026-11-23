@@ -3182,6 +3182,57 @@
         "title": "ImportWarningPayload",
         "description": "一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。"
       },
+      "InstanceSettings": {
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "title": "Base Url"
+          },
+          "api_key_masked": {
+            "type": "string",
+            "title": "Api Key Masked"
+          },
+          "api_key_set": {
+            "type": "boolean",
+            "title": "Api Key Set"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "deep_model": {
+            "type": "string",
+            "title": "Deep Model"
+          },
+          "configured": {
+            "type": "boolean",
+            "title": "Configured"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "base_url",
+          "api_key_masked",
+          "api_key_set",
+          "model",
+          "deep_model",
+          "configured"
+        ],
+        "title": "InstanceSettings",
+        "description": "全站共享那一行（`owner = ''`）的样子。\n\n**只给部署方**（`can_edit_instance` 为真时才出现在响应里）。给别人看没有用：\n他们改不了，那是\"一片点不动的表单\"；而 `base_url` 是部署方用的供应商，不该\n成为所有人的可见信息。"
+      },
       "KnowledgeHit": {
         "properties": {
           "source_id": {
@@ -3759,6 +3810,21 @@
               }
             ],
             "title": "Updated At"
+          },
+          "can_edit_instance": {
+            "type": "boolean",
+            "title": "Can Edit Instance",
+            "default": false
+          },
+          "instance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InstanceSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -4647,12 +4713,21 @@
             "type": "boolean",
             "title": "Clear Api Key",
             "default": false
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "user",
+              "instance"
+            ],
+            "title": "Scope",
+            "default": "user"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "title": "SaveModelSettingsRequest",
-        "description": "`PUT /settings/model` 的请求体。**每个字段的\"空\"含义不同**（见 `store.save`）。\n\n  - `api_key` 省略或空串 → **不改**（界面上那个框显示打码值，用户不动它就发空串）；\n    要清空必须 `clear_api_key: true`。\n  - `base_url` / `model` / `deep_model` 省略 → 不改；空串 → 清掉库里的覆盖，\n    回落到环境变量。\n\n`extra=\"forbid\"` 是仓库的默认风格：拼错字段名时宁可 422，也不要静默忽略——\n\"我把密钥填进 `apikey` 了，保存成功但没生效\"是最难自查的一类失败。"
+        "description": "`PUT /settings/model` 的请求体。**每个字段的\"空\"含义不同**（见 `store.save`）。\n\n  - `api_key` 省略或空串 → **不改**（界面上那个框显示打码值，用户不动它就发空串）；\n    要清空必须 `clear_api_key: true`。\n  - `base_url` / `model` / `deep_model` 省略 → 不改；空串 → 清掉库里的覆盖，\n    回落到环境变量。\n  - `scope`：`\"user\"`（缺省）= 写你自己那行；`\"instance\"` = 写全站共享那行\n    （只有部署方可以，别人 403 `settings_forbidden`）。\n\n`extra=\"forbid\"` 是仓库的默认风格：拼错字段名时宁可 422，也不要静默忽略——\n\"我把密钥填进 `apikey` 了，保存成功但没生效\"是最难自查的一类失败。"
       },
       "SaveModelSettingsResponse": {
         "properties": {
@@ -4714,6 +4789,21 @@
               }
             ],
             "title": "Updated At"
+          },
+          "can_edit_instance": {
+            "type": "boolean",
+            "title": "Can Edit Instance",
+            "default": false
+          },
+          "instance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InstanceSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "changed": {
             "type": "boolean",

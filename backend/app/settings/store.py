@@ -5,16 +5,29 @@
 `EnvironmentFile` 再重启 systemd——而重启会把正在跑的长图打断。用户看得到的
 那个页面里没有任何入口。
 
-**为什么是单行表**：这套配置描述的是"这台机器用哪个模型服务"，不是"这个人偏好
-什么"。仓库里没有登录/JWT（只有 nginx 的一层 Basic Auth，全局一个账号），所以
-配置表**没有 `user_id` 维度**——加一列只会在换部署时变成一个永远为 NULL 的字段。
-将来真要支持多用户，正确做法是给这张表加 `user_id` 并把 `id` 换成复合主键，
-而不是现在先挖一个空维度。单行由 `CHECK (id = 1)` 在数据库层钉住：多行并存就
-等于"到底哪一行生效"要靠 `ORDER BY` 猜。
+**为什么有 `owner` 这一维**：这一版开始有账号了（`app/auth/`），"用哪个模型服务"
+变成两个层次同时成立的事——部署方给这台机器配一份，每个登录的人在面板里可以再
+配自己的一份（BYOK）。所以表从"单行 + `CHECK (id = 1)`"变成"**一行一个 owner**"，
+`owner` 就是主键：
+
+  - `''`（`INSTANCE_OWNER`）= **部署方那一份**。它同时是"谁都没配过时大家借用的
+    那一份"，免费额度花的就是它；也是环境变量那套配置在库里的对应位置。
+  - `user:<user_id>` = 某个登录账号自己的密钥。
+  - `guest:<guest_id>` = 某台浏览器（游客）自己的密钥。游客也能 BYOK——他
+    不想填而已，不是不许。
+
+**为什么不是给每行加一个可空的 `user_id`**：那样"部署方那一份"与"某个人的那一
+份"会共用一个 `id = 1` 的位置，而它俩的写入者、可见范围、删除时机都不同。主键
+直接写 owner 之后，"读谁的那一行"是一句 `WHERE owner = ?`，不需要在查询里猜
+`user_id IS NULL` 是不是"公共"的意思。
 
 **回落顺序（唯一一份实现，在 `resolve()` 里）**::
 
-    库里的值（面板保存过）  →  环境变量  →  空（= 未配置）
+    当前身份自己那一行  →  部署方那一份  →  环境变量  →  空（= 未配置）
+
+逐字段回落。中间那一档是这一版新增的，也是最容易写错的一档：**它必须存在**，
+否则刚注册、还没填密钥的人一条路都走不了（连免费体验都没有）；而它**只该在
+自己没有的时候**才被碰到，否则用户的 BYOK 永远会被部署方那份盖住。
 
 **逐字段回落，不是整组回落**。只填了密钥、端点仍用环境变量，是这套配置最常见
 的用法（换 key 比换供应商频繁得多）；按"整组"回落的话用户会被迫在面板里重填
@@ -43,9 +56,17 @@ from app.core.errors import AppError
 
 logger = logging.getLogger(__name__)
 
-#: 表名与唯一那一行的 id。`CHECK (id = 1)` 与这里的常量是同一个决定的两半。
+#: 表名与"部署方那一行"的 owner 值。
+#:
+#: `INSTANCE_OWNER` 是空串而不是 `"instance"` 之类的名字，因为它同时承担三件事：
+#: 部署方那份配置的 owner、每个人自己没有配置时的回落来源、以及**老库迁移时那唯一
+#: 一行的去处**（迁移就是把 `id = 1` 那一行搬成 `owner = ''`，不搬成任何一个 URI）。
 TABLE = "model_settings"
-ROW_ID = 1
+INSTANCE_OWNER = ""
+
+#: 迁移时老表临时叫这个名字。带版本号是为了让"迁移到一半被杀掉"这件事可以被识别：
+#: 下次启动看到 `_legacy` 表还在、新表也在，就知道要补一次搬运而不是从头重来。
+_LEGACY_TABLE = f"{TABLE}_legacy_v1"
 
 #: 环境变量名。与 `generation/service.py` 里的读法保持同一组名字——回落就是
 #: "库里没有才发现它在这里"，名字一旦对不上，回落会静默变成"未配置"。
@@ -65,6 +86,13 @@ SOURCE_SAVED = "saved"
 SOURCE_ENV = "env"
 SOURCE_UNSET = "unset"
 SOURCE_FALLBACK = "fallback"
+#: **部署方那一行**（`owner = ''`）填的值，被当前这个人借用着。
+#:
+#: 它必须与 `saved` 分开：两者都"在库里"，但一个是"我自己配的"、一个是"这台机器的
+#: 主人在面板里配的公共配置"。界面上的差别是决定性的——看到 `saved` 时用户改的那
+#: 一行就是他自己的；看到 `instance` 时他改自己那行只是覆盖，删掉就回到公共配置。
+#: 合并成一个值会让用户以为公共配置是他自己配的，而"清除"于是变成一件不敢点的按钮。
+SOURCE_INSTANCE = "instance"
 #: 库里有密钥，但它绑定的那台地址已经不是当前生效的地址了。**这时不交出密钥**。
 #:
 #: 它不是"没配"：面板要能说清"你换过地址，密钥需要重新填一次"，而 `unset` 那句话
@@ -90,7 +118,7 @@ SETTINGS_LOCK_TIMEOUT = 2.0
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
-    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    owner        TEXT PRIMARY KEY,
     base_url     TEXT NOT NULL DEFAULT '',
     api_key      TEXT NOT NULL DEFAULT '',
     model        TEXT NOT NULL DEFAULT '',
@@ -98,6 +126,13 @@ _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
     updated_at   TEXT,
     api_key_host TEXT NOT NULL DEFAULT ''
 )"""
+
+#: 老表（单行，`id INTEGER PRIMARY KEY CHECK (id = 1)`）的形状标记。
+#:
+#: 判据用"有没有 `id` 列"而不是"有没有 `owner` 列"：两者互补，但 `id` 是**老表独有**
+#: 的列，而 `owner` 在新表里也一定存在——用 `owner` 判会在"迁移到一半"时把半成品
+#: 当成已完成。
+_LEGACY_MARKER_COLUMN = "id"
 
 #: 降级只告警一次。库坏了（文件被删、权限变了、盘满）时每一次模型调用都会走到
 #: 这里，逐次 `warning` 会把日志刷满，反而看不出"从哪一刻开始坏的"。
@@ -136,6 +171,63 @@ class SettingsError(AppError):
     """设置写入被拒。带着业务 code 出去，界面才有话可说。"""
 
 
+def _columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({TABLE})")}
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
+    return row is not None
+
+
+def _migrate_legacy(conn: sqlite3.Connection) -> None:
+    """把老的单行表搬成"一行一个 owner"。幂等，且**两段都能续上**。
+
+    老表是 `id INTEGER PRIMARY KEY CHECK (id = 1)`——它把"部署方那一份配置"钉死在
+    唯一一行上。新表的主键换成 `owner`，老那一行搬成 `owner = ''`（`INSTANCE_OWNER`）。
+
+    **为什么不用 `ALTER TABLE ADD COLUMN owner` 再补主键**：SQLite 不支持给已有表
+    加主键，也不支持改主键。要么重建表，要么放弃主键约束——而放弃约束之后"同一个
+    owner 两行"就成了一种可能的状态，那时 `SELECT` 得靠 `ORDER BY` 猜哪行生效，
+    正是老设计用 `CHECK (id = 1)` 想避免的那件事。
+
+    **两段式，每段都可续**：
+
+      1. `RENAME` 老表 → `_LEGACY_TABLE`，再建新表，再 `INSERT ... SELECT` 搬那一行。
+      2. 删掉 `_LEGACY_TABLE`。
+
+    进程在任何一处被杀掉，下一次 `connect()` 看到的都是可识别的中间态：新表已建、
+    老表还在 → 再搬一次（`INSERT OR REPLACE` 幂等）；老表已删、新表在 → 什么都不做。
+    这是刻意的：迁移跑在一个每个请求都会调的函数里，它不能有"只许成功一次"的假设。
+
+    **只在真的看到老表时才动**（判据是 `id` 列且没有 `owner` 列）。老表独有的 `id`
+    而不是新表也有的 `owner`：迁移到一半时新表已经有了 `owner`，用 `owner` 判会把
+    半成品当成已完成。
+    """
+    columns = _columns(conn)
+    legacy_renamed = _has_table(conn, _LEGACY_TABLE)
+    if _LEGACY_MARKER_COLUMN in columns and "owner" not in columns:
+        # 第 1 段。老表名还在，先改名腾出表名（`IF NOT EXISTS` 的 `_CREATE` 才能建新表）。
+        conn.execute(f"ALTER TABLE {TABLE} RENAME TO {_LEGACY_TABLE}")
+        legacy_renamed = True
+    if legacy_renamed:
+        # 新表必须在这里就建出来，不能留给 `ensure_schema()` 后面的那句 `_CREATE`：
+        # 改名之后 `PRAGMA table_info({TABLE})` 是**空集**（表名已经挪走了），下面
+        # 那段"看到 `owner` 列才算搬"的判据会永远为假，于是搬运与删表都不发生——
+        # 结果是库里同时躺着一张空的新表和一张没搬的老表，老配置看起来"不见了"。
+        conn.execute(_CREATE)
+    if legacy_renamed and _has_table(conn, _LEGACY_TABLE):
+        # 第 2 段。搬那一行（如果它真的有行：老库可能是空表）。
+        conn.execute(
+            f"""INSERT OR REPLACE INTO {TABLE}
+                    (owner, base_url, api_key, model, deep_model, updated_at, api_key_host)
+                SELECT ?, base_url, api_key, model, deep_model, updated_at,
+                       COALESCE(api_key_host, '')
+                FROM {_LEGACY_TABLE}""", (INSTANCE_OWNER,))
+        conn.execute(f"DROP TABLE {_LEGACY_TABLE}")
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """建表。由 `repository.connect()` 在同一个连接上调用，幂等。
 
@@ -143,11 +235,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     读它的路径（**每一次模型调用**，见 `generation.service._config`）在热路径上，
     多一个"发现表不存在 → 建表"的分支只会在最不该出错的地方多一条可能出错的路径。
 
-    `_ensure_columns` 这一步今天是空操作（建表语句里已经有全部列），留着是为了
+    **先迁移、再建表**：顺序反了的话，老库上 `CREATE TABLE IF NOT EXISTS` 会因为
+    同名表已存在而静默什么都不做，`_ensure_columns` 随后补上 `deep_model` 之类的列，
+    于是"迁移"看起来成功了——而表还是单行的那张，`SELECT ... WHERE owner = ?` 会抛
+    `no such column: owner`，被 `saved()` 的降级分支吞成"未配置"。用户看到的是
+    "我配的密钥不见了"，而不是"迁移没跑"。
+
+    `_ensure_columns` 那一步在新表上是空操作（建表语句里已经有全部列），留着是为了
     下一个人往这张表加列时不必记得"`CREATE TABLE IF NOT EXISTS` 不会给**已经存在**
     的表补列"——线上那张表一旦有行，加列就再也进不去了，而缺列的表现是
     `SELECT` 抛 `no such column`，被下面的降级分支吞成"未配置"，看起来像"用户没设过"。
     """
+    _migrate_legacy(conn)
     conn.execute(_CREATE)
     from app.mindmaps.repository import _ensure_columns
 
@@ -237,20 +336,71 @@ def _host_of(base_url: str) -> str:
         return ""
 
 
-def _cache_key() -> str:
-    """缓存键：库路径 + 写入计数。
+def _cache_key(owner: str) -> str:
+    """缓存键：库路径 + 写入计数 + 是谁那一行。
 
     带路径的理由见 `_CACHE` 的注释（测试每个用例换一个库）。带写入计数的理由：
     `save()` 之后即使 TTL 还没到也必须作废，所以键里直接含"写过几次"——写一次，
     键就变了，旧项自然不再命中，不需要额外的失效逻辑去和并发读抢。
+
+    带 owner 是这一版新增的，也是**一旦漏掉就会串号**的一处：同一个进程里 A 与 B
+    前后脚请求，不带 owner 的缓存键会让 B 读到 A 的那一行配置。那不是"读到旧值"，
+    是"读到别人的密钥"。
     """
     from app.mindmaps import repository
 
-    return f"{repository.db_path()}::{_WRITES}"
+    return f"{repository.db_path()}::{_WRITES}::{owner}"
 
 
-def saved() -> Ready:
-    """库里那一行。没有行、或者库读不出来，都返回全空。
+# ---------------------------------------------------------------- owner
+#
+# 一行配置属于谁。三种 owner，两种形状（见文件头）：实例行是空串，其余带前缀。
+#
+# **为什么带前缀而不是直接存 `user_id`**：游客没有 `user_id`，而两者都是不透明的
+# 十六进制串——不前缀就分不清"这个串是用户还是游客"，一个 id 撞上另一个就是
+# "游客拿到了账号的密钥"。前缀让这件事在**存进去的那一刻**就不可能。
+
+_OWNER_USER = "user:"
+_OWNER_GUEST = "guest:"
+
+
+def owner_of(identity) -> str:
+    """当前身份自己那一行的 owner。**没登录也没游客 cookie 时是空串**。
+
+    空串在这里有两重意思，而它们恰好等价：`INSTANCE_OWNER`（部署方那一行）与
+    "这个人还没有自己的行"。匿名请求不该往库里写任何东西，读的时候也直接落到
+    实例行——这正是我们要的：没有身份的人借用公共配置。
+
+    `identity` 用鸭子类型（只读 `.user` 与 `.guest_id`）而不是标成 `store.Identity`
+    类型：`app.auth.identity` 会 import 本模块，反过来标类型就成环。
+    """
+    user = getattr(identity, "user", None)
+    if user is not None:
+        return f"{_OWNER_USER}{user.id}"
+    guest_id = getattr(identity, "guest_id", None)
+    if guest_id:
+        return f"{_OWNER_GUEST}{guest_id}"
+    return INSTANCE_OWNER
+
+
+def _owner_for_write(scope: str) -> str:
+    """这次写入落哪一行。`scope="instance"` 是"本站共享配置"，其余按当前身份。
+
+    由 `save()` 调用。权限判定在路由层（它要能回一个带 code 的 403），这里只做
+    "instance 就是一种 owner" 这件事——判定与落点分开，是因为落点还要给测试与
+    "部署方自己用面板"两条路复用。
+    """
+    if scope == "instance":
+        return INSTANCE_OWNER
+    from app.auth.identity import current_identity
+
+    return owner_of(current_identity())
+
+
+def saved(owner: str | None = None) -> Ready:
+    """库里某个 owner 那一行。没有行、或者库读不出来，都返回全空。
+
+    `owner=None` 读的是**当前身份自己那一行**（匿名请求 → 实例行，见 `owner_of`）。
 
     **读失败时降级而不是抛**：这条路径在每一次模型调用的开头，让它因为一个读不到
     的配置表把整次生成打成失败，比"回落到环境变量"糟糕得多——后者在绝大多数部署
@@ -261,7 +411,11 @@ def saved() -> Ready:
     去试一次——那本来就该被看见。
     """
     global _DEGRADED_WARNED
-    key = _cache_key()
+    if owner is None:
+        from app.auth.identity import current_identity
+
+        owner = owner_of(current_identity())
+    key = _cache_key(owner)
     cached = _CACHE.get(key)
     if cached is not None and time.monotonic() - cached[0] < _CACHE_TTL_SECONDS:
         return cached[1]
@@ -269,7 +423,7 @@ def saved() -> Ready:
         with closing(_connect()) as conn:
             row = conn.execute(
                 f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host "
-                f"FROM {TABLE} WHERE id = ?", (ROW_ID,)).fetchone()
+                f"FROM {TABLE} WHERE owner = ?", (owner,)).fetchone()
     except sqlite3.Error as exc:
         if not _DEGRADED_WARNED:
             _DEGRADED_WARNED = True
@@ -300,8 +454,8 @@ def _row_host(row: sqlite3.Row) -> str:
     return (row["api_key_host"] or "") if "api_key_host" in row.keys() else ""
 
 
-def _read_strict(*, timeout: float | None = None) -> Ready | None:
-    """像 `saved()` 一样读那一行，但**读失败时抛、不降级**。只有写路径用。
+def _read_strict(owner: str, *, timeout: float | None = None) -> Ready | None:
+    """像 `saved(owner)` 一样读那一行，但**读失败时抛、不降级**。只有写路径用。
 
     `saved()` 的降级是给**生成路径**准备的：读不到就回落环境变量，那在绝大多数
     部署上恰好是对的，绝不能因为一个读不出来的配置表把整次生成打成失败。
@@ -317,7 +471,7 @@ def _read_strict(*, timeout: float | None = None) -> Ready | None:
     with closing(_connect(timeout=timeout)) as conn:
         row = conn.execute(
             f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host "
-            f"FROM {TABLE} WHERE id = ?", (ROW_ID,)).fetchone()
+            f"FROM {TABLE} WHERE owner = ?", (owner,)).fetchone()
     if row is None:
         return None
     return Ready(
@@ -338,15 +492,28 @@ def _invalidate() -> None:
     _CACHE.clear()
 
 
-def _pick(stored: str, env_name: str, *, normalize) -> tuple[str, str]:
-    """一个字段的回落：库 → 环境变量 → 空。
+def _pick(own: str, instance: str, env_name: str, *, normalize) -> tuple[str, str]:
+    """一个字段的回落：**自己那行 → 部署方那行 → 环境变量 → 空**。
 
-    **逐字段**（见文件头）：库里有值就用库里的，没有才看环境变量。反过来
-    （环境变量优先）会让"用户在面板里改完立刻生效"变成一个谎。
+    **逐字段**（见文件头）：自己那行有值就用它，没有才看下一档。反过来会让
+    "用户在面板里改完立刻生效"变成一个谎。
+
+    为什么中间那档（`instance`）必须存在：新注册的人自己一行都没有，若只认
+    "自己那行 + 环境变量"，那么一个在面板里配好的实例（密钥只存在库里、环境变量
+    是空的）会让新用户一条路都走不了——他会看到"模型还没配置"，而部署方明明配过。
+    反过来，只在自己**没有**这个字段时才看实例行：否则 BYOK 永远被公共配置盖住，
+    用户填了也不生效（那是更坏的形状：他以为自己的钱在花，其实是公共额度）。
+
+    三档必须报三种不同的来源。看到 `saved` 时用户改自己那行就是改他自己的；看到
+    `instance` 时他改自己那行只是**覆盖**，清掉就回到公共配置——把两者合并成一个
+    "已配置"会让「清除」变成一个不敢点的按钮。
     """
-    value = normalize(stored)
+    value = normalize(own)
     if value:
         return value, SOURCE_SAVED
+    value = normalize(instance)
+    if value:
+        return value, SOURCE_INSTANCE
     value = normalize(os.getenv(env_name, ""))
     if value:
         return value, SOURCE_ENV
@@ -368,7 +535,10 @@ def _binding_of(stored: Ready, api_key_source: str) -> str:
         时无从校验（返回空串），这种情况下"谁配的地址谁说了算"，而那种部署本来
         就把密钥放在一台谁能改地址谁就能读环境变量的机器上。
     """
-    if api_key_source == SOURCE_SAVED:
+    if api_key_source in (SOURCE_SAVED, SOURCE_INSTANCE):
+        # `instance` 那一行也是"面板里存的"，锚点语义完全一样：它记的是部署方
+        # 把那把密钥写进那台地址时的事。借用它的用户不会改它，所以锚点对不上只可能
+        # 是部署方自己换过地址——那时谁都不该拿到这把旧密钥。
         return _norm_text(stored.api_key_host).lower() or _host_of(stored.base_url)
     if api_key_source == SOURCE_ENV:
         return _host_of(os.getenv(BASE_URL_ENV, ""))
@@ -392,21 +562,40 @@ def resolve() -> Resolved:
     `POST /settings/model/test` 会带着**已存的**密钥去请求。绑定的判据不放在
     `probe()` 里，是因为发送点不止一个——生成、视觉提取、外部检索全都从这里取
     密钥，把判据放在出口上，所有路径一起受保护（放进入口就得记住每一个入口）。
+
+    **回落是两级**（`_pick` 的注释里写了为什么中间那档必须有）：当前身份自己
+    那一行 → 部署方那一份 → 环境变量。没有身份的人（既没登录也没游客 cookie）
+    直接读实例行——这正是我们要的：没有身份的人借用公共配置。
     """
-    stored = saved()
-    base_url, base_url_source = _pick(stored.base_url, BASE_URL_ENV, normalize=_norm_base)
-    api_key, api_key_source = _pick(stored.api_key, API_KEY_ENV, normalize=_norm_text)
-    model, model_source = _pick(stored.model, MODEL_ENV, normalize=_norm_text)
+    from app.auth.identity import current_identity
+
+    identity = current_identity()
+    owner = owner_of(identity)
+    stored = saved(owner)
+    # 实例行只在"这本来就不是实例行"时才有意义：`owner == INSTANCE_OWNER` 时
+    # 同一个对象读两遍，第二遍还会撞上缓存之外的另一次查询。
+    instance = Ready() if owner == INSTANCE_OWNER else saved(INSTANCE_OWNER)
+    base_url, base_url_source = _pick(
+        stored.base_url, instance.base_url, BASE_URL_ENV, normalize=_norm_base)
+    api_key, api_key_source = _pick(
+        stored.api_key, instance.api_key, API_KEY_ENV, normalize=_norm_text)
+    model, model_source = _pick(
+        stored.model, instance.model, MODEL_ENV, normalize=_norm_text)
     deep_model, deep_model_source = _pick(
-        stored.deep_model, DEEP_MODEL_ENV, normalize=_norm_text)
+        stored.deep_model, instance.deep_model, DEEP_MODEL_ENV, normalize=_norm_text)
     # 只在这个地址**真的存在**时校验：没有地址就无从"发错地方"，而那时
     # `configured` 已经是 False，界面上说的是另一个问题（去填地址）。
     # 锚点为空串 = 无从判断（环境里只给了密钥、没给地址），那时不拦——
     # 拦住它只会让这种部署升级后直接不可用，而它本来就把密钥交给了一台
     # "谁能改配置谁就能读环境变量"的机器。
+    #
+    # 锚点取自**密钥来的那一行**（`stored` 在 `saved` 时是实例行内容，但 `_pick`
+    # 才知道到底用了谁的值）：借用了部署方那行时锚点必须也是那行的锚点，用自己
+    # 那行（可能是空的）去比会得出"无从判断"从而放行一把被绑过的密钥。
+    anchor_row = instance if api_key_source == SOURCE_INSTANCE else stored
     host = _host_of(base_url)
     if api_key and host:
-        bound = _binding_of(stored, api_key_source)
+        bound = _binding_of(anchor_row, api_key_source)
         if bound and bound != host:
             api_key, api_key_source = "", SOURCE_UNBOUND
     return Resolved(
@@ -424,13 +613,36 @@ def resolve() -> Resolved:
 def deep_override() -> tuple[str, str]:
     """「深度思考」显式配置的模型名，以及它来自哪里。空串 = 没配。
 
-    单独一个函数而不是让 `_model_for` 直接读环境变量：那一档的优先级（库 → 环境
-    变量）必须与其余三个字段同源，否则"面板里填了深度模型"会对工具内部那几次
-    调用无效，而界面上 `done.model` 显示的是外层那一次——又是"看起来对了，只有
-    产物是错的"。
+    单独一个函数而不是让 `_model_for` 直接读环境变量：那一档的优先级（自己那行
+    → 部署方那行 → 环境变量）必须与其余三个字段同源，否则"面板里填了深度模型"
+    会对工具内部那几次调用无效，而界面上 `done.model` 显示的是外层那一次——又是
+    "看起来对了，只有产物是错的"。
     """
-    stored = saved()
-    return _pick(stored.deep_model, DEEP_MODEL_ENV, normalize=_norm_text)
+    from app.auth.identity import current_identity
+
+    owner = owner_of(current_identity())
+    stored = saved(owner)
+    instance = Ready() if owner == INSTANCE_OWNER else saved(INSTANCE_OWNER)
+    return _pick(
+        stored.deep_model, instance.deep_model, DEEP_MODEL_ENV, normalize=_norm_text)
+
+
+def updated_at() -> str | None:
+    """界面上"上次保存"该显示的时刻：自己那行有就用它，否则用部署方那行。
+
+    为什么不是 `saved().updated_at`：一个刚从游客变成账号的人自己一行都没有，
+    而画布上生效的明明是部署方的共享配置——显示 `null` 会让面板说"还没配过"，
+    与它上面显示的地址/模型名自相矛盾。
+    """
+    from app.auth.identity import current_identity
+
+    owner = owner_of(current_identity())
+    own = saved(owner).updated_at
+    if own:
+        return own
+    if owner == INSTANCE_OWNER:
+        return None
+    return saved(INSTANCE_OWNER).updated_at
 
 
 def mask_api_key(key: str) -> str:
@@ -503,14 +715,14 @@ def _check_text(value: str, *, label: str, limit: int) -> str:
     return text
 
 
-def _read_strict_for_save() -> Ready:
+def _read_strict_for_save(owner: str) -> Ready:
     """`save()` 专用的读：**读不到就拒写**，绝不返回"空值"。
 
     与 `_read_strict()` 分开只是为了把"没有行"折成空 `Ready`——第一次保存时
     本来就没有行，那不是错误；而"读不出来"必须抛。
     """
     try:
-        row = _read_strict(timeout=SETTINGS_LOCK_TIMEOUT)
+        row = _read_strict(owner, timeout=SETTINGS_LOCK_TIMEOUT)
     except sqlite3.Error as exc:
         # 宁可这次保存失败，也不能把"读不到"当成"是空的"：那会把用户已存的
         # base_url 与密钥一起写成空串，还回 200「保存成功」。
@@ -528,9 +740,14 @@ def save(
     model: str | None = None,
     deep_model: str | None = None,
     clear_api_key: bool = False,
+    scope: str = "user",
 ) -> tuple[Resolved, bool]:
     """写配置，返回（写入后的生效配置，这次有没有真的改变）。
 
+    `scope` 决定写谁那一行：`"user"`（缺省）= 当前身份自己那行（登录用户、游客
+    都算，"他不想填而已，不是不许"）；`"instance"` = 部署方那行、全站共享。
+    **谁能传 `"instance"` 由路由层判定**，这里只负责落点——判定要回带 code 的
+    403、要读"谁是第一个注册的人"，那些都不该在存储层。
     **三个字段的"空串"含义不同，是有意为之**：
 
       - `api_key=None / ""` → **不改**。界面上那个框显示的是打码值（`…abcd`），
@@ -552,7 +769,8 @@ def save(
             "settings_clear_conflict",
             "不能同时提交新密钥和「清除密钥」；请只留一个。", status=400)
 
-    current = _read_strict_for_save()
+    owner = _owner_for_write(scope)
+    current = _read_strict_for_save(owner)
     next_base = current.base_url if base_url is None else _check_base_url(base_url)
     if clear_api_key:
         next_key = ""
@@ -563,7 +781,10 @@ def save(
         next_key = current.api_key
     else:
         next_key = _check_text(api_key, label="密钥", limit=MAX_KEY_CHARS)
-        effective_key, _ = _pick(current.api_key, API_KEY_ENV, normalize=_norm_text)
+        # 生效密钥可能是自己那行的、也可能是借用实例行的（`resolve()` 的回落链），
+        # 所以比法要用**生效值**而不是只看自己那行：用户看到的那段打码值就是从
+        # 生效值算出来的，拿自己那行（空的）去比会在"借用公共配置"这一路上漏掉。
+        effective_key = resolve().api_key
         if next_key and next_key in (mask_api_key(current.api_key),
                                      mask_api_key(effective_key)):
             # 提交的是**打码后的样子**（`…abcd`），不是密钥本身。把它当新密钥存下去，
@@ -620,16 +841,17 @@ def save(
             with closing(_connect(timeout=SETTINGS_LOCK_TIMEOUT)) as conn, conn:
                 conn.execute(
                     f"""INSERT INTO {TABLE}
-                            (id, base_url, api_key, model, deep_model, updated_at, api_key_host)
+                            (owner, base_url, api_key, model, deep_model, updated_at,
+                             api_key_host)
                         VALUES (?, ?, ?, ?, ?, {_NOW}, ?)
-                        ON CONFLICT(id) DO UPDATE SET
+                        ON CONFLICT(owner) DO UPDATE SET
                             base_url     = excluded.base_url,
                             api_key      = excluded.api_key,
                             model        = excluded.model,
                             deep_model   = excluded.deep_model,
                             updated_at   = excluded.updated_at,
                             api_key_host = excluded.api_key_host""",
-                    (ROW_ID, next_base, next_key, next_model, next_deep, next_host),
+                    (owner, next_base, next_key, next_model, next_deep, next_host),
                 )
         except sqlite3.Error as exc:
             # 与 `_read_strict_for_save` 同一条规矩：写不进去也要给出能读的 code。
@@ -645,12 +867,20 @@ def save(
     return resolve(), changed
 
 
-def clear() -> int:
-    """清空配置行（只在用例与本地调试用）。返回删掉的行数。"""
+def clear(owner: str | None = None) -> int:
+    """清空配置行（只在用例与本地调试用）。返回删掉的行数。
+
+    `owner=None` 清**所有行**——用例与调试要的是"从头来一遍"。真实接口不清全表，
+    它走 `save(..., clear_api_key=True)` 或写空值，落点由 `scope` 决定。
+    """
     global _DEGRADED_WARNED
     _DEGRADED_WARNED = False
     with closing(_connect()) as conn, conn:
-        rowcount = conn.execute(f"DELETE FROM {TABLE}").rowcount
+        if owner is None:
+            rowcount = conn.execute(f"DELETE FROM {TABLE}").rowcount
+        else:
+            rowcount = conn.execute(
+                f"DELETE FROM {TABLE} WHERE owner = ?", (owner,)).rowcount
     _invalidate()
     return rowcount
 
@@ -659,13 +889,16 @@ __all__ = [
     "API_KEY_ENV",
     "BASE_URL_ENV",
     "DEEP_MODEL_ENV",
+    "INSTANCE_OWNER",
     "LLM_MODE_ENV",
     "MODEL_ENV",
     "Ready",
     "Resolved",
     "SOURCE_ENV",
     "SOURCE_FALLBACK",
+    "SOURCE_INSTANCE",
     "SOURCE_SAVED",
+    "SOURCE_UNBOUND",
     "SOURCE_UNSET",
     "SETTINGS_LOCK_TIMEOUT",
     "SettingsError",
@@ -675,7 +908,9 @@ __all__ = [
     "ensure_schema",
     "llm_mode",
     "mask_api_key",
+    "owner_of",
     "resolve",
     "save",
     "saved",
+    "updated_at",
 ]
