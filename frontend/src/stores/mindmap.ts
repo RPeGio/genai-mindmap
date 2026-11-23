@@ -2869,6 +2869,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
         status.value = '这张导图已被别人改过，本地修改还没保存。';
         return 'conflict';
       }
+      // 403 只可能来自一件事：这张图不是你创建的（门禁有身份就能过，所以不是登录问题）。
+      // 后端那句话已经说了下一步（另存为新建一份），这里原样透传——自己再编一句只会
+      // 与后端口径漂移，而"为什么存不了"这件事只有一个正确答案。
+      if (error instanceof ApiError && error.status === 403) {
+        status.value = error.message;
+        return 'failed';
+      }
+      // 401 = 身份过期（会话 30 天到期、换了浏览器、清了 Cookie）。保存是**唯一**
+      // 一个用户会反复点的动作，所以这一档必须说清"刷新页面"而不是"重试"：
+      // 原样重发还是会 401，而刷新一下就会领到新的游客身份。
+      if (error instanceof ApiError && error.status === 401) {
+        status.value = '这一页的身份过期了：刷新页面后重新打开这张图再保存。';
+        return 'failed';
+      }
       status.value = error instanceof ApiError ? error.message : '保存失败，请重试。';
       return 'failed';
     } finally {

@@ -540,6 +540,9 @@ export interface paths {
          *     "生成过但没保存"与"生成过、也存下来了"只能靠这个时间戳分开：那份内容可能被
          *     PUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`
          *     表反推，得到的全是猜。
+         *
+         *     按 owner 过滤：否则知道别人 `run_id` 的人能替他标掉这一位，那条记录再也不会
+         *     出现在他的「上次的结果」里——一条安静的数据丢失。
          */
         post: operations["mark_run_applied_api_agent_runs__run_id__applied_post"];
         delete?: never;

@@ -139,6 +139,26 @@ describe('失败分类', () => {
     expect(guide.actions.some(item => item.kind === 'copy')).toBe(true);
   });
 
+  it('身份过期时先给动作（刷新），再说额度，不假装是操作失误', () => {
+    const guide = guideForFailure({
+      code: 'auth_required',
+      message: '这个操作需要一个身份。',
+      canRetry: true,
+      running: false,
+    });
+
+    // 这一档出现的唯一原因是页面里的 cookie 没了，原样重发还是 401——所以按死重试。
+    expect(guide.retryable).toBe(false);
+    expect(guide.title).toContain('身份');
+    // 先给动作：刷新会领到新身份。
+    expect(guide.next).toContain('刷新');
+    // 再说额度那条路，否则用户不知道"刷新之后还能不能免费用"。
+    expect(guide.next).toContain('游客');
+    expect(guide.next).toContain('注册');
+    const retry = guide.actions.find(item => item.kind === 'retry');
+    expect(retry?.disabledReason).toContain('刷新');
+  });
+
   it('未知错误码走兜底，不猜一个可能错的解释', () => {
     const guide = guideForFailure({ code: 'something_new', message: '后端新加的错误', canRetry: true });
 
@@ -151,6 +171,7 @@ describe('失败分类', () => {
     const codes = [
       'model_not_configured',
       'free_quota_exhausted',
+      'auth_required',
       'budget_exhausted',
       'too_many_failures',
       'unexpected_finish',

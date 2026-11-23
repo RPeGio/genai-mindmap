@@ -139,6 +139,20 @@ function explain(input: FailureInput): FailureGuide {
         ],
         retryable: false,
       };
+    case 'auth_required':
+      // 门禁回的 401。它只会在一种情况下出现：页面里的游客/会话 cookie 没了——
+      // 换了浏览器、清了 Cookie、会话过期（30 天），或者后端换了库。这不是"你操作
+      // 错了"，所以指引必须**先给动作**（刷新一下就会拿到新身份），再说额度那句，
+      // 否则用户会以为是自己刚才哪个按钮点坏了。
+      return {
+        title: '这一页的身份过期了',
+        next:
+          '刷新一下页面就好：刷新时会自动分配一个游客身份（每天有 3 次免费生成），'
+          + '想长期保存自己的图就注册一个账号。已经画在画布上的内容刷新后会丢，'
+          + '先点「保存」——不过保存同样需要身份，所以这里只能重来。',
+        actions: [retryAction(retryBlocker(input, '刷新页面才能拿到新身份，重试还是会被拦。')), COPY_ACTION],
+        retryable: false,
+      };
     case 'budget_exhausted':
       return explainBudget(input);
     case 'too_many_failures':
