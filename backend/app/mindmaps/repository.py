@@ -284,6 +284,12 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     from app.auth.store import ensure_schema as ensure_auth_schema
 
     ensure_auth_schema(conn)
+    # 登录失败限速（`app/auth/throttle.py`）。它的读点在登录请求上，那里的
+    # 代价特别高——限速判据必须在任何哈希计算**之前**给出答案，而"表不存在"
+    # 会让那次判断退化成一整条 DDL，正好落在最不该慢的位置上。
+    from app.auth.throttle import ensure_schema as ensure_throttle_schema
+
+    ensure_throttle_schema(conn)
     return conn
 
 

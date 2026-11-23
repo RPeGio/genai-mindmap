@@ -124,6 +124,48 @@ def read_cookie(scope: dict, name: str) -> str:
     return (_cookies(scope).get(name) or "").strip()
 
 
+_REAL_IP = "x-real-ip"
+_FORWARDED_FOR = "x-forwarded-for"
+
+
+def _header(scope: dict, wanted: str) -> str:
+    for name, value in scope.get("headers") or ():
+        if name.decode("latin-1").lower() == wanted:
+            return value.decode("latin-1").strip()
+    return ""
+
+
+def client_ip(scope: dict) -> str:
+    """发起这次请求的地址，用于登录限速。
+
+    **顺序是刻意的**：`X-Real-IP` 优先于 `X-Forwarded-For`。两份 nginx 配置都写
+    `X-Real-IP $remote_addr`（`deploy/nginx.conf` 与 `docker/nginx.conf`），那是
+    直连那一跳的真实地址；而 `X-Forwarded-For` 是**追加**的列表，最左那个是客户端
+    自己声称的——把最左当真相等于让攻击者填什么就是什么。这里取 `X-Forwarded-For`
+    只是为了不依赖我们自己的反代配置（比如有人直接把 uvicorn 暴露给一个只设了
+    这个头的网关），所以取**最后一个**而不是第一个：最后一个是我们信任的那一跳
+    写进来的。
+
+    三个来源都没有时退回 `scope["client"][0]`；连它也没有就给空串，限速那边会
+    把空串归成一个桶——那不是"不限"，是"所有身份不明的人共用一个桶"，比悄悄
+    放行安全。
+
+    注意这一层不校验地址真伪：能伪造 `X-Real-IP` 的前提是能直接连到后端端口
+    （绕过 nginx），那种情况下前端所有防护都已经失效，限速表里多一个假桶不是
+    新的损失。真要收紧，方向是在 nginx 上覆盖掉客户端传来的这两个头。
+    """
+    real = _header(scope, _REAL_IP)
+    if real:
+        return real
+    forwarded = _header(scope, _FORWARDED_FOR)
+    if forwarded:
+        parts = [piece.strip() for piece in forwarded.split(",") if piece.strip()]
+        if parts:
+            return parts[-1]
+    client = scope.get("client") or ()
+    return str(client[0]) if client else ""
+
+
 def _read_guest(cookies: dict[str, str]) -> str | None:
     raw = (cookies.get(store.GUEST_COOKIE) or "").strip().lower()
     return raw if _GUEST_PATTERN.match(raw) else None
@@ -174,6 +216,7 @@ class IdentityMiddleware:
 __all__ = [
     "IdentityMiddleware",
     "cleared_cookie",
+    "client_ip",
     "cookie_header",
     "current_identity",
     "current_user",
