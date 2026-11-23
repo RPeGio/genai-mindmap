@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-23，公共免费额度之后）：后端 2617 个测试（pytest，另有 29 个 subtest）、前端 1040 个 vitest 用例（64 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-23，门禁与最小数据隔离之后）：后端 2653 个测试（pytest，另有 29 个 subtest）、前端 1053 个 vitest 用例（65 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -100,11 +100,11 @@ backend/
     memory/            记忆模块（生成时注入相关记忆、会话结束总结）
     prefs/             用户偏好（读写 + 从历史推建议）
     settings/          模型服务配置（页面内改地址/密钥/模型，落 SQLite 单行表，回落环境变量）
-    auth/              账号与会话（scrypt 口令、sessions 表、HttpOnly cookie、身份中间件；暂不拦请求）
+    auth/              账号与会话（scrypt 口令、sessions 表、HttpOnly cookie、身份中间件 + 门禁中间件）
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               2617 个测试（另有 29 个 subtest）
+  tests/               2653 个测试（另有 29 个 subtest）
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -134,7 +134,7 @@ frontend/
     stores/settings.ts Pinia：模型服务配置（读 / 存 / 测试连接）
     demo/presets.ts    三张预置演示导图（生产也带，点按钮才加载）
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               1040 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
+  tests/               1053 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -237,7 +237,7 @@ GET  /api/settings/model           当前生效值 + 每个字段的来源（库
 PUT  /api/settings/model           改地址 / 密钥 / 模型名（密钥只回打码值，清空要显式声明）
 POST /api/settings/model/test      测试连接（失败也是 200 + 结论，不是 5xx）
 
-账号与会话（这一批只有身份层，**还没上任何门禁**）
+账号与会话（`/api/` 下必须带身份：游客或登录都算，匿名 401 `auth_required`）
 GET  /api/auth/me                  当前是谁（永远 200）；全站唯一发游客 cookie 的地方
 POST /api/auth/register            注册并直接登录（重名 409，不区分大小写）
 POST /api/auth/login               登录（账号或密码不对统一 401，不区分是哪一项）

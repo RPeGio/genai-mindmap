@@ -112,7 +112,17 @@
 | `POST /api/auth/logout` | 无 | 204，**幂等**（本来就没登录也是 204）；撤销这一次会话并清 cookie | — |
 | `POST /api/auth/password` | `{"current_password","new_password"}` | 204，清 cookie。需要**已登录 + 旧密码**；改完撤销这个人的**全部**会话 | 未登录 `auth_required` 401；旧密码不对 `auth_bad_credentials` 401；新密码长度不合规同上 |
 
-**账号这一批只有身份层，还没上任何门禁。** 五个接口之外，33 条业务路径**一条都没有被拦**——身份中间件只回答"当前是谁"，`kind` 可能是 `user` / `guest` / `anonymous`，但没有一条路径因为身份而 401。这是刻意的顺序：一次把门禁与身份一起翻掉，合并当天所有人（包括自己和队友）都进不去，而"进不去"没有旁路可验证。门禁按接口逐个打开，判据是 `tests/test_auth.py::test_business_endpoints_are_still_open_in_this_batch`——等它红了，说明有人开始合闸，那条用例该被改成"该 401 的 401、该放行的放行"，而不是删掉。
+**门禁：`/api/` 下的请求必须带一个身份，匿名的直接 401。** 判据是"有身份"而不是"登录过"——带会话 cookie（`mm_session`）或者游客 cookie（`mm_guest`）都算，所以**新访客打开页面就能用**，每天还有 3 次免费生成。白名单只有两处：`GET /api/health`（部署的健康检查与容器健康探针）与 `/api/auth/*`（否则没人能注册或登录）；`OPTIONS` 与所有非 `/api/` 路径（前端静态资源）也放行。实现在 `backend/app/auth/gate.py`，一张显式白名单而不是给 32 条业务路径各挂一个依赖——**漏一条就是一条匿名口子，而"漏了一条"在评审里极难看出来**。
+
+401 的响应体和其他错误同一个形状，`code` 是 `auth_required`，`message` 会说"刷新页面即可（会自动分配一个游客身份，每天有 3 次免费生成），或者注册账号"，`detail.path` 带你请求的那个路径，并且**带 `X-Request-ID`**（沿用请求头里的那个，没有就新生成一个 8 位）。前端拿不到身份时不要假装成功：这一档在界面上的处理是"刷新页面"，不是"重试"——原样重发还是 401。
+
+**数据隔离：读共享，写限主。** 导图的 `owner` 是创建时的身份（`user:<id>` 或 `guest:<cookie id>`）：任何人都能读别人保存的图（团队协作要能看），但 `PUT` 只有创建者能改，别人拿到 403 `map_forbidden`（**不是 404**——他看得见这张图，假装不存在只会让他以为自己的图丢了）；正文会告诉他用「另存为」新建一份。门禁打开之前存下的老行 `owner` 是空串，语义是"无主"，**只有部署方（第一个注册的账号）能改**，其余人 403。游客创建的图归他那台浏览器，清了 cookie 就找不回来——这是"游客"这个词本身的含义，不是缺陷。
+
+`runs` 的可见性口径**刻意与导图不同**：只本人可见。导图是作品、读共享；`runs` 是过程记录（还没保存的树、模型的思考、失败原因），属于发起者。别人的 `run_id` 读 `GET /runs/{id}` 返 404（不是 403：`run_id` 是随机串，"存在但不属于你"本身就是不该给出的信息），`pending` 永远按 owner 过滤，`POST /runs/{id}/applied` 也只有本人能打——否则知道别人 `run_id` 的人能替他标掉这一位，那条记录再也不会出现在他的「上次的结果」里，一条安静的数据丢失。
+
+**为什么门禁在中间件而不是路由依赖**：`IdentityMiddleware` 先把身份放进 ContextVar，`GateMiddleware` 只读。两者注册顺序不能反——Starlette 的 `add_middleware` 是 `insert(0)`，后注册的在外层，反了就是"门禁跑在身份解析之前"，`current_identity()` 恒匿名、**整站 401**，而现象看起来像部署坏了或者 cookie 没生效。`tests/test_gate.py::test_the_gate_wraps_the_identity_layer` 钉住这个顺序。
+
+**前端启动顺序也是硬要求**：进页面先 `GET /api/auth/me`（拿游客 cookie）**再挂载 `App`**。反过来（先挂载）会让挂载瞬间发出的那批请求（偏好、知识库、可恢复的运行）赶在 cookie 之前到后端，一起 401——现象是"页面一打开就报错，刷新一下又好了"。见 `frontend/src/main.ts`。
 
 **会话是 HttpOnly cookie，不是 JWT，也不出现在任何响应体里。** cookie 名 `mm_session`，属性 `Path=/; HttpOnly; SameSite=Strict`（走 https 才加 `Secure`，本机 http 不加——否则部分浏览器直接不收）。库里存的是 `sha256(token)`：库文件泄漏时拿到的是哈希，不是一串能直接用的 cookie。**可撤销**是这次整改的硬要求，无状态 token 只能等它自己过期，所以没用 JWT（详见 `backend/app/auth/store.py` 的文件头）。
 
