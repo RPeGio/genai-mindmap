@@ -47,13 +47,17 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
 | `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
-| `MINDMAP_SETTINGS_ALLOW_PRIVATE` | 空（关） | 允不允许把模型地址指向本机 / 内网。关着时"测试连接"与生成都会拒（`probe._refuse()`），因为**这个面能用已存密钥当内网探针**。要连 Ollama / LM Studio / 同机自建端点就设 `1`；它同时放开本机与内网，没有更细的粒度 |
+| `MINDMAP_SETTINGS_ALLOW_PRIVATE` | 空（关） | 允不允许把模型地址指向本机 / 内网。关着时"测试连接"与生成都会拒（`probe._refuse()`），因为**这个面能用已存密钥当内网探针**。要连 Ollama / LM Studio / 同机自建端点就设 `1`；它同时放开本机与内网，没有更细的粒度。**云元数据地址（`169.254.169.254`、`metadata.google.internal`、`100.100.100.200` 等）这个开关也打不开**——那里没有模型，只有临时凭证 |
 
 **四个 `MINDMAP_LLM_*` 的优先级：页面设置面板（`/api/settings/model`，落 SQLite）> 环境变量 > 未配置。** 回落是**逐字段**的——只改了模型名、地址与密钥仍从环境变量来。面板保存后立即生效（1 秒 TTL 的进程内缓存，单 worker 下等于即时；多 worker 时另一个进程最多滞后 1 秒）。`MINDMAP_LLM_MODE` **不进库**：它是部署方定的"这台机器要不要联网"，面板只显示、不能改。面板只接受 OpenAI 兼容接口（实际请求的是"地址 + `/chat/completions`"）。密钥只回打码值（`…abcd`），要清空必须显式声明。**打码值不是密钥**：把它原样 `PUT` 回去会被拒（400 `settings_api_key_masked`）而不是当成新密钥存下来——否则库里那把真密钥会被字面量顶掉，而接口照旧说"已配置"、之后每次调用都 401。这条对直接调接口的人尤其重要：界面上那个值只出现在 placeholder 里，正常点击不会提交它。
 
 **改地址之后保存会带一句 `notice`**："上次「测试连接」的结论对新地址不成立，建议现在点一次"。只提醒不阻拦——"先把地址填好、等供应商开白名单"是正常操作，强制先测通会把这条路堵死。同值重复保存、以及从"什么都没配"到"填了个地址"的首次配置都不提醒（没有旧结论可作废）。
 
-**地址不许指向本机 / 内网 / 云元数据地址。** 这个面最贵的失误不是"填错"，是"被改写"：无鉴权时 `PUT` 换掉 `base_url`、再 `POST /model/test`（空 body 走回落生效值这条免费路径），已存密钥就随 `Authorization` 头送到了那个地址——攻击者既不需要知道密钥，也不需要读得到响应。所以现在有两道：`docker/nginx.conf` 与 `deploy/nginx.conf` 把 `/api/settings/` 挡在 Basic Auth 后面；`backend/app/settings/probe.py::_refuse()` 在发请求**之前**拒掉本机、内网、链路本地、保留地址与云元数据地址（`MINDMAP_SETTINGS_ALLOW_PRIVATE=1` 可放开，见上表）。它不是"防住内网"的完整方案（DNS rebinding、302 跳内网、公网域名解析到私网都挡不住），挡的是成本最低的那一步。
+**地址不许指向本机 / 内网 / 云元数据地址。** 这个面最贵的失误不是"填错"，是"被改写"：无鉴权时 `PUT` 换掉 `base_url`、再 `POST /model/test`（空 body 走回落生效值这条免费路径），已存密钥就随 `Authorization` 头送到了那个地址——攻击者既不需要知道密钥，也不需要读得到响应。所以现在有三道：`docker/nginx.conf` 与 `deploy/nginx.conf` 把 `/api/settings/` 挡在 Basic Auth 后面；`backend/app/settings/probe.py::_refuse()` 在发请求**之前**拒掉本机、内网、链路本地、保留地址（`MINDMAP_SETTINGS_ALLOW_PRIVATE=1` 可放开，见上表）与云元数据地址（开关也打不开）；公网地址必须 `https://`（`http://` 会让密钥明文过中间每一跳；私网不查这一条，本机 Ollama 常开在 http）。它仍不是"防住内网"的完整方案（DNS rebinding、302 跳内网、公网域名解析到私网都挡不住），挡的是成本最低的那一步。
+
+**密钥与地址绑定（`api_key_host`）——第二层，挡"已经改好地址"之后的安静形状。** 上面那些挡的是"填个地址就把密钥送出去"，发生在测试连接那一刻。但还有一个形状不经过测试连接：改完地址（这一步本来没有密钥出门），下一次**正常生成**就会带着库里那把密钥去访问新地址。所以 `model_settings` 多一列 `api_key_host`，记"这把密钥被哪台主机保存过"，`store.resolve()` 只在当前生效地址的主机名与锚点一致时才交出明文；不一致时 `api_key_source` 变成 `unbound`、`api_key` 为空、`configured` 变 `false`，界面上那一栏提示"重新粘贴一次"。
+
+三个边界：① **只比主机名**，不比端口与路径——`/v1` 换 `/v2`、Ollama 11434 挪到 11435 都不该逼人重填，为这些变动弹提示只会训练出"看到提示就再粘一次"的习惯；换主机才意味着"换了一个会收到这把密钥的对方"。② 锚点**落库**而不是每次读时算，算的话它会跟着新地址一起漂，绑定等于不存在。③ 老库升级时该列补成空串，此时按那一行自己的 `base_url` 兜底——否则升级当天所有人的已存配置会一起被判成"未配置"。重新粘贴一次密钥就是唯一的恢复动作，`POST /model/test` 在这个状态下回 400 `settings_key_unbound` 并且**一个字节都不发**。
 
 ## 4. 各格式的依赖与耗时
 
