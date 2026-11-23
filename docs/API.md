@@ -108,7 +108,7 @@
 | `POST /api/settings/model/test` | `{"base_url?","api_key?","model?"}`（空字段回落当前生效值） | 200 一律返回 `{"ok","message","model","status","latency_ms"}`——发一次 `max_tokens=1` 的最小请求；**失败也是结论不是 5xx**，上游错误体里的密钥会被替换成 `…` 再截 200 字 | `settings_incomplete` 400（三项不齐）/ `settings_key_unbound` 400（地址换过了、库里那把密钥属于旧地址，要重贴；**不发请求**）/ `settings_api_key_masked` 400（`api_key` 传的是打码值，不发请求就拒）/ `settings_base_url_refused` 400（地址指向本机、内网、云元数据或保留地址，**一个字节都不发**；本机/内网要连得设 `MINDMAP_SETTINGS_ALLOW_PRIVATE=1`，**云元数据地址这个开关也打不开**） |
 | `GET /api/auth/me` | 无 | `{"user":{…}\|null,"guest_id":str\|null,"kind":"user"\|"guest"\|"anonymous"}`，**永远 200** | — |
 | `POST /api/auth/register` | `{"username","password"}` | 201 + `{"id","username","created_at"}`，**直接登录**（同时下发会话 cookie） | 账号名不合规 `auth_username_invalid` 400；密码不足 8 位 `auth_password_too_short` 400；超 200 位 `auth_password_too_long` 400；重名 `auth_username_taken` 409（**不区分大小写**） |
-| `POST /api/auth/login` | `{"username","password"}` | `{"id","username","created_at"}` + 会话 cookie | `auth_bad_credentials` 401——**不区分"没这个人"与"密码错"**，那是账号枚举信道 |
+| `POST /api/auth/login` | `{"username","password"}` | `{"id","username","created_at"}` + 会话 cookie | `auth_bad_credentials` 401——**不区分"没这个人"与"密码错"**，那是账号枚举信道；`auth_rate_limited` 429 + `Retry-After: <秒>`——同 IP 或同账号在 15 分钟窗口内已失败 20 次 |
 | `POST /api/auth/logout` | 无 | 204，**幂等**（本来就没登录也是 204）；撤销这一次会话并清 cookie | — |
 | `POST /api/auth/password` | `{"current_password","new_password"}` | 204，清 cookie。需要**已登录 + 旧密码**；改完撤销这个人的**全部**会话 | 未登录 `auth_required` 401；旧密码不对 `auth_bad_credentials` 401；新密码长度不合规同上 |
 
@@ -121,6 +121,8 @@
 **口令用标准库 `hashlib.scrypt`**（`n=2^14, r=8, p=1`，实测一次 36 毫秒 / 16 MB），不引 `passlib` / `bcrypt` / `python-jose`——这台机器是 2C2G，少一个依赖少一份部署风险。哈希串是 `scrypt$n$r$p$<salt_hex>$<hash_hex>`，**参数写进串里**，所以将来调参不会让老密码全部失效；校验时按串里那组参数重算，并对 `n/r/p` 设上限（一行被改成 `n=2^30` 的记录会让进程申请几百 GB，那是拒绝服务）。
 
 **没有"找回密码"**：仓库里没有 SMTP，发不出任何邮件；假装有这个流程（"我们会给你发一封邮件"）比没有它更糟。真要做，入口是部署方直接改库。
+
+**登录失败是限速的，而且限速在哈希之前。** 两个桶 `ip:<地址>` 与 `acct:<小写账号名>` 各记一份失败，判据取严——只按账号限，撞库（一个口令试很多账号）绕过；只按 IP 限，NAT 出口后面的人互相拖累。规则是 15 分钟滑动窗口内前 20 次失败正常回 401，之后每次都要等 5 秒（429 + `Retry-After`），等够了放行一次，也就是封顶 12 次/分钟；窗口滑出后重新拿到 20 次，"昨晚忘了密码"不会欠到第二天。**`store.authenticate()`（那次 36 毫秒的 scrypt）在限速判据之后才被调用**——顺序反过来的话，被拒的请求照样烧算力，限速本身成了放大器，用例 `test_a_throttled_login_does_not_touch_the_hash` 钉的就是这一点。成功登录只清账号桶、**不清 IP 桶**：清 IP 桶会让"持有一个有效账号的人"能用它给自己重置后继续撞别人，而那正好是最需要防的形状；IP 桶只随窗口自然衰减。限速表读写异常时**放开**（记 `logger.error` 并当作没有记录）——关掉保护比把所有人关在门外好。
 
 **密钥与地址是绑定的（`api_key_host`）。** P0-1 的第一层是"发请求之前挡一道"（`probe._refuse`），第二层在这里：库里每一把密钥记着**它被保存时那个主机名**，`store.resolve()` 只在当前生效地址的主机名与锚点一致时才交出明文。这条挡的是第一层挡不住的形状——攻击者先在自己的面板里把地址改成 `https://attacker.example`（这一步本来没有任何密钥出门），下一次正常生成就会带着已存密钥去访问那个地址。锚点只记主机名不记端口与路径：同一台机器 `/v1` → `/v2` 不该逼人重填，换主机才意味着"换了一个会收到这把密钥的对方"。锚点是**落库**的而不是每次读时算——算的话会跟着新地址一起漂，绑定等于不存在。老库升级时该列补成空串，此时按那一行自己的 `base_url` 兜底，不会把所有已存配置一次性打成"未配置"。
 
