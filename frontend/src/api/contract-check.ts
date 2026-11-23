@@ -51,6 +51,7 @@ import type {
   Pref,
   PrefSuggestion,
   ModelSettings,
+  InstanceSettings,
   SaveModelSettingsRequest,
   SaveModelSettingsResponse,
   SavedPref,
@@ -109,6 +110,10 @@ export const checks = {
   // 明文字段（`api_key` 而不是 `api_key_masked`），这里会红——比 code review 可靠，
   // 因为加字段的人往往只是想"顺手把值也带出来"。
   modelSettingsKeys: true satisfies SameKeys<ModelSettings, Schemas['ModelSettings']>,
+  // 共享配置那一行：同样不许带明文密钥——它是"别人也在用"的那份配置，泄露面比
+  // 自己的更大。
+  instanceSettingsKeys: true satisfies
+    SameKeys<InstanceSettings, Schemas['InstanceSettings']>,
   saveModelSettingsRequestKeys: true satisfies
     SameKeys<SaveModelSettingsRequest, Schemas['SaveModelSettingsRequest']>,
   saveModelSettingsResponseKeys: true satisfies
@@ -155,6 +160,8 @@ export const checks = {
   libraryListShape: true satisfies SameShape<LibraryList, Schemas['LibraryList']>,
   librarySourceShape: true satisfies SameShape<LibrarySource, Schemas['LibrarySource']>,
   modelSettingsShape: true satisfies SameShape<ModelSettings, Schemas['ModelSettings']>,
+  instanceSettingsShape: true satisfies
+    SameShape<InstanceSettings, Schemas['InstanceSettings']>,
   saveModelSettingsResponseShape: true satisfies
     SameShape<SaveModelSettingsResponse, Schemas['SaveModelSettingsResponse']>,
   testModelSettingsResponseShape: true satisfies

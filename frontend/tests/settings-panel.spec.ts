@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
-import type { ModelSettings, TestModelSettingsResponse } from '../src/api/types';
+import type { InstanceSettings, ModelSettings, TestModelSettingsResponse } from '../src/api/types';
 import { apiKeyPlaceholder, settingSourceLabel, useSettingsStore } from '../src/stores/settings';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
@@ -56,6 +56,8 @@ function settingsPayload(overrides: Partial<ModelSettings> = {}): ModelSettings 
     deep_model_effective: 'deepseek-reasoner',
     llm_mode: 'model',
     configured: true,
+    can_edit_instance: false,
+    instance: null,
     updated_at: '2026-11-20T10:00:00.000Z',
     ...overrides,
   };
@@ -240,8 +242,8 @@ describe('打开面板：读的是"当前生效值"，密钥只有打码值', ()
     // 深度模型没配：框是空的，但"实际会发什么"要写出来（勾了深度思考时用深模型）。
     expect((wrapper.get('[data-test="settings-deep-model"]').element as HTMLInputElement).value).toBe('');
     expect(text(wrapper, '[data-test="settings-deep-effective"]')).toBe('deepseek-reasoner');
-    // 来源标签：面板设的 vs 环境变量，不标出来用户分不清"为什么这里不是我填的值"。
-    expect(wrapper.get(PANEL).text()).toContain('面板设置');
+    // 来源标签：自己设的 vs 环境变量，不标出来用户分不清"为什么这里不是我填的值"。
+    expect(wrapper.get(PANEL).text()).toContain('我的设置');
   });
 
   it('密钥框是密码类型、占位符里是打码值，**整个 DOM 里没有明文**', async () => {
@@ -479,6 +481,83 @@ describe('清除密钥是单独的动作', () => {
   });
 });
 
+describe('本站共享配置：只有部署方看得到', () => {
+  const instance: InstanceSettings = {
+    base_url: 'https://shared.example/v1',
+    api_key_masked: '…9999',
+    api_key_set: true,
+    model: 'shared-model',
+    deep_model: '',
+    configured: true,
+    updated_at: '2026-11-20T09:00:00.000Z',
+  };
+
+  it('部署方：显示共享那一行的内容与状态', async () => {
+    stubBackend({ current: { can_edit_instance: true, instance } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-instance"]')).toBe(true);
+    expect(text(wrapper, '[data-test="settings-instance-base-url"]')).toBe('https://shared.example/v1');
+    expect(text(wrapper, '[data-test="settings-instance-key"]')).toBe('…9999');
+    expect(text(wrapper, '[data-test="settings-instance-state"]')).toBe('已配置');
+  });
+
+  it('非部署方：整块都不出现（不是显示成灰的）', async () => {
+    stubBackend({ current: { can_edit_instance: false, instance: null } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    // 藏起来而不是置灰：一个点了就 403 的表单，用户会以为是网络问题。
+    expect(has(wrapper, '[data-test="settings-instance"]')).toBe(false);
+  });
+
+  it('共享行没配好时状态说"还没配好"，别让人以为游客能用', async () => {
+    stubBackend({
+      current: { can_edit_instance: true, instance: { ...instance, configured: false, api_key_set: false, api_key_masked: '' } },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(text(wrapper, '[data-test="settings-instance-state"]')).toBe('还没配好');
+    expect(text(wrapper, '[data-test="settings-instance-key"]')).toBe('（空）');
+  });
+
+  it('「存为共享配置」带 `scope: "instance"`，且把四项一起发出去', async () => {
+    const backend = stubBackend({ current: { can_edit_instance: true, instance } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-save-instance"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts).toHaveLength(1);
+    // 语义是"共享配置 = 这一份"，所以整个覆盖：空字段也要发（空串 = 清掉）。
+    expect(backend.puts[0].body).toEqual({
+      clear_api_key: false,
+      scope: 'instance',
+      base_url: 'https://api.deepseek.com/v1',
+      model: 'deepseek-chat',
+      deep_model: '',
+    });
+    // 没打字就不带 `api_key`：空串在后端是"不改"，共享那把密钥要原样留着。
+    expect(backend.puts[0].body?.api_key).toBeUndefined();
+  });
+
+  it('在共享行里打了新密钥就把新密钥带上', async () => {
+    const backend = stubBackend({ current: { can_edit_instance: true, instance } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-api-key"]').setValue(SECRET);
+    await wrapper.get('[data-test="settings-save-instance"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts[0].body?.api_key).toBe(SECRET);
+    expect(backend.puts[0].body?.scope).toBe('instance');
+  });
+});
+
 describe('测试连接', () => {
   it('用表单里的值（含还没保存的改动）发一次，结果显示在面板里', async () => {
     const backend = stubBackend();
@@ -650,8 +729,10 @@ describe('关闭', () => {
 });
 
 describe('store 与纯函数', () => {
-  it('来源标签四档：saved / env / unset / unbound', () => {
-    expect(settingSourceLabel('saved')).toBe('面板设置');
+  it('来源标签五档：saved / instance / env / unset / unbound', () => {
+    expect(settingSourceLabel('saved')).toBe('我的设置');
+    // 借用共享配置是独立一档：清掉自己那行会回到它，用户得知道这件事。
+    expect(settingSourceLabel('instance')).toBe('本站共享配置');
     expect(settingSourceLabel('env')).toBe('环境变量');
     expect(settingSourceLabel('unset')).toBe('未设置');
     // `unbound` 必须自己一档：它与 `unset` 的下一句完全不同（重贴一次 vs 去配一把）。

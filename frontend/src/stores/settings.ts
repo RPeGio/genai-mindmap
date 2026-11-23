@@ -41,10 +41,19 @@ export const SETTING_SOURCE_UNSET = 'unset';
  * 一直是好的。
  */
 export const SETTING_SOURCE_UNBOUND = 'unbound';
+/**
+ * 生效值来自**本站共享配置**（部署方填的那一份），而不是你自己那行。
+ *
+ * 与 `saved` 必须分开：看到 `saved` 时你改的就是自己那行；看到 `instance` 时你
+ * 改自己那行只是"覆盖"，清掉就回到共享配置。合成一档会让"清除"变成不敢点的
+ * 按钮——用户不知道点下去会发生什么。
+ */
+export const SETTING_SOURCE_INSTANCE = 'instance';
 
 /** 来源标签。界面要能分辨"我在面板里设的"与"部署方在环境变量里设的"。 */
 export function settingSourceLabel(source: string): string {
-  if (source === SETTING_SOURCE_SAVED) return '面板设置';
+  if (source === SETTING_SOURCE_SAVED) return '我的设置';
+  if (source === SETTING_SOURCE_INSTANCE) return '本站共享配置';
   if (source === SETTING_SOURCE_ENV) return '环境变量';
   if (source === SETTING_SOURCE_UNBOUND) return '地址换过，待重填';
   return '未设置';

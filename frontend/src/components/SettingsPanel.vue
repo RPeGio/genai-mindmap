@@ -60,6 +60,16 @@ const canClearKey = computed(() => view.value?.api_key_set === true);
  */
 const keyUnbound = computed(() => view.value?.api_key_source === SETTING_SOURCE_UNBOUND);
 
+/**
+ * 当前这个人能不能写**全站共享配置**（部署方 = 这台机器上第一个注册的账号）。
+ *
+ * 只有他能看到那一块。给所有人显示一个点了就 403 的按钮，比看不见更糟——用户会
+ * 以为是网络问题。
+ */
+const canEditInstance = computed(() => view.value?.can_edit_instance === true);
+/** 共享那一行现在配好没有。没配好时借它兜底的人（游客、新账号）根本生成不了。 */
+const instanceConfigured = computed(() => view.value?.instance?.configured === true);
+
 /** 有哪几个字段真被改过。空对象 = 什么都不用发。 */
 const dirty = computed(() => {
   const body: SaveModelSettingsRequest = { clear_api_key: false };
@@ -71,7 +81,12 @@ const dirty = computed(() => {
   return body;
 });
 
-const nothingToSave = computed(() => Object.keys(dirty.value).length <= 1);
+/** 有没有实质改动。判据不含 `clear_api_key` 这个恒定键。 */
+const changeCount = computed(
+  () => ['base_url', 'api_key', 'model', 'deep_model'].filter((key) => key in dirty.value).length,
+);
+
+const nothingToSave = computed(() => changeCount.value === 0);
 
 /** 三项齐了没有（用于保存按钮的提示文案，不用于禁用——用户可能只想先存地址）。 */
 const incomplete = computed(() => view.value?.configured !== true);
@@ -108,7 +123,7 @@ async function runTest(): Promise<void> {
 
 async function runSave(): Promise<void> {
   const body = dirty.value;
-  if (Object.keys(body).length <= 1) {
+  if (nothingToSave.value) {
     // 什么都没改：不发请求，也不假装保存过。
     return;
   }
@@ -119,6 +134,29 @@ async function runSave(): Promise<void> {
 /** 显式清空已保存的密钥。走 `clear_api_key`，不是"提交空串"。 */
 async function clearKey(): Promise<void> {
   const saved = await settingsStore.clearApiKey();
+  if (saved) fillFrom(saved);
+}
+
+/**
+ * 把上面填的这份存成**全站共享配置**（只有部署方看得到这个按钮）。
+ *
+ * 语义是整个覆盖，不是合并："共享配置 = 这一份"。所以四项都带上——`base_url` /
+ * `model` / `deep_model` 用当前表单值（空串就是清掉），密钥只有用户真打了才带
+ * （空串在后端是"不改"，所以没打字时共享那份的密钥原样留着）。
+ *
+ * 为什么不给所有人一个"保存到哪一行"的单选：绝大多数人只有自己那一份，多一个选择
+ * 只会让他们犹豫；而写共享行是部署时才做一次的动作。
+ */
+async function saveAsInstance(): Promise<void> {
+  const body: SaveModelSettingsRequest = {
+    clear_api_key: false,
+    scope: 'instance',
+    base_url: baseUrl.value.trim(),
+    model: model.value.trim(),
+    deep_model: deepModel.value.trim(),
+  };
+  if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
+  const saved = await settingsStore.save(body);
   if (saved) fillFrom(saved);
 }
 
@@ -339,6 +377,48 @@ function trapFocus(event: KeyboardEvent): void {
           </span>
         </label>
       </div>
+
+      <!--
+        全站共享配置：只有部署方看得到。
+
+        它是游客与"还没填自己密钥的人"生成时用的那一份。不显示的话，部署方看不到
+        自己配的是什么，而"游客说用不了"时无从对照。
+      -->
+      <section
+        v-if="canEditInstance"
+        data-test="settings-instance"
+        class="mt-4 rounded-md border border-slate-200 bg-slate-50/60 px-3 py-2.5"
+      >
+        <div class="flex items-baseline justify-between gap-2">
+          <h3 class="text-xs font-medium text-slate-700">本站共享配置</h3>
+          <span
+            class="text-[11px]"
+            :class="instanceConfigured ? 'text-slate-500' : 'text-amber-700'"
+            data-test="settings-instance-state"
+          >
+            {{ instanceConfigured ? '已配置' : '还没配好' }}
+          </span>
+        </div>
+        <p class="mt-1 text-[11px] leading-relaxed text-slate-500">
+          游客、以及还没填自己密钥的账号，生成时用这一份。填好之后点下面那个按钮把它存成共享配置。
+        </p>
+        <dl class="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px] text-slate-600">
+          <dt class="text-slate-400">地址</dt>
+          <dd class="truncate" data-test="settings-instance-base-url">{{ view?.instance?.base_url || '（空）' }}</dd>
+          <dt class="text-slate-400">密钥</dt>
+          <dd data-test="settings-instance-key">{{ view?.instance?.api_key_set ? view?.instance?.api_key_masked : '（空）' }}</dd>
+          <dt class="text-slate-400">模型</dt>
+          <dd class="truncate">{{ view?.instance?.model || '（空）' }}</dd>
+        </dl>
+        <button
+          type="button"
+          data-test="settings-save-instance"
+          class="mt-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+          :disabled="settingsStore.saving"
+          :title="'把上面填的这几项存成全站共享配置'"
+          @click="saveAsInstance"
+        >存为共享配置</button>
+      </section>
 
       <div class="mt-4 flex flex-wrap items-center gap-2">
         <button

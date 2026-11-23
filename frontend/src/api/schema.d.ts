@@ -1596,6 +1596,30 @@ export interface components {
             /** Message */
             message: string;
         };
+        /**
+         * InstanceSettings
+         * @description 全站共享那一行（`owner = ''`）的样子。
+         *
+         *     **只给部署方**（`can_edit_instance` 为真时才出现在响应里）。给别人看没有用：
+         *     他们改不了，那是"一片点不动的表单"；而 `base_url` 是部署方用的供应商，不该
+         *     成为所有人的可见信息。
+         */
+        InstanceSettings: {
+            /** Base Url */
+            base_url: string;
+            /** Api Key Masked */
+            api_key_masked: string;
+            /** Api Key Set */
+            api_key_set: boolean;
+            /** Model */
+            model: string;
+            /** Deep Model */
+            deep_model: string;
+            /** Configured */
+            configured: boolean;
+            /** Updated At */
+            updated_at?: string | null;
+        };
         /** KnowledgeHit */
         KnowledgeHit: {
             /** Source Id */
@@ -1838,6 +1862,12 @@ export interface components {
             configured: boolean;
             /** Updated At */
             updated_at?: string | null;
+            /**
+             * Can Edit Instance
+             * @default false
+             */
+            can_edit_instance: boolean;
+            instance?: components["schemas"]["InstanceSettings"] | null;
         };
         /** Node */
         "Node-Input": {
@@ -2194,6 +2224,8 @@ export interface components {
          *         要清空必须 `clear_api_key: true`。
          *       - `base_url` / `model` / `deep_model` 省略 → 不改；空串 → 清掉库里的覆盖，
          *         回落到环境变量。
+         *       - `scope`：`"user"`（缺省）= 写你自己那行；`"instance"` = 写全站共享那行
+         *         （只有部署方可以，别人 403 `settings_forbidden`）。
          *
          *     `extra="forbid"` 是仓库的默认风格：拼错字段名时宁可 422，也不要静默忽略——
          *     "我把密钥填进 `apikey` 了，保存成功但没生效"是最难自查的一类失败。
@@ -2212,6 +2244,12 @@ export interface components {
              * @default false
              */
             clear_api_key: boolean;
+            /**
+             * Scope
+             * @default user
+             * @enum {string}
+             */
+            scope: "user" | "instance";
         };
         /**
          * SaveModelSettingsResponse
@@ -2251,6 +2289,12 @@ export interface components {
             configured: boolean;
             /** Updated At */
             updated_at?: string | null;
+            /**
+             * Can Edit Instance
+             * @default false
+             */
+            can_edit_instance: boolean;
+            instance?: components["schemas"]["InstanceSettings"] | null;
             /** Changed */
             changed: boolean;
             /** Notice */
