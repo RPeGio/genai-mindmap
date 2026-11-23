@@ -23,9 +23,14 @@ const username = ref('');
 const password = ref('');
 
 const submitLabel = computed(() => (mode.value === 'login' ? '登录' : '注册并登录'));
+/**
+ * 登录那一句**不能**说"不再受游客额度的限制"：免费额度是按 IP 数的一个共享池，
+ * 游客和账号共用（注册一个账号不会多出次数），只有自己填了密钥才不受限。
+ * 承诺系统不会兑现的东西，比不说更糟——用户会用"我登录了怎么还不行"来回报它。
+ */
 const modeHint = computed(() => (
   mode.value === 'login'
-    ? '登录之后：导图保存到自己名下，不再受游客额度的限制。'
+    ? '登录之后：导图保存到自己名下，别的账号能看不能改。'
     : '用户名 3–32 位字母数字下划线，密码至少 8 位。'
 ));
 
@@ -49,6 +54,11 @@ async function submit(): Promise<void> {
 
 async function signOut(): Promise<void> {
   await auth.signOut();
+  // 退回「登录」而不是停在用户退出前那个模式：刚点了退出的人下一次大概率是
+  // 重新登录，不是注册一个新账号。停在「注册」等于把最不可能的动作用主按钮摆着。
+  mode.value = 'login';
+  username.value = '';
+  password.value = '';
 }
 </script>
 

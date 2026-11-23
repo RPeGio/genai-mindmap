@@ -207,4 +207,38 @@ describe('账号区的界面', () => {
     expect(wrapper.find('[data-test="auth-password"]').exists()).toBe(false);
     expect(wrapper.get('[data-test="auth-sign-out"]').text()).toBe('退出登录');
   });
+
+  it('登录那句提示不许承诺多出来的免费次数', async () => {
+    // 免费额度是按 IP 数的一个共享池，游客与账号共用——注册一个账号不会多出次数，
+    // 这里写"不再受额度限制"就是在承诺系统不会兑现的东西。
+    stubFetch({ '/auth/me': jsonReply(GUEST) });
+    const auth = useAuthStore();
+    await auth.probe();
+    const wrapper = mount(AuthPanel);
+    const hint = wrapper.text();
+    expect(hint).not.toContain('不再受游客额度');
+    expect(hint).not.toContain('额度限制');
+    expect(hint).toContain('保存到自己名下');
+  });
+
+  it('登出之后回到「登录」模式，不是停在退出前那个', async () => {
+    stubFetch({
+      '/auth/me': [jsonReply(GUEST), jsonReply(SIGNED_IN), jsonReply(GUEST)],
+      '/auth/logout': jsonReply({}, 204),
+    });
+    const auth = useAuthStore();
+    await auth.probe();
+    const wrapper = mount(AuthPanel);
+    // 先切到注册模式，再"登录"成功（这个 stub 的第二次 /me 就是已登录），最后登出。
+    await wrapper.get('[data-test="auth-switch"]').trigger('click');
+    expect(wrapper.get('[data-test="auth-submit"]').text()).toBe('注册并登录');
+    await wrapper.get('[data-test="auth-username"]').setValue('alice');
+    await wrapper.get('[data-test="auth-password"]').setValue('password123');
+    await wrapper.get('form').trigger('submit');
+    await flushPromises();
+    await wrapper.get('[data-test="auth-sign-out"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('[data-test="auth-submit"]').text()).toBe('登录');
+    expect((wrapper.get('[data-test="auth-username"]').element as HTMLInputElement).value).toBe('');
+  });
 });
