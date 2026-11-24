@@ -148,8 +148,24 @@ TTL 取 1 小时：上下架不是分钟级事件，而每次刷新要占上游 
 `_clip_tree` 回收，代价是节点变少、用户看到一张缺分支的图。16000 在"够写完"与
 "不要它多想"之间，并且仍低于 `max_tokens_cap()`。
 
+这个数只对"结构那一次"验算过。**补说明那一次不需要 16000**：它按节点数切两半、
+每半最多 40 个节点，而一次写说明的输出成本是 `per_node_tokens(detail_chars=150,
+refs=0) ≈ 151` tok/节点（说明不带引用，只有正文），40 个约 6000 tok，16000 有充足
+余量。写说明是 `chat_async` 那条出口、不传 `on_delta`，所以它走的是一次性请求，
+撞上限的表现是 `_fill_details_half` 收到 `GenerationError` → 那一半全丢（`salvage`
+回收不了半截 JSON 里的说明），实测离上限还有一倍以上余量。
+
 两条模型出口（`chat_async` 与 `provider._attempt`）都要夹，`FREE_MAX_OUTPUT_TOKENS`
 和 `FREE_MIN_OUTPUT_TOKENS` 一样只在 `resolve()` 标了 `reasoning_effort` 时生效。
+
+**上限还要进"按上限反推容量"的地方**：`agent.tools._max_tokens()` 与它下游的
+`_nodes_per_call()` 不发请求，却用这个数算"这次装得下几个节点"。少这一道时免费档
+按 65536 规划批次（`max_nodes_for_tokens(65536) = 75` 对 `max_nodes_for_tokens
+(16000) = 18`，四倍多），照它切出来的批必然被 `finish_reason=length` 截断。所以
+`_max_tokens()` 里除 `max_tokens_cap()` 之外还要过一道
+`generation.service.apply_free_tier_ceiling()`。目前 `_nodes_per_call()` 只有
+`_generate_deep` 在用（`create_deep` 生产不可达），但这个缺口会在它挂回大图时立刻
+生效，所以按"现在就接上"处理。
 
 ## 5. 免费模型也要密钥
 
