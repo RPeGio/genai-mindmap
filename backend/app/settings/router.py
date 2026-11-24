@@ -281,8 +281,10 @@ async def test_model_settings(
     """
     overrides = body or TestModelSettingsRequest()
     resolved = store.resolve()
-    base_url = (overrides.base_url or "").strip().rstrip("/") or resolved.base_url
-    api_key = (overrides.api_key or "").strip() or resolved.api_key
+    given_base = (overrides.base_url or "").strip().rstrip("/")
+    given_key = (overrides.api_key or "").strip()
+    base_url = given_base or resolved.base_url
+    api_key = given_key or resolved.api_key
     model = (overrides.model or "").strip() or resolved.model
     if not api_key and resolved.api_key_source == store.SOURCE_UNBOUND:
         # 库里有密钥，但它是给**另一个地址**存下的（`store._binding_of` 那条判定
@@ -296,6 +298,26 @@ async def test_model_settings(
             status=400)
     if not base_url or not api_key or not model:
         _raise_incomplete()
+    if not given_key:
+        # 密钥是**已存的**（库里或环境里那把），地址却可以来自 `given_base`。
+        # 绑定判定只写在 `store.resolve()` 的出口，而这里 `base_url` 是 overrides，
+        # 不经过那个出口——于是"地址随手填一个域名 + 密钥借已存的"就成了一条绕开
+        # 绑定的路，且**一次请求内就完成外送**，攻击者既不需要知道密钥，也不需要
+        # 读得到响应（PR 自查复现过这条）。所以这里补同一把尺子。
+        #
+        # 比**主机名**而不是直接拒绝"地址非空"：面板的常规用法是"地址填着不动、
+        # 点一下测试"，那不传递新目的地，应当放行；只有主机名变了才是新地址。
+        #
+        # `bound_host` 在锚点为空时用生效地址兜底——"只给了密钥没给地址"那种
+        # 部署里，它今天会被发到哪儿，就应该只允许发到哪儿。
+        bound = store.bound_host(resolved)
+        if not bound or bound != store.host_of(base_url):
+            raise store.SettingsError(
+                "settings_key_unbound",
+                "已保存的密钥只会发往它当初保存时的那台地址。这次要测的地址不是它"
+                "（或无法确认它属于哪台），请把密钥一起重新粘贴一次；要测已保存的"
+                "配置，把地址那一栏清空。",
+                status=400)
     if api_key in (store.mask_api_key(resolved.api_key),
                    store.mask_api_key(store.saved().api_key)):
         # 提交的是打码值（`…abcd`）。真拿去发请求，上游会 401，而这里会把它翻译成

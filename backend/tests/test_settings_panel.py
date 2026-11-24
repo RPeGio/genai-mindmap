@@ -1193,3 +1193,55 @@ def test_testing_a_connection_after_the_address_moved_says_what_to_do(monkeypatc
     assert SECRET not in body.text
     assert sent == [], "旧密钥被发到新地址去了"
 
+
+def test_probe_never_sends_a_saved_key_to_a_different_host(monkeypatch):
+    """P0-1 的第三条入口：**一次请求内**完成的密钥外送。
+
+    `PUT /model/test` 可以只带 `base_url`——密钥留空就走"回落生效值"。绑定判据写在
+    `store.resolve()` 的出口，而这里的地址是请求体里的 overrides，不经过那个出口，
+    于是"随手填一个域名 + 借已存密钥"绕开了整条绑定。攻击者既不需要知道密钥，也
+    不需要读得到响应：请求发出去，密钥就在路径上了。
+
+    判据：已存的密钥只能发往它被绑定的那台主机；主机对不上就是 400，且**一个字节
+    都不许发**（`sent == []` 是"发请求之前就挡住"的证据）。
+    """
+    sent = _use_fake(monkeypatch, response=_FakeResponse(200, {
+        "model": "m", "choices": [{"message": {"content": "p"}}],
+    }))
+    client.put("/api/settings/model",
+               json=_body(base_url="https://mine.example/v1", api_key=SECRET, model="m"))
+
+    body = client.post("/api/settings/model/test",
+                       json=_body(base_url="https://attacker.example/v1"))
+    assert body.status_code == 400
+    assert body.json()["code"] == "settings_key_unbound"
+    assert SECRET not in body.text
+    assert sent == [], "已存的密钥被发到了另一个主机"
+
+    # 同主机换路径照旧放行：那不是新目的地，逼人重贴只会训练出"看到提示就再粘一次"。
+    sent.clear()
+    body = client.post("/api/settings/model/test",
+                       json=_body(base_url="https://mine.example/v1/v2"))
+    assert body.status_code == 200
+    assert sent[0]["url"] == "https://mine.example/v1/v2/chat/completions"
+
+
+def test_probe_allows_a_new_host_when_the_key_comes_with_it(monkeypatch):
+    """自己填地址 + 自己填密钥是**合法**用法，不能被上面那条判据误伤。
+
+    面板支持"改了地址、还没保存，先点一下测试"。这时密钥也得一起粘进来——那一对
+    是用户自己给出的新绑定，与库里的旧锚点无关。
+    """
+    sent = _use_fake(monkeypatch, response=_FakeResponse(200, {
+        "model": "m", "choices": [{"message": {"content": "p"}}],
+    }))
+    client.put("/api/settings/model",
+               json=_body(base_url="https://mine.example/v1", api_key=SECRET, model="m"))
+
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://other.example/v1", api_key="sk-other-7777", model="m"))
+    assert body.status_code == 200
+    assert body.json()["ok"] is True
+    assert sent[0]["url"] == "https://other.example/v1/chat/completions"
+    assert sent[0]["headers"]["Authorization"] == "Bearer sk-other-7777"
+

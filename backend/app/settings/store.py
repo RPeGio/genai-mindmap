@@ -193,13 +193,86 @@ class SettingsError(AppError):
 
 
 def _columns(conn: sqlite3.Connection) -> set[str]:
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({TABLE})")}
+    return _columns_of(conn, TABLE)
+
+
+def _columns_of(conn: sqlite3.Connection, table: str) -> set[str]:
+    """这张表现在的列名；表不存在时是空集。
+
+    迁移要按**老表实际有什么列**来搬（见 `_copy_legacy_rows`），所以不能只有
+    "当前表"这一份。
+    """
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
     return row is not None
+
+
+def _not_null_columns(conn: sqlite3.Connection, table: str = TABLE) -> set[str]:
+    """这张表里所有带 `NOT NULL` 的列。
+
+    搬行时要对它们补默认值：`INSERT OR IGNORE` 会把违反约束的整行丢掉，而老表
+    可能允许 NULL（main 的 `deep_model TEXT` 就没有 `NOT NULL`）。用 `PRAGMA
+    table_info` 的 `notnull` 那一位判断，不手抄列名——手抄的清单改表时不会跟着变。
+    """
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})") if row[3]}
+
+
+def _copy_legacy_rows(conn: sqlite3.Connection) -> None:
+    """把老表那一行搬进新表，**只搬两张表都有的列**。
+
+    列名不能写死。`api_key_host` 是 PR#27 才加到新表上的，而 main 时代的老表里
+    根本没有这一列——写死成 `SELECT ..., COALESCE(api_key_host, '') FROM 老表`
+    会在 `SELECT` 阶段抛 `no such column`，而这里是 `connect()` 的中段，抛出去
+    就是**整个服务起不来**（不是 `saved()` 那个降级分支能兜住的）。
+
+    实测过：拿 main 的老库跑一遍，`repository.connect()` 直接
+    `sqlite3.OperationalError: no such column: api_key_host`。
+
+    老表没有的列按"新表那次补列的语义"给默认值：`api_key_host` 缺就是空串
+    （= 没绑定过，`resolve()` 按"绑定校验不生效"处理，不会在升级后把已存配置
+    打成未配置）。老表有而新表没有的列（已废弃的）自然不搬。
+    """
+    source = _columns_of(conn, _LEGACY_TABLE)
+    target = _columns(conn)
+    if not source or not target:
+        return
+    #: 老表里没有时补什么。目前只有 `api_key_host` 是"新增列"，它的缺省语义是空串。
+    defaults: dict[str, object] = {"api_key_host": ""}
+    overrides: dict[str, object] = {"owner": INSTANCE_OWNER}
+    carried = [name for name in sorted(target)
+               if name not in overrides and name in source]
+    missing = [name for name in sorted(target)
+               if name not in overrides and name not in source and name in defaults]
+    names = [*overrides, *carried, *missing]
+    #: 新表里 `NOT NULL` 的那些列。老表可能宽容地允许 NULL（main 的
+    #: `deep_model TEXT` 就没有 `NOT NULL`，而新表是 `TEXT NOT NULL DEFAULT ''`），
+    #: 搬过来时要在 `SELECT` 里就地补默认值。
+    required = _not_null_columns(conn)
+    select_parts = ["?"] * len(overrides)
+    values: list[object] = [*overrides.values()]
+    for name in carried:
+        if name in required:
+            select_parts.append(f'COALESCE("{name}", ?)')
+            values.append(defaults.get(name, ""))
+        else:
+            select_parts.append(f'"{name}"')
+    select_parts.extend(["?"] * len(missing))
+    values.extend(defaults[name] for name in missing)
+    # `OR IGNORE` 而不是 `OR REPLACE`：能走到"老表还在、新表也有行"的时候，说明上一次
+    # 迁移在"搬完 / 删老表"之间断了，而那一瞬间之后可能已经有人在新表上保存过配置。
+    # 老表里那份是**更旧的**，拿它盖掉新行等于把用户刚改的设置回退。已经搬过去的那
+    # 一份本来就一样，IGNORE 不丢东西。
+    #
+    # **`IGNORE` 的代价**：它连 `NOT NULL` 违规也一起吞掉（`OR REPLACE` 会换成列
+    # 默认值）。实测过：main 的老库里 `deep_model` 是 NULL，直接搬会让整行被静默
+    # 丢掉、`rowcount = 0`，用户看到"升级完密钥没了"。所以上面逐个 `COALESCE`。
+    conn.execute(
+        f"""INSERT OR IGNORE INTO {TABLE} ({", ".join(f'"{name}"' for name in names)})
+            SELECT {", ".join(select_parts)} FROM {_LEGACY_TABLE}""", tuple(values))
 
 
 def _migrate_legacy(conn: sqlite3.Connection) -> None:
@@ -219,8 +292,21 @@ def _migrate_legacy(conn: sqlite3.Connection) -> None:
       2. 删掉 `_LEGACY_TABLE`。
 
     进程在任何一处被杀掉，下一次 `connect()` 看到的都是可识别的中间态：新表已建、
-    老表还在 → 再搬一次（`INSERT OR REPLACE` 幂等）；老表已删、新表在 → 什么都不做。
+    老表还在 → 再搬一次（`INSERT OR IGNORE` 幂等）；老表已删、新表在 → 什么都不做。
     这是刻意的：迁移跑在一个每个请求都会调的函数里，它不能有"只许成功一次"的假设。
+
+    **每段末尾都要 `commit()`**——这一版最贵的教训。`sqlite3` 在默认
+    `isolation_level` 下只对 DML 开事务，DDL（`ALTER` / `CREATE` / `DROP`）走自动
+    提交。所以"改名 → 建表 → 搬行 → 删表"这四步里，一、二、四步立刻落盘，而
+    `INSERT ... SELECT` 停在一个没人提交的事务里，`connect()` 的调用方一 `close()`
+    就整段回滚。磁盘上留下的是"新表空的 + 老表还在"，而判据（老表在 = 还没搬完）
+    下次仍然成立，于是**又搬一次空表、老数据再也没被读过**——用户在页面上看到的是
+    "我配的密钥没了"。第一次读之所以还能读到，是因为同一条连接里事务还没回滚。
+
+    开发库上真踩到过：
+
+        tables: [... 'model_settings_legacy_v1' ... 'model_settings']
+        model_settings rows: []
 
     **只在真的看到老表时才动**（判据是 `id` 列且没有 `owner` 列）。老表独有的 `id`
     而不是新表也有的 `owner`：迁移到一半时新表已经有了 `owner`，用 `owner` 判会把
@@ -240,13 +326,10 @@ def _migrate_legacy(conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE)
     if legacy_renamed and _has_table(conn, _LEGACY_TABLE):
         # 第 2 段。搬那一行（如果它真的有行：老库可能是空表）。
-        conn.execute(
-            f"""INSERT OR REPLACE INTO {TABLE}
-                    (owner, base_url, api_key, model, deep_model, updated_at, api_key_host)
-                SELECT ?, base_url, api_key, model, deep_model, updated_at,
-                       COALESCE(api_key_host, '')
-                FROM {_LEGACY_TABLE}""", (INSTANCE_OWNER,))
+        _copy_legacy_rows(conn)
+        conn.commit()
         conn.execute(f"DROP TABLE {_LEGACY_TABLE}")
+    conn.commit()
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -587,6 +670,39 @@ def _free_model(base_url: str) -> str:
     if not free_models.enabled():
         return ""
     return free_models.current(base_url) or ""
+
+
+def host_of(base_url: str) -> str:
+    """`base_url` 的主机名（小写，不含端口与路径）；解析不了时返回空串。
+
+    公开 `_host_of` 的**唯一理由**：路由层那条"测连接"的路径要拿同一把尺子比
+    "这个地址是不是密钥当初绑定的那台"。两处各写一套解析，迟早会在
+    `https://x/v1` 与 `https://x:443/v1` 这种形状上给出不同答案。
+    """
+    return _host_of(base_url)
+
+
+def bound_host(resolved: Resolved) -> str:
+    """生效密钥绑定的主机名；没密钥、或无法确认绑在哪台时返回空串。
+
+    给 `settings.router` 的"测连接"用。那条路的地址是**请求里给的**（`overrides`），
+    不经过 `resolve()`，所以 `resolve()` 出口那道绑定校验管不着它：用户可以把地址
+    填成任意域名、而密钥留空借走已存的那把，一次请求就把部署方的密钥发出去
+    （PR#27 审查的 P0-1）。
+
+    锚点行与 `resolve()` 里的 `_binding_of` 同一套口径：密钥来自实例行就看实例行，
+    否则看当前这个人自己那行。兜底用生效地址——"只给了密钥没给地址"的部署里，
+    那把密钥今天本来就会被发到那儿，返回空串会让那条常规用法突然报错。
+    """
+    if not resolved.api_key:
+        return ""
+    from app.auth.identity import current_identity
+
+    if resolved.api_key_source == SOURCE_INSTANCE:
+        anchor = saved(INSTANCE_OWNER)
+    else:
+        anchor = saved(owner_of(current_identity()))
+    return _binding_of(anchor, resolved.api_key_source) or _host_of(resolved.base_url)
 
 
 def free_tier_endpoint() -> tuple[str, str]:
@@ -1021,10 +1137,12 @@ __all__ = [
     "SETTINGS_LOCK_TIMEOUT",
     "SettingsError",
     "TABLE",
+    "bound_host",
     "clear",
     "deep_override",
     "ensure_schema",
     "free_tier_endpoint",
+    "host_of",
     "llm_mode",
     "mask_api_key",
     "owner_of",
