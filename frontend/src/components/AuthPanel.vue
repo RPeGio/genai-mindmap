@@ -81,6 +81,9 @@ async function signOut(): Promise<void> {
       <p class="leading-relaxed text-[11px] text-slate-400">
         保存的导图都在你名下，别的账号能看不能改。
       </p>
+      <p class="leading-relaxed text-[11px] text-slate-400">
+        这里没有改密码的入口：改密码要旧密码，而且改完所有设备都要重新登录，那是设置页的事。忘了密码这边也帮不上——仓库里没有发邮件的地方，只能让部署的人直接改库。
+      </p>
       <button
         type="button"
         data-test="auth-sign-out"

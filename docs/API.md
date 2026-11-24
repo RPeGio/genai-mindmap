@@ -98,6 +98,7 @@
 | `GET /api/agent/runs/{run_id}` | 无 | 同上再加 `candidate`（整棵树；字段名沿用，语义是"这次生成产出的树"）、`failure`、`mode` | 不存在 404 |
 | `POST /api/agent/runs/{run_id}/applied` | 无 | 204；幂等（只打第一个时间戳）。语义是**这份结果被保存进库了**（前端在保存成功后调用），它决定下次进页面还要不要提醒 | 不存在 404 |
 | `GET /api/prefs` | 无 | 全部偏好：`key` / `value` / `scope` / `source` / 两个时间戳，以及 `last_applied_at`（来自 `runs.request.prefs_applied`，为空 = 从未生效） | — |
+| `GET /api/prefs/{pref_key}` | 无 | 单条偏好，形状同上 | 不存在 404（`pref_not_found`）。**这条端点原先缺失**，于是 `GET /api/prefs/style` 这类请求会命中 `/{pref_key}` 却被判 405「方法不允许」——字面意思是"资源存在但方法不行"，与实情（根本没这条偏好）正好相反 |
 | `PUT /api/prefs/{pref_key}` | `{"value":"…","source":"user_explicit / suggestion_accepted","source_run_id":null}` | `{"pref":…,"changed":true/false}`；同值重复提交 `changed=false` 且不刷新 `updated_at` | 键非法 / 枚举外 / 备注超 8 条或 500 字 400（`pref_key_invalid` / `pref_value_invalid` / `pref_limit_exceeded`） |
 | `DELETE /api/prefs/{pref_key}` | 无 | 204，硬删（没有软删） | 不存在 404（与"删了但还在"必须分得开） |
 | `GET /api/prefs/suggestions` | 无 | 候选建议数组（`key` / `value` / `label` / `count` / `message`）。**只读不落库**：最近 3 次有效选择都是同一个值、且与当前偏好不同才提 | — |
@@ -120,6 +121,20 @@
 
 `runs` 的可见性口径**刻意与导图不同**：只本人可见。导图是作品、读共享；`runs` 是过程记录（还没保存的树、模型的思考、失败原因），属于发起者。别人的 `run_id` 读 `GET /runs/{id}` 返 404（不是 403：`run_id` 是随机串，"存在但不属于你"本身就是不该给出的信息），`pending` 永远按 owner 过滤，`POST /runs/{id}/applied` 也只有本人能打——否则知道别人 `run_id` 的人能替他标掉这一位，那条记录再也不会出现在他的「上次的结果」里，一条安静的数据丢失。
 
+**流入口这条路也是按 owner 的**：`POST /agent/runs/stream` 带别人的 `run_id` 时，既不会重放他的树、也不会把他的行重开成自己的，统一 404 `run_not_found`。`runs.begin()` 的重开 `UPDATE` 带着 `AND owner = ?`——没有这个条件，任何一个知道别人 `run_id` 的人都能把那个 `failed` 行"接着跑"成自己的，`UPDATE ... SET owner = ?` 会把行改归他，原主人之后连 `GET /runs/{id}` 都是 404。审查时实测过这条（`tests/test_isolation.py` 里两条 stream 用例钉住它）。
+
+**五张表各不相同的口径，一张表看完**：
+
+| 数据 | 谁读 | 谁写 | 说明 |
+| --- | --- | --- | --- |
+| `mindmaps`（保存的图） | 所有人 | 只有创建者 | 读共享写限主；别人 `PUT` 403 `map_forbidden` |
+| `runs`（未保存的树 / 运行记录） | 只有本人 | 只有本人 | 别人 404（含 stream 入口，不只是 detail） |
+| `knowledge`（材料库） | 所有人 | 所有人 | **刻意共享**：单用户单库是部署假设，多账号 = 共用一个库（`docs/DEPLOY.md` 有原文） |
+| `memory_items`（推断出的记忆） | 只有本人 | 只有本人 | 存的是"关于这个人的推断"，跨账号读等于共享人格画像 |
+| `user_prefs` / `style_profile`（偏好与风格画像） | 只有本人 | 只有本人 | `note.*` 是唯一进 prompt 的自由文本——不能让别人往里写 |
+
+`memory_items`、`user_prefs`、`style_profile` 上**只有**"共享是有意的"那两张（导图读、材料库）之外的口径：其余按 owner 隔离。三者都是 PR#27 新加的列（老库迁移到 `owner = ''`，语义是"无主"，只有部署方能改），迁移在 `repository.connect()` 里两段式跑，幂等且可从半成品状态续上。
+
 **为什么门禁在中间件而不是路由依赖**：`IdentityMiddleware` 先把身份放进 ContextVar，`GateMiddleware` 只读。两者注册顺序不能反——Starlette 的 `add_middleware` 是 `insert(0)`，后注册的在外层，反了就是"门禁跑在身份解析之前"，`current_identity()` 恒匿名、**整站 401**，而现象看起来像部署坏了或者 cookie 没生效。`tests/test_gate.py::test_the_gate_wraps_the_identity_layer` 钉住这个顺序。
 
 **前端启动顺序也是硬要求**：进页面先 `GET /api/auth/me`（拿游客 cookie）**再挂载 `App`**。反过来（先挂载）会让挂载瞬间发出的那批请求（偏好、知识库、可恢复的运行）赶在 cookie 之前到后端，一起 401——现象是"页面一打开就报错，刷新一下又好了"。见 `frontend/src/main.ts`。
@@ -127,6 +142,8 @@
 **会话是 HttpOnly cookie，不是 JWT，也不出现在任何响应体里。** cookie 名 `mm_session`，属性 `Path=/; HttpOnly; SameSite=Strict`（走 https 才加 `Secure`，本机 http 不加——否则部分浏览器直接不收）。库里存的是 `sha256(token)`：库文件泄漏时拿到的是哈希，不是一串能直接用的 cookie。**可撤销**是这次整改的硬要求，无状态 token 只能等它自己过期，所以没用 JWT（详见 `backend/app/auth/store.py` 的文件头）。
 
 **游客 cookie（`mm_guest`）只由 `GET /api/auth/me` 下发**，`Max-Age` 一年。它的语义是"这台浏览器"而不是"这次登录"，免费额度那一批会按它计数；放在别的接口上（每次生成、每次保存）会让"我到底发过几个游客 id"变成无法回答的问题。
+
+**游客 cookie 的值是签名过的**（`<32 位 id>.<16 位 hmac>`，见 `auth/store.py` 的 `sign_guest` / `read_guest`）。没有签名时它只是一段格式合法的十六进制串——改一下就能变成别人的身份（审查时实测：拿别人的 id 能读到他的草稿、待处理列表、他那次运行的树）。签名密钥从库文件路径派生，**不引入新环境变量**：多一个 env 就多一种"忘了设 / 两台不一致"的故障形态，而这两种故障都表现为"游客数据全丢"。伪造或形状不对的 cookie **等价于没有 cookie**（`/me` 补发一个新的），不是 401——游客是合法状态，一份坏 cookie 不该让页面打不开。签名不防"cookie 被真偷走"，那由 `HttpOnly` + `SameSite=Strict` + 只走 https 管。
 
 **口令用标准库 `hashlib.scrypt`**（`n=2^14, r=8, p=1`，实测一次 36 毫秒 / 16 MB），不引 `passlib` / `bcrypt` / `python-jose`——这台机器是 2C2G，少一个依赖少一份部署风险。哈希串是 `scrypt$n$r$p$<salt_hex>$<hash_hex>`，**参数写进串里**，所以将来调参不会让老密码全部失效；校验时按串里那组参数重算，并对 `n/r/p` 设上限（一行被改成 `n=2^30` 的记录会让进程申请几百 GB，那是拒绝服务）。
 

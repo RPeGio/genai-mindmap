@@ -606,7 +606,17 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Get Pref
+         * @description 读一条。不存在 404，不是 200 + null。
+         *
+         *     **为什么要这个端点**：`/api/prefs/{pref_key}` 之前只挂了 `PUT` / `DELETE`，于是
+         *     `GET /api/prefs/style` 这类请求会命中这条路径却被判成"方法不允许"（405）。405
+         *     的字面意思是"这个资源存在，但这个方法不行"，而实际含义是"根本没有这个偏好"——
+         *     同一件事两种错法，排查时会往错误的方向翻代码。现在未知键是 404，与 `DELETE`
+         *     的口径一致。
+         */
+        get: operations["get_pref_api_prefs__pref_key__get"];
         /**
          * Set Pref
          * @description 写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。
@@ -643,6 +653,10 @@ export interface paths {
          *
          *     它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过
          *     （会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。
+         *
+         *     **只列这个人自己的**：记忆里存的是"关于这个人的推断"（在做哪些项目、习惯
+         *     怎样），跨账号读等于让所有人共享一份人格画像。加账号之前没有这条边界，因为
+         *     那时只有一个人。
          */
         get: operations["list_memories_api_memory_get"];
         put?: never;
@@ -673,6 +687,9 @@ export interface paths {
         /**
          * Delete Memory
          * @description 硬删。404 而不是幂等 204：界面上"这条已经不在了"与"我删了但没删掉"必须分开。
+         *
+         *     别人的记忆同样回 404（`owner` 参与 `WHERE`）：既不删，也不告诉对方"这个 id
+         *     存在但不属于你"——那本身就是一条不该泄漏的事实。
          */
         delete: operations["delete_memory_api_memory__item_id__delete"];
         options?: never;
@@ -3541,6 +3558,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Pref"][];
+                };
+            };
+        };
+    };
+    get_pref_api_prefs__pref_key__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Pref"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
