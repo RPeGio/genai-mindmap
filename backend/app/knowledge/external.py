@@ -608,10 +608,35 @@ def _proxy() -> str | None:
         if raw:
             break
     if not raw:
+        _warn_default_proxy()
         return DEFAULT_PROXY
     if raw.lower() in ("none", "off", "direct", "0"):
         return None
     return raw
+
+
+# `DEFAULT_PROXY` 这个兜底值是两个环境里含义相反的东西：
+#   - 开发机上它是对的（Clash Verge 就在 7897，外部检索能通）；
+#   - 服务器上它是错的（那儿没人监听 7897），而表现是**五个源全部 ConnectError**，
+#     上层只看到"这次没搜到外部资料"——坏了和本来就没有长得一样。
+# 所以走兜底时必须留痕。日志只写一次：它在每次检索里都会被调用，逐次 warning 会把
+# 真正的问题淹掉。
+_WARNED_DEFAULT_PROXY = False
+
+
+def _warn_default_proxy() -> None:
+    """走到 `DEFAULT_PROXY` 兜底时告警一次。"""
+    global _WARNED_DEFAULT_PROXY
+    if _WARNED_DEFAULT_PROXY:
+        return
+    _WARNED_DEFAULT_PROXY = True
+    logger.warning(
+        "没有配置 %s，外部检索正在猜本机代理 %s。这在开发机上通常是对的，"
+        "在服务器上大概率没人监听那个端口——那会让每个外部源都连不上，"
+        "而调用方只会看到『没有搜到外部资料』。线上请显式设置 %s，"
+        "或设成 none 表示直连。",
+        EXTERNAL_PROXY_ENV, DEFAULT_PROXY, EXTERNAL_PROXY_ENV,
+    )
 
 
 def _client() -> httpx.Client:
