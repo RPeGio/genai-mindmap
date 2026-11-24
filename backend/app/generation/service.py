@@ -7,6 +7,7 @@ import math
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -958,29 +959,70 @@ def _model_for(base: str, model: str, deep_thinking: bool) -> str:
     return model
 
 
-def _stream_frame(data: str) -> tuple[str, str | None] | None:
-    """一帧 `data:` 里的 `(delta.content, finish_reason)`；形状不对返回 None。
+def _stream_frame(data: str) -> tuple[str, str, str | None] | None:
+    """一帧 `data:` 里的 `(delta.content, delta.reasoning, finish_reason)`。
 
-    `content` 与 `finish_reason` 都可能只出现在其中一部分帧里（首帧常见
-    `role`、末帧才带 `finish_reason`），所以两者各自缺省，调用方不该指望
-    "一帧里同时拿到正文和结束原因"。
+    形状不对返回 None。三个字段都可能只出现在一部分帧里（首帧常见 `role`、
+    末帧才带 `finish_reason`），所以各自缺省，调用方不该指望"一帧里同时拿到
+    正文、思考与结束原因"。
+
+    `reasoning` 是模型的思考增量。**字段名是 `reasoning` 而不是
+    `reasoning_content`**：Command Code 的免费模型（`recursive/flint-v1.0:free`
+    / `stealth/glyph-cluster:free`）实测逐帧发的是 `delta.reasoning`，探针统计
+    到 `{'role': 9, 'reasoning': 41, 'content': 56}`。DeepSeek 的推理模型用
+    `reasoning_content`，所以两个都认、先认 `reasoning`——多认一个名字的成本是
+    一行，认错的成本是"推理模型的思考过程永远显示不出来"。
+
+    思考与正文分开返回、不拼在一起：正文要拼进 `content` 去解析 JSON，思考只
+    用来告诉页面"它在动"，拼进去会把 JSON 解析搞坏。
     """
     try:
         choice = json.loads(data)["choices"][0] or {}
         delta = choice.get("delta") or {}
         text = delta.get("content")
+        thought = delta.get("reasoning")
+        if not isinstance(thought, str) or not thought:
+            thought = delta.get("reasoning_content")
         reason = choice.get("finish_reason")
     except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
         return None
     return (text if isinstance(text, str) else "",
+            thought if isinstance(thought, str) else "",
             reason if isinstance(reason, str) else None)
+
+
+# 思考增量的去处。**用 ContextVar 而不是给 `chat_async` 加参数**，两个理由：
+#
+#   1. `chat_async` 的调用方是 `tools._chat`，而测试里有四十来个按脚本回放的假
+#      出口（`chat(system, user, *, max_tokens=None, on_delta=None)`）。加一个
+#      关键字参数会让它们全部 `TypeError`，而它们与"思考过程"这件事毫无关系。
+#   2. 真正的调用点有六个（骨架 / 结构 / 说明的两半 / 分片展开 / node_expand）。
+#      逐个手传参数这种事在这条链上出过一次——`deep_thinking` 当初就是逐个传的，
+#      结果六个点里一个都没传，开关白勾了一整轮（见 `tools._chat` 的注释）。
+#      ContextVar 只有一个设置点（`agent.service._run_tool`），六个点自动都在。
+#
+# 默认 None 同样是硬要求：单测与直接调工具的代码没有消费者，这条路上不能多发一帧，
+# 也不能因为拿不到 sink 就跳过流式请求。
+_thinking_sink: ContextVar[Callable[[str], Awaitable[None]] | None] = ContextVar(
+    "generation_thinking_sink", default=None)
+
+
+def set_thinking_sink(sink: Callable[[str], Awaitable[None]] | None) -> Any:
+    """挂上"思考增量往哪送"。返回的 token 交给 `reset_thinking_sink` 复位。"""
+    return _thinking_sink.set(sink)
+
+
+def reset_thinking_sink(token: Any) -> None:
+    """恢复上一个 sink。**必须与 `set_thinking_sink` 成对**：不复位会让下一次
+    运行把思考帧发进上一个已经没人读的队列（`_run_tool` 用 `finally` 保证）。"""
+    _thinking_sink.reset(token)
 
 
 async def _chat_streamed(
     base: str,
     request_body: dict[str, Any],
     headers: dict[str, str],
-    on_delta: Callable[[str], Awaitable[None]],
+    on_delta: Callable[[str], Awaitable[None]] | None,
 ) -> dict[str, Any] | None:
     """试一次 `stream: true` 请求：成功返回与一次性路径同形的解析结果。
 
@@ -992,11 +1034,18 @@ async def _chat_streamed(
     其余一切（服务端不认 `stream` 直接回整包 JSON、流里一段正文都没有、流中途
     断掉、拼起来的正文解析不出对象、网络层报错）都退回 None：预览少几帧可以，
     整次生成不能因为预览机制而失败。
+
+    `on_delta` 可以为 None：写说明那条链没有预览解析器，但它有思考 sink，也要
+    走流式（实测写说明要 232.8 秒，是整条链最长的静默段）。
     """
     content = ""
     finish_reason: str | None = None
     ended = False          # 见到 `[DONE]` 或 finish_reason 才算这次流完整结束
     callback: Callable[[str], Awaitable[None]] | None = on_delta
+    # 思考增量走 ContextVar 那条通道，与 `on_delta`（正文增量）分开：正文的消费者
+    # 是预览解析器（`_GenerateGrowStream`），思考的消费者是"让页面看见它在动"，
+    # 两者出错时该各自降级。`sink` 为 None 时这些帧一个字节都不产生。
+    sink = _thinking_sink.get()
     body = dict(request_body, stream=True)
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS,
@@ -1024,10 +1073,18 @@ async def _chat_streamed(
                     frame = _stream_frame(data)
                     if frame is None:
                         continue
-                    text, reason = frame
+                    text, thought, reason = frame
                     if reason is not None:
                         finish_reason = reason
                         ended = True
+                    # 思考先上报：它通常排在正文之前（模型先想、后写），而且模型
+                    # 只思考不落笔的那段最需要"它在动"的证据。回调自己坏了就
+                    # 关掉它，不能让"显示思考"这件事连累这次生成。
+                    if thought and sink is not None:
+                        try:
+                            await sink(thought)
+                        except Exception:  # noqa: BLE001 — 纯展示，出错就不显示
+                            sink = None
                     if not text:
                         continue
                     content += text
@@ -1322,7 +1379,10 @@ async def chat_async(
         # 首个候选复用已经拼好的请求体；后续候选只换模型名，其余字节不动。
         attempt_body = request_body if candidate == model else dict(request_body, model=candidate)
         try:
-            if on_delta is not None:
+            # 走不走流式看"有没有人要增量"，两条通道各算一条：写说明那条链没有
+            # 预览解析器（`on_delta is None`），但它是最长的一段（实测 232.8 秒），
+            # 恰恰最需要"它在动"。只按 `on_delta` 判断会让它全程静默。
+            if on_delta is not None or _thinking_sink.get() is not None:
                 streamed = await _chat_streamed(base, attempt_body, headers, on_delta)
                 if streamed is not None:
                     return streamed

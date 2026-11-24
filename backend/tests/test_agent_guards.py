@@ -477,15 +477,17 @@ def test_timed_out_tool_reports_the_same_sentence_as_the_loop(caplog):
     assert caplog.text.count("tool_timeout") >= 1
 
 
-def test_seconds_ceiling_is_unchanged():
-    """`max_seconds` 这次**没有**放宽：600 秒仍是默认的物理边界。
+def test_seconds_ceiling_covers_the_free_tier():
+    """`max_seconds` 默认 1800 秒：实测推着改的，不是拍脑袋放宽。
 
-    调大它会让用户等更久，而"50 次工具调用能不能跑完"的瓶颈是模型往返延迟，
-    不是这个数：`edit` 意图下一次细粒度工具本身是内存操作（毫秒级），一次往返
-    5–20 秒时 50 次大约 250–1000 秒——撞线是**可能**的。撞线时的解释比放宽数字
-    更有用，所以改成在诊断里说清"用掉多少、做到哪、之后没执行"。
+    600 秒那一版是照付费档拍的（同一张图约 103 秒）。免费档实测整条链
+    **567.6 秒**（结构 311.7s + 写说明 232.8s + 收尾 12.7s，33 个节点），
+    另有一次 600.1 秒被掐断——也就是说 600 秒不是"余量偏薄"，是**恰好落在
+    正常生成耗时上**，一半的请求会以 `budget_exhausted` 收场。
+
+    1800 = 实测的三倍余量。上界仍是一小时：那是"卡住不动"的物理边界。
     """
-    assert RunBudget().max_seconds == 600.0
+    assert RunBudget().max_seconds == 1800.0
     with pytest.raises(ValidationError):
         RunBudget(max_seconds=3601)
 
