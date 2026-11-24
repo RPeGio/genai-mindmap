@@ -12,7 +12,8 @@
    也要记 warning。两者都不许静默——"没有免费档"与"这次没拉到"是两件事。
 4. **接线**：打开开关之后 `resolve()` 把模型名换成免费那个、并给出
    `reasoning_effort`；两条模型出口（`chat_async` 与 provider）都要把它放进
-   请求体，且 `max_tokens` 抬到 4000（1400 时正文会被 reasoning 吃光）。
+   请求体，且 `max_tokens` 同时有**下限**（1400 时正文会被 reasoning 吃光）与
+   **上限**（免费模型按额度大小决定思考多久，不夹上限时整条链 549.9 秒、夹住 359.6 秒）。
 
 时间在测试里不睡：缓存条目直接改时间戳来"让时间过去"。
 """
@@ -321,6 +322,39 @@ def test_chat_async_sends_the_reasoning_effort_and_a_floor_on_max_tokens(
     assert sent[0]["max_tokens"] >= generation_service.FREE_MIN_OUTPUT_TOKENS
 
 
+def test_chat_async_puts_a_ceiling_on_max_tokens_for_the_free_tier(
+        monkeypatch, llm_env):
+    """只抬下限是错的：调用方要 65536 时 `max(65536, 4000)` 还是 65536。
+
+    免费模型**按额度大小决定思考多久**（同一份提示词：cap=4000 → 19.9 秒、
+    cap=65536 → 87.7 秒，正文都是 1900 字左右），所以上限必须真的夹住，
+    而不是只保证"不太小"。整条链实测 549.9 秒 → 359.6 秒就是这一条。
+    """
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    _put_cache(["recursive/flint-v1.0:free"])
+    sent = _capture_chat(monkeypatch)
+
+    asyncio.run(chat_async("sys", "user", max_tokens=65536))
+
+    assert sent[0]["max_tokens"] == generation_service.FREE_MAX_OUTPUT_TOKENS
+    assert sent[0]["max_tokens"] <= generation_service.FREE_MAX_OUTPUT_TOKENS
+    # 上限必须留得住一次结构调用的正文：实测 1723–2712 字 + 最多 2052 的 reasoning。
+    assert generation_service.FREE_MAX_OUTPUT_TOKENS > generation_service.FREE_MIN_OUTPUT_TOKENS
+
+
+def test_the_ceiling_never_exceeds_the_server_cap(monkeypatch, llm_env):
+    """服务端上限优先：`MINDMAP_LLM_MAX_TOKENS` 比免费档上限还小时，听服务端的。"""
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    monkeypatch.setenv(generation_service.MAX_TOKENS_ENV, "4000")
+    generation_service.reset_learned_max_tokens()
+    _put_cache(["recursive/flint-v1.0:free"])
+    sent = _capture_chat(monkeypatch)
+
+    asyncio.run(chat_async("sys", "user", max_tokens=65536))
+
+    assert sent[0]["max_tokens"] == 4000
+
+
 def test_chat_async_keeps_the_body_byte_identical_without_the_free_tier(
         monkeypatch, llm_env):
     """关着的时候请求体里不该多出 `reasoning_effort`，`max_tokens` 也不许被抬。"""
@@ -328,10 +362,40 @@ def test_chat_async_keeps_the_body_byte_identical_without_the_free_tier(
     sent = _capture_chat(monkeypatch)
 
     asyncio.run(chat_async("sys", "user", max_tokens=1400))
+    asyncio.run(chat_async("sys", "user", max_tokens=65536))
 
     assert "reasoning_effort" not in sent[0]
     assert sent[0]["max_tokens"] == 1400
     assert sent[0]["model"] == "vendor/paid-model"
+    # 也不能被压：16000 那道夹子只对免费档生效（上下两个方向都要钉，
+    # 否则"顺手给所有档位都加个上限"这种改法能悄悄过掉）
+    assert sent[1]["max_tokens"] == 65536
+
+
+def test_the_free_tier_ceiling_reaches_the_budget_arithmetic(monkeypatch, llm_env):
+    """上限不只在"发请求那一刻"生效：按上限反推容量的地方也要跟着降。
+
+    `_max_tokens()` / `_nodes_per_call()` 自己不发请求，却用这个数算"这次装得下
+    几个节点"。少这一道时免费档会按 65536 规划批次，而实际只发 16000——规划量是
+    真实容量的四倍多，照它切出来的批必然被 `finish_reason=length` 截断。
+    """
+    from app.agent.contracts import AgentRunRequest, RunBudget, RunContext
+    from app.agent.tools import _max_tokens, _nodes_per_call
+
+    def context() -> RunContext:
+        return RunContext(request=AgentRunRequest(
+            goal="做一张导图", intent="create",
+            budget=RunBudget(max_model_calls=10, max_output_tokens=65536),
+        ))
+
+    paid = _nodes_per_call(context())
+    assert _max_tokens(context()) == generation_service.max_tokens_cap()
+
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    _put_cache(["recursive/flint-v1.0:free"])
+
+    assert _max_tokens(context()) == generation_service.FREE_MAX_OUTPUT_TOKENS
+    assert _nodes_per_call(context()) < paid
 
 
 def test_chat_async_fails_over_to_the_next_free_model(monkeypatch, llm_env):
@@ -378,6 +442,31 @@ def test_a_self_configured_endpoint_keeps_the_old_error_sentence(
     with pytest.raises(generation_service.GenerationError) as caught:
         asyncio.run(chat_async("sys", "user"))
     assert str(caught.value) == "模型服务返回 HTTP 429，请检查服务配置"
+
+
+def test_a_gateway_timeout_also_counts_as_unavailable(monkeypatch, llm_env):
+    """524 是 Cloudflare 的"源站超时"，对我们与 502/504 是同一件事。
+
+    本地实测免费模型一次响应能跑到 180 秒以上，网关先撑不住——`recursive/
+    flint-v1.0:free` 在结构那一步直接回 524。它不在这个集合里的话，免费档
+    不会换候选，整轮就以一条"请检查服务配置"的假结论结束，而配置是对的。
+    """
+    assert 524 in generation_service.UNAVAILABLE_STATUSES
+
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    _put_cache(["a/model:free", "b/model:free"])
+    seen: list[str] = []
+
+    async def fake_once(base: str, request_body: dict, headers: dict) -> dict:
+        seen.append(request_body["model"])
+        if len(seen) == 1:
+            # 走真实的 `_chat_once` 映射路径：524 必须变成 `_ModelUnavailable`。
+            raise generation_service._ModelUnavailable("模型服务返回 HTTP 524")
+        return {"title": "t", "root": {"id": "r", "label": "t", "children": []}}
+
+    monkeypatch.setattr(generation_service, "_chat_once", fake_once)
+    asyncio.run(chat_async("sys", "user"))
+    assert seen == ["a/model:free", "b/model:free"]
 
 
 # ---------------------------------------------------------------- 6. provider 那条出口
@@ -459,8 +548,11 @@ def test_the_provider_also_switches_to_the_next_free_model(
     assert completion.served_model == "b/model:free"
     assert [body["model"] for body in client.bodies_sent] == [
         "a/model:free", "b/model:free"]
-    # 免费档的请求体必须带 reasoning_effort，且 max_tokens 有下限。
+    # 免费档的请求体必须带 reasoning_effort，且 max_tokens 有下限与上限。
     assert client.bodies_sent[0]["reasoning_effort"] == store.FREE_REASONING_EFFORT
     assert client.bodies_sent[0]["max_tokens"] >= generation_service.FREE_MIN_OUTPUT_TOKENS
+    # 上限也要落在 provider 这条出口上：`RunBudget` 默认要 65536，不夹的话
+    # agent 那一轮会按额度大小思考几百秒（见 `FREE_MAX_OUTPUT_TOKENS`）。
+    assert client.bodies_sent[0]["max_tokens"] <= generation_service.FREE_MAX_OUTPUT_TOKENS
     # 已经在这个 provider 实例里失败过的模型不再重试。
     assert provider._tried == {"a/model:free"}

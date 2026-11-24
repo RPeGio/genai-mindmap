@@ -71,7 +71,7 @@ TTL 取 1 小时：上下架不是分钟级事件，而每次刷新要占上游 
 一次跑到一半才失败的生成）。id 升序是**确定性**：没有它，同一天里前一次用 flint、
 后一次用 glyph，用户会觉得功能时好时坏。
 
-### 约束三：上游偶发 429
+### 约束三：上游偶发 429 / 524
 
 **决定：给出候选序列，一次运行内逐个试。**
 
@@ -81,8 +81,13 @@ TTL 取 1 小时：上下架不是分钟级事件，而每次刷新要占上游 
 不能放模块级**：那是每请求的东西，放模块级会让并发请求互相污染（A 试过 flint，B 就
 永远拿不到 flint）。
 
+后来在生产链路上还撞到 **524**（Cloudflare 的"源站超时"）：免费模型一次响应能跑到
+180 秒以上，网关先撑不住（本地实测 `recursive/flint-v1.0:free` 在结构那一步直接回 524）。
+它对我们与 502/504 是同一件事——这条路不通了、换一个免费模型往往就通，所以
+`UNAVAILABLE_STATUSES = {429, 502, 503, 504, 524}`。
+
 "该换下一个"的判据只有一份：`generation/service.py` 的
-`UNAVAILABLE_STATUSES = {429, 502, 503, 504}` 与 `_ModelUnavailable`。**400 不在里面**
+`UNAVAILABLE_STATUSES` 与 `_ModelUnavailable`。**400 不在里面**
 ——它几乎总是"这个请求本身不对"（模型名不支持、参数越界），换模型重发只会把同一个
 400 再来一次、还多花一次额度。
 
@@ -111,6 +116,56 @@ TTL 取 1 小时：上下架不是分钟级事件，而每次刷新要占上游 
 
 注意这也是"为什么免费档慢"的一半原因：24.6 tok/s 的吞吐加上每个节点都要写说明，
 一张四十节点的图要几分钟。部署方想快就用自己那行填密钥，那样根本不进这一档。
+
+## 4.5 只设下限是错的：上限 `FREE_MAX_OUTPUT_TOKENS = 16000`
+
+第一版只写了 `max(requested, 4000)`，等于什么都没做：调用方（`RunBudget.max_output_tokens`
+的默认值）要的是 **65536**，`max(65536, 4000)` 还是 65536。免费模型**按额度大小决定
+思考多久**，于是每一次调用都在"可以想 6.5 万 token"的前提下思考。同一份提示词只改
+`max_tokens`（`recursive/flint-v1.0:free`，`reasoning_effort=low`，本地实测）：
+
+| `max_tokens` | 耗时 | `reasoning_tokens` | 正文 |
+| --- | --- | --- | --- |
+| 4000 | 19.9 秒 | 508 | 604 字 |
+| 16000 | 36.3 秒 | 1262 | 1912 字 |
+| 65536 | **87.7 秒** | 2123 | 1941 字 |
+
+正文到 1900 字左右就不再增长，多出来的额度全花在思考上。整条 `mindmap_generate`
+链路的差距（4 次模型调用）：
+
+| 场景 | 总耗时 | 结果 |
+| --- | --- | --- |
+| 免费档，不限上限 | **549.9 秒** | 撞 `max_seconds`，或勉强完成 |
+| 免费档，`max_tokens` 限 16000 | **359.6 秒** | 57 节点，`done` |
+| 付费 `z-ai/glm-5.3-flash` | 103.5 秒 | 对照 |
+
+对照组说明了这不是"模型慢"：`z-ai/glm-5.3-flash` 对 `max_tokens` **完全不敏感**
+（4000 与 65536 都是 9–10 秒、`reasoning_tokens=30`）。所以问题出在"给免费模型
+留了多大的思考预算"，不在模型本身。
+
+**为什么上限是 16000 而不是 4000**：一次结构调用实测需要 1723–2712 字正文 + 最多
+2052 的 `reasoning`，4000 会把它截断（`finish_reason=length`），截断的树要靠
+`_clip_tree` 回收，代价是节点变少、用户看到一张缺分支的图。16000 在"够写完"与
+"不要它多想"之间，并且仍低于 `max_tokens_cap()`。
+
+这个数只对"结构那一次"验算过。**补说明那一次不需要 16000**：它按节点数切两半、
+每半最多 40 个节点，而一次写说明的输出成本是 `per_node_tokens(detail_chars=150,
+refs=0) ≈ 151` tok/节点（说明不带引用，只有正文），40 个约 6000 tok，16000 有充足
+余量。写说明是 `chat_async` 那条出口、不传 `on_delta`，所以它走的是一次性请求，
+撞上限的表现是 `_fill_details_half` 收到 `GenerationError` → 那一半全丢（`salvage`
+回收不了半截 JSON 里的说明），实测离上限还有一倍以上余量。
+
+两条模型出口（`chat_async` 与 `provider._attempt`）都要夹，`FREE_MAX_OUTPUT_TOKENS`
+和 `FREE_MIN_OUTPUT_TOKENS` 一样只在 `resolve()` 标了 `reasoning_effort` 时生效。
+
+**上限还要进"按上限反推容量"的地方**：`agent.tools._max_tokens()` 与它下游的
+`_nodes_per_call()` 不发请求，却用这个数算"这次装得下几个节点"。少这一道时免费档
+按 65536 规划批次（`max_nodes_for_tokens(65536) = 75` 对 `max_nodes_for_tokens
+(16000) = 18`，四倍多），照它切出来的批必然被 `finish_reason=length` 截断。所以
+`_max_tokens()` 里除 `max_tokens_cap()` 之外还要过一道
+`generation.service.apply_free_tier_ceiling()`。目前 `_nodes_per_call()` 只有
+`_generate_deep` 在用（`create_deep` 生产不可达），但这个缺口会在它挂回大图时立刻
+生效，所以按"现在就接上"处理。
 
 ## 5. 免费模型也要密钥
 
@@ -218,8 +273,10 @@ MINDMAP_FREE_TIER=1
 网关），那个地址就也能被填进面板并成为探测目标。所以：
 
 - 只在**整台机器都是私网自用**的部署里打开它；
-- 打开之后，`/api/settings/` 那两个写接口的访问控制就更重要（`docker/nginx.conf` 与
-  `deploy/nginx.conf` 都用 Basic Auth 挡着，见 `docs/DEPLOY.md`）；
+- 打开之后，"谁能改模型地址"这件事更重要：应用层是门禁（匿名被挡）+ `PUT /api/settings/model`
+  只有本人能改自己那行 + `POST /model/test` 也过 `_refuse`；nginx 那层**已经不再有
+  Basic Auth**（`v0.6.0` 起弃用，见 `docs/DEPLOY.md`），所以外层还有没有别的闸取决于
+  部署方自己——`docs/DOCKER.md` 第 11 节写明了"注册是开放的，不想让陌生人进来要在外层限"；
 - 云元数据地址**始终拒**，不受这个变量影响——那一条没有"私网自用"的正当理由。
 
 ## 9. 这一批没做的事
