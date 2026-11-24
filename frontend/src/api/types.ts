@@ -976,7 +976,41 @@ export interface ModelSettings {
   llm_mode: string;
   /** 地址 / 密钥 / 模型名三项齐了没有。判据与后端 `_config()` 一致。 */
   configured: boolean;
+  /**
+   * 当前这个人能不能改**全站共享**的那份配置（`scope: "instance"`）。
+   *
+   * 真值只属于部署方——这台机器上第一个注册的账号。界面上"本站共享配置"那一块
+   * 据此决定显不显示：藏起来不是为了保密，是因为给所有人显示一个点了就 403 的
+   * 表单项，比看不见更糟。
+   */
+  can_edit_instance: boolean;
+  /**
+   * 全站共享那一行（`owner = ''`）的**原始内容**。只有部署方拿得到，别人是 `null`。
+   *
+   * 与上面那几个字段的区别：那些是"我这次生成会用哪份配置"（会一路回落到环境
+   * 变量），这里是"共享那一行存了什么"。部署方把它清空之后，`base_url` 会回落成
+   * 环境变量里的值，而 `instance.base_url` 如实变成空串。
+   */
+  instance: InstanceSettings | null;
   /** 库里那一行最后保存的时刻；没保存过是 `null`。 */
+  updated_at?: string | null;
+}
+
+/**
+ * 全站共享那一行（`owner = ''`）的样子。只有部署方能看到。
+ *
+ * 游客、以及还没填自己密钥的账号，生成时用的就是这一份——所以面板有必要让部署方
+ * 看到它现在配的是什么，否则"游客说用不了"时无从对照。
+ */
+export interface InstanceSettings {
+  base_url: string;
+  /** 打码后的密钥：`…abcd`；没配时是空串。**永远不是明文**。 */
+  api_key_masked: string;
+  api_key_set: boolean;
+  model: string;
+  deep_model: string;
+  /** 三项齐了没有。不齐时借它兜底的人依旧没有可用配置。 */
+  configured: boolean;
   updated_at?: string | null;
 }
 
@@ -994,6 +1028,14 @@ export interface SaveModelSettingsRequest {
   deep_model?: string | null;
   /** 显式清除已保存的密钥。与同时提交 `api_key` 冲突（400 `settings_clear_conflict`）。 */
   clear_api_key: boolean;
+  /**
+   * 写到哪一行：`user`（缺省）= 你自己那行；`instance` = 全站共享那行。
+   *
+   * `instance` 只有部署方可以，别人 403 `settings_forbidden`——权限判定在后端，
+   * 这里只是把两个作用域区分开。缺省值刻意是 `user`：老客户端（与不传这个字段的
+   * 调用）行为与改造前一致。
+   */
+  scope?: 'user' | 'instance';
 }
 
 /** `PUT` 的响应：写入后的生效配置 + 这次有没有真的改变（同值重复保存是 `false`）。 */
@@ -1029,6 +1071,41 @@ export interface TestModelSettingsResponse {
   /** 对端 HTTP 状态码；超时/连不上时是 `null`。 */
   status?: number | null;
   latency_ms: number;
+}
+
+// ---- 账号与会话（`/api/auth/*`）----
+//
+// 会话本身是 **HttpOnly cookie**，所以这里的类型里没有 token 字段——浏览器替我们
+// 保管，JS 拿不到（那正是它防 XSS 的方式）。前端只需要知道"现在是谁"。
+//
+// `kind` 由后端算而不是前端拼：`user ? 'user' : guest_id ? 'guest' : 'anonymous'`
+// 三个分支写在界面里，迟早会在某处漏掉一个，而漏掉的表现是"游客被当成已登录"。
+
+/** 对外的账号形状。**不含任何口令相关字段**。 */
+export interface AuthUser {
+  id: string;
+  username: string;
+  created_at: string;
+}
+
+/** `GET /api/auth/me` 的响应：当前是谁。未登录时 `user` 为 `null`，**永远是 200**。 */
+export interface WhoAmI {
+  user?: AuthUser | null;
+  /** 这台浏览器的游客编号。已登录时可能为 `null`（登录请求不一定带游客 cookie）。 */
+  guest_id?: string | null;
+  kind: 'user' | 'guest' | 'anonymous';
+}
+
+/** 注册与登录共用的请求体。 */
+export interface Credentials {
+  username: string;
+  password: string;
+}
+
+/** 改密码：需要旧密码，并且需要已经登录。 */
+export interface ChangePasswordRequest {
+  current_password: string;
+  new_password: string;
 }
 
 // ---- 编辑日志（统计"用户最常改什么"）----

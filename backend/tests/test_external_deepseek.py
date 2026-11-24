@@ -27,13 +27,13 @@ from typing import Any
 
 import httpx
 import pytest
+from conftest import guest_client
 from fastapi.testclient import TestClient
 
 from app.agent import tools as agent_tools
 from app.contracts.source import SourceKind
 from app.knowledge import external
 from app.knowledge import external_cache
-from app.main import app
 
 # 真实响应（2026-11 实测，正文截短到几十字）。三个结果刻意覆盖三种情形：
 #   1. 正常命中（中文站、有 content）；
@@ -555,7 +555,8 @@ def test_request_limit_covers_the_sixth_source():
 
 
 def _api() -> TestClient:
-    return TestClient(app)
+    # 门禁上线之后，这些用例走的是"有身份时接口对不对"，身份由 `guest_client()` 补齐。
+    return guest_client()
 
 
 def test_fetch_endpoint_is_off_by_default(monkeypatch):

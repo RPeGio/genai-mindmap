@@ -8,17 +8,65 @@
 
 **响应里没有任何明文密钥**。`api_key_masked` 是唯一会出门的密钥形状（`…abcd`），
 连"长度"都不给：长度对撞库没有帮助，对截图里的旁观者倒是有。
+
+**配置按人分开存**（第三片）：每个人（登录账号、游客）在 `model_settings` 里
+自己一行，读的时候按"自己那行 → 部署方那行 → 环境变量"回落。部署方那行是全站
+共享配置（游客免费额度用的就是它），只有部署方能改——判定在 `_deployer()`。
 """
 from __future__ import annotations
+
+from typing import Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict
 
+from app.auth import identity as identity_module
+from app.auth import store as auth_store
 from app.generation.service import _model_for
 from app.settings import probe as probe_module
 from app.settings import store
 
 router = APIRouter(prefix="/settings", tags=["模型设置"])
+
+
+def _deployer() -> bool:
+    """当前请求是不是"部署方"（这台机器上第一个注册的账号）。
+
+    为什么用"第一个注册的人"而不是一个 `MINDMAP_ADMIN` 环境变量：这台机器上第一个
+    注册的人只可能是部署它的人（部署完自己先注册一个），而环境变量会多出一种故障
+    形态——"忘了设 / 设错了"，那时代码能做的只有拒绝所有人。**也没有"账号密码等于
+    管理权"的额外秘密**：注册是开放的，谁先注册谁就是部署方，这件事在部署完成的那
+    一刻就已决定。
+
+    匿名与游客一律 `False`：他们能改的是自己那行（BYOK），不是全站共享那行。
+    """
+    user = identity_module.current_user()
+    if user is None:
+        return False
+    first = auth_store.first_user()
+    return first is not None and first.id == user.id
+
+
+class InstanceSettings(BaseModel):
+    """全站共享那一行（`owner = ''`）的样子。
+
+    **只给部署方**（`can_edit_instance` 为真时才出现在响应里）。给别人看没有用：
+    他们改不了，那是"一片点不动的表单"；而 `base_url` 是部署方用的供应商，不该
+    成为所有人的可见信息。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    #: `…abcd`；没配时是空串。
+    api_key_masked: str
+    api_key_set: bool
+    model: str
+    deep_model: str
+    #: 三项齐了没有。游客与没填自己密钥的人靠这一份生成。
+    configured: bool
+    #: 这一行最后一次被保存的时刻；从没存过是 `null`。
+    updated_at: str | None = None
 
 
 class ModelSettings(BaseModel):
@@ -27,7 +75,7 @@ class ModelSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     base_url: str
-    #: `saved` / `env` / `unset`。界面据此标「你在面板里设的」或「来自环境变量」。
+    #: `saved`（你自己那行）/ `instance`（借用部署方的共享配置）/ `env` / `unset`。
     base_url_source: str
     #: `…abcd`；没配时是空串。**永远不返回明文**。
     api_key_masked: str
@@ -50,6 +98,35 @@ class ModelSettings(BaseModel):
     configured: bool
     #: 库里那一行最后一次被保存的时刻；没保存过是 `null`。
     updated_at: str | None = None
+    #: 当前请求**能不能改全站共享那行**（即是不是部署方）。界面据此决定要不要
+    #: 显示"本站共享配置"区块——不显示比显示一个点不动的按钮好。
+    can_edit_instance: bool = False
+    #: 全站共享那一行的内容。**只有部署方拿得到**（否则是 `null`）。
+    instance: InstanceSettings | None = None
+
+
+def _instance_view() -> InstanceSettings | None:
+    """全站共享那一行的视图。非部署方拿 `None`。
+
+    刻意**不复用 `_view()`**：那一份回答的是"我这次生成会用哪份配置"，会一路回落到
+    环境变量；而这里要回答的是"共享那一行**存了什么**"，环境变量不是它的一部分
+    （部署方清空共享行之后，共享行就是空的，即使环境变量还配着）。
+    """
+    if not _deployer():
+        return None
+    row = store.saved(store.INSTANCE_OWNER)
+    return InstanceSettings(
+        base_url=row.base_url,
+        api_key_masked=store.mask_api_key(row.api_key),
+        api_key_set=bool(row.api_key),
+        model=row.model,
+        deep_model=row.deep_model or "",
+        configured=(
+            row.base_url.startswith(("https://", "http://"))
+            and bool(row.api_key) and bool(row.model)
+        ),
+        updated_at=row.updated_at,
+    )
 
 
 def _view(resolved: store.Resolved, *, updated_at: str | None) -> ModelSettings:
@@ -69,6 +146,8 @@ def _view(resolved: store.Resolved, *, updated_at: str | None) -> ModelSettings:
         llm_mode=store.llm_mode(),
         configured=_configured(resolved),
         updated_at=updated_at,
+        can_edit_instance=_deployer(),
+        instance=_instance_view(),
     )
 
 
@@ -85,7 +164,7 @@ def read_model_settings() -> ModelSettings:
     `changed` 之类的写入信息不在这里——`GET` 只回答"现在是什么"。
     """
     resolved = store.resolve()
-    return _view(resolved, updated_at=store.saved().updated_at)
+    return _view(resolved, updated_at=store.updated_at())
 
 
 class SaveModelSettingsRequest(BaseModel):
@@ -95,6 +174,8 @@ class SaveModelSettingsRequest(BaseModel):
         要清空必须 `clear_api_key: true`。
       - `base_url` / `model` / `deep_model` 省略 → 不改；空串 → 清掉库里的覆盖，
         回落到环境变量。
+      - `scope`：`"user"`（缺省）= 写你自己那行；`"instance"` = 写全站共享那行
+        （只有部署方可以，别人 403 `settings_forbidden`）。
 
     `extra="forbid"` 是仓库的默认风格：拼错字段名时宁可 422，也不要静默忽略——
     "我把密钥填进 `apikey` 了，保存成功但没生效"是最难自查的一类失败。
@@ -108,6 +189,8 @@ class SaveModelSettingsRequest(BaseModel):
     deep_model: str | None = None
     #: 显式清除已经保存的密钥。与同时给 `api_key` 冲突（400）。
     clear_api_key: bool = False
+    #: 写到哪一行。`user` 缺省，`instance` 仅部署方可用。别的值 422。
+    scope: Literal["user", "instance"] = "user"
 
 
 class SaveModelSettingsResponse(ModelSettings):
@@ -134,6 +217,14 @@ def save_model_settings(body: SaveModelSettingsRequest) -> SaveModelSettingsResp
     `{code, message, detail, request_id}`——错误码分得开，界面才能说清"是地址不合法
     还是密钥太长"。
     """
+    if body.scope == "instance" and not _deployer():
+        # 403 而不是 400：请求形状没问题，是"你不能改这一份"。说清是权限而不是
+        # 拼错了字段——后者会让用户去检查一个没错的东西。
+        raise store.SettingsError(
+            "settings_forbidden",
+            "全站共享的模型配置只有部署方（这台机器上第一个注册的账号）能改。"
+            "你自己的密钥请直接保存，会存在你自己名下。",
+            status=403)
     before = store.resolve().base_url
     resolved, changed = store.save(
         base_url=body.base_url,
@@ -141,9 +232,10 @@ def save_model_settings(body: SaveModelSettingsRequest) -> SaveModelSettingsResp
         model=body.model,
         deep_model=body.deep_model,
         clear_api_key=body.clear_api_key,
+        scope=body.scope,
     )
     return SaveModelSettingsResponse(
-        **_view(resolved, updated_at=store.saved().updated_at).model_dump(),
+        **_view(resolved, updated_at=store.updated_at()).model_dump(),
         changed=changed,
         notice=_notice_for(before, resolved.base_url),
     )
@@ -189,12 +281,45 @@ async def test_model_settings(
     """
     overrides = body or TestModelSettingsRequest()
     resolved = store.resolve()
-    base_url = (overrides.base_url or "").strip().rstrip("/") or resolved.base_url
-    api_key = (overrides.api_key or "").strip() or resolved.api_key
+    given_base = (overrides.base_url or "").strip().rstrip("/")
+    given_key = (overrides.api_key or "").strip()
+    base_url = given_base or resolved.base_url
+    api_key = given_key or resolved.api_key
     model = (overrides.model or "").strip() or resolved.model
+    if not api_key and resolved.api_key_source == store.SOURCE_UNBOUND:
+        # 库里有密钥，但它是给**另一个地址**存下的（`store._binding_of` 那条判定
+        # 把生效值清空了）。这里必须与"三项没填齐"分开说：那句话会让人以为密钥
+        # 丢了，于是去供应商后台重开一把——而库里那把一直是好的，只是不能发给新
+        # 地址。也不该默默用新地址加旧密钥去试：那正是这套绑定要禁止的事。
+        raise store.SettingsError(
+            "settings_key_unbound",
+            "地址换过了，而库里那把密钥是为旧地址保存的。确认新地址可信之后，"
+            "重新粘贴一次密钥再测试连接。",
+            status=400)
     if not base_url or not api_key or not model:
         _raise_incomplete()
-    if api_key in (store.mask_api_key(resolved.api_key), store.mask_api_key(store.saved().api_key)):
+    if not given_key:
+        # 密钥是**已存的**（库里或环境里那把），地址却可以来自 `given_base`。
+        # 绑定判定只写在 `store.resolve()` 的出口，而这里 `base_url` 是 overrides，
+        # 不经过那个出口——于是"地址随手填一个域名 + 密钥借已存的"就成了一条绕开
+        # 绑定的路，且**一次请求内就完成外送**，攻击者既不需要知道密钥，也不需要
+        # 读得到响应（PR 自查复现过这条）。所以这里补同一把尺子。
+        #
+        # 比**主机名**而不是直接拒绝"地址非空"：面板的常规用法是"地址填着不动、
+        # 点一下测试"，那不传递新目的地，应当放行；只有主机名变了才是新地址。
+        #
+        # `bound_host` 在锚点为空时用生效地址兜底——"只给了密钥没给地址"那种
+        # 部署里，它今天会被发到哪儿，就应该只允许发到哪儿。
+        bound = store.bound_host(resolved)
+        if not bound or bound != store.host_of(base_url):
+            raise store.SettingsError(
+                "settings_key_unbound",
+                "已保存的密钥只会发往它当初保存时的那台地址。这次要测的地址不是它"
+                "（或无法确认它属于哪台），请把密钥一起重新粘贴一次；要测已保存的"
+                "配置，把地址那一栏清空。",
+                status=400)
+    if api_key in (store.mask_api_key(resolved.api_key),
+                   store.mask_api_key(store.saved().api_key)):
         # 提交的是打码值（`…abcd`）。真拿去发请求，上游会 401，而这里会把它翻译成
         # "密钥被拒"——用户于是去供应商后台换密钥，而他手里那把其实一直是好的。
         # 与 `save()` 里那条判据同一个理由：打码值不是密钥，任何一次都不能当密钥用。

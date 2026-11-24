@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../src/App.vue';
-import type { ModelSettings, TestModelSettingsResponse } from '../src/api/types';
+import type { InstanceSettings, ModelSettings, TestModelSettingsResponse } from '../src/api/types';
 import { apiKeyPlaceholder, settingSourceLabel, useSettingsStore } from '../src/stores/settings';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
@@ -56,6 +56,8 @@ function settingsPayload(overrides: Partial<ModelSettings> = {}): ModelSettings 
     deep_model_effective: 'deepseek-reasoner',
     llm_mode: 'model',
     configured: true,
+    can_edit_instance: false,
+    instance: null,
     updated_at: '2026-11-20T10:00:00.000Z',
     ...overrides,
   };
@@ -240,8 +242,8 @@ describe('打开面板：读的是"当前生效值"，密钥只有打码值', ()
     // 深度模型没配：框是空的，但"实际会发什么"要写出来（勾了深度思考时用深模型）。
     expect((wrapper.get('[data-test="settings-deep-model"]').element as HTMLInputElement).value).toBe('');
     expect(text(wrapper, '[data-test="settings-deep-effective"]')).toBe('deepseek-reasoner');
-    // 来源标签：面板设的 vs 环境变量，不标出来用户分不清"为什么这里不是我填的值"。
-    expect(wrapper.get(PANEL).text()).toContain('面板设置');
+    // 来源标签：自己设的 vs 环境变量，不标出来用户分不清"为什么这里不是我填的值"。
+    expect(wrapper.get(PANEL).text()).toContain('我的设置');
   });
 
   it('密钥框是密码类型、占位符里是打码值，**整个 DOM 里没有明文**', async () => {
@@ -283,6 +285,39 @@ describe('打开面板：读的是"当前生效值"，密钥只有打码值', ()
     expect(has(wrapper, '[data-test="settings-clear-key"]')).toBe(false);
     // 三项不齐：右侧要给一句结论，而不是让人对着空表猜。
     expect(wrapper.get(PANEL).text()).toContain('三项填齐后');
+  });
+
+  it('地址换过之后，密钥那一栏要自己说清「重贴一次」，不能只显示「未设置」', async () => {
+    // 后端此刻的状态：库里那把密钥仍在，但它绑定的是旧主机，所以 `store.resolve()`
+    // 已经把生效值清空（`api_key_set: false`、`api_key_masked: ''`）。界面上如果
+    // 只说"未设置"，用户会去供应商后台重开一把——而库里那把一直是好的。
+    stubBackend({
+      current: {
+        base_url: 'https://new.example.com/v1',
+        api_key_masked: '',
+        api_key_source: 'unbound',
+        api_key_set: false,
+        configured: false,
+      },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    const hint = wrapper.get('[data-test="settings-key-unbound"]').text();
+    expect(hint).toContain('重新粘贴');
+    expect(hint).toContain('旧地址');
+    // 来源标签也得说这一档，而不是退回"未设置"。
+    expect(wrapper.get(PANEL).text()).toContain('地址换过，待重填');
+    // 没有可清的密钥，所以"清除"按钮不该出现。
+    expect(has(wrapper, '[data-test="settings-clear-key"]')).toBe(false);
+  });
+
+  it('没换过地址时不该出现那条提示：绝大多数打开都是正常状态', async () => {
+    stubBackend();
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-key-unbound"]')).toBe(false);
   });
 
   it('地址框下面写明「只支持 OpenAI 兼容格式」：不做 provider 下拉的代价要说出来', async () => {
@@ -443,6 +478,83 @@ describe('清除密钥是单独的动作', () => {
     // 什么都不会发生，而界面会说"已保存"。
     expect(backend.puts[0].body).toEqual({ clear_api_key: true });
     expect(backend.puts[0].body?.api_key).toBeUndefined();
+  });
+});
+
+describe('本站共享配置：只有部署方看得到', () => {
+  const instance: InstanceSettings = {
+    base_url: 'https://shared.example/v1',
+    api_key_masked: '…9999',
+    api_key_set: true,
+    model: 'shared-model',
+    deep_model: '',
+    configured: true,
+    updated_at: '2026-11-20T09:00:00.000Z',
+  };
+
+  it('部署方：显示共享那一行的内容与状态', async () => {
+    stubBackend({ current: { can_edit_instance: true, instance } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-instance"]')).toBe(true);
+    expect(text(wrapper, '[data-test="settings-instance-base-url"]')).toBe('https://shared.example/v1');
+    expect(text(wrapper, '[data-test="settings-instance-key"]')).toBe('…9999');
+    expect(text(wrapper, '[data-test="settings-instance-state"]')).toBe('已配置');
+  });
+
+  it('非部署方：整块都不出现（不是显示成灰的）', async () => {
+    stubBackend({ current: { can_edit_instance: false, instance: null } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    // 藏起来而不是置灰：一个点了就 403 的表单，用户会以为是网络问题。
+    expect(has(wrapper, '[data-test="settings-instance"]')).toBe(false);
+  });
+
+  it('共享行没配好时状态说"还没配好"，别让人以为游客能用', async () => {
+    stubBackend({
+      current: { can_edit_instance: true, instance: { ...instance, configured: false, api_key_set: false, api_key_masked: '' } },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(text(wrapper, '[data-test="settings-instance-state"]')).toBe('还没配好');
+    expect(text(wrapper, '[data-test="settings-instance-key"]')).toBe('（空）');
+  });
+
+  it('「存为共享配置」带 `scope: "instance"`，且把四项一起发出去', async () => {
+    const backend = stubBackend({ current: { can_edit_instance: true, instance } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-save-instance"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts).toHaveLength(1);
+    // 语义是"共享配置 = 这一份"，所以整个覆盖：空字段也要发（空串 = 清掉）。
+    expect(backend.puts[0].body).toEqual({
+      clear_api_key: false,
+      scope: 'instance',
+      base_url: 'https://api.deepseek.com/v1',
+      model: 'deepseek-chat',
+      deep_model: '',
+    });
+    // 没打字就不带 `api_key`：空串在后端是"不改"，共享那把密钥要原样留着。
+    expect(backend.puts[0].body?.api_key).toBeUndefined();
+  });
+
+  it('在共享行里打了新密钥就把新密钥带上', async () => {
+    const backend = stubBackend({ current: { can_edit_instance: true, instance } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-api-key"]').setValue(SECRET);
+    await wrapper.get('[data-test="settings-save-instance"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts[0].body?.api_key).toBe(SECRET);
+    expect(backend.puts[0].body?.scope).toBe('instance');
   });
 });
 
@@ -617,10 +729,20 @@ describe('关闭', () => {
 });
 
 describe('store 与纯函数', () => {
-  it('来源标签三档：saved / env / unset', () => {
-    expect(settingSourceLabel('saved')).toBe('面板设置');
+  it('来源标签七档：saved / instance / public / free / env / unset / unbound', () => {
+    expect(settingSourceLabel('saved')).toBe('我的设置');
+    // 借用共享配置是独立一档：清掉自己那行会回到它，用户得知道这件事。
+    expect(settingSourceLabel('instance')).toBe('本站共享配置');
+    // 公共免费密钥也只能自己一档：它是唯一一档"有次数上限"的来源，混进
+    // `instance` 会让用户以为可以随便用。
+    expect(settingSourceLabel('public')).toBe('本站免费额度');
+    // 免费档也单独一档：模型名会变成一个不认识的 id，得能分辨这是部署方开的功能
+    // 还是自己配错了。
+    expect(settingSourceLabel('free')).toBe('免费模型');
     expect(settingSourceLabel('env')).toBe('环境变量');
     expect(settingSourceLabel('unset')).toBe('未设置');
+    // `unbound` 必须自己一档：它与 `unset` 的下一句完全不同（重贴一次 vs 去配一把）。
+    expect(settingSourceLabel('unbound')).toBe('地址换过，待重填');
     // 后端加了新的来源值时不能炸，退回"未设置"比显示 `undefined` 诚实。
     expect(settingSourceLabel('future')).toBe('未设置');
   });
@@ -629,6 +751,15 @@ describe('store 与纯函数', () => {
     expect(apiKeyPlaceholder(settingsPayload())).toBe(`${MASKED}（留空＝不改）`);
     expect(apiKeyPlaceholder(settingsPayload({ api_key_set: false, api_key_masked: '' }))).toBe('sk-…');
     expect(apiKeyPlaceholder(null)).toBe('sk-…');
+  });
+
+  it('地址换过之后，占位符不能还是打码值——那会让人以为配好了', () => {
+    // 库里那把密钥仍然存在（`mask_api_key` 拿得到），但它属于旧地址。
+    // 只要 placeholder 还在显示 `…1234`，用户就不会去重贴，而生成一路 401。
+    expect(apiKeyPlaceholder(settingsPayload({
+      api_key_source: 'unbound',
+      api_key_set: false,
+    }))).toBe('地址换过了，请重新粘贴密钥');
   });
 
   it('store 的 `isDemoMode` 只认 `demo`，空串不算', async () => {

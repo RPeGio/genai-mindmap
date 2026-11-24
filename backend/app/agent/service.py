@@ -59,6 +59,7 @@ from app.generation.service import (
     ModelNotConfigured,
     _demo_content,
 )
+from app.auth import owner as owner_module
 from app.memory import store as memory_store
 from app.prefs import service as prefs
 from app.prefs import style as prefs_style
@@ -1120,9 +1121,14 @@ async def _memory_hints(request: AgentRunRequest) -> str:
          `agent_failed`，而用户要的是那张图。
       3. **空串**：没有命中时返回空串而不是"（暂无记忆）"，调用方整段跳过。一个
          空的小标题会让模型以为"这个人的记忆是空的"是一种需要它处理的输入。
+
+    **owner 在这里、在进线程之前读**：`asyncio.to_thread` 里读不到请求的
+    `ContextVar`，若把 owner 交给线程去问，得到的永远是空串——于是所有人检索到的
+    都是无主记忆（PR#27 审查里 P0-2 的另一半）。
     """
     try:
-        return await asyncio.to_thread(memory_store.prompt_for, request)
+        return await asyncio.to_thread(
+            memory_store.prompt_for, request, owner=owner_module.current_owner())
     except Exception as exc:  # noqa: BLE001 — 见 docstring 第 2 条
         logger.warning("记忆检索失败（%s），这次不注入记忆", type(exc).__name__)
         return ""

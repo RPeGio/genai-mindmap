@@ -231,6 +231,21 @@ describe('☰ 抽屉：原来那些按钮一件不少', () => {
     expect(options.join('|')).toContain('JSON');
   });
 
+  it('账号区在抽屉里，默认就是一个可用的游客状态', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    await wrapper.get('[data-test="history-toggle"]').trigger('click');
+    await flushPromises();
+
+    const drawer = wrapper.get('[data-test="history-drawer"]');
+    // 账号是低频动作，放进顶栏会把最常用的那三件挤走（见 §瘦顶栏）。
+    expect(wrapper.get('header').find('[data-test="auth-panel"]').exists()).toBe(false);
+    expect(drawer.find('[data-test="auth-panel"]').exists()).toBe(true);
+    // 游客是正常状态：有登录入口，但没有任何"请先登录才能用"的硬闸。
+    expect(drawer.find('[data-test="auth-username"]').exists()).toBe(true);
+    expect(drawer.get('[data-test="auth-submit"]').text()).toBe('登录');
+  });
+
   it('抽屉里的「演示示例」真的能打开预置图列表', async () => {
     stubFetch();
     const wrapper = mountApp();

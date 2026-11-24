@@ -31,6 +31,7 @@ from app.contracts.mindmap import (
     clip_label,
 )
 from app.contracts.source import Source, SourceUsage
+from app.generation import free_models
 from app.generation.budget import INITIAL_MAX_DEPTH, INITIAL_MAX_NODES
 from app.optimization.source_refs import EvidenceSpan, verify_source_refs
 # 模型配置的唯一读取处（库里保存的 ＞ 环境变量）。`_config()` 与 `_model_for()`
@@ -71,6 +72,12 @@ MAX_OUTPUT_TOKENS = 65536
 
 # 覆盖上面那个默认值的环境变量。
 MAX_TOKENS_ENV = "MINDMAP_LLM_MAX_TOKENS"
+
+# 走免费档时 `max_tokens` 的下限。实测（`docs/FREE-MODELS.md`）：两个免费模型在
+# `max_tokens=1400` 下会把全部额度花在 thinking 上，正文一个字都没写就
+# `finish_reason=length`；4000 时正常出 JSON。这个数只在 `resolve()` 标了
+# `reasoning_effort` 时才生效，自配端点不受影响。
+FREE_MIN_OUTPUT_TOKENS = 4000
 
 # 服务端在 400 里自报的上限（进程内学习值）。`None` = 还没学到任何东西。
 # 一旦学到就一直是它与配置值取小：同一进程里的每一个出口（生成、展开、agent
@@ -449,6 +456,23 @@ class GenerationError(Exception):
     pass
 
 
+# 上游说"这个模型此刻不可用"的状态码。与 `agent/provider.py` 同一组：判断的是
+# "换一个模型重发有没有用"，不是措辞。免费档实测会回 429（"Upstream model
+# provider is temporarily unavailable"），网关用 502/503/504 表达同一件事。
+#
+# 400 不在这里面：它几乎总是请求本身不对（模型名不支持、参数越界），换模型重发
+# 只会把同一个 400 再来一次，还多花一次额度。
+UNAVAILABLE_STATUSES = frozenset({429, 502, 503, 504})
+
+
+class _ModelUnavailable(GenerationError):
+    """上游明确说"这个模型暂时不可用"。免费档据此换下一个候选。
+
+    继承 `GenerationError` 是必需的：这两个发请求的出口最终都会被更外层按基类
+    捕获，一旦它逃到外面，用户看到的就是"未预期异常"而不是一条可读的失败文案。
+    """
+
+
 class ModelNotConfigured(GenerationError):
     """模型地址/密钥/模型名没配齐。
 
@@ -806,6 +830,28 @@ def _choice_message(body: Any) -> tuple[str, bool]:
     return choice["message"]["content"], truncated
 
 
+def _config_full() -> Any:
+    """`resolve()` 的完整结果，缺失时抛 `ModelNotConfigured`。
+
+    与 `_config()` 的关系：三元组版本是**绝大多数调用方**要的东西，签名字段是
+    三个字符串，改它会让五个调用点全部跟着动。而免费档多带了两件事
+    （`reasoning_effort`、以及"这次走的是免费模型"这个来源），只有两个发请求的
+    出口需要——所以它们读这一份，其余调用方继续用 `_config()`。
+
+    **校验只在这里写一次**：两处各写一份判据，迟早会出现"面板说配好了、发请求
+    说没配"这种分歧（`_configured()` 已经因为同一理由与这里对齐过一次）。
+    """
+    resolved = _settings_store.resolve()
+    base = resolved.base_url
+    key = resolved.api_key
+    model = resolved.model
+    if not base.startswith(("https://", "http://")) or not key or not model:
+        raise ModelNotConfigured(
+            "请在后端环境变量中配置模型地址、密钥和模型名称，"
+            "或在页面右上角的「模型设置」里填写")
+    return resolved
+
+
 def _config() -> tuple[str, str, str]:
     """读模型配置。缺失或格式不对时抛 GenerationError，让上层给出可读文案。
 
@@ -823,15 +869,8 @@ def _config() -> tuple[str, str, str]:
     "环境变量"这个词——它同时也是给部署方的提示（用 EnvironmentFile 的部署不必
     进页面）。
     """
-    resolved = _settings_store.resolve()
-    base = resolved.base_url
-    key = resolved.api_key
-    model = resolved.model
-    if not base.startswith(("https://", "http://")) or not key or not model:
-        raise ModelNotConfigured(
-            "请在后端环境变量中配置模型地址、密钥和模型名称，"
-            "或在页面右上角的「模型设置」里填写")
-    return base, key, model
+    resolved = _config_full()
+    return resolved.base_url, resolved.api_key, resolved.model
 
 
 # 「深度思考」那一次要用的模型名。两个模型在同一个 endpoint 上，差别只有这个名字
@@ -1022,6 +1061,10 @@ async def _chat_once(
         return _parse_choice(body, request_body)
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
+        if code in UNAVAILABLE_STATUSES:
+            # 免费档据此换下一个模型；自配端点没有候选，外层会把它变回一条
+            # 普通失败（`chat_async` 的候选序列只有一个元素时直接抛它）。
+            raise _ModelUnavailable(f"模型服务返回 HTTP {code}") from exc
         downgraded = _downgrade_max_tokens(request_body, exc.response)
         if downgraded is not None:
             logger.warning("模型服务拒绝 max_tokens=%s（HTTP 400，%s），按服务端上限 %d 重试一次",
@@ -1165,10 +1208,22 @@ async def chat_async(
 
     `deep_thinking` 走 `_model_for()`——与 `provider.complete_tools` 同一个函数。
     """
-    base, key, model = _config()
+    # 免费档要额外带两样东西，所以这里读完整结果而不是三元组。
+    #
+    # 为什么**每次调用都重读**而不是在 run 开始时取一次：免费档的候选会变（上游
+    # 429、免费模型下架），而 `_config_full()` 不缓存，天然给出"此刻最优"的答案。
+    # 一次生成有 5–27 次这种调用，每次多读一行 SQLite 是既有代价（见 `_config()`
+    # 的 docstring），免费档的模型名更新就顺势搭在这条既有路径上。
+    resolved = _config_full()
+    base, key, model = resolved.base_url, resolved.api_key, resolved.model
     # 模型名在工作区里只有这一份判定（理由见 `_model_for` 的注释）：勾了深度思考
     # 时，工具内部的每一次调用都必须和外层工具循环发同一个名字。
-    model = _model_for(base, model, deep_thinking)
+    #
+    # **免费档不走它**：深度思考那一档会换成 `deep_override()` 或
+    # `DEEP_MODEL_FALLBACK` 的名字，而那个模型不在免费名单里——照它发出去就是用
+    # 部署方的钱生成，与"免费额度"这个承诺相反。`provider.complete_tools` 同一判据。
+    if resolved.reasoning_effort is None:
+        model = _model_for(base, model, deep_thinking)
     # 输入侧的物理边界，与调用方是谁无关：装不装得进模型窗口由这里统一守，
     # 否则每个出口各守一个数，迟早分叉。
     ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
@@ -1176,6 +1231,15 @@ async def chat_async(
     # 较小者（见它的 docstring）。放在这里而不是调用方，是因为工具、agent 轮次、
     # 一次性接口都从这里出去——一处夹住，三条出口同值。
     requested = max_tokens or MAX_OUTPUT_TOKENS
+    if resolved.reasoning_effort is not None:
+        # 免费档的实测代价：`max_tokens=1400` 时两个免费模型都会把 1400 全花在
+        # reasoning 上（`completion_tokens=1400`、`reasoning_tokens=1311`），正文
+        # 一个字都没写就 `finish_reason=length`，56.9 秒白等。所以走免费档时给一个
+        # **下限**：调用方要得更少也抬到 4000，否则等于保证被截断。
+        #
+        # 用 `max(requested, 下限)` 之后再走 `max_tokens_cap()`：cap 是服务端真实的
+        # 上限，它的约束优先级更高——不能为了凑够 4000 发出一个一定会 400 的值。
+        requested = max(requested, FREE_MIN_OUTPUT_TOKENS)
     request_body: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -1185,12 +1249,40 @@ async def chat_async(
         "temperature": 0.2,
         "max_tokens": min(requested, max_tokens_cap()),
     }
+    if resolved.reasoning_effort:
+        # 只在免费档加这个键：**None 时请求体与加这个字段之前逐字节相同**，
+        # 部署方自己配的端点收不到一个它可能不认识的参数。
+        request_body["reasoning_effort"] = resolved.reasoning_effort
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    if on_delta is not None:
-        streamed = await _chat_streamed(base, request_body, headers, on_delta)
-        if streamed is not None:
-            return streamed
-    return await _chat_once(base, request_body, headers)
+    # 免费档的候选序列：上游偶发 429（实测同一时刻连发三次也可能全 200），换一个
+    # 免费模型往往就通了。与 `agent/provider.py` 同一策略，只是这条出口没有跨轮的
+    # provider 实例可挂状态，就把"这一次已经试过谁"放在这个函数里。
+    if resolved.reasoning_effort is None:
+        order = [model]
+    else:
+        order = [model] + free_models.candidates(base, tried={model})
+    failure: GenerationError | None = None
+    for index, candidate in enumerate(order):
+        if index:
+            logger.warning("免费模型 %s 暂时不可用，换下一个候选：%s", order[index - 1], failure)
+        # 首个候选复用已经拼好的请求体；后续候选只换模型名，其余字节不动。
+        attempt_body = request_body if candidate == model else dict(request_body, model=candidate)
+        try:
+            if on_delta is not None:
+                streamed = await _chat_streamed(base, attempt_body, headers, on_delta)
+                if streamed is not None:
+                    return streamed
+            return await _chat_once(base, attempt_body, headers)
+        except _ModelUnavailable as exc:
+            failure = exc
+            continue
+    if failure is not None:
+        # 自配端点没有别的候选，这条错误要与加免费档之前逐字一致（"请检查服务
+        # 配置"那句是给部署方的下一步，免费档里的失败则不是配置问题）。
+        if resolved.reasoning_effort is None:
+            raise GenerationError(f"{failure}，请检查服务配置") from failure
+        raise GenerationError(str(failure)) from failure
+    raise GenerationError("这个模型地址上没有可用的免费模型")
 
 
 # 占位内容里那句"请你改我"。三种图型共用同一个文案：演示模式下这三个字就是界面

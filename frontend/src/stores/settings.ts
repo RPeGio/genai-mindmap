@@ -33,11 +33,50 @@ import type {
 export const SETTING_SOURCE_SAVED = 'saved';
 export const SETTING_SOURCE_ENV = 'env';
 export const SETTING_SOURCE_UNSET = 'unset';
+/**
+ * 库里有密钥，但它是给**另一个地址**存下的，所以现在不交出。
+ *
+ * 与 `unset` 必须分开说：`unset` 的下一句是"去配一把"，而这里的下一句是"你换过
+ * 地址，把原来那把再填一次"。混成一句，用户会去供应商后台重开密钥——而库里那把
+ * 一直是好的。
+ */
+export const SETTING_SOURCE_UNBOUND = 'unbound';
+/**
+ * 生效值来自**本站共享配置**（部署方填的那一份），而不是你自己那行。
+ *
+ * 与 `saved` 必须分开：看到 `saved` 时你改的就是自己那行；看到 `instance` 时你
+ * 改自己那行只是"覆盖"，清掉就回到共享配置。合成一档会让"清除"变成不敢点的
+ * 按钮——用户不知道点下去会发生什么。
+ */
+export const SETTING_SOURCE_INSTANCE = 'instance';
+/**
+ * 这次生成走的是**免费模型**（部署方那台端点上当前标 `:free` 的那些）。
+ *
+ * 只出现在 `model_source` / `deep_model_source` 上，不涉及密钥：免费模型也要密钥
+ * （不带 key 直接 401），只是那次调用不收费。所以这一档的语义是"用部署方那把钥匙
+ * 走不收费的模型"，而不是"不用密钥"。
+ *
+ * 界面上必须说出来：免费档是慢的（实测约 24.6 tok/s），而且受每日次数限制。用户
+ * 看到模型名变成一个不认识的 id 时，得能分辨这是"部署方开了免费档"还是"我配错了"。
+ */
+export const SETTING_SOURCE_FREE = 'free';
+/**
+ * 生效密钥是**本站的公共免费密钥**（`MINDMAP_FREE_TIER_API_KEY`），不是任何人的私钥。
+ *
+ * 与 `instance`/`env` 必须分开，理由只有一个：这是唯一一档**有次数上限**的来源。
+ * 用户看到"本站共享配置"会以为可以随便用，看到这一档才该知道"每天几次，用完就没了"。
+ * 合并来源会让"这次要不要扣次数"在界面上无从解释。
+ */
+export const SETTING_SOURCE_PUBLIC = 'public';
 
 /** 来源标签。界面要能分辨"我在面板里设的"与"部署方在环境变量里设的"。 */
 export function settingSourceLabel(source: string): string {
-  if (source === SETTING_SOURCE_SAVED) return '面板设置';
+  if (source === SETTING_SOURCE_SAVED) return '我的设置';
+  if (source === SETTING_SOURCE_INSTANCE) return '本站共享配置';
+  if (source === SETTING_SOURCE_PUBLIC) return '本站免费额度';
+  if (source === SETTING_SOURCE_FREE) return '免费模型';
   if (source === SETTING_SOURCE_ENV) return '环境变量';
+  if (source === SETTING_SOURCE_UNBOUND) return '地址换过，待重填';
   return '未设置';
 }
 
@@ -46,9 +85,15 @@ export function settingSourceLabel(source: string): string {
  *
  * 有已保存的密钥时给打码值（`…abcd`）——用户能认出"是那一把"，而截图或旁人看不出
  * 其余部分。没配时给一个形状示例。
+ *
+ * `unbound` 单列一档：库里那把密钥不能让输入框显示成"已保存"，否则用户看着占位
+ * 里那把（属于旧地址的）以为配好了，而生成一路 401。
  */
 export function apiKeyPlaceholder(settings: ModelSettings | null): string {
   if (!settings) return 'sk-…';
+  if (settings.api_key_source === SETTING_SOURCE_UNBOUND) {
+    return '地址换过了，请重新粘贴密钥';
+  }
   if (settings.api_key_set) return `${settings.api_key_masked}（留空＝不改）`;
   return 'sk-…';
 }
