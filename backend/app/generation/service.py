@@ -79,6 +79,25 @@ MAX_TOKENS_ENV = "MINDMAP_LLM_MAX_TOKENS"
 # `reasoning_effort` 时才生效，自配端点不受影响。
 FREE_MIN_OUTPUT_TOKENS = 4000
 
+# 走免费档时 `max_tokens` 的**上限**。只设下限是错的，而且错得很贵：调用方
+# （`_max_tokens()` / `RunBudget.max_output_tokens`）要的是 65536，`max(65536, 4000)`
+# 还是 65536，于是免费模型被允许吐 6.5 万 token——它不会真吐完，而是**按额度大小
+# 决定思考多久**。同一份提示词只改 `max_tokens`（`recursive/flint-v1.0:free`，本地实测）：
+#
+#   cap=4000  → 19.9 秒，reasoning 508，正文 604 字
+#   cap=16000 → 36.3 秒，reasoning 1262，正文 1912 字
+#   cap=65536 → 87.7 秒，reasoning 2123，正文 1941 字
+#
+# 正文到了 1900 字左右就不再增长，多出来的额度全花在思考上。整条生成链的差距是
+# 549.9 秒（不限上限）对 359.6 秒（限 16000）；而同样一档付费的 glm-5.3-flash
+# 只要 103.5 秒，且它对 `max_tokens` 不敏感（4000 与 65536 都是 9–10 秒）。
+#
+# 为什么是 16000 而不是 4000：一次结构调用实测要 1723–2712 字正文 + 最多 2052 的
+# reasoning，4000 会把它截断（`finish_reason=length`），截断的树要靠 `_clip_tree`
+# 回收，代价是节点变少、用户看到一张缺分支的图。16000 在"够写完"与"不要它多想"
+# 之间取得平衡，仍低于 `max_tokens_cap()`，所以不会发出一个必然 400 的值。
+FREE_MAX_OUTPUT_TOKENS = 16000
+
 # 服务端在 400 里自报的上限（进程内学习值）。`None` = 还没学到任何东西。
 # 一旦学到就一直是它与配置值取小：同一进程里的每一个出口（生成、展开、agent
 # 轮次）都该发同一个数，否则"三处各写一个上限"这个老问题会以另一种形式回来。
@@ -460,9 +479,13 @@ class GenerationError(Exception):
 # "换一个模型重发有没有用"，不是措辞。免费档实测会回 429（"Upstream model
 # provider is temporarily unavailable"），网关用 502/503/504 表达同一件事。
 #
+# 524 是 Cloudflare 的"源站超时"：免费模型一次响应能跑到 180 秒以上，网关先撑不住
+# （本地实测 `recursive/flint-v1.0:free` 在结构那一步直接回 524）。它对我们与
+# 502/504 是同一件事——这条路不通了，换另一个免费模型往往就通，所以一并算进来。
+#
 # 400 不在这里面：它几乎总是请求本身不对（模型名不支持、参数越界），换模型重发
 # 只会把同一个 400 再来一次，还多花一次额度。
-UNAVAILABLE_STATUSES = frozenset({429, 502, 503, 504})
+UNAVAILABLE_STATUSES = frozenset({429, 502, 503, 504, 524})
 
 
 class _ModelUnavailable(GenerationError):
@@ -1237,9 +1260,14 @@ async def chat_async(
         # 一个字都没写就 `finish_reason=length`，56.9 秒白等。所以走免费档时给一个
         # **下限**：调用方要得更少也抬到 4000，否则等于保证被截断。
         #
-        # 用 `max(requested, 下限)` 之后再走 `max_tokens_cap()`：cap 是服务端真实的
-        # 上限，它的约束优先级更高——不能为了凑够 4000 发出一个一定会 400 的值。
+        # 同样要给**上限**，理由见 `FREE_MAX_OUTPUT_TOKENS`：调用方要 65536 时，
+        # 只抬起下限等于什么都没做，而免费模型会按额度大小决定思考多久——整条链
+        # 从 359.6 秒劣化到 549.9 秒，最后还撞上 `max_seconds`。
+        #
+        # 两个都夹完再走 `max_tokens_cap()`：cap 是服务端真实的上限，它的约束
+        # 优先级更高——不能为了凑够 4000 发出一个一定会 400 的值。
         requested = max(requested, FREE_MIN_OUTPUT_TOKENS)
+        requested = min(requested, FREE_MAX_OUTPUT_TOKENS)
     request_body: dict[str, Any] = {
         "model": model,
         "messages": [

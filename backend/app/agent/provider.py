@@ -30,6 +30,7 @@ from app.agent.contracts import Completion, RunBudget, ToolCall
 from app.generation import free_models as _free_models
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
+    FREE_MAX_OUTPUT_TOKENS,
     FREE_MIN_OUTPUT_TOKENS,
     UNAVAILABLE_STATUSES,
     GenerationError,
@@ -202,8 +203,11 @@ class OpenAICompatibleProvider:
         if reasoning_effort is not None:
             # 免费档的实测代价：`max_tokens=1400` 时两个免费模型都会把 1400 全花在
             # thinking 上，正文一个字没写就 `finish_reason=length`。所以给它一个
-            # 下限；`max_tokens_cap()` 仍是最终上限（服务端真实边界优先）。
+            # 下限；**也要给上限**，理由见 `FREE_MAX_OUTPUT_TOKENS`——只抬下限时
+            # 调用方要的 65536 会原样发出去，免费模型按额度大小决定思考多久，
+            # 一轮就能吃掉几百秒。`max_tokens_cap()` 仍是最终上限。
             requested = max(requested, FREE_MIN_OUTPUT_TOKENS)
+            requested = min(requested, FREE_MAX_OUTPUT_TOKENS)
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
