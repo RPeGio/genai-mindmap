@@ -151,12 +151,33 @@ TTL 取 1 小时：上下架不是分钟级事件，而每次刷新要占上游 
 这个数只对"结构那一次"验算过。**补说明那一次不需要 16000**：它按节点数切两半、
 每半最多 40 个节点，而一次写说明的输出成本是 `per_node_tokens(detail_chars=150,
 refs=0) ≈ 151` tok/节点（说明不带引用，只有正文），40 个约 6000 tok，16000 有充足
-余量。写说明是 `chat_async` 那条出口、不传 `on_delta`，所以它走的是一次性请求，
-撞上限的表现是 `_fill_details_half` 收到 `GenerationError` → 那一半全丢（`salvage`
-回收不了半截 JSON 里的说明），实测离上限还有一倍以上余量。
+余量。写说明是 `chat_async` 那条出口、**不传 `on_delta`**（没有预览解析器），但自
+`thinking` 帧之后它仍走流式——思考通道是另一条上下文变量，`_chat_streamed` 的
+`on_delta` 因此可以是 `None`。撞上限的表现是 `_fill_details_half` 收到
+`GenerationError` → 那一半全丢（`salvage` 回收不了半截 JSON 里的说明），实测离上限
+还有一倍以上余量。
 
 两条模型出口（`chat_async` 与 `provider._attempt`）都要夹，`FREE_MAX_OUTPUT_TOKENS`
 和 `FREE_MIN_OUTPUT_TOKENS` 一样只在 `resolve()` 标了 `reasoning_effort` 时生效。
+
+## 4.6 生成预算 `max_seconds` 按免费档的实测调到了 1800
+
+夹住 `max_tokens` 之后整条链路仍要 **5–10 分钟**，而 `RunBudget.max_seconds` 的
+默认值原先照着付费档（103.5 秒）拍的 600 秒——免费档实测 **567.6 秒**（33 节点：
+结构段 311.7s + 写说明段 232.8s + 收尾 12.7s），另有一次 600.1 秒被掐断。也就是说
+600 秒对免费档不是"余量偏薄"，是**刚好卡在正常生成的耗时上**：同样一张图，节点多
+几个就会在收尾前被 `budget_exhausted` 打断。
+
+所以默认值改成 **1800 秒**（`backend/app/agent/contracts.py` 的 `RunBudget`），
+取三倍余量。上限仍是 3600——那是"卡住不动"的物理边界，不为了免费档放宽。
+
+两个配套事实：
+
+- **前端根本不发 `budget`**，所以改默认值就是改实际生效值，不需要动前端。
+- **systemd 的 `TimeoutStopSec` 故意留在 90 秒**，没有跟着调大到 30 分钟：发版是
+  需要立刻生效的运维动作，不能因为有人在等免费档生成而挂 30 分钟。被打断的那次
+  有检查点兜着（见 `docs/AGENT_STREAM_PROTOCOL.md` 的「检查点」一节），用户能在
+  "上次的结果"里点「补齐说明」接着做完。
 
 **上限还要进"按上限反推容量"的地方**：`agent.tools._max_tokens()` 与它下游的
 `_nodes_per_call()` 不发请求，却用这个数算"这次装得下几个节点"。少这一道时免费档
