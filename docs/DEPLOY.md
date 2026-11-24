@@ -47,6 +47,8 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
 | `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
+| `MINDMAP_EXTERNAL_PROXY` | `http://127.0.0.1:7897` | **只给外部检索用**的代理（维基、arXiv、OpenAlex、Crossref、百科）。不设时会兜底猜本机 Clash 端口，在服务器上那是错的——表现是五个源全部连不上、上层只看到"没搜到外部资料"，所以走兜底时日志会告警一次。设 `none` / `off` / `direct` 表示显式直连。**不要用 `HTTP_PROXY`/`HTTPS_PROXY` 代替它**：那两只会被其余 9 处 httpx 客户端读走，把模型调用、ASR、视觉提取、embedding、rerank 一起塞进代理。见第 11.5 节 |
+| `MINDMAP_DEEPSEEK_TOOLS_PROXY` | `none` | DeepSeek 那两个外部检索接口的代理，**与上面那条反向**：默认直连。实测它们要直连才通，塞进代理等于让它永远失败 |
 | `MINDMAP_SETTINGS_ALLOW_PRIVATE` | 空（关） | 允不允许把模型地址指向本机 / 内网。关着时"测试连接"与生成都会拒（`probe._refuse()`），因为**这个面能用已存密钥当内网探针**。要连 Ollama / LM Studio / 同机自建端点就设 `1`；它同时放开本机与内网，没有更细的粒度。**云元数据地址（`169.254.169.254`、`metadata.google.internal`、`100.100.100.200` 等）这个开关也打不开**——那里没有模型，只有临时凭证 |
 | `MINDMAP_FREE_TIER` | 空（关） | 走 Command Code coding plan 里当前标 `:free` 的模型（免费额度那一档用的就是它）。打开后，**只有借用部署方配置的人**（自己没填密钥）会换成免费模型，并自动带 `reasoning_effort=low`、把 `max_tokens` 夹到 4000–16000 之间（下限防止思考吃光额度，上限防止它按 6.5 万 token 的预算思考几十分钟）。默认关：打开它等于改变"这一次生成花谁的钱"，已有部署升级后不该静默变成又慢又受每日次数限制。详见 `docs/FREE-MODELS.md` |
 | `MINDMAP_FREE_TIER_API_KEY` | 空（关） | **公共免费密钥**：配了它就有"每 IP 每天 3 次免费生成"，没配就完全没有额度这回事。它本身就是开关（不再有单独的 `MINDMAP_FREE_QUOTA`——那只会多出"配了钥匙忘开开关"的状态）。用的是**部署方那把钥匙**，所以只有"没有自己密钥"的人会走到；且地址也必须是部署方选的（`base_url_source` 是 `instance`/`env`），**调用方自己写的地址永远领不到这把钥匙**。详见 `docs/FREE-MODELS.md` 第 8 节 |
@@ -479,6 +481,107 @@ ip route; cat /etc/resolv.conf
 
 1. **依赖包**：本机 `pip download -r backend/requirements.txt -d wheels/`（Windows 上要加 `--platform manylinux2014_x86_64 --only-binary=:all:`），传上去 `pip install --no-index --find-links wheels/ -r requirements.txt`。
 2. **docling 模型**：首次解析 docx/pptx/pdf 会去 HuggingFace 取版面模型。公网不通就用 `HF_ENDPOINT` 指到可达镜像，或在能上网的机器上把 `~/.cache/docling` 打包带过去，解到 `/var/lib/genai-mindmap/.cache/docling`（服务单元的 `HOME` 就指向那里）。⚠️ 这条没做过端到端验证，纯文本生成与思维导图主流程不受影响，受影响的是文档/PDF 上传。
+
+### 11.5 外部检索要走代理时：只给检索走，别给全站走
+
+境内机器上 `zh.wikipedia.org` 通常直连不通（TLS 被掐，`curl: (35) SSL_ERROR_SYSCALL`），而 arXiv / OpenAlex / Crossref / 百科**都是通的**。所以需要的是一个"只给外部检索用"的代理，而不是系统级代理。
+
+**先看这一点，它决定了整节的形状：全仓只有一处客户端显式读代理。** `backend/app/knowledge/external.py::_client()` 传了 `proxy=_proxy()` 且 `trust_env=False`；其余九处 httpx 客户端（模型调用、ASR、PDF 视觉、embedding、rerank、页面上的"测试连接"）默认 `trust_env=True`。于是：
+
+- ✅ 设 `MINDMAP_EXTERNAL_PROXY` → 只有外部检索走代理。
+- ❌ 设 `HTTP_PROXY` / `HTTPS_PROXY`（或 `clash-cli on` 帮你设的那七个变量）→ 那九处一起走代理。模型调用绕一圈出国再回来，"测试连接"会把内网探针的话术变成谎言，最坏情况是整站不可用。
+
+所以下面**不用 `clash-cli on`**（它的 `_set_system_proxy()` 就是导出 `http_proxy`/`https_proxy`/`all_proxy`/`no_proxy`），只让内核在 `127.0.0.1` 上监听，由应用那一个变量点名走它。
+
+**为什么不用 `clash-cli install`。** 它会 `exec bash -i`（`script/common.sh` 的 `_quit()`），在非交互 shell 里 stdin 是管道，直接永久挂住；成功路径末尾也走 `_quit`。手工铺三样东西更省事，而且不会往 `~/.bashrc` 塞 `watch_proxy`（那一行会让每次 root 登录都悄悄设上系统代理变量）。
+
+**铺法（以 `mihomo` v1.19.2 为例，实测于 Alibaba Cloud Linux 3）**
+
+1. 拿到 `mihomo` 与 `yq` 两个二进制。GitHub 不通的机器可以从 PyPI 的 `clash-cli` wheel 里取（`clash_cli/resources/resources/zip/` 下有 `mihomo-linux-amd64-compatible-v*.gz`、`yq_linux_amd64.tar.gz`）：
+   ```bash
+   gzip -dc mihomo-linux-amd64-compatible-v1.19.2.gz > /opt/clash/bin/mihomo && chmod +x /opt/clash/bin/mihomo
+   tar -xzf yq_linux_amd64.tar.gz -C /opt/clash/bin ./yq
+   /opt/clash/bin/mihomo -v
+   ```
+2. 写 `/opt/clash/config.yaml`。关键是**不要**照抄订阅方给的全量配置——那份会开 DNS 劫持、fake-ip、甚至系统代理，把宿主的其他出网也一起改掉。用 `proxy-providers` 直接吃订阅（base64 的 vless / hysteria2 清单也能吃，不需要 subconverter）：
+   ```yaml
+   mixed-port: 7890
+   bind-address: 127.0.0.1
+   allow-lan: false
+   mode: rule
+   ipv6: false
+   dns:
+     enable: false
+   proxy-providers:
+     airplane:
+       type: http
+       url: "https://<你的订阅地址>"
+       path: ./providers/airplane.yaml
+       interval: 3600
+   proxy-groups:
+     - name: PROXY
+       type: fallback
+       use: [airplane]
+       url: "https://zh.wikipedia.org/w/api.php?action=query&format=json&meta=siteinfo"
+       interval: 300
+   rules:
+     - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+     - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+     - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+     - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+     - DOMAIN-SUFFIX,zh.wikipedia.org,PROXY
+     - DOMAIN-SUFFIX,wikipedia.org,PROXY
+     - DOMAIN-SUFFIX,wikimedia.org,PROXY
+     - MATCH,DIRECT
+   ```
+   三个非显然的选择：
+   - **`type: fallback` 而不是 `url-test`**，且 `url` 指向**维基**而不是 `generate_204`。实测很多节点 `gstatic.com/generate_204` 300–2000ms 正常，但维基一上去就 `SSL_ERROR_SYSCALL`——`url-test` 会挑那个"最快"的、恰好是不能用的。fallback 按顺序挑第一个真正取到 200 的。
+   - **`dns.enable: false` + 不开 tun + 不开 system-proxy**：这台机器上还跑着模型调用与 pip，劫持 DNS 的收益是零、风险是整站出网。
+   - **`MATCH,DIRECT` 兜底**：这就是"收窄"本身。将来有人误把 `HTTPS_PROXY` 写进 env，mihomo 也会把非白名单域名直连放行，不至于把国内端点绕出国。要加新域名就往 `PROXY` 那组上面插一行。
+3. `mihomo -t -d /opt/clash -f /opt/clash/config.yaml` 先测配置，再写一个最小 systemd 单元：
+   ```ini
+   [Unit]
+   Description=mihomo (external search proxy)
+   After=network-online.target
+   [Service]
+   Type=simple
+   ExecStart=/opt/clash/bin/mihomo -d /opt/clash -f /opt/clash/config.yaml
+   Restart=on-failure
+   RestartSec=5s
+   NoNewPrivileges=true
+   PrivateTmp=true
+   ProtectSystem=strict
+   ProtectHome=true
+   ReadWritePaths=/opt/clash
+   LimitNOFILE=65535
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   `systemctl enable --now mihomo`，然后 `ss -lntp | grep 7890` 确认只在 `127.0.0.1` 上听。
+4. `echo 'MINDMAP_EXTERNAL_PROXY=http://127.0.0.1:7890' >> /etc/genai-mindmap/env`，`systemctl restart genai-mindmap`。
+
+**验收（三条，缺一条都别算通过）**
+
+```bash
+# ① 只有维基走代理，国内/直连站点仍然是直连
+curl -s -o /dev/null -w '%{http_code} %{time_total}\n' -x http://127.0.0.1:7890 \
+  'https://zh.wikipedia.org/w/api.php?action=query&format=json&meta=siteinfo'
+curl -s -o /dev/null -w '%{http_code} %{time_total}\n' -x http://127.0.0.1:7890 \
+  http://export.arxiv.org/api/query?search_query=all:quantum
+
+# ② 进程环境里只有那一个代理变量，没有 HTTP(S)_PROXY
+tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value genai-mindmap)/environ | grep -i proxy
+
+# ③ 用应用自己的库与配置真检索一次（比 curl 更能证明接线对了）
+cd /opt/genai-mindmap/backend && set -a && . /etc/genai-mindmap/env && set +a && \
+  MINDMAP_DB_PATH=/var/lib/genai-mindmap/mindmaps.db \
+  /opt/genai-mindmap/.venv/bin/python -c \
+  'from app.knowledge import external; print(external._proxy()); print(len(external.search_external("量子计算", limit=6)))'
+```
+
+第 ③ 条在接好之后应当返回 4 条左右的结果；接之前是 0。**注意它可能带缓存**（`external_cache` 表），第一次为空的结果也会被记住一小时，排查时先清那一行或换个 query。
+
+源级失败要分开看：`快懂百科 404`、`arXiv 429` 这类是源站自己的状态（走的是直连），与代理无关；代理坏了的表现是**维基那一条**失败，且日志里会有一次"没有配置 `MINDMAP_EXTERNAL_PROXY`，正在猜本机代理"的告警。
 
 ## 12. 自动化部署（GitHub Actions + 自托管 runner，零入方向端口）
 
