@@ -48,7 +48,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
 | `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
 | `MINDMAP_SETTINGS_ALLOW_PRIVATE` | 空（关） | 允不允许把模型地址指向本机 / 内网。关着时"测试连接"与生成都会拒（`probe._refuse()`），因为**这个面能用已存密钥当内网探针**。要连 Ollama / LM Studio / 同机自建端点就设 `1`；它同时放开本机与内网，没有更细的粒度。**云元数据地址（`169.254.169.254`、`metadata.google.internal`、`100.100.100.200` 等）这个开关也打不开**——那里没有模型，只有临时凭证 |
-| `MINDMAP_FREE_TIER` | 空（关） | 走 Command Code coding plan 里当前标 `:free` 的模型（免费额度那一档用的就是它）。打开后，**只有借用部署方配置的人**（自己没填密钥）会换成免费模型，并自动带 `reasoning_effort=low`、把 `max_tokens` 抬到 4000。默认关：打开它等于改变"这一次生成花谁的钱"，已有部署升级后不该静默变成又慢又受每日次数限制。详见 `docs/FREE-MODELS.md` |
+| `MINDMAP_FREE_TIER` | 空（关） | 走 Command Code coding plan 里当前标 `:free` 的模型（免费额度那一档用的就是它）。打开后，**只有借用部署方配置的人**（自己没填密钥）会换成免费模型，并自动带 `reasoning_effort=low`、把 `max_tokens` 夹到 4000–16000 之间（下限防止思考吃光额度，上限防止它按 6.5 万 token 的预算思考几十分钟）。默认关：打开它等于改变"这一次生成花谁的钱"，已有部署升级后不该静默变成又慢又受每日次数限制。详见 `docs/FREE-MODELS.md` |
 | `MINDMAP_FREE_TIER_API_KEY` | 空（关） | **公共免费密钥**：配了它就有"每 IP 每天 3 次免费生成"，没配就完全没有额度这回事。它本身就是开关（不再有单独的 `MINDMAP_FREE_QUOTA`——那只会多出"配了钥匙忘开开关"的状态）。用的是**部署方那把钥匙**，所以只有"没有自己密钥"的人会走到；且地址也必须是部署方选的（`base_url_source` 是 `instance`/`env`），**调用方自己写的地址永远领不到这把钥匙**。详见 `docs/FREE-MODELS.md` 第 8 节 |
 | `MINDMAP_FREE_QUOTA_LIMIT` | `3` | 每个 IP 每天的免费次数上限（1–100）。写错或越界退回 3 并留一条 warning |
 | `TZ` | （系统默认） | **部署这台机器时建议显式设成 `Asia/Shanghai`**：免费额度按**本地日期**跨天重置，容器/systemd 默认是 UTC 的话"明天"会从北京时间早八点开始 |
@@ -67,7 +67,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 三个边界：① **只比主机名**，不比端口与路径——`/v1` 换 `/v2`、Ollama 11434 挪到 11435 都不该逼人重填，为这些变动弹提示只会训练出"看到提示就再粘一次"的习惯；换主机才意味着"换了一个会收到这把密钥的对方"。② 锚点**落库**而不是每次读时算，算的话它会跟着新地址一起漂，绑定等于不存在。③ 老库升级时该列补成空串，此时按那一行自己的 `base_url` 兜底——否则升级当天所有人的已存配置会一起被判成"未配置"。重新粘贴一次密钥就是唯一的恢复动作，`POST /model/test` 在这个状态下回 400 `settings_key_unbound` 并且**一个字节都不发**。
 
-**免费档（`MINDMAP_FREE_TIER`）：模型名是运行时现问的，不写死。** 打开之后，`store.resolve()` 会问一次部署方那台端点的 `GET /models`，挑出当前 id 以 `:free` 结尾、且 `supported_endpoints` 里带 `/chat/completions` 的那些，按"上下文大的优先、同大按 id 升序"排第一个来用。**这份名单会变**——平台会新上架免费模型，也会把已有的下架，所以这里一个模型名都没硬编码；`docs/FREE-MODELS.md` 记着实测数据与坑。三条运维要点：① 拉一次列表要 20 秒以上，所以它是后台线程 + 1 小时 TTL 缓存，**永远不会出现在请求路径上**（冷启动第一次会报"免费档还没准备好"，点一次重试就好）；② 免费模型**也要密钥**（不带 key 直接 401），只是那次调用不收费，所以这一档用的是部署方那把钥匙，`model_source` 会报 `free`；③ 上游偶发 429，一次运行内会按候选序列换下一个免费模型，全试完才报错。用户自己填了密钥就完全不进这一档。
+**免费档（`MINDMAP_FREE_TIER`）：模型名是运行时现问的，不写死。** 打开之后，`store.resolve()` 会问一次部署方那台端点的 `GET /models`，挑出当前 id 以 `:free` 结尾、且 `supported_endpoints` 里带 `/chat/completions` 的那些，按"上下文大的优先、同大按 id 升序"排第一个来用。**这份名单会变**——平台会新上架免费模型，也会把已有的下架，所以这里一个模型名都没硬编码；`docs/FREE-MODELS.md` 记着实测数据与坑。四条运维要点：① 拉一次列表要 20 秒以上，所以它是后台线程 + 1 小时 TTL 缓存，**永远不会出现在请求路径上**（冷启动第一次会报"免费档还没准备好"，点一次重试就好）；② 免费模型**也要密钥**（不带 key 直接 401），只是那次调用不收费，所以这一档用的是部署方那把钥匙，`model_source` 会报 `free`；③ 上游偶发 429 / 524，一次运行内会按候选序列换下一个免费模型，全试完才报错；④ **免费档单次生成要 4–6 分钟**（付费档约 100 秒的同一张图），`RunBudget.max_seconds` 默认 600 秒余量偏薄——把免费档当主路径前先确认它不是唯一开关，或把 `MINDMAP_LLM_MAX_TOKENS` 留在默认（免费档的 `max_tokens` 上限由代码夹在 16000，不跟随这个变量往上走）。用户自己填了密钥就完全不进这一档。
 
 **公共免费额度（`MINDMAP_FREE_TIER_API_KEY`）：每 IP 每天 3 次，用完 429。** 配了这把钥匙，没有自己密钥的人就能借它生成，`api_key_source` 报 `public`。四件要知道的事：
 
