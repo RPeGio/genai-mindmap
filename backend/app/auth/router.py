@@ -98,10 +98,14 @@ def who_am_i(request: Request, response: Response) -> WhoAmI:
     if guest_id is None:
         # 没有合法游客 id：发一个新的。`Max-Age` 给一年——比会话长得多，因为它的
         # 语义是"这台浏览器"，不是"这次登录"。
+        #
+        # 值是 `<id>.<签名>`（`identity.guest_cookie_value`）：没有签名时任何格式
+        # 合法的 32 位十六进制串都会被当成身份，改一下 cookie 就能读别人的草稿。
         guest_id = identity.new_guest_id()
         response.headers.append(
             "set-cookie",
-            identity.cookie_header(store.GUEST_COOKIE, guest_id,
+            identity.cookie_header(store.GUEST_COOKIE,
+                                   identity.guest_cookie_value(guest_id),
                                    scope=request.scope, max_age=365 * 24 * 3600))
     return WhoAmI(guest_id=guest_id, kind="guest")
 

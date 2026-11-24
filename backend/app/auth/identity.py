@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from contextvars import ContextVar
 from uuid import uuid4
 
@@ -33,10 +32,6 @@ logger = logging.getLogger(__name__)
 #: 身份，否则会在多用户场景下把 A 的密钥用在 B 的请求上——那是最坏的一种 bug，
 #: 而且它只在并发下出现。
 _current: ContextVar[store.Identity] = ContextVar("auth_identity", default=store.Identity())
-
-#: 游客 id 的形状。只接受 uuid4 的十六进制串，别的一律当作"没有游客 cookie"：
-#: 这个值会被写进额度计数表，接受任意字符串等于接受任意长度的键。
-_GUEST_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 def current_identity() -> store.Identity:
@@ -113,10 +108,20 @@ def cleared_cookie(name: str, *, scope: dict) -> str:
 def new_guest_id() -> str:
     """一个新的游客 id。
 
-    `uuid4().hex` 而不是 `token_urlsafe`：这个值不需要保密（它不是一个凭证，
-    只是"这台浏览器"的编号），固定 32 位十六进制让 cookie 与库里的列都定长。
+    `uuid4().hex` 而不是 `token_urlsafe`：固定 32 位十六进制让 cookie 与库里的列
+    都定长。
     """
     return uuid4().hex
+
+
+def guest_cookie_value(guest_id: str) -> str:
+    """放进 `mm_guest` 的值：`<id>.<签名>`。
+
+    签名在 `store.sign_guest` 里（密钥从库路径派生，见那边的注释）。**签发与读取
+    必须成对出现**：只改一边会让所有游客 cookie 突然不认，表现为"每次刷新都换一个
+    游客身份"，而用户自己的导图与设置看起来就像丢了。
+    """
+    return store.sign_guest(guest_id)
 
 
 def read_cookie(scope: dict, name: str) -> str:
@@ -167,8 +172,14 @@ def client_ip(scope: dict) -> str:
 
 
 def _read_guest(cookies: dict[str, str]) -> str | None:
-    raw = (cookies.get(store.GUEST_COOKIE) or "").strip().lower()
-    return raw if _GUEST_PATTERN.match(raw) else None
+    """从 cookie 读出**已验证签名**的游客 id（`store.read_guest`）。
+
+    没有签名时，任何格式合法的 32 位十六进制串都是一个身份：审查时实测过，把
+    `mm_guest` 改成别人的值就能读到那个人未保存的草稿、待处理列表，甚至用他的
+    run_id 拿到他那一轮的树。签名让"拿到别人的 cookie"与"拿到别人的密码"重新
+    成为同一件事。
+    """
+    return store.read_guest(cookies.get(store.GUEST_COOKIE) or "")
 
 
 def resolve_identity(scope: dict) -> store.Identity:
@@ -220,6 +231,7 @@ __all__ = [
     "cookie_header",
     "current_identity",
     "current_user",
+    "guest_cookie_value",
     "new_guest_id",
     "resolve_identity",
 ]

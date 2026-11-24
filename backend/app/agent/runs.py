@@ -292,6 +292,13 @@ def begin(run_id: str, request: dict[str, Any], *, owner: str | None = None) -> 
     `{"intent": "create"}`，前端载入时按 create 重置 `mapId`，用户点保存会变成新建
     一条而不是覆盖原记录。`candidate` 反过来**必须**留着：重开跑的是"在已有树上
     继续"，抹掉它等于把这次续写的起点删了。
+
+    **重开只允许本人**：`WHERE ... AND owner = ?`。没有这个条件时，任何知道别人
+    `run_id` 的人都能把他的 `failed` 行重开成自己的——`UPDATE` 里那句 `owner = ?`
+    会把行改归发起人，原主人之后连 `GET /runs/{id}` 都是 404（审查实测过这条：
+    B 用 A 的 `failed` id 发一次流，那行就变成 B 的了）。老行（`owner = ''`，加账号
+    之前留下的）因此谁都不能重开：它们是没有主人的历史草稿，重新生成一次比"猜
+    该归谁"更安全，也不需要再引入一个"部署方可以接管别人的行"的旁路。
     """
     payload = None if not request else json.dumps(request, ensure_ascii=False)
     if owner is None:
@@ -322,10 +329,12 @@ def begin(run_id: str, request: dict[str, Any], *, owner: str | None = None) -> 
                     f"partial = NULL, partial_reason = NULL, checkpointed_at = NULL, "
                     # 重开是**另一个请求**在用这行跑，`request` 必须换成这一轮的摘要；
                     # 空摘要（内部调用方不传）用 COALESCE 保住旧值，等于"这次没带摘要"。
-                    # `owner` 同理换成本轮发起人：重开的人是这一轮的主人。
+                    # `owner` 不换：`WHERE ... AND owner = ?` 已经限定只有本人能重开，
+                    # 这一句在语义上是冗余的自证（写回同一个值），留着是为了让 SQL
+                    # 自解释"这行的主人还是他"。
                     f"request = COALESCE(?, request), owner = ?, updated_at = {_NOW} "
-                    "WHERE run_id = ? AND status IN (?, ?)",
-                    (STATUS_RUNNING, payload, owner, run_id, *RESTARTABLE_STATUSES),
+                    "WHERE run_id = ? AND status IN (?, ?) AND owner = ?",
+                    (STATUS_RUNNING, payload, owner, run_id, *RESTARTABLE_STATUSES, owner),
                 )
                 claimed = reopened.rowcount == 1
             conn.execute("COMMIT")

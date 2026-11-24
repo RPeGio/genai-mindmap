@@ -196,3 +196,55 @@ def test_marking_applied_cannot_be_done_by_someone_else():
     _seed_run("run-apply", "user:owner")
     assert runs_module.mark_applied("run-apply", owner="user:other") is False
     assert runs_module.mark_applied("run-apply", owner="user:owner") is True
+
+
+# ---------------------------------------------------------------- 流接口的归属
+
+def test_streaming_someone_elses_finished_run_is_404():
+    """`POST /runs/stream` 带别人的 `run_id` 必须是 404，不能把树重放出来。
+
+    这条路是审查时实测到的（P1-1）：`GET /runs/{id}` 已经按 owner 过滤了，但
+    stream 走的是 `runs.begin()` → `_replay()`，中间没有任何归属检查。B 拿 A 的
+    done 行打一次流，流里就是 A 的整棵树。`run_id` 由前端生成（时间戳 + 随机 6 位），
+    猜中的成本比看上去低，而代价是别人的未保存草稿。
+    """
+    alice, bob = _register("stream_alice"), _register("stream_bob")
+    _seed_run("run-stream-done", "user:1")
+
+    response = bob.post("/api/agent/runs/stream",
+                        json={"goal": "偷看一下", "intent": "create",
+                              "run_id": "run-stream-done"})
+    assert response.status_code == 404
+    assert response.json()["code"] == "run_not_found"
+    # 流里一个字节都不该有 A 的内容。404 走的是错误响应，不是流。
+    assert "候选" not in response.text
+
+
+def test_streaming_an_abandoned_run_of_someone_else_does_not_steal_it():
+    """用别人 `failed` 的 `run_id` 打流 → 404，**而且那行不能改归自己**。
+
+    这是审查里更隐蔽的那一半：光拒绝请求还不够。原来的重开 SQL 是
+    `UPDATE ... SET owner = ?`，所以 B 打一次流之后那行就变成 B 的了，A 之后连
+    自己的 `GET /runs/{id}` 都是 404——一次"请求被允许"变成了数据归属的静默转移。
+    """
+    alice, bob = _register("steal_alice"), _register("steal_bob")
+    with closing(runs_module._connect()) as conn, conn:
+        conn.execute(
+            "INSERT INTO runs (run_id, status, request, created_at, updated_at, owner) "
+            "VALUES ('run-steal', 'failed', '{}', "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "'user:1')")
+
+    response = bob.post("/api/agent/runs/stream",
+                        json={"goal": "接着跑", "intent": "create",
+                              "run_id": "run-steal"})
+    assert response.status_code == 404
+    assert response.json()["code"] == "run_not_found"
+
+    with closing(runs_module._connect()) as conn:
+        owner = conn.execute(
+            "SELECT owner FROM runs WHERE run_id = 'run-steal'").fetchone()[0]
+        status = conn.execute(
+            "SELECT status FROM runs WHERE run_id = 'run-steal'").fetchone()[0]
+    assert owner == "user:1", "别人的行不能被重开成自己的"
+    assert status == "failed", "被拒绝的请求也不该把状态改成 running"

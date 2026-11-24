@@ -105,6 +105,13 @@ SESSION_COOKIE = "mm_session"
 #: 游客身份。它现在只用来"记住这台浏览器是谁"，免额度那一批会在它上面计数。
 GUEST_COOKIE = "mm_guest"
 
+#: 游客 id 的形状：32 位小写十六进制（`uuid4().hex`）。
+_GUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+#: 签名的字符数（sha256 hex 的前 16 位 = 64 bit）。16 足够：伪造一个游客身份需要
+#: 2^64 次尝试，而它的收益是"读另一个游客的偏好设置"。截短是为了让 cookie 短一点，
+#: 不是为了安全（`read_guest` 的比对才是安全的那一半）。
+GUEST_SIG_CHARS = 16
+
 #: 过期的会话行保留一段时间再清：刚过期就删会让"为什么突然要重新登录"没有任何
 #: 痕迹可查（用户来问时，库里连那条会话都不在了）。留七天。
 SESSION_GC_AFTER_SECONDS = 7 * 24 * 3600
@@ -159,6 +166,64 @@ def _connect() -> sqlite3.Connection:
     from app.mindmaps import repository
 
     return repository.connect()
+
+
+# ---------------------------------------------------------------- 游客签名
+
+#: 游客 cookie 的签名密钥。**进程级常量，不是环境变量**。
+#:
+#: 为什么不给一个 `MINDMAP_SECRET`：多一个环境变量就多一种"忘了设 / 设错了 / 两台
+#: 机器的值不一样"的故障形态，而这两种故障都表现为"所有人突然变成游客"或"游客
+#: 数据全部丢失"——排查时间全花在配置上。密钥从库文件的绝对路径派生：它天然是
+#: 每台机器一份、随库一起搬、不需要任何运维动作。
+#:
+#: 代价说清楚：**同一个人在两台机器上会拿到同一个游客 id**（如果库文件恰好同名
+#: 同路径）。那不是泄漏，是"这两台机器上的游客数据会合并"——本来就只有一个库。
+_SECRET_PREFIX = b"mindmap-guest-v1:"
+
+
+def _guest_secret() -> bytes:
+    """从库路径派生签名密钥（见 `_SECRET_PREFIX` 的注释）。"""
+    from app.mindmaps import repository
+
+    return hashlib.sha256(
+        _SECRET_PREFIX + str(repository.db_path()).encode("utf-8")).digest()
+
+
+def sign_guest(guest_id: str) -> str:
+    """给一个游客 id 签名，返回放进 cookie 的值 `"<id>.<sig>"`。
+
+    **为什么需要签名**：游客 id 是身份。没有签名时，任何格式合法的 32 位十六进制
+    串都会被当成一个身份（审查时实测：把 `mm_guest` 改成别人的值，就能读到别人的
+    未保存草稿、待处理列表、甚至发出别人的那次运行）。这与"会话 token 只存哈希"
+    是同一条纪律：拿到 cookie 的人应该只有他自己那一个身份。
+
+    `hmac.compare_digest` 比对而不是 `==`：常量时间。游客 id 是公开的一半（它在
+    cookie 里、也在 `/me` 的响应里），能被比对的只有签名；而"逐字节提前返回"会让
+    签名变成可爆破的。
+    """
+    signature = hmac.new(_guest_secret(), guest_id.encode("utf-8"),
+                         hashlib.sha256).hexdigest()[:GUEST_SIG_CHARS]
+    return f"{guest_id}.{signature}"
+
+
+def read_guest(raw: str) -> str | None:
+    """从 cookie 的原始值读出**已验证**的游客 id；形状不对或签名不对都返回 None。
+
+    返回 None 的后果由调用方决定：`identity.resolve_identity` 会当成"既没登录、
+    也没发过游客 cookie"，然后由 `GET /auth/me` 补发一个新的。也就是说**伪造的
+    cookie 等价于没有 cookie**，而不是 401——游客是合法状态，一份坏 cookie 不该
+    让页面打不开。
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        return None
+    guest_id, _, signature = text.partition(".")
+    if not signature or not _GUEST_ID_PATTERN.match(guest_id):
+        return None
+    expected = hmac.new(_guest_secret(), guest_id.encode("utf-8"),
+                        hashlib.sha256).hexdigest()[:GUEST_SIG_CHARS]
+    return guest_id if hmac.compare_digest(signature, expected) else None
 
 
 # ---------------------------------------------------------------- 口令哈希
@@ -522,9 +587,11 @@ __all__ = [
     "get_user",
     "hash_password",
     "open_session",
+    "read_guest",
     "revoke_all_sessions",
     "revoke_session",
     "session_hash",
     "session_user",
+    "sign_guest",
     "verify_password",
 ]
