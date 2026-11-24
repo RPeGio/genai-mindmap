@@ -447,6 +447,17 @@ export interface AgentWarning {
 const AGENT_WARNING_LIMIT = 20;
 
 /**
+ * 思考尾巴只留这么多字符。
+ *
+ * 页面固定只显示一行（约 40–60 个汉字），留 400 是让它有得滚、又不至于把整段
+ * 思考过程攒在内存里：一次免费档生成实测思考能到 2000+ token，全留就是这个
+ * 数字的十倍以上，而多出来的部分对"它在动"没有增量信息。
+ *
+ * 截断只切尾部（`slice(-THINKING_KEEP)`），因为要显示的就是最新的那一截文字。
+ */
+const THINKING_KEEP = 400;
+
+/**
  * 预览树里一个节点。
  *
  * 没有 id：`node_grow` 那一侧的事件里本来就没有 id（展开调用的响应只有 label
@@ -827,6 +838,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const status = ref(INITIAL_STATUS);
   const stageText = ref('');
   const waitedMs = ref(0);
+  /**
+   * 模型正在思考的滚动尾巴（只保留最后一行要显示的长度）。
+   *
+   * 与 `stageText` 分开存：`stageText` 是"做到哪一步了"的业务进度（"正在给 33 个
+   * 节点写说明"），会被后到的阶段帧覆盖；这一条只是"模型正在吐字"的活证据，
+   * 在两步之间一直滚。合进 `stageText` 会让一句业务进度被模型想的字顶掉，
+   * 而用户真正想知道的是后者。
+   *
+   * 只留尾部：页面固定只显示一行，攒整篇既占内存也诱使人去读。`THINKING_KEEP`
+   * 是前端显示宽度的几十倍，够滚动起来又不至于把整段思考留在内存里。
+   */
+  const thinkingTail = ref('');
+  /** 本次运行收过多少条思考帧——`> 0` 才让界面把那行显示出来。 */
+  const thinkingSeen = ref(false);
   const busy = ref(false);
   const selectedId = ref<string | null>(null);
   /**
@@ -3367,6 +3392,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     stageText.value = '正在连接';
     status.value = '正在生成…';
     waitedMs.value = 0;
+    // 思考尾巴同理：它描述的是上一个运行正在想的东西，留着就是挂一句已经
+    // 与屏幕上这棵树无关的话。
+    thinkingTail.value = '';
+    thinkingSeen.value = false;
     // 上一轮的模型名与思考过程在**这一次开始的那一刻**就作废：它们描述的是另一个
     // 运行。留到这一次的 done 帧才清，中间那段时间面板会挂着一个已经不对的模型名。
     runModel.value = null;
@@ -3434,6 +3463,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 的帧付这个成本。
         if (event.type === 'heartbeat') {
           waitedMs.value = Math.round(event.waited_ms / 1000);
+          return;
+        }
+        // 思考帧同样不进 `agentEvents`：它是活证据，不是事件。进列表会让右侧
+        // 面板被几百条碎片刷满，而每条都不值得单独看一眼。
+        if (event.type === 'thinking') {
+          thinkingSeen.value = true;
+          thinkingTail.value = (thinkingTail.value + event.text).slice(-THINKING_KEEP);
+          // 它与真进度帧一样算"有新内容"，所以 `waitedMs` 也归零——下面那行统一
+          // 做了，这里提前 return 会让"已等 N 秒"在模型边想边写的几分钟里一直涨。
+          waitedMs.value = 0;
           return;
         }
         agentEvents.value = [...agentEvents.value, event];
@@ -3588,6 +3627,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
         stageText.value = '';
         // 断流/异常退出时同理：这一轮已经结束，别再留着"模型正在思考"。
         waitedMs.value = 0;
+        thinkingTail.value = '';
+        thinkingSeen.value = false;
       }
     }
   }
@@ -4056,6 +4097,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 服务端回报的模型名（同一条帧的另一个字段）：与请求名分开，才能看出路由。
     runServedModel,
     lastReasoning,
+    // 模型正在思考的滚动尾巴：界面上固定只显示一行，让用户看见"它在动"
+    thinkingTail,
+    thinkingSeen,
     expanding,
     generating,
     runGeneration,

@@ -117,6 +117,92 @@ describe('底部对话框的状态机', () => {
     expect(wrapper.find(DOCK_CARD).exists()).toBe(false);
   });
 
+  it('模型在思考：细进度下面多一行滚动尾巴，且不再说"已等 N 秒"', async () => {
+    stubFetch([{ type: 'done', seq: 3, content: TREE, mode: 'model' }]);
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.busy = true;
+    store.stageText = '正在给 33 个节点写说明';
+    // 4 秒没有新内容：按旧逻辑这里会切成"模型正在思考，已等 4 秒"
+    store.waitedMs = 12;
+    store.thinkingSeen = true;
+    store.thinkingTail = '这三个节点讲的都是流程里同一处';
+    await wrapper.vm.$nextTick();
+
+    const row = wrapper.get('[data-test="run-status"]');
+    // 业务进度还在：它比"它在动"信息量大，不能被顶掉
+    expect(row.text()).toContain('正在给 33 个节点写说明');
+    // 那句"已等 N 秒"不再出现
+    expect(row.text()).not.toContain('已等');
+    // 思考尾巴单独一行，只显示尾部文字
+    expect(wrapper.get('[data-test="run-status-thinking"]').text())
+      .toBe('这三个节点讲的都是流程里同一处');
+  });
+
+  it('没有思考帧时那一行不出现（老后端不认这个帧也不能空一行出来）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.busy = true;
+    store.stageText = '正在定框架';
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find('[data-test="run-status"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="run-status-thinking"]').exists()).toBe(false);
+  });
+
+  it('思考帧真的从流里进 store：拼在尾部、只留最后一截，且不占事件列表', async () => {
+    // 可控的流：先发两帧 thinking，**暂不结束**——这样可以在运行中途看 store，
+    // 而不是等 finally 把这两行清掉之后再看（那样什么都测不到）。
+    const encoder = new TextEncoder();
+    let push: ((frame: unknown) => void) | null = null;
+    let close: (() => void) | null = null;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (frame: unknown) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+        };
+        close = () => controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      if (isOptimizationRequest(url)) return optimizationReply();
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ version: 'test' }) } as unknown as Response;
+      }
+      return { ok: true, status: 200, body, json: async () => ({}) } as unknown as Response;
+    }));
+
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    const running = store.runGeneration('机器学习', 'edit');
+    await flushPromises();
+
+    push!({ type: 'thinking', seq: 1, text: '甲'.repeat(390) });
+    push!({ type: 'thinking', seq: 2, text: '乙'.repeat(20) });
+    await flushPromises();
+
+    expect(store.thinkingSeen).toBe(true);
+    // 只留最后 400 字符：页面固定只显示一行，攒整篇没有意义
+    expect(store.thinkingTail.length).toBe(400);
+    expect(store.thinkingTail.endsWith('乙')).toBe(true);
+    // 思考不是事件：右侧事件列表不该被几百条碎片刷满
+    expect(store.agentEvents.length).toBe(0);
+
+    // 收尾：让它正常结束，别把挂起的 promise 留给下一个用例。
+    // `close()` 必须有：只发 `done` 帧不关闭流时读循环还等着下一块。
+    push!({ type: 'done', seq: 3, content: TREE, mode: 'model' });
+    close!();
+    await running;
+    await wrapper.vm.$nextTick();
+    // 运行结束后尾巴清掉：那一行不该在"生成成功"之后还挂着
+    expect(store.thinkingTail).toBe('');
+    expect(store.thinkingSeen).toBe(false);
+  });
+
   it('生成完：2 秒后淡出，只剩画布 + 悬浮球', async () => {
     stubFetch([{ type: 'done', seq: 3, content: TREE, mode: 'model' }]);
     const wrapper = mountApp();
