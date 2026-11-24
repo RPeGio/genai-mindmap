@@ -263,6 +263,11 @@ def _parse_completion(buffer: bytearray) -> Completion:
     # 输出被硬切时，tool_calls 里的 arguments 可能只写了一半。半截参数拿去执行
     # 比直接失败危险得多（比如 add 的 label 被截断，树里就多一个残缺节点），
     # 所以这里直接判失败，而不是"能解析多少算多少"。
+    #
+    # **与 `chat_async` 的 salvage 有意不同**：那条路要的是一棵可回收的树
+    # （`salvage_model_json` 能救回已经闭合的节点，交给用户半棵树比整轮报废好）；
+    # 这条路要的是一个**工具调用**，参数缺一半执行了就是脏数据，没有"回收一半"
+    # 这种选项。两处的判断因此不能统一——统一成 salvage 会把半截参数放进树里。
     if finish_reason == "length":
         raise GenerationError("模型输出被长度上限截断，本轮不执行任何工具调用")
 

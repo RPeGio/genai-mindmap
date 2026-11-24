@@ -362,10 +362,40 @@ def test_chat_async_keeps_the_body_byte_identical_without_the_free_tier(
     sent = _capture_chat(monkeypatch)
 
     asyncio.run(chat_async("sys", "user", max_tokens=1400))
+    asyncio.run(chat_async("sys", "user", max_tokens=65536))
 
     assert "reasoning_effort" not in sent[0]
     assert sent[0]["max_tokens"] == 1400
     assert sent[0]["model"] == "vendor/paid-model"
+    # 也不能被压：16000 那道夹子只对免费档生效（上下两个方向都要钉，
+    # 否则"顺手给所有档位都加个上限"这种改法能悄悄过掉）
+    assert sent[1]["max_tokens"] == 65536
+
+
+def test_the_free_tier_ceiling_reaches_the_budget_arithmetic(monkeypatch, llm_env):
+    """上限不只在"发请求那一刻"生效：按上限反推容量的地方也要跟着降。
+
+    `_max_tokens()` / `_nodes_per_call()` 自己不发请求，却用这个数算"这次装得下
+    几个节点"。少这一道时免费档会按 65536 规划批次，而实际只发 16000——规划量是
+    真实容量的四倍多，照它切出来的批必然被 `finish_reason=length` 截断。
+    """
+    from app.agent.contracts import AgentRunRequest, RunBudget, RunContext
+    from app.agent.tools import _max_tokens, _nodes_per_call
+
+    def context() -> RunContext:
+        return RunContext(request=AgentRunRequest(
+            goal="做一张导图", intent="create",
+            budget=RunBudget(max_model_calls=10, max_output_tokens=65536),
+        ))
+
+    paid = _nodes_per_call(context())
+    assert _max_tokens(context()) == generation_service.max_tokens_cap()
+
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    _put_cache(["recursive/flint-v1.0:free"])
+
+    assert _max_tokens(context()) == generation_service.FREE_MAX_OUTPUT_TOKENS
+    assert _nodes_per_call(context()) < paid
 
 
 def test_chat_async_fails_over_to_the_next_free_model(monkeypatch, llm_env):

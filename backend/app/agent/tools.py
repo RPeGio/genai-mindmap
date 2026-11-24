@@ -97,6 +97,7 @@ from app.generation.service import (
     EXTERNAL_TRUST_RULES,
     MIN_BRANCHES,
     GenerationError,
+    apply_free_tier_ceiling,
     chat_async,
     estimate_input_tokens,
     max_tokens_cap,
@@ -1130,8 +1131,13 @@ def _max_tokens(ctx: RunContext) -> int:
     夹的是 `max_tokens_cap()` 而不是字面常量：那个函数把
     `MINDMAP_LLM_MAX_TOKENS` 与服务端 400 里学到的上限取小（见它的 docstring）。
     qwen 系列只认 32768 时，配一个环境变量就能让这条出口跟着降下来。
+
+    再夹一次免费档的 16000（`apply_free_tier_ceiling`）：不发请求的地方也读这个
+    数，用它反推"这次装得下几个节点"。少这一道时免费档会按 65536 规划批次，而
+    实际只发 16000，规划出的节点数根本写不完。
     """
-    return min(ctx.request.budget.max_output_tokens, max_tokens_cap())
+    return apply_free_tier_ceiling(
+        min(ctx.request.budget.max_output_tokens, max_tokens_cap()))
 
 
 async def _chat(

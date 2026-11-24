@@ -165,11 +165,28 @@ def max_tokens_cap() -> int:
     `provider.complete_tools`（agent 轮次），以及任何将来新增的模型调用。
     各写一处 `min(...)` 的结果，是三条路上限慢慢分叉，而分叉的表现只是
     "某条路径偶尔 400"。
+
+    **注意它不含免费档的 16000**：那个上限只在真正发请求时由
+    `chat_async` / `provider._attempt` 夹（因为只对免费档生效、要读一次
+    `resolve()`）。按这个数反推"这次装得下几个节点"的地方要另外过
+    `apply_free_tier_ceiling()`，否则算出来的容量会比真实容量大好几倍。
     """
     cap = configured_max_tokens()
     if _LEARNED_MAX_TOKENS is not None:
         cap = min(cap, _LEARNED_MAX_TOKENS)
     return cap
+
+
+def apply_free_tier_ceiling(cap: int) -> int:
+    """按免费档上限再夹一次 `cap`，不在免费档时原样返回。
+
+    给"用上限反推容量"的调用方用（`agent.tools._max_tokens` 与它下游的
+    `_nodes_per_call`）：免费档实际只发 16000，按 65536 反解出来的节点数
+    是真实容量的四倍多，照着它规划批次必然被 `finish_reason=length` 截断。
+    """
+    if _settings_store.resolve().reasoning_effort is None:
+        return cap
+    return min(cap, FREE_MAX_OUTPUT_TOKENS)
 
 
 def learn_max_tokens(value: int) -> None:
@@ -967,9 +984,10 @@ async def _chat_streamed(
 ) -> dict[str, Any] | None:
     """试一次 `stream: true` 请求：成功返回与一次性路径同形的解析结果。
 
-    返回 None 表示**这次流式尝试不算数**，调用方应当退回一次性请求。只有两种
+    返回 None 表示**这次流式尝试不算数**，调用方应当退回一次性请求。只有三种
     情况故意抛出，因为它们与流式无关、一次性路径同样会拒：响应体超限、输出被
-    长度截断——重来一遍只是多花一次钱。
+    长度截断、以及"这个模型此刻不可用"（见下面的状态码分类）——前两者重来一遍
+    只是多花一次钱，后者重来一遍要多等一整个往返才得到同一个结论。
 
     其余一切（服务端不认 `stream` 直接回整包 JSON、流里一段正文都没有、流中途
     断掉、拼起来的正文解析不出对象、网络层报错）都退回 None：预览少几帧可以，
@@ -986,6 +1004,14 @@ async def _chat_streamed(
             async with client.stream("POST", base + "/chat/completions",
                                      content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                                      headers=headers) as response:
+                # 与 `_chat_once` / `provider._attempt` 同一判据：这些码的意思是
+                # "这个模型此刻不可用"，该立刻交给候选循环换一个。放进下面那条
+                # `except Exception` 就会被吃成"退回一次性请求"，于是同一个 524
+                # 要再等一整个往返（免费档实测单次能跑到 180 秒以上）才得到相同的
+                # 结论——而 524 恰恰是免费档最常撞到的码。
+                if response.status_code in UNAVAILABLE_STATUSES:
+                    raise _ModelUnavailable(
+                        f"模型服务返回 HTTP {response.status_code}")
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     # 有的兼容端点写 `data:{...}` 不带空格，两种都要认
