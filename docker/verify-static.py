@@ -189,25 +189,19 @@ check("nginx: 每条指令以 ; 或 { 结尾", not bad, "可疑行: %s" % bad[:5
 check("nginx: 配了 resolver（proxy_pass 用变量时必需）", "resolver 127.0.0.11" in nginx_code, "")
 check("nginx: set $backend 位于 server 块内", re.search(r"server\s*\{[^}]*set\s+\$backend", nginx_code, re.S) is not None, "")
 
-# ---------------------------------------------------------------- 设置面板的鉴权（P0-1）
-# 这一段**必须**只护住 /api/settings/，且必须 fail closed：能改 base_url 的接口
-# 等于能把已存的密钥送到任意地址，不能靠"部署方记得加密码文件"来防。
-settings_block = re.search(r"location\s+/api/settings/\s*\{(.*?)\n    \}", nginx_code, re.S)
-check("nginx: /api/settings/ 有独立 location（否则落进匿名的 /api/）",
-      settings_block is not None)
-if settings_block:
-    block = settings_block.group(1)
-    check("nginx(/api/settings/): 挂了 auth_basic", re.search(r"auth_basic\s+\"[^\"]+\"\s*;", block) is not None)
-    check("nginx(/api/settings/): 指了 user_file（缺文件时 nginx 会拒绝这一段而不是放行）",
-          re.search(r"auth_basic_user_file\s+\S+\s*;", block) is not None)
-    check("nginx(/api/settings/): 没有 auth_basic off（那等于把兜底关掉）",
-          re.search(r"auth_basic\s+off\s*;", block) is None)
-    check("nginx(/api/settings/): 仍然反代到同一个后端", "$backend$request_uri" in block)
+# ---------------------------------------------------------------- 设置面板的鉴权（已弃用 Basic Auth）
+# 这一面原先靠 nginx 的 Basic Auth 兜住，理由是"改 base_url + 点测试连接 =
+# 把已存密钥送到任意地址"。账号体系上线后改用应用层承担：门禁要求有身份
+# （`backend/app/auth/gate.py`），再加两道代码防线（`probe._refuse()` 拒内网与
+# 元数据、`store.resolve()` 的密钥与地址绑定）。**别再往 nginx 上加全站口令**：
+# 它会把游客挡在门外，而"游客每天 3 次免费"正是门禁允许匿名之外身份的前提。
+check("nginx: 指令里没有任何 auth_basic（账号体系在应用层）",
+      "auth_basic" not in nginx_code,
+      "残留: %s" % [l.strip() for l in nginx_code.splitlines() if "auth_basic" in l])
 
-# 反过来：匿名的 /api/ 段里不该有 auth_basic（那会连静态页面一起挡住）。
 plain_api = re.search(r"location\s+/api/\s*\{(.*?)\n    \}", nginx_code, re.S)
-check("nginx(/api/): 仍然匿名（auth_basic 只在 settings 那一段）",
-      plain_api is not None and "auth_basic" not in (plain_api.group(1) if plain_api else "x"))
+check("nginx(/api/): 反代到同一个后端且没有鉴权指令",
+      plain_api is not None and "$backend$request_uri" in plain_api.group(1))
 
 # 只看指令行：文件头注释里逐条**解释**了"去掉了 __DOMAIN__ 那一套"，
 # 那是说明文字，不是残留。用剥掉注释后的 nginx_code 判断才准。
@@ -318,9 +312,9 @@ for must in (".git", "backend/.venv", "frontend/node_modules", "frontend/dist", 
     hit = ignored(must)
     check(".dockerignore 排除了 %s" % must, hit is not None, ("规则 %r" % hit) if hit else "未命中")
 
-# 设置面板的密码文件：compose 从宿主机只读挂载它，既不该进镜像也不该进版本库。
-# 两处都断言，因为它们服务两个不同的目的——只加一处会得到"镜像干净但仓库里有
-# 口令哈希"或反过来。
+# 密码文件相关的规则留着（`.gitignore` / `.dockerignore` 里那两条不改）：
+# Basic Auth 已经弃用、compose 也不再挂这个文件，但这条规则的成本是零，而一旦
+# 哪天有人想起来要加一层反代口令，`htpasswd` 建出来的哈希正好会被它挡住。
 for hidden in ("docker/.htpasswd", ".htpasswd"):
     hit = ignored(hidden)
     check(".dockerignore 排除了 %s" % hidden, hit is not None, ("规则 %r" % hit) if hit else "未命中")

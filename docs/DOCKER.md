@@ -507,17 +507,11 @@ backend/.venv/Scripts/python.exe docker/verify-static.py .    # Windows
 ## 11. 已知限制
 
 1. **不内置 TLS。** `docker/nginx.conf` 只 `listen 80`。要 HTTPS 就在宿主机再架一层 nginx/caddy 反代到这个容器的 80，或者上 `deploy/nginx-tls.conf` 那套（但那套是给 systemd 部署的）。参考 `deploy/nginx-tls.conf` 的 443 配法，注意里面同样有三条 SSE 配置与 900s 超时，别在搬的时候漏掉。
-2. **只有 `/api/settings/` 挂了 Basic Auth，其它接口没有。** `deploy/nginx.conf` 全站有 `auth_basic`（密码文件 `/etc/nginx/.htpasswd-mindmap`）；容器版只给模型设置面板挂了这一段，其余接口仍然匿名。这是刻意的取舍：单机自用要先能跑起来，而配置面是被攻击时"密钥会出门"的那一面，先护它。
+2. **nginx 那层没有任何 Basic Auth，鉴权全在应用层。** 账号体系上线后，两份 nginx 配置（`deploy/nginx.conf`、`docker/nginx.conf`）都不再有 `auth_basic`；拦截匿名请求的是 `backend/app/auth/gate.py`，发身份与游客 cookie 的是 `IdentityMiddleware`。全站一个口令那层已经**弃用**——它不只是重复，还与"游客每天 3 次免费"直接冲突：口令过不去就拿不到游客 cookie，新访客连试用的机会都没有。
 
-   > **⚠️ 容器版的生成接口仍然没有鉴权。直接把它暴露到公网，等于把模型额度送人。** 任何人扫到 `IP:WEB_PORT` 就能用你的 `MINDMAP_LLM_API_KEY` 跑生成、烧配额，也能读到你所有已保存的导图。
+   > **⚠️ 但容器版仍然要求"有身份"，而身份是应用自己发的不代表外面有一道锁。** 唯一被应用放行的匿名路径是 `/api/health` 和 `/api/auth/*`（注册、登录、领游客 cookie）。**直接把它暴露到公网，任何人扫到 `IP:WEB_PORT` 都能立刻领一个游客身份、用掉那 3 次免费额度，并注册账号**——如果你不打算接受陌生人注册，就在外层（宿主机 nginx/caddy、安全组、SSO）限住来源。这是"门禁"与"谁能进来"两件事的分工：应用负责前者，部署方负责后者。
    >
-   > **设置面板那一段为什么单独护住。** `/api/settings/model` 曾经完全没有鉴权时，`PUT` 能把模型地址改指向任意主机、`POST /api/settings/model/test` 会带着**已存的那把密钥**去请求那个地址（`backend/app/settings/probe.py`）。两步就能把密钥明文送到攻击者手上，不需要知道它是什么；同一个面还能改成内网地址（`http://169.254.169.254/…`、`http://redis:6379/`）当探针用。现在两层都收了：nginx 这一段拦住未认证的调用，`probe._refuse()` 在代码层拒本机/内网/保留地址（要连本机模型得显式设 `MINDMAP_SETTINGS_ALLOW_PRIVATE=1`）。
-   >
-   > **密码文件必须自己建**（`htpasswd -c docker/.htpasswd admin`，见 `docker/.env.example`）。没建时设置面板一律 500——**这是有意的 fail closed**：缺文件时退回匿名放行，等于把这一层做成"忘了配就等于没配"，而忘了配正是最常发生的事。
-   >
-   > 要整站暴露到公网**必须**再在它前面加一层鉴权：宿主机的 nginx/caddy 上加 Basic Auth 或 SSO，或者把 `docker/nginx.conf` 里 `location /api/settings/` 的 `auth_basic` 提到 `location /api/`。`location = /api/health` 在线上那套里是 `auth_basic off`，如果加认证记得保持健康检查可达（否则 compose 的 healthcheck 与 `depends_on` 会一起失效）。
-   >
-   > 只在本机玩：把 compose 里那行 `.htpasswd` 挂载与 `docker/nginx.conf` 里那段 `location /api/settings/` **一起**删掉（只删一处会得到一个永远 500 的面板或一段无人消费的密码文件）。
+   > **`/api/settings/model` 那个面为什么现在安全了。** 它曾经完全没有鉴权：`PUT` 能把模型地址改指向任意主机、`POST /api/settings/model/test` 会带着**已存的那把密钥**去请求那个地址（`backend/app/settings/probe.py`）。两步就能把密钥明文送到攻击者手上，不需要知道它是什么。现在有三道，且都在代码层（不依赖部署方记得配什么）：门禁要求有身份；`probe._refuse()` 拒本机/内网/保留地址/云元数据（要连本机模型得显式设 `MINDMAP_SETTINGS_ALLOW_PRIVATE=1`）；`store.resolve()` 把密钥与它保存时的**主机名**绑定，换个地址就不再交出密钥（`api_key_source: "unbound"`，界面提示重贴一次）。
 
 3. **`--workers 1` 写死。** 不是性能调优：状态全在一个 SQLite 文件里（`backend/app/mindmaps/repository.py::connect()`），多 worker 就是多个写者，会偶发 `database is locked` 的 500。2C2G 上也吃不起多进程内存。**不要为了"多用几个核"去改这个值。**
 4. **后端不发布 8000。** 只有前端容器在宿主机上开 `WEB_PORT`。要本机调后端就临时加 `ports: ["127.0.0.1:8000:8000"]`，调完删掉——线上形态是"后端只听内网"。
@@ -548,7 +542,7 @@ backend/.venv/Scripts/python.exe docker/verify-static.py .    # Windows
 
 1. **CI 里不加 `docker build`。** 保持 `.github/workflows/ci.yml` 现状不动。理由：本机没有 Docker，在没人见过它成功构建之前就塞进 CI，只会得到"天天红、而且红不指向真实回归"——CI 的红灯必须意味着"代码坏了"，不能意味着"我们的验证环境不完整"。等第 12.1 节那条做完再考虑加。
 2. **LibreOffice 默认不装**（`WITH_OFFICE=0`）。装了能支持 `.doc`/`.ppt`，代价是镜像从约 1.5GB 变成约 3GB，顶穿 2.5GB 预算。不装时这两种格式返回 422，提示里说明需要 LibreOffice。要开就在 `.env` 里设 `WITH_OFFICE=1` 重新构建。成本分析见 `docs/LEGACY-FORMAT-COST.md`。
-3. **默认不做 Basic Auth**，维持"单机自用"的定位。**但这意味着容器版开箱即无鉴权**，上公网前必须先加一层，见第 11 节第 2 条的警告。
+3. **不用 nginx 的 Basic Auth**，鉴权由应用层账号体系承担（见第 11 节第 2 条）。这**不代表容器版"开箱即可安全上公网"**：门禁只拦匿名，游客身份谁都能领、注册是开放的，能不能进来要由部署方在外层限。
 4. **不引入 registry**，只用本地 tag（`genai-mindmap-backend:local` / `genai-mindmap-frontend:local`）。单机部署不需要分发；要做多机再说。
 
 ### 12.1 落地前必须做：找一台有 Docker 的机器跑通一次

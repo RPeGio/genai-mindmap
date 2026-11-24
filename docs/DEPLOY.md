@@ -61,7 +61,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 **改地址之后保存会带一句 `notice`**："上次「测试连接」的结论对新地址不成立，建议现在点一次"。只提醒不阻拦——"先把地址填好、等供应商开白名单"是正常操作，强制先测通会把这条路堵死。同值重复保存、以及从"什么都没配"到"填了个地址"的首次配置都不提醒（没有旧结论可作废）。
 
-**地址不许指向本机 / 内网 / 云元数据地址。** 这个面最贵的失误不是"填错"，是"被改写"：无鉴权时 `PUT` 换掉 `base_url`、再 `POST /model/test`（空 body 走回落生效值这条免费路径），已存密钥就随 `Authorization` 头送到了那个地址——攻击者既不需要知道密钥，也不需要读得到响应。所以现在有三道：`docker/nginx.conf` 与 `deploy/nginx.conf` 把 `/api/settings/` 挡在 Basic Auth 后面；`backend/app/settings/probe.py::_refuse()` 在发请求**之前**拒掉本机、内网、链路本地、保留地址（`MINDMAP_SETTINGS_ALLOW_PRIVATE=1` 可放开，见上表）与云元数据地址（开关也打不开）；公网地址必须 `https://`（`http://` 会让密钥明文过中间每一跳；私网不查这一条，本机 Ollama 常开在 http）。它仍不是"防住内网"的完整方案（DNS rebinding、302 跳内网、公网域名解析到私网都挡不住），挡的是成本最低的那一步。
+**地址不许指向本机 / 内网 / 云元数据地址。** 这个面最贵的失误不是"填错"，是"被改写"：无鉴权时 `PUT` 换掉 `base_url`、再 `POST /model/test`（空 body 走回落生效值这条免费路径），已存密钥就随 `Authorization` 头送到了那个地址——攻击者既不需要知道密钥，也不需要读得到响应。所以现在有三道：门禁要求这一面**必须有身份**（`backend/app/auth/gate.py`，nginx 那层 Basic Auth 已弃用）；`backend/app/settings/probe.py::_refuse()` 在发请求**之前**拒掉本机、内网、链路本地、保留地址（`MINDMAP_SETTINGS_ALLOW_PRIVATE=1` 可放开，见上表）与云元数据地址（开关也打不开）；公网地址必须 `https://`（`http://` 会让密钥明文过中间每一跳；私网不查这一条，本机 Ollama 常开在 http）。它仍不是"防住内网"的完整方案（DNS rebinding、302 跳内网、公网域名解析到私网都挡不住），挡的是成本最低的那一步。
 
 **密钥与地址绑定（`api_key_host`）——第二层，挡"已经改好地址"之后的安静形状。** 上面那些挡的是"填个地址就把密钥送出去"，发生在测试连接那一刻。但还有一个形状不经过测试连接：改完地址（这一步本来没有密钥出门），下一次**正常生成**就会带着库里那把密钥去访问新地址。所以 `model_settings` 多一列 `api_key_host`，记"这把密钥被哪台主机保存过"，`store.resolve()` 只在当前生效地址的主机名与锚点一致时才交出明文；不一致时 `api_key_source` 变成 `unbound`、`api_key` 为空、`configured` 变 `false`，界面上那一栏提示"重新粘贴一次"。
 
@@ -291,14 +291,14 @@ sudo bash deploy/install.sh --domain mindmap.example.com --version v0.4.7
 
 | 步骤 | 内容 |
 |---|---|
-| 1 | `dnf` 装 nginx / htpasswd / sqlite / 编译基础件 |
+| 1 | `dnf` 装 nginx / sqlite / 编译基础件 |
 | 2 | 没有 swap 就加 2G（2G 内存解析 PDF、装 torch 都要余量） |
 | 3 | 建 `genai` 系统用户；代码到 `/opt/genai-mindmap`；数据到 `/var/lib/genai-mindmap`；`/etc/genai-mindmap/env` 权限 0640；覆盖前把当前代码快照到 `/var/lib/genai-mindmap/releases/`（保留 5 份，回滚用） |
 | 4 | 用 `uv` 装独立 CPython 3.12（避开系统 python3.6）并建 venv、装 `backend/requirements.txt`（默认走阿里云 PyPI 镜像） |
 | 5 | 装 systemd 单元并启动（只 1 个 worker，理由见下） |
-| 6 | 装 nginx 站点配置（IPv6 关闭时只监听 v4）、生成 Basic Auth 账号 `demo`（随机密码只打印一次）、放行 SELinux 反代与静态目录上下文、装每日备份 cron |
+| 6 | 装 nginx 站点配置（IPv6 关闭时只监听 v4）、删除上一代遗留的 Basic Auth 口令文件（账号体系已接管鉴权）、放行 SELinux 反代与静态目录上下文、装每日备份 cron |
 
-重复执行是安全的，但有两处**故意不覆盖**：`/etc/genai-mindmap/env`（密钥）与 `/etc/nginx/.htpasswd-mindmap`（账号密码）。
+重复执行是安全的。只有一处**故意不覆盖**：`/etc/genai-mindmap/env`（密钥）。
 
 ### 9.3 填密钥（运行时注入，不进仓库）
 
@@ -348,7 +348,7 @@ sudo bash deploy/install.sh --domain mindmap.example.com   # 检测到证书后�
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health                  # 后端活着
-curl -su demo:<密码> https://mindmap.example.com/api/health # 反代通
+curl -s https://mindmap.example.com/api/health # 反代通（免身份，门禁放行它）
 sudo ss -lntup | grep -E ':(80|443|8000)'                 # 8000 只能听 127.0.0.1
 ```
 
@@ -366,12 +366,11 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 
 恢复备份：`gunzip -c /var/backups/genai-mindmap/mindmaps-<时间>.db.gz > /var/lib/genai-mindmap/mindmaps.db`，然后 `chown genai:genai` 并重启服务。
 
-加演示账号：`sudo htpasswd /etc/nginx/.htpasswd-mindmap alice`。
+**账号在页面里注册，不用命令行。** 打开站点 → 抽屉里的「账号」区 → 注册。**第一个注册的账号就是部署方**（见第 3 节第 5 条），他能改全站共享的模型配置。nginx 那层 Basic Auth 已弃用，`/etc/nginx/.htpasswd-mindmap` 会被重跑的 `install.sh` 删掉——它现在是一份没人消费的口令，留着只会让人以为门外还有一道锁。
 
-**多加账号 = 共用一个知识库**。服务端是单用户单库的设计（见 `docs/PLAN.md` 的 F12），
-Basic Auth 只决定"能不能进来"，不区分是谁：任何账号打开「知识库」抽屉，都能列出
-别人的材料、并读到每份正文的前 4000 字。只想自己用就别加账号；真要多人共用，
-先想清楚这些材料能不能互相看见。
+**注册是开放的。** 门禁只挡匿名，游客身份谁都能领（每天 3 次免费生成），注册也不需要邀请码。**不想让陌生人进来就在外层限**：安全组只放行自己的 IP、宿主机再架一层 Basic Auth/SSO、或者干脆先不暴露公网。这是"门禁"与"谁能进来"两件事的分工——应用负责前者。
+
+**知识库是共用的**。服务端是单用户单库的设计（见 `docs/PLAN.md` 的 F12）：任何有身份的账号打开「知识库」抽屉，都能列出别人的材料、并读到每份正文的前 4000 字。只想自己用就别开放注册；真要多人共用，先想清楚这些材料能不能互相看见。
 
 **但记忆与偏好是分开的**。上面那条"共用"是**材料库**的口径，别顺手外推：账号体系
 落地之后，`memory_items`（从会话里总结出的"关于这个人的推断"）、`user_prefs`（含

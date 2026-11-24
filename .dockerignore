@@ -89,8 +89,7 @@ run-backend.bat
 Thumbs.db
 .visioncheck
 
-# 设置面板的 Basic Auth 密码文件（`htpasswd -c docker/.htpasswd admin`）。
-# 里面有密码哈希；镜像不需要它——compose 是从宿主机**只读挂载**进去的，
-# 不是 COPY 进镜像的。
+# Basic Auth 口令文件（`htpasswd` 的默认产物）。容器版已经不用它了，但保留这条
+# 规则的成本是零，而它挡的是"把密码哈希打进镜像层"这种事后很难收回的事。
 .htpasswd
 **/.htpasswd
