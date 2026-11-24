@@ -40,6 +40,7 @@ from app.agent.diagram_intent import apply as apply_diagram_intent
 from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.auth import identity as identity_module
+from app.auth import owner as owner_module
 from app.core.errors import AppError
 from app.generation import quota
 from app.generation.service import GenerationError, ModelNotConfigured
@@ -388,9 +389,25 @@ async def stream_run(body: AgentRunRequest, request: Request) -> StreamingRespon
         charged = True
 
     run_id = body.run_id or uuid4().hex[:_GENERATED_RUN_ID_BYTES * 2]
-    claim = runs.begin(run_id, _request_summary(body))
+    # `owner` 显式传进去，认领之后还要用它比对：`begin()` 的三种"没认领成功"
+    # 分支里有两种会把**库里那行**交回来（409 与重放），而那一行可能是别人的。
+    # 不比对的话，知道别人 `run_id` 的人能直接重放他的树（审查实测：B 打一次流
+    # 就拿到了 A 的图）。重开那条已经在 SQL 里用 `AND owner = ?` 挡住了。
+    who = owner_module.current_owner()
+    claim = runs.begin(run_id, _request_summary(body), owner=who)
     if not claim.claimed:
         record = claim.record
+        if record.owner != who:
+            # 404 而不是 403：`run_id` 是客户端自己起的字符串，可以随便猜。403 等于
+            # 确认"这个 id 真实存在"，于是 `runs` 成了一个可枚举的存在性探针。
+            # 对外那句话与"这个 id 根本没有过"完全一样。
+            if charged:
+                quota.refund(ip)
+            raise AppError(
+                code="run_not_found",
+                message="这次生成已经不在等待里了。换一个新的运行重新生成一次即可。",
+                status=404,
+            )
         if record.status == runs.STATUS_RUNNING:
             # 同一个 run 并发跑两次会互相打架：两边都往同一个候选上写，谁也说不清
             # 最终那棵树是谁的。409 是开流之前的错误，前端能按状态码分辨，不必
@@ -437,9 +454,14 @@ def _maybe_summarize(run_id: str) -> None:
 
     **失败只记 warning**：总结是附属动作，它抛出去会让一次本来正常的生成 500。
     读库超时、模型配置坏掉、库被锁——这些都不该影响用户这一次要的图。
+
+    **`owner` 在这里读、一路传下去**：`maybe_summarize` 起的线程读不到请求的
+    `ContextVar`，所以"总结出来算谁的"必须在这一刻定死。传空串（比如后台任务里
+    调这个函数）的后果是记忆写成无主——那正是 PR#27 审查里 P0-2 的形状。
     """
     try:
-        memory_summarize.maybe_summarize(exclude_run_id=run_id)
+        memory_summarize.maybe_summarize(
+            exclude_run_id=run_id, owner=owner_module.current_owner())
     except Exception as exc:  # noqa: BLE001 — 见 docstring
         logger.warning("上一个会话的记忆总结没有启动（%s），这次生成不受影响",
                        type(exc).__name__)

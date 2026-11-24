@@ -13,6 +13,24 @@ from app.contracts.mindmap import DiagramContent, MapRecord, migrate_content
 
 logger = logging.getLogger(__name__)
 
+#: 迁移前 `user_prefs` 改名后的落脚点。与 `settings.store._LEGACY_TABLE` 同一套做法：
+#: 建新表前先把老表挪走，之后每一段都能从"老表还在 / 已删掉"这个状态续上。
+_PREF_LEGACY_TABLE = "user_prefs_legacy_v1"
+
+#: `user_prefs` 的建表语句。主键是 `(owner, pref_key)`——同一个偏好键，每个人各一条。
+#: 抽成常量是因为迁移函数要用它建新表（那时 `connect()` 里那句 `IF NOT EXISTS` 还没跑到）。
+_PREF_CREATE = """CREATE TABLE IF NOT EXISTS user_prefs (
+    owner         TEXT NOT NULL DEFAULT '',
+    pref_key      TEXT NOT NULL,
+    pref_value    TEXT NOT NULL,
+    scope         TEXT NOT NULL DEFAULT 'global',
+    source        TEXT NOT NULL,
+    source_run_id TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (owner, pref_key)
+)"""
+
 
 def db_path() -> Path:
     configured = os.getenv("MINDMAP_DB_PATH", "").strip()
@@ -67,6 +85,64 @@ def _drop_columns(conn: sqlite3.Connection, table: str, columns: Sequence[str]) 
             conn.execute(f'ALTER TABLE {table} DROP COLUMN "{name}"')
         except sqlite3.Error:
             logger.warning("%s.%s 应该删掉但没删成，代码已不再读写它", table, name)
+
+
+def _migrate_legacy_prefs(conn: sqlite3.Connection) -> None:
+    """把单主键的 `user_prefs` 搬成 `(owner, pref_key)` 复合主键。幂等，两段都能续。
+
+    老表是 `pref_key TEXT PRIMARY KEY`——它假设"这台机器只有一个用户"，而加账号
+    之后同一个键必须能两个人各有一条。SQLite 不支持改主键，所以只能重建。
+
+    搬迁把老行落到 `owner = ''`（`settings.store.INSTANCE_OWNER`）。空串这行的
+    读法由 `prefs.service` 决定：**只有部署方继承它**，别人看不到。这样单用户装
+    升级上来的那份配置（备注、图型、图标开关）不会凭空消失，而多用户部署里它
+    也不会漏给别人——与 `mindmaps.update_map(allow_unowned=...)` 同一个判据。
+
+    判据是"有 `pref_key` 列、没有 `owner` 列"。反过来用 `owner` 判不行：迁移到
+    一半时新表已经有 `owner` 了，会把半成品当成已完成。
+
+    **每段末尾都要 `commit()`**：`connect()` 的调用方是只读路径，不会替这里提交。
+    `ALTER` / `CREATE` / `DROP` 在 SQLite 里走自动提交，而 `INSERT ... SELECT` 是
+    DML、停在隐式事务里——连接一关就回滚，磁盘上剩下"新表空的 + 老表还在"，老行
+    再也没被搬过（实测：`user_prefs_legacy_v1` 在、`user_prefs` 是空的）。同一个
+    坑在 `settings.store._migrate_legacy` 里也踩过一次，两处都写了注释。
+    """
+    columns = _columns_of(conn, "user_prefs")
+    legacy_name = f"{_PREF_LEGACY_TABLE}"
+    legacy_waiting = _table_exists(conn, legacy_name)
+    if not columns or ("owner" in columns and not legacy_waiting):
+        return
+    if "owner" not in columns:
+        conn.execute(f"ALTER TABLE user_prefs RENAME TO {legacy_name}")
+        conn.execute(_PREF_CREATE)
+        legacy_waiting = True
+    if legacy_waiting:
+        source = _columns_of(conn, legacy_name)
+        target = _columns_of(conn, "user_prefs")
+        carried = [name for name in sorted(target) if name in source and name != "owner"]
+        names = ["owner", *carried]
+        select = ", ".join(["?"] + [f'"{name}"' for name in carried])
+        # `OR IGNORE` 而不是 `OR REPLACE`：能走到这里说明上一次迁移在"搬完还没删老表"
+        # 之间断了（正常路径下老表在搬完的同一个事务提交后就删掉了）。那一瞬间之后
+        # 可能已经有新的写入落在新表上——这时老表里的行是**更旧的**，拿它盖掉新行
+        # 等于回退用户刚做的修改。已经搬过去的那批行本来就一样，IGNORE 不丢东西。
+        conn.execute(
+            f"""INSERT OR IGNORE INTO user_prefs ({", ".join(f'"{n}"' for n in names)})
+                SELECT {select} FROM {legacy_name}""", ("",))
+        conn.commit()
+        conn.execute(f"DROP TABLE {legacy_name}")
+    conn.commit()
+
+
+def _columns_of(conn: sqlite3.Connection, table: str) -> set[str]:
+    """这张表现在的列名；表不存在时是空集。"""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
+    return row is not None
 
 
 def connect(*, timeout: float = 10) -> sqlite3.Connection:
@@ -178,7 +254,12 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     # 理由同 `runs`：读它的两条路径（生成前的预填、`_system_text` 的注入）都不该
     # 再有一次"发现表不存在 → 建表"的分支。
     #
-    # `pref_key` 是主键，这是整个设计的关键：**同一件事只能有一条**。"4 层"与
+    # 主键是**复合的 `(owner, pref_key)`**，这是加账号之后改的第一件事：老表拿
+    # `pref_key` 单列做主键，等于断言"这台机器只有一个人"，两个账号设同一个键时
+    # 后写的会覆盖先写的——而 `note.*` 是会进别人 prompt 的自由文本，那不只是
+    # 串号，是把"往别人提示词里写指令"做成了一条普通操作（见 PR#27 的审查）。
+    #
+    # `pref_key` 在同一 owner 内仍是主键语义：**同一件事只能有一条**。"4 层"与
     # "6 层"不会两条并存互相矛盾——写就是 upsert，后写的赢。自由文本做不到这件事。
     #
     # `scope` 现在恒为 `'global'`，留着它不是预留"会话/工作区"——那两层在我们的
@@ -189,15 +270,11 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     # `source` 只有两个值：`user_explicit`（用户自己设的）与 `suggestion_accepted`
     # （系统从历史运行里提了候选、用户点了同意）。**没有第三个**：模型没有写记忆的
     # 权限，也没有"系统自动学到的"这一类。
-    conn.execute("""CREATE TABLE IF NOT EXISTS user_prefs (
-        pref_key      TEXT PRIMARY KEY,
-        pref_value    TEXT NOT NULL,
-        scope         TEXT NOT NULL DEFAULT 'global',
-        source        TEXT NOT NULL,
-        source_run_id TEXT,
-        created_at    TEXT NOT NULL,
-        updated_at    TEXT NOT NULL
-    )""")
+    #
+    # 老库（单主键）在这里就地迁移：`CREATE TABLE IF NOT EXISTS` 对已有表是空操作，
+    # 光改建表语句不会给线上那张表换主键。迁移函数自己负责建新表与搬行。
+    _migrate_legacy_prefs(conn)
+    conn.execute(_PREF_CREATE)
     # 编辑事件（`app/mindmaps/edits.py`）。与上面三张表建在同一时刻、同一个连接上，
     # 理由同 `runs` / `user_prefs`：读它的路径（统计接口）不该再有"发现表不存在 →
     # 建表"的分支。
@@ -232,6 +309,7 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         map_id      TEXT NOT NULL,
         run_id      TEXT,
+        owner       TEXT NOT NULL DEFAULT '',
         actor       TEXT NOT NULL,
         kind        TEXT NOT NULL,
         node_id     TEXT,
@@ -251,7 +329,12 @@ def connect(*, timeout: float = 10) -> sqlite3.Connection:
     # （`total` 一直是 0，看着和"没人改过"一模一样）。所以补列必须幂等且在这里做。
     _ensure_columns(conn, "edit_events",
                     {"subtree_size": "INTEGER", "change_count": "INTEGER",
-                     "node_count": "INTEGER"})
+                     "node_count": "INTEGER",
+                     # 老行补空串 = "不知道是谁"，与 `mindmaps` / `runs` 的老行同一口径。
+                     # 不给这一列的话，`memory.summarize._events` 只能靠 `run_id` 回查
+                     # `runs.owner`，而手工编辑（`kind` 全是 user 的那批）根本没有
+                     # `run_id`——它们会被整批排除，总结里永远看不到"他改了什么"。
+                     "owner": "TEXT NOT NULL DEFAULT ''"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edit_events_map ON edit_events(map_id, at)")
     # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
     # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"

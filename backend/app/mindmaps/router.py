@@ -13,6 +13,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.auth import identity as identity_module
+from app.auth import owner as owner_module
 from app.auth import store as auth_store
 from app.contracts.edits import EditEventRow, EditHealth, EditSummary
 from app.contracts.mindmap import MapRecord, SaveRequest, UpdateRequest
@@ -53,7 +54,7 @@ def _record_edits(body: SaveRequest, map_id: str) -> None:
     if body.truncated:
         logger.warning("编辑事件分批：map_id=%s 本次提交 %d 条，另有 %d 条留到下次保存",
                        map_id, len(body.events), body.truncated)
-    edits.record(map_id, body.events)
+    edits.record(map_id, body.events, owner=owner_module.current_owner())
 
 
 @router.get("", response_model=list[MapRecord])
