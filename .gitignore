@@ -77,8 +77,10 @@ frontend/verify-fishbone.html
 frontend/verify-fishbone.ts
 frontend/verify-shots/
 
-# 本地启动脚本：里面是真实的 API key（DeepSeek + 阿里 MaaS）。
-# 启动方式见文件本身；要给别人用就照 .env.example 另写一份带占位符的。
+# 旧的手工启动脚本，里面写死了真实的 API key（DeepSeek + 阿里 MaaS）。
+# 已被 `backend/scripts/start-dev.bat` 取代——后者不带密钥，只从 `backend/.env`
+# 读（而 `.env` 本身在更上面那两条规则里）。留着这条是因为那个文件可能还躺在
+# 某些人的工作副本里，别让人哪天 `git add -A` 把它带进来。
 run-backend.bat
 
 # Basic Auth 口令文件（`htpasswd -c … `）。nginx 那层已经弃用（鉴权在应用层的
