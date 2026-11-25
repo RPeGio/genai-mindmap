@@ -133,12 +133,14 @@ DASHSCOPE_API_KEY=
 MINDMAP_AGENT_ENABLED=1
 MINDMAP_NLI_ENABLED=0
 # 外部检索（维基 / arXiv / OpenAlex / Crossref / 百科）专用的代理。
-# 境内机器通常只有 zh.wikipedia.org 直连不通，其余都通；不填的话代码会兜底猜
-# 本机 Clash 的 7897，在服务器上没人监听那个端口，表现是"五个源全失败、上层只
-# 看到没搜到外部资料"。写 none 表示显式直连。注意：**不要**在这里写
-# HTTP_PROXY / HTTPS_PROXY —— 那两只会被其余九处 httpx 客户端读走，把模型调用、
-# ASR、PDF 视觉、embedding、rerank 一起塞进代理。搭法见 docs/DEPLOY.md 11.5。
-MINDMAP_EXTERNAL_PROXY=
+# 默认 none = 直连：境内机器通常只有 zh.wikipedia.org 直连不通，直连只丢维基这
+# 一条，arXiv / OpenAlex / Crossref / 百科 都还能用。写成 127.0.0.1:7897 之类
+# 的前提是那台机器上真有人监听——服务器上通常没有，那时五个源会全部失败，而上层
+# 只看到"没搜到外部资料"（坏了和本来就没有长得一样）。要连维基就按
+# docs/DEPLOY.md 11.5 给它单独起一个 mihomo，再把地址填在这里。
+# 注意：**不要**在这里写 HTTP_PROXY / HTTPS_PROXY —— 那两只会被其余九处 httpx
+# 客户端读走，把模型调用、ASR、PDF 视觉、embedding、rerank 一起塞进代理。
+MINDMAP_EXTERNAL_PROXY=none
 # docling 首次解析会去 HuggingFace 取版面模型；国内直连常超时，用镜像更快。
 # 不需要就删掉这行。
 HF_ENDPOINT=https://hf-mirror.com

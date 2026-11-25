@@ -47,7 +47,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
 | `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
-| `MINDMAP_EXTERNAL_PROXY` | `http://127.0.0.1:7897` | **只给外部检索用**的代理（维基、arXiv、OpenAlex、Crossref、百科）。不设时会兜底猜本机 Clash 端口，在服务器上那是错的——表现是五个源全部连不上、上层只看到"没搜到外部资料"，所以走兜底时日志会告警一次。设 `none` / `off` / `direct` 表示显式直连。**不要用 `HTTP_PROXY`/`HTTPS_PROXY` 代替它**：那两只会被其余 9 处 httpx 客户端读走，把模型调用、ASR、视觉提取、embedding、rerank 一起塞进代理。见第 11.5 节 |
+| `MINDMAP_EXTERNAL_PROXY` | `http://127.0.0.1:7897`（代码兜底值；`deploy/install.sh` 的首装模板写 `none`） | **只给外部检索用**的代理（维基、arXiv、OpenAlex、Crossref、百科）。不设时会兜底猜本机 Clash 端口，在服务器上那是错的——表现是五个源全部连不上、上层只看到"没搜到外部资料"，所以走兜底时日志会告警一次。**首装模板默认写 `none`（直连）而不是留空**：直连只丢维基一条，其余四个源照常可用；留空则是把"丢一条"换成"全挂"。设 `none` / `off` / `direct` 表示显式直连。**不要用 `HTTP_PROXY`/`HTTPS_PROXY` 代替它**：那两只会被其余 9 处 httpx 客户端读走，把模型调用、ASR、视觉提取、embedding、rerank 一起塞进代理。见第 11.5 节 |
 | `MINDMAP_DEEPSEEK_TOOLS_PROXY` | `none` | DeepSeek 那两个外部检索接口的代理，**与上面那条反向**：默认直连。实测它们要直连才通，塞进代理等于让它永远失败 |
 | `MINDMAP_SETTINGS_ALLOW_PRIVATE` | 空（关） | 允不允许把模型地址指向本机 / 内网。关着时"测试连接"与生成都会拒（`probe._refuse()`），因为**这个面能用已存密钥当内网探针**。要连 Ollama / LM Studio / 同机自建端点就设 `1`；它同时放开本机与内网，没有更细的粒度。**云元数据地址（`169.254.169.254`、`metadata.google.internal`、`100.100.100.200` 等）这个开关也打不开**——那里没有模型，只有临时凭证 |
 | `MINDMAP_FREE_TIER` | 空（关） | 走 Command Code coding plan 里当前标 `:free` 的模型（免费额度那一档用的就是它）。打开后，**只有借用部署方配置的人**（自己没填密钥）会换成免费模型，并自动带 `reasoning_effort=low`、把 `max_tokens` 夹到 4000–16000 之间（下限防止思考吃光额度，上限防止它按 6.5 万 token 的预算思考几十分钟）。默认关：打开它等于改变"这一次生成花谁的钱"，已有部署升级后不该静默变成又慢又受每日次数限制。详见 `docs/FREE-MODELS.md` |
@@ -491,6 +491,8 @@ ip route; cat /etc/resolv.conf
 - ✅ 设 `MINDMAP_EXTERNAL_PROXY` → 只有外部检索走代理。
 - ❌ 设 `HTTP_PROXY` / `HTTPS_PROXY`（或 `clash-cli on` 帮你设的那七个变量）→ 那九处一起走代理。模型调用绕一圈出国再回来，"测试连接"会把内网探针的话术变成谎言，最坏情况是整站不可用。
 
+**默认值这一栏容易踩**：代码兜底是 `http://127.0.0.1:7897`（作者本机 Clash 的端口），而 `deploy/install.sh` 生成的首装模板写的是 `MINDMAP_EXTERNAL_PROXY=none`。两者故意不一致——模板要管的是"新机器最小的坏结果"。留空会让代码去猜 7897，服务器上没人监听，五个源**全部**连不上；写 `none` 则只丢维基一条，arXiv / OpenAlex / Crossref / 百科照常用。要维基就按下面铺 mihomo，再把地址填进去。
+
 所以下面**不用 `clash-cli on`**（它的 `_set_system_proxy()` 就是导出 `http_proxy`/`https_proxy`/`all_proxy`/`no_proxy`），只让内核在 `127.0.0.1` 上监听，由应用那一个变量点名走它。
 
 **为什么不用 `clash-cli install`。** 它会 `exec bash -i`（`script/common.sh` 的 `_quit()`），在非交互 shell 里 stdin 是管道，直接永久挂住；成功路径末尾也走 `_quit`。手工铺三样东西更省事，而且不会往 `~/.bashrc` 塞 `watch_proxy`（那一行会让每次 root 登录都悄悄设上系统代理变量）。
@@ -581,7 +583,7 @@ cd /opt/genai-mindmap/backend && set -a && . /etc/genai-mindmap/env && set +a &&
 
 第 ③ 条在接好之后应当返回 4 条左右的结果；接之前是 0。**注意它可能带缓存**（`external_cache` 表），第一次为空的结果也会被记住一小时，排查时先清那一行或换个 query。
 
-源级失败要分开看：`快懂百科 404`、`arXiv 429` 这类是源站自己的状态（走的是直连），与代理无关；代理坏了的表现是**维基那一条**失败，且日志里会有一次"没有配置 `MINDMAP_EXTERNAL_PROXY`，正在猜本机代理"的告警。
+源级失败要分开看：`快懂百科 404`、`arXiv 429` 这类是源站自己的状态（走的是直连），与代理无关；代理坏了的表现是**维基那一条**失败，且日志里会有一次"没有配置 `MINDMAP_EXTERNAL_PROXY`，正在猜本机代理"的告警（这句话每个进程只写一次，所以第一次检索的日志里没看到的话，之后也不会再有——要复现就重启服务）。
 
 ## 12. 自动化部署（GitHub Actions + 自托管 runner，零入方向端口）
 

@@ -345,6 +345,17 @@ for k in ("MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY", "MI
 active_db = re.search(r"^MINDMAP_DB_PATH=(.+)$", env_example, re.M)
 check(".env.example: MINDMAP_DB_PATH 未硬编码（交给 compose）", active_db is None, active_db.group(0) if active_db else "")
 
+# 首装模板里的代理默认值：留空会走兜底猜本机 7897（服务器上没人监听 → 五个源全挂），
+# 所以模板必须写 none（直连只丢维基一条）。这条曾经在两处都不对：模板留空、
+# 上面的 compose 只断言"有这个键"，于是"键在、值是坏默认"能一路过掉。
+install_sh = read("deploy/install.sh")
+template = re.search(r"^MINDMAP_EXTERNAL_PROXY=(.*)$", install_sh, re.M)
+check(
+    "install.sh: 首装模板把 MINDMAP_EXTERNAL_PROXY 显式写成 none",
+    template is not None and template.group(1).strip().lower() == "none",
+    template.group(0) if template else "模板里没有这一行",
+)
+
 # dx: 每个 docker/ 下的文件都要被 Dockerfile 或 compose 引用（没有孤儿文件）
 print()
 fails = [r for r in results if not r[0]]
