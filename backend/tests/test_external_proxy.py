@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -20,6 +22,7 @@ from app.knowledge import external
 _PROXY_NAMES = (
     external.EXTERNAL_PROXY_ENV,
     "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy",
 )
 
 
@@ -62,6 +65,17 @@ def test_an_ambient_proxy_is_still_honoured(monkeypatch):
     assert external._proxy() == "http://10.9.9.9:3128"
 
 
+@pytest.mark.parametrize("name", ["ALL_PROXY", "all_proxy"])
+def test_all_proxy_counts_too(monkeypatch, name):
+    """`ALL_PROXY` 与 httpx 自己的 `trust_env` 认的是同一批变量。
+
+    不认它的后果不是"少支持一种配法"：同一台机器上别的 httpx 客户端走了代理、
+    只有外部检索裸连，表现是"检索连不上、别的都正常"，而人会先怀疑源站。
+    """
+    monkeypatch.setenv(name, "http://10.9.9.9:3128")
+    assert external._proxy() == "http://10.9.9.9:3128"
+
+
 @pytest.mark.parametrize("value", ["none", "off", "direct", "0", "NONE", " Off "])
 def test_direct_is_a_first_class_answer(monkeypatch, value):
     """`none` / `off` / `direct` / `0` 表示显式直连，大小写与首尾空白都不计较。
@@ -99,6 +113,58 @@ def test_the_guess_is_said_only_once(caplog):
         for _ in range(5):
             assert external._proxy() == external.DEFAULT_PROXY
 
+    assert len(_warnings(caplog)) == 1
+
+
+def test_a_concurrent_first_retrieval_still_warns_once(caplog):
+    """五个源是并发冷启动的，第一次检索可能同时有五条线程走到兜底。
+
+    这里断言的是结果（只留一条痕迹）；"先读后写"那个窗口窄到撞不出来，
+    所以另有一条 `test_every_caller_goes_through_the_lock` 去钉住锁本身。
+    """
+    workers = 8
+    ready = threading.Barrier(workers)
+
+    def call() -> str | None:
+        ready.wait(timeout=5)
+        return external._proxy()
+
+    with caplog.at_level(logging.WARNING, logger=external.logger.name):
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = [future.result() for future in
+                       [pool.submit(call) for _ in range(workers)]]
+
+    assert results == [external.DEFAULT_PROXY] * workers
+    assert len(_warnings(caplog)) == 1
+
+
+def test_every_caller_goes_through_the_lock(monkeypatch, caplog):
+    """钉住"走到兜底时确实进了锁"，而不只是"结果恰好只有一条"。
+
+    这条是上面那条的补强：`_WARNED_DEFAULT_PROXY` 是先读后写，把它外面那层
+    `with` 删掉之后，并发下能打出几条完全取决于线程调度——用例大概率仍然绿。
+    换成数"进锁次数"，删掉 `with` 就必红（次数变 0），窗口宽窄不再影响判据。
+    """
+    entered: list[int] = []
+    real = external._WARN_LOCK
+
+    class SpyLock:
+        def __enter__(self):
+            entered.append(1)
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    monkeypatch.setattr(external, "_WARN_LOCK", SpyLock())
+
+    workers = 4
+    with caplog.at_level(logging.WARNING, logger=external.logger.name):
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda _: external._proxy(), range(workers)))
+
+    assert len(entered) == workers
+    # 进锁次数与告警条数不是一回事：每条线程都进锁，但只有第一条真的写。
     assert len(_warnings(caplog)) == 1
 
 

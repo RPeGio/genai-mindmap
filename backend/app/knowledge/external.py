@@ -597,13 +597,15 @@ def _directions_enabled() -> bool:
 def _proxy() -> str | None:
     """本次检索用的代理地址；None 表示直连。
 
-    只认显式配置：`MINDMAP_EXTERNAL_PROXY` 优先，其次 `HTTPS_PROXY` / `HTTP_PROXY`，
-    都没有就落到 `DEFAULT_PROXY`。`none` / `off` / `direct` 是显式直连——没有这个出口，
+    只认显式配置：`MINDMAP_EXTERNAL_PROXY` 优先，其次 `HTTPS_PROXY` / `HTTP_PROXY` /
+    `ALL_PROXY`（与 httpx 自己的 `trust_env` 认同一批变量，否则同一个环境里别的
+    客户端走了代理、只有检索裸连，排查时会怀疑到代码头上），都没有就落到
+    `DEFAULT_PROXY`。`none` / `off` / `direct` 是显式直连——没有这个出口，
     在"机器上本来就有透明代理"的环境里就没法关掉它。
     """
     raw = ""
     for name in (EXTERNAL_PROXY_ENV, "HTTPS_PROXY", "https_proxy",
-                 "HTTP_PROXY", "http_proxy"):
+                 "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         raw = os.getenv(name, "").strip()
         if raw:
             break
@@ -622,19 +624,26 @@ def _proxy() -> str | None:
 # 所以走兜底时必须留痕。日志只写一次：它在每次检索里都会被调用，逐次 warning 会把
 # 真正的问题淹掉。
 _WARNED_DEFAULT_PROXY = False
+# 五个源是**并发**冷启动的（`_search_one` 的线程池），所以 `_proxy()` 会同时被
+# 多个线程走到这里。先读后写不是原子的：没有这把锁，首次检索可能打出 2–5 条
+# 一模一样的 warning，正好把这条"只写一次"的用心抵消掉。
+_WARN_LOCK = threading.Lock()
 
 
 def _warn_default_proxy() -> None:
     """走到 `DEFAULT_PROXY` 兜底时告警一次。"""
     global _WARNED_DEFAULT_PROXY
-    if _WARNED_DEFAULT_PROXY:
-        return
-    _WARNED_DEFAULT_PROXY = True
+    with _WARN_LOCK:
+        if _WARNED_DEFAULT_PROXY:
+            return
+        _WARNED_DEFAULT_PROXY = True
+    # 日志放在锁外：别让 IO 占着锁。
     logger.warning(
         "没有配置 %s，外部检索正在猜本机代理 %s。这在开发机上通常是对的，"
-        "在服务器上大概率没人监听那个端口——那会让每个外部源都连不上，"
-        "而调用方只会看到『没有搜到外部资料』。线上请显式设置 %s，"
-        "或设成 none 表示直连。",
+        "在服务器上大概率没人监听那个端口——那会让**五个源全部**连不上，"
+        "而调用方只会看到『没有搜到外部资料』。线上请显式设置 %s；"
+        "或者设成 none 表示直连——直连只丢维基一条，"
+        "arXiv / OpenAlex / Crossref / 百科 都还能用。",
         EXTERNAL_PROXY_ENV, DEFAULT_PROXY, EXTERNAL_PROXY_ENV,
     )
 
