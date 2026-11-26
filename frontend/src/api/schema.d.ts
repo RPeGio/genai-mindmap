@@ -2161,7 +2161,7 @@ export interface components {
             max_tool_calls: number;
             /**
              * Max Seconds
-             * @default 600
+             * @default 1800
              */
             max_seconds: number;
             /**

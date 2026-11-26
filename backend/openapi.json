@@ -4471,7 +4471,7 @@
             "maximum": 3600.0,
             "exclusiveMinimum": 0.0,
             "title": "Max Seconds",
-            "default": 600.0
+            "default": 1800.0
           },
           "max_output_tokens": {
             "type": "integer",

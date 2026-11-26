@@ -328,7 +328,7 @@ RUN python -c "import torch,sys; sys.exit('CUDA wheel leaked in: ' + torch.__ver
    chunked_transfer_encoding on;
    ```
 
-3. **超时层**：生成预算最长 600 秒（`backend/app/agent/contracts.py:206` 的 `RunBudget.max_seconds`，`default=600.0`、`le=3600`），所以读超时必须比它大：
+3. **超时层**：这里要防的不是"生成要跑多久"，而是"两次读之间隔多久"。`proxy_read_timeout` 的语义是**两次成功读之间的最大间隔**，而 SSE 链路上每 `HEARTBEAT_INTERVAL_SECONDS`（10 秒，`backend/app/agent/service.py`）必有一帧：真进度帧之外，模型调用的长静默由 `_await_quietly` 每 10 秒发一次 `heartbeat`。所以 900 秒是帧间隔的 90 倍余量——**它不随生成预算（`RunBudget.max_seconds`，现 1800 秒）变化**：
 
    ```nginx
    proxy_connect_timeout 10s;
@@ -336,7 +336,7 @@ RUN python -c "import torch,sys; sys.exit('CUDA wheel leaked in: ' + torch.__ver
    proxy_read_timeout    900s;
    ```
 
-   写成 60s 之类的"看起来合理"的值，长材料会以 `504 Gateway Time-out` 收场——**而后端其实还在跑**。用户看到的是"失败"，真实情况是"nginx 放弃等待"。这是 `deploy/nginx.conf` 里已经踩过一次的坑，别重新踩。
+   写成 60s 之类的"看起来合理"的值仍然危险——不是因为预算 1800 秒，而是因为**任何一次超过 60 秒没有帧的窗口**都会被掐。正常情况下帧不会断：工具执行期间由 `_run_tool` 的 `asyncio.wait_for(updates.get(), timeout=10)` 兜发心跳，模型调用期间由 `_await_quietly` 每 10 秒发一次，入库那段有开头的 SSE 注释帧。所以读超时设小了，实际含义是"我认定 60 秒没帧就等于卡死"。这是 `deploy/nginx.conf` 里已经踩过一次的坑，别重新踩。反过来，把读超时跟着预算一路调大也没有意义：帧真的断了就说明后端卡死了，让它 504 比让浏览器一直转圈更好。
 
 ### 8.2 还有两条容易被当成"无关"的
 
@@ -410,7 +410,7 @@ curl -N -s -X POST http://127.0.0.1/api/agent/runs/stream \
 | 20 | `HOME=/data` 下的 `.cache/docling` 可写 | 同上 | `useradd --uid 10001` 的属主与卷属主是否匹配（"空 named volume 复制镜像目录属主"这个行为本身没实测，但写权限已由第 9.5 节的构建期探针兜住，属主对不上会在构建时就失败而不是运行时） |
 | 21 | 健康检查脚本（`python -c` 里的 urllib）在容器里能跑 | `docker compose ps` 显示 healthy | 单行 `python -c` 的引号转义没在真 shell 里跑过 |
 | 22 | `wget` 在 `nginx:1.27-alpine` 里存在（busybox 提供） | 同上 | alpine 的 busybox 通常带 wget，没实测 |
-| 23 | `stop_grace_period: 90s` 下正在跑的生成能优雅收尾 | 生成中途 `docker compose down` | 与 systemd 的 `TimeoutStopSec=90` 同量级，但没实测 |
+| 23 | `stop_grace_period: 90s` 下 `docker compose down` 会在 90 秒后 SIGKILL，**正在跑的生成会被打断** | 生成中途 `docker compose down` | 与 systemd 的 `TimeoutStopSec=90` 同量级，且是刻意的：发版不能等在跑的生成跑完（预算现 1800 秒）。打断后靠检查点续做——用户在「上次的结果」里点「补齐说明」。这一行早先写的是"能优雅收尾"，那是错的 |
 
 ### 9.3 明确"不知道"的
 
@@ -478,7 +478,7 @@ backend/.venv/Scripts/python.exe docker/verify-static.py .    # Windows
 5. **变量闭环**：compose 里（剥掉注释行后）每个 `${VAR}` 在 `docker/.env.example` 都有赋值行；compose 的每个 build arg 在 `backend.Dockerfile` 有 `ARG` 声明
 6. **nginx upstream 名 == compose service 名**：从 nginx 里抽出所有 `http://host:port`，主机名集合必须恰为 `{"backend"}`
 7. **SSE 八条逐条正则**：`proxy_buffering off` / `proxy_cache off` / `chunked_transfer_encoding on` / `proxy_http_version 1.1` / `proxy_set_header Connection ""` / `proxy_connect_timeout 10s` / `proxy_send_timeout 900s` / `proxy_read_timeout 900s`
-8. **超时与体积语义**：`proxy_read_timeout`(900) > `RunBudget.max_seconds`(600)；`client_max_body_size` ≥ 21m（音频上限 20MB）；`gzip_types` 不含 `event-stream` 也不含 `*`
+8. **超时与体积语义**：`proxy_read_timeout`(900) > 6 × `HEARTBEAT_INTERVAL_SECONDS`(10)（**按帧间隔计，不按生成预算计**；预算与读超时早已不同量级：预算 1800 秒，读超时 900 秒，这不是缺陷）；`client_max_body_size` ≥ 21m（音频上限 20MB）；`gzip_types` 不含 `event-stream` 也不含 `*`
 9. **nginx 语法级自检**：花括号净深度 0；每条指令以 `;`/`{`/`}` 结尾；有 `resolver 127.0.0.11`；`set $backend` 在 server 块内；剥注释后无 `__DOMAIN__`/`__WEB_ROOT__`/`__CERT_DIR__`/`__LISTEN6__` 残留
 10. **Dockerfile 关键事实**：后端 `python:3.12-slim`、`--workers 1`、`USER app`、HEALTHCHECK 打 `/api/health`；前端构建段 `node:24`、有 `AS build`、运行段 `FROM nginx:`、有 HEALTHCHECK
 11. **COPY 源路径**：从两个 Dockerfile 抽出所有非 `--from=` 的 COPY 源（10 个），逐个 `exists()`；再用 `fnmatch` 模拟 `.dockerignore`，断言这 10 个**都没被排除**，同时断言 `.git`/`backend/.venv`/`frontend/node_modules`/`frontend/dist`/`.env`/`backend/data` 六个**都**会命中排除规则（这一条是**规则匹配**，不是存在性检查——`frontend/dist` 与 `backend/data` 在当前工作树里本来就不存在，它们在构建机与生产机上才会出现，规则必须能挡住它们）
@@ -593,7 +593,7 @@ for d in ('/models','/data/.cache'): print(d, pathlib.Path(d).exists() and sum(1
 | backend 一直 `unhealthy` | `docker compose logs backend`；`docker compose exec backend python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8000/api/health').read())"` |
 | 前端打开是 502 | backend 没起来或 healthcheck 没过；nginx 用了变量 + `resolver`，backend 挂着时它不退出、只返 502——这是设计 |
 | 首字迟迟不出来（SSE） | 第 8 节，尤其 8.5 的 `curl -N` |
-| 长材料 504 | `proxy_read_timeout` 被改小了；必须 > 600s |
+| 长材料 504 | `proxy_read_timeout` 被改小了（必须远大于 10 秒帧间隔，见 8.1 第 3 条）；若用的是默认值，看后端日志是否还在打印——在打印说明是"真的 900 秒没发过一帧"，那已经是卡死 |
 | 保存导图 500 | `MINDMAP_DB_PATH` 没指到卷，或卷属主不对（第 9.5 节） |
 | 首次解析 PDF 很慢/失败 | 模型在下载（`/models`）；看 `HF_ENDPOINT` 与出网；日志里会有 HuggingFace 的下载记录 |
 | 外部检索总是返回空 | `MINDMAP_EXTERNAL_PROXY` 指向了容器自己的 127.0.0.1（第 11 节第 5 条） |

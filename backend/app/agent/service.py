@@ -38,6 +38,8 @@ from app.agent.contracts import (
     RunContext,
     SnapshotEvent,
     StageEvent,
+    THINKING_TAIL_CHARS,
+    ThinkingEvent,
     ToolCall,
     ToolProvider,
     ToolResult,
@@ -58,6 +60,8 @@ from app.generation.service import (
     GenerationError,
     ModelNotConfigured,
     _demo_content,
+    reset_thinking_sink,
+    set_thinking_sink,
 )
 from app.auth import owner as owner_module
 from app.memory import store as memory_store
@@ -662,9 +666,9 @@ class _ToolOutcome:
 def _budget_message(ctx: RunContext, limit: str, tool_calls: int) -> str:
     """预算停下来的那句话。时间上限这一条要带上"走到哪了"。
 
-    `max_seconds` 从 120 提到 600 之后，它是一条**只在长循环上**才撞到的上限，
-    而撞上它的那一刻恰恰是最需要解释的时候：用户等了十分钟，看到的如果只是
-    「这次运行超过了时间上限」，他无从判断"我的图改完没有""这一版能不能用"。
+    `max_seconds` 从 120 提到 600 再到 1800 之后，它是一条**只在长循环上**才撞到
+    的上限，而撞上它的那一刻恰恰是最需要解释的时候：用户等了半小时，看到的如果
+    只是「这次运行超过了时间上限」，他无从判断"我的图改完没有""这一版能不能用"。
     预算的作用是限制继续花钱，不是把已经做了一半的事说成一句没有下文的错误。
 
     次数上限那两条不加进度：`max_model_calls` / `max_tool_calls` 停在**某一轮
@@ -869,7 +873,9 @@ async def _await_quietly(
     awaitable: "asyncio.Future[Any] | Any",
     seq: "itertools.count[int]",
     out: _Waited,
-) -> AsyncIterator[HeartbeatEvent]:
+    *,
+    with_thinking: bool = False,
+) -> AsyncIterator[AgentEvent]:
     """等一件事完成，期间按 `HEARTBEAT_INTERVAL_SECONDS` 补心跳帧。
 
     只该包在**会产生长静默**的等待上（模型调用、工具内部执行）。心跳不带业务
@@ -877,12 +883,53 @@ async def _await_quietly(
 
     被等的 awaitable 自己负责超时（调用方传的是 `asyncio.wait_for(...)`），这里不
     另设时限：两处都判超时的话，哪个先到就成了第二份真相。
+
+    `with_thinking=True` 时顺手把被等者的思考增量也转出来（`thinking` 帧）。现在
+    只有工具选择轮用它：那一段最长能到几十秒且一帧不发。**被等者必须有这个
+    能力才开**——挂上通道会让 `chat_async` 和 provider 都改走流式请求，对不支持
+    流式的端点会多一个往返（provider 那条有兜底，见 `_read_stream`）。
     """
+    updates: "asyncio.Queue[str]" = asyncio.Queue()
+    token: Any = None
+    getter: "asyncio.Future[str] | None" = None
+
+    async def thinking(text: str) -> None:
+        update = text.strip()
+        if update:
+            updates.put_nowait(update)
+
+    if with_thinking:
+        # 必须先挂通道再 `ensure_future`：Task 在创建那一刻就复制了当前的
+        # ContextVar，反过来做的顺序会让被等者永远看不到这个通道——
+        # 第一次端到端测试就是这么红的（`_run_tool` 的顺序一直是先挂再建任务）。
+        token = set_thinking_sink(thinking)
+        getter = asyncio.ensure_future(updates.get())
     task = asyncio.ensure_future(awaitable)
     silence_started = time.monotonic()
     try:
         while True:
-            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SECONDS)
+            waiting: set[Any] = {task}
+            if getter is not None:
+                waiting.add(getter)
+            # `FIRST_COMPLETED`：等两件事里的任意一件（任务完成 / 来了一帧思考），
+            # 只在都还没动时才等到心跳间隔。用默认的 `ALL_COMPLETED` 会让每帧思考
+            # 都压到下一个心跳才发出去——那就等于没有思考帧。
+            done, _ = await asyncio.wait(
+                waiting, timeout=HEARTBEAT_INTERVAL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # 先收思考、再看任务：mock 里一帧思考与任务完成经常落进**同一次**
+            # `asyncio.wait` 的 done 集，先看任务就会带着没发出去的思考直接
+            # return——第一次端到端测试就是这么把帧丢光的。先收思考再回来看
+            # 任务，队列总有排空的一轮。
+            if getter is not None and getter in done:
+                text = getter.result()
+                getter = asyncio.ensure_future(updates.get())
+                # 与 `_run_tool` 同一条纪律：思考在流就说明"它在动"，静默计时归零。
+                silence_started = time.monotonic()
+                yield ThinkingEvent(
+                    seq=next(seq), text=text[-THINKING_TAIL_CHARS:])
+                continue
             if task in done:
                 # 在这一句里抛出被等者的异常（超时、上游失败），与直接 await 一致
                 out.value = task.result()
@@ -892,6 +939,13 @@ async def _await_quietly(
                 waited_ms=int((time.monotonic() - silence_started) * 1000),
             )
     finally:
+        # 先摘掉通道再取消任务：否则收尾期间代理还会往一个没人读的队列里写。
+        if token is not None:
+            reset_thinking_sink(token)
+        if getter is not None and not getter.done():
+            getter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await getter
         # 客户端中途断开时调用方会被关掉：不取消这个任务，模型请求还在跑、还在计费。
         if not task.done():
             task.cancel()
@@ -923,6 +977,28 @@ async def _run_tool(
     async def emit(payload: dict[str, Any]) -> None:
         updates.put_nowait(("emit", payload))
 
+    async def thinking(text: str) -> None:
+        """模型的思考增量 → 一条 `thinking` 帧。
+
+        **不带完整正文**：页面只需要"它在动"，把几万字的思考过程原样推到浏览器
+        既占带宽也诱使人去读它。这里按帧截断到一个很短的尾巴，由前端滚动显示
+        一行——超过的部分对"它在动"这个用途没有增量信息。
+
+        这里逐片转发、不攒批：模型可能一口气发上百个小片段，服务端攒批会让
+        "它在动"变成"过一会儿动一下"。前端也不做节流——它只是把每片拼到尾巴上
+        再 `slice(-THINKING_KEEP)` 截断，渲染交给那一行的 CSS `truncate`。
+        片数看着多（一次免费档调用实测 41 片 `reasoning`），但每片都只是一次
+        字符串拼接加一次 ref 赋值，省下来不值得让"动"变得一顿一顿。
+
+        并发工具（`_fill_details` 的两半、分片生长）共用这一个通道：两路的思考
+        会在尾巴上交错，读起来像一个人在来回想。这是刻意的——为它加锁就得让
+        一路等另一路，而这里要的只是"屏幕在动"。
+        """
+        update = text.strip()
+        if not update:
+            return
+        updates.put_nowait(("thinking", update))
+
     async def worker() -> None:
         try:
             result = await _execute_once(call, ctx, registry)
@@ -934,6 +1010,10 @@ async def _run_tool(
         updates.put_nowait(("result", result))
 
     ctx.emit = emit
+    # 思考通道与 `ctx.emit` 同时挂、同时摘。挂在 `generation.service` 的
+    # ContextVar 上而不是 `RunContext` 上，是因为消费者在那一层（`chat_async`
+    # 的流式循环里），而它拿不到 `RunContext`。
+    thinking_token = set_thinking_sink(thinking)
     task = asyncio.create_task(worker())
     deadline = time.monotonic() + timeout
     silence_started = time.monotonic()
@@ -960,6 +1040,13 @@ async def _run_tool(
                 )
                 continue
             silence_started = time.monotonic()
+            if kind == "thinking":
+                # 思考帧与 `emit` 一样重置静默计时（上面那行统一做了）：页面确实
+                # 在收到新内容，"已等 N 秒"不该继续涨。它与业务进度的区别在别处
+                # ——思考帧只说明模型在动，不说明树长了，所以前端拿它显示滚动那
+                # 一行，**不**把它当 `stageText`。
+                yield ThinkingEvent(seq=next(seq), text=str(payload)[-THINKING_TAIL_CHARS:])
+                continue
             if kind == "emit":
                 event = _tool_frame(payload, seq)
                 if event is not None:
@@ -974,6 +1061,7 @@ async def _run_tool(
         # 通道只在这段执行期间有效：留着它，下一次工具的增量就会推进一个已经
         # 没人读的队列，控制器看见的是一串永远不出现的帧。
         ctx.emit = None
+        reset_thinking_sink(thinking_token)
         task.cancel()
         # 已结束的任务再 cancel 是空操作；这里等它收尾，避免留下
         # "Task was destroyed but it is pending" 和一个还在跑的模型请求。
@@ -1281,6 +1369,10 @@ async def _loop(
                     timeout=max(0.1, _remaining_seconds(budget, started)),
                 ),
                 seq, waited,
+                # 工具选择轮是整条链里除工具执行之外唯一的长静默：免费档实测
+                # 单次能到几十秒，而这一段以前只有心跳。挂上思考通道之后
+                # provider 会改走流式，把 `delta.reasoning` 转出来。
+                with_thinking=True,
             )) as waiting:
                 async for beat in waiting:
                     yield beat

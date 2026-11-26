@@ -1078,7 +1078,8 @@ class BudgetDefaultsTest(unittest.TestCase):
 
     def test_defaults_match_the_measured_limits(self):
         budget = RunBudget()
-        self.assertEqual(budget.max_seconds, 600.0)
+        # 免费档实测整条链 567.6 秒，600 秒会在正常生成上撞线；1800 是它的三倍。
+        self.assertEqual(budget.max_seconds, 1800.0)
         self.assertEqual(budget.max_output_tokens, 65536)
 
     def test_seconds_ceiling_admits_an_hour(self):

@@ -69,7 +69,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 
 三个边界：① **只比主机名**，不比端口与路径——`/v1` 换 `/v2`、Ollama 11434 挪到 11435 都不该逼人重填，为这些变动弹提示只会训练出"看到提示就再粘一次"的习惯；换主机才意味着"换了一个会收到这把密钥的对方"。② 锚点**落库**而不是每次读时算，算的话它会跟着新地址一起漂，绑定等于不存在。③ 老库升级时该列补成空串，此时按那一行自己的 `base_url` 兜底——否则升级当天所有人的已存配置会一起被判成"未配置"。重新粘贴一次密钥就是唯一的恢复动作，`POST /model/test` 在这个状态下回 400 `settings_key_unbound` 并且**一个字节都不发**。
 
-**免费档（`MINDMAP_FREE_TIER`）：模型名是运行时现问的，不写死。** 打开之后，`store.resolve()` 会问一次部署方那台端点的 `GET /models`，挑出当前 id 以 `:free` 结尾、且 `supported_endpoints` 里带 `/chat/completions` 的那些，按"上下文大的优先、同大按 id 升序"排第一个来用。**这份名单会变**——平台会新上架免费模型，也会把已有的下架，所以这里一个模型名都没硬编码；`docs/FREE-MODELS.md` 记着实测数据与坑。四条运维要点：① 拉一次列表要 20 秒以上，所以它是后台线程 + 1 小时 TTL 缓存，**永远不会出现在请求路径上**（冷启动第一次会报"免费档还没准备好"，点一次重试就好）；② 免费模型**也要密钥**（不带 key 直接 401），只是那次调用不收费，所以这一档用的是部署方那把钥匙，`model_source` 会报 `free`；③ 上游偶发 429 / 524，一次运行内会按候选序列换下一个免费模型，全试完才报错；④ **免费档单次生成要 4–6 分钟**（付费档约 100 秒的同一张图），`RunBudget.max_seconds` 默认 600 秒余量偏薄——把免费档当主路径前先确认它不是唯一开关，或把 `MINDMAP_LLM_MAX_TOKENS` 留在默认（免费档的 `max_tokens` 上限由代码夹在 16000；**往下是跟这个变量的**：把它设成 2000，免费档最后也只发 2000，只有往上调才顶不过 16000 这道夹子）。用户自己填了密钥就完全不进这一档。
+**免费档（`MINDMAP_FREE_TIER`）：模型名是运行时现问的，不写死。** 打开之后，`store.resolve()` 会问一次部署方那台端点的 `GET /models`，挑出当前 id 以 `:free` 结尾、且 `supported_endpoints` 里带 `/chat/completions` 的那些，按"上下文大的优先、同大按 id 升序"排第一个来用。**这份名单会变**——平台会新上架免费模型，也会把已有的下架，所以这里一个模型名都没硬编码；`docs/FREE-MODELS.md` 记着实测数据与坑。四条运维要点：① 拉一次列表要 20 秒以上，所以它是后台线程 + 1 小时 TTL 缓存，**永远不会出现在请求路径上**（冷启动第一次会报"免费档还没准备好"，点一次重试就好）；② 免费模型**也要密钥**（不带 key 直接 401），只是那次调用不收费，所以这一档用的是部署方那把钥匙，`model_source` 会报 `free`；③ 上游偶发 429 / 524，一次运行内会按候选序列换下一个免费模型，全试完才报错；④ **免费档单次生成实测 4–10 分钟**（567.6 秒那次是 33 个节点；付费档同一张图约 100 秒），`RunBudget.max_seconds` 默认已按这个数调到 **1800 秒**（上限 3600，见 `backend/app/agent/contracts.py`）——把免费档当主路径前先确认它不是唯一开关，同时注意**前端根本不发 `budget`，所以这个默认值就是实际生效值**。免费档的 `max_tokens` 上限由代码夹在 16000；**往下是跟 `MINDMAP_LLM_MAX_TOKENS` 的**：把它设成 2000，免费档最后也只发 2000，只有往上调才顶不过 16000 那道夹子。用户自己填了密钥就完全不进这一档。
 
 **公共免费额度（`MINDMAP_FREE_TIER_API_KEY`）：每 IP 每天 3 次，用完 429。** 配了这把钥匙，没有自己密钥的人就能借它生成，`api_key_source` 报 `public`。四件要知道的事：
 
@@ -388,7 +388,13 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 `--host 127.0.0.1` 与 compose 的 `expose`（不 `ports`）不是"顺手写得保守"，是这套
 计数的前提。
 
-**重启会等正在跑的生成**：单元里 `TimeoutStopSec=660`（生成预算是 600 秒），所以有长请求在跑时 `systemctl restart` 可能等到十来分钟。演示前别在有人用的时候重启；确实要立刻停，用
+**重启会等正在跑的生成**：单元的 `TimeoutStopSec` 是 90 秒，**不是**生成预算
+（`RunBudget.max_seconds` 默认 1800 秒）。这两者刻意不同：跟着调到 30 分钟意味着
+每次发版都要等在跑的生成跑完，而发版需要立刻生效。被打断的那次不会白丢——生成在
+结构那一段写完时会落一个检查点，硬断之后那一行留成 `running`，老过
+`RUN_ABANDONED_SECONDS`（1800 秒）后在下一次生成开始时被扫成 `failed` /
+`run_abandoned`，出现在"上次的结果"里，点「补齐说明」就能接着做完。演示前别在有人
+用的时候重启；确实要立刻停，用
 `sudo systemctl kill -s SIGKILL genai-mindmap && sudo systemctl start genai-mindmap`（代价是那条请求直接断，前端看到断流）。
 
 ### 9.8 故障对照表
@@ -402,7 +408,7 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 | nginx 起不来，error.log 里 `bind() to [::]:80 failed` | 机器把 IPv6 关了，配置里却还有 `listen [::]:80`。`install.sh` 现在按 `/proc/sys/net/ipv6/conf/all/disable_ipv6` 决定写不写这行——注意 `nginx -t` 只查语法，**查不出 bind 失败**，必须是 `systemctl restart nginx` 之后看 `status` 才算数 |
 | 重跑过安装脚本后 HTTPS 没了 | 旧版脚本用 `certbot --nginx` 把 443 写进 `conf.d`，又被下一次 `install.sh` 用模板覆盖。现在用 `certbot certonly --webroot` 只签发，443 由 `deploy/nginx-tls.conf` 渲染，重跑不会丢 |
 | 413 Request Entity Too Large | 上传超过 nginx 的 `client_max_body_size 24m` |
-| 504 但后端日志还在打印 | 生成超过 `proxy_read_timeout`；已设 900s，仍超时说明 `MINDMAP_LLM_*` 指向的模型太慢 |
+| 504 但后端日志还在打印 | 900 秒里**一帧都没发出去**（`proxy_read_timeout` 计的是两次读之间的间隔，而正常每 10 秒必有一帧心跳）。已设 900s 仍超时，说明那段时间连心跳线程都被占住了：看是不是 `MINDMAP_LLM_*` 指向的模型卡在一个不返回的请求上（单次请求超时是 `_TIMEOUT_SECONDS = 600`），或机器本身在换页 |
 | 点了生成一直转圈、最后一次性出图 | SSE 被缓冲：确认 `location /api/` 里有 `proxy_buffering off` |
 | 偶发 `database is locked` | 起了多个 worker 或多个 uvicorn 实例；SQLite 只能一个写者 |
 | 上传 PDF 返回 422 说需要密钥 | `MINDMAP_LLM_MODE=demo`，或 `MINDMAP_LLM_*` 没填全 |

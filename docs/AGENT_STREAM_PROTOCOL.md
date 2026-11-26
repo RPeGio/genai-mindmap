@@ -27,7 +27,8 @@ JSON 内自带的 id，只能由工具层带上路径。
 
 ## 事件
 
-沿用现有 SSE 信封 `{seq, type, ...}`，新增一种：
+沿用现有 SSE 信封 `{seq, type, ...}`，本文主要讲 `node_grow`；另外两种"让页面
+知道它在跑"的帧（`heartbeat`、`thinking`）见文末各自的小节。
 
 ```json
 {"seq": 31, "type": "node_grow", "path": [0, 2], "label": "按章节通读教材",
@@ -254,8 +255,10 @@ if ctx.checkpoint is not None:
 1. 不在本进程的活跃登记里（`runs._ACTIVE`，由 `_frames` 在生成器第一行 `active()`、
    `finally` 里 `inactive()`）。单靠时间判不出来：一轮生成里最长的静默是**单次模型
    调用**，它受 `max_seconds` 约束、上限 3600 秒，比下面那个阈值还长。
-2. `updated_at` 超过 `RUN_ABANDONED_SECONDS`（1800 秒，是线上默认 `max_seconds` 的
-   两倍）。自己还在跑的 run 一律不扫，1800 秒只对"登记表里没有、又很久没动"的行生效。
+2. `updated_at` 超过 `RUN_ABANDONED_SECONDS`（1800 秒）。这个数原来取的是"线上默认
+   `max_seconds` 的两倍"，但默认预算在免费档实测之后也调成了 1800 秒——现在两者相等，
+   **没有余量了**。留着它不往上抬，是因为抬上去只会让"进程已经死掉"的行多躺半小时；
+   时间判据本来就只是兜底，真正拦住误杀的是上一条的活跃登记。
 
 判中的行变成 `failed` + `failure.code = "run_abandoned"`，**不动 `candidate`**（清理的是
 状态，不是那棵树）。放在 `begin()` 里而不是启动钩子，是因为这台机器只有一个 worker、
@@ -357,8 +360,72 @@ if ctx.checkpoint is not None:
    其实已经在长。
 3. 静默达到 10 秒时状态行文案换成"模型正在思考，已等 N 秒"，替掉原来的阶段文案
    （不是两句并列）——阶段文案描述的是上一个动作，此刻它已经不成立了。
+   **判据只有"当前静默了多久"**，不要让"这一轮收到过 `thinking` 帧"变成永久
+   开关：模型在吐字时 `waited_ms` 本来就被归零（见上一节），两者天然互斥；而
+   一旦做成闩锁，某一轮只要收到过一帧思考，此后**所有**长静默都不再有这句兜底
+   （`thinking` 帧覆盖不到工具选择轮，见下一节）。顺手在界面上多一行滚动尾巴即
+   可，那句"已等 N 秒"不该被它顶掉。
 4. 心跳是**保活手段，不是保证**。客户端断线仍可能发生，所以"既没 `done` 也没
    `error` 就 EOF"必须继续按"连接中断"处理，不能因为有心跳就当成正常结束。
+
+## `thinking` 帧
+
+心跳只证明链路活着，不证明模型在动。线上实测（2026-11-24，免费档
+`recursive/flint-v1.0:free`）一次生成 **567.6 秒**：结构段 311.7 秒、写说明段
+232.8 秒。这五分钟里事件流上只有每 10 秒一次的 `heartbeat`，从页面看就是**彻底
+静默**——用户分不清"在跑"与"卡死了"，而这两件事该做的操作完全相反（等 vs 刷新
+重来）。
+
+```json
+{"seq": 8, "type": "thinking", "text": "先看第一个分支，它的子项分别是"}
+```
+
+- `text`：模型思考的**增量片段**，不是完整过程。服务端每片只保留尾部
+  `THINKING_TAIL_CHARS = 200` 个字符（`backend/app/agent/contracts.py`）。
+- 来源是流式响应里的 `delta.reasoning`（Command Code 的免费模型）或
+  `delta.reasoning_content`（DeepSeek 的推理模型），两个名字都认。实测见
+  `backend/app/generation/service.py::_stream_frame` 的 docstring。
+- 只在**挂了思考通道**时才走流式请求（`backend/app/generation/service.py` 的
+  `_thinking_sink` ContextVar）。没有消费者的路径（单测、直接调工具）与加这个
+  功能之前逐字相同——连流式请求都不发。
+
+规则：
+
+1. **它不是业务进度**。树长了多少仍看 `stage` / `node_grow`。这一帧只有一个
+   用途：让用户知道模型还在动。
+2. **界面上固定只显示一行**，滚动更新、只显示尾部：不展开、不折叠、不进事件
+   列表、不可选中。用户原话是"让用户知道模型在跑就行，不关注思考内容本身"。
+   给读屏软件加 `aria-hidden`——每几百毫秒蹦一句半截话，对读屏用户是纯干扰，
+   而"它在动"这件事已经由状态行与旋转圆点表达了。
+3. **它重置"已等 N 秒"**（与其它非 `heartbeat` 帧一样）。状态行那句兜底文案的判据
+   因此只有 `waited_ms`：思考帧在流时它恒为 0，"已等 N 秒"本来就不会出现，不需要
+   再记一个"本轮收到过思考帧"的开关（那样会让下面「覆盖不到哪里」的那些阶段连
+   兜底文案都失去）。
+4. 思考片段回调自己抛错时**只是不再显示**，正文照收、这次生成不受影响
+   （`_chat_streamed` 里把回调置空）。
+
+### 覆盖到哪里
+
+思考帧现在覆盖两段：
+
+- **工具执行期间**：`backend/app/agent/service.py::_run_tool` 挂上通道，工具内部
+  经 `chat_async` 走的流式请求读到 `delta.reasoning` 就转发。
+- **模型选择工具的那一轮**（`backend/app/agent/provider.py::complete_tools`）。
+  `_loop` 在 `_await_quietly` 上挂 `with_thinking=True`，provider 那条出口看到有
+  思考消费者才把请求改成 `stream: true`，自己拼 `delta.tool_calls` 分片（缺 id、
+  缺函数名、服务端不认 `stream` 都退回整包读——工具选择轮不能因为想显示思考就
+  失败）。`finish_reason == "length"` 照旧硬失败：半截 `arguments` 拿去执行比
+  直接失败危险得多，这条纪律两条读法一致（见 `_parse_completion`）。
+
+**没有**思考帧的只剩一类：工具之外的等待（检索、解析这类没有模型调用的段），
+它们本来就没有模型在"想"，只有 `heartbeat`。
+
+一个曾经踩过的坑，写在这里防止回归：`_await_quietly` 里挂通道必须发生在
+`ensure_future` **之前**——Task 在创建那一刻就复制了 ContextVar，反过来的顺序
+会让被等者永远看不到通道，思考帧静默消失（端到端测试抓到过一次）。
+
+所以前端**不能**把"收到过思考帧"当成"以后不会再有长静默"：那一行出现与否只看
+`waited_ms`。
 
 ## `sources` 帧
 

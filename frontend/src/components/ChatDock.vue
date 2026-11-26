@@ -646,6 +646,14 @@ const statusText = computed(() => {
       return '生成期间你改过这张图：两棵树都还在，选一个';
     case 'running': {
       const parts = [runningVerb.value];
+      // 判据只有 `waitedMs`（当前静默了多久），**不要**再加"本轮有没有收到过思考
+      // 帧"那种闩锁：`waitedMs` 自己就是静默时长（思考帧到达时 store 会把它归零），
+      // 模型在吐字时这里本来就不成立。反过来，闩锁一旦置真就再也回不来——而模型
+      // 选择工具的那一轮（`provider.complete_tools`）根本不走流式、没有思考帧，
+      // 于是那一段最长静默反而永远失去这句兜底文案。
+      //
+      // 业务进度（`stageText`）优先级仍在最前：写了"正在给 33 个节点写说明"就
+      // 说明模型跑到哪一步了，比"它在想"信息量大。
       if (store.waitedMs >= SILENT_HINT_SECONDS) {
         parts.push(`模型正在思考，已等 ${store.waitedMs} 秒`);
       } else {
@@ -985,8 +993,28 @@ defineExpose({
         aria-live="polite"
       >
         <span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-sky-500" aria-hidden="true" />
-        <span class="min-w-0 flex-1 truncate font-medium text-slate-700" data-test="run-status-text">
-          {{ statusText }}
+        <span class="min-w-0 flex-1">
+          <span class="block truncate font-medium text-slate-700" data-test="run-status-text">
+            {{ statusText }}
+          </span>
+          <!--
+            模型正在思考的那一行：**固定一行、只显示尾部、滚动更新**。
+
+            用户的原话是"固定只流式显示 1 行，让用户知道模型在跑就行，不关注思考
+            内容本身"。所以这里既不做展开、也不可选中：`truncate` + `text-slate-400`
+            让它明显是"背景噪声"而不是要读的内容；`aria-hidden` 让屏幕阅读器跳过
+            ——每几百毫秒蹦一句半截话对读屏用户是纯粹的干扰，而"它在动"这件事
+            已经由上面那行状态与旋转的圆点表达了。
+
+            `direction: rtl` 的替代做法是只用尾部文字：`statusText` 那边已经
+            保证不会同时挂"已等 N 秒"，两句话不会互相打架。
+          -->
+          <span
+            v-if="store.thinkingTail"
+            data-test="run-status-thinking"
+            aria-hidden="true"
+            class="block truncate text-[11px] leading-tight text-slate-400"
+          >{{ store.thinkingTail }}</span>
         </span>
         <button
           v-for="action in statusActions"

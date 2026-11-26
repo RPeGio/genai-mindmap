@@ -162,8 +162,13 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=5 \
 #
 # 超时与 keepalive 照抄 systemd 单元：--timeout-keep-alive 65 比 nginx 的
 # upstream keepalive 略长；--timeout-graceful-shutdown 15 给正在收尾的
-# SSE 连接一个窗口（生成预算 RunBudget.max_seconds=600 由 stop_grace_period
-# 兜住，见 compose）。
+# SSE 连接一个窗口。
+#
+# 别指望 stop_grace_period 兜住生成预算：compose 里是 90 秒，而
+# RunBudget.max_seconds 的默认值已经是 1800 秒——两者差了二十倍，正在跑的
+# 生成一定会被 SIGKILL 打断（systemd 那边同样刻意留 90 秒，理由见
+# deploy/genai-mindmap.service）。打断之后靠检查点续做：用户下次进来在
+# 「上次的结果」里点「补齐说明」，不必从头再跑一遍。
 # 写成一行（不用 `\` 续行）是刻意的：exec 形式的 JSON 数组要靠 Dockerfile 解析器
 # 先吃掉续行再交给 JSON 解析，本机没有 docker 验证这一步。一行就没有歧义。
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips=*", "--no-server-header", "--timeout-keep-alive", "65", "--timeout-graceful-shutdown", "15"]
