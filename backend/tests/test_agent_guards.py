@@ -421,8 +421,9 @@ def test_expanding_a_branch_counts_as_progress():
 def test_seconds_timeout_message_carries_the_progress():
     """时间上限那一句必须带"走到哪了"。
 
-    600 秒是只在长循环上才撞到的上限，撞上它的那一刻恰恰最需要解释：用户等了
-    十分钟，只看到"这次运行超过了时间上限"，他无从判断"我的图改完没有"。
+    默认上限 1800 秒（免费档实测整链 567.6 秒的三倍）是只在长循环上才撞到的，
+    撞上它的那一刻恰恰最需要解释：用户等了半小时，只看到"这次运行超过了时间
+    上限"，他无从判断"我的图改完没有"。
     """
     request = _request(snapshot=_tree())
     ctx = _ctx(request, candidate=_tree())

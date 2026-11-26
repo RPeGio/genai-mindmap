@@ -410,7 +410,7 @@ curl -N -s -X POST http://127.0.0.1/api/agent/runs/stream \
 | 20 | `HOME=/data` 下的 `.cache/docling` 可写 | 同上 | `useradd --uid 10001` 的属主与卷属主是否匹配（"空 named volume 复制镜像目录属主"这个行为本身没实测，但写权限已由第 9.5 节的构建期探针兜住，属主对不上会在构建时就失败而不是运行时） |
 | 21 | 健康检查脚本（`python -c` 里的 urllib）在容器里能跑 | `docker compose ps` 显示 healthy | 单行 `python -c` 的引号转义没在真 shell 里跑过 |
 | 22 | `wget` 在 `nginx:1.27-alpine` 里存在（busybox 提供） | 同上 | alpine 的 busybox 通常带 wget，没实测 |
-| 23 | `stop_grace_period: 90s` 下正在跑的生成能优雅收尾 | 生成中途 `docker compose down` | 与 systemd 的 `TimeoutStopSec=90` 同量级，但没实测 |
+| 23 | `stop_grace_period: 90s` 下 `docker compose down` 会在 90 秒后 SIGKILL，**正在跑的生成会被打断** | 生成中途 `docker compose down` | 与 systemd 的 `TimeoutStopSec=90` 同量级，且是刻意的：发版不能等在跑的生成跑完（预算现 1800 秒）。打断后靠检查点续做——用户在「上次的结果」里点「补齐说明」。这一行早先写的是"能优雅收尾"，那是错的 |
 
 ### 9.3 明确"不知道"的
 

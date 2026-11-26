@@ -74,8 +74,10 @@ services:
     # （docling 会把 python 子进程拉起来做格式转换）。`--workers 1` 时影响有限，
     # 但代价为零，且少了它会变成"跑久了进程表全是 defunct"这种只能在现场查的事。
     init: true
-    # 生成预算最长 600 秒（RunBudget.max_seconds）。`docker compose down` /
-    # 重启时给正在收尾的 SSE 连接一点时间，与 systemd 的 TimeoutStopSec=90 同量级。
+    # 与 systemd 的 TimeoutStopSec=90 同量级，**故意不跟生成预算走**
+    # （RunBudget.max_seconds 现 1800 秒）：发版要立刻生效，不能在 `down` 里
+    # 等在跑的生成跑完。被打断的那一轮靠检查点续做（用户在「上次的结果」里
+    # 点「补齐说明」接着写完）。理由与取舍见 deploy/genai-mindmap.service。
     stop_grace_period: 90s
     healthcheck:
       test:

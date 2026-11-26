@@ -255,8 +255,10 @@ if ctx.checkpoint is not None:
 1. 不在本进程的活跃登记里（`runs._ACTIVE`，由 `_frames` 在生成器第一行 `active()`、
    `finally` 里 `inactive()`）。单靠时间判不出来：一轮生成里最长的静默是**单次模型
    调用**，它受 `max_seconds` 约束、上限 3600 秒，比下面那个阈值还长。
-2. `updated_at` 超过 `RUN_ABANDONED_SECONDS`（1800 秒，是线上默认 `max_seconds` 的
-   两倍）。自己还在跑的 run 一律不扫，1800 秒只对"登记表里没有、又很久没动"的行生效。
+2. `updated_at` 超过 `RUN_ABANDONED_SECONDS`（1800 秒）。这个数原来取的是"线上默认
+   `max_seconds` 的两倍"，但默认预算在免费档实测之后也调成了 1800 秒——现在两者相等，
+   **没有余量了**。留着它不往上抬，是因为抬上去只会让"进程已经死掉"的行多躺半小时；
+   时间判据本来就只是兜底，真正拦住误杀的是上一条的活跃登记。
 
 判中的行变成 `failed` + `failure.code = "run_abandoned"`，**不动 `candidate`**（清理的是
 状态，不是那棵树）。放在 `begin()` 里而不是启动钩子，是因为这台机器只有一个 worker、
