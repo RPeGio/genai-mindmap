@@ -404,18 +404,25 @@ if ctx.checkpoint is not None:
 4. 思考片段回调自己抛错时**只是不再显示**，正文照收、这次生成不受影响
    （`_chat_streamed` 里把回调置空）。
 
-### 覆盖不到哪里
+### 覆盖到哪里
 
-思考帧只在**工具执行期间**存在：`backend/app/agent/service.py::_run_tool` 挂上通道，
-工具内部经 `chat_async` 走的流式请求读到 `delta.reasoning` 就转发。离开工具的另外
-两段**没有**思考帧，只有 `heartbeat`：
+思考帧现在覆盖两段：
 
-- **模型选择工具的那一轮**（`backend/app/agent/provider.py::complete_tools`）。它
-  刻意不是流式请求：那条路要的是一个完整的 `tool_calls` 参数，参数缺一半执行了
-  就是脏数据（`_parse_completion` 故意不 salvage，与 `chat_async` 的取舍相反）。
-  要给它思考帧就得把请求改成流式、自己拼 `delta.tool_calls` 分片——那是另一件事，
-  不在这条帧的契约里。
-- **工具之外的心跳包装**（`_await_quietly`），比如检索、解析这类没有模型调用的段。
+- **工具执行期间**：`backend/app/agent/service.py::_run_tool` 挂上通道，工具内部
+  经 `chat_async` 走的流式请求读到 `delta.reasoning` 就转发。
+- **模型选择工具的那一轮**（`backend/app/agent/provider.py::complete_tools`）。
+  `_loop` 在 `_await_quietly` 上挂 `with_thinking=True`，provider 那条出口看到有
+  思考消费者才把请求改成 `stream: true`，自己拼 `delta.tool_calls` 分片（缺 id、
+  缺函数名、服务端不认 `stream` 都退回整包读——工具选择轮不能因为想显示思考就
+  失败）。`finish_reason == "length"` 照旧硬失败：半截 `arguments` 拿去执行比
+  直接失败危险得多，这条纪律两条读法一致（见 `_parse_completion`）。
+
+**没有**思考帧的只剩一类：工具之外的等待（检索、解析这类没有模型调用的段），
+它们本来就没有模型在"想"，只有 `heartbeat`。
+
+一个曾经踩过的坑，写在这里防止回归：`_await_quietly` 里挂通道必须发生在
+`ensure_future` **之前**——Task 在创建那一刻就复制了 ContextVar，反过来的顺序
+会让被等者永远看不到通道，思考帧静默消失（端到端测试抓到过一次）。
 
 所以前端**不能**把"收到过思考帧"当成"以后不会再有长静默"：那一行出现与否只看
 `waited_ms`。
