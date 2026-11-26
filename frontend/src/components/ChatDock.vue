@@ -646,13 +646,15 @@ const statusText = computed(() => {
       return '生成期间你改过这张图：两棵树都还在，选一个';
     case 'running': {
       const parts = [runningVerb.value];
-      // 有思考帧时，那一行**不**再被"已等 N 秒"顶掉：模型正在吐字，页面该显示
-      // 它在想什么（滚动那一行），而不是一个还在涨的秒数——秒数是"没动静"的
-      // 证据，两者同时成立时这句话本身就自相矛盾。
+      // 判据只有 `waitedMs`（当前静默了多久），**不要**再加"本轮有没有收到过思考
+      // 帧"那种闩锁：`waitedMs` 自己就是静默时长（思考帧到达时 store 会把它归零），
+      // 模型在吐字时这里本来就不成立。反过来，闩锁一旦置真就再也回不来——而模型
+      // 选择工具的那一轮（`provider.complete_tools`）根本不走流式、没有思考帧，
+      // 于是那一段最长静默反而永远失去这句兜底文案。
       //
       // 业务进度（`stageText`）优先级仍在最前：写了"正在给 33 个节点写说明"就
       // 说明模型跑到哪一步了，比"它在想"信息量大。
-      if (store.waitedMs >= SILENT_HINT_SECONDS && !store.thinkingSeen) {
+      if (store.waitedMs >= SILENT_HINT_SECONDS) {
         parts.push(`模型正在思考，已等 ${store.waitedMs} 秒`);
       } else {
         if (store.stageText) parts.push(store.stageText);

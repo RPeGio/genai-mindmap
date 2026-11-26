@@ -117,26 +117,79 @@ describe('底部对话框的状态机', () => {
     expect(wrapper.find(DOCK_CARD).exists()).toBe(false);
   });
 
-  it('模型在思考：细进度下面多一行滚动尾巴，且不再说"已等 N 秒"', async () => {
+  it('模型在思考：细进度下面多一行滚动尾巴', async () => {
     stubFetch([{ type: 'done', seq: 3, content: TREE, mode: 'model' }]);
     const wrapper = mountApp();
     const store = useMindMapStore();
     store.busy = true;
     store.stageText = '正在给 33 个节点写说明';
-    // 4 秒没有新内容：按旧逻辑这里会切成"模型正在思考，已等 4 秒"
-    store.waitedMs = 12;
-    store.thinkingSeen = true;
+    // 思考帧在流时 `waitedMs` 是 0（store 的 thinking 分支会归零），所以这里模拟
+    // 的正是"正在吐字"的那一刻：有尾巴、没有秒数。
+    store.waitedMs = 0;
     store.thinkingTail = '这三个节点讲的都是流程里同一处';
     await wrapper.vm.$nextTick();
 
     const row = wrapper.get('[data-test="run-status"]');
     // 业务进度还在：它比"它在动"信息量大，不能被顶掉
     expect(row.text()).toContain('正在给 33 个节点写说明');
-    // 那句"已等 N 秒"不再出现
     expect(row.text()).not.toContain('已等');
     // 思考尾巴单独一行，只显示尾部文字
     expect(wrapper.get('[data-test="run-status-thinking"]').text())
       .toBe('这三个节点讲的都是流程里同一处');
+  });
+
+  it('吐完思考又静默：那句"已等 N 秒"还得回来', async () => {
+    // 闩锁反例：模型选工具的那一轮（`provider.complete_tools`）不走流式、一个
+    // 思考帧都没有。如果"收到过思考帧"被当成永久开关，这一段最长的静默就再也
+    // 没有兜底文案，只剩一个还在涨的秒数。这里走真实的帧序列：先来思考帧，再
+    // 来一条 waited_ms 很大的心跳。
+    const encoder = new TextEncoder();
+    let push: ((frame: unknown) => void) | null = null;
+    let close: (() => void) | null = null;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (frame: unknown) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+        };
+        close = () => controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      if (isOptimizationRequest(url)) return optimizationReply();
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ version: 'test' }) } as unknown as Response;
+      }
+      return { ok: true, status: 200, body, json: async () => ({}) } as unknown as Response;
+    }));
+
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.stageText = '正在给 33 个节点写说明';
+    const running = store.runGeneration('机器学习', 'edit');
+    await flushPromises();
+
+    push!({ type: 'thinking', seq: 1, text: '先看第一个分支' });
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(store.thinkingTail).toBe('先看第一个分支');
+    expect(store.waitedMs).toBe(0);
+    expect(wrapper.get('[data-test="run-status"]').text()).not.toContain('已等');
+
+    // 同一次运行里接着静默 12 秒（心跳把 waited_ms 报上来）：这句兜底必须回来
+    push!({ type: 'heartbeat', seq: 2, waited_ms: 12000 });
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    const row = wrapper.get('[data-test="run-status"]');
+    expect(row.text()).toContain('模型正在思考，已等 12 秒');
+    // 切成兜底文案时不再并列阶段文案：它描述的上一个动作已经不成立了
+    expect(row.text()).not.toContain('正在给 33 个节点写说明');
+
+    push!({ type: 'done', seq: 3, content: TREE, mode: 'model' });
+    close!();
+    await running;
   });
 
   it('没有思考帧时那一行不出现（老后端不认这个帧也不能空一行出来）', async () => {
@@ -185,8 +238,6 @@ describe('底部对话框的状态机', () => {
     push!({ type: 'thinking', seq: 2, text: '乙'.repeat(20) });
     await flushPromises();
 
-    expect(store.thinkingSeen).toBe(true);
-    // 只留最后 400 字符：页面固定只显示一行，攒整篇没有意义
     expect(store.thinkingTail.length).toBe(400);
     expect(store.thinkingTail.endsWith('乙')).toBe(true);
     // 思考不是事件：右侧事件列表不该被几百条碎片刷满
@@ -200,7 +251,6 @@ describe('底部对话框的状态机', () => {
     await wrapper.vm.$nextTick();
     // 运行结束后尾巴清掉：那一行不该在"生成成功"之后还挂着
     expect(store.thinkingTail).toBe('');
-    expect(store.thinkingSeen).toBe(false);
   });
 
   it('生成完：2 秒后淡出，只剩画布 + 悬浮球', async () => {

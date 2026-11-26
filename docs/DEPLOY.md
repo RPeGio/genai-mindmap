@@ -408,7 +408,7 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 | nginx 起不来，error.log 里 `bind() to [::]:80 failed` | 机器把 IPv6 关了，配置里却还有 `listen [::]:80`。`install.sh` 现在按 `/proc/sys/net/ipv6/conf/all/disable_ipv6` 决定写不写这行——注意 `nginx -t` 只查语法，**查不出 bind 失败**，必须是 `systemctl restart nginx` 之后看 `status` 才算数 |
 | 重跑过安装脚本后 HTTPS 没了 | 旧版脚本用 `certbot --nginx` 把 443 写进 `conf.d`，又被下一次 `install.sh` 用模板覆盖。现在用 `certbot certonly --webroot` 只签发，443 由 `deploy/nginx-tls.conf` 渲染，重跑不会丢 |
 | 413 Request Entity Too Large | 上传超过 nginx 的 `client_max_body_size 24m` |
-| 504 但后端日志还在打印 | 生成超过 `proxy_read_timeout`；已设 900s，仍超时说明 `MINDMAP_LLM_*` 指向的模型太慢 |
+| 504 但后端日志还在打印 | 900 秒里**一帧都没发出去**（`proxy_read_timeout` 计的是两次读之间的间隔，而正常每 10 秒必有一帧心跳）。已设 900s 仍超时，说明那段时间连心跳线程都被占住了：看是不是 `MINDMAP_LLM_*` 指向的模型卡在一个不返回的请求上（单次请求超时是 `_TIMEOUT_SECONDS = 600`），或机器本身在换页 |
 | 点了生成一直转圈、最后一次性出图 | SSE 被缓冲：确认 `location /api/` 里有 `proxy_buffering off` |
 | 偶发 `database is locked` | 起了多个 worker 或多个 uvicorn 实例；SQLite 只能一个写者 |
 | 上传 PDF 返回 422 说需要密钥 | `MINDMAP_LLM_MODE=demo`，或 `MINDMAP_LLM_*` 没填全 |

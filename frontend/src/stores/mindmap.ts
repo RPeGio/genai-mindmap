@@ -850,8 +850,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 是前端显示宽度的几十倍，够滚动起来又不至于把整段思考留在内存里。
    */
   const thinkingTail = ref('');
-  /** 本次运行收过多少条思考帧——`> 0` 才让界面把那行显示出来。 */
-  const thinkingSeen = ref(false);
+  // 曾经有个 `thinkingSeen`（"本轮收过思考帧"）当状态行的闩锁用，已删除：它一旦
+  // 置真就再也回不来，而模型选择工具的那一轮（`provider.complete_tools`）根本不
+  // 走流式、没有思考帧——那一段最长的静默反而永远失去"已等 N 秒"这句兜底。
+  // "模型在吐字"这件事由 `waitedMs`（思考帧到达即归零）自己表达，不需要第二个开关。
   const busy = ref(false);
   const selectedId = ref<string | null>(null);
   /**
@@ -3395,7 +3397,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 思考尾巴同理：它描述的是上一个运行正在想的东西，留着就是挂一句已经
     // 与屏幕上这棵树无关的话。
     thinkingTail.value = '';
-    thinkingSeen.value = false;
     // 上一轮的模型名与思考过程在**这一次开始的那一刻**就作废：它们描述的是另一个
     // 运行。留到这一次的 done 帧才清，中间那段时间面板会挂着一个已经不对的模型名。
     runModel.value = null;
@@ -3468,7 +3469,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 思考帧同样不进 `agentEvents`：它是活证据，不是事件。进列表会让右侧
         // 面板被几百条碎片刷满，而每条都不值得单独看一眼。
         if (event.type === 'thinking') {
-          thinkingSeen.value = true;
           thinkingTail.value = (thinkingTail.value + event.text).slice(-THINKING_KEEP);
           // 它与真进度帧一样算"有新内容"，所以 `waitedMs` 也归零——下面那行统一
           // 做了，这里提前 return 会让"已等 N 秒"在模型边想边写的几分钟里一直涨。
@@ -3628,7 +3628,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 断流/异常退出时同理：这一轮已经结束，别再留着"模型正在思考"。
         waitedMs.value = 0;
         thinkingTail.value = '';
-        thinkingSeen.value = false;
       }
     }
   }
@@ -4099,7 +4098,6 @@ export const useMindMapStore = defineStore('mindmap', () => {
     lastReasoning,
     // 模型正在思考的滚动尾巴：界面上固定只显示一行，让用户看见"它在动"
     thinkingTail,
-    thinkingSeen,
     expanding,
     generating,
     runGeneration,
