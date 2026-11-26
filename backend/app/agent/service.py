@@ -873,7 +873,9 @@ async def _await_quietly(
     awaitable: "asyncio.Future[Any] | Any",
     seq: "itertools.count[int]",
     out: _Waited,
-) -> AsyncIterator[HeartbeatEvent]:
+    *,
+    with_thinking: bool = False,
+) -> AsyncIterator[AgentEvent]:
     """等一件事完成，期间按 `HEARTBEAT_INTERVAL_SECONDS` 补心跳帧。
 
     只该包在**会产生长静默**的等待上（模型调用、工具内部执行）。心跳不带业务
@@ -881,12 +883,53 @@ async def _await_quietly(
 
     被等的 awaitable 自己负责超时（调用方传的是 `asyncio.wait_for(...)`），这里不
     另设时限：两处都判超时的话，哪个先到就成了第二份真相。
+
+    `with_thinking=True` 时顺手把被等者的思考增量也转出来（`thinking` 帧）。现在
+    只有工具选择轮用它：那一段最长能到几十秒且一帧不发。**被等者必须有这个
+    能力才开**——挂上通道会让 `chat_async` 和 provider 都改走流式请求，对不支持
+    流式的端点会多一个往返（provider 那条有兜底，见 `_read_stream`）。
     """
+    updates: "asyncio.Queue[str]" = asyncio.Queue()
+    token: Any = None
+    getter: "asyncio.Future[str] | None" = None
+
+    async def thinking(text: str) -> None:
+        update = text.strip()
+        if update:
+            updates.put_nowait(update)
+
+    if with_thinking:
+        # 必须先挂通道再 `ensure_future`：Task 在创建那一刻就复制了当前的
+        # ContextVar，反过来做的顺序会让被等者永远看不到这个通道——
+        # 第一次端到端测试就是这么红的（`_run_tool` 的顺序一直是先挂再建任务）。
+        token = set_thinking_sink(thinking)
+        getter = asyncio.ensure_future(updates.get())
     task = asyncio.ensure_future(awaitable)
     silence_started = time.monotonic()
     try:
         while True:
-            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SECONDS)
+            waiting: set[Any] = {task}
+            if getter is not None:
+                waiting.add(getter)
+            # `FIRST_COMPLETED`：等两件事里的任意一件（任务完成 / 来了一帧思考），
+            # 只在都还没动时才等到心跳间隔。用默认的 `ALL_COMPLETED` 会让每帧思考
+            # 都压到下一个心跳才发出去——那就等于没有思考帧。
+            done, _ = await asyncio.wait(
+                waiting, timeout=HEARTBEAT_INTERVAL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # 先收思考、再看任务：mock 里一帧思考与任务完成经常落进**同一次**
+            # `asyncio.wait` 的 done 集，先看任务就会带着没发出去的思考直接
+            # return——第一次端到端测试就是这么把帧丢光的。先收思考再回来看
+            # 任务，队列总有排空的一轮。
+            if getter is not None and getter in done:
+                text = getter.result()
+                getter = asyncio.ensure_future(updates.get())
+                # 与 `_run_tool` 同一条纪律：思考在流就说明"它在动"，静默计时归零。
+                silence_started = time.monotonic()
+                yield ThinkingEvent(
+                    seq=next(seq), text=text[-THINKING_TAIL_CHARS:])
+                continue
             if task in done:
                 # 在这一句里抛出被等者的异常（超时、上游失败），与直接 await 一致
                 out.value = task.result()
@@ -896,6 +939,13 @@ async def _await_quietly(
                 waited_ms=int((time.monotonic() - silence_started) * 1000),
             )
     finally:
+        # 先摘掉通道再取消任务：否则收尾期间代理还会往一个没人读的队列里写。
+        if token is not None:
+            reset_thinking_sink(token)
+        if getter is not None and not getter.done():
+            getter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await getter
         # 客户端中途断开时调用方会被关掉：不取消这个任务，模型请求还在跑、还在计费。
         if not task.done():
             task.cancel()
@@ -1319,6 +1369,10 @@ async def _loop(
                     timeout=max(0.1, _remaining_seconds(budget, started)),
                 ),
                 seq, waited,
+                # 工具选择轮是整条链里除工具执行之外唯一的长静默：免费档实测
+                # 单次能到几十秒，而这一段以前只有心跳。挂上思考通道之后
+                # provider 会改走流式，把 `delta.reasoning` 转出来。
+                with_thinking=True,
             )) as waiting:
                 async for beat in waiting:
                     yield beat

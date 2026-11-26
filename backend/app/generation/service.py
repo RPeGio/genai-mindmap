@@ -959,12 +959,13 @@ def _model_for(base: str, model: str, deep_thinking: bool) -> str:
     return model
 
 
-def _stream_frame(data: str) -> tuple[str, str, str | None] | None:
-    """一帧 `data:` 里的 `(delta.content, delta.reasoning, finish_reason)`。
+def _stream_chunk(data: str) -> dict[str, Any] | None:
+    """一帧 `data:` 的全部可用字段，形状不对返回 None。
 
-    形状不对返回 None。三个字段都可能只出现在一部分帧里（首帧常见 `role`、
-    末帧才带 `finish_reason`），所以各自缺省，调用方不该指望"一帧里同时拿到
-    正文、思考与结束原因"。
+    键始终齐全（缺的就是空值）：`text` / `thought` / `reason` / `tool_calls` /
+    `model` / `usage`。几路字段都可能只出现在一部分帧里（首帧常见 `role`、
+    末帧才带 `finish_reason`、`usage` 只会出现在带 `stream_options` 的末帧），
+    所以各自缺省，调用方不该指望"一帧里同时拿到正文、思考与结束原因"。
 
     `reasoning` 是模型的思考增量。**字段名是 `reasoning` 而不是
     `reasoning_content`**：Command Code 的免费模型（`recursive/flint-v1.0:free`
@@ -973,22 +974,46 @@ def _stream_frame(data: str) -> tuple[str, str, str | None] | None:
     `reasoning_content`，所以两个都认、先认 `reasoning`——多认一个名字的成本是
     一行，认错的成本是"推理模型的思考过程永远显示不出来"。
 
-    思考与正文分开返回、不拼在一起：正文要拼进 `content` 去解析 JSON，思考只
-    用来告诉页面"它在动"，拼进去会把 JSON 解析搞坏。
+    **两个出口共用这一份解析**：`chat_async` 那条只取正文与思考，工具选择轮
+    （`agent.provider._attempt`）还要拼 `delta.tool_calls` 分片。字段名与"两个
+    都认"的规则只该有一份实现——两份实现漂移之后，一个出口能显示思考、另一个
+    不能，而这种差别在代码里看不出来。
     """
     try:
-        choice = json.loads(data)["choices"][0] or {}
+        payload = json.loads(data)
+        choice = payload["choices"][0] or {}
         delta = choice.get("delta") or {}
         text = delta.get("content")
         thought = delta.get("reasoning")
         if not isinstance(thought, str) or not thought:
             thought = delta.get("reasoning_content")
         reason = choice.get("finish_reason")
+        pieces = delta.get("tool_calls")
+        model = payload.get("model")
+        usage = payload.get("usage")
     except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
         return None
-    return (text if isinstance(text, str) else "",
-            thought if isinstance(thought, str) else "",
-            reason if isinstance(reason, str) else None)
+    return {
+        "text": text if isinstance(text, str) else "",
+        "thought": thought if isinstance(thought, str) else "",
+        "reason": reason if isinstance(reason, str) else None,
+        "tool_calls": [piece for piece in pieces if isinstance(piece, dict)] if isinstance(pieces, list) else [],
+        "model": model if isinstance(model, str) else None,
+        "usage": usage if isinstance(usage, dict) else {},
+    }
+
+
+def _stream_frame(data: str) -> tuple[str, str, str | None] | None:
+    """一帧 `data:` 里的 `(delta.content, delta.reasoning, finish_reason)`。
+
+    与 `_stream_chunk` 同一份解析，只是给"只要正文与思考"的调用方一个三元组。
+    思考与正文分开返回、不拼在一起：正文要拼进 `content` 去解析 JSON，思考只
+    用来告诉页面"它在动"，拼进去会把 JSON 解析搞坏。
+    """
+    chunk = _stream_chunk(data)
+    if chunk is None:
+        return None
+    return (chunk["text"], chunk["thought"], chunk["reason"])
 
 
 # 思考增量的去处。**用 ContextVar 而不是给 `chat_async` 加参数**，两个理由：
@@ -1010,6 +1035,16 @@ _thinking_sink: ContextVar[Callable[[str], Awaitable[None]] | None] = ContextVar
 def set_thinking_sink(sink: Callable[[str], Awaitable[None]] | None) -> Any:
     """挂上"思考增量往哪送"。返回的 token 交给 `reset_thinking_sink` 复位。"""
     return _thinking_sink.set(sink)
+
+
+def current_thinking_sink() -> Callable[[str], Awaitable[None]] | None:
+    """现在有没有人在看思考增量。
+
+    `agent.provider` 用它决定**要不要为了思考走流式**：那条出口默认收整包，
+    只有在有人看的时候才切成 SSE。直接读 `_thinking_sink` 也行，但那样
+    provider 就依赖了一个下划线名字，后续想换通道（比如改成队列）时改不动。
+    """
+    return _thinking_sink.get()
 
 
 def reset_thinking_sink(token: Any) -> None:
