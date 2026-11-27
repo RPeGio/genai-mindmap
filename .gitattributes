@@ -1,4 +1,9 @@
 * text=auto eol=lf
+# Windows 批处理必须保持 CRLF。cmd.exe 读 LF-only 的 .bat 时，`goto :label` 与
+# 跨行 `for` / `if` 块会定位错（症状是跳到错误的分支或直接"命令语法不正确"）。
+# 这一条要压在 `eol=lf` 之后：gitattributes 后匹配的规则优先。
+*.bat text eol=crlf
+*.cmd text eol=crlf
 *.png binary
 *.jpg binary
 *.jpeg binary

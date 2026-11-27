@@ -35,8 +35,13 @@ ExecStart=/opt/genai-mindmap/.venv/bin/uvicorn app.main:app \
     --timeout-graceful-shutdown 15
 Restart=always
 RestartSec=3
-# 生成预算 600 秒（RunBudget.max_seconds）。20 秒会让任何一次 systemctl restart
-# 把正在跑的生成硬断掉，用户看到的是流突然结束、候选丢失。90 秒留给它收尾，
+# 生成预算 1800 秒（RunBudget.max_seconds，照免费档实测 567.6 秒取三倍余量）。
+# 但这里**故意不跟着调大**：TimeoutStopSec 调到 30 分钟意味着每次发版都要等在跑的
+# 生成跑完，而发版是需要立刻生效的运维动作。90 秒够它收尾；没跑完的那些不会白丢
+# ——生成会在结构那一段写完时落一个检查点（`runs.checkpoint`），被硬断之后那一行
+# 留成 `running`，等到它的 `updated_at` 老过 `RUN_ABANDONED_SECONDS`（1800 秒）后，
+# 下一次有生成开始时被扫成 `failed` / `run_abandoned`，出现在"上次的结果"里，用户
+# 可以点「补齐说明」接着做完，不必重跑骨架与结构。
 # 真正的优雅关闭窗口由 uvicorn 的 --timeout-graceful-shutdown 15 控制。
 TimeoutStopSec=90
 KillSignal=SIGINT

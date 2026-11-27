@@ -118,6 +118,12 @@ _INITIAL_CALL_PLANS_PER_RUN = 3
 MAX_TOOL_CALLS_LIMIT = 120
 
 
+# 一条思考帧最多带多少字符。它不是一个"截断阈值"而是一行的容量：页面上那行
+# 只显示尾部（`text-overflow` 之外再由前端截到固定宽度），带更多字符既看不见，
+# 也让每一帧的 JSON 变大。200 足够让"正在写第几个节点"这类信息滚出来。
+THINKING_TAIL_CHARS = 200
+
+
 def _default_max_model_calls() -> int:
     """默认额度 = 初次生成需要量 × 3，向上取整到 100。
 
@@ -199,11 +205,24 @@ class RunBudget(BaseModel):
     # 反过来说：把 `max_tool_calls` 调到 100 以上而不动 `max_model_calls`，
     # 就不再是工具额度先停，而是模型额度先停——两个上限必须一起看。
     max_tool_calls: int = Field(default=50, ge=1, le=MAX_TOOL_CALLS_LIMIT)
-    # 时间上限从 120 提到 600：120 秒是照「一句话主题」的短路径拍的，实测
-    # 12106 字材料出 526 个节点要 48.6 秒，慢速档 97 tok/s 时同样的材料光是
-    # 输出就要 136 秒，多轮工具循环必然超时。上限放到一小时：这是"卡住不动"
-    # 的物理边界，不是给正常路径设的目标值。
-    max_seconds: float = Field(default=600.0, gt=0, le=3600)
+    # 时间上限 120 → 600 → 1800，三次都是被实测推着改的：
+    #
+    #   - 120 秒照「一句话主题」的短路径拍的；实测 12106 字材料出 526 个节点要
+    #     48.6 秒，慢速档 97 tok/s 时同样的材料光是输出就要 136 秒。
+    #   - 600 秒是照付费档（`z-ai/glm-5.3-flash`，同一张图约 103 秒）拍的。
+    #   - 免费档（Command Code 的 `:free` 模型）实测整条链 **567.6 秒**：结构段
+    #     311.7s + 写说明段 232.8s + 收尾 12.7s，出 33 个节点。而且这还只是
+    #     "跑完的一次"——同一天另有 600.1 秒被掐断的样本，`free_quota` 里那次
+    #     额度也照规矩退回了。600 秒对免费档不是余量偏薄，是**刚好卡在正常
+    #     生成的耗时上**：一半的请求会以 `budget_exhausted` 收场。
+    #
+    # 1800 秒 = 实测 567.6 秒的三倍余量，仍在上限 3600 之内（那是"卡住不动"的
+    # 物理边界，不是给正常路径设的目标值）。免费档慢有结构性原因：它要
+    # `reasoning_effort=low`、单次响应能跑到 180 秒以上，而付费档对
+    # `max_tokens` 不敏感、思考只有 30 token。
+    #
+    # 前端根本不发 `budget`，所以这个默认值就是实际生效值。
+    max_seconds: float = Field(default=1800.0, gt=0, le=3600)
     # 这是**单次**模型调用的输出上限，不是整轮累计——它直接作为 provider 请求里
     # 的 `max_tokens` 发出去，每次调用都按这个值重新计。整轮累计的上界是
     # 「这个值 × 实际调用次数」，而调用次数由 `max_model_calls` 约束，因此
@@ -922,6 +941,31 @@ class HeartbeatEvent(_EventBase):
     waited_ms: int = Field(ge=0)
 
 
+class ThinkingEvent(_EventBase):
+    """模型正在思考的滚动片段。
+
+    用户要求的原话："让用户知道模型在跑就行，不关注思考内容"。所以这一帧的
+    用途**只有一个**：证明模型还在动。界面上固定只显示一行、滚动更新，用户读
+    不到完整思考过程——真读得到也没用，那些内容既不是结论也不是证据。
+
+    为什么需要它：实测免费档一次生成 567.6 秒，其中结构段 311.7 秒、写说明段
+    232.8 秒。这五分钟里事件流上只有每 10 秒一次的 `heartbeat`（"已等 N 秒"
+    一直涨），从页面看就是**彻底静默**——用户在等的过程中无法区分"在跑"与
+    "卡死了"，而那两件事该做的操作完全不同（等 vs 刷新重来）。
+
+    与 `heartbeat` 的分工：心跳是"整条链路还活着"，本帧是"模型正在产出字节"。
+    两者都**不是**业务进度——树长了多少仍看 `stage` / `node_grow`。
+
+    `text` 是**增量片段**，不是完整思考过程：服务端按片转发、每片只保留尾部
+    `THINKING_TAIL_CHARS` 个字符（前端滚动拼接与显示都只取尾部一行）。刻意
+    不发全文——几万字思考过程推到浏览器既占带宽，也会诱使人去读它，而读它
+    不会让用户更快拿到图。
+    """
+
+    type: Literal["thinking"] = "thinking"
+    text: str = Field(max_length=THINKING_TAIL_CHARS)
+
+
 class DoneEvent(_EventBase):
     type: Literal["done"] = "done"
     content: DiagramContent | None = None
@@ -987,7 +1031,8 @@ class ErrorEvent(_EventBase):
 AgentEvent = Annotated[
     Union[
         StageEvent, ToolStartEvent, ToolEndEvent, OpsEvent, SnapshotEvent,
-        NodeGrowEvent, SourcesEvent, HeartbeatEvent, DoneEvent, ErrorEvent,
+        NodeGrowEvent, SourcesEvent, HeartbeatEvent, ThinkingEvent, DoneEvent,
+        ErrorEvent,
     ],
     Field(discriminator="type"),
 ]

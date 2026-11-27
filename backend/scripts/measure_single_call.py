@@ -300,7 +300,9 @@ async def _main(argv: list[str]) -> int:
 
     _fill_credentials()
     os.environ["MINDMAP_EXTERNAL_KNOWLEDGE"] = "1" if args.external else "0"
-    os.environ.setdefault("MINDMAP_EXTERNAL_PROXY", "http://127.0.0.1:7890")
+    # 不在这里写死端口：代理的唯一出处是 `MINDMAP_EXTERNAL_PROXY`（读完落到
+    # `external.DEFAULT_PROXY`）。这里曾经 setdefault 一个 7890，和兜底值 7897
+    # 不是同一个数——两处各写一个，改了一处就变成"脚本能通、应用不通"。
 
     from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
     from app.agent.tools import build_registry

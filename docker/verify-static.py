@@ -161,7 +161,28 @@ for label, pat in sse_required:
 
 m = re.search(r"proxy_read_timeout\s+(\d+)s", nginx_code)
 read_t = int(m.group(1)) if m else 0
-check("nginx: proxy_read_timeout > RunBudget.max_seconds(600)", read_t > 600, "%ss" % read_t)
+
+# 这条不变式原来写的是"proxy_read_timeout > RunBudget.max_seconds(600)"，而 600
+# 是**手抄**进来的字面量：预算调到 1800 之后，`900 > 1800` 已经不成立，这条 check
+# 却照旧 PASS（比的是 600）。废弃一个不变式比守错一个更糟，所以两边都从源码里读。
+#
+# 真实的不变式也不是"读超时 > 预算"：`proxy_read_timeout` 计的是**两次读之间**的
+# 间隔。SSE 链路上每 `HEARTBEAT_INTERVAL_SECONDS`（10 秒）必有一帧，即使是模型调用
+# 期间的长静默，`_await_quietly` 也在发心跳。所以读超时只需要大于帧间隔若干倍。
+# 预算变大并不要求读超时跟着变大——这里刻意不再拿预算做判据。
+hb = re.search(r"^HEARTBEAT_INTERVAL_SECONDS\s*=\s*([0-9.]+)", read("backend/app/agent/service.py"), re.M)
+hb_t = float(hb.group(1)) if hb else 0.0
+check("backend: 读得出 HEARTBEAT_INTERVAL_SECONDS", hb_t > 0, "%ss" % hb_t)
+check(
+    "nginx: proxy_read_timeout > 6 × 心跳间隔（按帧间隔计，不按预算计）",
+    read_t > hb_t * 6,
+    "%ss vs %ss" % (read_t, hb_t * 6),
+)
+
+# 预算本身也要读得出来：它被文档与部署单元引用（`docker-compose.yml` 的注释、
+# `deploy/genai-mindmap.service`），手抄的数字迟早与代码分家。
+budget = re.search(r"max_seconds:\s*float\s*=\s*Field\(default=([0-9.]+)", read("backend/app/agent/contracts.py"))
+check("backend: 读得出 RunBudget.max_seconds", budget is not None, budget.group(1) + "s" if budget else "未匹配")
 
 m = re.search(r"client_max_body_size\s+(\d+)m", nginx_code)
 check("nginx: client_max_body_size >= 21m（音频上限 20MB）", bool(m) and int(m.group(1)) >= 21, m.group(0) if m else "未设")
@@ -344,6 +365,17 @@ for k in ("MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY", "MI
     check(".env.example: 含 %s" % k, re.search(r"^%s=" % k, env_example, re.M) is not None, "")
 active_db = re.search(r"^MINDMAP_DB_PATH=(.+)$", env_example, re.M)
 check(".env.example: MINDMAP_DB_PATH 未硬编码（交给 compose）", active_db is None, active_db.group(0) if active_db else "")
+
+# 首装模板里的代理默认值：留空会走兜底猜本机 7897（服务器上没人监听 → 五个源全挂），
+# 所以模板必须写 none（直连只丢维基一条）。这条曾经在两处都不对：模板留空、
+# 上面的 compose 只断言"有这个键"，于是"键在、值是坏默认"能一路过掉。
+install_sh = read("deploy/install.sh")
+template = re.search(r"^MINDMAP_EXTERNAL_PROXY=(.*)$", install_sh, re.M)
+check(
+    "install.sh: 首装模板把 MINDMAP_EXTERNAL_PROXY 显式写成 none",
+    template is not None and template.group(1).strip().lower() == "none",
+    template.group(0) if template else "模板里没有这一行",
+)
 
 # dx: 每个 docker/ 下的文件都要被 Dockerfile 或 compose 引用（没有孤儿文件）
 print()

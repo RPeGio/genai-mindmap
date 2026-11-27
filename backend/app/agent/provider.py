@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -44,6 +45,14 @@ from app.generation.service import (
     # 复用，不重新定义——两处各写一份的结果已经出现过一次：勾上深度思考只换了
     # 外层工具循环的模型，骨架/结构/说明仍是普通模型。
     _model_for,
+    # SSE 帧的字段名（`reasoning` / `reasoning_content` 两个都认）与工具调用分片
+    # 的拼装规则都只有一份实现，在 generation 那边：这条出口与 `chat_async`
+    # 必须按同一套规则读同一个响应。这里只负责"要不要走流式"与结果组装。
+    _stream_chunk,
+    # 「现在有没有人在看思考增量」。有消费者才走流式：没有消费者时这条出口
+    # 必须与加流式之前**逐字节一致**（请求体相同、同样只收整包），否则一次
+    # 与预览无关的改动会顺手改掉所有直接调 provider 的行为。
+    current_thinking_sink,
     context_overflow_error,
     estimate_input_tokens,
     max_tokens_cap,
@@ -197,7 +206,18 @@ class OpenAICompatibleProvider:
         budget: RunBudget,
         reasoning_effort: str | None,
     ) -> Completion:
-        """发一次请求。只有"上游明确说这个模型此刻不可用"才抛 `_ModelUnavailable`。"""
+        """发一次请求。只有"上游明确说这个模型此刻不可用"才抛 `_ModelUnavailable`。
+
+        两种发法，**由"有没有人在看思考增量"决定**：
+
+        - 没人看（单测、直接调 provider 的脚本）：收整包，与加流式之前逐字节一致。
+        - 有人看（`_run_tool` 之外的工具选择轮）：`stream: true` 逐帧读，把
+          `delta.reasoning` 转进思考通道，同时自己拼 `delta.tool_calls` 分片。
+
+        为什么不一律走流式：这条路的消费者要的是**完整**的 `tool_calls`，流式拼装
+        多一处状态机与一处兜底（服务端不认 `stream` 会直接回整包 JSON），那些代价
+        只有在能拿到思考增量时才值得付。
+        """
         self.model_name = model
         requested = budget.max_output_tokens
         if reasoning_effort is not None:
@@ -222,28 +242,209 @@ class OpenAICompatibleProvider:
             body["tools"] = tools
 
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        sink = current_thinking_sink()
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, follow_redirects=True) as client:
-                async with client.stream(
-                    "POST", base + "/chat/completions",
-                    content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                    headers=headers,
-                ) as response:
-                    if response.status_code in _UNAVAILABLE_STATUSES:
-                        raise _ModelUnavailable(
-                            f"模型服务返回 HTTP {response.status_code}")
-                    response.raise_for_status()
-                    buffer = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        buffer.extend(chunk)
-                        if len(buffer) > _MAX_RESPONSE_BYTES:
-                            raise GenerationError("模型响应过大")
+                if sink is None:
+                    buffer = await _read_whole(client, base, body, headers)
+                    return _parse_completion(buffer)
+                streamed = await _read_stream(client, base, body, headers, sink)
         except httpx.HTTPStatusError as exc:
             raise GenerationError(f"模型服务返回 HTTP {exc.response.status_code}") from exc
         except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
             raise GenerationError("无法连接模型服务或请求超时") from exc
+        if streamed is None:
+            # 服务端不认 `stream`（直接回了整包 JSON）或流里一帧可用的都没有：
+            # 退回整包读，这一轮的结果不能因为"想显示思考"而失败。
+            async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS,
+                                         follow_redirects=True) as client:
+                buffer = await _read_whole(client, base, body, headers)
+            return _parse_completion(buffer)
+        return streamed
 
-        return _parse_completion(buffer)
+
+async def _read_whole(
+    client: Any, base: str, body: dict[str, Any], headers: dict[str, str],
+) -> bytearray:
+    """收满整个响应体。**请求体一个字都不改**——没有思考消费者时必须与旧行为一致。"""
+    async with client.stream(
+        "POST", base + "/chat/completions",
+        content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+    ) as response:
+        if response.status_code in _UNAVAILABLE_STATUSES:
+            raise _ModelUnavailable(f"模型服务返回 HTTP {response.status_code}")
+        response.raise_for_status()
+        buffer = bytearray()
+        async for chunk in response.aiter_bytes():
+            buffer.extend(chunk)
+            if len(buffer) > _MAX_RESPONSE_BYTES:
+                raise GenerationError("模型响应过大")
+    return buffer
+
+
+async def _read_stream(
+    client: Any,
+    base: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    sink: Callable[[str], Awaitable[None]],
+) -> Completion | None:
+    """`stream: true` 读一遍，边读边把思考推给 `sink`，同时拼 `delta.tool_calls`。
+
+    返回 None 表示**这次流式尝试不算数**，调用方退回整包读：服务端不认 `stream`
+    直接回了整包 JSON、流里没见到任何帧、流被切断（`[DONE]` 与 finish_reason 都
+    没见到）、拼出来的工具调用缺 id 或缺函数名。这些都是"预览机制"该
+    自己认栽的范围——工具选择轮不能因为想显示思考就失败。
+
+    **故意抛出的只有一种**：`finish_reason == "length"`。半截 `arguments` 拿去执行
+    比直接失败危险得多（见 `_parse_completion` 里那段注释），这条纪律两条读法
+    必须一致——流式路径也**不**去 salvage 半个工具调用。另外 `_ModelUnavailable`
+    与"响应过大"照旧向上抛，它们与流式无关。
+    """
+    body = dict(body, stream=True)
+    text_parts: list[str] = []
+    pending: dict[int, dict[str, Any]] = {}
+    finish_reason: str | None = None
+    served_model: str | None = None
+    usage: dict[str, Any] = {}
+    seen_any = False
+    ended = False
+    async with client.stream(
+        "POST", base + "/chat/completions",
+        content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+    ) as response:
+        if response.status_code in _UNAVAILABLE_STATUSES:
+            raise _ModelUnavailable(f"模型服务返回 HTTP {response.status_code}")
+        response.raise_for_status()
+        size = 0
+        async for line in response.aiter_lines():
+            # 有的兼容端点写 `data:{...}` 不带空格，两种都要认。
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                ended = True
+                break
+            chunk = _stream_chunk(data)
+            if chunk is None:
+                continue
+            seen_any = True
+            size += len(data)
+            if size > _MAX_RESPONSE_BYTES:
+                raise GenerationError("模型响应过大")
+            if chunk["model"]:
+                served_model = chunk["model"]
+            if chunk["usage"]:
+                usage = dict(chunk["usage"])
+            if chunk["thought"]:
+                # 与 `chat_async` 同一条纪律：回调自己坏了就关掉它，
+                # 不能让"显示思考"连累这次生成。
+                try:
+                    await sink(chunk["thought"])
+                except Exception:  # noqa: BLE001 — 纯展示，出错就不显示
+                    sink = _no_sink
+            if chunk["text"]:
+                text_parts.append(chunk["text"])
+            for piece in chunk["tool_calls"]:
+                _absorb_tool_delta(pending, piece)
+            if chunk["reason"] is not None:
+                finish_reason = chunk["reason"]
+                ended = True
+    if not seen_any or not ended:
+        return None
+    if finish_reason == "length":
+        raise GenerationError("模型输出被长度上限截断，本轮不执行任何工具调用")
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+    calls, raw_calls = _assembled_tool_calls(pending)
+    if calls is None:
+        return None
+    if raw_calls:
+        message["tool_calls"] = raw_calls
+    return Completion(
+        message=message,
+        tool_calls=calls,
+        finish_reason=finish_reason,
+        usage=usage,
+        served_model=served_model,
+    )
+
+
+async def _no_sink(_text: str) -> None:
+    """思考通道坏掉之后的空实现：保留"每帧都在调 sink"的形状，一个字节都不发。"""
+    return None
+
+
+def _absorb_tool_delta(pending: dict[int, dict[str, Any]], piece: dict[str, Any]) -> None:
+    """把一帧 `delta.tool_calls` 分片并进 `pending[index]`。
+
+    流式下工具调用是**按片**发出来的：第一片带 `id` 与 `function.name`、后续片
+    只带 `function.arguments` 的一段字符串，`index` 是唯一稳定的键（有的端点连
+    首片的 `index` 都省，按"当前有几条"兜底）。拼装规则只有这一份实现，别在
+    调用方再写一遍——两份拼法不一致时坏的不是形状，是参数内容。
+    """
+    index = piece.get("index")
+    if not isinstance(index, int):
+        index = len(pending)
+    slot = pending.setdefault(index, {"id": "", "name": "", "arguments": ""})
+    if isinstance(piece.get("id"), str) and piece["id"]:
+        slot["id"] = piece["id"]
+    function = piece.get("function")
+    if not isinstance(function, dict):
+        return
+    if isinstance(function.get("name"), str) and function["name"]:
+        slot["name"] = function["name"]
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        slot["arguments"] += arguments
+
+
+def _assembled_tool_calls(
+    pending: dict[int, dict[str, Any]],
+) -> tuple[list[ToolCall] | None, list[dict[str, Any]]]:
+    """拼好的工具调用，以及它们要回填进 `message` 的那份原始形状。
+
+    缺 id 或名字时返回 `None`（调用方退回整包读）：一个没有名字的工具调用没法
+    执行，也没法回给模型。
+    """
+    calls: list[ToolCall] = []
+    raw_calls: list[dict[str, Any]] = []
+    for index in sorted(pending):
+        slot = pending[index]
+        if not slot["id"] or not slot["name"]:
+            return None, []
+        decoded, parse_error = _decode_arguments(slot["arguments"])
+        calls.append(ToolCall(
+            call_id=slot["id"],
+            name=slot["name"],
+            arguments=decoded,
+            raw_arguments=slot["arguments"],
+            parse_error=parse_error,
+        ))
+        raw_calls.append({
+            "id": slot["id"],
+            "type": "function",
+            "function": {"name": slot["name"], "arguments": slot["arguments"]},
+        })
+    return calls, raw_calls
+
+
+def _decode_arguments(raw_args: str) -> tuple[dict[str, Any], str | None]:
+    """`arguments` 字符串 → `(解析出来的对象, 解析错误)`。
+
+    解析错误**不抛**：让执行层把它变成一条可回给模型的具体错误，模型看到
+    "参数不是合法 JSON"通常会自己重写一次。两条读法共用这一份判定。
+    """
+    if not raw_args:
+        return {}, None
+    try:
+        decoded = json.loads(raw_args)
+    except json.JSONDecodeError as exc:
+        return {}, f"函数参数不是合法 JSON：{exc.msg}"
+    if isinstance(decoded, dict):
+        return decoded, None
+    return {}, "函数参数必须是一个 JSON 对象"
 
 
 def _parse_completion(buffer: bytearray) -> Completion:
@@ -275,19 +476,9 @@ def _parse_completion(buffer: bytearray) -> Completion:
     for raw in message.get("tool_calls") or []:
         function = raw.get("function") or {}
         raw_args = function.get("arguments") or ""
-        arguments: dict[str, Any] = {}
-        parse_error: str | None = None
-        if raw_args:
-            try:
-                decoded = json.loads(raw_args)
-                if isinstance(decoded, dict):
-                    arguments = decoded
-                else:
-                    parse_error = "函数参数必须是一个 JSON 对象"
-            except json.JSONDecodeError as exc:
-                # 不在这里抛：让执行层把它变成一条可回给模型的具体错误，
-                # 模型看到"参数不是合法 JSON"通常会自己重写一次。
-                parse_error = f"函数参数不是合法 JSON：{exc.msg}"
+        # 与流式那条读法共用同一份判定：两处各写一遍时，一处改了另一处没改，
+        # 坏的不是形状而是"同一份参数在两种读法下解析结果不同"。
+        arguments, parse_error = _decode_arguments(raw_args)
         calls.append(ToolCall(
             call_id=str(raw.get("id") or ""),
             name=str(function.get("name") or ""),
