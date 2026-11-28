@@ -988,6 +988,20 @@ export interface ModelSettings {
   deep_model_effective: string;
   /** `MINDMAP_LLM_MODE` 的原值。`demo` 表示"配好了也不会调模型"，**只读**。 */
   llm_mode: string;
+  /**
+   * 这次生成会发出去的思考档位；`null` = 不发这个键（走服务商默认）。
+   *
+   * 免费档时它来自模型目录（每模型各自），用户自己挑的走自己那行——两个来源
+   * 面板都只是**显示**，改它要走保存请求。
+   */
+  reasoning_effort?: string | null;
+  /**
+   * 这一个模型在目录里声明的全部档位（目录顺序）。
+   *
+   * 空数组 = 目录没给档位信息：面板据此**不显示**"思考强度"下拉，而不是自己
+   * 编一排档位——发一个目录没声明的档位是实测会 400 的形状。
+   */
+  reasoning_effort_options: string[];
   /** 地址 / 密钥 / 模型名三项齐了没有。判据与后端 `_config()` 一致。 */
   configured: boolean;
   /**
@@ -1040,6 +1054,11 @@ export interface SaveModelSettingsRequest {
   /** 省略 = 不改；空串 = 清掉覆盖、回落环境变量。 */
   model?: string | null;
   deep_model?: string | null;
+  /**
+   * 思考档位。`null` = 不改；`""` = 清掉（请求里不发这个键，走服务商默认）；
+   * 其余值必须是下拉选项之一——目录没声明的档位后端会 400 `settings_effort_invalid`。
+   */
+  reasoning_effort?: string | null;
   /** 显式清除已保存的密钥。与同时提交 `api_key` 冲突（400 `settings_clear_conflict`）。 */
   clear_api_key: boolean;
   /**

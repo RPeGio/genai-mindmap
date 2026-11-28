@@ -2,7 +2,9 @@
 import { computed, nextTick, onMounted, ref } from 'vue';
 
 import type { SaveModelSettingsRequest, TestModelSettingsRequest } from '../api/types';
+import { useAuthStore } from '../stores/auth';
 import {
+  SETTING_SOURCE_FREE,
   SETTING_SOURCE_UNBOUND,
   apiKeyPlaceholder,
   settingSourceLabel,
@@ -34,6 +36,7 @@ import {
  */
 
 const settingsStore = useSettingsStore();
+const authStore = useAuthStore();
 
 /** 面板是覆盖式浮层：`fixed` 挂在最上面，不参与主区 flex，开合不改变画布宽度。 */
 const emit = defineEmits<{ close: [] }>();
@@ -43,12 +46,44 @@ const baseUrl = ref('');
 const apiKey = ref('');
 const model = ref('');
 const deepModel = ref('');
+/** 登录用户挑的思考档位；空串 = 沿用服务商默认（不发键）。 */
+const reasoningEffort = ref('');
 /** 打开面板时的快照，用来算"改了哪几个字段"。 */
-const initial = ref({ base_url: '', model: '', deep_model: '' });
+const initial = ref({ base_url: '', model: '', deep_model: '', reasoning_effort: '' });
 
 const baseUrlInput = ref<HTMLInputElement | null>(null);
 
 const view = computed(() => settingsStore.settings);
+
+/**
+ * 游客的只读视图。
+ *
+ * 游客额度（每人每天 3 次）走的是**部署方**的密钥与免费模型，面板里那四个输入框
+ * 对他全是"填了也用不上"的假入口：改地址改不动免费档的选取，填密钥没有意义还
+ * 可能把自己的值存进库里顶掉兜底。与其给一片会误导的表单，不如只读模型名加一句
+ * 说明——需要配置能力的出口是注册，不是乱填。
+ */
+const guestOnly = computed(() => authStore.kind === 'guest');
+
+/** 免费档：档位是目录替这个模型选好的，界面只显示，不提供编辑。 */
+const isFreeTier = computed(() => view.value?.model_source === SETTING_SOURCE_FREE);
+
+/** 目录给这个模型声明的档位。空数组 = 目录没说，界面不显示下拉（别自己编）。 */
+const effortOptions = computed(() => view.value?.reasoning_effort_options ?? []);
+
+/** 下拉里每个档位的人话。`none` 排在最前（目录声明了它就能关思考）。 */
+function effortLabel(word: string): string {
+  const labels: Record<string, string> = {
+    none: '关闭思考（最省）',
+    minimal: '极简',
+    low: '较低',
+    medium: '中等',
+    high: '较高',
+    xhigh: '很高',
+    max: '最大（最费）',
+  };
+  return labels[word] ?? word;
+}
 
 const canClearKey = computed(() => view.value?.api_key_set === true);
 
@@ -74,16 +109,21 @@ const instanceConfigured = computed(() => view.value?.instance?.configured === t
 const dirty = computed(() => {
   const body: SaveModelSettingsRequest = { clear_api_key: false };
   const start = initial.value;
+  if (guestOnly.value) return body;
   if (baseUrl.value.trim() !== start.base_url) body.base_url = baseUrl.value.trim();
   if (model.value.trim() !== start.model) body.model = model.value.trim();
   if (deepModel.value.trim() !== start.deep_model) body.deep_model = deepModel.value.trim();
+  if (reasoningEffort.value !== start.reasoning_effort) {
+    body.reasoning_effort = reasoningEffort.value;
+  }
   if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
   return body;
 });
 
 /** 有没有实质改动。判据不含 `clear_api_key` 这个恒定键。 */
 const changeCount = computed(
-  () => ['base_url', 'api_key', 'model', 'deep_model'].filter((key) => key in dirty.value).length,
+  () => ['base_url', 'api_key', 'model', 'deep_model', 'reasoning_effort']
+    .filter((key) => key in dirty.value).length,
 );
 
 const nothingToSave = computed(() => changeCount.value === 0);
@@ -95,11 +135,14 @@ function fillFrom(next: typeof view.value): void {
   baseUrl.value = next?.base_url ?? '';
   model.value = next?.model ?? '';
   deepModel.value = next?.deep_model ?? '';
+  // 档位：`null` = 后端这次本来就不发键，界面上按"沿用默认"（空串）显示。
+  reasoningEffort.value = next?.reasoning_effort ?? '';
   apiKey.value = '';
   initial.value = {
     base_url: baseUrl.value.trim(),
     model: model.value.trim(),
     deep_model: deepModel.value.trim(),
+    reasoning_effort: reasoningEffort.value,
   };
 }
 
@@ -155,6 +198,9 @@ async function saveAsInstance(): Promise<void> {
     model: model.value.trim(),
     deep_model: deepModel.value.trim(),
   };
+  // 部署方在共享行上挑的档位也一起存（空串 = 不发键）。目录没给档位时下拉不显示、
+  // `reasoningEffort` 保持快照值，存什么都不会变。
+  body.reasoning_effort = reasoningEffort.value;
   if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
   const saved = await settingsStore.save(body);
   if (saved) fillFrom(saved);
@@ -266,6 +312,31 @@ function trapFocus(event: KeyboardEvent): void {
 
       <p v-if="settingsStore.loading" class="mb-3 text-xs text-slate-400">正在读取当前配置…</p>
 
+      <!--
+        游客是只读的：免费额度走部署方的密钥与免费模型，下面四个输入框对他全是
+        "填了也用不上"的假入口。只读模型名加一句说明，出口是注册而不是乱填。
+      -->
+      <section
+        v-if="guestOnly"
+        data-test="settings-guest"
+        class="flex flex-col gap-2"
+      >
+        <div class="flex flex-col gap-1">
+          <span class="flex items-baseline justify-between gap-2">
+            <span class="text-xs font-medium text-slate-600">当前使用的模型</span>
+            <span class="text-[11px] text-slate-400">{{ settingSourceLabel(view?.model_source ?? 'unset') }}</span>
+          </span>
+          <span
+            data-test="settings-guest-model"
+            class="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs text-slate-700"
+          >{{ view?.model || '（还没配好，请联系部署方）' }}</span>
+        </div>
+        <p class="text-[11px] leading-relaxed text-slate-500" data-test="settings-guest-hint">
+          当前正在使用免费体验额度，无法配置模型。注册账号后即可配置自己的模型与密钥。
+        </p>
+      </section>
+
+      <template v-else>
       <div class="flex flex-col gap-3">
         <label class="flex flex-col gap-1">
           <span class="flex items-baseline justify-between gap-2">
@@ -376,7 +447,45 @@ function trapFocus(event: KeyboardEvent): void {
             实际会发：<code data-test="settings-deep-effective">{{ view.deep_model_effective }}</code>
           </span>
         </label>
+
+        <!--
+          思考强度。选项来自**这个模型在目录里的声明**，不是我们自己编的一排——
+          发一个供应商没声明的档位是实测会 400 的形状。
+        -->
+        <label v-if="isFreeTier" class="flex flex-col gap-1">
+          <span class="text-xs font-medium text-slate-600">思考强度</span>
+          <span
+            data-test="settings-effort-free"
+            class="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs text-slate-700"
+          >免费模型自动{{ view?.reasoning_effort ? `：${view.reasoning_effort}` : '（沿用服务商默认）' }}</span>
+        </label>
+        <label v-else-if="effortOptions.length > 0" class="flex flex-col gap-1">
+          <span class="text-xs font-medium text-slate-600">思考强度（可选）</span>
+          <select
+            v-model="reasoningEffort"
+            data-test="settings-effort"
+            class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
+          >
+            <option value="" data-test="settings-effort-default">沿用服务商默认</option>
+            <option
+              v-for="word in effortOptions"
+              :key="word"
+              :value="word"
+            >{{ effortLabel(word) }}</option>
+          </select>
+          <span class="text-[11px] text-slate-400">
+            思考越多越慢也越费。生成时实际用的是「当前使用的模型」那一个档位。
+          </span>
+        </label>
+        <p
+          v-else
+          data-test="settings-effort-unknown"
+          class="text-[11px] text-slate-400"
+        >
+          该模型没有公开档位信息，沿用服务商默认。
+        </p>
       </div>
+      </template>
 
       <!--
         全站共享配置：只有部署方看得到。

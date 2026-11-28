@@ -1882,6 +1882,13 @@ export interface components {
             deep_model_effective: string;
             /** Llm Mode */
             llm_mode: string;
+            /** Reasoning Effort */
+            reasoning_effort?: string | null;
+            /**
+             * Reasoning Effort Options
+             * @default []
+             */
+            reasoning_effort_options: string[];
             /** Configured */
             configured: boolean;
             /** Updated At */
@@ -2263,6 +2270,8 @@ export interface components {
             model?: string | null;
             /** Deep Model */
             deep_model?: string | null;
+            /** Reasoning Effort */
+            reasoning_effort?: string | null;
             /**
              * Clear Api Key
              * @default false
@@ -2309,6 +2318,13 @@ export interface components {
             deep_model_effective: string;
             /** Llm Mode */
             llm_mode: string;
+            /** Reasoning Effort */
+            reasoning_effort?: string | null;
+            /**
+             * Reasoning Effort Options
+             * @default []
+             */
+            reasoning_effort_options: string[];
             /** Configured */
             configured: boolean;
             /** Updated At */

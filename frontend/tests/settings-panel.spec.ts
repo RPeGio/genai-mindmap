@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { InstanceSettings, ModelSettings, TestModelSettingsResponse } from '../src/api/types';
 import { apiKeyPlaceholder, settingSourceLabel, useSettingsStore } from '../src/stores/settings';
+import { useAuthStore } from '../src/stores/auth';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 /**
@@ -55,6 +56,8 @@ function settingsPayload(overrides: Partial<ModelSettings> = {}): ModelSettings 
     deep_model_source: 'unset',
     deep_model_effective: 'deepseek-reasoner',
     llm_mode: 'model',
+    reasoning_effort: null,
+    reasoning_effort_options: [],
     configured: true,
     can_edit_instance: false,
     instance: null,
@@ -74,6 +77,8 @@ interface StubOptions {
   probe?: Partial<TestModelSettingsResponse>;
   /** 让某一个动词返回业务错误（`{status, code, message}`）。 */
   fail?: 'get' | 'put' | 'test';
+  /** `/api/auth/me` 的回答（缺省 `anonymous`：老用例不关心身份，看见的是完整表单）。 */
+  auth?: { user?: string | null; guest_id?: string | null };
 }
 
 /**
@@ -104,6 +109,19 @@ function stubBackend(options: StubOptions = {}) {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
 
     if (isPrefsRequest(url)) return prefsReply(url);
+    if (url.endsWith('/auth/me')) {
+      const user = options.auth?.user ? { id: 'u1', username: options.auth.user, created_at: '2026-11-01T00:00:00Z' } : null;
+      const guestId = options.auth?.guest_id ?? null;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          user,
+          guest_id: guestId,
+          kind: user ? 'user' : guestId ? 'guest' : 'anonymous',
+        }),
+      } as unknown as Response;
+    }
     if (url.endsWith('/health')) {
       return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'test' }) } as unknown as Response;
     }
@@ -536,6 +554,7 @@ describe('本站共享配置：只有部署方看得到', () => {
     expect(backend.puts[0].body).toEqual({
       clear_api_key: false,
       scope: 'instance',
+      reasoning_effort: '',
       base_url: 'https://api.deepseek.com/v1',
       model: 'deepseek-chat',
       deep_model: '',
@@ -771,5 +790,75 @@ describe('store 与纯函数', () => {
     expect(store.isDemoMode).toBe(false);
     expect(store.configured).toBe(true);
     expect(has(wrapper, '[data-test="settings-base-url"]')).toBe(true);
+  });
+});
+
+describe('思考强度：档位是模型目录给的，不是我们自己编的', () => {
+  it('目录给了档位就有下拉，选项原样来自目录；挑一档会进保存请求', async () => {
+    const backend = stubBackend({ current: { reasoning_effort_options: ['none', 'low', 'high'] } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    const select = wrapper.get('[data-test="settings-effort"]');
+    const words = select.findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'none', 'low', 'high']);
+    expect(text(wrapper, '[data-test="settings-effort-default"]')).toContain('沿用服务商默认');
+
+    await select.setValue('low');
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts[0].body).toMatchObject({ reasoning_effort: 'low' });
+  });
+
+  it('目录没给档位就不显示下拉，说"沿用服务商默认"', async () => {
+    stubBackend({ current: { reasoning_effort_options: [] } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
+    expect(text(wrapper, '[data-test="settings-effort-unknown"]')).toContain('没有公开档位信息');
+  });
+
+  it('免费档：档位是只读的，不提供编辑', async () => {
+    stubBackend({ current: { model_source: 'free', model: 'nemotron-3.5-super-vl-free', reasoning_effort: 'none' } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
+    expect(text(wrapper, '[data-test="settings-effort-free"]')).toContain('none');
+  });
+
+  it('游客是只读视图：看得见在用哪个模型，看不见四个输入框', async () => {
+    stubBackend({
+      auth: { guest_id: 'g-123' },
+      current: { model: 'nemotron-3.5-super-vl-free', model_source: 'free' },
+    });
+    const wrapper = mountApp();
+    // 测试不走 `main.ts` 的启动序，身份要自己问一次——与真实浏览器里"进页面先
+    // probe 再挂载"是同一个动作，只是时序放到了面板打开之后。
+    await useAuthStore().probe();
+    await openPanel(wrapper);
+
+    expect(text(wrapper, '[data-test="settings-guest-model"]')).toBe('nemotron-3.5-super-vl-free');
+    expect(text(wrapper, '[data-test="settings-guest-hint"]')).toContain('免费体验额度');
+    expect(has(wrapper, '[data-test="settings-base-url"]')).toBe(false);
+    expect(has(wrapper, '[data-test="settings-api-key"]')).toBe(false);
+    expect(has(wrapper, '[data-test="settings-model"]')).toBe(false);
+    expect(has(wrapper, '[data-test="settings-deep-model"]')).toBe(false);
+  });
+
+  it('游客在只读视图里点保存不发请求（也没东西可改）', async () => {
+    const backend = stubBackend({
+      auth: { guest_id: 'g-123' },
+      current: { model: 'nemotron-3.5-super-vl-free', model_source: 'free' },
+    });
+    const wrapper = mountApp();
+    await useAuthStore().probe();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
+    await flushPromises();
+    expect(backend.puts).toHaveLength(0);
   });
 });
