@@ -54,10 +54,23 @@ CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 say "1/6 系统依赖"
-# nginx：静态文件 + 反代；sqlite 用于在线备份；
-# git/tar 用于拉代码；policycoreutils-python-utils 提供 semanage（SELinux 上下文）。
-dnf install -y nginx git tar sqlite policycoreutils-python-utils \
+# nginx：静态文件 + 反代；git/tar 用于拉代码；policycoreutils-python-utils 提供
+# semanage（SELinux 上下文）。
+dnf install -y nginx git tar policycoreutils-python-utils \
   gcc gcc-c++ make openssl-devel libffi-devel
+
+# PostgreSQL **客户端**（psql / pg_dump / pg_isready），备份脚本靠它。
+# 只装客户端：服务端是这台机器上另一个独立进程，由你另行安装（`dnf install
+# postgresql16-server` 或指向外部实例），本脚本不碰它的数据目录与配置——
+# 库从此不在 /var/lib/genai-mindmap 里，别按"单文件库"的旧直觉去那儿找。
+# 版本必须 **>= 服务端的 16**：pg_dump 不允许客户端比服务端旧，会直接
+# "server version: 16.x; pg_dump version: 13.x" 退出 1，而 cron 里这表现为
+# 每天静默零备份。AL3 默认源里的 `postgresql` 是 13，所以优先装 16。
+if ! dnf install -y postgresql16; then
+  echo "⚠️ 装 postgresql16 失败，回落到默认的 postgresql（AL3 是 13）。" >&2
+  echo "   服务端若是 16，pg_dump 会因版本过旧而拒绝工作——请装 PGDG 的 postgresql16 客户端。" >&2
+  dnf install -y postgresql
+fi
 
 if [[ $WITH_OFFICE -eq 1 ]]; then
   # .doc / .ppt 需要 LibreOffice，约 1.5GB；不带这个参数时不装，
@@ -128,7 +141,13 @@ MINDMAP_LLM_MODE=model
 MINDMAP_LLM_BASE_URL=
 MINDMAP_LLM_API_KEY=
 MINDMAP_LLM_MODEL=
-MINDMAP_DB_PATH=/var/lib/genai-mindmap/mindmaps.db
+# PostgreSQL 连接串。库不再是 /var/lib/genai-mindmap 下的一个文件，而是独立进程
+# 里的一个库；这一行就是"服务去哪里找它"的唯一开关，备份脚本也读同一行。
+# 留成下面这个值 = 本机 unix socket 上的 mindmaps 库（与 app/db/pool.py 的
+# DEFAULT_DSN 一致）。要连远端或换库就写完整 URL，例如
+#   postgresql://mindmap:<口令>@127.0.0.1:5432/mindmaps
+# 注意：换成 TCP + 口令时，这个文件的权限是 0640 root:genai，口令随文件保护。
+MINDMAP_PG_DSN=postgresql:///mindmaps?host=/var/run/postgresql
 DASHSCOPE_API_KEY=
 MINDMAP_AGENT_ENABLED=1
 MINDMAP_NLI_ENABLED=0
@@ -148,6 +167,19 @@ ENVFILE
   echo "已生成 $ENV_DIR/env —— 记得填 MINDMAP_LLM_* 四项"
 else
   echo "$ENV_DIR/env 已存在，保留不动"
+  # 从 SQLite 版本升级上来的机器：env 里那张旧模板只有 MINDMAP_DB_PATH。
+  # 保留不动是对的（里面有人手填的密钥），但**必须把库地址补上**——只删不补的话
+  # MINDMAP_PG_DSN 缺省，服务会静默回落到 app/db/pool.py 的 DEFAULT_DSN，
+  # "升级后数据不见了"就是这么来的。所以这里就地改：注释掉旧键、补新的。
+  if grep -q '^MINDMAP_DB_PATH=' "$ENV_DIR/env"; then
+    echo "⚠️ 发现已废除的 MINDMAP_DB_PATH（SQLite 时代的键），改为注释并补 MINDMAP_PG_DSN"
+    sed -i 's|^MINDMAP_DB_PATH=.*|# 已废除（SQLite 时代的库文件路径）：库现在是 PostgreSQL，见下面的 MINDMAP_PG_DSN|' "$ENV_DIR/env"
+  fi
+  if ! grep -q '^MINDMAP_PG_DSN=' "$ENV_DIR/env"; then
+    printf '%s\n' \
+      '# 由 install.sh 在升级时补上：原有 env 里没有这一行。本机 unix socket 上的 mindmaps 库。' \
+      'MINDMAP_PG_DSN=postgresql:///mindmaps?host=/var/run/postgresql' >> "$ENV_DIR/env"
+  fi
 fi
 chown root:"$APP_USER" "$ENV_DIR/env"
 chmod 640 "$ENV_DIR/env"
@@ -187,6 +219,13 @@ done
 if [[ -z "$health" ]]; then
   printf '服务没有在 20 秒内响应 /api/health，最近日志：\n'
   journalctl -u genai-mindmap -n 20 --no-pager || true
+  # 迁移之后"起不来"最常见的原因换了：不再是文件权限，而是连不上 PG。
+  # 单独提示一句，省得对着一条 psycopg 的连接异常去翻代码。
+  printf '\n提示：若日志里是 psycopg 的连接错误（Connection refused / 认证失败 / 库不存在），\n'
+  printf '      说明库那一侧还没准备好，与本脚本无关。按顺序核对：\n'
+  printf '        1) 服务端装了并起起来了      systemctl status postgresql-16\n'
+  printf '        2) 从这台机器连得上          psql "$(grep -h "^MINDMAP_PG_DSN=" /etc/genai-mindmap/env 2>/dev/null | cut -d= -f2-)" -c "select 1"\n'
+  printf '        3) genai 这个系统用户能登录  库角色/口令配了没有（本机 socket 的 peer 认证看用户名）\n'
   die "后端启动失败，先按上面日志修，再重跑本脚本"
 fi
 printf '健康检查：%s\n' "$health"
@@ -263,7 +302,8 @@ systemctl restart nginx
 # 前端 dist 是 scp 上来的，默认权限可能是 600，nginx（用户 nginx）读不到就是 403
 chmod -R a+rX "$WEB_ROOT" || true
 
-# 备份：每天 03:20 用 sqlite 的在线备份接口导一份，保留 14 天
+# 备份：每天 03:20 用 pg_dump -Fc 导一份一致性快照，保留 14 天
+# （恢复走 pg_restore，不是"把文件拷回去"——见 deploy/backup.sh 开头的说明）
 install -m 755 "$REPO_DIR/deploy/backup.sh" /usr/local/bin/genai-mindmap-backup
 echo '20 3 * * * root /usr/local/bin/genai-mindmap-backup >/var/log/genai-mindmap/backup.log 2>&1' \
   > /etc/cron.d/genai-mindmap-backup

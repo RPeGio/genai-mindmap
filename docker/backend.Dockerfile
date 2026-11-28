@@ -120,8 +120,9 @@ USER app
 # 构建期断言（app 身份）：这才是"能不能写"的真探针。
 # 上面那条 root 侧的断言只能证明属主位对不对，证明不了以 app 身份真能写（还有
 # 挂载点、ACL、目录位这些变量）。这里以最终运行身份真的建文件再删掉：
-#   - /data 是 SQLite（mindmaps.db）与 docling 的 HOME 缓存落点
-#     （backend/app/mindmaps/repository.py 的 connect() 会 mkdir 父目录后建库）；
+#   - /data 是 docling 的 HOME 缓存落点（数据库**不在这里了**：它现在是
+#     PostgreSQL 服务端的库，本容器只有一条连接通到 postgres 容器去，
+#     见 docker-compose.yml 的 MINDMAP_PG_DSN）；
 #   - /models 是 HF_HOME / DOCLING_CACHE_DIR 落点（首次解析 PDF/DOCX 时下载模型）。
 # 只要有一条写不进，用户第一次保存导图或第一次解析 PDF 就会看到 "Permission denied"
 # 并以为整个应用坏了——那种故障很难联想到这里。让它在**构建时**失败，日志里直接
@@ -146,11 +147,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=5 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"
 
 # ---------------------------------------------------------------- 启动
-# --workers 1 是**硬要求**，不是性能调优：状态全在一个 SQLite 文件里
-# （backend/app/mindmaps/repository.py 的 connect()，知识库/向量缓存/外部
-# 检索缓存都复用它），多 worker 就是多个写者，会偶发 "database is locked"
-# 的 500。2C2G 上多进程也吃不起内存。deploy/genai-mindmap.service 同样是
-# --workers 1，两边必须一致。
+# --workers 1 的理由在迁移到 PostgreSQL 之后**换了**，别按旧的读：
+#   · 以前是正确性硬要求：状态全在一个 SQLite 文件里，多 worker 就是多个写者，
+#     会偶发 "database is locked" 的 500。**这条已经不存在了**——并发现在由 PG
+#     的行锁/MVCC 管，多 worker 同时写是安全的。
+#   · 现在是内存：每个 worker 各开一份自己的 psycopg 池
+#     （backend/app/db/pool.py 的 POOL_MAX=8，实测每条后端连接常驻 15–23MB）
+#     并各持一份完整 Python 运行时（torch/docling 的 import 不共享）。2C2G 上
+#     第二个 worker 就是白多一份池 + 一份解释器。
+# deploy/genai-mindmap.service 同样是 --workers 1，两边保持一致。
 #
 # --host 0.0.0.0：容器网络里前端 nginx 要能连过来（线上形式是只听
 # 127.0.0.1:8000、由同机 nginx 反代）。宿主机**不发布**这个端口，

@@ -1,344 +1,430 @@
-"""`repository._ensure_columns` 的两件事：补上缺的列，以及容忍并发补列。
+"""`app/db/schema.py` 的那几件事：幂等建表、补列、清库、时间戳形状。
 
-并发那条不是理论：`test_agent_runs.py::test_eight_simultaneous_begin_calls_start_exactly_one_run`
-在 CI 上红过两次（`duplicate column name: model`、`partial`）。八个线程同时第一次
-打开一个新库，都读到缺列、各发一条 `ALTER TABLE ADD COLUMN`，后到的就抛错。
+**这个文件原来是另一副样子**：它锁的是"SQLite 老库就地迁移"——`_ensure_columns`
+补列的竞态、`model_settings` / `user_prefs` 从单行表搬成多 owner 表、半迁移状态的
+续搬、以及"搬完必须 commit 否则跨连接看不见"。换到 PostgreSQL 之后那些前提**全部
+消失**：
 
-这里用一个最小的假连接把两种情形钉死：撞名当成功，别的 SQLite 错误照旧往外抛——
-后者是这条兜底唯一危险的走向，把 `database is locked` 一起吞掉就变成静默丢列。
+- 就地迁移那段代码被删了。`init_schema()` 建出来的就是终态表，老库数据由一次性
+  导入脚本搬成终态形状（见 `docs/PG-MIGRATION-PLAN.md` D10）。没有"半迁移状态"
+  可言——导入是一次性的、失败就整体重来。
+- `PRAGMA table_info` + `ALTER` + 吞 `duplicate column name` 那一整套竞态处理也不需要
+  了：PG 的 `ADD COLUMN IF NOT EXISTS` 把竞态收进了语句本身。
+- "跨连接读得到 == commit 过"这条判据仍然成立，而且在新形状下更值得钉——因为
+  `Conn.__exit__` 会 commit、`close()` 会 rollback，两者的顺序一错就会静默丢写入。
+
+所以这里的用例换成了新契约：**幂等性**（跑两遍与跑一遍等价）、**补列**（缺的补上、
+已有的不动）、**时间戳格式**（与旧 SQLite 那条 strftime 逐字节同形，因为全仓的
+时间比较都靠字典序）、**清库**（17 张表 + 自增序列，每测试复用它）。
 """
 from __future__ import annotations
 
-import sqlite3
+import re
 import unittest
 
-from app.mindmaps.repository import _ensure_columns
+from app.db import schema
+from app.db.conn import Conn
+from app.db.errors import DatabaseError
+from app.db.pool import get_pool
+from app.mindmaps import repository
+
+#: `nowstamp()` 该产出的形状：定宽 UTC、三位毫秒、以 `Z` 收尾。`` 与 SQLite 的
+#: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` 逐字节同形——这是全仓时间比较按字典序
+#: 做的前提，形状一变，"谁更晚"的比较就会在边界上错。
+_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
 
-class _StubConnection:
-    """只实现 `_ensure_columns` 用到的那两件事：PRAGMA 查列、ALTER 补列。"""
-
-    def __init__(self, existing: set[str], error: Exception | None = None) -> None:
-        self.existing = set(existing)
-        self.error = error
-        self.alter_attempts: list[str] = []
-
-    def execute(self, sql: str):
-        if sql.startswith("PRAGMA table_info("):
-            return [(0, name, "TEXT", 0, None, 0) for name in sorted(self.existing)]
-        self.alter_attempts.append(sql)
-        if self.error is not None:
-            raise self.error
-        self.existing.add(sql.split("ADD COLUMN ")[1].split(" ")[0])
-        return None
+def _conn() -> Conn:
+    """新开一条连接。用完必须 `close()`（它会 rollback 未提交事务再归还池）。"""
+    return Conn(get_pool().getconn(), get_pool())
 
 
-class EnsureColumnsTest(unittest.TestCase):
-    def test_missing_column_is_added(self):
-        conn = _StubConnection({"run_id", "status"})
-
-        _ensure_columns(conn, "runs", {"model": "TEXT"})  # type: ignore[arg-type]
-
-        self.assertEqual(len(conn.alter_attempts), 1)
-        self.assertIn("ADD COLUMN model TEXT", conn.alter_attempts[0])
-
-    def test_existing_column_is_not_touched(self):
-        conn = _StubConnection({"run_id", "model"})
-
-        _ensure_columns(conn, "runs", {"model": "TEXT"})  # type: ignore[arg-type]
-
-        self.assertEqual(conn.alter_attempts, [])
-
-    def test_duplicate_column_error_means_someone_else_won(self):
-        """"已经有人补上了"是想要的结果，不该让第一个并发请求失败一次。"""
-        conn = _StubConnection({"run_id"}, sqlite3.OperationalError("duplicate column name: model"))
-
-        _ensure_columns(conn, "runs", {"model": "TEXT"})  # type: ignore[arg-type]  # 不抛
-
-        self.assertEqual(len(conn.alter_attempts), 1)
-
-    def test_other_sqlite_errors_still_raise(self):
-        """吞掉全部 OperationalError 会把"库锁住了"变成"列没补上还装作补上了"。"""
-        conn = _StubConnection({"run_id"}, sqlite3.OperationalError("database is locked"))
-
-        with self.assertRaises(sqlite3.OperationalError) as info:
-            _ensure_columns(conn, "runs", {"model": "TEXT"})  # type: ignore[arg-type]
-
-        self.assertIn("database is locked", str(info.exception))
-
-
-# --------------------------------------------------------------------- 表迁移
-#
-# 下面这些用例都跑**真库**（`clean_env` 已经把 `MINDMAP_DB_PATH` 指到 tmp），
-# 因为要钉的恰恰是"迁移有没有落盘"。用假连接测不出来：写死列名的 `INSERT ...
-# SELECT` 在假连接上永远成功，而真库上它是 `no such column`；"没提交"这件事
-# 更是只有跨连接再读一次才看得见。
-
-_LEGACY_SETTINGS_NO_HOST = """CREATE TABLE model_settings (
-    id         INTEGER PRIMARY KEY CHECK (id = 1),
-    base_url   TEXT NOT NULL DEFAULT '',
-    api_key    TEXT NOT NULL DEFAULT '',
-    model      TEXT NOT NULL DEFAULT '',
-    deep_model TEXT NOT NULL DEFAULT '',
-    updated_at TEXT
-);"""
-
-_LEGACY_SETTINGS_WITH_HOST = """CREATE TABLE model_settings (
-    id           INTEGER PRIMARY KEY CHECK (id = 1),
-    base_url     TEXT NOT NULL DEFAULT '',
-    api_key      TEXT NOT NULL DEFAULT '',
-    model        TEXT NOT NULL DEFAULT '',
-    deep_model   TEXT NOT NULL DEFAULT '',
-    updated_at   TEXT,
-    api_key_host TEXT NOT NULL DEFAULT ''
-);"""
-
-_LEGACY_PREFS = """CREATE TABLE user_prefs (
-    pref_key      TEXT PRIMARY KEY,
-    pref_value    TEXT NOT NULL,
-    scope         TEXT NOT NULL DEFAULT 'global',
-    source        TEXT NOT NULL,
-    source_run_id TEXT,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
-);"""
-
-
-def _seed(sql: str | None) -> None:
-    """在当前 `MINDMAP_DB_PATH` 上建一张老表。`None` = 什么都不建。"""
-    if sql is None:
-        return
-    from app.mindmaps.repository import db_path
-
-    conn = sqlite3.connect(db_path())
-    conn.executescript(sql)
-    conn.commit()
-    conn.close()
-
-
-def _rows(table: str, columns: str) -> list[tuple]:
-    """**新开一条裸连接**读，绕开一切缓存——只看得见真的落盘了的东西。"""
-    from app.mindmaps.repository import db_path
-
-    conn = sqlite3.connect(db_path())
+def _columns(table: str) -> set[str]:
+    """某张表在**当前库**里的列名集合。"""
+    conn = _conn()
     try:
-        return [tuple(row) for row in conn.execute(f"SELECT {columns} FROM {table}")]
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ?",
+            (table,)).fetchall()
     finally:
         conn.close()
+    return {str(row["column_name"]) for row in rows}
 
 
 def _tables() -> set[str]:
-    from app.mindmaps.repository import db_path
-
-    conn = sqlite3.connect(db_path())
+    conn = _conn()
     try:
-        return {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()").fetchall()
     finally:
         conn.close()
+    return {str(row["table_name"]) for row in rows}
 
 
-class SettingsMigrationTest(unittest.TestCase):
-    def _migrate(self) -> None:
-        from app.settings import store
+class InitSchemaTest(unittest.TestCase):
+    def test_init_schema_is_idempotent(self):
+        """再跑一遍不抛、不丢数据。启动期每条连接都会走到它附近，重复是常态。"""
+        conn = _conn()
+        try:
+            conn.execute("INSERT INTO mindmaps (id, version, content, updated_at) "
+                         "VALUES ('keep-me', 1, '{}', nowstamp())")
+            conn.commit()
+        finally:
+            conn.close()
 
-        store._CACHE.clear()
-        self.addCleanup(store._CACHE.clear)
-        conn = __import__("app.mindmaps.repository", fromlist=["connect"]).connect()
-        conn.close()
+        schema.init_schema()  # 第二遍
 
-    def test_a_main_era_row_survives_the_migration(self):
-        """main 的老表**没有 `api_key_host`**。
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM mindmaps WHERE id = 'keep-me'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "幂等建表把已有的行冲掉了")
+        self.assertEqual(row["id"], "keep-me")
 
-        写死列名的搬运行会在这里抛 `no such column: api_key_host`，而它在
-        `connect()` 的中段——不是"降级成未配置"，是**整个服务起不来**。
+    def test_every_declared_table_exists(self):
+        conn = _conn()
+        try:
+            conn.execute("SELECT 1")
+        finally:
+            conn.close()
+        present = _tables()
+        # `TABLES_IN_CLEAR_ORDER` 是"清库要清哪些"的清单，它就是全表清单。
+        missing = set(schema.TABLES_IN_CLEAR_ORDER) - present
+        self.assertEqual(missing, set(), f"这些表没建出来：{sorted(missing)}")
+
+    def test_the_schema_version_is_recorded(self):
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT value FROM schema_migrations WHERE key = 'version'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "schema_migrations 里没有版本行")
+        self.assertEqual(str(row["value"]), schema.SCHEMA_VERSION)
+
+
+class EnsureColumnsTest(unittest.TestCase):
+    """补列：缺的补上、已有的不动、跑两遍等价。
+
+    原来是拿一个 `_StubConnection` 模拟 PRAGMA + ALTER 测"并发补列撞名要不要吞"。
+    新实现是 `ADD COLUMN IF NOT EXISTS` 一句话，没有"撞名"这个分支可测——要测的是
+    **幂等**（第二遍不抛），以及**已有的列值不被清掉**。
+    """
+
+    _TABLE = "probe_columns"
+
+    def setUp(self):
+        conn = _conn()
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {self._TABLE}")
+            conn.execute(f"CREATE TABLE {self._TABLE} (id TEXT PRIMARY KEY)")
+            conn.commit()
+        finally:
+            conn.close()
+        self.addCleanup(self._drop)
+
+    def _drop(self) -> None:
+        conn = _conn()
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {self._TABLE}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_a_missing_column_is_added(self):
+        conn = _conn()
+        try:
+            schema.ensure_columns(conn, self._TABLE, {"model": "TEXT"})
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIn("model", _columns(self._TABLE))
+
+    def test_running_twice_is_harmless(self):
+        """第二遍不能再抛。原来这里靠吞 `duplicate column name` 才不炸。"""
+        conn = _conn()
+        try:
+            schema.ensure_columns(conn, self._TABLE, {"model": "TEXT"})
+            schema.ensure_columns(conn, self._TABLE, {"model": "TEXT"})
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIn("model", _columns(self._TABLE))
+
+    def test_an_existing_column_is_not_touched(self):
+        conn = _conn()
+        try:
+            conn.execute(f"INSERT INTO {self._TABLE} (id) VALUES ('r1')")
+            schema.ensure_columns(conn, self._TABLE, {"id": "TEXT"})
+            conn.commit()
+            row = conn.execute(
+                f"SELECT id FROM {self._TABLE} WHERE id = 'r1'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "补列把已有的行冲掉了")
+
+    def test_drop_columns_is_also_idempotent(self):
+        conn = _conn()
+        try:
+            schema.ensure_columns(conn, self._TABLE, {"model": "TEXT"})
+            schema.drop_columns(conn, self._TABLE, ("model",))
+            schema.drop_columns(conn, self._TABLE, ("model",))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertNotIn("model", _columns(self._TABLE))
+
+
+class NowstampTest(unittest.TestCase):
+    """时间戳形状。全仓的时间比较都按字符串字典序，格式是硬契约。"""
+
+    def _stamp(self, offset: float | None = None) -> str:
+        conn = _conn()
+        try:
+            if offset is None:
+                row = conn.execute("SELECT nowstamp() AS stamp").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT nowstamp(?) AS stamp", (offset,)).fetchone()
+        finally:
+            conn.close()
+        return str(row["stamp"])
+
+    def test_shape_matches_the_old_sqlite_format(self):
+        self.assertRegex(self._stamp(), _STAMP_RE)
+
+    def test_an_offset_moves_the_stamp_backwards_in_lexicographic_order(self):
+        """`nowstamp(-86400)` 是一天前，**而且字典序也确实是更小**。
+
+        这条比"格式对"更本质：`sweep_abandoned` / `library.prune` / `edits` 的时间窗
+        全靠 `updated_at < nowstamp(-N)` 这种比较，格式对了但顺序反了照样错。
         """
-        _seed(_LEGACY_SETTINGS_NO_HOST + """
-            INSERT INTO model_settings
-            VALUES (1, 'https://real.example/v1', 'sk-REAL', 'm1', '', '2026-01-01');
-        """)
+        now = self._stamp()
+        before = self._stamp(-86400)
+        self.assertRegex(before, _STAMP_RE)
+        self.assertLess(before, now)
 
-        self._migrate()  # 不抛就已经过了一半
+    def test_two_calls_in_the_same_statement_share_one_timestamp(self):
+        """同一条语句里的两个 `nowstamp()` 相等——和 SQLite 一样。
 
-        self.assertEqual(
-            _rows("model_settings", "owner, base_url, api_key, model, api_key_host"),
-            [("", "https://real.example/v1", "sk-REAL", "m1", "")])
-        self.assertNotIn("model_settings_legacy_v1", _tables())
-
-    def test_a_row_with_a_bound_host_keeps_that_host(self):
-        """PR#27 中间态的老表：绑定过主机的那一行，迁移后绑定不能丢。
-
-        丢了不会报错，只会让 `resolve()` 认为"没绑定过"、于是绑定校验整段失效——
-        正是 P0-1 要挡的那条路。
+        理由不是"事务开始时刻"（那是 `now()`，见下一条用例），而是
+        `statement_timestamp()` 在**一条语句内**是常量：SQLite 的
+        `strftime(...,'now')` 也是这样。成对写 `created_at` / `updated_at` 时两者
+        必须一致，否则"什么时候建的"与"什么时候改的"会差几毫秒，而排序键用的正是后者。
         """
-        _seed(_LEGACY_SETTINGS_WITH_HOST + """
-            INSERT INTO model_settings
-            VALUES (1, 'https://real.example/v1', 'sk-REAL', 'm1', '', '2026-01-01', 'real.example');
-        """)
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT nowstamp() AS a, nowstamp() AS b").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(str(row["a"]), str(row["b"]))
 
-        self._migrate()
+    def test_nowstamp_is_a_statement_clock_not_a_transaction_clock(self):
+        """同一事务里的两条**语句**必须拿到不同的时间戳。
 
-        self.assertEqual(
-            _rows("model_settings", "owner, api_key, api_key_host"),
-            [("", "sk-REAL", "real.example")])
+        这条钉的是 `_NOWSTAMP_SQL` 里那个函数的选择。用 `now()`（=
+        `transaction_timestamp()`）时，一个事务内所有写入的时间戳**逐字节相等**，
+        而 SQLite 的 `strftime(...,'now')` 是每条语句重新求值——`ingest_many` 一个
+        事务里入库多份材料，靠"按新旧淘汰"的 `prune` 就此退化成按 id 排。
 
-    def test_the_migration_is_committed_not_just_written_in_a_transaction(self):
-        """跨越连接还能读到，才叫落盘。
-
-        `connect()` 的调用方是只读路径，不会替迁移提交。少了 `commit()` 的表现是：
-        同一个进程里第一次读**看得见**（那条连接里事务还没回滚），下一次连接就是
-        空的——而老表已经被 DROP，数据再也拿不回来。开发库上真踩到过。
+        用 `clock_timestamp()` 也不对：它在**同一条语句的多行之间**就会变，而
+        SQLite 的 `now` 在一条语句内是常量（见上一条）。`statement_timestamp()`
+        是唯一两头都对的那个。
         """
-        _seed(_LEGACY_SETTINGS_WITH_HOST + """
-            INSERT INTO model_settings
-            VALUES (1, 'https://x.example/v1', 'sk-KEEP', 'm1', '', '2026-01-01', 'x.example');
-        """)
+        conn = _conn()
+        try:
+            first = str(conn.execute("SELECT nowstamp() AS s").fetchone()["s"])
+            conn.execute("SELECT pg_sleep(0.02)")
+            second = str(conn.execute("SELECT nowstamp() AS s").fetchone()["s"])
+        finally:
+            conn.close()
+        self.assertNotEqual(
+            first, second,
+            "nowstamp() 退化成事务时间戳了（见 app/db/schema.py 的 _NOWSTAMP_SQL）")
 
-        self._migrate()
+    def test_every_row_of_one_insert_shares_the_statement_stamp(self):
+        """一条 `INSERT ... SELECT` 写多行时，行与行之间共享同一个时间戳。
 
-        # 这里每一条都是新连接：看的就是磁盘上那份。
-        self.assertEqual(_rows("model_settings", "api_key"), [("sk-KEEP",)])
-        self._migrate()  # 再跑一次（每个请求都会调它）
-        self.assertEqual(_rows("model_settings", "api_key"), [("sk-KEEP",)])
-
-    def test_a_half_migrated_database_is_finished_by_the_next_connect(self):
-        """崩溃窗口：老表已改名、新表已建、行没搬。
-
-        判据必须认得出这个状态，否则老表永远躺在那里没人搬，而用户看到的是
-        "我配的密钥没了"。
+        `_ingest_one` 的 `executemany` 与 `sweep_abandoned` 的批量 `UPDATE` 都依赖
+        这一点：同一批操作在语义上是"一次"，不该因为行数多少而产生几十个不同时刻。
+        用 `clock_timestamp()` 会破坏它（行行不同）。
         """
-        _seed(_LEGACY_SETTINGS_NO_HOST.replace("model_settings", "model_settings_legacy_v1")
-              + """
-            INSERT INTO model_settings_legacy_v1
-            VALUES (1, 'https://real.example/v1', 'sk-REAL', 'm1', '', '2026-01-01');
-        """)
-        from app.settings.store import _CREATE
+        conn = _conn()
+        try:
+            conn.execute("DROP TABLE IF EXISTS _stamp_rows")
+            conn.execute("CREATE TABLE _stamp_rows (n int, at text)")
+            conn.execute(
+                "INSERT INTO _stamp_rows SELECT g, nowstamp() "
+                "FROM generate_series(1, 50) g")
+            row = conn.execute(
+                "SELECT count(DISTINCT at) AS kinds FROM _stamp_rows").fetchone()
+            conn.execute("DROP TABLE _stamp_rows")
+        finally:
+            conn.close()
+        self.assertEqual(int(row["kinds"]), 1)
 
-        conn = sqlite3.connect(__import__("app.mindmaps.repository",
-                                          fromlist=["db_path"]).db_path())
-        conn.execute(_CREATE)
-        conn.commit()
-        conn.close()
 
-        self._migrate()
+class ClearAllTest(unittest.TestCase):
+    """`clear_all()` 是每个测试函数的前置动作（`conftest.fresh_db`）。
 
-        self.assertEqual(_rows("model_settings", "api_key"), [("sk-REAL",)])
-        self.assertNotIn("model_settings_legacy_v1", _tables())
+    它错了不会报错，只会让用例之间互相污染——症状是"单跑绿、全跑红"，那种失败
+    最难查。所以这里钉两件事：真的清空了，以及自增序列也回到 1。
+    """
 
-    def test_a_null_column_does_not_silently_drop_the_row(self):
-        """老表允许 NULL 的列，搬到新表时必须补默认值，不能让整行消失。
+    def test_it_empties_every_table_in_the_clear_list(self):
+        conn = _conn()
+        try:
+            conn.execute("INSERT INTO mindmaps (id, version, content, updated_at) "
+                         "VALUES ('to-be-cleared', 1, '{}', nowstamp())")
+            conn.commit()
+        finally:
+            conn.close()
 
-        `deep_model` 在**更早的版本**里是 `_ensure_columns` 用 `ALTER TABLE ADD
-        COLUMN deep_model TEXT` 补上去的——`ADD COLUMN` 不带 `NOT NULL`，所以那批
-        库里这一列允许 NULL；而新表把它声明成 `NOT NULL`。夹具必须复刻这个形状，
-        直接照抄 main 现在的 `_CREATE`（那里已经是 `NOT NULL`）就造不出这个状态。
+        schema.clear_all()
 
-        `INSERT OR IGNORE` 会把违反 `NOT NULL` 的**整行**丢掉——不是报错，是
-        `rowcount = 0`。实测症状是"升级完之后密钥与地址都没了"，而迁移日志一切正常。
+        conn = _conn()
+        try:
+            for table in schema.TABLES_IN_CLEAR_ORDER:
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS total FROM {table}").fetchone()
+                self.assertEqual(int(row["total"]), 0, f"{table} 没被清空")
+        finally:
+            conn.close()
+
+    def test_it_restarts_the_sequences(self):
+        """`edit_events.id` 是 `bigserial`，而用例会断言"第一条 id 是 1"。
+
+        不重置序列的话，第二个用例拿到的 id 接着上一个涨——`test_edit_events.py`
+        里 `assert rows[1]["id"] == 2` 那条会变成跨用例随机红。
         """
-        _seed("""CREATE TABLE model_settings (
-            id         INTEGER PRIMARY KEY CHECK (id = 1),
-            base_url   TEXT NOT NULL DEFAULT '',
-            api_key    TEXT NOT NULL DEFAULT '',
-            model      TEXT NOT NULL DEFAULT '',
-            updated_at TEXT
-        );
-        ALTER TABLE model_settings ADD COLUMN deep_model TEXT;
-        INSERT INTO model_settings
-        VALUES (1, 'https://real.example/v1', 'sk-NULLCOL', 'm1', '2026-01-01', NULL);
-        """)
+        conn = _conn()
+        try:
+            # `actor` / `kind` 是 NOT NULL 且没有默认值：插值必须给全，否则撞
+            # `NotNullViolation`。**这条不是测试写法问题**——`edit_events` 的
+            # 写入方 `repository.record_edit_event()` 一直在给这几列。
+            conn.execute(
+                "INSERT INTO edit_events (map_id, actor, kind, at, recorded_at) "
+                "VALUES ('m', 'user', 'move', nowstamp(), nowstamp())")
+            conn.commit()
+        finally:
+            conn.close()
 
-        self._migrate()
+        schema.clear_all()
 
-        self.assertEqual(
-            _rows("model_settings", "owner, api_key, deep_model"),
-            [("", "sk-NULLCOL", "")])
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "INSERT INTO edit_events (map_id, actor, kind, at, recorded_at) "
+                "VALUES ('m2', 'user', 'move', nowstamp(), nowstamp()) "
+                "RETURNING id").fetchone()
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(int(row["id"]), 1, "自增序列没有回到 1")
 
 
-class PrefsMigrationTest(unittest.TestCase):
-    def _connect(self):
-        from app.mindmaps import repository
+class CommitSemanticsTest(unittest.TestCase):
+    """`Conn` 的两条收尾路径：`with` 提交、`close()` 回滚。
 
-        return repository.connect()
+    这是 shim 最容易错的地方，而错了的表现是"写进去了"和"没写进去"在进程内长得
+    一样——只有**换一条连接**再读才分得开。
+    """
 
-    def test_an_old_single_key_row_lands_under_the_empty_owner(self):
-        """老行搬成 `owner = ''`（实例行），再由 `prefs.service` 只让部署方继承。"""
-        _seed(_LEGACY_PREFS + """
-            INSERT INTO user_prefs
-            VALUES ('note.1', '别让外人看到', 'global', 'user_explicit', NULL,
-                    '2026-01-01', '2026-01-01');
-        """)
+    def test_a_with_block_commits(self):
+        with _conn() as conn:
+            conn.execute("INSERT INTO mindmaps (id, version, content, updated_at) "
+                         "VALUES ('committed', 1, '{}', nowstamp())")
+        # 出了 with，连接已归还池；读的是另一个会话。
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM mindmaps WHERE id = 'committed'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "with 块没有提交")
 
-        self._connect().close()
-
-        self.assertEqual(
-            _rows("user_prefs", "owner, pref_key, pref_value, source"),
-            [("", "note.1", "别让外人看到", "user_explicit")])
-        self.assertNotIn("user_prefs_legacy_v1", _tables())
-
-    def test_the_new_primary_key_allows_two_owners_on_the_same_key(self):
-        """复合主键是这次迁移**唯一的目的**：同一个键两个人各一条。"""
-        _seed(_LEGACY_PREFS)
-        self._connect().close()
-
-        conn = self._connect()
-        conn.execute("INSERT INTO user_prefs (owner, pref_key, pref_value, source, "
-                     "created_at, updated_at) VALUES ('user:1', 'icon.style', 'soft', "
-                     "'user_explicit', '2026-01-01', '2026-01-01')")
-        conn.execute("INSERT INTO user_prefs (owner, pref_key, pref_value, source, "
-                     "created_at, updated_at) VALUES ('user:2', 'icon.style', 'flat', "
-                     "'user_explicit', '2026-01-01', '2026-01-01')")
-        conn.commit()
-        conn.close()
-
-        self.assertEqual(
-            _rows("user_prefs", "owner, pref_value"),
-            [("user:1", "soft"), ("user:2", "flat")])
-
-    def test_a_half_migrated_prefs_table_is_finished(self):
-        """与 settings 同一个崩溃窗口，prefs 这侧也要能续上。"""
-        _seed(_LEGACY_PREFS.replace("user_prefs", "user_prefs_legacy_v1") + """
-            INSERT INTO user_prefs_legacy_v1
-            VALUES ('note.1', '老备注', 'global', 'user_explicit', NULL,
-                    '2026-01-01', '2026-01-01');
-        """)
-        from app.mindmaps.repository import _PREF_CREATE
-
-        conn = sqlite3.connect(__import__("app.mindmaps.repository",
-                                          fromlist=["db_path"]).db_path())
-        conn.execute(_PREF_CREATE)
-        conn.commit()
-        conn.close()
-
-        self._connect().close()
-
-        self.assertEqual(_rows("user_prefs", "owner, pref_value"), [("", "老备注")])
-        self.assertNotIn("user_prefs_legacy_v1", _tables())
-
-    def test_the_recovery_does_not_overwrite_fresher_rows(self):
-        """续搬时新表可能已经有更新的行（崩溃那一刻之后用户改过）。
-
-        老表里那份是更旧的，不能盖回去——`INSERT OR IGNORE` 才是对的。
+    def test_close_without_commit_rolls_back(self):
+        """不提交就关 = 回滚。这是 SQLite 语义，也是仓库里 `closing(conn)` 全部
+        依赖它的原因。psycopg 原生的 `close()` 也回滚，但 `with conn:` 会**关连接**，
+        所以 shim 必须自己实现这一层。
         """
-        _seed(_LEGACY_PREFS.replace("user_prefs", "user_prefs_legacy_v1") + """
-            INSERT INTO user_prefs_legacy_v1
-            VALUES ('note.1', '老备注', 'global', 'user_explicit', NULL,
-                    '2026-01-01', '2026-01-01');
-        """)
-        from app.mindmaps.repository import _PREF_CREATE
+        conn = _conn()
+        conn.execute("INSERT INTO mindmaps (id, version, content, updated_at) "
+                     "VALUES ('rolled-back', 1, '{}', nowstamp())")
+        conn.close()  # 没有 commit
 
-        conn = sqlite3.connect(__import__("app.mindmaps.repository",
-                                          fromlist=["db_path"]).db_path())
-        conn.execute(_PREF_CREATE)
-        conn.execute("INSERT INTO user_prefs (owner, pref_key, pref_value, source, "
-                     "created_at, updated_at) VALUES ('', 'note.1', '新备注', "
-                     "'user_explicit', '2026-02-02', '2026-02-02')")
-        conn.commit()
-        conn.close()
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM mindmaps WHERE id = 'rolled-back'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNone(row, "没提交的写入居然落库了")
 
-        self._connect().close()
+    def test_a_failed_statement_does_not_poison_the_transaction(self):
+        """**每条语句包 SAVEPOINT 的唯一理由。**
 
-        self.assertEqual(_rows("user_prefs", "pref_value"), [("新备注",)])
+        现有代码十几处依赖"吞掉一条语句的错误、接着用同一条连接"（典型是
+        `prefs/profile.py` 串行取三张表的样本，任一张失败只 warning 继续下一张）。
+        psycopg 的原生行为是"语句一错整个事务进 aborted 态，后续全部拒绝执行"，
+        那会把"少一份样本"放大成"整个画像层失效"。
+        """
+        with _conn() as conn:
+            with self.assertRaises(DatabaseError):
+                conn.execute("SELECT * FROM table_that_does_not_exist")
+            # 同一条连接、同一个事务里继续跑——不该抛 InFailedSqlTransaction。
+            row = conn.execute("SELECT 1 AS one").fetchone()
+        self.assertEqual(int(row["one"]), 1)
+
+
+class LegacyAdoptionTest(unittest.TestCase):
+    """`_adopt_legacy` 是**保留**下来的那部分：它不是 schema 迁移，是业务认领。
+
+    三处运行期就地迁移（settings / prefs / style）被删掉了，但"老库无主行归部署方"
+    这条业务规则还在。`owner = ''` 的行在新库里不会自然出现（导入脚本会写真实
+    owner），所以它在新库上是零成本的空转——**空转也要验证它不炸**。
+    """
+
+    def test_style_adopt_legacy_is_a_no_op_on_an_empty_table(self):
+        from app.prefs import style
+
+        style._adopt_legacy()  # 不该抛
+
+        conn = _conn()
+        try:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS total FROM {style.STYLE_TABLE}").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(int(row["total"]), 0)
+
+    def test_prefs_adopt_legacy_is_a_no_op_on_an_empty_table(self):
+        from app.prefs import service
+
+        service._adopt_legacy()  # 不该抛
+
+
+class DbPathAliasTest(unittest.TestCase):
+    """`repository.db_path()` 还在，但返回的是 DSN 而不是文件路径。
+
+    它被两处当**稳定的实例标识**用：`auth/store.py` 的 cookie 签名密钥、
+    `settings/store.py` 的缓存键。返回 DSN 是有意的——换库等于换实例，旧会话全部
+    失效是预期行为（导入脚本不动这些），而不是 bug。
+    """
+
+    def test_it_returns_the_dsn_not_a_file_path(self):
+        text = repository.db_path()
+        self.assertTrue(text.startswith("postgresql://"), text)
+
+    def test_it_agrees_with_the_pool(self):
+        from app.db.pool import dsn
+
+        self.assertEqual(repository.db_path(), dsn())
 
 
 if __name__ == "__main__":

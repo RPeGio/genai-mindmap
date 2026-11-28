@@ -46,13 +46,14 @@ except Exception as exc:  # noqa: BLE001
 # ---------------------------------------------------------------- compose 自洽
 services = compose.get("services", {}) if isinstance(compose, dict) else {}
 check(
-    "compose: 服务集合恰为 {backend, frontend}",
-    set(services) == {"backend", "frontend"},
+    "compose: 服务集合恰为 {backend, frontend, postgres}",
+    set(services) == {"backend", "frontend", "postgres"},
     "实际: %s" % sorted(services),
 )
 
 be = services.get("backend", {}) or {}
 fe = services.get("frontend", {}) or {}
+pg = services.get("postgres", {}) or {}
 
 for svc_name, svc in (("backend", be), ("frontend", fe)):
     build = svc.get("build", {}) or {}
@@ -69,8 +70,8 @@ check(
 
 top_vols = set(compose.get("volumes", {}) or {})
 check(
-    "compose: 顶层声明 mindmap-data 与 mindmap-models",
-    top_vols == {"mindmap-data", "mindmap-models"},
+    "compose: 顶层声明 mindmap-data、mindmap-models 与 mindmap-db",
+    top_vols == {"mindmap-data", "mindmap-models", "mindmap-db"},
     str(sorted(top_vols)),
 )
 
@@ -82,10 +83,29 @@ for m in be.get("volumes", []) or []:
 check("compose[backend]: mindmap-data 挂到 /data", be_mounts.get("/data") == "mindmap-data", str(be_mounts))
 check("compose[backend]: mindmap-models 挂到 /models", be_mounts.get("/models") == "mindmap-models", str(be_mounts))
 
-# env 与挂载点必须自洽
+# env 与挂载点 / 服务拓扑必须自洽。
+# 迁移到 PostgreSQL 之后这里断言的东西变了：MINDMAP_DB_PATH 已经废除，
+# 现在要保证的是"backend 的 DSN 指向 compose 内的 postgres 服务名"——
+# 容器里的 127.0.0.1 是容器自己，写成 localhost 的后端会连不上库，而现象是
+# 容器反复重启 + 日志里一条看着像代码 bug 的连接错误（跨容器最常见的错）。
 be_env = be.get("environment", {}) or {}
-db_path = be_env.get("MINDMAP_DB_PATH", "")
-check("compose[backend]: MINDMAP_DB_PATH 落在 /data 卷内", db_path.startswith("/data/"), db_path)
+be_dsn = be_env.get("MINDMAP_PG_DSN", "")
+check(
+    "compose[backend]: MINDMAP_PG_DSN 指向 compose 内的 postgres 服务名（不是 localhost）",
+    "@postgres:" in be_dsn,
+    be_dsn.replace("${MINDMAP_PG_PASSWORD:?", "<口令>") if be_dsn else "未设置",
+)
+check(
+    "compose[backend]: 已废弃的 MINDMAP_DB_PATH 没有残留",
+    "MINDMAP_DB_PATH" not in be_env,
+    str(sorted(be_env)),
+)
+# 口令必须是变量插值，不能是明文常量：写死在 compose 里 = 提交进 git。
+check(
+    "compose[backend]: DSN 口令来自 ${MINDMAP_PG_PASSWORD}，不是明文",
+    "${MINDMAP_PG_PASSWORD" in be_dsn,
+    "",
+)
 for key in ("HF_HOME", "DOCLING_CACHE_DIR"):
     val = be_env.get(key, "")
     check("compose[backend]: %s 落在 /models 卷内" % key, val.startswith("/models"), val)
@@ -98,6 +118,39 @@ check(
     "compose[backend]: 显式覆盖 MINDMAP_EXTERNAL_PROXY（缺省值指向容器自己的 127.0.0.1:7897）",
     "MINDMAP_EXTERNAL_PROXY" in be_env,
     str(be_env.get("MINDMAP_EXTERNAL_PROXY")),
+)
+
+# ---------------------------------------------------------------- postgres 服务
+pg_env = pg.get("environment", {}) or {}
+check("compose[postgres]: 版本钉在 16（与服务端一致，pg_dump 跟随大版本）", pg.get("image") == "postgres:16", str(pg.get("image")))
+check(
+    "compose[postgres]: 口令同样来自 ${MINDMAP_PG_PASSWORD}（与 backend DSN 同一个来源）",
+    "${MINDMAP_PG_PASSWORD" in str(pg_env.get("POSTGRES_PASSWORD", "")),
+    str(pg_env.get("POSTGRES_PASSWORD", "")),
+)
+pg_mounts = {}
+for m in pg.get("volumes", []) or []:
+    if isinstance(m, str):
+        src, _, dst = m.partition(":")
+        pg_mounts[dst] = src
+check(
+    "compose[postgres]: mindmap-db 卷挂到 PGDATA（库不能落在容器可写层）",
+    pg_mounts.get("/var/lib/postgresql/data") == "mindmap-db",
+    str(pg_mounts),
+)
+check(
+    "compose[postgres]: 不向宿主机发布 5432（只在 compose 内网可达）",
+    "ports" not in pg,
+    "ports=%r" % (pg.get("ports"),),
+)
+pg_hc = json.dumps(pg.get("healthcheck", {}), ensure_ascii=False)
+check("compose[postgres]: healthcheck 用 pg_isready（端口通不等于能查询）", "pg_isready" in pg_hc, "")
+be_dep = be.get("depends_on") or {}
+be_pg_dep = be_dep.get("postgres", {}) if isinstance(be_dep, dict) else {}
+check(
+    "compose[backend]: depends_on postgres 且 condition=service_healthy",
+    be_pg_dep.get("condition") == "service_healthy",
+    str(be.get("depends_on")),
 )
 
 check(
@@ -235,7 +288,7 @@ fe_df = read("docker/frontend.Dockerfile")
 check("backend.Dockerfile: 基于 python:3.12-slim（= CI python-version）", re.search(r"^FROM python:3\.12-slim", df_backend, re.M) is not None, "")
 check("frontend.Dockerfile: 构建段 node:24（= CI node-version）", re.search(r"^FROM node:24", fe_df, re.M) is not None, "")
 check("frontend.Dockerfile: 多阶段构建（builder -> nginx）", "AS build" in fe_df and re.search(r"^FROM nginx:", fe_df, re.M) is not None, "")
-check("backend.Dockerfile: uvicorn --workers 1（SQLite 单写者，硬要求）", re.search(r'"--workers",\s*"1"', df_backend) is not None, "")
+check("backend.Dockerfile: uvicorn --workers 1（PG 下是内存约束，不再是写冲突）", re.search(r'"--workers",\s*"1"', df_backend) is not None, "")
 check("backend.Dockerfile: 非 root 运行（USER app）", re.search(r"^USER app\b", df_backend, re.M) is not None, "")
 check("backend.Dockerfile: HEALTHCHECK 打 /api/health", "/api/health" in df_backend, "")
 check("frontend.Dockerfile: HEALTHCHECK 存在", "HEALTHCHECK" in fe_df, "")
@@ -243,7 +296,8 @@ check("frontend.Dockerfile: HEALTHCHECK 存在", "HEALTHCHECK" in fe_df, "")
 # ---------------------------------------------------------------- 卷属主 / 非 root 可写
 # 这一段是"第一次真跑最可能炸"的地方：named volume 首次创建时会把镜像里挂载点的
 # 内容与**属主**一起复制进卷。镜像里 /data、/models 若没 chown 给 app，容器起来后
-# 以 uid 10001 跑就写不进 SQLite，用户看到的是 "Permission denied"，会以为应用坏了。
+# 以 uid 10001 跑就写不进 /data（首启上传与 docling 缓存都要写），用户看到的是
+# "Permission denied"，会以为应用坏了。
 # 本机没有 docker，跑不了容器，只能静态断言"这条因果链在文件里是接上的"：
 #   1. 有 mkdir -p（目录在镜像里就存在，不是等运行时才建）
 #   2. 有 chown -R app:app，且**在 USER app 之前**（放在之后等于没做，root 才跑得动）
@@ -289,7 +343,7 @@ check(
     "probe@%d USER@%d" % (i_probe, i_user),
 )
 check(
-    "backend.Dockerfile: 探针覆盖 /data 与 /models（SQLite 与模型缓存两个落点）",
+    "backend.Dockerfile: 探针覆盖 /data 与 /models（上传/缓存与模型两个落点）",
     re.search(r"for d in /data /models", df_backend) is not None,
     "",
 )
@@ -363,8 +417,26 @@ check('tsconfig: include 含 "tests"（前端镜像必须 COPY frontend/tests）
 
 for k in ("MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY", "MINDMAP_LLM_MODEL"):
     check(".env.example: 含 %s" % k, re.search(r"^%s=" % k, env_example, re.M) is not None, "")
+# MINDMAP_DB_PATH 已废除（库不再是容器里的文件）。现在要断的是两件事：
+# 模板里不能再出现那条已废的键（留着会让人以为还能用文件库），以及模板
+# **不能硬编码真口令**——模板是要提交进 git 的。
 active_db = re.search(r"^MINDMAP_DB_PATH=(.+)$", env_example, re.M)
-check(".env.example: MINDMAP_DB_PATH 未硬编码（交给 compose）", active_db is None, active_db.group(0) if active_db else "")
+check(".env.example: 已废弃的 MINDMAP_DB_PATH 没有赋值行", active_db is None, active_db.group(0) if active_db else "")
+check(
+    ".env.example: 有 MINDMAP_PG_PASSWORD 赋值行（compose 的 :? 校验依赖它存在）",
+    re.search(r"^MINDMAP_PG_PASSWORD=", env_example, re.M) is not None,
+    "",
+)
+pg_pw = re.search(r"^MINDMAP_PG_PASSWORD=(.*)$", env_example, re.M)
+check(
+    ".env.example: MINDMAP_PG_PASSWORD 留空（模板里不许有真口令）",
+    pg_pw is not None and pg_pw.group(1).strip() == "",
+    repr(pg_pw.group(1)) if pg_pw else "模板里没有这一行",
+)
+# 模板里也不能出现一条 enabled 的 MINDMAP_PG_DSN：连外部库是例外路径，
+# 留着会盖掉 compose 里那条指向 postgres 服务名的正确配置。
+active_dsn = re.search(r"^MINDMAP_PG_DSN=(.+)$", env_example, re.M)
+check(".env.example: MINDMAP_PG_DSN 未硬编码（交给 compose）", active_dsn is None, active_dsn.group(0) if active_dsn else "")
 
 # 首装模板里的代理默认值：留空会走兜底猜本机 7897（服务器上没人监听 → 五个源全挂），
 # 所以模板必须写 none（直连只丢维基一条）。这条曾经在两处都不对：模板留空、
@@ -377,7 +449,45 @@ check(
     template.group(0) if template else "模板里没有这一行",
 )
 
-# dx: 每个 docker/ 下的文件都要被 Dockerfile 或 compose 引用（没有孤儿文件）
+# ---------------------------------------------------------------- CI 也连真库
+# 后端测试自迁移起就要连一个真的 PostgreSQL（conftest 每用例 DELETE FROM 全表），
+# CI 上没有库就是整套后端测试全红。这两条断言的是"CI 与本地跑的是同一个形状"：
+# backend job 里必须有 postgres service，且 pytest 步骤必须把 MINDMAP_TEST_DSN
+# 显式指过去（缺这一行 conftest 会落到它们自己的本机默认端口 55433）。
+ci_path = ROOT / ".github/workflows/ci.yml"
+try:
+    ci = yaml.safe_load(ci_path.read_text(encoding="utf-8")) or {}
+    ci_ok = True
+except Exception as exc:  # noqa: BLE001
+    check("ci.yml: YAML 可解析", False, repr(exc))
+    ci, ci_ok = {}, False
+if ci_ok:
+    check("ci.yml: YAML 可解析", True)
+    ci_backend = ((ci.get("jobs") or {}).get("backend") or {})
+    ci_pg = (ci_backend.get("services") or {}).get("postgres") or {}
+    check(
+        "ci.yml: backend job 有 postgres service（测试要连真库）",
+        ci_pg.get("image") == "postgres:16",
+        str(ci_pg.get("image")),
+    )
+    ci_steps = ci_backend.get("steps") or []
+    # 只认真正跑用例的那一步：Install 那步的 `pip install pytest pytest-cov`
+    # 也会命中 "pytest"，按那个找会把 env 断言错配到安装步骤上。
+    test_steps = [s for s in ci_steps if re.search(r"pytest\s+-q", str((s or {}).get("run", "")))]
+    check(
+        "ci.yml: pytest 步骤带 MINDMAP_TEST_DSN（否则回落到 conftest 的本机默认端口）",
+        bool(test_steps)
+        and any("MINDMAP_TEST_DSN" in str((s or {}).get("env") or {}) for s in test_steps),
+        "找到 %d 个 pytest 步骤" % len(test_steps),
+    )
+    checkout = [s for s in ci_steps if str((s or {}).get("uses", "")).startswith("actions/checkout")]
+    check(
+        "ci.yml: checkout 保留 fetch-depth: 0（git show 旧版本的回归测试靠它）",
+        bool(checkout) and str((checkout[0].get("with") or {}).get("fetch-depth")) == "0",
+        str((checkout[0].get("with") if checkout else None)),
+    )
+
+# 每个 docker/ 下的文件都要被 Dockerfile 或 compose 引用（没有孤儿文件）
 print()
 fails = [r for r in results if not r[0]]
 print("=" * 72)

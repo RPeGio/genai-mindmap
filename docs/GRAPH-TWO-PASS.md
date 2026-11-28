@@ -180,7 +180,7 @@ kind 分布（两次合计）：`depends_on` 12、`conflicts` 4、`part_of` 3、
 | # | 关系 | why | 材料里有没有依据 |
 |---|---|---|---|
 | 1 | 语音转写改走云端 → W1 只上 IP:8080（conflicts） | 前端录音需安全上下文，与 W1 只上 IP:8080 不做 TLS 直接冲突 | 有：`ARCHITECTURE.md` 与 `PLAN.md` 都写了"录音需安全上下文 / W1 只上 IP:8080" |
-| 2 | PG 迁移顺延验收后 → 图存储选 SQLite（conflicts） | PG 迁移顺延后 W1–W3 用 SQLite 单文件，两者是同一位置的替代方案 | 有：`RAG-DECISIONS.md` 第 4 节的取舍记录 |
+| 2 | PG 迁移顺延验收后 → 图存储选 SQLite（conflicts） | PG 迁移顺延后 W1–W3 用 SQLite 单文件，两者是同一位置的替代方案 | 有：`RAG-DECISIONS.md` 第 4 节的取舍记录（**两条前提后来都失效了**：PG 迁移已于验收后执行；图存储也已改成 Neo4j，见下） |
 | 3 | 图存储选 SQLite → 单机 compose 与 nginx（depends_on） | 选 SQLite 而非 Neo4j 的直接动因是 2C2G 单机部署的内存与算力约束 | 有：`RAG-DECISIONS.md` 第 4 节的 2C2G 内存账 |
 | 4 | 工具消息配对与回填 → OpBatch 原子应用（depends_on） | 工具结果回填后要传入更新后的候选树，依赖 OpBatch 原子应用 | 有：`AGENT_PLAN.md` 的工具协议一节 |
 | 5 | 状态机与工具执行 → op 批与原子应用（depends_on） | agent 循环的每次改树都要落成 op 批并原子应用，否则候选与保存版本会串线 | 有 |

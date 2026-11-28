@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +40,7 @@ from app.agent.tools import ToolRegistry
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source
 from app.core.errors import register_error_handlers
+from app.mindmaps import repository
 
 app = FastAPI()
 register_error_handlers(app)
@@ -1031,60 +1031,53 @@ if __name__ == "__main__":
     unittest.main()
 
 
-# ------------------------------------------------------- 迁移的并发安全（CI 红过一次）
+# ------------------------------------------------------- 补列的语义（PG 之后换了形状）
 #
-# `_ensure_columns` 是 check-then-act：`PRAGMA` 查到列不存在，然后 `ALTER`。
-# 两个连接同时进来时两边都查到"不存在"，一个成功、另一个抛
-# `duplicate column name`。本地 Windows 上时序恰好躲过去了，CI 的 Linux 上
-# `test_eight_simultaneous_begin_calls_start_exactly_one_run` 必红。
+# 原来这里有两条用例锁 `_ensure_columns` 的"check-then-act + 吞 duplicate column"：
+# SQLite 没有 `ADD COLUMN IF NOT EXISTS`，所以老实现是 `PRAGMA` 查列 → `ALTER` →
+# catch `duplicate column name`，两条用例分别验"同一次迁移跑两遍不抛"与
+# "别的 ALTER 错误仍然要抛"。
 #
-# SQLite 没有 `ADD COLUMN IF NOT EXISTS`，只能 catch。这两条钉住的是：
-# "同一次迁移跑两遍不抛"，以及"别的 ALTER 错误仍然要抛"。
+# **换到 PostgreSQL 之后那个实现整个没了**：`ADD COLUMN IF NOT EXISTS` 把竞态收进了
+# 语句本身（见 `app/db/schema.py`），没有 catch 分支可测。要测的语义只剩两条，而且
+# 都是正向的：**真的补上了**，以及**表不存在时照样抛**（后者不能丢——迁移出问题时
+# 被静默跳过，后果是"事件全部静默丢失"）。
 
 
-def test_ensure_columns_survives_a_racing_second_adder(tmp_path) -> None:
-    """模拟竞态：PRAGMA 说没有，实际别人已经加好了。
+def test_ensure_columns_adds_a_column_that_is_missing() -> None:
+    """缺列能补上。`ADD COLUMN IF NOT EXISTS` 是幂等的，跑两遍都不抛。"""
+    from app.db import schema
 
-    直接连调两次是不够的 —— 那时 PRAGMA 会看到列、走 `continue`，catch 分支
-    根本走不到。所以用一个代理把 `PRAGMA table_info` 的答案骗成"什么都没有"，
-    强制它真的去 ALTER 一个已存在的列 —— 这正是 CI 上八个并发 `begin()` 撞出来
-    的那条路。（`sqlite3.Connection.execute` 是 C 方法，`patch.object` 换不掉它，
-    所以用代理而不是 mock。）
+    with repository.connect() as conn, conn:
+        conn.execute("DROP TABLE IF EXISTS probe_ensure_columns")
+        conn.execute("CREATE TABLE probe_ensure_columns (id TEXT PRIMARY KEY)")
+    try:
+        with repository.connect() as conn, conn:
+            schema.ensure_columns(conn, "probe_ensure_columns", {"served_model": "TEXT"})
+            # 第二遍：老实现在这里靠 catch `duplicate column name` 才不炸。
+            schema.ensure_columns(conn, "probe_ensure_columns", {"served_model": "TEXT"})
+
+        with repository.connect() as conn:
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "  AND table_name = 'probe_ensure_columns'").fetchall()
+        columns = {str(row["column_name"]) for row in rows}
+        assert "served_model" in columns
+    finally:
+        with repository.connect() as conn, conn:
+            conn.execute("DROP TABLE IF EXISTS probe_ensure_columns")
+
+
+def test_ensure_columns_still_raises_on_a_missing_table() -> None:
+    """表名拼错要继续抛。
+
+    否则迁移出问题时会被静默跳过，而缺列的后果是"事件全部静默丢失"（`edits.record()`
+    把异常吞成一条 warning）。
     """
-    from app.mindmaps.repository import _ensure_columns
+    from app.db import schema
+    from app.db.errors import DatabaseError
 
-    class _BlindPragma:
-        """除了 `PRAGMA table_info` 之外，一切都转给真连接。"""
-
-        def __init__(self, real):
-            self._real = real
-
-        def execute(self, sql, *args, **kwargs):
-            if sql.startswith("PRAGMA table_info"):
-                return iter(())          # 骗它："这一列都没有"
-            return self._real.execute(sql, *args, **kwargs)
-
-    conn = sqlite3.connect(tmp_path / "probe.db")
-    conn.execute("CREATE TABLE probe (id TEXT PRIMARY KEY)")
-    conn.execute("ALTER TABLE probe ADD COLUMN served_model TEXT")   # 别人先加好了
-
-    _ensure_columns(_BlindPragma(conn), "probe", {"served_model": "TEXT"})   # 不该抛
-
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(probe)")}
-    assert "served_model" in columns
-    conn.close()
-
-
-def test_ensure_columns_reraises_errors_that_are_not_duplicates(tmp_path) -> None:
-    """只吞 `duplicate column name`。
-
-    表名拼错要继续抛 —— 否则迁移出问题时会被静默跳过，而缺列的后果是
-    "事件全部静默丢失"（`_ensure_columns` 的 docstring 里写着）。
-    """
-    from app.mindmaps.repository import _ensure_columns
-
-    conn = sqlite3.connect(tmp_path / "probe2.db")
-    conn.execute("CREATE TABLE probe (id TEXT PRIMARY KEY)")
-    with pytest.raises(sqlite3.OperationalError):
-        _ensure_columns(conn, "no_such_table", {"x": "TEXT"})
-    conn.close()
+    with repository.connect() as conn:
+        with pytest.raises(DatabaseError):
+            schema.ensure_columns(conn, "no_such_table_here", {"x": "TEXT"})

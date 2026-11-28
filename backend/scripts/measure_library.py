@@ -6,34 +6,39 @@
   2. **库的核心价值**：把请求内的 `sources` 清空、只留 `library=True`，还能不能
      召回。这一条是"材料跨请求复用"唯一不可替代的证据——`library=False` 在同样
      输入下必须返回空，否则测的就不是库。
-  3. **100 份的账**：按实测单份大小外推，给出库文件体积与 2C2G 上的判断。
+  3. **100 份的账**：按实测单份大小外推，给出库体积与 2C2G 上的判断。
 
 用法（在 `backend/` 下）：
 
     python scripts/measure_library.py
     python scripts/measure_library.py --docx "C:/path/to/报告.docx"
-    python scripts/measure_library.py --keep      # 保留临时库文件以便自己去看
+    python scripts/measure_library.py --keep      # 保留临时库，自己连上去看
 
 默认用 `docs/AGENT_PLAN.md`、`docs/RAG-DECISIONS.md` 与桌面那份实验报告 docx
-（`--docx` 可以改路径；找不到就只用两份 md）。库落在临时目录，**不碰**
-`backend/data/mindmaps.db`。
+（`--docx` 可以改路径；找不到就只用两份 md）。库是**临时 database**，**不碰**
+`MINDMAP_PG_DSN` 指的那个库。
 
-口径说明：
+口径说明（2026-11 由 SQLite 换到 PostgreSQL，数字**不能与旧报告直接比**）：
 
   - 入库耗时只算 `library.ingest`（切块 + 写库），**不含解析**。解析里 Docling
     首次要加载模型（本机实测 55 秒），混进入库耗时会把这张表变成"解析器有多慢"。
-  - "库文件增长"是 `-journal` 之外的主库文件字节差，含 SQLite 页开销。正文是
-    UTF-8 存储，中文约 3 字节/字，所以这个数一定大于字符数的 3 倍。
+  - "库有多大"现在是 `pg_database_size(current_database())`：**整个 database 的
+    逻辑体积**。旧口径是主库文件的 `st_size`，两者差在三处，缺一条都会算错：
+    ① PG 每建一个库就有固定的目录开销（PG 16 的 template1 约 7.4 MB），空库
+    不是 0 字节；② PG 页是 8 KB（SQLite 默认 4 KB），同量正文的碎片率不同；
+    ③ `pg_database_size` 不含 WAL——写放大在 `pg_wal/` 里，那是集群级共享的，
+    不属于任何单库。所以这个数**不再**等价于"磁盘上多占了这么多"。
+  - 逐材料增长用"入库前后的差"，所以①那笔固定开销被减掉了；`100 份外推`
+    用的是同一个差值，口径自洽。
   - 检索耗时用 `search_parent(..., library=True)` 冷启动一次、再取 3 次中位数。
     `library=True` 每次都要从库里读最近 100 份正文做粗筛，这是它的固定成本。
 """
 from __future__ import annotations
 
 import argparse
-import os
+import atexit
 import statistics
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -42,10 +47,21 @@ REPO = BACKEND.parent
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-# 库落临时目录。必须在第一次 `repository.connect()` 之前设好：`db_path()` 每次都
-# 读环境变量，但连接一旦建好就不会再改路径。
-_WORK = Path(tempfile.mkdtemp(prefix="library-measure-"))
-os.environ["MINDMAP_DB_PATH"] = str(_WORK / "library.db")
+# `scripts/` 不是包，`_pg_tmp` 就在旁边。显式插一次而不是指望 sys.path[0]。
+SCRIPTS = Path(__file__).resolve().parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import _pg_tmp  # noqa: E402  （必须在 sys.path 插好之后）
+
+# 库是临时 database，且必须在**第一次 `repository.connect()` 之前**建好并建表：
+# 这个脚本会重灌材料、清空重建 100 份的副本，落在真库里就是把开发库冲掉。
+# 为什么用模块级 `create()` + `atexit` 而不是 `with`：本脚本的流程全在 `main()`
+# 里、模块级还要先准备好库再 import app（下面那些 `noqa: E402` 就是这层顺序），
+# 没有一处能把整段包进 `with`。`atexit` 在进程正常退出时等同于收尾，`_pg_tmp`
+# 的 `close()` 自己也幂等（`main` 里提前关过一次也不会重复 DROP）。
+_DB = _pg_tmp.TempDatabase.create("mm_library")
+atexit.register(_DB.close)
 
 from app.contracts.source import Source, SourceKind  # noqa: E402
 from app.ingestion.service import parse_bytes  # noqa: E402
@@ -70,7 +86,21 @@ QUERIES = [
 
 
 def _db_bytes() -> int:
-    return (Path(os.environ["MINDMAP_DB_PATH"])).stat().st_size
+    """整个 database 的**逻辑**体积（不是磁盘占用，口径见模块 docstring）。
+
+    为什么用 `pg_database_size` 而不是 `pg_total_relation_size`：后者只算指定的表，
+    会漏掉 `schema_migrations` 与序列，而且旧口径（SQLite 的 `st_size`）本来就是
+    "整库"；两者都是整库才谈得上"入库前后差多少"。也不能用 `current_database()` 的
+    目录 `du`：那要跑 shell，且 WSL 与 Windows 两侧看到的路径不一样。
+    """
+    from contextlib import closing
+
+    from app.mindmaps import repository
+
+    with closing(repository.connect()) as conn:
+        row = conn.execute(
+            "SELECT pg_database_size(current_database()) AS n").fetchone()
+    return int(row["n"])
 
 
 def _scale_probe(materials: list[tuple[str, object]], count: int = 100) -> None:
@@ -79,7 +109,7 @@ def _scale_probe(materials: list[tuple[str, object]], count: int = 100) -> None:
     **只测成本，不测召回质量**：这份副本是按模板轮换生成的（正文几乎相同，只多
     一行唯一注释让 `content_hash` 不同），所以它们互相竞争同一个查询——那是
     "重复内容"的形态，不是真实语料。要说的是：正文量放大到 100 份时，落库要多久、
-    库文件多大、一次 `library=True` 检索要读多少字节与多少毫秒。
+    库体积多大、一次 `library=True` 检索要读多少字节与多少毫秒。
 
     这一段的库是**清空重建**的（前面的 3 份测量已经完成），所以行数与体积都从
     建表基线重新计。
@@ -103,7 +133,7 @@ def _scale_probe(materials: list[tuple[str, object]], count: int = 100) -> None:
     print(f"{count} 份的成本实测（副本轮换生成，只测成本）")
     print("=" * 68)
     print(f"正文合计：{chars / 1000:.0f} 千字符 / 切块 {chunks} 行")
-    print(f"库文件：{baseline} B → {_db_bytes()} B"
+    print(f"库体积：{baseline} B → {_db_bytes()} B"
           f"（+{grown / 1024 / 1024:.2f} MB，{grown / max(chars, 1):.2f} B/字符）")
     print(f"入库总耗时：{ingest_seconds:.1f} 秒（{count / ingest_seconds:.1f} 份/秒）")
 
@@ -142,11 +172,11 @@ def main() -> int:
     args = parser.parse_args()
 
     rows = _material_rows(args.docx)
-    print(f"库文件：{os.environ['MINDMAP_DB_PATH']}")
+    print(f"临时 database：{_DB.name}（{_DB.dsn}）")
     print(f"材料：{len(rows)} 份\n")
 
-    # 建表之后的基线（三张 CREATE TABLE IF NOT EXISTS 的页开销也算进"库有多大"，
-    # 但不算进"材料带来了多少"。）
+    # 建表之后的基线（建表带来的目录/页开销也算进"库有多大"，但不算进"材料带来了
+    # 多少"——两处都用差值，那笔固定开销自然被减掉。）
     library.list_sources()
     baseline_bytes = _db_bytes()
 
@@ -180,7 +210,7 @@ def main() -> int:
           f"{sum(ingest_ms):>9.1f}{total_chars * 3 / 1024:>9.0f}")
 
     sources = library.list_sources()
-    print(f"\n库文件：建表后 {baseline_bytes} B → 入库后 {_db_bytes()} B"
+    print(f"\n库体积：建表后 {baseline_bytes} B → 入库后 {_db_bytes()} B"
           f"（+{grown} B，{grown / max(total_chars, 1):.2f} B/字符）")
     print(f"表内行数：library_sources={len(sources)}  library_chunks={total_chunks}")
     print(f"入库耗时：中位 {statistics.median(ingest_ms):.1f} ms/份"
@@ -232,11 +262,11 @@ def main() -> int:
     print(f"单份均值：{per_source['chars']:.0f} 字符 / {per_source['bytes']:.0f} B"
           f" / {per_source['chunks']:.0f} 行 / {per_source['ms']:.1f} ms")
     print(f"100 份：正文 {per_source['chars'] * 100 / 1000:.0f} 千字符，"
-          f"库文件 {per_source['bytes'] * 100 / 1024 / 1024:.2f} MB，"
+          f"库体积 {per_source['bytes'] * 100 / 1024 / 1024:.2f} MB，"
           f"切块 {per_source['chunks'] * 100:.0f} 行，"
           f"入库 {per_source['ms'] * 100 / 1000:.1f} 秒")
     # prune 的默认上限是 200 条：库真正会停在那儿，不是"无限增长"。
-    print(f"200 条上限（prune 默认 keep_count）：库文件 "
+    print(f"200 条上限（prune 默认 keep_count）：库体积 "
           f"{per_source['bytes'] * 200 / 1024 / 1024:.2f} MB，"
           f"切块 {per_source['chunks'] * 200:.0f} 行")
     print(f"检索时读放大：最近 100 份 ≈ {per_source['chars'] * 100 / 1000:.0f} 千字符"
@@ -245,17 +275,17 @@ def main() -> int:
     if args.hundred:
         _scale_probe(parsed)
 
-    if not args.keep:
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            candidate = Path(str(os.environ["MINDMAP_DB_PATH"]) + suffix)
-            if candidate.exists():
-                candidate.unlink()
-        try:
-            _WORK.rmdir()
-        except OSError:
-            pass
+    # 收尾：默认删掉这个临时 database（并关池）。`--keep` 的语义从"把库文件留在
+    # 磁盘上"变成"把这个 database 留在集群里"——文件能留在原地是 SQLite 的性质，
+    # database 只有"存在/不存在"，所以要么删、要么留着并告诉人怎么手动删。
+    # `atexit` 上那个 close 必须先摘掉，否则进程退出时还是会 DROP。
+    if args.keep:
+        atexit.unregister(_DB.close)
+        print(f"\n临时 database 已保留：{_DB.name}")
+        print(f"  连上去看：psql \"{_DB.dsn}\"")
+        print(f"  用完删掉：DROP DATABASE \"{_DB.name}\" WITH (FORCE);")
     else:
-        print(f"\n库文件保留在：{os.environ['MINDMAP_DB_PATH']}")
+        _DB.close()
 
     return 0 if hit_any else 1
 

@@ -13,8 +13,8 @@
 3. 图里还没有实体——建图要真调模型，刚 clone 的机器上就是空的。
 
 跨文档那两条再多一道：图上的边存的是**建图时那个库**的持久 `source_id`，没有那个库
-（`MINDMAP_LIVE_LIBRARY_DB`）就解不出正文，`search_graph` 会把每条证据都丢掉——那时
-要 skip 而不是断言"图没用"。
+（`MINDMAP_LIVE_LIBRARY_DSN`，一条指向"建图时用的那个 PG 库"的连接串）就解不出正文，
+`search_graph` 会把每条证据都丢掉——那时要 skip 而不是断言"图没用"。
 
 端到端入库默认 skip：它真调一次模型（花钱、看网络）。要看它跑：
 `MINDMAP_LIVE_LLM=1 pytest tests/test_graph_neo4j_live.py -k end_to_end`。
@@ -42,7 +42,7 @@ URI_ENV = "MINDMAP_TEST_NEO4J_URI"
 USER_ENV = "MINDMAP_TEST_NEO4J_USER"
 PASSWORD_ENV = "MINDMAP_TEST_NEO4J_PASSWORD"
 DATABASE_ENV = "MINDMAP_TEST_NEO4J_DATABASE"
-LIBRARY_ENV = "MINDMAP_LIVE_LIBRARY_DB"
+LIBRARY_ENV = "MINDMAP_LIVE_LIBRARY_DSN"
 LLM_ENV = "MINDMAP_LIVE_LLM"
 
 # 端到端那条要真调模型，而 `conftest.clean_env` 把 `MINDMAP_LLM_*` 全清空了（这是
@@ -139,10 +139,10 @@ def test_crossdoc_queries_can_hit_two_materials(live_graph, monkeypatch):
     断言写成"至少一条"而不是逐条：命中取决于图里抽出了哪些实体名，而那是模型的
     产物，逐条断言会把测试钉死在一张具体的图上。
     """
-    db = os.getenv(LIBRARY_ENV, "").strip()
-    if not db:
-        pytest.skip(f"未提供建图时用的库（{LIBRARY_ENV}）：边上的 source_id 解不出正文")
-    monkeypatch.setenv("MINDMAP_DB_PATH", db)
+    dsn = os.getenv(LIBRARY_ENV, "").strip()
+    if not dsn:
+        pytest.skip(f"未提供建图时用的库（{LIBRARY_ENV}，一条 PG 连接串）：边上的 source_id 解不出正文")
+    monkeypatch.setenv("MINDMAP_PG_DSN", dsn)
     monkeypatch.setenv("MINDMAP_GRAPH_SEARCH", "1")
 
     module = _load_eval_module()

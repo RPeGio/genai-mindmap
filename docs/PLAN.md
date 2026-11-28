@@ -12,8 +12,8 @@
 | 分工 | **A**（RPeGio）：契约、前端、画布/布局/主题/导出、协作客户端、部署基建、CI；**B**（陈嘉涛）：生成链路、多模态解析、RAG、诊断、代理、评估集、后端地基 |
 | 交界 | 契约、SSE 协议、协作协议、上线联调 —— 改动必须双人 review |
 | 前端 | Vue 3 + TypeScript + Vite + Pinia + Tailwind + `@vue-flow/core` + Vitest |
-| 后端 | FastAPI + Pydantic v2 + httpx + `sqlite3` 直连；`pydantic-settings` / SQLAlchemy / Alembic 顺延到验收之后（Q35），当前配置经 `os.getenv` 读取，见第 10 节 |
-| 数据 | PostgreSQL 16（compose 容器）+ pgvector（W3） |
+| 后端 | FastAPI + Pydantic v2 + httpx + psycopg 3（`backend/app/db/` 兼容层，连接串 `MINDMAP_PG_DSN`）；**不引入** SQLAlchemy / Alembic（D3：零 ORM 项目里它俩只解决 DDL 版本管理，幂等 DDL + `schema_migrations` 表 ~150 行就够），当前配置经 `os.getenv` 读取，见第 10 节 |
+| 数据 | PostgreSQL 16（导图、运行记录、知识库分块、调用记录都在这）；向量仍存 `bytea` 由 `vector_cache.py` 管，pgvector 索引未上（D7） |
 | 协作 | Yjs + `y-websocket`（独立 Node 容器） |
 | 部署 | 阿里云 ECS 2C2G / 40G ESSD / Alibaba Cloud Linux 3.2104 / 华南1深圳 / 无 GPU，`docker compose` 五容器，公网 `IP:8080` |
 | 铁律 | 深度优先；每个功能能口头讲清数据流；不返回假成功；**11/22 功能冻结** |
@@ -24,7 +24,7 @@
 |---|---|---|
 | 讲清代码逻辑 | 每个 PR 附「讲解稿」：做什么 / 为什么这么写 / 边界与失败路径；每周互讲 30 分钟；面试前 20 题抽问 | PR 历史 + 白板讲架构 |
 | 独立部署运行 | Compose 五容器 + PG 迁移 + 备份脚本 + 健康探针 + 一键部署脚本 | 现场 `curl /api/health`，`docker compose ps` |
-| 含数据库及基建 | PG 实例、Alembic 版本、每日 `pg_dump`、Nginx 反代、systemd/compose 自启、swap | 打开备份目录与迁移历史 |
+| 含数据库及基建 | PG 16 实例、`schema_migrations` 版本记录（不引 Alembic，见 Q35）、每日 `pg_dump -Fc`、Nginx 反代、systemd/compose 自启、swap | 打开备份目录与 `select * from schema_migrations` |
 | GitHub 留档 | `main` / `dev` / `feat/*`·`fix/*`，PR 双人 assign，Conventional Commits（中文），阶段 tag | 分支图 + tag 列表 |
 | 不许完全依赖 AI | 讲解稿制度 + 抽问 + 每人对**另一侧**至少一个核心模块可讲 | 交叉抽问当场答 |
 
@@ -87,7 +87,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 **关键取舍（答辩要能讲）**
 
 1. **生成改单次流式**：一次模型调用，边收 token 边解析 JSON，节点逐个推送（首节点 1–2 秒、完整 2–3 秒）。曾在「两段式（先骨架再展开）」与「单次增量」之间做过对比，最终保留单次增量：调用次数减半、代码与测试都更简单。代价是中途失败没有「保留骨架」的降级结果。详见 [ARCHITECTURE_ADDENDUM.md](ARCHITECTURE_ADDENDUM.md)。
-2. **存储换 PG 不再保留 SQLite 双轨**：部署要求"含数据库"，协作快照、`llm_calls`、pgvector 都要真库；双轨会让测试与迁移分叉。开发与 CI 都用 compose 起的 PG，单测用事务回滚隔离。
+2. **存储换 PG 不再保留 SQLite 双轨**：部署要求"含数据库"，协作快照、`llm_calls`、pgvector 都要真库；双轨会让测试与迁移分叉。开发与 CI 都连同一个 PG 16 服务端形态（`MINDMAP_PG_DSN` / 测试用 `MINDMAP_TEST_DSN`），**单测隔离不是"事务回滚"**：同一库 + 每测试 `DELETE FROM` 全表，需要时 `ALTER SEQUENCE ... RESTART` 重置序列（终态 17 张表实测 17.4ms/次；`TRUNCATE` 332ms、`CREATE DATABASE ... TEMPLATE` 127ms 全否决）。事务回滚做不到，是因为现有代码里有 `BEGIN IMMEDIATE`/`COMMIT` 与建表 DDL，它们会跟外层测试事务打架。SQLite 那份一次性导入后即退役，旧文件原样保留作回滚点（`mindmaps.db.pre-pg`）。
 3. **协作必须真 CRDT**：现有乐观锁只能防覆盖，无法合并并发编辑。Yjs 单房间 + 房间 token（api 签发）+ 30s 快照。映射层（`MindMapContent` ↔ `Y.Map`）自研，这是能讲清的技术点。
 4. **视觉直接用 `deepseek-flash`，不引入第二家**：该模型原生支持图片输入，三种传法（base64 内联 / 外链 / Files API `file_id`），单图上限 32 MiB（base64）或 64 MiB（file_id），请求体 48 MiB，每图最多计 1024 token，且图片只能出现在 `user` 消息中。我们走**前端压缩到 1600px → base64 内联**，草图为一次性输入，不需要 Files API 复用。
 5. ~~**ASR 做成可插拔 sidecar**~~ **（已推翻，2026-11-04；后续又换过一次实现）**：原计划 `moss`（默认，带说话人分离）/ `aliyun`（线上备选）/ `faster-whisper`（降级档 + 评测基线），线上 2C2G 不常驻 MOSS 模型。第一次实测后排除了本地方案——`sherpa-onnx` paraformer-zh-small 在 2C2G 上常驻 143 MB、短音频 RTF 0.013，但架构吃不下长输入（33.8 秒整段 CER 86.4%，60 秒直接返回空串并抛 onnxruntime Reshape 错误）。第二次实测又把云端接口从 ISI 一句话识别换成百炼 Qwen-Audio-ASR：后者自带句级/词级时间戳、60 秒音频快 2.8 倍、便宜 3.9 倍、单次时长从 60 秒放宽到 300 秒（见 v1.7）。多后端抽象始终没有价值——每次都只有一条路能跑通，留着切换开关等于维护几个用不上的分支。数字见 [部署文档](DEPLOY.md) 第 6 节。
@@ -98,7 +98,7 @@ F09 鱼骨图、F14 知识图谱嵌入对比实验、F21 模型微调、F22 Kube
 | 容器 | 常驻估算 |
 |---|---|
 | 系统 + Docker | 300 MB |
-| postgres | 180 MB（`shared_buffers=128MB`、`work_mem=4MB`） |
+| postgres | 实测：空闲 45 MB / 连接池预热 67 MB / 8 线程写压测后 **168 MB**（`shared_buffers=128MB`、`work_mem=4MB`）。纸面的 180 MB 是估算，**偏乐观 20–30 MB**——它没算连接池 + 每语句 `SAVEPOINT` 的叠加；但仍属同一量级，下表合计按 180 MB 排、不调高（生产 RSS 峰值一旦超 250 MB，就把池 `max_size` 从 8 降到 4，实测池 idle 单连接仅 1–2 MB，有退路） |
 | api（1 worker） | 200 MB |
 | ys（Node） | 90 MB |
 | nginx | 20 MB |
@@ -183,7 +183,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
 | `MINDMAP_LLM_API_KEY` | — | 调用密钥，只从环境变量读，不进代码库与日志 |
 | `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（端点 `https://api.commandcode.ai/provider/v1`），此前用 `deepseek-flash`。PDF 视觉识别与图片识别复用同一组变量 |
-| `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径，留空即取默认值 |
+| `MINDMAP_PG_DSN` | 一条完整连接串，缺省 `postgresql:///mindmaps?host=/var/run/postgresql` | PostgreSQL 连接串，原 `MINDMAP_DB_PATH`（SQLite 文件路径）已废除。**改名不只是换个地址**：cookie 签名密钥从这条串派生（`auth/store.py`），所以迁移上线后所有既有会话都会失效一次，须写进发布说明 |
 | `DASHSCOPE_API_KEY` | — | 百炼语音转写（F07）。没配时 `.wav` 上传返回 422 |
 | `MINDMAP_SOFFICE_CMD` | — | `soffice` 完整路径；不配则从 `PATH` 找。`.doc`/`.ppt` 转换需要 |
 | `MINDMAP_AGENT_ENABLED` | `1` | 设为 `0` 关闭 `/api/agent/runs/stream` |
@@ -198,7 +198,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | 变量 | 依赖功能 | 状态 |
 |---|---|---|
 | `APP_ENV` | 区分 dev / prod | 未排期 |
-| `DATABASE_URL` | PostgreSQL 迁移 | Q35：顺延到验收之后 |
+| `DATABASE_URL` | PostgreSQL 迁移 | **已执行**：实际用的变量名是 `MINDMAP_PG_DSN`（见 10.1），没有引入这个通用名 |
 | `JWT_SECRET` / `JWT_TTL_HOURS` / `FERNET_KEY` / `DAILY_LLM_QUOTA` | 登录签发、BYOK 加密、每日配额 | F12 为单用户单库，暂不需要 |
 | `ASR_BACKEND` / `ASR_URL` / `ASR_MAX_SECONDS` / `ASR_WHISPER_MODEL` / `ASR_WHISPER_COMPUTE` | 语音转写（F07） | **已作废**。原计划的多后端（MOSS / faster-whisper / aliyun）没有落地。实际语音只用一个变量 `DASHSCOPE_API_KEY`（阿里云百炼），见 [部署文档](DEPLOY.md) 第 6 节。选型理由：本地方案在 2C2G 上吃不下长输入（33.8 秒整段 CER 86.4%），云端接口则自带时间戳且更便宜 |
 
@@ -224,7 +224,7 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | Q32 | W1 只上 `IP:8080`，域名与 CF 推迟 W3 | 备案不可控（R1）；验收只看"能独立部署并访问"，TLS 不是硬门 |
 | Q33 | 前端换 Vue 生态（陈嘉涛已同意）；**先做 D4**（R1 骨架、R2 画布、R3 编辑保存） | 前端负责人只熟 Vue；R1 已完成（PR #3），画布是答辩主视觉，优先于后端地基 |
 | Q34 | 双人 review **仅**在 fork → 上游 PR 时强制；本仓库 dev 分支的 PR 由提交人自己 review 后合并 | 仓库是 fork，日常产出先落在自己仓库；向上游提 PR 时再走 `CODEOWNERS`，由 RPeGio 与陈嘉涛互相 assign |
-| Q35 | **后端地基压缩**：采纳陈嘉涛在 `NEXT-PLAN.md` 的建议，W1 只做「统一错误体 + `urllib`→`httpx`」两项；SQLAlchemy / Alembic / PostgreSQL 迁移顺延到**验收之后**，v1 继续 `sqlite3` 直连 | RPeGio 2026-11-03 确认。理由：契约 v2 与 ORM 迁移无法在 W2 前同时装进两地排期；错误体与 httpx 已由陈嘉涛在 `027b0c9` 落地。影响：第 3 节架构图中的 PG16、第 5 节验收门第 7 条（compose 五容器含 `db`）同批顺延到验收后，W1–W3 以 SQLite 单文件 + 备份脚本兑现"含数据库"的部署要求 |
+| Q35 | **后端地基压缩**：采纳陈嘉涛在 `NEXT-PLAN.md` 的建议，W1 只做「统一错误体 + `urllib`→`httpx`」两项；SQLAlchemy / Alembic / PostgreSQL 迁移顺延到**验收之后**，v1 继续 `sqlite3` 直连。**该顺延项已于验收后执行完毕**（见 [PG 迁移方案](PG-MIGRATION-PLAN.md)）：存储换 PostgreSQL 16，SQLAlchemy / Alembic 仍未引入——第一轮把 `alembic` 当硬性前置，实测后推翻，改成幂等 DDL + `schema_migrations` 表 | RPeGio 2026-11-03 确认。理由：契约 v2 与 ORM 迁移无法在 W2 前同时装进两地排期；错误体与 httpx 已由陈嘉涛在 `027b0c9` 落地。影响：第 3 节架构图中的 PG16、第 5 节验收门第 7 条（compose 五容器含 `db`）同批顺延到验收后，W1–W3 以 SQLite 单文件 + 备份脚本兑现"含数据库"的部署要求。**执行结果**：PG16 这条已兑现（导图/运行/知识库/调用记录全在真库里），"SQLite 单文件 + 备份脚本"随之退役，备份换成 `pg_dump -Fc`；那条"顺延"只剩 SQLAlchemy 与 Alembic 两项，且这两项已判定不引入 |
 | Q36 | **实时协作（F17）保留，但排期延后**：不设 W2 硬门，W3 有余量再做，无余量则降级为文档说明 | 陈嘉涛倾向实现协作，RPeGio 同意保留该功能（`NEXT-PLAN.md` 原提议"W2 不做协作"不再成立）；协作依赖画布稳定与 save/undo 语义，先做完 R2–R3 再评估余量，避免两条线并行时相互阻塞 |
 | Q37 | **`main` 转为生产分支**：`main` ← `dev` ← `feat/*`；里程碑时 `dev` → `main` 合入并在 `main` 上打 tag，部署与回滚都以 tag 为准，ECS 只跟 `main` | 核心功能（生成、画布、编辑保存、多来源、引用、导出）已打通，需要一个稳定的"线上是什么"的答案；此前 main 与 dev 长期同步推进，无法区分"能演示"与"正在改"。`dev` 保留为集成分支，未验证完的改动不落到生产 |
 
@@ -278,3 +278,4 @@ Docker Swarm/K8s、多租户与权限矩阵、离线协作与冲突合并 UI、�
 | v1.43 | 2026-11-24 | **外部检索走上代理，但只给检索走**。境内机器上 `zh.wikipedia.org` 直连被掐 TLS（`curl: (35) SSL_ERROR_SYSCALL`），而 arXiv / OpenAlex / Crossref / 百科都通，所以需要的是「只给外部检索用」的代理，不是系统代理。全仓只有 `backend/app/knowledge/external.py::_client()` 显式传 `proxy=` 且 `trust_env=False`，其余九处 httpx 客户端（模型调用、ASR、PDF 视觉、embedding、rerank、测试连接）默认 `trust_env=True`——所以只能设 `MINDMAP_EXTERNAL_PROXY`，绝不能设 `HTTP(S)_PROXY`，也**不能用 `clash-cli on`**（它的 `_set_system_proxy()` 导出的就是那七个变量）。同一条纪律的第三处：`clash-cli install` 会 `exec bash -i`（`script/common.sh` 的 `_quit()`），在非交互 shell 里 stdin 是管道，实测永久挂住 10 分钟不返回，成功路径末尾也走它——改手工铺二进制。ECS 侧结果（实测）：mihomo v1.19.2 只监听 `127.0.0.1:7890`、`dns.enable: false`、不开 tun / system-proxy；`proxy-providers` 直接吃 base64 的 vless/hysteria2 订阅（78 个节点，不需要 subconverter）；`rules` 只有 `wikipedia.org` / `wikimedia.org` 三条走 `PROXY`、私网四条 `DIRECT`、末条 `MATCH,DIRECT`——这就是「收窄」本身，将来误设 `HTTP(S)_PROXY` 也不会把国内端点绕出国。**两个非显然的选择**：① 组类型用 `fallback` 而不是 `url-test`，且健康检查目标指向维基 API 而不是 `generate_204`——实测很多节点 gstatic 通（300–2000ms）而维基一上去就 `SSL_ERROR_SYSCALL`，`url-test` 会挑那个「最快」的、恰好是不能用的；② `dns.enable: false`，这台机器上还跑着模型调用与 pip，劫持 DNS 收益是零、风险是整站出网。应用侧只加一个变量 `MINDMAP_EXTERNAL_PROXY=http://127.0.0.1:7890` 进 `/etc/genai-mindmap/env`；验收判据是 `/proc/<MainPID>/environ` 里（用 `tr '\0' '\n'` 展开之后 grep `-i proxy`）**只有这一个**，以及用应用自己的库真检索一次能拿到 4 条（接之前 0 条、且日志里只剩源站自身状态造成的 arXiv 429 / 快懂 404）。代码侧本轮只加一件事：兜底值 `DEFAULT_PROXY` 现在会**告警一次**（它在本机是对的、在服务器上是错的，而错的表现是「五个源全连不上、上层只看到没搜到外部资料」——坏了和本来就没有长得一样；逐次 warning 又会把真问题淹掉，所以只写一次、但第一次把话说全：名字、兜底值、怎么显式设置、`none` 表示直连）。`deploy/install.sh` 的 env 模板补上 `MINDMAP_EXTERNAL_PROXY=none` 与那段注释——**默认给直连而不是留空**：留空会走兜底去猜本机 7897，而服务器上没人监听，那是把「只丢维基一条」换成「五个源全挂」。基线 2685 → **后端 2703（另有 29 subtest）、前端 1055（65 文件，未变）**。 |
 | v1.44 | 2026-11-25 | **免费档的预算与"它在动"：`max_seconds` 600 → 1800，新增 `thinking` 帧**。① 预算：实测免费档整条 `mindmap_generate` **567.6 秒**（33 节点：结构段 311.7s + 写说明段 232.8s + 收尾 12.7s，`recursive/flint-v1.0:free`，中途两次 524 换候选成功），另有一次 600.1 秒被 `budget_exhausted / max_seconds` 掐断。也就是说 600 秒对免费档不是"余量偏薄"，是**刚好卡在正常生成的耗时上**——同样一张图多几个节点就会在收尾前被打断。`RunBudget.max_seconds` 默认值改 1800（上限仍是 3600，那是"卡住不动"的物理边界）；**前端根本不发 `budget`，所以默认值即实际生效值**。配套：systemd 的 `TimeoutStopSec` **刻意留在 90 秒不跟着调大**——发版需要立刻生效，而被打断的那次有检查点兜底（用户在"上次的结果"里点「补齐说明」接着做完）。`docs/DEPLOY.md` 那句 `TimeoutStopSec=660` 是早就过期的错数，本轮一并改准。② 思考帧：实测这些模型把大量 token 花在 reasoning 上（同一份提示词 65536 额度时 reasoning 2123），而 `_stream_frame` 只取 `delta.content`，**思考过程全被丢掉**；加上事件流在 5 分钟里只有每 10 秒一次的 `heartbeat`（只带 `waited_ms`），从页面看就是彻底静默，用户分不清"在跑"与"卡死"。新增 `ThinkingEvent{type:"thinking", text}`：`_stream_frame` 改返回三元组并同时认 `delta.reasoning`（Command Code 实测的那个名）与 `delta.reasoning_content`（DeepSeek 那个名）；传递用 `generation.service` 的 `_thinking_sink` ContextVar 而不是给 `chat_async` 加参数——四十来个测试里的假 `chat()` 签名会 TypeError，而且"六个调用点逐个手传"这件事在这条链上出过（`deep_thinking` 当初一个都没传，开关白勾一整轮）。`_chat_streamed` 的 `on_delta` 因此可为 `None`（写说明那段没有预览解析器、但它是最长静默段 232.8 秒）。每片只留尾部 `THINKING_TAIL_CHARS = 200` 字符，前端拼到 `thinkingTail` 只保留最后 400 字符，**固定显示一行**、`aria-hidden`、不进 `agentEvents`；状态行那句"模型正在思考，已等 N 秒"的判据只有 `waitedMs`（思考帧到达即归零），**不要**再加"本轮收到过思考帧"那种闩锁——它一旦置真就回不来，而思考帧覆盖不到工具选择轮（见下）。思考回调自己抛错只是不再显示，正文照收。基线 2703 → **后端 2718（另有 29 subtest）、前端 1058（65 文件）**。评审之后又补了两条：① 删掉那个`thinkingSeen` 闩锁——`provider.complete_tools` 的请求体里**没有** `stream`（它用 `client.stream` 只为边收边卡体积），所以模型选工具那一轮一个思考帧都不会有，而那恰恰是最长的静默之一，闩锁会让它连"已等 N 秒"这句兜底都永久失去；`AGENT_STREAM_PROTOCOL.md` 补了「覆盖不到哪里」一节，把这条边界写成事实。② `docker/verify-static.py` 那条 `proxy_read_timeout > RunBudget.max_seconds(600)` 的 600 是手抄的，预算调到 1800 之后 `900 > 1800` 已不成立而 check 照旧 PASS——不变式换成真实的那个（`> 6 × HEARTBEAT_INTERVAL_SECONDS`，读超时计的是两次读之间的间隔，与预算无关），预算与心跳两个值都改成从源码里 `re` 读出来；三份 nginx 模板与 `DOCKER.md`/`DEPLOY.md` 的过期口径同步。基线 → **后端 2718、前端 1059（65 文件）**。 |
 | v1.45 | 2026-11-26 | **工具选择轮也有思考帧（PR#30 那条边界补上）**。v1.44 把「模型选择工具那一轮没有思考帧」写成已知边界，这轮补上：`provider._attempt` 看到**有思考消费者**才把请求改成 `stream: true`（没有消费者时请求体与改动前逐字节一致，连 `stream` 键都不带），逐帧读 SSE、把 `delta.reasoning`/`delta.reasoning_content` 转进思考通道，同时自己拼 `delta.tool_calls` 分片（`index` 是唯一稳定键，首片带 id 与函数名、后续片只有 `arguments` 的一段；缺 id、缺函数名、服务端不认 `stream` 直接回整包 JSON、流里没有可用帧——四种情况都**退回整包读**，工具选择轮不能因为想显示思考就失败）。`finish_reason == "length"` 在流式路径上照旧硬失败：半截 `arguments` 拿去执行比失败危险得多，这条纪律两条读法必须一致。SSE 帧解析从 `_stream_frame` 收敛成 `_stream_chunk`（键固定的六字段 dict），`chat_async` 与 provider 两条出口共用一份实现——两份实现漂移的后果是"一个出口能显示思考、另一个不能"。`agent.service._await_quietly` 加 `with_thinking` 形参：挂上通道后同时等"任务完成"与"下一帧思考"（`FIRST_COMPLETED`），思考帧转成 `ThinkingEvent` 推出、静默计时归零；**挂通道必须发生在 `ensure_future` 之前**——Task 创建那一刻就复制了 ContextVar，反过来的顺序会让被等者永远看不到通道（端到端测试抓到过），"先收思考再看任务"同理（同一次 wait 里两者都 done 时先看任务会把没发出去的思考带进坟墓）。基线 2718 → **后端 2733（另有 29 subtest）、前端 1059（65 文件）**。 |
+| v1.46 | 2026-11-28 | **文档跟着存储一起搬家（Q35 顺延项的收尾）**。代码迁到 PostgreSQL 16 之后，文档里"状态全在一个 SQLite 文件里"这套说法会从"过时的描述"变成"误导性的描述"——它会让人继续按单文件库的心智评估内存（以为库零成本嵌在 API 进程里）、按"拷文件"备份、按"多 worker 就是多个写者"回避并发。所以这一轮不是把 `SQLite` 替换成 `PostgreSQL` 了事，而是把三件会被旧措辞带错的事写清：① **内存账**：库现在是一个独立进程，实测空闲 45 MB / 池预热 67 MB / 8 线程写压测后 168 MB，`PLAN.md` 第 4 节那行纸面 180 MB 是估算、偏乐观 20–30 MB（没算连接池 + 每语句 SAVEPOINT 的叠加）但同量级，所以合计仍按 180 MB 排、不调高；超预算时的动作是池 `max_size` 8→4，**不是**加 worker。② **验收口径**：`conftest` 原来"每测试一个全新库文件"在 PG 上换成「同一库 + 每测试 `DELETE FROM` 全表 + 必要时重置序列」（终态 17 张表实测 17.4 ms/次，2775 条用例约 48 秒；方案定稿时按 13 张表、未含提交算出的 0.140 ms 是同一个选择的乐观口径），而不是"每测试开事务回滚"——后者与 `BEGIN IMMEDIATE` 语义和 `ensure_schema` 的 DDL 会跟外层测试事务打架。③ **迁移步骤**：`ARCHITECTURE_ADDENDUM.md` 1.4 原写的"双写观察一周"不可行（单文件库没有服务端形态，谈不上两库并跑；而且活跃库只有 20 行真实数据，观察窗口本身没有对象），改成「停服 → 跑导入脚本 → 校验行数/内容 → 切换 → 旧库文件原样留作回滚点」。同批把 `AGENTS.md` 的"2C2G 单机 + SQLite 单文件"改成 PostgreSQL 16，并补一条"单文件库那套旧直觉要换掉"，因为它正是后面所有判断的源头。**评估语料的指纹按方案 A 重算覆写**：`docs/PLAN.md` 与 `docs/ARCHITECTURE.md` 都在标注章节内，改正文必然让 `MANUAL_SOURCE_HASHES` 失配；`docs/AGENT_PLAN.md`、`docs/RAG-DECISIONS.md` 本轮没动、指纹保持不变。章节标题与两句 `focus` 锚（录音冲突那句、第 5 节的指标口径那句）刻意不动——`case` 靠 `sections` 前缀与 `focus` 逐字原文定位，动了它们不是"指纹要重算"，而是 28 条手工标注直接失去落点；**连在这里复述那两句原文也不行**，锚点要求全文恰好命中一次，变更记录里抄一遍就变成两次，装载当场 `SystemExit`。**评审之后修了十二条**（P1 两条 + P2 十条）：① `nowstamp()` 里的 `now()` 换成 **`statement_timestamp()`**——`now()` 是事务时间戳，同一个事务里隔 0.4 秒写两行，时间戳逐字节相等，而 SQLite 的 `now` 是每条语句重新求值（`library.ingest_many` 一批材料的 `created_at` 会因此全同）；也不能换 `clock_timestamp()`，它在同一条语句的多行之间就会变。② 建表不变式：`vector_cache._open()` 与 `external_cache._open()` 不再每次懒建表（每条 `IF NOT EXISTS` 在 PG 上是一次真实往返 2.458ms，而这是检索热路径），`db/schema.py` 那句"各模块的 `ensure_schema` 是薄壳"也改准了——它们其实是各自完整的建表 DDL，只是生产路径不再调用。其余十条都是注释与死代码：`row.keys()` 这类为 `sqlite3.Row` 准备的死分支、`_guest_secret` 里"库文件绝对路径"的过期论证、"测试每个用例换一个 `MINDMAP_DB_PATH`"、三处还在讲 SQLite 写锁的措辞、`ensure_columns`/`drop_columns` 的无调用现状、PRAGMA 抛 `RuntimeError` 改 `NotImplementedError`、`row_factory`/`isolation_level` 两个假 property 直接删、`docs/PG-MIGRATION-PLAN.md` 里 `schema_meta` 表名写错、`_savepoint_rollback` 的日志措辞。基线 → **后端 2737（另有 29 subtest）、前端 1059（65 文件）**。 |

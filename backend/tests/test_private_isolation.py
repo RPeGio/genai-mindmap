@@ -207,6 +207,6 @@ def test_the_style_profile_is_computed_per_person():
     assert style.read(owner="") == {}
 
     with closing(repository.connect()) as conn:
-        owners = {row[0] for row in conn.execute(
+        owners = {row["owner"] for row in conn.execute(
             "SELECT DISTINCT owner FROM style_profile")}
     assert "user:2" not in owners

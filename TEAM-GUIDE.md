@@ -51,7 +51,16 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 模型服务必须兼容 `/chat/completions`，且能按提示词返回 JSON。切回演示模式：`$env:MINDMAP_LLM_MODE = 'demo'`。
 
-数据默认存在 `backend/data/mindmaps.db`（SQLite，已排除在版本控制外）。
+数据存在 **PostgreSQL 16** 里，不再是 `backend/data/mindmaps.db` 那个文件。
+
+```powershell
+# 本机先起一个 PG（版本 16 即可），然后指定连接串；不设就用代码里的本机默认
+# postgresql:///mindmaps?host=/var/run/postgresql（Linux 上的 unix socket 形式，Windows 上要显式给）
+$env:MINDMAP_PG_DSN = 'postgresql://postgres@127.0.0.1:5432/mindmaps'
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+表结构会在启动时自动建（幂等 DDL + `schema_migrations` 记版本），不用手工跑迁移、也没有 Alembic。**第一次连不上库会直接报错，不会静默退回本地文件**——这是故意的：以前那种"悄悄落到另一个库"的行为，表现是"数据莫名其妙不见了"，比启动失败难查得多。跑测试另用 `MINDMAP_TEST_DSN`（缺省指向 `127.0.0.1:55433` 的 `mindmap_test` 库）。原 `MINDMAP_DB_PATH` 已废除；它同时参与 cookie 签名密钥的派生，所以从旧版本升级上来的机器上，**所有人（包括你自己）要重新登录一次**。详见 `docs/PG-MIGRATION-PLAN.md`。
 
 ---
 
@@ -68,7 +77,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-27，工具选择轮思考帧之后）：后端 2733 个测试（pytest，另有 29 个 subtest）、前端 1059 个 vitest 用例（65 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-28，PG 迁移评审修复之后）：后端 2737 个测试（pytest，另有 29 个 subtest）、前端 1059 个 vitest 用例（65 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -104,7 +113,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               2733 个测试（另有 29 个 subtest）
+  tests/               2737 个测试（另有 29 个 subtest）
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）

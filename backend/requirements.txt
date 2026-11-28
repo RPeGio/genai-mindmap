@@ -14,3 +14,11 @@ xlrd>=2,<3
 # 图存储（app/knowledge/graph_store.py）。5.x 与 6.x 的异常树不一样（6.0 起
 # ServiceUnavailable 不再属于 Neo4jError），代码两边都兼容，见 _session 的 docstring
 neo4j>=5.14,<7
+
+# 主存储（app/db/）。**不再有 sqlite3**：所有表都在 PostgreSQL 里。
+# `[binary]` 带预编译的 libpq，省掉目标机上装 libpq-dev 与 pg_config 的步骤
+# （2C2G 那台是 Debian 12，不装构建工具链）。池是本项目的硬性依赖而不是优化：
+# 旧实现每次操作新开连接、并在连接里重放十几条建表语句，PG 上那是 2.5ms/次，
+# 一次生成要读几十次设置——不池化等于把"微秒级"变成"几十毫秒级"。
+psycopg[binary]>=3.2,<4
+psycopg-pool>=3.2,<4

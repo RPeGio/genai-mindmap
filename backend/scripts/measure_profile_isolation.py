@@ -43,8 +43,9 @@ python scripts/measure_profile_isolation.py --run
 ```
 
 要 `MINDMAP_EMBEDDING_API_KEY`（或 `DASHSCOPE_API_KEY`）+ `MINDMAP_EMBEDDING_BASE_URL`。
-**走临时库**（`data/_profile_isolation.db`），不动 `data/mindmaps.db`：这个脚本会
-反复建表、清库、重灌材料，跑在真库上等于把用户的 18 份来源与 23 张图冲掉。
+**走临时 database**（每次现建、跑完删掉），不动 `MINDMAP_PG_DSN` 指的那个库：这个脚本
+会反复清库、重灌材料，跑在真库上等于把用户的 18 份来源与 23 张图冲掉。要看结果就
+`--keep-db`（保留这个库并打印 psql 连法），要跑在固定的库上就 `--db <库名>`。
 
 不调模型：量的是检索 + 重排，`rag_query` 那一层不需要 LLM 参与就能给出这三个数。
 """
@@ -56,11 +57,13 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BACKEND)
+# `scripts/` 不是包，`_pg_tmp` 就在旁边；显式插一次（与本目录其它脚本同一做法）。
+sys.path.insert(0, SCRIPTS)
 
-DEFAULT_DB = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data",
-    "_profile_isolation.db")
+import _pg_tmp  # noqa: E402  （必须在 sys.path 插好之后）
 
 # ---------------------------------------------------------------- 两组材料
 #
@@ -231,13 +234,15 @@ class Counter:
         self._saved.clear()
 
 
-def _prepare_db(path: str) -> list[str]:
-    """建临时库、灌两组材料、返回 (图 A 的 source_id 列表)。
+def _prepare_db() -> list[str]:
+    """灌两组材料、返回全部 source_id（前 3 个是图 A、后 3 个是图 B）。
 
     材料进库走 `library.ingest`——与生产路径同一个入口，所以落库形态、`content_hash`
     唯一约束、切块台账全都与真跑一致。
+
+    库由调用方先准备好（`_run` 里建临时 database 并 `init_schema()`）：这个函数自己
+    不碰 DSN、也不建表，否则"谁负责清理"会分散到两处。
     """
-    os.environ["MINDMAP_DB_PATH"] = path
     from app.contracts.source import Source
     from app.knowledge import library
 
@@ -248,7 +253,7 @@ def _prepare_db(path: str) -> list[str]:
     return ids
 
 
-def _warm(path: str, ids: list[str], counter: Counter) -> None:
+def _warm(ids: list[str], counter: Counter) -> None:
     """把两组材料的子块向量灌进 `chunk_vectors`——模拟"这些材料被检索过一次"。
 
     这是 A/B **都要付**的底座成本，所以它不计入任何一组的画像成本；而它产生的
@@ -348,7 +353,7 @@ def _detail(hits: list[Any], boosted: Any, own_ids: set[str],
     return lines
 
 
-def _run(keep_db: bool = False, path: str = DEFAULT_DB) -> int:
+def _run(keep_db: bool = False, db_spec: str = "") -> int:
     from app.knowledge import embedding, service
     from app.knowledge.library import load
     from app.prefs import profile
@@ -358,19 +363,31 @@ def _run(keep_db: bool = False, path: str = DEFAULT_DB) -> int:
               "MINDMAP_EMBEDDING_BASE_URL 再跑。")
         return 2
 
-    if os.path.exists(path):
-        os.remove(path)
-    ids = _prepare_db(path)
-    a_ids, b_ids = set(ids[:3]), set(ids[3:])
-    a_sources = [source for source in (load(i) for i in ids[:3]) if source]
-    b_sources = [source for source in (load(i) for i in ids[3:]) if source]
-    titles = {source.id: (source.filename or source.id)
-              for source in (*a_sources, *b_sources)}
+    # 库的生命周期在这里收口：`--db` 给了就指向那个库（同集群里没有就建），
+    # 没给就现建一个一次性 database——两种都由 `_pg_tmp` 负责 `init_schema()`。
+    # 为什么不用 `with` 包住整个 `_run`：`--keep-db` 要"跑完**不**删"，而 `with` 的
+    # 出口无条件删；所以这里显式 create，清理放在 finally 里按 keep_db 分叉。
+    if db_spec:
+        _dsn, created = _pg_tmp.persistent_database(db_spec)
+        temp: _pg_tmp.TempDatabase | None = None
+        db_label = db_spec + ("（本次新建）" if created else "（复用已有）")
+    else:
+        temp = _pg_tmp.TempDatabase.create("mm_profile_iso")
+        db_label = temp.name
+    print(f"库：{db_label}")
 
     counter = Counter()
     counter.install()
     try:
-        _warm(path, ids, counter)
+        # 灌材料放在 try 里：建库已经成功，这一步要是失败，库里会留下一个
+        # 孤儿 database（临时库没人收、--keep-db 之外也不该留），所以清理统一走 finally。
+        ids = _prepare_db()
+        a_ids, b_ids = set(ids[:3]), set(ids[3:])
+        a_sources = [source for source in (load(i) for i in ids[:3]) if source]
+        b_sources = [source for source in (load(i) for i in ids[3:]) if source]
+        titles = {source.id: (source.filename or source.id)
+                  for source in (*a_sources, *b_sources)}
+        _warm(ids, counter)
         print(f"底座：{len(ids)} 份材料入库，块向量预热用掉 {counter.calls} 次调用 / "
               f"{counter.texts} 条文本（A/B 共用，不计入任何一组的画像成本）\n")
 
@@ -459,21 +476,33 @@ def _run(keep_db: bool = False, path: str = DEFAULT_DB) -> int:
         print("条上限 = 6 次调用。隔离那组在两种库里都是 0 次。")
     finally:
         counter.remove()
-        if os.path.exists(path) and not keep_db:
-            os.remove(path)
+        # 池永远要关（连接攥着不放，同进程后面改 DSN 会拿到指向旧库的池）；
+        # 删不删库看 --keep-db：临时库默认删，--db 指的持久库一律不删。
+        if temp is not None and not keep_db:
+            temp.close()
+        else:
+            from app.db import pool as pool_module
+
+            pool_module.close_pool()
+            if temp is not None:
+                print(f"\n临时 database 已保留：{temp.name}")
+                print(f"连上去看：psql \"{temp.dsn}\"")
+                print(f"用完删掉：DROP DATABASE \"{temp.name}\" WITH (FORCE);")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true", help="真跑（需要 embedding 凭证）")
-    parser.add_argument("--keep-db", action="store_true", help="跑完保留临时库")
-    parser.add_argument("--db", default=DEFAULT_DB, help="临时库路径")
+    parser.add_argument("--keep-db", action="store_true",
+                        help="跑完保留临时库（打印库名与 psql 连法）")
+    parser.add_argument("--db", default="",
+                        help="持久库（库名或完整 DSN）；不给就现建一个临时库")
     args = parser.parse_args(argv)
     if not args.run:
         parser.print_help()
         return 0
-    return _run(keep_db=args.keep_db, path=args.db)
+    return _run(keep_db=args.keep_db, db_spec=args.db)
 
 
 if __name__ == "__main__":

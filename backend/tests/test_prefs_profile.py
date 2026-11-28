@@ -334,20 +334,26 @@ def test_stale_is_false_right_after_rebuild(monkeypatch):
         conn.execute(
             "INSERT INTO profile_vectors (id, vector, label, weight, samples,"
             " created_at, updated_at, map_id) VALUES ('d0', ?, '方向', 1.0, 2,"
-            " strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
-            " '')",
+            " nowstamp(), nowstamp(), '')",
             (profile.vector_cache.pack([1.0, 0.0]),))
     assert profile.stale() is False
 
 
 def test_profile_vectors_schema_is_the_agreed_one():
-    """`map_id` 是后来加的列，顺序排在最后——老行的该列是 NULL（"当时还没有隔离"）。"""
+    """`map_id` 是后来加的列，顺序排在最后——老行的该列是 NULL（"当时还没有隔离"）。
+
+    查 `information_schema.columns` 而不是 `PRAGMA table_info`：后者是 SQLite 的
+    表结构内省，PG 上没有这个命令（`app/db/conn.py` 见到它会直接报错指路）。
+    """
     from contextlib import closing
 
     from app.mindmaps import repository
 
     with closing(repository.connect()) as conn:
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(profile_vectors)")]
+        columns = [row["column_name"] for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'profile_vectors' "
+            "ORDER BY ordinal_position")]
     assert columns == ["id", "vector", "label", "weight", "samples",
                        "created_at", "updated_at", "map_id"]
 

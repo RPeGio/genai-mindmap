@@ -39,7 +39,7 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头。**可被页面内的设置面板覆盖**（见下） |
 | `MINDMAP_LLM_API_KEY` | — | 密钥。**可被页面内的设置面板覆盖**（落库为明文，与 `EnvironmentFile` 同一信任边界） |
 | `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（经 `https://api.commandcode.ai/provider/v1`），先前用 `deepseek-flash`。**可被设置面板覆盖** |
-| `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径 |
+| `MINDMAP_PG_DSN` | 一条完整连接串，缺省 `postgresql:///mindmaps?host=/var/run/postgresql`（走本机 Unix socket） | PostgreSQL 连接串，**原 `MINDMAP_DB_PATH`（SQLite 文件路径）已废除**。不拆成 `MINDMAP_PG_HOST/PORT/DB/USER/PASSWORD` 五个变量：拆开就要处理"配了三个漏了两个"的半配置，而 psycopg 的 DSN 本来就能表达全部组合。改名不只是换个地址：cookie 签名密钥从这条串派生，所以升级后所有既有会话失效一次——这是预期行为，不是 bug，写进发布说明 |
 | `MINDMAP_SOFFICE_CMD` | 自动探测 | 可选，LibreOffice 可执行文件路径 |
 | `DASHSCOPE_API_KEY` | — | 语音转写用。阿里云百炼控制台创建，`sk-` 开头 |
 | `MINDMAP_NLI_ENABLED` | 空（关） | 引用核验的第三层（语义蕴含打分）。需同时配 `MINDMAP_NLI_MODEL_DIR` |
@@ -101,12 +101,15 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 |---|---|
 | Python 依赖磁盘 | 约 700 MB（主要是 `docling` 及其传递依赖） |
 | LibreOffice 磁盘 | 约 1.5 GB（仅旧格式需要） |
-| 常驻内存 | 约 350 MB（`docling` 在首次解析后常驻） |
+| 常驻内存 | 约 350 MB（`docling` 在首次解析后常驻）+ PostgreSQL 常驻 45 MB |
+| PostgreSQL 峰值内存 | 池预热后 67 MB；8 线程写压测后 168 MB（`shared_buffers=128MB`、`work_mem=4MB`；纸面 180 MB 的估算偏乐观 20–30 MB，它没算连接池与每语句 SAVEPOINT 的叠加，但同量级） |
 | 单次 PDF 解析峰值内存 | 约 70 MB（渲染与模型调用都在外部） |
 
 2C2G 的机器上：不装 LibreOffice 可以跑，装了之后要留意 `.doc/.ppt` 转换时 `soffice` 进程会额外占 350–380 MB。
 
-知识库（`backend/data/mindmaps.db`，可用 `MINDMAP_DB_PATH` 指定位置）随使用增长，但入库之后会按 90 天 / 200 份自动淘汰（触发条件与成本见 `docs/LIBRARY-MEASUREMENTS.md`），稳态在 10 MB 以内。仍然建议把该分区剩余空间纳入监控（例如低于 500 MB 告警）：磁盘写满时 SQLite 报 `database or disk is full`，会连带影响生成。
+数据库从 SQLite 单文件换成 PostgreSQL 16 之后，内存账要加两笔：**库进程自己常驻 45 MB**（不再是"零成本嵌在 API 进程里"），以及连接池预热后到 67 MB、并发写压到 168 MB。这三档是同一份 `PG-MIGRATION-PLAN.md` 里的实测，选它们是因为"空闲"和"真实干活"差了三倍——只看空闲会低估，只看压测峰值会误判成要升配。生产 RSS 一旦超过 250 MB 就把池的 `max_size` 从 8 降到 4（空闲单连接约 1–2 MB）。
+
+知识库（`library_sources` / `library_chunks` 两张表，在同一个 PostgreSQL 库里，不再是一个独立文件）随使用增长，但入库之后会按 90 天 / 200 份自动淘汰（触发条件与成本见 `docs/LIBRARY-MEASUREMENTS.md`），稳态在 10 MB 以内。仍然建议把数据库所在分区剩余空间纳入监控（例如低于 500 MB 告警）：磁盘写满时 PostgreSQL 报 `could not extend file ... No space left on device`，写失败会连带影响生成。**度量库体积不要再 `stat` 文件**——PG 的库不是单个文件，用 `select pg_total_relation_size('library_chunks')`（含索引与 TOAST），口径见 `LIBRARY-MEASUREMENTS.md`。
 
 ## 6. 语音输入（F07）
 
@@ -194,7 +197,7 @@ quantize_dynamic('model.onnx', 'model.int8.onnx', weight_type=QuantType.QInt8)
 
 导出后 `model.int8.onnx` 98.3 MB，配合 `tokenizer.json` 和 `config.json` 放进 `MINDMAP_NLI_MODEL_DIR`。注意 **`id2label` 顺序各模型不同**（mobilebert 是 `0=ENTAILMENT`，Erlangshen 是 `0=CONTRADICTION`），代码从 `config.json` 读，写死会整体错位。
 
-2C2G 上的账：后端基线约 350 MB + NLI 140 MB ≈ 490 MB，语音转写峰值 250 MB 与之不同时发生，2 GB 内存够用。
+2C2G 上的账：后端基线约 350 MB + NLI 140 MB ≈ 490 MB，语音转写峰值 250 MB 与之不同时发生，2 GB 内存够用。**这一笔里没有 PostgreSQL**：它迁出进程之后是独立进程，空闲 45 MB、池预热 67 MB、8 线程写压测 168 MB（第 5 节有实测三档），所以要按"490 + 67 ≈ 560 MB"这类常态来留余量，而不是继续按 490 MB 算。
 
 ## 8. 启动
 
@@ -293,11 +296,11 @@ sudo bash deploy/install.sh --domain mindmap.example.com --version v0.4.7
 
 | 步骤 | 内容 |
 |---|---|
-| 1 | `dnf` 装 nginx / sqlite / 编译基础件 |
+| 1 | `dnf` 装 nginx / PostgreSQL（服务端 + 客户端，`pg_dump` 也在这里）/ 编译基础件 |
 | 2 | 没有 swap 就加 2G（2G 内存解析 PDF、装 torch 都要余量） |
 | 3 | 建 `genai` 系统用户；代码到 `/opt/genai-mindmap`；数据到 `/var/lib/genai-mindmap`；`/etc/genai-mindmap/env` 权限 0640；覆盖前把当前代码快照到 `/var/lib/genai-mindmap/releases/`（保留 5 份，回滚用） |
 | 4 | 用 `uv` 装独立 CPython 3.12（避开系统 python3.6）并建 venv、装 `backend/requirements.txt`（默认走阿里云 PyPI 镜像） |
-| 5 | 装 systemd 单元并启动（只 1 个 worker，理由见下） |
+| 5 | 装 systemd 单元并启动（只 1 个 worker，理由见 9.9：换库之前是写者冲突，换库之后是内存） |
 | 6 | 装 nginx 站点配置（IPv6 关闭时只监听 v4）、删除上一代遗留的 Basic Auth 口令文件（账号体系已接管鉴权）、放行 SELinux 反代与静态目录上下文、装每日备份 cron |
 
 重复执行是安全的。只有一处**故意不覆盖**：`/etc/genai-mindmap/env`（密钥）。
@@ -366,7 +369,19 @@ sudo tail -n 50 /var/log/nginx/error.log
 sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/backups/genai-mindmap
 ```
 
-恢复备份：`gunzip -c /var/backups/genai-mindmap/mindmaps-<时间>.db.gz > /var/lib/genai-mindmap/mindmaps.db`，然后 `chown genai:genai` 并重启服务。
+备份与恢复换成了 PostgreSQL 的两条命令（数据库从单文件变成服务端之后，`sqlite3 .backup` / `gunzip > 文件` 这套就不成立了——没有一个文件可以 gzip 回去）：
+
+```bash
+# 备份：自定义格式（-Fc），可压缩、可选择性恢复、pg_restore 能用 -l 先看内容
+sudo -u postgres pg_dump -Fc mindmaps > /var/backups/genai-mindmap/genai-$(date +%F-%H%M).dump
+
+# 恢复：先停服务（否则连接池里的连接会跟 pg_restore 抢表锁，报 "database is being accessed by other users"）
+sudo systemctl stop genai-mindmap
+sudo -u postgres pg_restore --clean --if-exists -d mindmaps /var/backups/genai-mindmap/genai-<时间>.dump
+sudo systemctl start genai-mindmap
+```
+
+三点必须知道：**① 备份用 `-Fc` 不用 `-Fp`（纯 SQL）**，因为恢复时 `pg_restore --clean --if-exists` 能一条命令覆盖现有库；纯 SQL 得自己 `drop database` 再重建，多一步就多一个出错的地方。**② `--clean` 会删表**，所以恢复前先按上面那条 `pg_dump` 现备一份——恢复错了还有回退。**③ 服务必须先停**：不停的话连接池持有连接，`pg_restore` 要么报错、要么恢复出"一半新一半旧"的库。日常备份 cron 由 `install.sh` 安装（`deploy/backup.sh`，产物在 `/var/backups/genai-mindmap`，保留 14 天）。
 
 **账号在页面里注册，不用命令行。** 打开站点 → 抽屉里的「账号」区 → 注册。**第一个注册的账号就是部署方**（见第 3 节第 5 条），他能改全站共享的模型配置。nginx 那层 Basic Auth 已弃用，`/etc/nginx/.htpasswd-mindmap` 会被重跑的 `install.sh` 删掉——它现在是一份没人消费的口令，留着只会让人以为门外还有一道锁。
 
@@ -403,14 +418,15 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 |---|---|
 | 502 Bad Gateway | 后端没起来或崩了：`systemctl status genai-mindmap`、`journalctl -u genai-mindmap -n 50` |
 | 服务起不来，`status` 里写 `226/NAMESPACE` | 单元里 `ReadWritePaths` 指向了不存在的目录（`/var/log/genai-mindmap`）。现在改成 systemd 的 `LogsDirectory` 自己建，旧单元升级时重跑一次 `install.sh` 即可 |
-| 服务起不来，journal 里 `Failed to load environment files` | 这是**故意的**：单元里的 `EnvironmentFile` 没有 `-` 前缀，`/etc/genai-mindmap/env` 不在就拒绝启动。填好该文件（至少 `MINDMAP_DB_PATH` 与 `MINDMAP_LLM_*`）再启动 |
+| 服务起不来，journal 里 `Failed to load environment files` | 这是**故意的**：单元里的 `EnvironmentFile` 没有 `-` 前缀，`/etc/genai-mindmap/env` 不在就拒绝启动。填好该文件（至少 `MINDMAP_PG_DSN` 与 `MINDMAP_LLM_*`）再启动 |
 | 403 Forbidden（页面本身） | 两层：文件权限（`chmod -R a+rX .../dist`）与 SELinux 上下文（`/opt` 下默认是 `usr_t`，nginx 读不了；`install.sh` 会 `semanage fcontext -t httpd_sys_content_t` + `restorecon`，手工传 dist 之后要再跑一次） |
 | nginx 起不来，error.log 里 `bind() to [::]:80 failed` | 机器把 IPv6 关了，配置里却还有 `listen [::]:80`。`install.sh` 现在按 `/proc/sys/net/ipv6/conf/all/disable_ipv6` 决定写不写这行——注意 `nginx -t` 只查语法，**查不出 bind 失败**，必须是 `systemctl restart nginx` 之后看 `status` 才算数 |
 | 重跑过安装脚本后 HTTPS 没了 | 旧版脚本用 `certbot --nginx` 把 443 写进 `conf.d`，又被下一次 `install.sh` 用模板覆盖。现在用 `certbot certonly --webroot` 只签发，443 由 `deploy/nginx-tls.conf` 渲染，重跑不会丢 |
 | 413 Request Entity Too Large | 上传超过 nginx 的 `client_max_body_size 24m` |
 | 504 但后端日志还在打印 | 900 秒里**一帧都没发出去**（`proxy_read_timeout` 计的是两次读之间的间隔，而正常每 10 秒必有一帧心跳）。已设 900s 仍超时，说明那段时间连心跳线程都被占住了：看是不是 `MINDMAP_LLM_*` 指向的模型卡在一个不返回的请求上（单次请求超时是 `_TIMEOUT_SECONDS = 600`），或机器本身在换页 |
 | 点了生成一直转圈、最后一次性出图 | SSE 被缓冲：确认 `location /api/` 里有 `proxy_buffering off` |
-| 偶发 `database is locked` | 起了多个 worker 或多个 uvicorn 实例；SQLite 只能一个写者 |
+| PG 连不上，日志里 `connection refused` / `could not connect to server` | PostgreSQL 服务没起（`systemctl status postgresql`），或 `MINDMAP_PG_DSN` 里的 host/端口写错。旧的 `database is locked` 这条不会再出现——那是 SQLite 单写者的症状，多 worker 在 PG 上只是多个普通客户端，写冲突由服务端行锁处理 |
+| 日志里 `InFailedSqlTransaction` / `current transaction is aborted` | 某条语句在事务里出错后没回滚到 SAVEPOINT，后面的语句全部连锁失败。这是兼容层（`app/db/`，每语句一个 SAVEPOINT）该兜住的场景，出现即说明有条 SQL 绕过了 shim——不要靠"整体重连"盖掉它 |
 | 上传 PDF 返回 422 说需要密钥 | `MINDMAP_LLM_MODE=demo`，或 `MINDMAP_LLM_*` 没填全 |
 | 页面上 Excel/Word 上传 422 | 没装 `--with-office` 时 `.doc/.ppt` 不可用（`.docx/.xlsx` 不需要 LibreOffice） |
 | `git clone` 报 `SSL_ERROR_SYSCALL` / 443 超时 | 服务器出口连不上 GitHub，见 9.1 的三条出路（tar + scp 最省事） |
@@ -418,9 +434,11 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 
 ### 9.9 内存与并发（2C2G 的实话）
 
-- 空闲常驻约 150–250MB；`docling` 是懒加载，第一次上传 docx/pptx/xlsx/html/md 时会冲高到 600MB–1GB，之后常驻。
+- 空闲常驻约 150–250MB；`docling` 是懒加载，第一次上传 docx/pptx/xlsx/html/md 时会冲高到 600MB–1GB，之后常驻。**PostgreSQL 单独再占 45 MB（空闲）/ 67 MB（池预热）/ 168 MB（8 线程写压测）**——它现在是独立进程，不再跟 API 挤在同一块内存里，所以这 45–168 MB 要从"后端基线 350 MB"之外另算。
 - PDF 逐页视觉识别会并发 8 个请求，但内存主要花在 SSE 连接与图片缓冲上；**同时演示的人数控制在 2–3 人**。
 - 想要更多余量：升到 4G，或把 `MINDMAP_LLM_MODE` 保持 `model` 但避开大 PDF。
+
+**换库没有让内存变紧，但它换了一种紧法。** SQLite 是嵌在进程里的，内存涨在 API 进程的 RSS 上（所以"后端 350 MB"里有它一份说不清的部分）；PG 是独立进程，账目清楚、但**空闲时也要 45 MB**。真正的风险在生产 RSS 加起来超过 250 MB 时——那时不要把 worker 改成 2 去"分担"，而是把连接池的 `max_size` 从 8 降到 4（池空闲单连接 1–2 MB），这条在 `PG-MIGRATION-PLAN.md` 的风险表里已经定好。
 
 ## 10. 更新已部署的版本
 
@@ -464,7 +482,9 @@ sudo systemctl status genai-mindmap --no-pager
 
 前端也要跟着回：9.4 发布时如果按建议把旧目录留成 `dist.prev`，`cd /opt/genai-mindmap/frontend && rm -rf dist && mv dist.prev dist`，再 `restorecon -R dist`。
 
-⚠️ 契约回滚有数据风险：库里一旦有 v2 记录（`schema_version: 2`），退回 v1 的读入路径会被 `extra="forbid"` 拒掉。真要回滚，先备份 `mindmaps.db`，并确认该版本能读现有数据。
+⚠️ 契约回滚有数据风险：库里一旦有 v2 记录（`schema_version: 2`），退回 v1 的读入路径会被 `extra="forbid"` 拒掉。真要回滚，先 `pg_dump -Fc` 备一份，并确认该版本能读现有数据。
+
+⚠️ **库的版本回滚是另一回事。** 代码回滚到旧快照时，如果那份代码还是读 `MINDMAP_DB_PATH`（SQLite）的版本，它会连不上现在的库——SQLite 单文件那个回滚点只有一份，就是迁移时改名保留的 `/var/lib/genai-mindmap/mindmaps.db.pre-pg`（`ARCHITECTURE_ADDENDUM.md` 1.4 第 5 步）。所以"回滚到迁移前"只有两条路：换回旧库文件 + 旧代码，或者用 `pg_restore` 回退数据。**不要只回代码不回数据**：PG 上已写入的记录那份旧代码根本看不见。
 
 ## 11. 出网受限的 ECS：PyPI 与模型源
 
@@ -582,7 +602,6 @@ tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value genai-mindmap)/environ 
 
 # ③ 用应用自己的库与配置真检索一次（比 curl 更能证明接线对了）
 cd /opt/genai-mindmap/backend && set -a && . /etc/genai-mindmap/env && set +a && \
-  MINDMAP_DB_PATH=/var/lib/genai-mindmap/mindmaps.db \
   /opt/genai-mindmap/.venv/bin/python -c \
   'from app.knowledge import external; print(external._proxy()); print(len(external.search_external("量子计算", limit=6)))'
 ```

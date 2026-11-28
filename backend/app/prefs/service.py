@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from contextlib import closing
 from typing import Literal, get_args, get_origin
 
@@ -46,6 +45,7 @@ from app.agent.contracts import AgentRunRequest
 from app.auth import owner
 from app.contracts.mindmap import DIAGRAM_LABELS
 from app.core.errors import AppError
+from app.db.conn import Connection, Row
 from app.generation.service import THINKING_MODELS
 from app.mindmaps import repository
 
@@ -101,7 +101,7 @@ SOURCES: tuple[str, ...] = get_args(PrefSource)
 
 #: 时间格式与 `mindmaps` / `runs` / `library_*` 完全一致。三处格式不同会在"谁更晚"
 #: 上错一天——这是仓库里写过的教训（`agent/runs.py:_NOW`、`knowledge/library.py`）。
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_NOW = "nowstamp()"
 
 #: 建议窗口：最近几次都选了同一个值才算"你一直都这样"。
 #:
@@ -302,7 +302,7 @@ def _check_value(key: str, value: str, existing: dict[str, Pref]) -> str:
 # ---------------------------------------------------------------- 读
 
 
-def _row(row: sqlite3.Row) -> Pref:
+def _row(row: Row) -> Pref:
     return Pref(
         key=row["pref_key"],
         value=row["pref_value"],
@@ -314,7 +314,7 @@ def _row(row: sqlite3.Row) -> Pref:
     )
 
 
-def _connect() -> sqlite3.Connection:
+def _connect() -> Connection:
     # 表在 `repository.connect()` 里与 `mindmaps` / `runs` 同一时刻建好，所以这里
     # 没有任何"发现表不存在"的分支。
     return repository.connect()

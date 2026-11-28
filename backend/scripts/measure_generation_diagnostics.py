@@ -30,7 +30,6 @@ import argparse
 import asyncio
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -41,9 +40,11 @@ for entry in (BACKEND, SCRIPTS):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-# 与 `measure_deep_slicing` 一样：环境必须在 import 应用之前定下来，且数据库要隔离。
-_TMP = tempfile.mkdtemp(prefix="measure-diag-")
-os.environ["MINDMAP_DB_PATH"] = str(Path(_TMP) / "measure.db")
+# 临时库不在这里建：下面 `import measure_deep_slicing as base` 一执行，base 的模块级
+# 就建好了库并 `init_schema()`，而且 base 把 `MINDMAP_PG_DSN` 指向那个库。这里再设
+# 一遍只会骗读者——**设了也立刻被覆盖**（这正是它以前那两行被当成"已隔离"的原因）。
+# 开关仍然在这里定：它们是 `os.environ.pop/setdefault`，base 只设了前三个，
+# NLI 那两个必须在本脚本里关掉（下面 import 的 `optimization` 模块会读它们）。
 os.environ.pop("MINDMAP_HYBRID_SEARCH", None)
 os.environ.setdefault("MINDMAP_PARENT_RETRIEVAL", "1")
 os.environ.setdefault("MINDMAP_EXTERNAL_KNOWLEDGE", "0")

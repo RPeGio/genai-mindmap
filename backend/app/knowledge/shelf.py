@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
 from typing import Any
 
@@ -25,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import SourceKind
+from app.db.errors import DatabaseError
 from app.knowledge import library as knowledge_library
 from app.mindmaps import repository
 
@@ -105,7 +105,7 @@ def _cited_counts(*, refresh: bool = False) -> dict[str, int]:
 
     try:
         fingerprint = repository.maps_fingerprint()
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("读不到导图表（%s），引用计数按 0 处理：%s",
                        type(exc).__name__, str(exc)[:160])
         return {}
@@ -135,7 +135,7 @@ def _scan_cited_counts() -> dict[str, int]:
     counts: dict[str, int] = {}
     try:
         maps = repository.list_maps(tolerant=True)
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("读不到导图表（%s），引用计数按 0 处理：%s",
                        type(exc).__name__, str(exc)[:160])
         return counts
@@ -189,7 +189,7 @@ def list_entries(*, limit: int = DEFAULT_LIMIT) -> LibraryList:
         # 即便将来它抛了 sqlite 错误，也不该连带把列表变成 500。
         # 空库不必白扫一遍导图表。
         cited_by = _cited_counts() if rows else {}
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("读不到知识库（%s），列表按空处理：%s",
                        type(exc).__name__, str(exc)[:160])
         return LibraryList(items=[], total=0)
@@ -207,7 +207,7 @@ def read_entry(source_id: str) -> LibrarySource:
     """
     try:
         source = knowledge_library.load(source_id)
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("读不到知识库（%s），预览按不可用处理：%s",
                        type(exc).__name__, str(exc)[:160])
         raise LibraryUnavailable(source_id) from exc

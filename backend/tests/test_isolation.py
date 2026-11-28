@@ -151,8 +151,7 @@ def _seed_run(run_id: str, owner: str, *, candidate: str | None = None) -> None:
     with closing(runs_module._connect()) as conn, conn:
         conn.execute(
             "INSERT INTO runs (run_id, status, request, candidate, created_at, updated_at, owner) "
-            "VALUES (?, 'done', ?, ?, "
-            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)",
+            "VALUES (?, 'done', ?, ?, nowstamp(), nowstamp(), ?)",
             (run_id, json.dumps(request, ensure_ascii=False), candidate, owner))
 
 
@@ -171,7 +170,7 @@ def test_a_run_is_only_visible_to_its_owner():
 
     with closing(runs_module._connect()) as conn, conn:
         owner_key = conn.execute("SELECT owner FROM runs WHERE run_id = ?",
-                                 ("run-presence-check",)).fetchone()[0]
+                                 ("run-presence-check",)).fetchone()["owner"]
     mine = identity_module.current_identity()
     assert mine.kind == "anonymous", "测试里不该有残留身份"
     # 直接在 owner 语境下建一行并读回来：`get_for` 的 owner 参数是这条用例的主角。
@@ -231,9 +230,7 @@ def test_streaming_an_abandoned_run_of_someone_else_does_not_steal_it():
     with closing(runs_module._connect()) as conn, conn:
         conn.execute(
             "INSERT INTO runs (run_id, status, request, created_at, updated_at, owner) "
-            "VALUES ('run-steal', 'failed', '{}', "
-            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
-            "'user:1')")
+            "VALUES ('run-steal', 'failed', '{}', nowstamp(), nowstamp(), 'user:1')")
 
     response = bob.post("/api/agent/runs/stream",
                         json={"goal": "接着跑", "intent": "create",
@@ -243,8 +240,8 @@ def test_streaming_an_abandoned_run_of_someone_else_does_not_steal_it():
 
     with closing(runs_module._connect()) as conn:
         owner = conn.execute(
-            "SELECT owner FROM runs WHERE run_id = 'run-steal'").fetchone()[0]
+            "SELECT owner FROM runs WHERE run_id = 'run-steal'").fetchone()["owner"]
         status = conn.execute(
-            "SELECT status FROM runs WHERE run_id = 'run-steal'").fetchone()[0]
+            "SELECT status FROM runs WHERE run_id = 'run-steal'").fetchone()["status"]
     assert owner == "user:1", "别人的行不能被重开成自己的"
     assert status == "failed", "被拒绝的请求也不该把状态改成 running"

@@ -59,9 +59,11 @@ def _raw_insert(key: str, value: str, updated_at: str) -> None:
     """
     with closing(repository.connect()) as conn, conn:
         conn.execute(
-            "INSERT OR REPLACE INTO user_prefs "
-            "(pref_key, pref_value, scope, source, source_run_id, created_at, updated_at) "
-            "VALUES (?, ?, 'global', 'user_explicit', NULL, ?, ?)",
+            "INSERT INTO user_prefs "
+            "(owner, pref_key, pref_value, scope, source, source_run_id, created_at, updated_at) "
+            "VALUES ('', ?, ?, 'global', 'user_explicit', NULL, ?, ?) "
+            "ON CONFLICT (owner, pref_key) DO UPDATE SET pref_value = EXCLUDED.pref_value,"
+            " updated_at = EXCLUDED.updated_at",
             (key, value, updated_at, updated_at),
         )
 

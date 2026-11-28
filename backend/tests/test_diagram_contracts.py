@@ -482,15 +482,24 @@ class TestDiagramUnion:
 
 
 @pytest.fixture()
-def temp_db(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "repo.db"))
+def clean_maps():
+    """清掉本类写过的导图行。
+
+    **不再靠 tmp 库文件隔离**：PG 的库是共享的，隔离由 `conftest.py` 的
+    `fresh_db` 每用例清表；这里再清一次是为了同文件内两条用例互不可见
+    （`create_map` 会留行，而 `legacy` 那条依赖 `get_map("legacy")` 唯一）。
+    """
+    from contextlib import closing
+
     yield
+    with closing(repository.connect()) as conn, conn:
+        conn.execute("DELETE FROM mindmaps")
 
 
 class TestRepositoryRoundTrip:
     """三套形状都能经 `SaveRequest` → `repository` 存进去、原样读出来。"""
 
-    def test_all_three_shapes_survive_a_round_trip(self, temp_db):
+    def test_all_three_shapes_survive_a_round_trip(self, clean_maps):
         payloads = [
             {"title": "树", "root": node("r")},
             {"title": "鱼骨", "problem": "为什么漏检", "bones": [bone("人")]},
@@ -505,15 +514,11 @@ class TestRepositoryRoundTrip:
             assert type(again.content) is type(body.content)
             assert again.content.model_dump() == body.content.model_dump()
 
-    def test_a_legacy_row_reads_as_a_tree(self, temp_db):
+    def test_a_legacy_row_reads_as_a_tree(self, clean_maps):
         """库里一条 v2 早期记录（没有 `diagram_type` / `edges`）读出来是树。"""
-        import sqlite3
         from contextlib import closing
 
-        with closing(sqlite3.connect(repository.db_path())) as conn, conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS mindmaps (id TEXT PRIMARY KEY,"
-                         " version INTEGER NOT NULL, content TEXT NOT NULL,"
-                         " updated_at TEXT NOT NULL)")
+        with closing(repository.connect()) as conn, conn:
             conn.execute("INSERT INTO mindmaps (id, version, content, updated_at)"
                          " VALUES ('legacy', 1, ?,"
                          " '2026-11-01T00:00:00.000Z')",

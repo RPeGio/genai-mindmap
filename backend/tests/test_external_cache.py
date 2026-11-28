@@ -111,12 +111,15 @@ def _age_cache(hours: float) -> None:
 
 
 def _rows() -> int:
-    """表里有几行。**表还不存在时算 0**：这张表是 `external_cache._open()` 懒建的，
-    "从来没写过缓存"的用例里它本来就该不存在。"""
+    """表里有几行。**表还不存在时算 0**。
+
+    表由 `db.schema.init_schema()` 建好（`_open()` 不再懒建），所以正常路径上它一定
+    在；这个 try 只是给"有人直接拿空库跑这个模块"留的余量，与"0 行"同义。
+    """
     try:
         with repository.connect() as conn:
             return int(conn.execute(
-                f"SELECT COUNT(*) FROM {external_cache.CACHE_TABLE}").fetchone()[0])
+                f"SELECT COUNT(*) AS total FROM {external_cache.CACHE_TABLE}").fetchone()["total"])
     except Exception:  # noqa: BLE001 — 没有表 = 没有缓存，与"0 行"同义
         return 0
 
@@ -209,14 +212,14 @@ def test_hit_count_tracks_reuse(monkeypatch):
     external.search_external("碳中和")
     with repository.connect() as conn:
         before = conn.execute(
-            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()[0]
+            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()["hit_count"]
     assert before == 0
 
     external.search_external("碳中和")
     external.search_external("碳中和")
     with repository.connect() as conn:
         after = conn.execute(
-            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()[0]
+            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()["hit_count"]
     assert after == 2
 
 
@@ -413,7 +416,7 @@ def test_expired_rows_are_pruned_on_write(monkeypatch):
     assert _rows() == 1
     with repository.connect() as conn:
         query = conn.execute(
-            f"SELECT query FROM {external_cache.CACHE_TABLE}").fetchone()[0]
+            f"SELECT query FROM {external_cache.CACHE_TABLE}").fetchone()["query"]
     assert query == "另一件事"
 
 

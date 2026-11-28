@@ -20,13 +20,13 @@ from __future__ import annotations
 
 import importlib
 import logging
-import sqlite3
 import threading
 import time
 
 import pytest
 
 from app.contracts.source import Source, SourceKind
+from app.db.errors import DatabaseError
 from app.knowledge import library, remember
 
 
@@ -100,7 +100,7 @@ def test_blank_material_keeps_its_id_and_does_not_raise(tmp_path):
 def test_library_failure_does_not_break_the_batch(tmp_path, monkeypatch):
     """库写不进去时整批保留原 id：生成照跑，只是这批材料不能复用。"""
     def boom(sources, *, deadline=None):
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     monkeypatch.setattr(library, "ingest_many", boom)
     sources = [_source("甲。"), _source("乙。")]
@@ -114,7 +114,7 @@ def test_library_failure_does_not_break_the_batch(tmp_path, monkeypatch):
 def test_unexpected_error_is_contained_and_logged(tmp_path, monkeypatch, caplog):
     """不在已知清单里的意外同样不许穿透：入库是旁路，没有拖垮生成的权力。
 
-    现实里的意外不止 `ValueError`/`sqlite3.Error`/`OSError`：旧记录的 metadata
+    现实里的意外不止 `ValueError`/`DatabaseError`/`OSError`：旧记录的 metadata
     过不了 pydantic 校验、编码器内部状态不对，都可能在这里冒头。异常一旦穿到
     `agent/router.py` 的兜底分支，整轮生成就变成 `agent_failed`——一份材料的
     记账失败不该有这个后果。
@@ -275,7 +275,7 @@ def test_count_failure_does_not_affect_ingest(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(remember, "PRUNE_INTERVAL_SECONDS", 0.0)
 
     def boom() -> int:
-        raise sqlite3.OperationalError("no such table: library_sources")
+        raise DatabaseError("no such table: library_sources")
 
     monkeypatch.setattr(library, "count", boom)
 
@@ -290,7 +290,7 @@ def test_count_failure_does_not_affect_ingest(tmp_path, monkeypatch, caplog):
 def test_prune_failure_is_only_a_warning(tmp_path, monkeypatch, caplog):
     """守护线程里 `prune` 抛错只记 warning：淘汰失败不该冒到任何人面前。"""
     def boom(**kwargs):
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     monkeypatch.setattr(library, "prune", boom)
 

@@ -19,8 +19,8 @@ flowchart LR
   RAG -. 检索上下文 .-> GEN
   GEN --> MAP
   OPT -. 建议修改 .-> MAP
-  MAP --> DB[(SQLite 开发 / PostgreSQL 规划)]
-  RAG -. 规划中 .-> VEC[(PostgreSQL + pgvector)]
+  MAP --> DB[(PostgreSQL 16)]
+  RAG -. 规划中 .-> VEC[(pgvector 向量索引 规划中)]
   INGEST -. 规划中 .-> FILE[(本地 / 对象存储)]
   Y -. 规划中 .-> DB
 ```
@@ -32,7 +32,7 @@ flowchart LR
 | 模块 | 当前代码 / 计划位置 | 输入 → 输出 | 职责 |
 |---|---|---|---|
 | 导图编辑 | `frontend/src/App.vue`、`frontend/src/canvas/`、`frontend/src/stores/mindmap.ts`、`frontend/src/mindmap/` | 导图 JSON → 修改后的 JSON | R2 接入 `@vue-flow/core` 画布与自研 tidy-tree 布局（平移 / 缩放 / 点选看全文 / 四种方向）；R3 接入内联改名、Tab 建子节点、Enter 建兄弟、删子树、50 步撤销重做与乐观锁保存。 |
-| 导图管理 | `backend/app/mindmaps/` | 导图 JSON + 版本 → 保存记录 | 当前 SQLite 本地存储；后续 PostgreSQL、用户权限、历史版本。 |
+| 导图管理 | `backend/app/mindmaps/` | 导图 JSON + 版本 → 保存记录 | 已从 SQLite（`backend/data/mindmaps.db` 一个本地文件）迁到 PostgreSQL 16（`app/db/` 兼容层，连接串 `MINDMAP_PG_DSN`）；乐观锁语义不变。后续用户权限、历史版本。 |
 | 生成与模型适配 | `backend/app/generation/` | 文本 → 导图 JSON | 演示适配器和基础模型适配；后续接入生成任务、提示词管理和重试策略。 |
 | 共享数据契约 | `backend/app/contracts/`，`frontend/src/api/types.ts`，[CONTRACT_V2](CONTRACT_V2.md) | 结构验证 | 后端已落地 v2（2026-11-10）：`schema_version` / `note` / `layout` / `theme` / `relations` / 节点样式与坐标；v1 请求体仍被接受（读时补默认值）。前端仍在手写 `types.ts`，类型生成（`openapi-typescript`）排在下一个 PR。 |
 | 多模态输入 | `backend/app/ingestion/`、`frontend/src/sources/`、`frontend/src/audio/` | 文本 / 文档 / 图片 / WAV 音频 → 来源 | 文本、Markdown、文档上传（PDF 逐页渲染交模型视觉识别；DOCX/PPTX/XLSX/HTML/MD 走 Docling；`.doc`/`.ppt` 经 LibreOffice 转换；`.xls` 走 `xlrd`）、图片理解（与 PDF 共用 `ingestion/vision_pdf.py` 的调用）与语音转写（百炼 Qwen-Audio-ASR，带句级时间戳，`ingestion/asr.py`）均可用。 |
@@ -61,7 +61,7 @@ flowchart LR
 - **Vue Flow（已接入，R2）**：`@vue-flow/core` 负责节点与连线交互（参见 [xyflow/xyflow](https://github.com/xyflow/xyflow)），节点坐标由自研 tidy-tree 布局计算，不引入 dagre——2C2G 上少一个依赖比省几行代码重要。
 - **Docling + 视觉模型（已接入）**：结构化格式（DOCX/PPTX/XLSX/HTML/Markdown）走 Docling，保留标题层级与表格（参见 [支持格式](https://github.com/docling-project/docling/blob/main/docs/usage/supported_formats.md)）；PDF 改成 pymupdf 逐页渲染后交多模态模型识别（扫描件也能读，选型实测见 [PDF 解析选型](PDF-PARSER-SELECTION.md)），命令行解析器不再参与。`.doc`/`.ppt` 经 LibreOffice 转 PDF，`.xls` 用 `xlrd` 直读。
 - **百炼语音识别（已接入）**：WAV 走 DashScope 的 Qwen-Audio-ASR，需要 `DASHSCOPE_API_KEY`；单次 ≤300 秒，更长的音频自动切片并发，结果带句级时间戳（成本与延迟见 [旧格式成本](LEGACY-FORMAT-COST.md)）。
-- **PostgreSQL + pgvector（规划）**：PostgreSQL 保存业务数据，pgvector 实现向量检索；参见 [pgvector](https://github.com/pgvector/pgvector)。当前存储仅为 SQLite，没有 PostgreSQL 或向量检索实现。
+- **PostgreSQL 16（已接入）+ pgvector（规划）**：业务数据（导图、编辑事件、知识库分块、调用记录）已经落在 PostgreSQL 16，见 [迁移方案](PG-MIGRATION-PLAN.md)。换掉 SQLite 单文件的直接原因是"含数据库"的部署要求与多进程/运维恢复能力：单文件库没有服务端形态，备份只能靠 `sqlite3 .backup`，主从、连接数管理、在线恢复都无从谈起。落地方式是新增 `backend/app/db/` 薄兼容层（psycopg + 每语句 SAVEPOINT），不改动原有 190 处 `conn.execute` 的写法——把 5 万行代码一次性换 SQL 方言，风险远大于收益。向量检索仍在规划：当前向量存 `bytea`、由纯 Python 的 `vector_cache.py` 管，没有 pgvector 索引。
 - **Yjs + y-websocket（规划）**：Yjs 提供共享数据类型，y-websocket 是其 WebSocket 连接方案；参见 [Yjs](https://github.com/yjs/yjs)、[y-websocket](https://github.com/yjs/y-websocket)。需要额外实现用户权限、房间授权、持久化、恢复和数据格式映射。
 - **导出（已接入）**：PUML / Markdown / OPML 三种文本由后端返回，前端只做下载，不在浏览器渲染。`plantuml-encoder` 输出的是 URL 片段、真正出图需要 JVM 服务，`viz.js` 只认 DOT 语法，两者都不引入（论证见 [增量附录](ARCHITECTURE_ADDENDUM.md)）。
 
@@ -69,7 +69,7 @@ flowchart LR
 
 ## 安全与部署边界
 
-当前仅限本机与单机部署：没有用户认证、权限隔离、文件上传和生产日志策略。目标形态是**单台 2 核 2G ECS + Docker Compose**（nginx / api / web / postgres / y-websocket 五个容器；语音转写走云端 API，不占容器也不需要 sidecar），先以 `IP:8080` 暴露、不做 TLS，域名与 Cloudflare 推迟到 W3（理由与降级路径见 [执行计划](PLAN.md) 第 4 节与 R1/R3）。
+当前仅限本机与单机部署：没有用户认证、权限隔离、文件上传和生产日志策略。目标形态是**单台 2 核 2G ECS + Docker Compose**（nginx / api / web / postgres / y-websocket 五个容器；语音转写走云端 API，不占容器也不需要 sidecar），先以 `IP:8080` 暴露、不做 TLS，域名与 Cloudflare 推迟到 W3（理由与降级路径见 [执行计划](PLAN.md) 第 4 节与 R1/R3）。`postgres` 这个容器不再是图纸上的规划：导图、编辑事件、知识库与调用记录的读写都已经走它，本机开发与 CI 也是同一个服务端形态（2C2G 上的实测常驻 45 MB、连接池预热 67 MB、8 线程写压测后 168 MB，见 [迁移方案](PG-MIGRATION-PLAN.md) 第 1.3 节）。因此部署清单里多了"一个必须起来、必须备份、必须有磁盘的服务"——它比单文件库多占一份固定内存，也多了一套恢复流程（`pg_dump -Fc` / `pg_restore`）。
 
 **这条与录音功能冲突**：浏览器只在安全上下文（HTTPS 或 localhost）下暴露 `navigator.mediaDevices`，`http://IP:8080` 打开时浏览器内录音不可用，只能上传音频文件。要开放录音必须先上 TLS，详见 [部署文档](DEPLOY.md) 第 6 节。
 

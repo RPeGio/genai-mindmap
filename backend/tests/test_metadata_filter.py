@@ -513,11 +513,13 @@ def _forbidden(*args, **kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _isolated(monkeypatch, tmp_path):
+def _isolated(monkeypatch):
     # conftest 全局默认关掉了向量路；这个文件测的是"先过滤再向量化"，
     # 需要它真的开，凭证由各用例的 `_keyed()` 配。
+    #
+    # 库的隔离由 `conftest.fresh_db` 负责（每用例清表），这里不建临时库文件：
+    # `MINDMAP_DB_PATH` 已废除，写它既不起作用、又会让人以为隔离还靠文件。
     monkeypatch.setenv("MINDMAP_HYBRID_SEARCH", "1")
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "vectors.db"))
     monkeypatch.setattr(embedding, "RETRY_BACKOFF", 0.0)
 
 

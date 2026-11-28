@@ -20,8 +20,10 @@
     "重排这条路"只在 `tests/test_rerank.py` 里被覆盖——那是刻意的，别在这里改成
     1，否则每个配了 `MINDMAP_EMBEDDING_API_KEY` 替身的用例都会多出一次被 mock
     的 rerank 调用，断言会以"多了一条请求"的形式莫名失败。
-  - **数据库落 tmp**：`MINDMAP_DB_PATH` 指向本次测试的 `tmp_path`，仓库里的
-    `backend/data/mindmaps.db` 不会被任何测试碰到。
+  - **数据库连测试库**：`MINDMAP_PG_DSN` 指向一个专门的测试库（缺省见
+    `TEST_DSN`），建表只在会话开始时做一次，每个用例之间用 `DELETE FROM` 清空。
+    `MINDMAP_DB_PATH` 被**显式清掉**：它还留在环境里的话，任何忘了改的旧代码会
+    以为自己在用 SQLite，读到的却是一个不存在的路径。
   - **`MINDMAP_NEO4J_*` 一律清空**：宿主机上可能正好跑着一个 Neo4j（开发机上很
     常见），不清空的话图存储的用例会去连它、写它、然后断在别人的数据上。清空之后
     "没配置图存储"是每个用例的默认前提，需要真 Neo4j 的用例自己 `setenv` 进去
@@ -36,6 +38,8 @@
 根本走不到传输层；这道闸证明的是"这些断言不依赖网络"，而不是"实现不发请求"。
 """
 from __future__ import annotations
+
+import os
 
 import httpx
 import pytest
@@ -145,15 +149,90 @@ NEO4J = (
     "MINDMAP_NEO4J_DATABASE",
 )
 
+#: 测试库的 DSN。**故意与部署用的 `MINDMAP_PG_DSN` 同名**，所以宿主机上配了它
+#: 也能被这里覆盖掉（`monkeypatch.setenv` 是设而不是清）——`clean_env` 的职责就是
+#: "宿主机上配了什么，都不能改变任何一条断言"，库地址同理。
+#:
+#: 库名带 `_test`：这个 fixture 每个用例都 `DELETE FROM` 全部表，指到开发库上就是
+#: 数据丢失。`MINDMAP_TEST_DSN` 留给"我用 docker 起了一个"的那种机器。
+TEST_DSN_ENV = "MINDMAP_TEST_DSN"
+TEST_DSN = "postgresql://postgres@127.0.0.1:55433/mindmap_test"
+
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch, tmp_path):
-    """每个测试的起点：没凭证、开关全关、数据库在 tmp、图存储未配置。"""
+    """每个测试的起点：没凭证、开关全关、连测试库、图存储未配置。"""
     for name in (*CREDENTIALS, *BEHAVIOUR, *NEO4J):
         monkeypatch.delenv(name, raising=False)
     for name in SWITCHES:
         monkeypatch.setenv(name, "0")
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "mindmaps.db"))
+    # 旧变量显式清掉：留着它只会让"忘了改的代码"以为自己在用 SQLite。
+    monkeypatch.delenv("MINDMAP_DB_PATH", raising=False)
+    monkeypatch.setenv("MINDMAP_PG_DSN", os.getenv(TEST_DSN_ENV, "").strip() or TEST_DSN)
+    yield
+
+
+@pytest.fixture(scope="session")
+def _test_schema():
+    """建一次表。session 级：`init_schema` 建 20 张表 + 索引，每个用例跑一次纯属浪费。
+
+    连接串取自**运行 pytest 的那个进程**的环境（这里不经过 `monkeypatch`，它只在
+    函数作用域生效），所以 runner 需要把 `MINDMAP_TEST_DSN` 或 `MINDMAP_PG_DSN`
+    配好；两个都没配时用 `TEST_DSN`。
+    """
+    from app.db import pool as pool_module
+    from app.db.schema import init_schema
+
+    dsn = (os.getenv(TEST_DSN_ENV, "").strip() or os.getenv(pool_module.DSN_ENV, "").strip()
+           or TEST_DSN)
+    os.environ[pool_module.DSN_ENV] = dsn
+    pool_module.close_pool()
+    init_schema()
+    yield
+    pool_module.close_pool()
+
+
+@pytest.fixture(autouse=True)
+def fresh_db(_test_schema):
+    """每个用例一张干净的表。
+
+    **`DELETE FROM` 而不是 `TRUNCATE`/重建 schema/换库**：这几档在当前 17 张表上
+    实测过（全部含 commit，中位数）：`DELETE` + 重置序列 **17.4ms**、`TRUNCATE`
+    **332ms**、`CREATE SCHEMA`+建表 14.0ms、`CREATE DATABASE ... TEMPLATE` 127ms。
+    `TRUNCATE` 慢 19 倍且不是被 WAL 拖的（`synchronous_commit=off` 对它无效），慢在
+    自己的文件截断路径上。`CREATE SCHEMA` 那一档只快 3ms，代价却是每条连接都要带
+    对 `search_path`——而 21 处连接入口共用一个池一个 DSN，把隔离塞进 DSN 的结果是
+    谁写个直连就绕过了隔离（"坏了和本来就没有长得一样"）。完整对比与取舍见
+    `app/db/schema.clear_all` 的 docstring。
+
+    **这笔代价是真的**：2775 条用例 × 17.4ms ≈ 48 秒，占全量 150 秒的三分之一。
+
+    也**不是**"事务回滚隔离"（`docs/PLAN.md` 原来写的口径）：本项目大量代码自己
+    调 `conn.commit()`，包在一个外层事务里回滚不掉已经提交的那部分，会造出"这条
+    用例过了、下一条被上一批残留数据绊倒"的串味失败。
+
+    **顺带清进程级缓存**：SQLite 时代每个用例换一个 `MINDMAP_DB_PATH`，那些以库
+    路径为键的缓存（`settings/store._CACHE` 的键就含 `db_path()`）自然互不可见。
+    换成一个固定的测试 DSN 之后，键不再变，上一轮的配置就会被下一轮读到——
+    表现为"单跑绿、整文件红"的串味。这里显式清掉，与清表同一个理由。
+    """
+    from app.db.conn import Conn
+    from app.db.pool import get_pool
+    from app.db.schema import clear_all
+    from app.generation import free_models
+    from app.knowledge import shelf
+    from app.settings import store as settings_store
+
+    settings_store._CACHE.clear()
+    settings_store._WRITES = 0
+    free_models._CACHE.clear()
+    shelf._cited_cache = None
+
+    conn = Conn(get_pool().getconn(), get_pool())
+    try:
+        clear_all(conn)
+    finally:
+        conn.close()
     yield
 
 

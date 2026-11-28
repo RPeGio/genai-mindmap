@@ -26,7 +26,6 @@ import logging
 import math
 import os
 import re
-import sqlite3
 import time
 from collections import Counter
 from collections.abc import Iterator
@@ -37,6 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from app.contracts.source import (Source, SourceKind, SourceMetadata, blank_to_none,
                                   clean_tags, to_utc_iso)
+from app.db.errors import DatabaseError
 from app.knowledge import library as knowledge_library
 from app.knowledge import rerank as knowledge_rerank
 from app.knowledge import vector_cache
@@ -1598,7 +1598,7 @@ def _library_sources(
     """
     try:
         pool = knowledge_library.recent(limit=LIBRARY_SCAN_LIMIT)
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("知识库不可用，本次只检索请求内的来源：%s", type(exc).__name__)
         return []
     if not pool:
@@ -2288,7 +2288,7 @@ def _with_graph(
         fused = graph_search.fuse_hits(text_hits, graph_hits, top_k, parent=parent)
         logger.debug("图检索：图证据 %d 条 → 融合后 %d 条", len(graph_hits), len(fused))
         return fused
-    except (OSError, ValueError, sqlite3.Error) as exc:
+    except (OSError, ValueError, DatabaseError) as exc:
         # `GraphStoreError` 是 `OSError` 的子类（见 `graph_store` 模块 docstring），
         # 所以这里不需要单独 import 它——写 `OSError` 还顺手接住了 `library.load`
         # 的磁盘错误。

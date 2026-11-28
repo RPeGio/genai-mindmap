@@ -1,19 +1,13 @@
 """错误响应格式测试：任何出口（404 / 422 / 业务异常）都必须是同一套结构。
 
-不访问模型、不写真实数据库（用临时库）。
+不访问模型；库里没有需要预置的行（`conftest.py` 的 `fresh_db` 每用例清表）。
 """
 import asyncio
 import json
-import os
-import tempfile
 import unittest
 import uuid
-from pathlib import Path
-from unittest.mock import patch
 
 from app.main import app
-
-BACKEND = Path(__file__).resolve().parents[1]
 
 #: 门禁要求"有身份"，而这里手写 ASGI scope、不经过 `TestClient` 的 cookie 罐。
 #: 用 `store.sign_guest()` 现签一个游客 cookie——裸的 32 位十六进制已经不够了
@@ -24,7 +18,7 @@ GUEST_ID = uuid.uuid4().hex
 
 
 def _guest_cookie() -> bytes:
-    """现签一次游客 cookie。签名密钥从库路径派生，必须在 `MINDMAP_DB_PATH` 打好之后调用。"""
+    """现签一次游客 cookie。签名密钥从连接串（`dsn()`）派生，必须在 DSN 定好之后调用。"""
     from app.auth import store as auth_store
     return f"mm_guest={auth_store.sign_guest(GUEST_ID)}".encode()
 
@@ -64,21 +58,6 @@ def request(method: str, path: str, body=None, headers=None):
 
 
 class ErrorFormatTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        data = BACKEND / "data"
-        data.mkdir(exist_ok=True)
-        cls.tmp = tempfile.TemporaryDirectory(dir=data, ignore_cleanup_errors=True)
-        cls.env = patch.dict(os.environ, {
-            "MINDMAP_DB_PATH": str(Path(cls.tmp.name) / "errors.db"),
-        })
-        cls.env.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.env.stop()
-        cls.tmp.cleanup()
-
     def assert_unified(self, body, response_headers):
         """四件套齐全，且响应头把同一个 request_id 带回来。"""
         self.assertEqual(set(body), {"code", "message", "detail", "request_id"})

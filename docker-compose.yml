@@ -5,7 +5,8 @@
 #   打开 http://<主机>/api/health  后端健康检查（返回 {"status":"ok","version":...}）
 #
 # 与 deploy/ 下那套 systemd 部署**互斥，别同时跑**：两边都占 8000（后端）与
-# 80（nginx），而且会指向同一个 SQLite 文件的两份副本。选一套，见 docs/DOCKER.md。
+# 80（nginx），而且会连到同一个 PostgreSQL 库（本文件里的 postgres 容器与
+# 服务器上那套若共用 DSN 就是同一个库的两份写入方）。选一套，见 docs/DOCKER.md。
 #
 # 配置全部走同目录下的 .env（照 backend/.env.example 抄一份，见 docs/DOCKER.md）。
 # compose 文件里的 ${VAR} 就是从这里读的，`docker compose config` 能验证解析结果。
@@ -31,13 +32,14 @@ services:
       # 与 systemd 的 EnvironmentFile 不带 `-` 前缀是同一个用意：不许静默带空配置跑。
       - .env
     environment:
-      # 这四个是"容器内必须覆盖"的，不覆盖就会写进镜像的只读层或算错缓存位置。
+      # 这几个是"容器内必须覆盖"的，不覆盖就会写进镜像的只读层或算错缓存位置。
       #
-      # 1) 数据库。必须是卷上的路径；不设的话会回落到
-      #    backend/app/mindmaps/repository.py:19 的 app/../data/mindmaps.db
-      #    （也就是 /app/backend/data），容器一删就没了。
-      #    知识库、块向量、外部检索缓存在同一个 SQLite 文件里，所以一个卷就够。
-      MINDMAP_DB_PATH: /data/mindmaps.db
+      # 1) 数据库连接串。**指向本文件里的 postgres 服务名**（不是 127.0.0.1：
+      #    容器里的回环是容器自己，那是跨容器最常见的错）。数据落在
+      #    mindmap-db 卷上，容器删了库还在。
+      #    口令从 .env 的 MINDMAP_PG_PASSWORD 来，两处共用同一个变量，别在这里
+      #    再写一份明文——写在 compose 里就等于提交进 git 了。
+      MINDMAP_PG_DSN: postgresql://mindmap:${MINDMAP_PG_PASSWORD:?请在 .env 里设置 MINDMAP_PG_PASSWORD}@postgres:5432/mindmaps
       # 2) docling 的缓存目录缺省是 Path.home()/".cache"/"docling"
       #    （site-packages/docling/datamodel/settings.py:72），HOME 必须是**可写**的。
       #    systemd 单元里这一条是 HOME=/var/lib/genai-mindmap，同源问题：HOME 不
@@ -58,8 +60,17 @@ services:
       # 100% 连不上。这里默认改成 none（直连），要代理就自己在 .env 里写
       # host.docker.internal:7897 之类。
       MINDMAP_EXTERNAL_PROXY: ${MINDMAP_EXTERNAL_PROXY:-none}
+    depends_on:
+      postgres:
+        # 等 pg_isready 探针绿了再起后端。只写 `depends_on: [postgres]` 是不够的：
+        # 那只能保证"容器起来了"，而 postgres 官方镜像在 initdb/WAL 恢复期间端口
+        # 已经监听但查询会报 57P03。后端这时连上去会在 lifespan 的 init_schema()
+        # 里直接失败，容器进 restart 循环，日志里只有一条看起来像代码 bug 的
+        # 连接错误。
+        condition: service_healthy
     volumes:
-      # SQLite（导图 / 运行记录 / 知识库 / 向量缓存 / 外部检索缓存）
+      # 上传中转与 docling 的 HOME 缓存（**不含数据库**：库在 postgres 容器的
+      # mindmap-db 卷里，见文件末尾的 postgres 服务）
       - mindmap-data:/data
       # docling 的版面与表格模型（首次解析 PDF/DOCX 时下载，几百 MB）
       - mindmap-models:/models
@@ -94,6 +105,51 @@ services:
       # 初始化十几秒），但模块级没有 import torch，所以 /api/health 冷启动很快。
       # start_period 主要留给容器内的首次启动开销。
       start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    # 钉 16 而不是 latest：生产那套是 16，库文件格式与 pg_dump 都跟大版本走，
+    # 某天 latest 跳到 17 之后 `docker compose pull` 会得到一个读不了旧数据目录的
+    # 服务端——症状是容器起不来、日志里一堆 "database files are incompatible"。
+    image: postgres:16
+    environment:
+      POSTGRES_DB: mindmaps
+      POSTGRES_USER: mindmap
+      # 口令从 .env 来，**不给默认值**。`:?` 的含义是"变量没设就让 compose 直接
+      # 报错退出"，正是要的效果：宁可 up 不起来，也不要一个用 postgres/postgres
+      # 这种公开口令跑在生产上的库。backend 的 DSN 用的也是同一个变量。
+      POSTGRES_PASSWORD: ${MINDMAP_PG_PASSWORD:?请在 .env 里设置 MINDMAP_PG_PASSWORD}
+    volumes:
+      # 库的数据目录。/var/lib/postgresql/data 是官方镜像的 PGDATA；
+      # 挂命名卷（不是 bind mount）是为了让 docker 管属主——PG 对数据目录权限
+      # 很挑，宿主机上一个 nobody 属主的空目录会让它拒绝启动。
+      - mindmap-db:/var/lib/postgresql/data
+    # 不发布 5432 到宿主机：后端走 compose 内网用服务名 postgres 连它。
+    # 要本机用 psql 连上去看数据就临时加一行（别开公网）：
+    #   ports: ["127.0.0.1:5433:5432"]
+    # 用 5433 是为了不跟宿主机上可能已装的 PG 抢 5432。
+    healthcheck:
+      # pg_isready 比"端口通"严格：initdb 与 WAL 恢复期间端口是监听的，但查询会
+      # 报 57P03。backend 的 depends_on 等的是这一条绿。
+      test: ["CMD-SHELL", "pg_isready -U mindmap -d mindmaps"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    # 2C2G 的机器上别让 PG 自己按宿主机内存去算 shared_buffers（它默认按物理内存的
+    # 25% 估，容器里看到的常是宿主机全量内存）。给一个保守上限，剩下的留给后端与
+    # torch/docling 那堆。真要调就改这里，不要改镜像里的 postgresql.conf。
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=40
     logging:
       driver: json-file
       options:
@@ -137,3 +193,7 @@ services:
 volumes:
   mindmap-data:
   mindmap-models:
+  # PostgreSQL 的数据目录（导图 / 运行记录 / 知识库 / 块向量 / 外部检索缓存
+  # 全在这一个库的几张表里）。**备份走 pg_dump -Fc，不是拷这个卷**：
+  # 服务在跑时拷数据目录拿到的是撕裂的集群，见 deploy/backup.sh 开头的说明。
+  mindmap-db:

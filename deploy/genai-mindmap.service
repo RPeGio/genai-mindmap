@@ -11,8 +11,8 @@ Group=genai
 WorkingDirectory=/opt/genai-mindmap/backend
 
 # 密钥等运行时配置放在这里，仓库里不存（install.sh 会创建，权限 0640 root:genai）。
-# 这里刻意不写 `-` 前缀：带 `-` 时文件缺失只是静默跳过，于是 MINDMAP_DB_PATH 回落到
-# 代码目录下的 backend/data（被 ProtectSystem=strict 挂成只读），MINDMAP_LLM_* 也全是空，
+# 这里刻意不写 `-` 前缀：带 `-` 时文件缺失只是静默跳过，于是 MINDMAP_PG_DSN 回落到
+# app/db/pool.py 的 DEFAULT_DSN（本机 socket 上的 mindmaps 库），MINDMAP_LLM_* 也全是空，
 # 表现为"服务起来了、一保存就 500"或者生成直接报错。宁可启动失败并给出明确的
 # "Failed to load environment files"，也不要一个看起来正常的坏服务。
 EnvironmentFile=/etc/genai-mindmap/env
@@ -26,8 +26,16 @@ Environment=HOME=/var/lib/genai-mindmap
 # --proxy-headers + --forwarded-allow-ips：nginx 在 127.0.0.1 上反代，
 # 让 request_id 日志与限流能看到真实来源 IP。
 #
-# 只开 1 个 worker：SQLite 是单写者，开多 worker 只会让写冲突变成
-# "database is locked" 的偶发 500；2C2G 上多进程也吃内存。
+# 只开 1 个 worker。**理由已经变了**（迁移到 PostgreSQL 之前是另一条）：
+#   · 以前是**正确性**：SQLite 单写者，多 worker 会把写冲突变成偶发
+#     "database is locked" 500。这条随着 PG 一起消失了——并发现在由数据库
+#     的行锁/MVCC 管，多 worker 同时写是合法且安全的，**不要再以为还有写冲突**。
+#   · 现在是**内存**：每个 uvicorn worker 是一个独立进程，各持一份自己
+#     lazily 打开的 psycopg 池（app/db/pool.py 的 POOL_MAX=8，实测每条后端
+#     连接常驻 15–23MB）与一份完整 Python 运行时（torch/docling 那堆 import
+#     全在私有内存里，不共享）。2C2G 上开第 2 个 worker 等于凭空多一份常驻
+#     池 + 一份解释器，换来的并行度在"单机 + 单库"下也几乎没有收益。
+# 真要横向扩，正确方向是换更大内存的机器或把库挪走，而不是在这里加数字。
 ExecStart=/opt/genai-mindmap/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 --port 8000 --workers 1 \
     --proxy-headers --forwarded-allow-ips=127.0.0.1 \
@@ -51,8 +59,12 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 
-# 只允许写数据目录。服务本身不往 /var/log/genai-mindmap 写（日志走 journal），
-# 那个目录是给备份脚本的 cron 重定向用的，由 install.sh 创建，不进这里。
+# 只允许写数据目录。/var/lib/genai-mindmap 现在**不含数据库**了：库是 PG 服务端
+# 的进程在管，落在 PG 自己的数据目录下（默认 /var/lib/pgsql），本服务只有一条
+# 网络/unix-socket 连接通到它，不需要写权限。这里保留的写权限是给
+# docling / HF 模型缓存（$HOME/.cache，HOME 指到此处）与上传中转的。
+# 服务本身不往 /var/log/genai-mindmap 写（日志走 journal），那个目录是给备份
+# 脚本的 cron 重定向用的，由 install.sh 创建，不进这里。
 # 注意：systemd 为不存在的 ReadWritePaths 建 namespace 会直接 226/NAMESPACE 起不来，
 # 所以这里只列确定存在的路径。
 ReadWritePaths=/var/lib/genai-mindmap

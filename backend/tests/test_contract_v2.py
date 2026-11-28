@@ -6,13 +6,8 @@
     3. 那几条横跨整棵树的校验（关系端点、手动布局坐标）真的会拦住坏数据。
 """
 import json
-import os
-import sqlite3
-import tempfile
 import unittest
 from contextlib import closing
-from pathlib import Path
-from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -193,21 +188,22 @@ class MigrateTest(unittest.TestCase):
 
 
 class RepositoryCompatibilityTest(unittest.TestCase):
-    """仓储层：库里躺着 v1 记录时读得出来，保存后写成 v2。"""
+    """仓储层：库里躺着 v1 记录时读得出来，保存后写成 v2。
+
+    **不再用 tmp 库文件隔离**：PG 的库是共享的，隔离靠 `conftest.py` 的
+    `fresh_db`（每用例 `DELETE FROM` 全表）。这里只负责清掉自己写的那一行，
+    免得同文件内两条用例互相看见。
+    """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.env = patch.dict(os.environ, {"MINDMAP_DB_PATH": str(Path(self.tmp.name) / "repo.db")})
-        self.env.start()
+        self.map_id = "legacy"
 
     def tearDown(self):
-        self.env.stop()
-        self.tmp.cleanup()
+        with closing(repository.connect()) as conn, conn:
+            conn.execute("DELETE FROM mindmaps WHERE id = ?", (self.map_id,))
 
     def insert_v1_row(self, map_id="legacy"):
-        with closing(sqlite3.connect(repository.db_path())) as conn, conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS mindmaps (id TEXT PRIMARY KEY, version INTEGER NOT NULL,"
-                         " content TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        with closing(repository.connect()) as conn, conn:
             conn.execute("INSERT INTO mindmaps (id, version, content, updated_at) "
                          "VALUES (?, 1, ?, '2026-11-01T00:00:00.000Z')",
                          (map_id, json.dumps({"title": "旧图", "root": {"id": "r", "label": "根", "children": []}},
@@ -224,8 +220,9 @@ class RepositoryCompatibilityTest(unittest.TestCase):
         self.insert_v1_row()
         parsed = repository.get_map("legacy").content
         repository.update_map("legacy", 1, parsed)
-        with closing(sqlite3.connect(repository.db_path())) as conn, conn:
-            raw = json.loads(conn.execute("SELECT content FROM mindmaps WHERE id = 'legacy'").fetchone()[0])
+        with closing(repository.connect()) as conn, conn:
+            raw = json.loads(conn.execute(
+                "SELECT content FROM mindmaps WHERE id = 'legacy'").fetchone()["content"])
         self.assertEqual(raw["schema_version"], 2)
         self.assertEqual(raw["layout"], "tree")
 

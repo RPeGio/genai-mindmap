@@ -66,7 +66,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 | `DASHSCOPE_API_KEY` | 语音转写（百炼 Qwen-Audio-ASR），没配时 `.wav` 上传返回 422 |
 | `MINDMAP_SOFFICE_CMD` | 指到 LibreOffice 的 `soffice` 路径，处理 `.doc`/`.ppt`/`.xls` 之外的老格式；不配则从 `PATH` 里找 |
 | `MINDMAP_AGENT_ENABLED` | 设为 `0` 关闭 `/api/agent/runs/stream` |
-| `MINDMAP_DB_PATH` | SQLite 文件位置，默认 `backend/data/mindmaps.db` |
+| `MINDMAP_PG_DSN` | PostgreSQL 连接串（不设时用代码里的本机默认）；原 `MINDMAP_DB_PATH`（SQLite 文件位置）已废除——改名会让 cookie 签名密钥变化，升级后需重新登录一次 |
 | `MINDMAP_NLI_ENABLED`、`MINDMAP_NLI_MODEL_DIR`、`MINDMAP_NLI_MIN_FREE_MB` | 可选的引用语义校验（ONNX 模型），不配时只做机械核验 |
 
 PDF 视觉识别复用上面的 `MINDMAP_LLM_*`，并要求 `MINDMAP_LLM_MODE=model`；`demo` 模式下 PDF 只回落到文本层，扫描件会返回 422。

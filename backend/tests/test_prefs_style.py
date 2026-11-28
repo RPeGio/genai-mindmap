@@ -340,9 +340,11 @@ def _store_run(run_id: str, payload: dict, status: str = "done") -> None:
 
     with closing(repository.connect()) as conn, conn:
         conn.execute(
-            "INSERT OR REPLACE INTO runs (run_id, status, request, candidate, created_at,"
+            "INSERT INTO runs (run_id, status, request, candidate, created_at,"
             " updated_at) VALUES (?, ?, '{}', ?, '2026-11-19T00:00:00.000Z',"
-            " '2026-11-19T00:00:00.000Z')",
+            " '2026-11-19T00:00:00.000Z')"
+            " ON CONFLICT (run_id) DO UPDATE SET status = EXCLUDED.status,"
+            " candidate = EXCLUDED.candidate",
             (run_id, status, json.dumps(payload, ensure_ascii=False)))
 
 
@@ -365,9 +367,11 @@ def test_observations_skip_unparsable_candidate():
 
     with closing(repository.connect()) as conn, conn:
         conn.execute(
-            "INSERT OR REPLACE INTO runs (run_id, status, request, candidate, created_at,"
+            "INSERT INTO runs (run_id, status, request, candidate, created_at,"
             " updated_at) VALUES ('broken', 'done', '{}', '{\"root\": 1}',"
-            " '2026-11-19T00:00:00.000Z', '2026-11-19T00:00:00.000Z')")
+            " '2026-11-19T00:00:00.000Z', '2026-11-19T00:00:00.000Z')"
+            " ON CONFLICT (run_id) DO UPDATE SET status = EXCLUDED.status,"
+            " candidate = EXCLUDED.candidate")
     assert len(list(style.iter_observations())) == 5
 
 
@@ -383,7 +387,10 @@ def test_style_profile_schema_is_the_agreed_one():
     from app.mindmaps import repository
 
     with closing(repository.connect()) as conn:
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(style_profile)")]
+        columns = [row["column_name"] for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'style_profile' "
+            "ORDER BY ordinal_position")]
     assert columns == ["owner", "key", "value", "samples", "confidence", "updated_at"]
 
 
@@ -401,7 +408,8 @@ def test_style_does_not_touch_user_prefs():
         _store_run(f"run{index}", _tree(branches=count, depth=3))
     style.refresh()
     with closing(repository.connect()) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM user_prefs").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) AS total FROM user_prefs").fetchone()["total"] == 0
 
 
 def test_node_style_is_not_read_as_color():

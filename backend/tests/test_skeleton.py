@@ -1,20 +1,16 @@
 """骨架冒烟测试：验证新增模块的流程能走通、桩接口按约定返回。
 
-不访问模型、不写真实数据库（用临时库）。
+不访问模型；库里没有需要预置的行（`conftest.py` 的 `fresh_db` 每用例清表）。
 """
 import asyncio
 import json
 import os
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from app.main import app
 from app.ingestion.service import NotSupportedSource, parse_bytes
 from app.contracts.source import SourceKind
-
-BACKEND = Path(__file__).resolve().parents[1]
 
 #: 门禁要求"有身份"。本文件手写 ASGI scope、不经过 `TestClient` 的 cookie 罐，
 #: 所以自己签一个游客 cookie——游客 cookie 是 `<id>.<hmac>`，裸的 32 位十六进制
@@ -24,7 +20,7 @@ GUEST_ID = "0123456789abcdef0123456789abcdef"
 
 
 def _guest_cookie() -> bytes:
-    """现签一次游客 cookie。签名密钥从库路径派生，必须在 `MINDMAP_DB_PATH` 打好之后调用。"""
+    """现签一次游客 cookie。签名密钥从连接串（`dsn()`）派生，必须在 DSN 定好之后调用。"""
     from app.auth import store as auth_store
     return f"mm_guest={auth_store.sign_guest(GUEST_ID)}".encode()
 
@@ -77,21 +73,6 @@ def request(method: str, path: str, body=None):
 
 
 class SkeletonTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        data = BACKEND / "data"
-        data.mkdir(exist_ok=True)
-        cls.tmp = tempfile.TemporaryDirectory(dir=data, ignore_cleanup_errors=True)
-        cls.env = patch.dict(os.environ, {
-            "MINDMAP_DB_PATH": str(Path(cls.tmp.name) / "skeleton.db"),
-        })
-        cls.env.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.env.stop()
-        cls.tmp.cleanup()
-
     def test_health(self):
         status, raw = request("GET", "/api/health")
         self.assertEqual(status, 200)

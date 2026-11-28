@@ -111,8 +111,8 @@ class ManualCase:
 MANUAL_SOURCE_HASHES: dict[str, str] = {
     "docs/AGENT_PLAN.md": "4587560fa7bf967d3244b3c2f21c814328ba7a66e0d5581faa270e439e09d800",
     "docs/RAG-DECISIONS.md": "a96ec40fc249cffcb19a15ac057c2a2685b51ac8761675ed537d82e5e05e1b13",
-    "docs/PLAN.md": "b5291b5bfacb0ba36eb197e8254e514f5d1d4ac61bda70e97f98939181cd7bd3",
-    "docs/ARCHITECTURE.md": "a830171342192fec95c489e21502b94c7c19f7f2b35d883a914daa304b296279",
+    "docs/PLAN.md": "b7e2d264d2c1878189648c3038f8e5a37764c1a807747a967612f6690e7aafc2",
+    "docs/ARCHITECTURE.md": "c96e40782eba19390b926e2bcccacca8aa330352db0b31f29b8eeca2a5e9ca20",
 }
 """这四份材料**已标注章节正文**的 `sha256`；对不上就是标注覆盖的正文变了，整套要复核。
 

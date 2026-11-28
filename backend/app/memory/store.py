@@ -26,7 +26,6 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
@@ -34,6 +33,8 @@ from datetime import datetime, timezone
 from typing import Literal, get_args
 from uuid import uuid4
 
+from app.db.conn import Connection, Row
+from app.db.errors import DatabaseError
 from app.knowledge import vector_cache
 from app.knowledge.embedding import (
     EmbeddingError,
@@ -140,7 +141,7 @@ MAX_QUERY_SOURCES = 3
 
 #: 时间格式与 `mindmaps` / `runs` / `user_prefs` / `edit_events` / `library_*` 完全
 #: 一致。五处格式不同就会在"谁更晚"上错一天——这是仓库里写过的教训（`runs.py:_NOW`）。
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_NOW = "nowstamp()"
 
 _CREATE_ITEMS = f"""CREATE TABLE IF NOT EXISTS {ITEM_TABLE} (
     id            TEXT PRIMARY KEY,
@@ -156,7 +157,7 @@ _CREATE_ITEMS = f"""CREATE TABLE IF NOT EXISTS {ITEM_TABLE} (
     text_hash     TEXT NOT NULL,
     model         TEXT,
     dim           INTEGER,
-    vector        BLOB
+    vector        bytea
 )"""
 
 _CREATE_SESSIONS = f"""CREATE TABLE IF NOT EXISTS {SESSION_TABLE} (
@@ -168,7 +169,7 @@ _CREATE_SESSIONS = f"""CREATE TABLE IF NOT EXISTS {SESSION_TABLE} (
 )"""
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: Connection) -> None:
     """建两张表。由 `repository.connect()` 在同一个连接上调用，幂等。
 
     **`(owner, text_hash)` 上是一条 UNIQUE 索引**，不是普通索引：去重是这个设计的
@@ -190,9 +191,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # 老库补 `owner` 列。`CREATE TABLE IF NOT EXISTS` 不会给已有的表补列，
     # 而缺列的表现是 `SELECT ... WHERE owner = ?` 抛 `no such column`——被
     # `prompt_for` 的调用方吞成"这次没有相关记忆"，看起来和"记忆是空的"一样。
-    from app.mindmaps.repository import _ensure_columns
+    from app.db.schema import ensure_columns
 
-    _ensure_columns(conn, ITEM_TABLE, {"owner": "TEXT NOT NULL DEFAULT ''"})
+    ensure_columns(conn, ITEM_TABLE, {"owner": "TEXT NOT NULL DEFAULT ''"})
     conn.execute(f"DROP INDEX IF EXISTS idx_{ITEM_TABLE}_hash")
     conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{ITEM_TABLE}_owner_hash "
                  f"ON {ITEM_TABLE}(owner, text_hash)")
@@ -360,7 +361,7 @@ class Added:
     created: bool
 
 
-def _row(row: sqlite3.Row) -> Item:
+def _row(row: Row) -> Item:
     return Item(
         id=row["id"],
         text=row["text"],
@@ -376,7 +377,7 @@ def _row(row: sqlite3.Row) -> Item:
     )
 
 
-def _connect() -> sqlite3.Connection:
+def _connect() -> Connection:
     # 表在 `repository.connect()` 里与 `mindmaps` / `runs` 同一时刻建好，所以这里
     # 没有任何"发现表不存在"的分支——与 `prefs.service._connect` 同一条理由。
     return repository.connect()
@@ -482,7 +483,7 @@ def delete(item_id: str, *, owner: str) -> bool:
 def count(*, owner: str) -> int:
     with closing(_connect()) as conn:
         return int(conn.execute(
-            f"SELECT COUNT(*) FROM {ITEM_TABLE} WHERE owner = ?", (owner,)).fetchone()[0])
+            f"SELECT COUNT(*) AS total FROM {ITEM_TABLE} WHERE owner = ?", (owner,)).fetchone()["total"])
 
 
 def items(limit: int = 200, *, owner: str) -> list[Item]:
@@ -517,11 +518,11 @@ class Hit:
         return self.item.text
 
 
-def _candidates(limit: int = MAX_SCAN, *, owner: str) -> list[sqlite3.Row]:
+def _candidates(limit: int = MAX_SCAN, *, owner: str) -> list[Row]:
     """读出参与检索的行（含向量列），**只读这个人的**。"""
     with closing(_connect()) as conn:
         total = int(conn.execute(
-            f"SELECT COUNT(*) FROM {ITEM_TABLE} WHERE owner = ?", (owner,)).fetchone()[0])
+            f"SELECT COUNT(*) AS total FROM {ITEM_TABLE} WHERE owner = ?", (owner,)).fetchone()["total"])
         if total > limit:
             logger.warning("记忆表共 %d 行，超过本次检索上限 %d，只取最近的 %d 行"
                            "（更旧的这次不参与：要让它无偏，该上向量索引而不是调大这个数）",
@@ -622,7 +623,7 @@ def _touch(ids: list[str], moment: datetime) -> None:
             conn.execute(
                 f"UPDATE {ITEM_TABLE} SET last_used_at = ? WHERE id IN ({marks})",
                 (stamp, *ids))
-    except sqlite3.Error as exc:
+    except DatabaseError as exc:
         logger.warning("记忆的 last_used_at 没有写进去：%s", type(exc).__name__)
 
 

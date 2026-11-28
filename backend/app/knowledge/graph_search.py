@@ -124,7 +124,7 @@
 Neo4j 抛错时降级成纯文本检索并记 warning，**不让整次检索失败**：`graph_store` 的读
 接口本来就把"查不到"和"库坏了"折成同一个空值（见 `graph_store` 模块 docstring 的
 「写与读的降级不对称」），这一层再兜一次是为了接住自己的异常（`library.load` 的
-`sqlite3.Error`、区间校验的 `ValueError`）。
+`DatabaseError`、区间校验的 `ValueError`）。
 
 **降级还要够快**：库不可达时一次 `entity_degrees` 实测 2.04 秒、一次 `neighbors`
 2.04 秒，而一次图检索是 1 + 最多 4 条——十秒级的延迟已经超出"降级"的语义。所以
@@ -145,10 +145,10 @@ Neo4j 抛错时降级成纯文本检索并记 warning，**不让整次检索失�
 from __future__ import annotations
 
 import logging
-import sqlite3
 from typing import Literal
 
 from app.contracts.source import Source
+from app.db.errors import DatabaseError
 from app.knowledge import graph_store, library
 from app.knowledge.graph_resolve import (
     GENERIC_TERMS,
@@ -313,7 +313,7 @@ class _Resolver:
     def _load(self, source_id: str) -> Source | None:
         try:
             stored = library.load(source_id)
-        except (sqlite3.Error, OSError) as exc:
+        except (DatabaseError, OSError) as exc:
             # 库不可用是一种"这批证据拿不到"，不是"整次检索失败"。
             logger.warning("图证据的来源读取失败：%s", type(exc).__name__)
             return None

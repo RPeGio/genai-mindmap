@@ -27,11 +27,12 @@ import hmac
 import logging
 import re
 import secrets
-import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 
 from app.core.errors import AppError
+from app.db.conn import Connection, Row
+from app.db.errors import DatabaseError, IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,10 @@ SESSION_TABLE = "sessions"
 
 #: 时间格式与 `mindmaps` / `runs` / `user_prefs` / `edit_events` / `library_*` /
 #: `model_settings` 完全一致。格式不同会在"谁更晚"上错一天，仓库里已经为这件事
-#: 付过一次代价（`agent/runs.py:_NOW`）。
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+#: 付过一次代价（`agent/runs.py:_NOW`）。`nowstamp()` 是 `app/db/schema.py` 在
+#: PG 上建的服务器端函数，产出与 SQLite `strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+#: 逐字节同形的 UTC 文本；带参数版接秒数偏移（原来要拼 `'-N seconds'` 字符串）。
+_NOW = "nowstamp()"
 
 # ---------------------------------------------------------------- 口令
 
@@ -83,10 +86,24 @@ PASSWORD_MAX_CHARS = 200
 #: 而"找回密码"也没法真的实现。用户名不假装自己能做这两件事。
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 
-#: 唯一性按**不区分大小写**判（`COLLATE NOCASE`），显示保留用户打的大小写。
+#: 唯一性按**不区分大小写**判，显示保留用户打的大小写。
 #: 只按区分大小写判的话，`Alice` 与 `alice` 会是两个账号——它们看起来一样，
 #: 于是"我明明注册了却说没有"和"他怎么进了我的号"都会来找你。
-_NOCASE = " COLLATE NOCASE"
+#:
+#: **PG 没有 `COLLATE NOCASE`**（那只是 SQLite 的 collation 名）。在 PG 上这件事
+#: 由 `ensure_schema` 建的 `UNIQUE INDEX ... ON users (lower(username))` 承担，查询
+#: 侧统一写 `lower(username) = lower(?)`。**不能靠库的默认 collation 兜**：默认
+#: collation 取决于 `initdb` 时的 locale，`--locale=C` 下 `ORDER BY` 恰好与 `COLLATE
+#: "C"` 同序，但换成 `zh_CN.UTF-8` 就不是了——`lower()` 索引是唯一与 locale 无关的
+#: 判据。
+_NOCASE = ""
+
+#: 大小写无关的唯一索引。名字与 `app/db/schema.py` 的建表清单里那条一致：`init_schema()`
+#: 建终态表时已经建过，这里是给"只有老表、没跑过 `init_schema()`"的库兜一次底。
+_CREATE_USERNAME_INDEX = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{USER_TABLE}_username_lower "
+    f"ON {USER_TABLE} (lower(username))"
+)
 
 # ---------------------------------------------------------------- 会话
 
@@ -144,14 +161,18 @@ class AuthError(AppError):
     """账号相关的业务异常。带着业务 code 出去，界面才有话可说。"""
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: Connection) -> None:
     """建两张表。由 `repository.connect()` 在同一个连接上调用，幂等。
 
     与 `model_settings` / `library_sources` / `memory_items` 建在同一时刻的理由
     一样：读它的路径（**每一个请求的中间件**）在热路径上，多一个"发现表不存在 →
     建表"的分支，只会在最不该出错的地方多一条可能出错的路径。
+
+    正常启动路径上这些 DDL 已经是空转的（`app/db/schema.init_schema()` 在 lifespan
+    里建过同一批表）；保留它是为了让"直接拿一个空库跑脚本/测试"也能起来。
     """
     conn.execute(_CREATE_USERS)
+    conn.execute(_CREATE_USERNAME_INDEX)
     conn.execute(_CREATE_SESSIONS)
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{SESSION_TABLE}_user "
                  f"ON {SESSION_TABLE}(user_id)")
@@ -159,7 +180,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                  f"ON {SESSION_TABLE}(expires_at)")
 
 
-def _connect() -> sqlite3.Connection:
+def _connect() -> Connection:
     """拿连接。函数内 import 是为了避免环：`repository.connect()` 要调本模块的
     `ensure_schema`，模块顶层反向 import 回去就成环。与 `settings/store.py` 同一手法。
     """
@@ -174,16 +195,24 @@ def _connect() -> sqlite3.Connection:
 #:
 #: 为什么不给一个 `MINDMAP_SECRET`：多一个环境变量就多一种"忘了设 / 设错了 / 两台
 #: 机器的值不一样"的故障形态，而这两种故障都表现为"所有人突然变成游客"或"游客
-#: 数据全部丢失"——排查时间全花在配置上。密钥从库文件的绝对路径派生：它天然是
-#: 每台机器一份、随库一起搬、不需要任何运维动作。
+#: 数据全部丢失"——排查时间全花在配置上。密钥从**库身份**派生：每套部署天然一份、
+#: 不需要任何运维动作。
 #:
-#: 代价说清楚：**同一个人在两台机器上会拿到同一个游客 id**（如果库文件恰好同名
-#: 同路径）。那不是泄漏，是"这两台机器上的游客数据会合并"——本来就只有一个库。
+#: 上一次迁移（SQLite → PG）之后，`repository.db_path()` 返回的是 DSN 而不是文件
+#: 路径。语义因此从"库文件在哪"变成"连的是哪个库"，**代价变重了**：换库地址、甚至
+#: 只是给 DSN 加一个 `?application_name=...`，都会让所有游客 cookie 立刻失效
+#: （旧签名验不过 → 被当成没有 cookie → 换一个新游客 id）。这次迁移属于这种情况，
+#: 发布说明里写了"所有人需要重新登录"。要避免这种连带失效，就得换成独立的
+#: `MINDMAP_SECRET`——那是上面明确否掉的那个方案，取舍见 `docs/PG-MIGRATION-PLAN.md`。
 _SECRET_PREFIX = b"mindmap-guest-v1:"
 
 
 def _guest_secret() -> bytes:
-    """从库路径派生签名密钥（见 `_SECRET_PREFIX` 的注释）。"""
+    """从**库身份**（`repository.db_path()`，现在是 DSN 的别名）派生签名密钥。
+
+    见 `_SECRET_PREFIX` 的注释：换 DSN 会让所有游客 cookie 失效，那是这个方案的已知
+    代价，不是 bug。新代码要"这个库是哪一份"的身份，用 `repository.dsn()`。
+    """
     from app.mindmaps import repository
 
     return hashlib.sha256(
@@ -310,7 +339,7 @@ class Identity:
         return "anonymous"
 
 
-def _user(row: sqlite3.Row) -> User:
+def _user(row: Row) -> User:
     return User(id=row["id"], username=row["username"],
                 created_at=row["created_at"], updated_at=row["updated_at"])
 
@@ -358,7 +387,7 @@ def create_user(username: str, password: str) -> User:
             conn.execute(
                 f"INSERT INTO {USER_TABLE} (id, username, password_hash, created_at, updated_at) "
                 f"VALUES (?, ?, ?, {_NOW}, {_NOW})", (user_id, name, hashed))
-    except sqlite3.IntegrityError as exc:
+    except IntegrityError as exc:
         # `UNIQUE ... COLLATE NOCASE` 是唯一会在这条 INSERT 上撞的约束（id 是新
         # uuid，不会撞）。但仍然只认这一种：把任何 IntegrityError 都说成"账号名
         # 被占用"，会让真正的缺陷以一句用户看得懂的话被吞掉。
@@ -378,7 +407,7 @@ def get_user(user_id: str) -> User | None:
 def find_user(username: str) -> User | None:
     with closing(_connect()) as conn:
         row = conn.execute(
-            f"SELECT * FROM {USER_TABLE} WHERE username = ?{_NOCASE}",
+            f"SELECT * FROM {USER_TABLE} WHERE lower(username) = lower(?)",
             ((username or "").strip(),)).fetchone()
     return _user(row) if row else None
 
@@ -398,7 +427,7 @@ def authenticate(username: str, password: str) -> User | None:
         return None
     with closing(_connect()) as conn:
         row = conn.execute(
-            f"SELECT * FROM {USER_TABLE} WHERE username = ?{_NOCASE}", (name,)).fetchone()
+            f"SELECT * FROM {USER_TABLE} WHERE lower(username) = lower(?)", (name,)).fetchone()
     if row is None:
         # 与真校验同代价的占位（值本身无意义）。
         verify_password(password, _DUMMY_HASH)
@@ -449,18 +478,16 @@ def open_session(user_id: str) -> str:
         conn.execute(
             f"INSERT INTO {SESSION_TABLE} "
             f"(token_hash, user_id, created_at, last_seen_at, expires_at, revoked_at) "
-            f"VALUES (?, ?, {_NOW}, {_NOW}, "
-            f"strftime('%Y-%m-%dT%H:%M:%fZ','now', ?), NULL)",
-            (_hash_token(token), user_id, f"+{SESSION_TTL_SECONDS} seconds"))
+            f"VALUES (?, ?, {_NOW}, {_NOW}, nowstamp(?), NULL)",
+            (_hash_token(token), user_id, SESSION_TTL_SECONDS))
     return token
 
 
-def _gc_sessions(conn: sqlite3.Connection) -> None:
+def _gc_sessions(conn: Connection) -> None:
     """删掉过期够久的会话行。过期没多久的留着，好让"为什么又要登录"有据可查。"""
     conn.execute(
-        f"DELETE FROM {SESSION_TABLE} WHERE expires_at < "
-        f"strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)",
-        (f"-{SESSION_GC_AFTER_SECONDS} seconds",))
+        f"DELETE FROM {SESSION_TABLE} WHERE expires_at < nowstamp(?)",
+        (-SESSION_GC_AFTER_SECONDS,))
 
 
 def session_user(token: str) -> User | None:
@@ -479,7 +506,7 @@ def session_user(token: str) -> User | None:
                 f"FROM {SESSION_TABLE} s JOIN {USER_TABLE} u ON u.id = s.user_id "
                 f"WHERE s.token_hash = ? AND s.revoked_at IS NULL "
                 f"AND s.expires_at > {_NOW}", (token_hash,)).fetchone()
-    except sqlite3.Error:
+    except DatabaseError:
         # 会话层读不出来时**当作未登录**，不让它变成 500：身份层现在不拦任何请求，
         # 一个坏库应该表现为"这次认不出你是谁"，而不是整站不可用。
         logger.warning("读取会话失败，本次按未登录处理", exc_info=True)
@@ -501,11 +528,10 @@ def _touch(token_hash: str, last_seen: str | None) -> None:
         try:
             conn.execute(
                 f"UPDATE {SESSION_TABLE} SET last_seen_at = {_NOW} "
-                f"WHERE token_hash = ? AND last_seen_at < "
-                f"strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)",
-                (token_hash, f"-{SESSION_TOUCH_SECONDS} seconds"))
+                f"WHERE token_hash = ? AND last_seen_at < nowstamp(?)",
+                (token_hash, -SESSION_TOUCH_SECONDS))
             conn.commit()
-        except sqlite3.Error:
+        except DatabaseError:
             logger.warning("刷新会话时间失败（不影响这次请求）", exc_info=True)
 
 

@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sqlite3
 from contextlib import closing
 
 import httpx
@@ -30,6 +29,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.core.errors import register_error_handlers
+from app.db.errors import DatabaseError, UniqueViolation
 from app.generation import service as generation_service
 from app.generation.service import DEEP_MODEL_FALLBACK, ModelNotConfigured
 from app.ingestion import vision_pdf
@@ -673,19 +673,25 @@ def test_key_never_appears_in_the_log(monkeypatch, caplog):
 
 
 def test_a_broken_db_degrades_to_env_instead_of_failing_generation(
-        monkeypatch, tmp_path, caplog):
+        monkeypatch, caplog):
     """库读不出来时回落环境变量，并留一条 warning。
 
     这条路径在**每一次模型调用**的开头。让它因为一个读不到的配置表把整次生成
     打成失败，比"回落到环境变量"糟糕得多——后者在绝大多数部署上恰好是对的。
     "降级要留下降过级的痕迹"是 AGENTS.md 里那条约定。
+
+    库坏在 PG 上没有"文件坏掉"这种形状，所以这里直接让连接抛 `DatabaseError`：
+    判据是"读失败会降级"，而不是"用什么办法把库弄坏"。
     """
     monkeypatch.setenv(store.BASE_URL_ENV, "https://env.example/v1")
     monkeypatch.setenv(store.API_KEY_ENV, "env-key-0000")
     monkeypatch.setenv(store.MODEL_ENV, "env-model")
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "broken" / "nope.db"))
-    (tmp_path / "broken").mkdir()
-    (tmp_path / "broken" / "nope.db").write_text("not a database", encoding="utf-8")
+    monkeypatch.setattr(store, "_DEGRADED_WARNED", False)
+
+    def broken(*args, **kwargs):
+        raise DatabaseError("connection refused")
+
+    monkeypatch.setattr(store, "_connect", broken)
 
     with caplog.at_level(logging.WARNING):
         base, key, model = generation_service._config()
@@ -708,7 +714,7 @@ def test_saving_while_the_db_cannot_be_read_does_not_wipe_the_row(monkeypatch):
     original = store._read_strict
 
     def unreadable(owner, **kwargs):
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     monkeypatch.setattr(store, "_read_strict", unreadable)
 
@@ -752,7 +758,7 @@ def test_saving_while_the_write_lock_is_held_is_a_readable_503(monkeypatch):
     original = store._connect
 
     def locked(**kwargs):
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     monkeypatch.setattr(store, "_connect", locked)
     response = client.put("/api/settings/model", json=_body(model="deepseek-reasoner"))
@@ -771,56 +777,45 @@ def test_clear_resets_the_row():
 
 # ---------------------------------------------------------------- 建表
 
-def test_table_is_created_by_the_repository_connect():
-    """表由 `repository.connect()` 建：读它的路径在热路径上。
+def test_table_is_created_by_init_schema():
+    """表由 `init_schema()` 一次建好：读它的路径在热路径上。
 
     多一个"发现表不存在 → 建表"的分支，只会在最不该出错的地方多一条可能出错的路径。
     """
     with closing(repository.connect()) as conn:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        names = {row["table_name"] for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()")}
     assert store.TABLE in names
 
 
-def test_an_old_database_without_the_table_gets_it(monkeypatch, tmp_path):
-    """**旧库**（线上那份 `data/mindmaps.db`）里没有 `model_settings` 表。
+def test_a_missing_table_is_not_rescued_at_runtime(monkeypatch):
+    """**旧库补表这条路径已经不存在了**，取而代之的是启动期建表。
 
-    这一步是真的会发生的：上线时 `MINDMAP_DB_PATH` 指向一个已经跑了几个月、里面有
-    用户导图的 SQLite 文件。`connect()` 必须把它补上，而不是因为缺表把整次生成打成
-    失败。这里造一个只含 `mindmaps` 表的旧库，走一遍 `connect()` → 写 → 读。
+    原来这里造一个只有 `mindmaps` 表的 SQLite 旧库，验 `connect()` 会把
+    `model_settings` 补上。PG 上建表只发生在 `init_schema()`（lifespan），
+    "连一次就补表"没有了——所以现在钉的是它的反面：**表不在就是不在**，
+    读路径按降级处理而不是就地建表。
+
+    这一步在线上仍是真会发生的场景（部署了但没跑迁移 / 连错了库），
+    只是处理方式从"偷偷补上"变成"降级 + 留下痕迹"。
     """
-    import sqlite3
+    with closing(repository.connect()) as conn, conn:
+        conn.execute(f"ALTER TABLE {store.TABLE} RENAME TO {store.TABLE}_hidden")
 
-    path = tmp_path / "old.db"
-    legacy = sqlite3.connect(str(path))
     try:
-        # 旧库的最小形状：一张 users 会用的表 + 一个 `mindmaps` 表（不与新表重名）。
-        legacy.execute("CREATE TABLE mindmaps (id TEXT PRIMARY KEY, payload TEXT)")
-        legacy.execute("INSERT INTO mindmaps (id, payload) VALUES ('m1', '{}')")
-        legacy.commit()
+        monkeypatch.setattr(store, "_DEGRADED_WARNED", False)
+        store._CACHE.clear()
+        # 表不在 → 读不到 → 降级成空 `Ready()`，不是抛、也不是建表。
+        assert store.saved(owner=store.INSTANCE_OWNER) == store.Ready()
+        with closing(repository.connect()) as conn:
+            names = {row["table_name"] for row in conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema()")}
+        assert store.TABLE not in names, "读路径不该就地建表"
     finally:
-        legacy.close()
-
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(path))
-    store._CACHE.clear()
-
-    # connect() 之后表就存在了，且旧数据还在（补表不该动别的表）。
-    with closing(repository.connect()) as conn:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert store.TABLE in names
-        assert conn.execute("SELECT COUNT(*) FROM mindmaps").fetchone()[0] == 1
-
-    # 补出来的表可以正常读写：这是"迁移成功"的真正判据。
-    saved, changed = store.save(base_url="https://api.deepseek.com/v1",
-                                api_key=SECRET, model="deepseek-chat")
-    assert changed is True
-    assert saved.base_url == "https://api.deepseek.com/v1"
-    assert store.saved().model == "deepseek-chat"
-    # 再连一次仍然是同一行，不是每次 connect 插一行。
-    with closing(repository.connect()) as conn:
-        rows = conn.execute(f"SELECT owner FROM {store.TABLE}").fetchall()
-    assert [row[0] for row in rows] == [store.INSTANCE_OWNER]
+        with closing(repository.connect()) as conn, conn:
+            conn.execute(f"ALTER TABLE {store.TABLE}_hidden RENAME TO {store.TABLE}")
 
 
 def test_reading_does_not_rebuild_the_table_on_every_call(monkeypatch):
@@ -887,13 +882,11 @@ def test_one_row_per_owner_and_no_more():
     改成 `owner TEXT PRIMARY KEY` 之后这条约束由 DDL 承担；不同 owner 各有各的
     一行则是这一版的正常形态（那是多用户，不是重复）。
     """
-    import sqlite3
-
     with closing(repository.connect()) as conn, conn:
         conn.execute(
             f"INSERT INTO {store.TABLE} (owner, base_url) VALUES (?, 'https://a/v1')",
             (store.INSTANCE_OWNER,))
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(UniqueViolation):
             conn.execute(
                 f"INSERT INTO {store.TABLE} (owner, base_url) VALUES (?, 'https://b/v1')",
                 (store.INSTANCE_OWNER,))

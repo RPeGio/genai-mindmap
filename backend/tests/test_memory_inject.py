@@ -17,6 +17,7 @@ from contextlib import closing
 
 from app.agent import service as agent_service
 from app.agent.contracts import AgentRunRequest, Completion, RunContext, ToolCall
+from app.db.errors import DatabaseError
 from app.memory import store
 from app.mindmaps import repository
 
@@ -270,10 +271,8 @@ def test_unconfigured_embedding_skips_the_lookup_entirely(monkeypatch):
 
 def test_recall_failure_does_not_break_the_generation(monkeypatch):
     """检索抛错 → 一句 warning + 空串，生成照跑。"""
-    import sqlite3
-
     def boom(request):
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     monkeypatch.setattr(store, "prompt_for", boom)
     request = AgentRunRequest(goal="机器学习")

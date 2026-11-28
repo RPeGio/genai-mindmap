@@ -32,8 +32,10 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
+
+from app.db.conn import Connection, Row
+from app.db.errors import DatabaseError
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +71,12 @@ _MAX_ACCOUNT_KEY = 64
 _MAX_IP_KEY = 64
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: Connection) -> None:
     """建表。由 `repository.connect()` 在同一条连接上调用，幂等。"""
     conn.execute(_CREATE)
 
 
-def _connect() -> sqlite3.Connection:
+def _connect() -> Connection:
     """拿连接。函数内 import 避免环，与 `auth/store.py` 同一手法。"""
     from app.mindmaps import repository
 
@@ -88,18 +90,18 @@ def bucket_ip(address: str) -> str:
 
 
 def bucket_account(username: str) -> str:
-    """账号桶的键。小写归一，与 `users.username` 的 `COLLATE NOCASE` 对齐。"""
+    """账号桶的键。小写归一，与 `users` 的 `lower(username)` 唯一索引对齐。"""
     text = (username or "").strip().lower()[:_MAX_ACCOUNT_KEY]
     return f"{_ACCOUNT_PREFIX}{text or '?'}"
 
 
-def _read(conn: sqlite3.Connection, bucket: str) -> sqlite3.Row | None:
+def _read(conn: Connection, bucket: str) -> Row | None:
     return conn.execute(
         f"SELECT failures, first_at, last_at FROM {TABLE} WHERE bucket = ?", (bucket,)
     ).fetchone()
 
 
-def _blocked(conn: sqlite3.Connection, bucket: str, now: float) -> float:
+def _blocked(conn: Connection, bucket: str, now: float) -> float:
     """这个桶还要等多少秒；0 表示放行。
 
     窗口滑出时直接放行、**不**顺手删行：删行要写锁，而"判断"发生在每一次登录
@@ -131,7 +133,7 @@ def retry_after(*, ip: str, username: str) -> int:
             worst = max(_blocked(conn, key, now) for key in keys)
         finally:
             conn.close()
-    except sqlite3.Error as error:
+    except DatabaseError as error:
         logger.error("登录限速表读不出来，本次按未限速处理：%s", error)
         return 0
     return int(worst + 0.999) if worst > 0 else 0
@@ -148,11 +150,11 @@ def record_failure(*, ip: str, username: str) -> None:
             conn.commit()
         finally:
             conn.close()
-    except sqlite3.Error as error:
+    except DatabaseError as error:
         logger.error("登录失败没记进限速表，本次限速会偏松：%s", error)
 
 
-def _bump(conn: sqlite3.Connection, bucket: str, now: float) -> None:
+def _bump(conn: Connection, bucket: str, now: float) -> None:
     row = _read(conn, bucket)
     if row is None or now - float(row["first_at"]) > WINDOW_SECONDS:
         failures, first_at = 1, now
@@ -176,7 +178,7 @@ def clear_account(username: str) -> None:
             conn.commit()
         finally:
             conn.close()
-    except sqlite3.Error as error:
+    except DatabaseError as error:
         logger.error("登录成功但没清掉失败计数：%s", error)
 
 
@@ -190,7 +192,7 @@ def clear_all() -> int:
             return int(cursor.rowcount or 0)
         finally:
             conn.close()
-    except sqlite3.Error as error:
+    except DatabaseError as error:
         logger.error("限速表清不掉：%s", error)
         return 0
 
