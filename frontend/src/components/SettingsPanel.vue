@@ -67,6 +67,18 @@ const initial = ref({ base_url: '', model: '', deep_model: '', reasoning_effort:
 const probedEffortOptions = ref<string[] | null>(null);
 const lastProbe = ref('');
 
+/**
+ * "按下 + 松开都在遮罩上"才算点遮罩。只看 click 会把从卡片里拖出去的松手当成
+ * 关闭——那次 click 的目标恰好是遮罩（见模板上的注释）。卡片里的任何按下都把
+ * 这个标志清掉，防止一次没消费掉的真遮罩按下替后来的拖拽背书。
+ */
+const backdropPressed = ref(false);
+
+function onBackdropClick(): void {
+  if (backdropPressed.value) emit('close');
+  backdropPressed.value = false;
+}
+
 const baseUrlInput = ref<HTMLInputElement | null>(null);
 
 const view = computed(() => settingsStore.settings);
@@ -167,6 +179,10 @@ function fillFrom(next: typeof view.value): void {
     deep_model: deepModel.value.trim(),
     reasoning_effort: reasoningEffort.value,
   };
+  // 刚填进来的就是基准状态：点进去又点出来（比如面板打开时自动聚焦地址框，
+  // 用户点了模型框，地址框失焦）不该触发一次"什么都没改"的探测。签名与
+  // `rememberProbe` 记的是同一套：地址|密钥|模型，都取 trim 后的值。
+  lastProbe.value = [baseUrl.value.trim(), apiKey.value.trim(), model.value.trim()].join('|');
 }
 
 onMounted(async () => {
@@ -225,12 +241,14 @@ async function runTest(): Promise<void> {
  * 失焦自动探测（模型名、服务地址两个输入框都挂了它）。
  *
  * 触发条件按序排除：游客与免费档是只读视图，探测没有意义；正在测试（手动按钮
- * 或上一次失焦还没回来）不再并发；表单里地址与模型名全空，发也是 400；签名与
- * 上次相同（点进去又点出来、没改一个字）跳过——限速是每分钟 10 次，浪费不得。
+ * 或上一次失焦还没回来）不再并发；**模型名为空**（用户正在清掉重填）——探测的
+ * 对象就是模型名，此刻回落生效值去测，测到的是一个表单里已经不存在的名字；
+ * 签名与上次相同（点进去又点出来、没改一个字，含 `fillFrom` 种下的基准状态）
+ * 跳过——限速是每分钟 10 次，浪费不得。
  */
 async function maybeProbe(): Promise<void> {
   if (guestOnly.value || isFreeTier.value || settingsStore.testing) return;
-  if (!baseUrl.value.trim() && !model.value.trim()) return;
+  if (!model.value.trim()) return;
   const body = testBody();
   const signature = [body.base_url ?? '', body.api_key ?? '', body.model ?? ''].join('|');
   if (signature === lastProbe.value) return;
@@ -325,11 +343,16 @@ function trapFocus(event: KeyboardEvent): void {
   <!--
     遮罩 + 居中卡片。点遮罩关闭，`@click.stop` 挡住卡片内部的冒泡——
     少了那个 stop，点任何输入框都会把面板关掉。
+
+    关闭还要求**按下也发生在遮罩上**：从卡片里按住拖到遮罩上松手（选词、拖动
+    文本都可能这么干），浏览器把 click 派发到按下/松开两目标的公共祖先——恰好
+    是遮罩。只看 click 会把这次拖拽当成"点遮罩"，面板在用户不想关的时候消失。
   -->
   <div
     class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
     data-test="settings-backdrop"
-    @click.self="emit('close')"
+    @mousedown.self="backdropPressed = true"
+    @click.self="onBackdropClick"
   >
     <section
       ref="panel"
@@ -339,6 +362,7 @@ function trapFocus(event: KeyboardEvent): void {
       data-test="settings-panel"
       class="relative max-h-full w-full max-w-lg overflow-auto rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-xl"
       @click.stop
+      @mousedown="backdropPressed = false"
       @keydown="trapFocus"
     >
       <!--

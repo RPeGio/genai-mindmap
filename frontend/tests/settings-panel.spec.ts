@@ -719,11 +719,41 @@ describe('失焦自动探测：档位枚举是问供应商要的，不是我们�
     expect(text(wrapper, '[data-test="settings-effort-unknown"]')).toContain('没有公开档位信息');
   });
 
+  it('打开面板点进模型框不改一个字，不探测：地址框失焦也不算改了配置', async () => {
+    const backend = stubBackend();
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    // 打开面板时自动聚焦的是地址框；点模型框 = 地址框失焦。刚打开的表单是
+    // 基准状态（`fillFrom` 种下的签名），失焦不该替它发明一次请求。
+    await wrapper.get('[data-test="settings-base-url"]').trigger('blur');
+    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    await flushPromises();
+
+    expect(backend.tests).toHaveLength(0);
+  });
+
+  it('模型名清空后失焦不探测：回落生效值测出来的是表单里没有的名字', async () => {
+    const backend = stubBackend();
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    // 用户正在清掉重填。此刻探测会拿"生效值"里的旧模型名去测——那个名字
+    // 表单里已经没有了，结论只会误导。
+    await wrapper.get('[data-test="settings-model"]').setValue('');
+    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    await flushPromises();
+
+    expect(backend.tests).toHaveLength(0);
+  });
+
   it('探测进行中整面板盖着加载态，结束后收走', async () => {
     stubBackend({ probe: { effort_options: ['low'] } });
     const wrapper = mountApp();
     await openPanel(wrapper);
 
+    // 基准状态不触发探测：先真的改一下模型名。
+    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
     await wrapper.get('[data-test="settings-model"]').trigger('blur');
     // 失焦是异步动作，但 `testing` 在进入函数第一行就置位——遮罩此刻就该在。
     expect(has(wrapper, '[data-test="settings-detecting"]')).toBe(true);
@@ -783,7 +813,32 @@ describe('关闭', () => {
     expect(has(wrapper, PANEL)).toBe(false);
 
     await openPanel(wrapper);
-    await wrapper.get('[data-test="settings-backdrop"]').trigger('click');
+    // 真鼠标"点遮罩"是按下 + 松开都在遮罩上：mousedown 记标志，click 消费它。
+    const backdrop = wrapper.get('[data-test="settings-backdrop"]');
+    await backdrop.trigger('mousedown');
+    await backdrop.trigger('click');
+    await flushPromises();
+    expect(has(wrapper, PANEL)).toBe(false);
+  });
+
+  it('从面板里拖到遮罩上松手不关面板；在遮罩上按下再松开才关', async () => {
+    stubBackend();
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    const model = wrapper.get('[data-test="settings-model"]');
+    const backdrop = wrapper.get('[data-test="settings-backdrop"]');
+    // 按下在卡片里、松开在遮罩上：浏览器把那次 click 派发到两目标的公共祖先，
+    // 恰好是遮罩。只看 click 会把"选词/拖动文本"的收尾当成关闭指令。
+    await model.trigger('mousedown');
+    await backdrop.trigger('mouseup');
+    await backdrop.trigger('click');
+    await flushPromises();
+    expect(has(wrapper, PANEL)).toBe(true);
+
+    // 按下和松开都在遮罩上：这才是真的"点遮罩"。
+    await backdrop.trigger('mousedown');
+    await backdrop.trigger('click');
     await flushPromises();
     expect(has(wrapper, PANEL)).toBe(false);
   });
