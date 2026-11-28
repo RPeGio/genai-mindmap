@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from app.contracts.source import Source, SourceKind, SourceMetadata
+from app.core.textfold import fold_control_chars
 from app.db.errors import DatabaseError
 from app.ingestion.service import parse_bytes, write_content_hash
 from app.knowledge import graph_extract, graph_ingest, graph_store, library, service
@@ -233,7 +234,7 @@ def test_folding_keeps_line_breaks_so_chunking_still_works():
     一行——NUL 的问题修好了，切块与检索全坏了，而且不会有任何报错。
     """
     dirty = "一、总则\n\n本制度规定\t费用支出。\x00\n\n二、审批权限\n\n五万元以内。"
-    text = library.fold_control_chars(dirty)
+    text = fold_control_chars(dirty)
 
     assert "\x00" not in text
     assert text.count("\n") == dirty.count("\n"), "换行必须原样保留"
@@ -244,7 +245,7 @@ def test_folding_keeps_line_breaks_so_chunking_still_works():
 def test_folding_only_changes_the_dirty_record():
     """干净的正文一个字都不动：折字符不该成为"每次入库都换一条记录"的原因。"""
     text = _material(11)
-    assert library.fold_control_chars(text) == text
+    assert fold_control_chars(text) == text
     source_id = library.ingest(_source(text))
     stored = library.load(source_id)
     assert stored is not None

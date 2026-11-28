@@ -350,9 +350,10 @@ def _migrate_table(conn, legacy: sqlite3.Connection,
     folded = 0
     # 老库是 SQLite，它的 TEXT 收得下 NUL；PG 的 text 不收（`0x00` 会让整批 INSERT
     # 抛 `psycopg.DataError`）。**只折控制字符、不动别的**：这批字符在目标库里本来
-    # 也表达不出原意（详见 `library.fold_control_chars`）。延迟 import 与既有风格
-    # 一致，也保证 `--dry-run` 这条不连目标库的路径连这个模块都不加载。
-    from app.knowledge.library import fold_control_chars
+    # 也表达不出原意（详见 `app.core.textfold`）。这个模块只依赖标准库——迁移脚本
+    # 的运行环境可能只有 psycopg（实测 ECS 上的临时 venv 连 pydantic 都没有），
+    # import 任何走 `app.contracts` 的模块都会当场 `ModuleNotFoundError`。
+    from app.core.textfold import fold_control_chars
 
     for raw in raw_rows:
         values: list[Any] = []
