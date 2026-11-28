@@ -9,7 +9,6 @@ from app.contracts.mindmap import MAX_TREE_DEPTH, MAX_TREE_NODES, MindMapContent
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
-    MIN_BRANCHES,
     THINKING_MODELS,
     GenerationError,
     _demo_content,
@@ -37,8 +36,8 @@ def _oversized(ratio: float = 1.6) -> str:
 def _tree(branches: int) -> dict:
     """造一棵有 `branches` 条一级分支的树。
 
-    一级分支下限是 3，所以「合法模型结果」的最小形态是三条空分支 —— 老用例里
-    只写一条分支的 fixture 现在会被挡下，凡是断言生成成功的用例都得用这个函数。
+    一级分支**没有下限**（`MIN_BRANCHES` 已删）：几条分支都是"合法模型结果"，
+    这个函数只是让各用例方便造任意大小的树。
     """
     return {"title": "测试", "root": {"id": "1", "label": "测试", "children": [
         {"id": f"b{index}", "label": f"分支{index}", "children": []}
@@ -278,65 +277,46 @@ class ParseModelJsonTest(unittest.TestCase):
             parse_model_json("完全不是 JSON")
 
 
-class BranchFloorTest(unittest.TestCase):
-    """一级分支下限（`MIN_BRANCHES = 3`）：只作用于模型整图生成这条路径。
+class BranchFloorRemovedTest(unittest.TestCase):
+    """一级分支**没有下限**（`MIN_BRANCHES = 3` 已删，2026-11-28）。
 
-    下限是**质量**要求而不是合法性要求：`MindMapContent.validate_tree()` 不加这道
-    门槛，旧图和用户手工删到一条分支的图照常能存能开；demo 也显式跳过。
+    为什么删：线上实测里这道门槛成了失败的头号来源——免费模型两次把骨架给成
+    2 条一级分支，每次判 `too_few_branches`，两次失败就把整轮判成
+    `too_many_failures`，白烧两个 10 分钟级别的长调用。条数是模型对主题/材料
+    规模的判断，由提示词引导（"按需决定分支数量"），代码不再卡死。
 
-    门槛住在 `validate_generated_content()` 里，agent 的 `mindmap_generate` 收尾
-    走的就是它，所以这里直接对那个函数断言——经由一条已经删掉的同步出口去测，
-    测到的只会是那条出口有没有接上它，而不是门槛本身。
+    这组用例钉的是"删得干净"：条数不再是错误，一棵一条链的树照常通过校验；
+    契约校验（`MindMapContent.validate_tree()`）从来就没有这道门槛，旧图与
+    手工编辑后的图行为不变。
     """
 
-    def test_single_branch_is_rejected(self):
-        """一条分支就是一条链，不是层次结构。
-
-        文案必须可操作：说清模型给了几条、要求几条，并给出「换一种说法」或
-        「补充材料」这两条出路，而不是干巴巴一句「不合格」。
-        """
-        with self.assertRaises(GenerationError) as raised:
-            validate_generated_content(_tree(1))
-        message = str(raised.exception)
-        self.assertIn("分支", message)
-        self.assertIn("1 条", message)
-        self.assertIn("换一种说法", message)
-        self.assertIn("补充更多材料", message)
-
-    def test_two_branches_are_rejected(self):
-        with self.assertRaises(GenerationError) as raised:
-            validate_generated_content(_tree(2))
-        self.assertIn("2 条", str(raised.exception))
-
-    def test_root_only_tree_is_rejected(self):
-        """光杆根节点与「分支不够」是两种文案：前者连层次都没有。"""
-        tree = {"title": "测试", "root": {"id": "1", "label": "测试", "children": []}}
-        with self.assertRaises(GenerationError) as raised:
-            validate_generated_content(tree)
-        self.assertIn("没有任何分支", str(raised.exception))
-
-    def test_three_branches_pass(self):
-        content, diagnostics = validate_generated_content(_tree(3))
-        self.assertEqual(len(content.root.children), 3)
+    def test_single_branch_passes(self):
+        """一条分支就是一条链——过去判死，现在照常交付。"""
+        content, diagnostics = validate_generated_content(_tree(1))
+        self.assertEqual(len(content.root.children), 1)
         # 密度诊断不在这条出口里：它只是提示，由调用方（agent 的生成收尾）决定要不要带。
         self.assertEqual(diagnostics, [])
 
-    def test_demo_single_child_placeholder_still_passes(self):
-        """demo 是固定占位结构，本来就只有一个子节点，不该被模型质量门槛打回。
+    def test_two_branches_pass(self):
+        content, _ = validate_generated_content(_tree(2))
+        self.assertEqual(len(content.root.children), 2)
 
-        demo 出口（agent 的 run）从不经过这道校验，仍是显式关掉它更接近真实调用。
-        """
-        content, _ = validate_generated_content(
-            _demo_content("测试").model_dump(), enforce_min_branches=False)
+    def test_prompt_still_asks_for_children_on_the_root(self):
+        """代码门槛删了，提示词里的引导还在：根节点必须有子节点——
+        光杆根节点不是"条数不够"，是"没有内容"，这句必须留。"""
+        self.assertIn("根节点都必须有子节点", DETAIL_PROMPT)
+        self.assertIn("按主题的实际需要决定", DETAIL_PROMPT)
+        self.assertNotIn("不少于 3 条", DETAIL_PROMPT)
+
+    def test_demo_single_child_placeholder_still_passes(self):
+        """demo 是固定占位结构，本来就只有一个子节点，照常通过。"""
+        content, _ = validate_generated_content(_demo_content("测试").model_dump())
         self.assertEqual(len(content.root.children), 1)
 
     def test_contract_still_accepts_a_single_branch_tree(self):
         """契约校验不设分支下限：旧图与手工编辑后的图必须照常能存能开。"""
         content = MindMapContent.model_validate(_tree(1))
         self.assertEqual(len(content.root.children), 1)
-
-    def test_min_branch_constant(self):
-        self.assertEqual(MIN_BRANCHES, 3)
 
 
 class PromptQualityTest(unittest.TestCase):
@@ -349,9 +329,12 @@ class PromptQualityTest(unittest.TestCase):
     （见 `tests/test_citation_contract.py`）。
     """
 
-    def test_prompt_states_the_point_and_branch_floor(self):
+    def test_prompt_states_the_point_floor_and_no_branch_floor(self):
+        """每个可分解分支至少 2 个要点是**结构**要求；一级分支条数则明确"按需"——
+        写死的"不少于 3 条"会跟删掉 `MIN_BRANCHES` 的决定打架。"""
         self.assertIn("至少 2 个要点", DETAIL_PROMPT)
-        self.assertIn("不少于 3 条", DETAIL_PROMPT)
+        self.assertIn("按主题的实际需要决定", DETAIL_PROMPT)
+        self.assertNotIn("不少于 3 条", DETAIL_PROMPT)
 
     def test_material_branch_allows_expanding_beyond_the_material(self):
         """**内容可以展开**，但出处必须标：这是这一轮改掉的旧要求。

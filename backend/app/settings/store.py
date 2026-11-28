@@ -49,11 +49,15 @@ import os
 import time
 from contextlib import closing
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from app.core.errors import AppError
 from app.db.conn import Connection, Row
 from app.db.errors import DatabaseError
+
+if TYPE_CHECKING:  # 仅注解：运行时这层 import 会与 generation.free_models 成环
+    from app.generation import free_models
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +120,6 @@ MAX_URL_CHARS = 200
 MAX_MODEL_CHARS = 200
 MAX_KEY_CHARS = 500
 
-#: 走免费档时固定发这个思考档位。理由见 `Resolved.reasoning_effort`：不发它，
-#: 免费模型会把整个 `max_tokens` 烧在 reasoning 上、正文一个字都不写、
-#: `finish_reason` 变成 `length`，而那条路是直接判失败的。
-#:
-#: `"low"` 是实测出来的下限：两个免费模型都拒绝 `"off"`（400）。
-FREE_REASONING_EFFORT = "low"
-
 #: 生成侧与 probe 拼请求时一律用 `base + "/chat/completions"`，所以库里存的必须是
 #: **前缀**。用户粘完整端点时由 `_check_base_url` 剥掉这一段。
 _ENDPOINT_SUFFIX = "/chat/completions"
@@ -137,13 +134,14 @@ SETTINGS_LOCK_TIMEOUT = 2.0
 _NOW = "nowstamp()"
 
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
-    owner        TEXT PRIMARY KEY,
-    base_url     TEXT NOT NULL DEFAULT '',
-    api_key      TEXT NOT NULL DEFAULT '',
-    model        TEXT NOT NULL DEFAULT '',
-    deep_model   TEXT NOT NULL DEFAULT '',
-    updated_at   TEXT,
-    api_key_host TEXT NOT NULL DEFAULT ''
+    owner            TEXT PRIMARY KEY,
+    base_url         TEXT NOT NULL DEFAULT '',
+    api_key          TEXT NOT NULL DEFAULT '',
+    model            TEXT NOT NULL DEFAULT '',
+    deep_model       TEXT NOT NULL DEFAULT '',
+    updated_at       TEXT,
+    api_key_host     TEXT NOT NULL DEFAULT '',
+    reasoning_effort TEXT NOT NULL DEFAULT ''
 )"""
 
 #: 降级只告警一次。库坏了（文件被删、权限变了、盘满）时每一次模型调用都会走到
@@ -217,6 +215,9 @@ def ensure_schema(conn: Connection) -> None:
         # 那种行按"绑定校验不生效"处理（见 `resolve()`），不会在升级后
         # 突然把所有已存配置打成未配置。
         "api_key_host": "TEXT NOT NULL DEFAULT ''",
+        # 这个人给自己那把模型挑的思考档位。老库补列时全部是空串 = "没挑过，
+        # 请求里不发这个键"——与"加这个字段之前"的行为逐字节相同。
+        "reasoning_effort": "TEXT NOT NULL DEFAULT ''",
     })
 
 
@@ -232,6 +233,9 @@ class Ready:
     #: 这把密钥当初是在哪台主机上填进去的。空串 = 没有记录（老行，或从没换过地址）。
     #: 它是"密钥不出门"那条防线的锚点：地址一变，锚点对不上就不交密钥。
     api_key_host: str = ""
+    #: 这个人给自己那把模型挑的思考档位。空串 = 没挑过（请求里不发这个键，
+    #: 走服务商默认）。值域是 `free_models.EFFORT_WORDS`，写入时校验。
+    reasoning_effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -252,16 +256,31 @@ class Resolved:
     api_key_source: str = SOURCE_UNSET
     model_source: str = SOURCE_UNSET
     deep_model_source: str = SOURCE_UNSET
-    #: 走免费档时要一起发出去的思考档位；其余情况是 None（= 不传这个字段，
-    #: 请求体与加这个字段之前逐字节相同）。
+    #: 走免费档时**首选那个模型**要一起发出去的思考档位；其余情况是 None
+    #:（= 不传这个字段，请求体与加这个字段之前逐字节相同）。
     #:
-    #: 免费模型实测**会把 max_tokens 全部烧在 reasoning 上**：`max_tokens=1400`
-    #: 的一次调用用了 56.9 秒、`completion_tokens=1400` 其中 `reasoning_tokens=1311`、
-    #: 正文是空串、`finish_reason=length`——而 provider 对 length 是直接判失败。
-    #: 发 `reasoning_effort="low"` 之后同一次调用 8.9 秒、正文正常、还调了工具。
+    #: **它是每模型各自的，不是全局配置**：OpenCode 的目录里每个模型自带
+    #: `capabilities.reasoning`（`effort` 档位列表 / `toggle`），`none` 能不能发
+    #: 由目录说了算（`generation/free_models.py::FreeModel.effort`）。Command
+    #: Code 那侧的目录不带这个信息，按 `FALLBACK_EFFORT="low"` 兜底——那是实测
+    #: 出来的下限（不发它，免费模型把 max_tokens 全部烧在 reasoning 上：
+    #: `max_tokens=1400` 的一次调用 56.9 秒、`reasoning_tokens=1311`、正文空串、
+    #: `finish_reason=length`，而 provider 对 length 直接判失败；发 `low` 之后
+    #: 同一次调用 8.9 秒、正文正常、还调了工具）。
     #:
-    #: 不能发 `"off"`：两个免费模型都明确拒绝（400，只接受 low/medium/high/xhigh/max）。
+    #: 候选序列里**后续模型**的档位由调用方从候选记录里现取（两个出口都这么做），
+    #: 这里只负责首选那个——`Resolved` 只有一个模型名，也只有一个档位。
     reasoning_effort: str | None = None
+
+    @property
+    def free_tier(self) -> bool:
+        """这次是不是走"不收费"的那一档。
+
+        **别用 `reasoning_effort is not None` 来判断它**：档位是每模型各自的，
+        有的免费模型（目录里没给档位的那几个）根本不发这个键，`None` 在免费档里
+        是合法值。判"这一档"的唯一口径是 `model_source == SOURCE_FREE`。
+        """
+        return self.model_source == SOURCE_FREE
 
 
 def _connect(*, timeout: float | None = None) -> Connection:
@@ -393,7 +412,8 @@ def saved(owner: str | None = None) -> Ready:
     try:
         with closing(_connect()) as conn:
             row = conn.execute(
-                f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host "
+                f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host, "
+                f"reasoning_effort "
                 f"FROM {TABLE} WHERE owner = ?", (owner,)).fetchone()
     except DatabaseError as exc:
         if not _DEGRADED_WARNED:
@@ -409,6 +429,7 @@ def saved(owner: str | None = None) -> Ready:
         deep_model=row["deep_model"] or "",
         updated_at=row["updated_at"],
         api_key_host=_row_host(row),
+        reasoning_effort=row["reasoning_effort"] or "",
     )
     _CACHE[key] = (time.monotonic(), ready)
     return ready
@@ -444,7 +465,8 @@ def _read_strict(owner: str, *, timeout: float | None = None) -> Ready | None:
     """
     with closing(_connect(timeout=timeout)) as conn:
         row = conn.execute(
-            f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host "
+            f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host, "
+            f"reasoning_effort "
             f"FROM {TABLE} WHERE owner = ?", (owner,)).fetchone()
     if row is None:
         return None
@@ -455,6 +477,7 @@ def _read_strict(owner: str, *, timeout: float | None = None) -> Ready | None:
         deep_model=row["deep_model"] or "",
         updated_at=row["updated_at"],
         api_key_host=_row_host(row),
+        reasoning_effort=row["reasoning_effort"] or "",
     )
 
 
@@ -519,17 +542,22 @@ def _binding_of(stored: Ready, api_key_source: str) -> str:
     return ""
 
 
-def _free_model(base_url: str) -> str:
-    """当前首选的免费模型名；`MINDMAP_FREE_TIER` 没开或一个都没有时返回空串。
+def _free_model(base_url: str) -> free_models.FreeModel | None:
+    """当前首选的免费模型（含它自己的思考档位）；没开或一个都没有时返回 None。
 
-    这层薄封装的唯一作用是**把 import 放在函数里**：`generation.free_models` 要
-    回来读本模块（`free_tier_endpoint()`），模块顶层互相 import 就成环。
+    返回**整条记录**而不是裸 id：思考档位是每模型各自的（OpenCode 目录里
+    `capabilities.reasoning` 说的是"这一个模型"能不能关思考），`resolve()` 要把它
+    填进 `Resolved.reasoning_effort`，后续候选的档位则由两个模型出口从记录里现取。
+
+    这层薄封装的唯一作用是**把运行时 import 放在函数里**：`generation.free_models`
+    要回来读本模块（`free_tier_endpoint()`），运行时顶层互相 import 就成环；
+    注解里的名字走的是下面的 `TYPE_CHECKING` import，那不参与运行时。
     """
     from app.generation import free_models
 
     if not free_models.enabled():
-        return ""
-    return free_models.current(base_url) or ""
+        return None
+    return free_models.current(base_url)
 
 
 def host_of(base_url: str) -> str:
@@ -671,7 +699,7 @@ def resolve() -> Resolved:
     #
     # 判据是 `api_key_source` 落在 `instance` / `env` / `public` 上，而不是"没有密钥"：
     # 免费模型也一样要 key（实测无 key 401 `UNAUTHORIZED`），只是那次调用不收费。所以
-    # 这一档的语义是"用部署方那把 Command Code 的钥匙、但走它不收费的模型"。
+    # 这一档的语义是"用部署方那把钥匙、但走它不收费的模型"。
     #
     # 什么时候不换：
     #   - `saved`：用户填了自己的密钥，按用户的意思走，免费档与他的钱无关；
@@ -680,13 +708,32 @@ def resolve() -> Resolved:
     #
     # **免费档是慢的**（实测吞吐约 24.6 tok/s，一张四十节点的图要几分钟），所以
     # 打开它是一次明确的行为选择：部署方用自己的行填密钥就能退出这一档。
+    #
+    # **档位跟着模型走**（`FreeModel.effort`）：`Resolved.reasoning_effort` 只回答
+    # "首选那个模型该发什么"，候选序列里后续模型的档位由两个模型出口（`chat_async`
+    # 与 `agent/provider`）从候选记录里现取。判"这次是不是免费档"用
+    # `Resolved.free_tier`（`model_source == SOURCE_FREE`），**别用
+    # `reasoning_effort is not None`**——目录里没给档位的免费模型它就是 None。
     reasoning_effort: str | None = None
     if api_key and api_key_source in (SOURCE_INSTANCE, SOURCE_ENV, SOURCE_PUBLIC):
-        free_model = _free_model(base_url)
-        if free_model:
-            model, model_source = free_model, SOURCE_FREE
-            reasoning_effort = FREE_REASONING_EFFORT
+        free_record = _free_model(base_url)
+        if free_record is not None:
+            model, model_source = free_record.id, SOURCE_FREE
+            reasoning_effort = free_record.effort
             deep_model, deep_model_source = "", SOURCE_FREE
+
+    # 自己（或部署方那行）挑过的思考档位。档位是**对生效的那个模型**发的，所以
+    # 它跟"这次用谁的配置"走，而不跟"模型名写在哪一行"走：面板的下拉是按生效
+    # 模型的目录选项渲染的，用户挑了就期望它生效——哪怕模型名是环境变量给的。
+    # 免费档例外：它把模型整个换成了目录里的免费模型，档位由那一条目录记录决定
+    #（上面那段已经赋值），用户挑过的档位是给"他自己的模型"挑的，此刻并不在用。
+    #
+    # 没有自己行的人（游客/匿名）借用部署方那行时，部署方挑过的档位跟着借走：
+    # 那是他给"这份共享配置"挑的。空串 = 没挑过，None = 请求里不发这个键。
+    if reasoning_effort is None:
+        reasoning_effort = _norm_text(stored.reasoning_effort) or None
+        if reasoning_effort is None and model_source == SOURCE_INSTANCE:
+            reasoning_effort = _norm_text(instance.reasoning_effort) or None
 
     return Resolved(
         base_url=base_url,
@@ -824,12 +871,24 @@ def _read_strict_for_save(owner: str) -> Ready:
     return Ready() if row is None else row
 
 
+def _effort_words() -> tuple[str, ...]:
+    """思考档位的合法值域。
+
+    函数内运行时 import，与 `_free_model` 同一个理由：`free_models` 在读配置时
+    会调回本模块（`free_tier_endpoint()`），顶层互相 import 有环的风险。
+    """
+    from app.generation import free_models
+
+    return free_models.EFFORT_WORDS
+
+
 def save(
     *,
     base_url: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
     deep_model: str | None = None,
+    reasoning_effort: str | None = None,
     clear_api_key: bool = False,
     scope: str = "user",
 ) -> tuple[Resolved, bool]:
@@ -848,6 +907,11 @@ def save(
         值，回落到环境变量**。这三个不是密钥，界面上显示的是生效值本身，空的输入
         框就是"我不要这个覆盖了"；而"回到环境变量那套配置"是真实需求（换部署、
         回滚、临时排查）。
+
+    `reasoning_effort` 的语义与上面三个一致（`None` = 不改，`""` = 清掉、请求里
+    不发这个键），但合法值域收得紧：必须是 `free_models.EFFORT_WORDS` 里的一个。
+    发一个供应商不认识的档位是实测会 400 的形状，让它在保存时就被拦下，比在
+    第一次生成时才炸出来要好——那时用户只会看到"生成失败"。
 
     `changed=False` 时**不刷 `updated_at`**：同值重复保存把时间戳刷成"刚刚"，
     界面上就会出现一条看起来刚改过、其实一直没变的记录——与 `user_prefs.set`
@@ -897,6 +961,17 @@ def save(
                   else _check_text(model, label="模型名", limit=MAX_MODEL_CHARS))
     next_deep = (current.deep_model if deep_model is None
                  else _check_text(deep_model, label="深度思考模型名", limit=MAX_MODEL_CHARS))
+    if reasoning_effort is None:
+        next_effort = current.reasoning_effort
+    else:
+        effort = _norm_text(reasoning_effort)
+        if effort and effort not in _effort_words():
+            raise SettingsError(
+                "settings_effort_invalid",
+                "这个思考强度不认识；请从下拉的选项里挑一个，"
+                "或留空表示沿用服务商默认。",
+                status=400)
+        next_effort = effort
 
     # 密钥的锚点。三种情形，对应三件不同的事，与上面 `next_key` 那三段一一对应：
     #
@@ -924,25 +999,27 @@ def save(
     else:
         next_host = old_host
 
-    changed = (next_base, next_key, next_model, next_deep, next_host) != (
+    changed = (next_base, next_key, next_model, next_deep, next_effort, next_host) != (
         current.base_url, current.api_key, current.model, current.deep_model,
-        _norm_text(current.api_key_host).lower())
+        current.reasoning_effort, _norm_text(current.api_key_host).lower())
     if changed:
         try:
             with closing(_connect(timeout=SETTINGS_LOCK_TIMEOUT)) as conn, conn:
                 conn.execute(
                     f"""INSERT INTO {TABLE}
                             (owner, base_url, api_key, model, deep_model, updated_at,
-                             api_key_host)
-                        VALUES (?, ?, ?, ?, ?, {_NOW}, ?)
+                             api_key_host, reasoning_effort)
+                        VALUES (?, ?, ?, ?, ?, {_NOW}, ?, ?)
                         ON CONFLICT(owner) DO UPDATE SET
-                            base_url     = excluded.base_url,
-                            api_key      = excluded.api_key,
-                            model        = excluded.model,
-                            deep_model   = excluded.deep_model,
-                            updated_at   = excluded.updated_at,
-                            api_key_host = excluded.api_key_host""",
-                    (owner, next_base, next_key, next_model, next_deep, next_host),
+                            base_url         = excluded.base_url,
+                            api_key          = excluded.api_key,
+                            model            = excluded.model,
+                            deep_model       = excluded.deep_model,
+                            updated_at       = excluded.updated_at,
+                            api_key_host     = excluded.api_key_host,
+                            reasoning_effort = excluded.reasoning_effort""",
+                    (owner, next_base, next_key, next_model, next_deep, next_host,
+                     next_effort),
                 )
         except DatabaseError as exc:
             # 与 `_read_strict_for_save` 同一条规矩：写不进去也要给出能读的 code。
@@ -980,7 +1057,6 @@ __all__ = [
     "API_KEY_ENV",
     "BASE_URL_ENV",
     "DEEP_MODEL_ENV",
-    "FREE_REASONING_EFFORT",
     "INSTANCE_OWNER",
     "LLM_MODE_ENV",
     "MODEL_ENV",

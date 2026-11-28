@@ -40,6 +40,12 @@ from app.generation.service import (
     _config_full,
     # 「这个模型暂时不可用」的异常类型同源，见下面 `_UNAVAILABLE_STATUSES` 的注释。
     _ModelUnavailable,
+    # 免费平台的每日额度用完（OpenCode 实测 429 + 正文 `FreeUsageLimitError`）。
+    # 与 `_ModelUnavailable` 的分工：前者不换候选（账号级的桶，换模型没用）、
+    # 后者才换。两条出口都必须先查额度再查可用性。
+    FreeQuotaExhausted,
+    # 按"响应正文里有没有 FreeUsageLimitError"判定每日额度用完，见它的 docstring。
+    _quota_exhausted_error,
     # 模型名的判定与「深度思考」那三档优先级只有一份实现，在 generation 那边：
     # 工具内部的 `chat_async` 也要用同一套名字（两条出口同一个开关）。这里只是
     # 复用，不重新定义——两处各写一份的结果已经出现过一次：勾上深度思考只换了
@@ -148,21 +154,25 @@ class OpenAICompatibleProvider:
     ) -> Completion:
         resolved = _config_full()
         base, key = resolved.base_url, resolved.api_key
-        # `resolve()` 只在走免费档时给 `reasoning_effort`（见那边的注释），所以它
-        # 就是"这次走的是不收费的模型"这个事实的开关。不另读 `model_source`：
-        # 两样东西本来就同生同灭，多一个判据只多一处会分叉的地方。
-        free_tier = resolved.reasoning_effort is not None
+        # 判"这次走的是不收费的模型"用 `resolved.free_tier`（`model_source ==
+        # SOURCE_FREE`）。**别用 `reasoning_effort is not None`**：免费档的思考档位
+        # 现在是每模型各自的（OpenCode 目录 `capabilities.reasoning`），目录里没给
+        # 档位的免费模型它就是 None——那是合法值，不是"没走免费档"。
+        free_tier = resolved.free_tier
         if free_tier:
             # 免费档把模型名钉死在免费那个上，**不走 `_model_for`**：那一档可能
             # 换成深度模型（显式配置或 `DEEP_MODEL_FALLBACK`），而深度模型不在免费
             # 名单里——照它发出去就是用部署方的钱生成，与"免费额度"这个承诺相反。
-            order = [resolved.model]
+            # 首发那个的档位已在 `Resolved.reasoning_effort`（`resolve()` 从同一条
+            # 记录取的）；候选序列里的后续模型**各自的档位**从记录现取。
+            plan: list[tuple[str, str | None]] = [
+                (resolved.model, resolved.reasoning_effort)]
             # 同一次运行内的候选序列：上游偶发 429（实测同一时刻连发三次也可能
             # 全 200），换一个免费模型往往就通了。已经在这轮里失败过的不再重试。
-            order += _free_models.candidates(
-                base, tried=self._tried | {resolved.model})
+            plan += [(record.id, record.effort) for record in _free_models.candidates(
+                base, tried=self._tried | {resolved.model})]
         else:
-            order = [_model_for(base, resolved.model, self.deep_thinking)]
+            plan = [(_model_for(base, resolved.model, self.deep_thinking), None)]
 
         # 输入侧的物理边界。放在发请求之前、且只算一次：它只与消息和工具定义有关，
         # 与用哪个模型无关，换模型重试不必重算。
@@ -173,11 +183,11 @@ class OpenAICompatibleProvider:
                 tokens=used, limit=CONTEXT_TOKEN_LIMIT, label="本轮对话上下文")
 
         failure: Exception | None = None
-        for model in order:
+        for model, effort in plan:
             try:
                 completion = await self._attempt(
                     base=base, key=key, model=model, messages=messages, tools=tools,
-                    budget=budget, reasoning_effort=resolved.reasoning_effort,
+                    budget=budget, reasoning_effort=effort, free_tier=free_tier,
                 )
             except _ModelUnavailable as exc:
                 # 只有"这个模型此刻不可用"才轮到下一个候选。连不上、超时、响应
@@ -205,6 +215,7 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         budget: RunBudget,
         reasoning_effort: str | None,
+        free_tier: bool,
     ) -> Completion:
         """发一次请求。只有"上游明确说这个模型此刻不可用"才抛 `_ModelUnavailable`。
 
@@ -220,12 +231,16 @@ class OpenAICompatibleProvider:
         """
         self.model_name = model
         requested = budget.max_output_tokens
-        if reasoning_effort is not None:
+        if free_tier:
             # 免费档的实测代价：`max_tokens=1400` 时两个免费模型都会把 1400 全花在
             # thinking 上，正文一个字没写就 `finish_reason=length`。所以给它一个
             # 下限；**也要给上限**，理由见 `FREE_MAX_OUTPUT_TOKENS`——只抬下限时
             # 调用方要的 65536 会原样发出去，免费模型按额度大小决定思考多久，
             # 一轮就能吃掉几百秒。`max_tokens_cap()` 仍是最终上限。
+            #
+            # 夹不夹看的是 free_tier，**不是有没有 effort**：目录里没给档位的免费
+            # 模型（effort=None，请求里没有那个键）同样会把 token 烧在思考上——
+            # 夹住的是"给思考的预算"，键只是"告诉它按哪档想"。
             requested = max(requested, FREE_MIN_OUTPUT_TOKENS)
             requested = min(requested, FREE_MAX_OUTPUT_TOKENS)
         body: dict[str, Any] = {
@@ -235,7 +250,9 @@ class OpenAICompatibleProvider:
             "max_tokens": min(requested, max_tokens_cap()),
         }
         if reasoning_effort:
-            # 只在免费档加这个键：自配端点收不到一个它可能不认识的参数。
+            # 只在这个模型有自己的档位时加这个键（档位跟着模型走，见
+            # `free_models.FreeModel.effort`）；自配端点收不到一个它可能不认识的
+            # 参数。
             body["reasoning_effort"] = reasoning_effort
         # 没有工具时不要挂空的 tools 数组：部分兼容端点会因此返回 400。
         if tools:
@@ -273,6 +290,14 @@ async def _read_whole(
         headers=headers,
     ) as response:
         if response.status_code in _UNAVAILABLE_STATUSES:
+            # **先把错误体读进来，再判"是不是免费额度用完"**：流式响应在读之前
+            # `.text` 会抛 `ResponseNotRead`（`_quota_exhausted_error` 会把它吞成
+            # "没有正文"，判据就永远落空）。OpenCode 免费档用完回的就是 429，
+            # 先按"不可用"换候选会把同一个账号级的桶再撞十来次。
+            await response.aread()
+            exhausted = _quota_exhausted_error(response)
+            if exhausted is not None:
+                raise exhausted
             raise _ModelUnavailable(f"模型服务返回 HTTP {response.status_code}")
         response.raise_for_status()
         buffer = bytearray()
@@ -316,6 +341,12 @@ async def _read_stream(
         headers=headers,
     ) as response:
         if response.status_code in _UNAVAILABLE_STATUSES:
+            # **先把错误体读进来，再判"是不是免费额度用完"**（`_read_whole` 同一
+            # 处置，理由见那里——流式响应在读之前 `.text` 会抛 `ResponseNotRead`）。
+            await response.aread()
+            exhausted = _quota_exhausted_error(response)
+            if exhausted is not None:
+                raise exhausted
             raise _ModelUnavailable(f"模型服务返回 HTTP {response.status_code}")
         response.raise_for_status()
         size = 0

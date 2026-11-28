@@ -42,7 +42,8 @@ from app.generation.service import (
     GenerationError,
 )
 
-# 一级分支必须是 3 条：`mindmap_generate_deep` 走 `MIN_BRANCHES = 3` 那道关。
+# 三条一级分支只是这批用例顺手的规模：一级分支没有下限（`MIN_BRANCHES` 已删），
+# 用例不靠条数判合格，靠的是结构、引用与工具行为。
 TREE = {
     "title": "示例",
     "root": {
@@ -263,18 +264,24 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertLessEqual(state["peak"], DEEP_CONCURRENCY)
         self.assertGreaterEqual(state["peak"], 2)
 
-    def test_skeleton_with_two_branches_is_rejected(self):
-        """低于下限直接失败：两条分支不成一张图，继续展开只是白烧额度。"""
-        ctx = _ctx()
-        mocked = AsyncMock(return_value=_plan("甲", "乙"))
-        with patch("app.agent.tools.chat_async", new=mocked):
+    def test_skeleton_with_two_branches_still_builds(self):
+        """两条分支照常成图（`MIN_BRANCHES` 已删）：线上实测里它两次把免费生成
+        判死（`too_few_branches` × 2 → `too_many_failures`），白烧两个长调用。
+        条数是模型对主题规模的判断，继续展开比整轮失败便宜。"""
+        ctx = _ctx(max_model_calls=10)
+
+        async def fake(system, user, *, max_tokens=None):
+            if system.startswith(PLAN_PROMPT):
+                return _plan("甲", "乙")
+            return _points(2, _branch_title(user))
+
+        with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
             result = _run(build_registry("create_deep").execute(_call(
                 "mindmap_generate_deep", topic="x", branches=3), ctx))
 
-        self.assertFalse(result.ok)
-        self.assertEqual(result.data["code"], "too_few_branches")
-        self.assertIsNone(ctx.candidate)
-        self.assertEqual(mocked.await_count, 1)  # 骨架不合格就停手
+        self.assertTrue(result.ok, result.content)
+        self.assertIsNotNone(ctx.candidate)
+        self.assertEqual(len(ctx.candidate.root.children), 2)
 
     def test_skeleton_off_by_two_still_builds(self):
         """骨架条数超出 ±1 的宽容范围也用实际返回：为条数整张重来等于再花一轮。"""

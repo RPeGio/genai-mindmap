@@ -387,8 +387,8 @@ def to_flow(content: MindMapContent) -> tuple[FlowContent, FlowEdgeLoss]:
         stages.append(FlowStage(id=stage_id, root=child))
     if not stages:
         # 契约要求 `stages` 至少一个。走到这里说明上游已经放行了一棵没有一级分支
-        # 的树（`MIN_BRANCHES` 门槛会先拦住），保底补一个阶段而不是抛异常——用户
-        # 拿到一张"只有一段的流程"好过拿到一个 500。
+        # 的树（一级分支没有下限，`MIN_BRANCHES` 已删；提示词只要求根节点有子节点），
+        # 保底补一个阶段而不是抛异常——用户拿到一张"只有一段的流程"好过拿到一个 500。
         stages.append(FlowStage(id=f"s_{content.root.id}", root=content.root))
         stage_of[content.root.id] = stages[0].id
 

@@ -94,6 +94,12 @@ class ModelSettings(BaseModel):
     #: `MINDMAP_LLM_MODE` 的原值（`demo` / `model` / 空）。面板用它提示"本机是
     #: 演示模式，配好了也不会调模型"。**只读**，面板改不动它。
     llm_mode: str
+    #: 这次生成会发出去的思考档位；`null` = 不发这个键（走服务商默认）。
+    #: 免费档时它来自目录（每模型各自），用户自己挑的走自己那行。
+    reasoning_effort: str | None = None
+    #: 这一个模型在目录里声明的全部档位（目录顺序）。空 = 目录没给档位信息，
+    #: 面板据此不显示"思考强度"下拉——发一个目录没声明的档位会 400。
+    reasoning_effort_options: list[str] = []
     #: 三项（地址 / 密钥 / 模型名）齐了没有。判据与 `_config()` 一致。
     configured: bool
     #: 库里那一行最后一次被保存的时刻；没保存过是 `null`。
@@ -144,11 +150,27 @@ def _view(resolved: store.Resolved, *, updated_at: str | None) -> ModelSettings:
         deep_model_source=resolved.deep_model_source,
         deep_model_effective=effective,
         llm_mode=store.llm_mode(),
+        reasoning_effort=resolved.reasoning_effort,
+        reasoning_effort_options=list(_effort_options(resolved)),
         configured=_configured(resolved),
         updated_at=updated_at,
         can_edit_instance=_deployer(),
         instance=_instance_view(),
     )
+
+
+def _effort_options(resolved: store.Resolved) -> tuple[str, ...]:
+    """面板"思考强度"下拉的选项：**这一个模型**在目录里声明的档位。
+
+    函数内 import 与 `store._effort_words` 同一个理由（`free_models` 会调回
+    settings 一侧，顶层互相 import 有环的风险）。目录没给档位信息（Command Code
+    的形状，或列表还没拉到）时返回空——面板不显示下拉，用户存不了目录没声明的值。
+    """
+    from app.generation import free_models
+
+    if not resolved.model:
+        return ()
+    return free_models.options_for(resolved.base_url, resolved.model)
 
 
 def _configured(resolved: store.Resolved) -> bool:
@@ -187,6 +209,9 @@ class SaveModelSettingsRequest(BaseModel):
     api_key: str | None = None
     model: str | None = None
     deep_model: str | None = None
+    #: 思考档位。`None` = 不改；`""` = 清掉（请求里不发这个键，走服务商默认）；
+    #: 其余值必须在 `free_models.EFFORT_WORDS` 里（`settings_effort_invalid` 400）。
+    reasoning_effort: str | None = None
     #: 显式清除已经保存的密钥。与同时给 `api_key` 冲突（400）。
     clear_api_key: bool = False
     #: 写到哪一行。`user` 缺省，`instance` 仅部署方可用。别的值 422。
@@ -231,6 +256,7 @@ def save_model_settings(body: SaveModelSettingsRequest) -> SaveModelSettingsResp
         api_key=body.api_key,
         model=body.model,
         deep_model=body.deep_model,
+        reasoning_effort=body.reasoning_effort,
         clear_api_key=body.clear_api_key,
         scope=body.scope,
     )

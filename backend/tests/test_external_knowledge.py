@@ -244,7 +244,7 @@ def _ctx(sources: list[Source] | None = None) -> RunContext:
 
 
 def _tree(refs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """三条一级分支（`MIN_BRANCHES=3` 的下限），第一条带引用。"""
+    """三条一级分支（顺手规模，一级分支没有下限），第一条带引用。"""
     return {
         "title": "碳中和",
         "root": {"id": "root", "label": "碳中和", "children": [

@@ -365,6 +365,93 @@ def test_config_error_mentions_both_env_and_the_panel(monkeypatch):
     assert "模型设置" in message
 
 
+# ---------------------------------------------------------------- 思考强度
+
+def _seed_effort_options(monkeypatch, base: str = "https://api.deepseek.com/v1"):
+    """把目录缓存放成"当前模型有档位"的形状，让 GET 的 `reasoning_effort_options`
+    有东西可报。走 `free_models` 的真缓存路径（开着开关直写缓存）。"""
+    from app.generation import free_models
+
+    monkeypatch.setenv(store.BASE_URL_ENV, base)
+    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    with free_models._LOCK:
+        free_models._CACHE[base.rstrip("/")] = (
+            10.0 ** 9 + 10.0,
+            [free_models.FreeModel("deepseek-chat", "low", 128000,
+                                   ("none", "low", "high"))],
+        )
+
+
+def test_the_effort_choice_round_trips_through_the_panel(monkeypatch):
+    """面板里挑了档位 → 存进自己那行 → `GET` 与 `resolve()` 都看见它。"""
+    _seed_effort_options(monkeypatch)
+    client.put("/api/settings/model", json=_body(reasoning_effort="low"))
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort"] == "low"
+    assert body["reasoning_effort_options"] == ["none", "low", "high"]
+    resolved = store.resolve()
+    assert resolved.reasoning_effort == "low"
+
+
+def test_an_unknown_effort_word_is_refused_at_save_time(monkeypatch):
+    """非法档位在保存时被 400 拦下，而不是第一次生成时炸出来。"""
+    _seed_effort_options(monkeypatch)
+    response = client.put("/api/settings/model", json=_body(reasoning_effort="off"))
+    assert response.status_code == 400
+    assert response.json()["code"] == "settings_effort_invalid"
+    assert store.resolve().reasoning_effort is None
+
+
+def test_clearing_the_effort_sends_no_key_again(monkeypatch):
+    """空串 = 清掉，回到"不发这个键"。`None`（键都不带）= 不改。"""
+    _seed_effort_options(monkeypatch)
+    client.put("/api/settings/model", json=_body(reasoning_effort="low"))
+    assert store.resolve().reasoning_effort == "low"
+
+    client.put("/api/settings/model", json=_body(reasoning_effort=""))
+    assert store.resolve().reasoning_effort is None
+
+    # 键都不带 → 不改，仍然是"没挑过"。
+    client.put("/api/settings/model", json=_body(model="another-model"))
+    assert store.resolve().reasoning_effort is None
+
+
+def test_the_effort_follows_whichever_row_supplies_the_model(monkeypatch):
+    """档位跟着"模型名来自哪一行"走：部署方那行挑的档位，借用者也能看见。"""
+    from app.generation import free_models
+
+    base = "https://api.deepseek.com/v1"
+    monkeypatch.setenv(store.BASE_URL_ENV, base)
+    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    with free_models._LOCK:
+        free_models._CACHE[base.rstrip("/")] = (
+            10.0 ** 9 + 10.0,
+            [free_models.FreeModel("deepseek-chat", "low", 128000,
+                                   ("none", "low", "high"))],
+        )
+    store.save(base_url=base, model="deepseek-chat",
+               reasoning_effort="high", scope="instance")
+
+    # 换成另一个人（未注册的游客没有行，走实例回落）：
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort"] == "high"
+
+
+def test_options_come_from_the_directory_not_from_us(monkeypatch):
+    """`reasoning_effort_options` 是目录给的，目录没说的档位不会出现在下拉里。"""
+    from app.generation import free_models
+
+    base = "https://api.deepseek.com/v1"
+    monkeypatch.setenv(store.BASE_URL_ENV, base)
+    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
+    # 开关没开、缓存是空的：目录没给档位信息，面板不该显示下拉。
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == []
+    assert body["reasoning_effort"] is None
+
+
 # ---------------------------------------------------------------- 深度思考那一档
 
 def test_explicit_deep_model_from_the_panel_reaches_model_for():
@@ -906,6 +993,7 @@ def test_saved_row_is_readable_as_json_shape():
         "model", "model_source", "deep_model", "deep_model_source",
         "deep_model_effective", "llm_mode", "configured", "updated_at",
         "can_edit_instance", "instance",
+        "reasoning_effort", "reasoning_effort_options",
     }
     # 打码值能被 JSON 序列化（省略号是普通字符，不是控制字符）。
     json.dumps(body, ensure_ascii=False)

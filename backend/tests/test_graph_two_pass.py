@@ -208,7 +208,7 @@ def test_graph_mode_falls_back_when_the_graph_is_empty(monkeypatch):
     """图空 → 退回三段式，并且**说出来**。静默退回会让覆盖率数字莫名其妙地掉回去。
 
     降级之后走的是**原样的三段式**，所以模型替身必须能答骨架那一次（`branches`），
-    否则这次运行会死在 `too_few_branches` 上——那测的就不是降级了。
+    否则这次运行会拿不到一级分支、连结构那一步都过不去——那测的就不是降级了。
     """
     monkeypatch.setenv(GRAPH_SKELETON_ENV, "1")
 

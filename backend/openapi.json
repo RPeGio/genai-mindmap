@@ -3837,6 +3837,25 @@
             "type": "string",
             "title": "Llm Mode"
           },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
+          "reasoning_effort_options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasoning Effort Options",
+            "default": []
+          },
           "configured": {
             "type": "boolean",
             "title": "Configured"
@@ -4750,6 +4769,17 @@
             ],
             "title": "Deep Model"
           },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
           "clear_api_key": {
             "type": "boolean",
             "title": "Clear Api Key",
@@ -4815,6 +4845,25 @@
           "llm_mode": {
             "type": "string",
             "title": "Llm Mode"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
+          "reasoning_effort_options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasoning Effort Options",
+            "default": []
           },
           "configured": {
             "type": "boolean",

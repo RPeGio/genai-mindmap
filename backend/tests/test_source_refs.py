@@ -46,10 +46,9 @@ def sources():
 
 @pytest.fixture
 def tree(sources):
-    # 一级分支必须是 3 条：这些树最后都交给 `validate_generated_content`，
-    # 它默认要求 `MIN_BRANCHES = 3`。新增的 c 与其它分支一样带一条能逐字
-    # 对上原文的引用，这样它既不会引入新诊断，也让"某条诊断只出现在某个
-    # 节点"的断言保持原意。
+    # 一级分支没有下限（`MIN_BRANCHES` 已删），三条只是这批用例顺手的规模。
+    # 新增的 c 与其它分支一样带一条能逐字对上原文的引用，这样它既不会引入新
+    # 诊断，也让"某条诊断只出现在某个节点"的断言保持原意。
     return {
         "title": "材料摘要",
         "root": {"id": "r", "label": "材料摘要", "source_refs": [
@@ -256,7 +255,7 @@ def test_demo_does_not_invent_references(sources):
     两个节点各报一条 UNSOURCED_NODE——这是提示而非失败，占位树照常可用。
     """
     content, diagnostics = validate_generated_content(
-        _demo_content("材料摘要").model_dump(), sources=sources, enforce_min_branches=False)
+        _demo_content("材料摘要").model_dump(), sources=sources)
 
     assert content.root.source_refs == content.root.children[0].source_refs == []
     assert [d.code for d in diagnostics] == ["UNSOURCED_NODE", "UNSOURCED_NODE"]

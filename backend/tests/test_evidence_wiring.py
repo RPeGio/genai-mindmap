@@ -377,7 +377,7 @@ def test_verify_sources_drops_non_parsed_library_sources_too():
 
 
 def _tree(ref: dict[str, Any]) -> dict[str, Any]:
-    """一条一级分支带引用、另外两条不带：3 条分支是 `MIN_BRANCHES` 的下限。"""
+    """一条一级分支带引用、另外两条不带（三条只是顺手规模，一级分支没有下限）。"""
     return {
         "title": "证据核验",
         "root": {"id": "root", "label": "根", "children": [

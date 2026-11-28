@@ -36,8 +36,8 @@ from app.generation.service import (
 )
 
 # 生成工具返回的树：5 个节点、三层。用于验证工具内调用与 snapshot 帧。
-# 一级分支必须是 3 条：`mindmap_generate` 走 `validate_generated_content` 的默认
-# 路径，`MIN_BRANCHES = 3` 会把 2 分支的树判成 invalid_map。
+# 三条一级分支只是规模顺手：一级分支没有下限（`MIN_BRANCHES` 已删），2 分支的树
+# 也能通过 `validate_generated_content`。
 TREE = {
     "title": "示例",
     "root": {"id": "root", "label": "根", "children": [
