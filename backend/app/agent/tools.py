@@ -95,7 +95,6 @@ from app.generation.service import (
     DETAIL_NO_SOURCE_RULES,
     DETAIL_PROMPT,
     EXTERNAL_TRUST_RULES,
-    MIN_BRANCHES,
     GenerationError,
     apply_free_tier_ceiling,
     chat_async,
@@ -722,7 +721,10 @@ class GenerateDeepArgs(BaseModel):
     # 1000 节点理论能放 333 支；真正限制它的是可读性——超过二十条一级分支，
     # 图会宽到没法看。原来的 8 没有任何依据，长材料（比如二十几节的讲义）
     # 天然会有更多一级节点，卡在 8 等于逼模型把不相关的东西塞进同一支。
-    branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
+    # 下限曾经 ge=3：模型不能请求更少的骨架。`MIN_BRANCHES` 删掉之后它成了
+    # 同一道门槛的另一半（模型"自己要求自己给 3 条"），同样放开——条数按需定，
+    # 这个参数只保留"上限"那半个语义。
+    branches: int = Field(default=5, ge=1, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
     points_per_branch: int = Field(default=3, ge=2, le=5, description="每条一级分支下至少要有几个要点")
     # 深度同样只是**预算**而不是硬契约：额度不够时会被截短并标 `partial`，
     # 而不是把整次生成判成失败。
@@ -768,8 +770,9 @@ class GenerateArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
     # 与 `GenerateDeepArgs.branches` 同一个区间：它同时是**要求**和**上限**
-    # （骨架给多了会被截到 `DEEP_MAX_BRANCHES`）。
-    branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
+    # （骨架给多了会被截到 `DEEP_MAX_BRANCHES`）。下限曾经 ge=3，与
+    # `MIN_BRANCHES` 一起删掉——条数按需定（理由见 `GenerateDeepArgs.branches`）。
+    branches: int = Field(default=5, ge=1, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
     diagram_type: Literal["tree", "flowchart", "fishbone"] = Field(
         default="tree",
         description="图型：tree 思维导图（默认）/ flowchart 流程图（可带附加边）/ fishbone 鱼骨图",
@@ -5089,6 +5092,12 @@ GRAPH_SKELETON_TRUTHY = frozenset({"1", "on", "true", "yes"})
 GRAPH_ENTITY_LIMIT = 60
 GRAPH_LINK_LIMIT = 120
 
+# 图谱骨架的启动门槛：少于这个数的"带连接实体"撑不起一个像样的骨架，两段式
+# 不如退回章节骨架。这是**路径选择**的阈值，不是产出的质量门槛——一级分支
+# 本身没有下限（`MIN_BRANCHES` 已删，见 `generation/service.py`），两三个分支
+# 的图照常交付。数字按"至少能摆开一组有关联的实体"取 3。
+GRAPH_ENTITY_FLOOR = 3
+
 # 拿几个实体名去检索。`DEEP_BRANCH_TOP_K = 3` 是每支的条数，这里是**支数**：12 个实体
 # × 3 条 = 36 段原文，与三段式 20 支的检索量同量级，但 query 是材料里的真词。
 GRAPH_QUERY_LIMIT = 12
@@ -5498,7 +5507,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         graph_entities, graph_links = graph_store.subgraph(
             entities=GRAPH_ENTITY_LIMIT, links=GRAPH_LINK_LIMIT,
             scope=[source.id for source in sources] or None)
-        if len(graph_entities) < MIN_BRANCHES:
+        if len(graph_entities) < GRAPH_ENTITY_FLOOR:
             # 这是**真降级**，必须说出来：开关开着、图却没建（或建了但全是孤立实体）
             # 时，用户拿到的是一张"骨架照旧"的图。不说的话他以为两段式生效了，而
             # 覆盖率数字会莫名其妙地退回三段式的水平。
@@ -5507,7 +5516,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 level=DiagnosticLevel.warn, code="GRAPH_SKELETON_UNAVAILABLE",
                 message=(
                     f"图谱里只有 {len(graph_entities)} 个带连接的实体"
-                    f"（少于 {MIN_BRANCHES} 个），这一次退回章节骨架那条路；"
+                    f"（少于 {GRAPH_ENTITY_FLOOR} 个），这一次退回章节骨架那条路；"
                     "把材料重新入图（`scripts/ingest_graph_corpus.py`）之后再试两段式"
                 ),
             ))
@@ -5573,12 +5582,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 判据与上面的 `grouped_request` 同源（分支数 > `SKELETON_GROUP_THRESHOLD`）：
         # 这里判"要不要问"，那里判"回来的东西够不够两级"。
         plan = _cap_plan(_skeleton_plan(raw_plan))
-        if len(plan.flat) < MIN_BRANCHES:
-            return _fail(
-                "too_few_branches",
-                f"模型只给了 {len(plan.flat)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
-                branches=len(plan.flat),
-            )
+        # 一级分支**没有下限**（`MIN_BRANCHES` 已删）：模型给几条就用几条继续，
+        # 条数是它对主题/材料规模的判断。线上实测里这道门槛是整轮失败的头号来源
+        # ——免费模型两次给 2 条分支，两次 `too_few_branches` 就把整轮判成
+        # `too_many_failures`，白烧两个长调用。数量由提示词引导（`_plan_ask`
+        # 的"根据内容实际包含的方面来定"），与要求条数差得多时
+        # `SKELETON_SIZE_OFF` 诊断会让它被看见。
         # 配色在截断（`_cap_plan`）之后：只给真的要上画布的那几条分配颜色，否则
         # "第 4 支拿到第 4 个颜色"这种事会因为一条被截掉的尾巴而错位。两级时补的是
         # **分组**的色（一级颜色只属于分组）。
@@ -6718,12 +6727,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 会变成一个没有内容却要展开的节点（正好是这次改动要避免的浪费）。真要把两级
     # 搬到这里，正确做法是"分组只是树的形状、完全不进 `skeleton` 那张表"，
     # 而那需要另一轮实测，不在这条路上顺手做。
-    if len(branches) < MIN_BRANCHES:
-        return _fail(
-            "too_few_branches",
-            f"模型只给了 {len(branches)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
-            branches=len(branches),
-        )
+    #
+    # 一级分支**没有下限**（`MIN_BRANCHES` 已删，理由见 `_generate` 里同一段注释
+    # 与 `generation/service.py`）：给几条就用几条继续，条数差得多时由
+    # `SKELETON_SIZE_OFF` 诊断说明。
     # 一级分支的条数上限与参数模型同一个常量：模型偶尔会无视"最多 N 条"，
     # 这时最多留 20 条，再多的既不在一级分支的可读区间里，也挤占下层预算。
     branches = branches[:min(MAX_CHILDREN, DEEP_MAX_BRANCHES)]

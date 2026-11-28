@@ -12,12 +12,20 @@
 **配置按人分开存**（第三片）：每个人（登录账号、游客）在 `model_settings` 里
 自己一行，读的时候按"自己那行 → 部署方那行 → 环境变量"回落。部署方那行是全站
 共享配置（游客免费额度用的就是它），只有部署方能改——判定在 `_deployer()`。
+
+**「测试连接」有限速**（2026-11-28 起）：每点一次都是一次打到供应商的真请求
+（`max_tokens=1`）。不设限的话，一个脚本可以拿它当"烧额度慢刀"——每次只烧一个
+token，但一直烧。按身份（账号或游客）+ IP 各记一份，缺省每分钟 10 次，
+`MINDMAP_SETTINGS_TEST_LIMIT` 可调。
 """
 from __future__ import annotations
 
+import os
+import threading
+import time
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict
 
 from app.auth import identity as identity_module
@@ -27,6 +35,69 @@ from app.settings import probe as probe_module
 from app.settings import store
 
 router = APIRouter(prefix="/settings", tags=["模型设置"])
+
+
+# ---------------------------------------------------------------- 测试限速
+
+#: 缺省 10 次/分钟。探测第二步一次只烧一个 token，10 次 = 每分钟最多一个 token
+#: 出门——正常用户（填表、失焦、偶尔点一次按钮）用不到十分之一。
+TEST_LIMIT_DEFAULT = 10
+TEST_LIMIT_ENV = "MINDMAP_SETTINGS_TEST_LIMIT"
+_TEST_WINDOW = 60.0
+
+#: 键 = (身份, IP)。身份是账号 id 或游客 id，匿名（还没领游客 cookie 的）只有 IP。
+#: 两个维度都记与登录限速（`auth/throttle.py`）同一理由：只按账号限会被撞库式
+#: 换号绕过，只按 IP 限会拖累 NAT 后面的真人。
+_TEST_HITS: dict[tuple[str, str], list[float]] = {}
+_TEST_LOCK = threading.Lock()
+
+
+def _test_limit() -> int:
+    raw = (os.getenv(TEST_LIMIT_ENV) or "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return TEST_LIMIT_DEFAULT
+
+
+def _test_subject(request: Request) -> tuple[str, str]:
+    ident = identity_module.current_identity()
+    who = ident.user.id if ident.user else (ident.guest_id or "")
+    ip = request.client.host if request.client else "unknown"
+    return (who, ip)
+
+
+def _test_allow(subject: tuple[str, str], *, now: float) -> tuple[bool, float]:
+    """(放行, 需要等多久)。滑窗记满即拒，`Retry-After` 按最早那一条算。"""
+    limit = _test_limit()
+    with _TEST_LOCK:
+        hits = _TEST_HITS.get(subject)
+        if hits is None:
+            _TEST_HITS[subject] = [now]
+            _test_shrink(now)
+            return True, 0.0
+        fresh = [stamp for stamp in hits if now - stamp < _TEST_WINDOW]
+        if len(fresh) >= limit:
+            _TEST_HITS[subject] = fresh
+            return False, max(1.0, _TEST_WINDOW - (now - fresh[0]))
+        fresh.append(now)
+        _TEST_HITS[subject] = fresh
+        _test_shrink(now)
+        return True, 0.0
+
+
+def _test_shrink(now: float) -> None:
+    """桶数失控时（每 IP 一个键的脚本洪泛）先把过期条目清掉，还不行就整表清。
+
+    清整表等于给攻击者发新额度——但这个限速的对手模型是"一个人拿脚本烧额度"，
+    不是分布式洪泛；把进程内存耗光反而伤了所有真人。
+    """
+    if len(_TEST_HITS) <= 10_000:
+        return
+    for key, stamps in list(_TEST_HITS.items()):
+        if not stamps or now - stamps[-1] >= _TEST_WINDOW:
+            del _TEST_HITS[key]
+    if len(_TEST_HITS) > 10_000:
+        _TEST_HITS.clear()
 
 
 def _deployer() -> bool:
@@ -94,6 +165,14 @@ class ModelSettings(BaseModel):
     #: `MINDMAP_LLM_MODE` 的原值（`demo` / `model` / 空）。面板用它提示"本机是
     #: 演示模式，配好了也不会调模型"。**只读**，面板改不动它。
     llm_mode: str
+    #: 这次生成会发出去的思考档位；`null` = 不发这个键（走服务商默认）。
+    #: 免费档时它来自目录（每模型各自），用户自己挑的走自己那行。
+    reasoning_effort: str | None = None
+    #: 思考强度的全部可选档位。**用户自己管的那份**：自己那行存过
+    #: `effort_options` 就用它（编辑态里改过任何一档就是这份），没存过就是内置
+    #: 默认五档（`off/low/medium/high/max`）。免费档例外——那份模型不是用户配的，
+    #: 档位仍来自目录、面板只读。
+    reasoning_effort_options: list[str] = []
     #: 三项（地址 / 密钥 / 模型名）齐了没有。判据与 `_config()` 一致。
     configured: bool
     #: 库里那一行最后一次被保存的时刻；没保存过是 `null`。
@@ -144,11 +223,31 @@ def _view(resolved: store.Resolved, *, updated_at: str | None) -> ModelSettings:
         deep_model_source=resolved.deep_model_source,
         deep_model_effective=effective,
         llm_mode=store.llm_mode(),
+        reasoning_effort=resolved.reasoning_effort,
+        reasoning_effort_options=list(_effort_options(resolved)),
         configured=_configured(resolved),
         updated_at=updated_at,
         can_edit_instance=_deployer(),
         instance=_instance_view(),
     )
+
+
+def _effort_options(resolved: store.Resolved) -> tuple[str, ...]:
+    """面板"思考强度"下拉的选项：**用户自己管的那份列表**。
+
+    免费档例外：那份模型不是用户配的（游客只读，改不了），档位仍来自目录——
+    目录没给档位信息时返回空，面板显示"免费模型自动"。其余一切来源都走
+    自己那行存的 `effort_options`，没存过就是 `DEFAULT_EFFORT_OPTIONS` 五档。
+    函数内 import 与 store 侧同一个理由（`free_models` 会调回 settings，
+    顶层互相 import 有环的风险）。
+    """
+    from app.generation import free_models
+
+    if resolved.free_tier:
+        if not resolved.model:
+            return ()
+        return free_models.options_for(resolved.base_url, resolved.model)
+    return store.saved().effort_options or store.DEFAULT_EFFORT_OPTIONS
 
 
 def _configured(resolved: store.Resolved) -> bool:
@@ -187,6 +286,13 @@ class SaveModelSettingsRequest(BaseModel):
     api_key: str | None = None
     model: str | None = None
     deep_model: str | None = None
+    #: 思考档位。`None` = 不改；`""` = 清掉（请求里不发这个键，走服务商默认）；
+    #: 其余值必须在这一行的档位列表里（`effort_options`，没自定义则是内置默认
+    #: 五档；`settings_effort_invalid` 400）。
+    reasoning_effort: str | None = None
+    #: 档位列表本身。`None` = 不改；给了就整表替换（去重保序、空白项丢弃、
+    #: 单条 ≤16 字符、≤16 条；全清空 = 恢复内置默认五档）。
+    effort_options: list[str] | None = None
     #: 显式清除已经保存的密钥。与同时给 `api_key` 冲突（400）。
     clear_api_key: bool = False
     #: 写到哪一行。`user` 缺省，`instance` 仅部署方可用。别的值 422。
@@ -231,6 +337,8 @@ def save_model_settings(body: SaveModelSettingsRequest) -> SaveModelSettingsResp
         api_key=body.api_key,
         model=body.model,
         deep_model=body.deep_model,
+        reasoning_effort=body.reasoning_effort,
+        effort_options=body.effort_options,
         clear_api_key=body.clear_api_key,
         scope=body.scope,
     )
@@ -271,6 +379,7 @@ class TestModelSettingsResponse(BaseModel):
 
 @router.post("/model/test", response_model=TestModelSettingsResponse)
 async def test_model_settings(
+    request: Request,
     body: TestModelSettingsRequest | None = None,
 ) -> TestModelSettingsResponse:
     """发一次最小 chat 请求，验证地址 / 密钥 / 模型名。
@@ -278,7 +387,21 @@ async def test_model_settings(
     **为什么是 200 而不是 4xx**：失败原因分成"地址不通""密钥被拒""模型不存在"
     三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成"请求
     没发出去"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。
+
+    走的是单步 `probe()`：一个 `max_tokens=1` 的最小请求，同时验地址 / 密钥 /
+    模型名三层。限速在最前面——它防的就是"测试"本身被当烧额度的刀（每次测试
+    都是一次打到供应商的真请求）。思考档位的枚举**不从这里来**：下拉选项是
+    用户自己管的那份列表（`GET` 里的 `reasoning_effort_options`），垃圾值探测
+    拿枚举的做法只对 Command Code 一家有效，别家直接 4xx（2026-11-28 实测），
+    已废弃。
     """
+    allowed, retry_after = _test_allow(_test_subject(request), now=time.monotonic())
+    if not allowed:
+        raise store.SettingsError(
+            "settings_test_rate_limited",
+            f"测试连接太频繁了（每分钟 {_test_limit()} 次），约 {int(retry_after)} 秒后再试。",
+            status=429,
+            headers={"Retry-After": str(int(retry_after))})
     overrides = body or TestModelSettingsRequest()
     resolved = store.resolve()
     given_base = (overrides.base_url or "").strip().rstrip("/")
@@ -335,6 +458,7 @@ async def test_model_settings(
     refusal = probe_module._refuse(base_url)
     if refusal is not None:
         raise store.SettingsError("settings_base_url_refused", refusal, status=400)
+    # 单步探测：一次最小请求验三层。档位枚举不从这里来（见 docstring）。
     result = await probe_module.probe(base_url, api_key, model)
     return TestModelSettingsResponse(
         ok=result.ok, message=result.message, model=result.model,

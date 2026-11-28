@@ -43,7 +43,7 @@ from app.auth import identity as identity_module
 from app.auth import owner as owner_module
 from app.core.errors import AppError
 from app.generation import quota
-from app.generation.service import GenerationError, ModelNotConfigured
+from app.generation.service import FreeQuotaExhausted, GenerationError, ModelNotConfigured
 from app.knowledge.remember import remember_sources
 from app.memory import summarize as memory_summarize
 from app.settings import store as settings_store
@@ -302,6 +302,16 @@ async def _frames(
         failure = {"code": "model_not_configured", "message": str(exc)}
         yield encode_event(ErrorEvent(
             seq=seq + 1, code="model_not_configured", message=str(exc)))
+        finished = True
+    except FreeQuotaExhausted as exc:
+        # 免费档的每日桶用完了。**它也必须排在 `except GenerationError` 之前**
+        # （父子类），理由与下一条相同：这条错误的下一步不是"再试一次"，换模型
+        # 也是同一个桶；界面要显示成"明天再来 / 填自己的密钥"。
+        resolved = runs.STATUS_FAILED
+        failure = {"code": "free_quota_exhausted", "message": str(exc)}
+        yield encode_event(ErrorEvent(
+            seq=seq + 1, code="free_quota_exhausted", message=str(exc),
+            retry_after=exc.retry_after))
         finished = True
     except GenerationError as exc:
         resolved = runs.STATUS_FAILED

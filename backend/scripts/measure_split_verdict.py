@@ -62,7 +62,6 @@ from app.agent.tools import (  # noqa: E402
     BRANCH_NO_EVIDENCE_RULES,
     DEEP_MAX_BRANCHES,
     MAX_CHILDREN,
-    MIN_BRANCHES,
     PLAN_PROMPT,
     ToolRegistry,
     _TOOL_SPECS,
@@ -219,7 +218,7 @@ class ModelStub:
 class PlanSkeletonArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1)
-    branches: int = Field(default=BRANCHES, ge=MIN_BRANCHES, le=DEEP_MAX_BRANCHES)
+    branches: int = Field(default=BRANCHES, ge=1, le=DEEP_MAX_BRANCHES)
 
 
 class ExpandBranchArgs(BaseModel):
@@ -244,8 +243,10 @@ async def _tool_plan_skeleton(args: PlanSkeletonArgs, ctx) -> ToolResult:
     raw = await agent_tools.chat_async(
         PLAN_PROMPT, _plan_ask(args.topic, args.branches), max_tokens=_max_tokens(ctx))
     branches = _fill_branch_colors(_skeleton_branches(raw))[:DEEP_MAX_BRANCHES]
-    if len(branches) < MIN_BRANCHES:
-        return _fail("too_few_branches", f"模型只给了 {len(branches)} 条一级分支。")
+    # 一级分支没有下限（`MIN_BRANCHES` 已从产品口径里删掉），测量脚本跟着放行；
+    # 只拦"一条都没有"——那是 `validate_generated_content` 唯一还会拒的形状。
+    if not branches:
+        return _fail("too_few_branches", "模型一条一级分支都没给。")
 
     label = clip_label(args.topic.strip()) or "思维导图"
     taken: set[str] = set()

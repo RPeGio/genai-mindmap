@@ -57,12 +57,20 @@ def _reset_module_state():
 
     `_CACHE`：读缓存跨用例存活。键里带了库路径，正常情况下不会串，但"直接写库再
     读"的用例会撞上自己上一次读过的旧值——那种失败读起来像"保存没生效"。
+
+    `router._TEST_HITS`：测试连接的限速桶跨用例存活。每个用例都按同一个
+    （身份， IP）打点，攒够 10 条之后所有普通用例都会莫名吃到 429——那种失败
+    读起来像"端点坏了"，其实是前一个用例攒的账。
     """
+    from app.settings import router as router_module
+
     store._DEGRADED_WARNED = False
     store._CACHE.clear()
+    router_module._TEST_HITS.clear()
     yield
     store._DEGRADED_WARNED = False
     store._CACHE.clear()
+    router_module._TEST_HITS.clear()
 
 
 def _body(**kwargs) -> dict:
@@ -365,6 +373,175 @@ def test_config_error_mentions_both_env_and_the_panel(monkeypatch):
     assert "模型设置" in message
 
 
+# ---------------------------------------------------------------- 思考强度
+
+def test_the_effort_choice_round_trips_through_the_panel():
+    """面板里挑了档位 → 存进自己那行 → `GET` 与 `resolve()` 都看见它。
+
+    档位清单是**用户自己管的那份**（默认五档起步），不再问供应商要——垃圾值
+    探测只对 Command Code 有效，已废弃（2026-11-28 实测）。
+    """
+    client.put("/api/settings/model", json=_body(reasoning_effort="low"))
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort"] == "low"
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
+    resolved = store.resolve()
+    assert resolved.reasoning_effort == "low"
+
+
+def test_options_default_to_the_five_builtin_words():
+    """没自定义过 = 默认五档，不是空列表：面板永远有得选。"""
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
+    assert body["reasoning_effort"] is None
+
+
+def test_an_unknown_effort_word_is_refused_at_save_time():
+    """不在档位列表里的值在保存时被 400 拦下，而不是第一次生成时炸出来。
+
+    用 `banana` 而不是 `off`：off 在默认五档里是合法的（"关思考"最常见字面值），
+    当年拿它当非法值是因为校验词表里没有它——词表换成自定义列表后它合法了。
+    """
+    response = client.put("/api/settings/model", json=_body(reasoning_effort="banana"))
+    assert response.status_code == 400
+    assert response.json()["code"] == "settings_effort_invalid"
+    assert store.resolve().reasoning_effort is None
+
+
+def test_custom_options_round_trip_and_gate_the_effort():
+    """编辑态改出来的档位列表整行生效；挑"新档位"必须与列表同一次提交。
+
+    先算列表再校验档位（`save()` 的顺序）就是为这个场景：否则"加一个新档位并
+    选中它"会被旧列表拒掉，用户永远改不出第一步。
+    """
+    response = client.put("/api/settings/model", json=_body(
+        reasoning_effort="slow", effort_options=["slow", "medium"]))
+    assert response.status_code == 200
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["slow", "medium"]
+    assert store.resolve().reasoning_effort == "slow"
+
+    # 列表里没有的档位照样拒：门是这张表，不是全局词表。
+    refused = client.put("/api/settings/model", json=_body(reasoning_effort="high"))
+    assert refused.status_code == 400
+    assert refused.json()["code"] == "settings_effort_invalid"
+
+
+def test_removing_the_current_effort_from_the_list_is_refused():
+    """把正在选中的档位从列表里删掉 = 两个动作打架：整单拒绝，不许半套。"""
+    client.put("/api/settings/model", json=_body(reasoning_effort="low"))
+    response = client.put("/api/settings/model", json=_body(effort_options=["fast"]))
+    assert response.status_code == 400
+    assert response.json()["code"] == "settings_effort_invalid"
+    # 列表和档位都留在原值：不接受"列表改了、档位悬空"的中间态。
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
+    assert store.resolve().reasoning_effort == "low"
+
+
+def test_empty_options_list_restores_the_defaults():
+    """全清空 = 恢复默认五档，不是"从此没有档位"。"""
+    client.put("/api/settings/model", json=_body(
+        reasoning_effort="low", effort_options=["low"]))
+    assert client.get("/api/settings/model").json()["reasoning_effort_options"] == ["low"]
+
+    client.put("/api/settings/model", json=_body(reasoning_effort="low", effort_options=[]))
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
+    assert body["reasoning_effort"] == "low"
+
+
+def test_options_input_is_normalized_not_refused():
+    """空白项丢弃（编辑态的"清空即删"）、重复去重保序；超长的整单 400。"""
+    client.put("/api/settings/model", json=_body(
+        effort_options=["low", "  ", "low", "medium"]))
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["low", "medium"]
+
+    long_one = "x" * (store.MAX_EFFORT_CHARS + 1)
+    refused = client.put("/api/settings/model", json=_body(effort_options=[long_one]))
+    assert refused.status_code == 400
+    assert refused.json()["code"] == "settings_effort_invalid"
+
+
+def test_clearing_the_effort_sends_no_key_again():
+    """空串 = 清掉，回到"不发这个键"。`None`（键都不带）= 不改。"""
+    client.put("/api/settings/model", json=_body(reasoning_effort="low"))
+    assert store.resolve().reasoning_effort == "low"
+
+    client.put("/api/settings/model", json=_body(reasoning_effort=""))
+    assert store.resolve().reasoning_effort is None
+
+    # 键都不带 → 不改，仍然是"没挑过"。
+    client.put("/api/settings/model", json=_body(model="another-model"))
+    assert store.resolve().reasoning_effort is None
+
+
+def test_the_effort_follows_whichever_row_supplies_the_model(monkeypatch):
+    """档位跟着"这次用谁的配置"走：部署方那行挑的档位，借用者也能看见。"""
+    base = "https://api.deepseek.com/v1"
+    monkeypatch.setenv(store.BASE_URL_ENV, base)
+    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
+    store.save(base_url=base, model="deepseek-chat",
+               reasoning_effort="high", scope="instance")
+
+    # 换成另一个人（未注册的游客没有行，走实例回落）：
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort"] == "high"
+
+
+def test_free_tier_options_still_come_from_the_directory(monkeypatch):
+    """免费档是唯一还走目录的地方：游客只读，档位清单是供应商说的。"""
+    from app.generation import free_models
+
+    base = "https://api.deepseek.com/v1"
+    monkeypatch.setenv(store.BASE_URL_ENV, base)
+    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
+    monkeypatch.setenv(store.API_KEY_ENV, "env-key-0000")
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    with free_models._LOCK:
+        free_models._CACHE[base.rstrip("/")] = (
+            10.0 ** 9 + 10.0,
+            [free_models.FreeModel("deepseek-chat", "low", 128000,
+                                   ("none", "low", "high"))],
+        )
+
+    body = client.get("/api/settings/model").json()
+    assert body["model_source"] == "free"
+    assert body["reasoning_effort_options"] == ["none", "low", "high"]
+
+
+def test_a_free_model_without_effort_does_not_borrow_the_saved_word(monkeypatch):
+    """目录没给档位的免费模型（OpenCode 的 `big-pickle` 那类）不能借用用户存过的值。
+
+    用户存 `high` 是给他**自己的**模型挑的；免费档把模型整个换掉之后它不在用。
+    借过去就是一个"目录没声明、实测会 400"的请求。判据是 `model_source`，
+    不是"档位为空"——后者正好是这里要放行的情形。
+    """
+    from app.generation import free_models
+
+    base = "https://api.deepseek.com/v1"
+    monkeypatch.setenv(store.BASE_URL_ENV, base)
+    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
+    monkeypatch.setenv(store.API_KEY_ENV, "env-key-0000")
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+
+    # 用户自己有密钥的那行，挑过档位。
+    client.put("/api/settings/model", json=_body(reasoning_effort="high"))
+    assert store.resolve().reasoning_effort == "high"
+
+    # 免费档接管，而目录给的这个模型**没有**档位信息。
+    with free_models._LOCK:
+        free_models._CACHE[base.rstrip("/")] = (
+            10.0 ** 9 + 10.0,
+            [free_models.FreeModel("deepseek-chat", None, 128000)],
+        )
+
+    resolved = store.resolve()
+    assert resolved.free_tier is True
+    assert resolved.reasoning_effort is None
+
+
 # ---------------------------------------------------------------- 深度思考那一档
 
 def test_explicit_deep_model_from_the_panel_reaches_model_for():
@@ -485,7 +662,11 @@ def _use_fake(monkeypatch, **kwargs) -> list:
 
 
 def test_probe_success_sends_one_tiny_request(monkeypatch):
-    """成功路径：请求体是 `max_tokens=1` 的一次 ping，地址拼在 `/chat/completions`。"""
+    """成功路径：一次最小请求验三层，地址拼在 `/chat/completions`。
+
+    档位枚举不从这里来——垃圾值探测只对 Command Code 有效，已整体废弃；请求体
+    不带档位字段，`probe()` 探的只有地址、密钥、模型名。
+    """
     sent = _use_fake(monkeypatch, response=_FakeResponse(200, {
         "model": "deepseek-chat",
         "choices": [{"message": {"role": "assistant", "content": "p"}}],
@@ -497,6 +678,7 @@ def test_probe_success_sends_one_tiny_request(monkeypatch):
     assert body["ok"] is True
     assert body["model"] == "deepseek-chat"
     assert "连接正常" in body["message"]
+    assert len(sent) == 1
     assert sent[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
     assert sent[0]["json"]["max_tokens"] == 1
     assert sent[0]["json"]["model"] == "deepseek-chat"
@@ -637,6 +819,53 @@ def test_probe_with_incomplete_config_is_a_400():
     response = client.post("/api/settings/model/test", json=_body())
     assert response.status_code == 400
     assert response.json()["code"] == "settings_incomplete"
+
+
+# ---------------------------------------------------------------- 测试连接的限速
+
+
+
+def test_the_test_endpoint_is_rate_limited_with_retry_after(monkeypatch):
+    """限速防的是"测试"被当烧额度的刀：到量 429，`Retry-After` 写在响应头。
+
+    429 走的是 400 那条错误通道（`SettingsError` 带 `headers`），不是 `ok=false`
+    的结论——它是"这次请求没发出去"，不是"这次测试失败了"。
+    """
+    from app.settings import router as router_module
+
+    monkeypatch.setenv(router_module.TEST_LIMIT_ENV, "2")
+    _use_fake(monkeypatch, response=_FakeResponse(200, {"choices": [{"message": {}}]}))
+    payload = _body(base_url="https://api.deepseek.com/v1", api_key=SECRET,
+                    model="deepseek-chat")
+
+    assert client.post("/api/settings/model/test", json=payload).status_code == 200
+    assert client.post("/api/settings/model/test", json=payload).status_code == 200
+    third = client.post("/api/settings/model/test", json=payload)
+    assert third.status_code == 429
+    assert third.json()["code"] == "settings_test_rate_limited"
+    assert "Retry-After" in third.headers
+
+
+def test_the_rate_limit_buckets_by_identity_then_ip(monkeypatch):
+    """只按 IP 限会拖累 NAT 后面的真人：换了身份就换一个桶。
+
+    这份本地 app 只挂了 settings 路由（没有身份中间件），所以身份维度在
+    `_test_allow` 这一层钉：同 IP 下匿名与游客是两个桶。"cookie → 身份 → 桶"
+    的接线由带完整 app 的测试文件覆盖（`test_gate.py` 等）。
+    """
+    from app.settings import router as router_module
+
+    monkeypatch.setenv(router_module.TEST_LIMIT_ENV, "2")
+    anon = ("", "203.0.113.9")
+    guest = ("guest-1a2b3c", "203.0.113.9")
+
+    assert router_module._test_allow(anon, now=1.0) == (True, 0.0)
+    assert router_module._test_allow(anon, now=2.0) == (True, 0.0)
+    blocked, retry = router_module._test_allow(anon, now=3.0)
+    assert blocked is False and retry > 0
+
+    # 同一个 IP，换一个身份：新桶，立刻可用。
+    assert router_module._test_allow(guest, now=3.5) == (True, 0.0)
 
 
 # ---------------------------------------------------------------- 密钥不出门
@@ -906,6 +1135,7 @@ def test_saved_row_is_readable_as_json_shape():
         "model", "model_source", "deep_model", "deep_model_source",
         "deep_model_effective", "llm_mode", "configured", "updated_at",
         "can_edit_instance", "instance",
+        "reasoning_effort", "reasoning_effort_options",
     }
     # 打码值能被 JSON 序列化（省略号是普通字符，不是控制字符）。
     json.dumps(body, ensure_ascii=False)

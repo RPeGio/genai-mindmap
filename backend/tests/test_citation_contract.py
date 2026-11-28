@@ -89,7 +89,7 @@ def _ctx(sources: list[Source], *, max_model_calls: int = 30) -> RunContext:
 
 
 def _tree(refs: list[dict] | None = None) -> dict:
-    """3 条一级分支（`MIN_BRANCHES` 的下限），引用挂第一条分支上。"""
+    """3 条一级分支（顺手规模，一级分支没有下限），引用挂第一条分支上。"""
     children = [
         {"id": f"b{index}", "label": f"分支{index}", "children": [
             {"id": f"b{index}-1", "label": f"要点{index}", "children": []},

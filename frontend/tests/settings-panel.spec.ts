@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { InstanceSettings, ModelSettings, TestModelSettingsResponse } from '../src/api/types';
 import { apiKeyPlaceholder, settingSourceLabel, useSettingsStore } from '../src/stores/settings';
+import { useAuthStore } from '../src/stores/auth';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 /**
@@ -55,6 +56,8 @@ function settingsPayload(overrides: Partial<ModelSettings> = {}): ModelSettings 
     deep_model_source: 'unset',
     deep_model_effective: 'deepseek-reasoner',
     llm_mode: 'model',
+    reasoning_effort: null,
+    reasoning_effort_options: [],
     configured: true,
     can_edit_instance: false,
     instance: null,
@@ -74,6 +77,8 @@ interface StubOptions {
   probe?: Partial<TestModelSettingsResponse>;
   /** 让某一个动词返回业务错误（`{status, code, message}`）。 */
   fail?: 'get' | 'put' | 'test';
+  /** `/api/auth/me` 的回答（缺省 `anonymous`：老用例不关心身份，看见的是完整表单）。 */
+  auth?: { user?: string | null; guest_id?: string | null };
 }
 
 /**
@@ -104,6 +109,19 @@ function stubBackend(options: StubOptions = {}) {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
 
     if (isPrefsRequest(url)) return prefsReply(url);
+    if (url.endsWith('/auth/me')) {
+      const user = options.auth?.user ? { id: 'u1', username: options.auth.user, created_at: '2026-11-01T00:00:00Z' } : null;
+      const guestId = options.auth?.guest_id ?? null;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          user,
+          guest_id: guestId,
+          kind: user ? 'user' : guestId ? 'guest' : 'anonymous',
+        }),
+      } as unknown as Response;
+    }
     if (url.endsWith('/health')) {
       return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'test' }) } as unknown as Response;
     }
@@ -536,6 +554,7 @@ describe('本站共享配置：只有部署方看得到', () => {
     expect(backend.puts[0].body).toEqual({
       clear_api_key: false,
       scope: 'instance',
+      reasoning_effort: '',
       base_url: 'https://api.deepseek.com/v1',
       model: 'deepseek-chat',
       deep_model: '',
@@ -629,6 +648,116 @@ describe('测试连接', () => {
     expect(text(wrapper, '[data-test="settings-error"]')).toContain('三项');
     expect(wrapper.html()).not.toContain(SECRET);
   });
+
+  it('测试进行中整面板盖着加载态，结束后收走', async () => {
+    stubBackend({ probe: { message: '连接正常（320 毫秒）' } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-test"]').trigger('click');
+    // 测的就是表单里的值：这期间再改输入只会测到一半新一半旧，遮罩挡住它。
+    expect(has(wrapper, '[data-test="settings-detecting"]')).toBe(true);
+    await flushPromises();
+    expect(has(wrapper, '[data-test="settings-detecting"]')).toBe(false);
+  });
+});
+
+describe('思考强度：档位是用户自己管的那份列表', () => {
+  it('下拉选项就是 GET 给的那份列表：挑一档会进保存请求', async () => {
+    const backend = stubBackend({
+      current: { reasoning_effort_options: ['off', 'low', 'medium', 'high', 'max'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    const select = wrapper.get('[data-test="settings-effort"]');
+    const words = select.findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'off', 'low', 'medium', 'high', 'max']);
+    expect(text(wrapper, '[data-test="settings-effort-default"]')).toContain('沿用服务商默认');
+
+    await select.setValue('low');
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts[0].body).toMatchObject({ reasoning_effort: 'low' });
+  });
+
+  it('点「编辑」：下拉变成输入框，草稿抄的是当前生效的列表', async () => {
+    stubBackend({
+      current: { reasoning_effort: 'medium', reasoning_effort_options: ['low', 'medium'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-effort-edit"]')).toBe(true);
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+
+    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
+    const inputs = wrapper.findAll('[data-test="settings-effort-input"]');
+    expect(inputs.map(input => (input.element as HTMLInputElement).value)).toEqual(['low', 'medium']);
+  });
+
+  it('改一格、清空一格：保存发整表 effort_options，退出编辑回到下拉', async () => {
+    const backend = stubBackend({
+      current: { reasoning_effort_options: ['off', 'low', 'medium', 'high', 'max'] },
+      saved: { reasoning_effort_options: ['slow', 'low', 'medium', 'high'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+    const inputs = wrapper.findAll('[data-test="settings-effort-input"]');
+    await inputs[0].setValue('slow');
+    await inputs[4].setValue('');
+    await wrapper.get('[data-test="settings-effort-save"]').trigger('click');
+    await flushPromises();
+
+    // 清空一格 = 删除：提交的是改完之后的整表，不是补丁。
+    expect(backend.puts[0].body).toMatchObject({ effort_options: ['slow', 'low', 'medium', 'high'] });
+    expect(has(wrapper, '[data-test="settings-effort-input"]')).toBe(false);
+    // 保存响应里的列表就是下一次的下拉选项。
+    const words = wrapper.get('[data-test="settings-effort"]').findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'slow', 'low', 'medium', 'high']);
+  });
+
+  it('选中的档位被删掉时，保存请求同时把它换到还存在的档位上', async () => {
+    const backend = stubBackend({
+      current: { reasoning_effort: 'high', reasoning_effort_options: ['low', 'medium', 'high'] },
+      saved: { reasoning_effort: 'low', reasoning_effort_options: ['low', 'medium'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+    // 把 high（当前选中）清掉。
+    await wrapper.findAll('[data-test="settings-effort-input"]')[2].setValue('');
+    await wrapper.get('[data-test="settings-effort-save"]').trigger('click');
+    await flushPromises();
+
+    // 不带 reasoning_effort 的话，后端按新列表校验会整个 400。
+    expect(backend.puts[0].body).toMatchObject({
+      effort_options: ['low', 'medium'],
+      reasoning_effort: 'low',
+    });
+  });
+
+  it('全清空 = 恢复默认五档：发空数组，下拉回到默认选项', async () => {
+    const backend = stubBackend({
+      current: { reasoning_effort_options: ['slow'] },
+      saved: { reasoning_effort_options: ['off', 'low', 'medium', 'high', 'max'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+    await wrapper.get('[data-test="settings-effort-input"]').setValue('');
+    await wrapper.get('[data-test="settings-effort-save"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts[0].body).toMatchObject({ effort_options: [] });
+    const words = wrapper.get('[data-test="settings-effort"]').findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'off', 'low', 'medium', 'high', 'max']);
+  });
 });
 
 describe('demo 模式必须说出来', () => {
@@ -669,7 +798,32 @@ describe('关闭', () => {
     expect(has(wrapper, PANEL)).toBe(false);
 
     await openPanel(wrapper);
-    await wrapper.get('[data-test="settings-backdrop"]').trigger('click');
+    // 真鼠标"点遮罩"是按下 + 松开都在遮罩上：mousedown 记标志，click 消费它。
+    const backdrop = wrapper.get('[data-test="settings-backdrop"]');
+    await backdrop.trigger('mousedown');
+    await backdrop.trigger('click');
+    await flushPromises();
+    expect(has(wrapper, PANEL)).toBe(false);
+  });
+
+  it('从面板里拖到遮罩上松手不关面板；在遮罩上按下再松开才关', async () => {
+    stubBackend();
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    const model = wrapper.get('[data-test="settings-model"]');
+    const backdrop = wrapper.get('[data-test="settings-backdrop"]');
+    // 按下在卡片里、松开在遮罩上：浏览器把那次 click 派发到两目标的公共祖先，
+    // 恰好是遮罩。只看 click 会把"选词/拖动文本"的收尾当成关闭指令。
+    await model.trigger('mousedown');
+    await backdrop.trigger('mouseup');
+    await backdrop.trigger('click');
+    await flushPromises();
+    expect(has(wrapper, PANEL)).toBe(true);
+
+    // 按下和松开都在遮罩上：这才是真的"点遮罩"。
+    await backdrop.trigger('mousedown');
+    await backdrop.trigger('click');
     await flushPromises();
     expect(has(wrapper, PANEL)).toBe(false);
   });
@@ -706,6 +860,10 @@ describe('关闭', () => {
     const last = focusable[focusable.length - 1];
     const first = focusable[0];
     last.element.focus();
+    // 面板打开时自动聚焦了 base-url，把它挪到 `last` 上会触发一次失焦探测；
+    // 探测期间「测试连接」按钮被 `:disabled` 暂时移出可聚焦列表（探测结束即恢复，
+    // 见 blur 探测那条功能）。等这一次探测落地，列表恢复原状，下面的圈才算数。
+    await flushPromises();
     expect(document.activeElement).toBe(last.element);
 
     await panel.trigger('keydown', { key: 'Tab' });
@@ -771,5 +929,40 @@ describe('store 与纯函数', () => {
     expect(store.isDemoMode).toBe(false);
     expect(store.configured).toBe(true);
     expect(has(wrapper, '[data-test="settings-base-url"]')).toBe(true);
+  });
+});
+
+describe('游客是只读视图', () => {
+  it('游客是只读视图：看得见在用哪个模型，看不见四个输入框', async () => {
+    stubBackend({
+      auth: { guest_id: 'g-123' },
+      current: { model: 'nemotron-3.5-super-vl-free', model_source: 'free' },
+    });
+    const wrapper = mountApp();
+    // 测试不走 `main.ts` 的启动序，身份要自己问一次——与真实浏览器里"进页面先
+    // probe 再挂载"是同一个动作，只是时序放到了面板打开之后。
+    await useAuthStore().probe();
+    await openPanel(wrapper);
+
+    expect(text(wrapper, '[data-test="settings-guest-model"]')).toBe('nemotron-3.5-super-vl-free');
+    expect(text(wrapper, '[data-test="settings-guest-hint"]')).toContain('免费体验额度');
+    expect(has(wrapper, '[data-test="settings-base-url"]')).toBe(false);
+    expect(has(wrapper, '[data-test="settings-api-key"]')).toBe(false);
+    expect(has(wrapper, '[data-test="settings-model"]')).toBe(false);
+    expect(has(wrapper, '[data-test="settings-deep-model"]')).toBe(false);
+  });
+
+  it('游客在只读视图里点保存不发请求（也没东西可改）', async () => {
+    const backend = stubBackend({
+      auth: { guest_id: 'g-123' },
+      current: { model: 'nemotron-3.5-super-vl-free', model_source: 'free' },
+    });
+    const wrapper = mountApp();
+    await useAuthStore().probe();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
+    await flushPromises();
+    expect(backend.puts).toHaveLength(0);
   });
 });

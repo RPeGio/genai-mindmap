@@ -2,7 +2,9 @@
 import { computed, nextTick, onMounted, ref } from 'vue';
 
 import type { SaveModelSettingsRequest, TestModelSettingsRequest } from '../api/types';
+import { useAuthStore } from '../stores/auth';
 import {
+  SETTING_SOURCE_FREE,
   SETTING_SOURCE_UNBOUND,
   apiKeyPlaceholder,
   settingSourceLabel,
@@ -31,9 +33,15 @@ import {
  *
  * 「测试连接」发的是 `max_tokens=1` 的一次 ping——验地址/密钥/模型名，花费大约一个
  * token。它也可以用**还没保存**的值，所以"填了先测、测通了再存"是通的。
+ *
+ * 思考档位是**用户自己管的那份列表**（默认五档 off/low/medium/high/max 起步），
+ * 不再向供应商探测——垃圾值探测只对 Command Code 有效、换别家直接报错
+ * （2026-11-28 实测，已废弃）。平时是下拉；点「编辑」全部变成输入框，
+ * 改值、清空一格即删，按下面的「保存」退出编辑。
  */
 
 const settingsStore = useSettingsStore();
+const authStore = useAuthStore();
 
 /** 面板是覆盖式浮层：`fixed` 挂在最上面，不参与主区 flex，开合不改变画布宽度。 */
 const emit = defineEmits<{ close: [] }>();
@@ -43,12 +51,67 @@ const baseUrl = ref('');
 const apiKey = ref('');
 const model = ref('');
 const deepModel = ref('');
+/** 登录用户挑的思考档位；空串 = 沿用服务商默认（不发键）。 */
+const reasoningEffort = ref('');
 /** 打开面板时的快照，用来算"改了哪几个字段"。 */
-const initial = ref({ base_url: '', model: '', deep_model: '' });
+const initial = ref({ base_url: '', model: '', deep_model: '', reasoning_effort: '' });
+
+/**
+ * 档位编辑态：`effortDraft` 是编辑中的列表副本（空格子 = 删除该档位）。
+ * 编辑只改这份副本，按「保存」才整表提交——否则一格手滑就真改了生效配置。
+ */
+const editingEfforts = ref(false);
+const effortDraft = ref<string[]>([]);
+
+/**
+ * "按下 + 松开都在遮罩上"才算点遮罩。只看 click 会把从卡片里拖出去的松手当成
+ * 关闭——那次 click 的目标恰好是遮罩（见模板上的注释）。卡片里的任何按下都把
+ * 这个标志清掉，防止一次没消费掉的真遮罩按下替后来的拖拽背书。
+ */
+const backdropPressed = ref(false);
+
+function onBackdropClick(): void {
+  if (backdropPressed.value) emit('close');
+  backdropPressed.value = false;
+}
 
 const baseUrlInput = ref<HTMLInputElement | null>(null);
 
 const view = computed(() => settingsStore.settings);
+
+/**
+ * 游客的只读视图。
+ *
+ * 游客额度（每人每天 3 次）走的是**部署方**的密钥与免费模型，面板里那四个输入框
+ * 对他全是"填了也用不上"的假入口：改地址改不动免费档的选取，填密钥没有意义还
+ * 可能把自己的值存进库里顶掉兜底。与其给一片会误导的表单，不如只读模型名加一句
+ * 说明——需要配置能力的出口是注册，不是乱填。
+ */
+const guestOnly = computed(() => authStore.kind === 'guest');
+
+/** 免费档：档位是目录替这个模型选好的，界面只显示，不提供编辑。 */
+const isFreeTier = computed(() => view.value?.model_source === SETTING_SOURCE_FREE);
+
+/**
+ * 下拉的选项就是后端 `GET` 给的 `reasoning_effort_options`：非免费档是用户自己
+ * 管的那份（没自定义过 = 内置默认五档），免费档是模型目录（只读）。
+ * 空数组 = 界面不显示下拉（别自己编）。
+ */
+const effortOptions = computed(() => view.value?.reasoning_effort_options ?? []);
+
+/** 下拉里每个档位的人话。`none` 排在最前（目录声明了它就能关思考）。 */
+function effortLabel(word: string): string {
+  const labels: Record<string, string> = {
+    none: '关闭思考（最省）',
+    minimal: '极简',
+    low: '较低',
+    medium: '中等',
+    high: '较高',
+    xhigh: '很高',
+    max: '最大（最费）',
+  };
+  return labels[word] ?? word;
+}
 
 const canClearKey = computed(() => view.value?.api_key_set === true);
 
@@ -74,16 +137,21 @@ const instanceConfigured = computed(() => view.value?.instance?.configured === t
 const dirty = computed(() => {
   const body: SaveModelSettingsRequest = { clear_api_key: false };
   const start = initial.value;
+  if (guestOnly.value) return body;
   if (baseUrl.value.trim() !== start.base_url) body.base_url = baseUrl.value.trim();
   if (model.value.trim() !== start.model) body.model = model.value.trim();
   if (deepModel.value.trim() !== start.deep_model) body.deep_model = deepModel.value.trim();
+  if (reasoningEffort.value !== start.reasoning_effort) {
+    body.reasoning_effort = reasoningEffort.value;
+  }
   if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
   return body;
 });
 
 /** 有没有实质改动。判据不含 `clear_api_key` 这个恒定键。 */
 const changeCount = computed(
-  () => ['base_url', 'api_key', 'model', 'deep_model'].filter((key) => key in dirty.value).length,
+  () => ['base_url', 'api_key', 'model', 'deep_model', 'reasoning_effort']
+    .filter((key) => key in dirty.value).length,
 );
 
 const nothingToSave = computed(() => changeCount.value === 0);
@@ -95,12 +163,18 @@ function fillFrom(next: typeof view.value): void {
   baseUrl.value = next?.base_url ?? '';
   model.value = next?.model ?? '';
   deepModel.value = next?.deep_model ?? '';
+  // 档位：`null` = 后端这次本来就不发键，界面上按"沿用默认"（空串）显示。
+  reasoningEffort.value = next?.reasoning_effort ?? '';
   apiKey.value = '';
   initial.value = {
     base_url: baseUrl.value.trim(),
     model: model.value.trim(),
     deep_model: deepModel.value.trim(),
+    reasoning_effort: reasoningEffort.value,
   };
+  // 载入的新视图就是编辑基准：编辑态若还开着（保存成功会走到这里），一起收掉，
+  // 免得草稿还指着已被覆盖的旧列表。
+  editingEfforts.value = false;
 }
 
 onMounted(async () => {
@@ -112,13 +186,52 @@ onMounted(async () => {
   baseUrlInput.value?.focus();
 });
 
-/** 测试连接：**优先用表单里的值**（含还没保存的关键改动），空字段回落生效值。 */
-async function runTest(): Promise<void> {
+/** 测试请求体：**优先用表单里的值**（含还没保存的关键改动），空字段回落生效值。 */
+function testBody(): TestModelSettingsRequest {
   const body: TestModelSettingsRequest = {};
   if (baseUrl.value.trim()) body.base_url = baseUrl.value.trim();
   if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
   if (model.value.trim()) body.model = model.value.trim();
-  await settingsStore.test(body);
+  return body;
+}
+
+/** 手动「测试连接」：空表单也发，让后端把"三项没配齐"说清，而不是静默不动作。 */
+async function runTest(): Promise<void> {
+  await settingsStore.test(testBody());
+}
+
+/**
+ * 进入档位编辑态：把当前生效的列表抄进草稿。列表没自定义过（选项=默认五档）
+ * 也照抄——第一格想改成自己模型的真档位时，改的就是这一格。
+ *
+ * 没有单独的「取消」按钮：误入编辑态的出路是直接按「保存」——什么都不改时
+ * 提交上去的列表与生效值相同，后端判 `changed=false`，什么都不会变。
+ */
+function startEditing(): void {
+  effortDraft.value = effortOptions.value.length
+    ? [...effortOptions.value]
+    : ['off', 'low', 'medium', 'high', 'max'];
+  editingEfforts.value = true;
+}
+
+/**
+ * 提交档位列表并退出编辑。
+ *
+ * 后端按"改完之后的列表"校验档位，所以这次提交要带上档位本身：改完的列表里
+ * 已经没有当前选中值时，把选中值落到一个真实存在的档位上（用户拍板的默认：
+ * low，没有 low 就挑第一档，全空就清掉）——不发它，整个 PUT 会被 400 拒掉。
+ */
+async function saveEffortOptions(): Promise<void> {
+  // 空白格 = 删除（后端同样丢弃，但这里要**先**算，选中值才有依据）。
+  const next = effortDraft.value.map((word) => word.trim()).filter(Boolean);
+  const body: SaveModelSettingsRequest = { clear_api_key: false, effort_options: next };
+  if (reasoningEffort.value && !next.includes(reasoningEffort.value)) {
+    body.reasoning_effort = next.includes('low')
+      ? 'low'
+      : (next[0] ?? '');
+  }
+  const saved = await settingsStore.save(body);
+  if (saved) fillFrom(saved);
 }
 
 async function runSave(): Promise<void> {
@@ -155,6 +268,9 @@ async function saveAsInstance(): Promise<void> {
     model: model.value.trim(),
     deep_model: deepModel.value.trim(),
   };
+  // 部署方在共享行上挑的档位也一起存（空串 = 不发键）。目录没给档位时下拉不显示、
+  // `reasoningEffort` 保持快照值，存什么都不会变。
+  body.reasoning_effort = reasoningEffort.value;
   if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
   const saved = await settingsStore.save(body);
   if (saved) fillFrom(saved);
@@ -205,11 +321,16 @@ function trapFocus(event: KeyboardEvent): void {
   <!--
     遮罩 + 居中卡片。点遮罩关闭，`@click.stop` 挡住卡片内部的冒泡——
     少了那个 stop，点任何输入框都会把面板关掉。
+
+    关闭还要求**按下也发生在遮罩上**：从卡片里按住拖到遮罩上松手（选词、拖动
+    文本都可能这么干），浏览器把 click 派发到按下/松开两目标的公共祖先——恰好
+    是遮罩。只看 click 会把这次拖拽当成"点遮罩"，面板在用户不想关的时候消失。
   -->
   <div
     class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
     data-test="settings-backdrop"
-    @click.self="emit('close')"
+    @mousedown.self="backdropPressed = true"
+    @click.self="onBackdropClick"
   >
     <section
       ref="panel"
@@ -217,10 +338,26 @@ function trapFocus(event: KeyboardEvent): void {
       aria-modal="true"
       aria-label="模型设置"
       data-test="settings-panel"
-      class="max-h-full w-full max-w-lg overflow-auto rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-xl"
+      class="relative max-h-full w-full max-w-lg overflow-auto rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-xl"
       @click.stop
+      @mousedown="backdropPressed = false"
       @keydown="trapFocus"
     >
+      <!--
+        测试加载态：点「测试连接」期间盖住整面板——测的就是表单里的值，这期间
+        再改输入只会测到一半新一半旧。盖住 + 不可编辑 + `aria-busy`，
+        一句话说清在等什么。
+      -->
+      <div
+        v-if="settingsStore.testing"
+        data-test="settings-detecting"
+        aria-busy="true"
+        class="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-white/70"
+      >
+        <span class="rounded-md bg-white/90 px-3 py-1.5 text-xs text-slate-500 shadow">
+          检测模型可用性…
+        </span>
+      </div>
       <header class="mb-3 flex items-start justify-between gap-2">
         <div>
           <h2 class="text-base font-semibold text-slate-900">模型设置</h2>
@@ -266,6 +403,31 @@ function trapFocus(event: KeyboardEvent): void {
 
       <p v-if="settingsStore.loading" class="mb-3 text-xs text-slate-400">正在读取当前配置…</p>
 
+      <!--
+        游客是只读的：免费额度走部署方的密钥与免费模型，下面四个输入框对他全是
+        "填了也用不上"的假入口。只读模型名加一句说明，出口是注册而不是乱填。
+      -->
+      <section
+        v-if="guestOnly"
+        data-test="settings-guest"
+        class="flex flex-col gap-2"
+      >
+        <div class="flex flex-col gap-1">
+          <span class="flex items-baseline justify-between gap-2">
+            <span class="text-xs font-medium text-slate-600">当前使用的模型</span>
+            <span class="text-[11px] text-slate-400">{{ settingSourceLabel(view?.model_source ?? 'unset') }}</span>
+          </span>
+          <span
+            data-test="settings-guest-model"
+            class="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs text-slate-700"
+          >{{ view?.model || '（还没配好，请联系部署方）' }}</span>
+        </div>
+        <p class="text-[11px] leading-relaxed text-slate-500" data-test="settings-guest-hint">
+          当前正在使用免费体验额度，无法配置模型。注册账号后即可配置自己的模型与密钥。
+        </p>
+      </section>
+
+      <template v-else>
       <div class="flex flex-col gap-3">
         <label class="flex flex-col gap-1">
           <span class="flex items-baseline justify-between gap-2">
@@ -376,7 +538,82 @@ function trapFocus(event: KeyboardEvent): void {
             实际会发：<code data-test="settings-deep-effective">{{ view.deep_model_effective }}</code>
           </span>
         </label>
+
+        <!--
+          思考强度。选项是**用户自己管的那份列表**（默认五档起步），不是问供应商
+          要的——垃圾值探测只对 Command Code 有效，已废弃。平时是下拉；「编辑」
+          把所有档位变成输入框，改值、清空一格即删，按下面的「保存」退出。
+        -->
+        <label v-if="isFreeTier" class="flex flex-col gap-1">
+          <span class="text-xs font-medium text-slate-600">思考强度</span>
+          <span
+            data-test="settings-effort-free"
+            class="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs text-slate-700"
+          >免费模型自动{{ view?.reasoning_effort ? `：${view.reasoning_effort}` : '（沿用服务商默认）' }}</span>
+        </label>
+        <div v-else class="flex flex-col gap-1">
+          <span class="flex items-baseline justify-between gap-2">
+            <span class="text-xs font-medium text-slate-600">思考强度（可选）</span>
+            <button
+              v-if="!editingEfforts"
+              type="button"
+              data-test="settings-effort-edit"
+              class="text-[11px] text-slate-500 underline decoration-dotted hover:text-slate-700"
+              title="编辑档位列表（改值、清空一格即删）"
+              @click="startEditing"
+            >编辑</button>
+          </span>
+          <select
+            v-if="!editingEfforts && effortOptions.length > 0"
+            v-model="reasoningEffort"
+            data-test="settings-effort"
+            class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
+          >
+            <option value="" data-test="settings-effort-default">沿用服务商默认</option>
+            <option
+              v-for="word in effortOptions"
+              :key="word"
+              :value="word"
+            >{{ effortLabel(word) }}</option>
+          </select>
+          <template v-if="editingEfforts">
+            <div class="flex flex-col gap-1">
+              <input
+                v-for="(_, index) in effortDraft"
+                :key="index"
+                v-model="effortDraft[index]"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                data-test="settings-effort-input"
+                placeholder="档位值（原样发给供应商；清空一格 = 删除该档位）"
+                class="rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
+              />
+            </div>
+            <span class="text-[11px] leading-relaxed text-slate-400">
+              列表就是下拉的选项，也是发给供应商的档位参数值。全清空 = 恢复默认五档。
+            </span>
+            <button
+              type="button"
+              data-test="settings-effort-save"
+              class="self-start rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+              :disabled="settingsStore.saving"
+              @click="saveEffortOptions"
+            >{{ settingsStore.saving ? '保存中…' : '保存' }}</button>
+          </template>
+          <p
+            v-else-if="effortOptions.length === 0"
+            data-test="settings-effort-unknown"
+            class="text-[11px] text-slate-400"
+          >
+            该模型没有公开档位信息，沿用服务商默认。
+          </p>
+          <span v-if="!editingEfforts && effortOptions.length > 0" class="text-[11px] text-slate-400">
+            思考越多越慢也越费。生成时实际用的是「当前使用的模型」那一个档位。
+          </span>
+        </div>
       </div>
+      </template>
 
       <!--
         全站共享配置：只有部署方看得到。

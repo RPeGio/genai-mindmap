@@ -14,6 +14,12 @@
 `Incorrect API key provided: sk-abc***`）。`_redact()` 把出现的明文 key 换成打码值，
 再把正文截到 200 字——既留下能查的信息，又不把密钥写进响应体（界面会显示它，
 用户一截图就出去了）。
+
+**思考档位的枚举不从这里来**（2026-11-28 二次修订）：曾有一版"两步探测"——第一步
+带一个校验器不认的档位哨兵，从拒绝文案里把合法档位枚举拿回来。实测它只对
+Command Code 一家有效，换成别家直接 4xx（且其枚举本就不等于模型真实支持集），
+已整体废弃；下拉选项改为用户自己管的那份列表（`store.DEFAULT_EFFORT_OPTIONS`
+起步，编辑态里改成自己模型的真档位）。
 """
 from __future__ import annotations
 
@@ -282,5 +288,5 @@ async def probe(base_url: str, api_key: str, model: str) -> ProbeResult:
                        latency_ms=latency)
 
 
-__all__ = ["ALLOW_PRIVATE_ENV", "PROBE_MAX_TOKENS", "ProbeResult", "TIMEOUT_SECONDS",
-           "probe"]
+__all__ = ["ALLOW_PRIVATE_ENV", "PROBE_MAX_TOKENS",
+           "ProbeResult", "TIMEOUT_SECONDS", "probe"]

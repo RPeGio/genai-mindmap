@@ -1026,6 +1026,10 @@ class ErrorEvent(_EventBase):
     message: str
     # 预算耗尽时说明是哪一个，界面据此给可操作的提示
     limit: str | None = None
+    # 还需要等多久（秒）。现在只有免费档的每日桶带它：上游 `retry-after`
+    # 实测是到明天零点的秒数（约 19 小时），界面据此可以显示"约 N 小时后恢复"
+    # 而不是让用户猜"明天"是哪一刻。取不到就是 None，帧里整条不存在。
+    retry_after: int | None = None
 
 
 AgentEvent = Annotated[

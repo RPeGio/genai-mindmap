@@ -3,6 +3,11 @@
 > 起于 m16558：免费额度不能写死模型名。Command Code 的 coding plan 里标 `:free`
 > 的那些模型在活动期间不收费，但**名单不是常驻的**——平台会新上架免费模型，也会把
 > 已有的下架，下架之后再用那个名字只会 400。所以选谁是运行时现问的。
+>
+> 2026-11-28 起供应商换到 **OpenCode**（用户拍板）：它的目录自带
+> `capabilities.reasoning`（思考档位），免费聊天模型有 10 个，而且**能把思考关掉**
+> （`none` 档或 `toggle`），这是 Command Code 给不了的。Command Code 的判定路径
+> 保留（同一个"GET {base}/models"模式认得出两种形状），部署方把地址换回去它照样工作。
 
 代码只有两个文件：`backend/app/generation/free_models.py`（发现与排序）与
 `backend/app/settings/store.py` 里那段免费档替换（决定"这一次用不用免费档"）。
@@ -18,7 +23,9 @@
   `max_tokens` 也不会被抬高）；
 - 打开之后，只影响**借用部署方配置的人**（自己没填密钥的那些）。
 
-## 2. API 事实（2026-11-23 实测）
+## 2. API 事实（2026-11-23 Command Code 实测；2026-11-28 换 OpenCode 后实测）
+
+### Command Code（原供应商，判定路径保留）
 
 | 事实 | 值 |
 | --- | --- |
@@ -37,6 +44,33 @@
 `supported_endpoints` 里必须带 `/chat/completions` 才算可用：105 个模型里有 12 个只
 支持 `/messages`（Anthropic 格式）。如果哪天某个免费模型只挂在那条路上，选它出来会
 让每次调用都 400，而报错文案（"模型服务返回 HTTP 400"）完全看不出该换模型。
+
+### OpenCode（现供应商，2026-11-28 实测）
+
+| 事实 | 值 |
+| --- | --- |
+| 模型列表 | `GET https://opencode.ai/inference/openai/v1/models`，**带 key 才 200**（80 个模型）；目录原型 `https://opencode.ai/zen/v1/models` 无需鉴权（110 个），形状一致 |
+| 推理端点 | `https://opencode.ai/inference/openai/v1`（OpenAI 兼容）；`compatibility.reasoning_field: "reasoning_content"`——我们的 `_stream_frame` 两个名字都认，不用改 |
+| 免费判据 | `type == "chat"` 且 `cost.text.input/output.price` 都是 **0**（`big-pickle` 连 `-free` 后缀都没有，照样免费）；`recommended_api`（有就认）必须是 `chat-completions` |
+| 实测免费聊天模型 | 10 个：`seaglass-alpha-free` / `nemotron-3.5-super-vl-free` / `hy4-flash-free` / `beam-free` / `nemotron-3.5-lightning-free` / `iceman-free` / `flint-40b-free` / `mimo-v2.6-flash-free` / `deepseek-v4.1-flash-free` / `big-pickle` |
+| 思考档位 | `capabilities.reasoning.effort` 列表 + `toggle`；**"关思考"的形式是 `none`**（effort 列表直接含，或 `toggle:true` 加出来）——字面 `off` 任何模型都没有；实测 `none` 档下发 `reasoning_effort: "none"` |
+| 能关思考的 | `nemotron-3.5-super-vl-free` / `hy4-flash-free`（列表直接含 `none`）、`deepseek-v4.1-flash-free`（`toggle:true`）；`beam-free` / `flint-40b-free` / `seaglass-alpha-free` 有档位但无 `none`；`big-pickle` / `iceman` / `lightning` / `mimo` **没有档位信息**（发一个它没声明的档位才是真的 400） |
+| 限额 | **没有固定次数**——免费模型用完当天额度时 429 `FreeUsageLimitError`，`retry-after` 实测 68612~68615 秒 ≈ 19.1 小时（每日窗口）；正文原话 "Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going" |
+| key 的形状 | Console/workspace key（`oc_` 开头）**可以直接调 API**（429 是额度不是鉴权——"免费模型只认 opencode 客户端"这个担心被实测排除）；付费模型访问默认关闭（403 `permission_error`，去 console 的 Model access 里开） |
+| 客户端镜像提醒 | `open-code.ai` 是**第三方镜像**（github.com/lym0932/open-code.ai），真站是 `opencode.ai` |
+
+**两类 429 不能混**：OpenCode 的每日桶 429（正文带 `FreeUsageLimitError`）是**账号级**的
+——换任何一个免费模型都还是它，所以这一档**不换候选**，直接抛
+`FreeQuotaExhausted`（文案"今日免费体验额度已用完，明天再来，或配置自己的模型继续"，
+`retry_after` 透传）；上游偶发的模型级 429 仍然走"换下一个候选"。判据是**正文里的
+类型名**，不是状态码——Command Code 偶发的模型级 429 与它同码不同性。
+
+`retry_after` 透到哪了：`FreeQuotaExhausted` → `ErrorEvent.retry_after`（**SSE 的
+`error` 帧**，前端据此写"约 19 小时后恢复"）→ 前端 `failures.ts` 的
+`free_quota_exhausted` 卡片。它是 `GenerationError` 的**子类**，所以三个出口
+（`backend/app/agent/service.py` 的 except 链、工具内异常那条、`backend/app/agent/router.py`
+的兜底）都必须把它排在 `except GenerationError` **之前**——顺序反了它会被吞成可重试的
+`generation_failed`，卡片永远不出现。
 
 ## 3. 三条实测约束 → 三个设计决定
 
@@ -99,20 +133,35 @@ TTL 取 1 小时：上下架不是分钟级事件，而每次刷新要占上游 
 只接一条会得到"agent 那轮换了、写内容那次没换"——AGENTS.md 那条"改一个能力的入口
 要检查所有会走到它的路径"讲的就是这个。
 
-## 4. `reasoning_effort`：不给就会白等
+## 4. `reasoning_effort`：档位跟着模型走，不给就会白等
 
-两个免费模型**不支持 `off`**（400：`does not support reasoning_effort "off"`），但支持
-`low`。不传这个参数时它们的思考会吃掉整个输出预算：
+**2026-11-28 改版**：档位不再是写死的一个 `"low"`，而是**每模型各自**的，来源三档：
 
-| 配置 | 结果 |
-| --- | --- |
-| 不传 `reasoning_effort`，`max_tokens=1400` | **56.9 秒**、`completion_tokens=1400`、其中 `reasoning_tokens=1311`、**正文空串**、`finish_reason=length` |
-| `reasoning_effort="low"`，带 tools | 8.9 秒、`comp=385 reasoning=316`、`finish=tool_calls` |
-| 不传 `reasoning_effort`，`max_tokens=4000` | 正常，`comp=67 reasoning=14 finish=stop` |
+1. **OpenCode 目录**：`capabilities.reasoning.effort` 列表里有 `none` 就发 `none`；
+   没有 `none` 但有列表就取**最省**的一档（`_EFFORT_RANK` 全序，`none` < `minimal` <
+   `low` < … < `max`）；`toggle:true` 视同有 `none`（实测 deepseek-v4.1-flash-free
+   就是这么声明的）；**没有档位信息就不发这个键**——发一个目录没声明的档位是实测
+   会 400 的形状（那四个无档位模型）。目录顺序完整保留在 `FreeModel.effort_options`
+   里，设置面板的"思考强度"下拉按它渲染（登录用户可以自己挑，挑哪档发哪档；
+   免费档的自动档只显示、不让他们改）。
+2. **Command Code 兜底 `FALLBACK_EFFORT = "low"`**：它的目录不带 capabilities，
+   档位未知。它那两个免费模型实测**不支持 `off`**（400：`does not support
+   reasoning_effort "off"`），但支持 `low`；不传时思考会吃掉整个输出预算：
 
-所以走免费档时两件事一起做：发 `reasoning_effort: "low"`，并且给 `max_tokens` 一个
-**下限** `FREE_MIN_OUTPUT_TOKENS = 4000`（调用方要得更少也抬到 4000）。抬完之后仍要
-过 `max_tokens_cap()`——那是服务端真实上限，不能为了凑够 4000 发一个一定会 400 的值。
+   | 配置 | 结果 |
+   | --- | --- |
+   | 不传 `reasoning_effort`，`max_tokens=1400` | **56.9 秒**、`completion_tokens=1400`、其中 `reasoning_tokens=1311`、**正文空串**、`finish_reason=length` |
+   | `reasoning_effort="low"`，带 tools | 8.9 秒、`comp=385 reasoning=316`、`finish=tool_calls` |
+   | 不传 `reasoning_effort`，`max_tokens=4000` | 正常，`comp=67 reasoning=14 finish=stop` |
+
+3. **候选序列里后续模型的档位**：由两个模型出口（`chat_async` 与 `agent/provider`）
+   从候选记录里**现取**——`resolve()` 只回答"首选那个模型发什么"，它不知道运行中
+   会换到谁。
+
+与档位配套的是 `max_tokens` 的**下限** `FREE_MIN_OUTPUT_TOKENS = 4000`（调用方要得更少
+也抬到 4000）。抬完之后仍要过 `max_tokens_cap()`——那是服务端真实上限，不能为了凑够
+4000 发一个一定会 400 的值。夹不夹看 `Resolved.free_tier`（"这次走的是免费档"），
+不看"有没有档位"——目录里没给档位的免费模型照样要夹（夹的是"给思考的预算"）。
 
 注意这也是"为什么免费档慢"的一半原因：24.6 tok/s 的吞吐加上每个节点都要写说明，
 一张四十节点的图要几分钟。部署方想快就用自己那行填密钥，那样根本不进这一档。

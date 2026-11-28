@@ -185,7 +185,10 @@ def apply_free_tier_ceiling(cap: int) -> int:
     `_nodes_per_call`）：免费档实际只发 16000，按 65536 反解出来的节点数
     是真实容量的四倍多，照着它规划批次必然被 `finish_reason=length` 截断。
     """
-    if _settings_store.resolve().reasoning_effort is None:
+    # 判"是不是免费档"用 `free_tier`（`model_source == SOURCE_FREE`），**不是
+    # `reasoning_effort is not None`**——有的免费模型（目录里没给档位的）不发
+    # 那个键，但 token 照样要夹。
+    if not _settings_store.resolve().free_tier:
         return cap
     return min(cap, FREE_MAX_OUTPUT_TOKENS)
 
@@ -257,9 +260,8 @@ CONTENT_FREEDOM_CONTRACT = (
 #
 # 输入有两种形态，必须分开说：早先只写了「整理」和「不要捏造」，模型对
 # 一句话的主题（如「机器学习」）就严格照做——那四个字里确实没有可整理的
-# 分支，于是只回一个光杆根节点，被 MIN_BRANCHES 拦下。而这个产品本来的
-# 用法就是「说一个主题，给一张图」，所以要把「围绕主题展开框架」和
-# 「带材料的整理」区分开。
+# 分支，于是只回一个光杆根节点。而这个产品本来的用法就是「说一个主题，
+# 给一张图」，所以要把「围绕主题展开框架」和「带材料的整理」区分开。
 #
 # 两种形态在**深度与覆盖**上的规则现在是同一条（能拆就拆、材料没覆盖的按知识
 # 补全）。这一份是**纯主题**那条路（不带材料、或材料太短被降级）的树规则：有材料
@@ -319,12 +321,12 @@ DETAIL_PROMPT = (
     "材料没覆盖的方面按你的知识补全，不要留「材料中没有相关内容」这种空节点。"
     "每个可分解的分支至少 2 个要点，具体几个由内容决定；"
     "不要为了凑数把同一件事拆成两条。\n"
-    "2) 简短的主题或目标（如「机器学习」「帮我规划毕业论文」）：围绕它展开成 "
-    "3-6 个一级分支，每个分支再按上面那条「还能不能再拆」继续往下拆。"
+    "2) 简短的主题或目标（如「机器学习」「帮我规划毕业论文」）：围绕它展开一级分支，"
+    "分支数量按主题的实际需要决定——不设最少条数，也不要凑满某个数字；"
+    "每个分支再按上面那条「还能不能再拆」继续往下拆。"
     "这是框架展开；做法、步骤、判断标准按你的知识写，"
     "但不要编造看起来可核查的出处（书名、论文编号、链接）。\n"
-    "两种情况下所有一级分支加起来不少于 3 条，根节点都必须有子节点，"
-    "只有根节点的结果不合格。"
+    "两种情况下根节点都必须有子节点，只有根节点的结果不合格。"
     # 正反例沿用手写示例的写法（下面 quote 那段也是 ❌/✅）：只说「更具体」时
     # 模型每次都按自己的尺度解释，给一组形态对照它才有稳定的判据。
     # 例子刻意不写任何领域内容——无来源时会被当成可抄的事实，有来源时又不在
@@ -480,14 +482,12 @@ def thinking_options() -> list[dict[str, str]]:
     ]
 
 
-# 一级分支下限：少于这个数说明模型把一棵树压成了一条链 —— 那是「层次结构」
-# 最差的一种形态，比光杆根节点好不了多少。下限只加在**模型整图生成**这条路径上，
-# 而且是质量要求、不是合法性要求：`MindMapContent.validate_tree()` 不设门槛，
-# 旧图和用户手工删到一条分支的图照常能存能开；demo 是固定占位结构（本来就只有
-# 一个子节点），也显式跳过。同步接口、流式接口共用这一个值，改一处就全改 ——
-# 否则同一个模型结果会被一个入口判成功、另一个判失败。
-MIN_BRANCHES = 3
-
+# 一级分支**不再设下限**（2026-11-28 删掉 `MIN_BRANCHES = 3`）：线上实测里它成了
+# 失败的头号来源——免费模型两次把骨架给成 2 条一级分支，每次都判
+# `too_few_branches`，两次失败就把整轮判成 `too_many_failures`，白烧了两个
+# 10 分钟级别的长调用。骨架条数是模型对主题/材料规模的判断，不是要卡的口径；
+# 数量该由提示词引导（`DETAIL_PROMPT` / `_plan_ask` 都已写"按需决定"），代码只留
+# 契约校验。`MindMapContent.validate_tree()` 从来不设门槛，旧图与手工编辑照常。
 
 class GenerationError(Exception):
     pass
@@ -512,6 +512,55 @@ class _ModelUnavailable(GenerationError):
     继承 `GenerationError` 是必需的：这两个发请求的出口最终都会被更外层按基类
     捕获，一旦它逃到外面，用户看到的就是"未预期异常"而不是一条可读的失败文案。
     """
+
+
+class FreeQuotaExhausted(GenerationError):
+    """免费平台的**每日额度**用完了。
+
+    与 `_ModelUnavailable` 必须是两个类型：候选循环只捕后者——它换下一个免费模型
+    重试；而免费额度是**账号级的**（OpenCode 实测：免费档是部署方那把 key 共享
+    一个每日桶，正文写 `FreeUsageLimitError`、限额头 `retry-after` 是到明天的
+    秒数），换十个模型也是同一个桶，再发一次请求就是白花一次等待。
+
+    继承 `GenerationError` 是必需的，理由同上：逃出去就是"未预期异常"。
+    """
+
+    def __init__(self, message: str, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        #: 距离免费额度恢复的秒数；响应头没带就是 None。
+        self.retry_after = retry_after
+
+
+def _quota_exhausted_error(response: Any) -> FreeQuotaExhausted | None:
+    """把这个响应判成"免费平台的每日额度用完了"，不是就返回 None。
+
+    判据是**响应正文里的类型名**，不是状态码：OpenCode 免费档用完回
+    `429`（正文 `{"error": {"type": "FreeUsageLimitError", ...}}`，限额头
+    `retry-after` 是到明天的秒数），而 Command Code 的偶发 429（"Upstream
+    model provider is temporarily unavailable"）是"换一个模型往往就通"——同一个
+    状态码，两种性质，正文是唯一能区分的东西。
+
+    供两条发请求的出口在 `_UNAVAILABLE_STATUSES` 判定**之前**调：先查额度再查
+    可用性，顺序反了部署方的额度就会在十来个候选上各白挨一次 429。
+
+    `retry-after` 从响应头取（`FreeUsageLimitError` 实测 68612 秒 ≈ 19.1 小时，
+    正是"到明天窗口重置"的量级）；缺省 None。文案**不复述**上游那串推广链接，
+    用户在界面上需要的是"什么时候能再试"，不是"去哪里订阅"。
+    """
+    try:
+        body = response.text or ""
+    except Exception:  # noqa: BLE001 — 拿不到正文就当"没有额度信息"
+        body = ""
+    if "FreeUsageLimitError" not in body:
+        return None
+    retry_after: int | None = None
+    header = response.headers.get("retry-after") if response.headers else None
+    if header:
+        try:
+            retry_after = int(float(header))
+        except ValueError:
+            retry_after = None
+    return FreeQuotaExhausted("今日免费体验额度已用完，明天再来，或配置自己的模型继续。", retry_after)
 
 
 class ModelNotConfigured(GenerationError):
@@ -1088,12 +1137,21 @@ async def _chat_streamed(
             async with client.stream("POST", base + "/chat/completions",
                                      content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                                      headers=headers) as response:
-                # 与 `_chat_once` / `provider._attempt` 同一判据：这些码的意思是
-                # "这个模型此刻不可用"，该立刻交给候选循环换一个。放进下面那条
-                # `except Exception` 就会被吃成"退回一次性请求"，于是同一个 524
-                # 要再等一整个往返（免费档实测单次能跑到 180 秒以上）才得到相同的
-                # 结论——而 524 恰恰是免费档最常撞到的码。
                 if response.status_code in UNAVAILABLE_STATUSES:
+                    # **先把错误体读进来，再判"是不是免费额度用完"**：流式响应在
+                    # 读之前 `.text` 会抛 `ResponseNotRead`（`_quota_exhausted_error`
+                    # 会把它吞成"没有正文"，判据就永远落空）。OpenCode 免费档用完
+                    # 回的就是 429，先按"不可用"处理会让部署方那把 key 在十来个
+                    # 候选上各白挨一次。`_chat_once` / `provider._read_*` 同一处置。
+                    await response.aread()
+                    exhausted = _quota_exhausted_error(response)
+                    if exhausted is not None:
+                        raise exhausted
+                    # 与 `_chat_once` / `provider._attempt` 同一判据：这些码的意思是
+                    # "这个模型此刻不可用"，该立刻交给候选循环换一个。放进下面那条
+                    # `except Exception` 就会被吃成"退回一次性请求"，于是同一个 524
+                    # 要再等一整个往返（免费档实测单次能跑到 180 秒以上）才得到相同的
+                    # 结论——而 524 恰恰是免费档最常撞到的码。
                     raise _ModelUnavailable(
                         f"模型服务返回 HTTP {response.status_code}")
                 response.raise_for_status()
@@ -1202,6 +1260,12 @@ async def _chat_once(
         return _parse_choice(body, request_body)
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
+        # **先查免费额度再查可用性**：OpenCode 免费档用完回的就是 429（正文
+        # `FreeUsageLimitError`），先按"不可用"换候选会把同一个桶再撞十来次。
+        # `_chat_streamed` / `provider._read_*` 同一顺序。
+        exhausted = _quota_exhausted_error(exc.response)
+        if exhausted is not None:
+            raise exhausted from exc
         if code in UNAVAILABLE_STATUSES:
             # 免费档据此换下一个模型；自配端点没有候选，外层会把它变回一条
             # 普通失败（`chat_async` 的候选序列只有一个元素时直接抛它）。
@@ -1363,7 +1427,10 @@ async def chat_async(
     # **免费档不走它**：深度思考那一档会换成 `deep_override()` 或
     # `DEEP_MODEL_FALLBACK` 的名字，而那个模型不在免费名单里——照它发出去就是用
     # 部署方的钱生成，与"免费额度"这个承诺相反。`provider.complete_tools` 同一判据。
-    if resolved.reasoning_effort is None:
+    # 判"是不是免费档"用 `resolved.free_tier`（`model_source == SOURCE_FREE`），
+    # **别用 `reasoning_effort is not None`**——有的免费模型（目录里没给档位的）
+    # 档位就是 None，那是合法值。
+    if not resolved.free_tier:
         model = _model_for(base, model, deep_thinking)
     # 输入侧的物理边界，与调用方是谁无关：装不装得进模型窗口由这里统一守，
     # 否则每个出口各守一个数，迟早分叉。
@@ -1372,7 +1439,7 @@ async def chat_async(
     # 较小者（见它的 docstring）。放在这里而不是调用方，是因为工具、agent 轮次、
     # 一次性接口都从这里出去——一处夹住，三条出口同值。
     requested = max_tokens or MAX_OUTPUT_TOKENS
-    if resolved.reasoning_effort is not None:
+    if resolved.free_tier:
         # 免费档的实测代价：`max_tokens=1400` 时两个免费模型都会把 1400 全花在
         # reasoning 上（`completion_tokens=1400`、`reasoning_tokens=1311`），正文
         # 一个字都没写就 `finish_reason=length`，56.9 秒白等。所以走免费档时给一个
@@ -1384,6 +1451,10 @@ async def chat_async(
         #
         # 两个都夹完再走 `max_tokens_cap()`：cap 是服务端真实的上限，它的约束
         # 优先级更高——不能为了凑够 4000 发出一个一定会 400 的值。
+        #
+        # 夹不夹看的是 free_tier，**不是有没有 effort**：目录里没给档位的免费模型
+        #（effort=None，请求里没有那个键）同样会把 token 烧在思考上——夹住的是
+        # "给思考的预算"，键只是"告诉它按哪档想"。
         requested = max(requested, FREE_MIN_OUTPUT_TOKENS)
         requested = min(requested, FREE_MAX_OUTPUT_TOKENS)
     request_body: dict[str, Any] = {
@@ -1395,24 +1466,30 @@ async def chat_async(
         "temperature": 0.2,
         "max_tokens": min(requested, max_tokens_cap()),
     }
-    if resolved.reasoning_effort:
-        # 只在免费档加这个键：**None 时请求体与加这个字段之前逐字节相同**，
-        # 部署方自己配的端点收不到一个它可能不认识的参数。
-        request_body["reasoning_effort"] = resolved.reasoning_effort
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     # 免费档的候选序列：上游偶发 429（实测同一时刻连发三次也可能全 200），换一个
     # 免费模型往往就通了。与 `agent/provider.py` 同一策略，只是这条出口没有跨轮的
     # provider 实例可挂状态，就把"这一次已经试过谁"放在这个函数里。
-    if resolved.reasoning_effort is None:
-        order = [model]
+    #
+    # 候选带**各自的档位**（`(id, effort)`）：目录说这个模型能 `none` 就发 `none`，
+    # 没给档位就不发这个键。首发那个的档位已经在 `Resolved.reasoning_effort` 里
+    #（`resolve()` 从同一条记录取的），候选序列里的后续模型则从记录现取——resolved
+    # 只有一个模型名，也只有一个档位。
+    if resolved.free_tier:
+        order: list[tuple[str, str | None]] = [(model, resolved.reasoning_effort)]
+        order += [(record.id, record.effort)
+                  for record in free_models.candidates(base, tried={model})]
     else:
-        order = [model] + free_models.candidates(base, tried={model})
+        order = [(model, None)]
     failure: GenerationError | None = None
-    for index, candidate in enumerate(order):
+    for index, (candidate, effort) in enumerate(order):
         if index:
-            logger.warning("免费模型 %s 暂时不可用，换下一个候选：%s", order[index - 1], failure)
-        # 首个候选复用已经拼好的请求体；后续候选只换模型名，其余字节不动。
-        attempt_body = request_body if candidate == model else dict(request_body, model=candidate)
+            logger.warning("免费模型 %s 暂时不可用，换下一个候选：%s", order[index - 1][0], failure)
+        # 首个候选也走 dict 复制：把档位从"改公共体"变成"每个候选自己的体"，
+        # 逐字节结果与之前一致（首个体本来就不含 effort 键）。
+        attempt_body = dict(request_body, model=candidate)
+        if effort:
+            attempt_body["reasoning_effort"] = effort
         try:
             # 走不走流式看"有没有人要增量"，两条通道各算一条：写说明那条链没有
             # 预览解析器（`on_delta is None`），但它是最长的一段（实测 232.8 秒），
@@ -1428,7 +1505,7 @@ async def chat_async(
     if failure is not None:
         # 自配端点没有别的候选，这条错误要与加免费档之前逐字一致（"请检查服务
         # 配置"那句是给部署方的下一步，免费档里的失败则不是配置问题）。
-        if resolved.reasoning_effort is None:
+        if not resolved.free_tier:
             raise GenerationError(f"{failure}，请检查服务配置") from failure
         raise GenerationError(str(failure)) from failure
     raise GenerationError("这个模型地址上没有可用的免费模型")
@@ -1515,20 +1592,6 @@ def _demo_content(text: str, diagram_type: str = "tree") -> DiagramContent:
         children=[Node(id=str(uuid4()), label=DEMO_EDIT_LABEL)]))
 
 
-def _branch_shortfall(count: int) -> GenerationError:
-    """一级分支不足时的错误文案：说清现状、下限与下一步怎么做。
-
-    只说「不合格」用户没法行动；这里给出两条出路——换个说法重问，或者补充材料，
-    因为这两种情况正是模型给不出分支的两大原因（主题太窄、材料太少）。
-    """
-    if count == 0:
-        return GenerationError(
-            "模型只返回了一个根节点，没有任何分支，请换一种说法或补充材料后重试")
-    return GenerationError(
-        f"模型只给了 {count} 条一级分支，少于要求的 {MIN_BRANCHES} 条；"
-        "请换一种说法，或补充更多材料后重试")
-
-
 def _usage_entry(source: Source) -> dict[str, Any]:
     """一份来源 → `source_usage` 的一项。
 
@@ -1552,7 +1615,6 @@ def _usage_entry(source: Source) -> dict[str, Any]:
 
 def validate_generated_content(
     result: Any, *, sources: list[Source] | None = None,
-    enforce_min_branches: bool = True,
     evidence: Sequence[EvidenceSpan] | None = None,
 ) -> tuple[MindMapContent, list[Diagnostic]]:
     """以真实输入重建来源摘要，剔除模型伪造的关联，再执行契约与原文校验。
@@ -1560,14 +1622,15 @@ def validate_generated_content(
     这是"整棵树一次成型"那条路的出口，**那个出口已经删掉了**（`mindmap_generate`
     随 `MINDMAP_SOURCE_MODE=full` 一起删除，见 `docs/ONE-PATH.md`）：现在唯一的
     生成路（分片）自己建 `MindMapContent`、自己重算 `source_usage`、自己跑
-    `verify_source_refs`，不经过这里。留下来的是它承载的三件**与形态无关**的事：
-    按真实输入重建来源摘要、把模型编造的 `source_refs` 剔掉、按 `MIN_BRANCHES`
-    做质量门槛——用例（`tests/test_source_refs.py`、`tests/test_citation_contract.py`、
-    `tests/test_generation.py`）钉着这三件事，任何将来的整树出口也该复用同一份实现，
-    而不是各写一遍。
+    `verify_source_refs`，不经过这里。留下来的是它承载的两件**与形态无关**的事：
+    按真实输入重建来源摘要、把模型编造的 `source_refs` 剔掉——用例
+    （`tests/test_source_refs.py`、`tests/test_citation_contract.py`）钉着这两件事，
+    任何将来的整树出口也该复用同一份实现，而不是各写一遍。
 
-    `enforce_min_branches` 是**质量**门槛而不是契约门槛：模型整图生成要求一级
-    分支不少于 `MIN_BRANCHES` 条，demo 占位结构与用户已保存的旧图不走这道关。
+    一级分支**不再设下限**（`MIN_BRANCHES` 已删）：条数是模型对主题/材料规模的
+    判断，由提示词引导，不由代码卡死——线上实测里这道门槛是 `too_many_failures`
+    的头号来源（免费模型两次给 2 条分支，两次失败整轮判死）。demo 占位结构与
+    用户已保存的旧图本来也不走这道关。
 
     `evidence` 是本次运行累积的命中区间（`RunContext.evidence`）：它回答的是
     "这条引用落在本次可见的那几段原文里吗"，而不是"逐字在不在原文里"。不给
@@ -1634,8 +1697,6 @@ def validate_generated_content(
                 "画布上只显示标题，长内容应该在 detail 里"
             ),
         ))
-    if enforce_min_branches and len(content.root.children) < MIN_BRANCHES:
-        raise _branch_shortfall(len(content.root.children))
     if sources is not None:
         # `evidence or None`：空序列与"没给"必须是同一条路。留着空列表会让
         # `verify_source_refs` 进到"有 evidence"的分支，虽然判定结果相同，但

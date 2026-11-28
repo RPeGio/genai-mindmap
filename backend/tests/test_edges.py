@@ -377,13 +377,30 @@ def _load_baseline_tools():
         return sys.modules[name]
     module_path = BACKEND / f"_{name}.py"
     module_path.write_text(source, encoding="utf-8")
+    # 那个年代的 tools.py 会 `from app.generation.service import MIN_BRANCHES`，
+    # 而这个常量在 2026-11-28 被删掉了（分支数不再设下限，见 generation/service.py
+    # 顶部注释）。删掉它是对的，但把旧模块变得不可载入——基线测试连"逐字节比对
+    # 别的东西"都做不成了。所以这里给**旧模块**把符号借回来：只影响基线自己的
+    # 行为（它拿这个值去判"少于 3 条就失败"，与当年一致），现在的代码不读它；
+    # 用完立刻摘掉，免得这个幻影常量漏进同一进程里的其它测试。
+    import app.generation.service as _service
+
+    assert not hasattr(_service, "MIN_BRANCHES"), \
+        "常量已删；这个垫片只在它不存在时才该生效"
+    _service.MIN_BRANCHES = 3
     try:
         spec = importlib.util.spec_from_file_location(name, module_path)
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
+    except BaseException:
+        # 载入失败时把半初始化的模块摘掉，否则下一个用例会拿到一个缺属性
+        # 的残骸，报出的 AttributeError 与真因（载入失败）隔着两层。
+        sys.modules.pop(name, None)
+        raise
     finally:
+        del _service.MIN_BRANCHES
         module_path.unlink(missing_ok=True)
     return module
 

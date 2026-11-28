@@ -316,11 +316,16 @@ def test_the_public_key_takes_the_free_tier_with_it(monkeypatch):
     monkeypatch.setenv(free_models.ENABLED_ENV, "1")
     base = "https://api.commandcode.ai/provider/v1"
     with free_models._LOCK:
-        free_models._CACHE[base] = (10**9, ["recursive/flint-v1.0:free"])
+        free_models._CACHE[base] = (10**9, [
+            # 免费档候选现在是"每模型一条记录"（档位跟着模型走），不再是一串名字。
+            free_models.FreeModel("recursive/flint-v1.0:free",
+                                  free_models.FALLBACK_EFFORT, 262144),
+        ])
     resolved = store.resolve()
     assert resolved.model == "recursive/flint-v1.0:free"
     assert resolved.model_source == store.SOURCE_FREE
-    assert resolved.reasoning_effort == store.FREE_REASONING_EFFORT
+    assert resolved.reasoning_effort == free_models.FALLBACK_EFFORT
+    assert resolved.free_tier is True
 
 
 def test_the_free_model_list_is_asked_for_with_the_public_key(monkeypatch):

@@ -1041,6 +1041,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   const agentErrorCode = ref('');
   const agentErrorLimit = ref('');
+  /**
+   * 这个失败"还要等多少秒"才可能恢复。现在只有免费档每日桶会带它
+   * （后端 `ErrorEvent.retry_after`，来自上游 `retry-after`，实测约 19 小时）。
+   *
+   * 用 0 表示"没说"，而不是 `null`：它与 `agentErrorLimit` 同一套清空纪律，
+   * 每个清空点都是 `= 0`，卡片那边用 `> 0` 判有没有。
+   */
+  const agentErrorRetryAfter = ref(0);
 
   /**
    * 上一次真正发出去的请求，只给「重试」用（内存态，刷新即失效）。
@@ -1171,6 +1179,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 解释，而用户刚刚明明把结果接住了。
       agentErrorCode.value = '';
       agentErrorLimit.value = '';
+      agentErrorRetryAfter.value = 0;
       // 半棵树被捡回来时也得说清它是半棵树。实时流那条路在 `done` 帧上写了告警，
       // 载入这条路走的是台账接口——不在这里补一笔，同一份内容"刚生成时是半棵、
       // 隔天载入就成了完整交付"，而 `finishStatus` 正是照告警决定状态行怎么写。
@@ -3288,6 +3297,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
         agentError.value = problem;
         agentErrorCode.value = INVALID_SOURCES;
         agentErrorLimit.value = '';
+        agentErrorRetryAfter.value = 0;
         status.value = problem;
         return;
       }
@@ -3302,6 +3312,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       agentError.value = '';
       agentErrorCode.value = '';
       agentErrorLimit.value = '';
+      agentErrorRetryAfter.value = 0;
       agentWarnings.value = [];
       clearAgentPreview();
       status.value = '请在画布右上角的输入框里写下主题或要改什么；「导图标题」那个框只改名字，不会重新生成。';
@@ -3326,6 +3337,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 按上一轮的 code 解释了——而这一轮可能什么都还没发生。
     agentErrorCode.value = '';
     agentErrorLimit.value = '';
+    agentErrorRetryAfter.value = 0;
     // 记住这一次的完整参数，「重试」要原样再发一遍。放在清理之后、发请求之前：
     // 拦在闸门外的请求（没写主题、非树快照）不算"发出去过"，不该变成可重试的对象。
     lastAttempt.value = {
@@ -3582,6 +3594,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
               agentError.value = '模型这次没有产出导图。';
               agentErrorCode.value = NO_CONTENT;
               agentErrorLimit.value = '';
+              agentErrorRetryAfter.value = 0;
               status.value = '模型这次没有产出导图。';
             }
             break;
@@ -3595,6 +3608,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
             agentError.value = event.message;
             agentErrorCode.value = event.code;
             agentErrorLimit.value = event.limit ?? '';
+            agentErrorRetryAfter.value = event.retry_after ?? 0;
             status.value = event.message;
             break;
         }
@@ -3607,6 +3621,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
         agentError.value = '连接中断，结果可能不完整，请重试。';
         agentErrorCode.value = CONNECTION_LOST;
         agentErrorLimit.value = '';
+        agentErrorRetryAfter.value = 0;
         status.value = '连接中断，结果可能不完整，请重试。';
       }
     } catch (error) {
@@ -3617,6 +3632,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // 用它自己的错误码，面板据此给出"改输入"而不是"再来一次"。
       agentErrorCode.value = error instanceof ApiError ? error.code || '' : '';
       agentErrorLimit.value = '';
+      agentErrorRetryAfter.value = 0;
       status.value = message;
     } finally {
       // 取消后立刻重新运行、或换图后新请求已接管时，旧请求的收尾不能清掉新请求的状态。
@@ -3635,9 +3651,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 失败卡片要说的话：把后端那句"发生了什么"翻成"接下来该怎么办"。
    *
-   * 判据在 `mindmap/failures.ts`（纯函数，逐条有用例），这里只负责把手上这三个
-   * 分散的字段（`agentError` / `agentErrorCode` / `agentErrorLimit`）与"能不能
-   * 重试"拼成它的输入。没有失败时返回 null，面板据此整块不渲染。
+   * 判据在 `mindmap/failures.ts`（纯函数，逐条有用例），这里只负责把手上这几个
+   * 分散的字段（`agentError` / `agentErrorCode` / `agentErrorLimit` /
+   * `agentErrorRetryAfter`）与"能不能重试"拼成它的输入。没有失败时返回 null，
+   * 面板据此整块不渲染。
    */
   const failureGuide = computed<FailureGuide | null>(() => {
     if (!agentError.value) return null;
@@ -3645,6 +3662,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
       code: agentErrorCode.value,
       limit: agentErrorLimit.value,
       message: agentError.value,
+      // 0 = 没说（见 `agentErrorRetryAfter` 的注释）：卡片据此决定是写"约 N 小时后"
+      // 还是退回"每天零点"。
+      retry_after: agentErrorRetryAfter.value || null,
       // 有 lastAttempt 才谈得上重试：被闸门拦下的请求（没写主题、快照不是树）
       // 从没发出去过，给「重试」只会让用户点一次、什么都不会发生。
       canRetry: lastAttempt.value !== null,
@@ -4087,6 +4107,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 失败卡片：分类字段 + 翻译好的"下一步"，以及「重试」（原样重发上一次请求）
     agentErrorCode,
     agentErrorLimit,
+    agentErrorRetryAfter,
     failureGuide,
     lastAttempt,
     retryLastRun,
