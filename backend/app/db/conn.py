@@ -185,7 +185,7 @@ class Conn:
             # 没有对应物。另外几处 `PRAGMA table_info` 是查列，M0 之后已改走
             # information_schema，走不到这里。
             if "table_info" in sql.lower():
-                raise RuntimeError(
+                raise NotImplementedError(
                     "PRAGMA table_info 在 PG 上不存在，改查 information_schema.columns")
             return _NoOpCursor()
         if _BEGIN_RE.match(sql):
@@ -240,28 +240,13 @@ class Conn:
     def rollback(self) -> None:
         self._raw.rollback()
 
-    # ------------------------------------------------------------ 兼容属性
+    # ------------------------------------------------------------ 不再模拟的 SQLite 配置
     #
-    # 这两个属性在 SQLite 上是"配置连接"，在 PG 上没有意义。做成可写属性而不是
-    # 让赋值抛 `AttributeError`：`repository.py` / `runs.py` 里那两行赋值还在，
-    # 等它们被删掉之前，先让代码跑得起来。**`row_factory` 的读值是假的**——真正的
-    # 行工厂由 `pool.py` 的 `kwargs={"row_factory": dict_row}` 统一设。
-
-    @property
-    def row_factory(self):
-        return dict
-
-    @row_factory.setter
-    def row_factory(self, value) -> None:  # noqa: ARG002 - 故意忽略
-        return None
-
-    @property
-    def isolation_level(self):
-        return None
-
-    @isolation_level.setter
-    def isolation_level(self, value) -> None:  # noqa: ARG002 - 故意忽略
-        return None
+    # 这里原来有 `row_factory` / `isolation_level` 两个"可写但读值是假的"属性，为了
+    # 让 `repository.py` / `runs.py` 里那两行赋值先跑得起来。那两行已经删了（行工厂
+    # 统一由 `pool.py` 的 `kwargs={"row_factory": dict_row}` 设，事务由 psycopg 隐式
+    # 开、`COMMIT`/`ROLLBACK` 收尾），所以属性也删掉：留着只会让人以为"设了就生效"，
+    # 而现在赋值会直接抛 `AttributeError`，这正是想要的反馈。
 
     # ------------------------------------------------------------ SAVEPOINT
 
@@ -273,12 +258,18 @@ class Conn:
 
     def _savepoint_rollback(self) -> None:
         """回到保存点并清掉它。**清理失败只记日志**：这里正在处理一个真实错误，
-        不能用一个"清理也失败了"把它盖成另一个错。"""
+        不能用一个"清理也失败了"把它盖成另一个错。
+
+        实测过失败之后的样子：连接没断，也不是"事务已 aborted 但没人知道"——这条
+        `ROLLBACK TO` 成功时事务就退回到保存点之前，同一连接上的下一条语句照常执行。
+        只有 `ROLLBACK TO` 自己也失败（连接真的断了）时才会落到这里，那时后面的语句
+        本来也执行不了，交给 `close()` 的 rollback 与池的 reset 收尾。
+        """
         try:
             self._raw.execute(f"ROLLBACK TO SAVEPOINT {_SAVEPOINT}")
             self._raw.execute(f"RELEASE SAVEPOINT {_SAVEPOINT}")
         except psycopg.Error:
-            logger.debug("回滚保存点失败，连接可能已断", exc_info=True)
+            logger.debug("回滚保存点失败（连接可能已断）", exc_info=True)
 
 
 class _NoOpCursor:

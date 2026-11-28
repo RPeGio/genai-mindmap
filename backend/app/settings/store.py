@@ -160,18 +160,22 @@ _DEGRADED_WARNED = False
 #   - 分片生成（`mindmap_generate_deep`，4 支 × 3 点展开 = 25 次工具内调用，加
 #     外层 2 轮）= **27 次**。
 #
-# 每次都要 `repository.connect()`，而那个函数开头有十条 `CREATE TABLE IF NOT
-# EXISTS`——代价不在那条 `SELECT` 上，在这十条 DDL 上。27 次乘以十条 DDL 是每次
-# 大图生成白付的开销，而这份配置在一次生成期间根本不会变。
+# 每次都要 `repository.connect()`，而 SQLite 时代那个函数开头有十条 `CREATE TABLE
+# IF NOT EXISTS`——代价不在那条 `SELECT` 上，在那十条 DDL 上。27 次乘以十条 DDL 是
+# 每次大图生成白付的开销，而这份配置在一次生成期间根本不会变。（迁到 PG 之后那十条
+# DDL 已经从 `repository.connect()` 里拿掉了，建表只在 `init_schema()` 跑一次；这个
+# 缓存仍然留着——它省下的是 27 次池借还 + 27 次真实往返。）
 #
 # **为什么不是纯 TTL**：`save()` 之后必须立刻生效（这是这个功能的整个卖点）。所以
 # 写入侧（`save` / `clear`）会 `_invalidate()`，**同进程内保存 → 下一次读到新值**。
 # TTL（1 秒）只兜住另一种情况：多 worker 部署时另一个进程改了库，本进程看不到那次
-# `_invalidate`。本仓的目标形态是单机单 worker，1 秒是给"以后有人加了 worker"留的
-# 上限，不是给正常路径延迟的。
+# `_invalidate`。本仓的目标形态是单机单 worker（理由见 `docs/DOCKER.md` 的
+# `--workers` 一节：换成 PG 之后不再是写者冲突，而是内存），1 秒是给"以后有人加了
+# worker"留的上限，不是给正常路径延迟的。
 #
-# 键里带 `db_path()`：测试每个用例换一个 `MINDMAP_DB_PATH`，不带路径的缓存会让
-# 前一个用例的行漏到后一个用例里——那种"随机绿"最难查。
+# 键里带库身份（`repository.db_path()`，现在是 DSN 的别名）：同一进程连过两个库时
+# 不能串味。测试用的是一条固定 `MINDMAP_TEST_DSN`，每个用例靠 `conftest.fresh_db`
+# 显式 `_CACHE.clear()` 隔离，不再靠"每条用例换一个库"。
 _CACHE_TTL_SECONDS = 1.0
 _CACHE: dict[str, tuple[float, "Ready"]] = {}
 #: 写入计数器。`save()` / `clear()` 加一，缓存项随之作废。用它而不是清空字典，
@@ -184,15 +188,18 @@ class SettingsError(AppError):
 
 
 def ensure_schema(conn: Connection) -> None:
-    """建表。幂等。
+    """建表并补列。幂等。
 
-    **这个函数现在是空转的**，保留它是因为 `test_auth.py` 直接 import 过几个模块的
-    `ensure_schema`，删掉会连带改测试口径（那是 M4 的范围）。
+    **生产路径上不跑**：`repository.connect()` 不再调用任何模块的 `ensure_schema`，
+    表由 `init_schema()` 一次建到终态。这里保留是因为 `test_auth.py` 直接 import 过
+    几个模块的 `ensure_schema`，删掉会连带改测试口径（那是 M4 的范围）——但它**不是
+    空壳**：`_CREATE` 与 `ensure_columns` 都是完整的建表/补列语句。新代码别照抄，
+    加表加列请改 `app/db/schema.py` 的 `DDL`。
 
     历史：它原来做三件事——把老的单行表迁成"一 owner 一行"、建表、给已存在的表补列。
     前两件的前提（老库是 SQLite、`CREATE TABLE IF NOT EXISTS` 不给已有表补列）在
-    PostgreSQL 上都不成立：建出来的就是终态表，老数据由一次性导入脚本搬进终态形状。
-    第三件换成 PG 的 `ADD COLUMN IF NOT EXISTS`，仍然需要（以后加列时用得上）。
+    PostgreSQL 上都不成立了：建出来的就是终态表，老数据由一次性导入脚本搬进终态形状。
+    第三件换成 PG 的 `ADD COLUMN IF NOT EXISTS`。
 
     `_migrate_legacy` 那段被删掉的是**运行期的就地迁移**，包括它那句最贵的注释：
     SQLite 的 DDL 自动提交而 DML 不自动提交，所以"改名 → 建表 → 搬行 → 删表"这四步
@@ -300,9 +307,10 @@ def _host_of(base_url: str) -> str:
 
 
 def _cache_key(owner: str) -> str:
-    """缓存键：库路径 + 写入计数 + 是谁那一行。
+    """缓存键：库身份 + 写入计数 + 是谁那一行。
 
-    带路径的理由见 `_CACHE` 的注释（测试每个用例换一个库）。带写入计数的理由：
+    带库身份（`repository.db_path()`，现在是 DSN 的别名）的理由见 `_CACHE` 的注释：
+    同一进程连过两个库时不能串味。带写入计数的理由：
     `save()` 之后即使 TTL 还没到也必须作废，所以键里直接含"写过几次"——写一次，
     键就变了，旧项自然不再命中，不需要额外的失效逻辑去和并发读抢。
 
@@ -407,14 +415,17 @@ def saved(owner: str | None = None) -> Ready:
 
 
 def _row_host(row: Row) -> str:
-    """兼容"还没补上 `api_key_host` 列"的库。
+    """读出这一行绑定的主机名，没有这一列就当"没有绑定记录"。
 
-    `_ensure_columns` 会让新库与新连接都带上这一列，但降级路径（`saved()` 读失败
-    返回 `Ready()`）与"读到一半被别的进程改成老结构"这类边角不值得一次 500：
-    缺列就当"没有绑定记录"，走的是与老行相同的"不校验"分支。用 `row.keys()`
-    判而不是 try/except，是为了让 `IndexError` 真的冒出来——那是真 bug。
+    列由 `db.schema.init_schema()` 一次建到终态，正常路径上一定在。走 `.get()` 而不是
+    `row[...]` 是因为降级路径（`saved()` 读失败返回 `Ready()`）与"读到一半被别的进程
+    改结构"这类边角不值得一次 500：缺列时走的是与老行相同的"不校验"分支。
+
+    SQLite 时代这里判的是 `"api_key_host" in row.keys()`——那是给 `sqlite3.Row`
+    抛 `IndexError` 准备的；行现在是 `dict`（`pool.py` 的 `row_factory=dict_row`），
+    那个判断恒真、等于死分支。
     """
-    return (row["api_key_host"] or "") if "api_key_host" in row.keys() else ""
+    return row.get("api_key_host") or ""
 
 
 def _read_strict(owner: str, *, timeout: float | None = None) -> Ready | None:

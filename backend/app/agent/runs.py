@@ -251,10 +251,12 @@ def _record(row: Row) -> RunRecord:
             candidate = None
     request = _loads(row["request"])
     failure = _loads(row["failure"])
-    # `row["partial"]` 只在补过列的新库上有；老库这一行读出来会是 NULL。
-    # `sqlite3.Row` 对不存在的列会抛 `IndexError`，所以取值要按列名列表判一下——
-    # 但 `_ensure_columns` 在每次连接时都跑，正常路径上列一定在。
-    raw_partial = row["partial"] if "partial" in row.keys() else None
+    # 行是 `dict`（`pool.py` 的 `row_factory=dict_row`），列一定在：表由
+    # `db.schema.init_schema()` 一次建到终态。这里用 `.get()` 只是为了让"读到一行
+    # 缺列的老数据"退化成默认值而不是 `KeyError`——SQLite 时代这里判的是
+    # `"partial" in row.keys()`，那是给 `sqlite3.Row` 抛 `IndexError` 准备的，
+    # 在 `dict` 上恒真、等于死分支。
+    raw_partial = row.get("partial")
     return RunRecord(
         run_id=row["run_id"],
         status=row["status"],
@@ -268,10 +270,10 @@ def _record(row: Row) -> RunRecord:
         model=row["model"],
         served_model=row["served_model"],
         reasoning=row["reasoning"],
-        owner=(row["owner"] or "") if "owner" in row.keys() else "",
+        owner=row.get("owner") or "",
         partial=None if raw_partial is None else bool(raw_partial),
-        partial_reason=row["partial_reason"] if "partial_reason" in row.keys() else None,
-        checkpointed_at=row["checkpointed_at"] if "checkpointed_at" in row.keys() else None,
+        partial_reason=row.get("partial_reason"),
+        checkpointed_at=row.get("checkpointed_at"),
     )
 
 

@@ -21,10 +21,13 @@ EXISTS` ×13、`PRAGMA table_info` ×6、`ALTER` 若干）。那在 SQLite 上�
 ## 为什么是一个函数而不是 8 个 `ensure_schema`
 
 原来 8 个模块各有 `ensure_schema(conn)`，全部由 `repository.connect()` 顺次调用。
-现在调用点只剩两处（lifespan 与测试），分散在 8 个模块里只让"到底建了哪些表"更难
-读。表都在这儿列全。各模块的 `ensure_schema` 保留成"一行调 `init_schema`"的薄壳，
-因为它们被测试直接 import 过（`test_auth.py`），删掉会连带改测试口径——那是 M0 之外
-的事。
+现在生产路径上一个都不调了（建表只在 `init_schema()`），分散在 8 个模块里只让"到底
+建了哪些表"更难读。表都在这儿列全。
+
+**各模块的 `ensure_schema` 不是薄壳**：它们是各自完整的建表 DDL（`auth.store` 5 条、
+`knowledge.library` 3 条，其余各 1 条上下），一行 `init_schema()` 都没有。留着它们
+只是因为 `tests/test_auth.py` 直接 import 过一个，删掉会连带改测试口径。**新代码不要
+照着抄**：加表/加列请直接改本文件的 `DDL`，那才是唯一在跑的那份。
 
 ## `end` 是保留字
 
@@ -50,8 +53,8 @@ SCHEMA_VERSION = "2"
 #: 服务器端时间戳函数。**这是整个迁移里最关键的一个替换**。
 #:
 #: 旧代码有 10 个模块写着 `_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"` 并把它
-#: f-string 拼进 SQL。PG 里对应的写法是 `to_char(now() at time zone 'utc', ...)`，
-#: 而那个格式串里全是 `%`——psycopg 在**带参数**的语句上会把 `%` 当占位符解析，
+#: f-string 拼进 SQL。PG 里对应的写法是 `to_char(statement_timestamp() at time zone
+#: 'utc', ...)`，而那个格式串里全是 `%`——psycopg 在**带参数**的语句上会把 `%` 当占位符解析，
 #: 于是 `%Y` 会让整条语句抛 `ProgrammingError: only '%s', '%b', '%t' are allowed
 #: as placeholders, got '%'`。要绕开可以写 `%%Y`，但那就意味着每个 `_NOW` 用在
 #: 带参数的语句里时要手工转义，而用在无参数语句里时又不能转义——同一个常量两种写法。
@@ -62,6 +65,18 @@ SCHEMA_VERSION = "2"
 #: 完全匹配），所以 `TEXT` 时间戳列、以及依赖字典序的字符串比较（`memory/summarize.py`
 #: 的 `formed_at > ?`、`external_cache.py` 的 `searched_at < ?`、`edits.py` 的
 #: 一日窗口）全部原样成立。
+#:
+#: **为什么是 `statement_timestamp()` 而不是 `now()`**：`now()` 就是
+#: `transaction_timestamp()`，它在**一个事务内恒定**，而 SQLite 的 `strftime(...,'now')`
+#: 是**每条语句**重新求值。用 `now()` 的后果实测过：同一事务里隔 0.4 秒写两行，
+#: 时间戳**逐字节相等**。影响最大的是 `library.ingest_many`——一个事务里循环入库多份
+#: 材料，每份的 `created_at`/`last_used_at` 全同，`prune` 的"按新旧淘汰"就此退化成按 id。
+#:
+#: 也不用 `clock_timestamp()`：它**在同一语句的多行之间**也会变（实测同一条
+#: `INSERT ... SELECT FROM generate_series(1,3)` 得到 3 个不同的值），而 SQLite 的
+#: `now` 在一条语句内是常量。`statement_timestamp()` 恰好两头都对：跨语句不等、
+#: 单语句内多行同值（实测 500 行只有 1 个不同值）。回归用例见
+#: `tests/test_schema_migrations.py::test_nowstamp_is_a_statement_clock_not_a_transaction_clock`。
 #:
 #: **性能没有代价**：`INSERT ... VALUES (nowstamp())` p50 3.879ms vs 内联
 #: `to_char(...)` p50 3.938ms —— `STABLE` 的 SQL 函数会被内联，等于白拿。
@@ -78,7 +93,7 @@ LANGUAGE sql
 STABLE
 AS $$
     SELECT to_char(
-        (now() AT TIME ZONE 'utc') + make_interval(secs => offset_seconds),
+        (statement_timestamp() AT TIME ZONE 'utc') + make_interval(secs => offset_seconds),
         'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
     )
 $$
@@ -415,10 +430,13 @@ def _connect() -> Conn:
 # "PRAGMA 查列 → 决定要不要 ALTER → 吞掉 `duplicate column name` 竞态"这一整套，
 # 因为 SQLite 没有 `IF NOT EXISTS`。PG 有，所以这里是三行。
 #
-# **还留着它们**是因为三个模块在 `ensure_schema` 里调过（`settings/store.py`、
-# `memory/store.py`、`prefs/profile.py`）。那些调用在新库上是空操作（`init_schema`
-# 建的就是终态表），但删掉它们要改三个文件——那是 M4/M5 的作用域。留着是**为了让
-# 并行改动不撞车**，不是为了兼容老库：老库那条路已经由一次性导入脚本接管。
+# **生产路径上没有人调它们**：表由 `init_schema()` 一次建到终态，加列时改上面的
+# `DDL` 就行。还在的几个调用点（`settings/store.py`、`memory/store.py`、
+# `prefs/profile.py` 的 `ensure_schema`）本身也不在生产路径上——它们只被
+# `tests/test_auth.py` 直接 import 过，删掉要连带改测试口径。
+#
+# 留着**不是为了兼容老库**（老库那条路由一次性导入脚本接管），而是为了让并行改动
+# 不撞车；但请不要把 `ensure_columns(...)` 当成"加列的常规做法"，它不是。
 
 
 def ensure_columns(conn: Conn, table: str, columns: dict[str, str]) -> None:

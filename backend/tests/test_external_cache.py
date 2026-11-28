@@ -111,8 +111,11 @@ def _age_cache(hours: float) -> None:
 
 
 def _rows() -> int:
-    """表里有几行。**表还不存在时算 0**：这张表是 `external_cache._open()` 懒建的，
-    "从来没写过缓存"的用例里它本来就该不存在。"""
+    """表里有几行。**表还不存在时算 0**。
+
+    表由 `db.schema.init_schema()` 建好（`_open()` 不再懒建），所以正常路径上它一定
+    在；这个 try 只是给"有人直接拿空库跑这个模块"留的余量，与"0 行"同义。
+    """
     try:
         with repository.connect() as conn:
             return int(conn.execute(

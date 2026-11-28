@@ -209,11 +209,12 @@ class NowstampTest(unittest.TestCase):
         self.assertLess(before, now)
 
     def test_two_calls_in_the_same_statement_share_one_timestamp(self):
-        """同一条语句里的 `now()` 是事务开始时刻，所以两个 `nowstamp()` 相等。
+        """同一条语句里的两个 `nowstamp()` 相等——和 SQLite 一样。
 
-        这不是苛求精度，而是 `created_at` / `updated_at` 那种成对写必须一致——
-        不一致时"这一行是什么时候建的"与"什么时候改的"会差几毫秒，而排序键用的
-        正是后者。
+        理由不是"事务开始时刻"（那是 `now()`，见下一条用例），而是
+        `statement_timestamp()` 在**一条语句内**是常量：SQLite 的
+        `strftime(...,'now')` 也是这样。成对写 `created_at` / `updated_at` 时两者
+        必须一致，否则"什么时候建的"与"什么时候改的"会差几毫秒，而排序键用的正是后者。
         """
         conn = _conn()
         try:
@@ -222,6 +223,50 @@ class NowstampTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(str(row["a"]), str(row["b"]))
+
+    def test_nowstamp_is_a_statement_clock_not_a_transaction_clock(self):
+        """同一事务里的两条**语句**必须拿到不同的时间戳。
+
+        这条钉的是 `_NOWSTAMP_SQL` 里那个函数的选择。用 `now()`（=
+        `transaction_timestamp()`）时，一个事务内所有写入的时间戳**逐字节相等**，
+        而 SQLite 的 `strftime(...,'now')` 是每条语句重新求值——`ingest_many` 一个
+        事务里入库多份材料，靠"按新旧淘汰"的 `prune` 就此退化成按 id 排。
+
+        用 `clock_timestamp()` 也不对：它在**同一条语句的多行之间**就会变，而
+        SQLite 的 `now` 在一条语句内是常量（见上一条）。`statement_timestamp()`
+        是唯一两头都对的那个。
+        """
+        conn = _conn()
+        try:
+            first = str(conn.execute("SELECT nowstamp() AS s").fetchone()["s"])
+            conn.execute("SELECT pg_sleep(0.02)")
+            second = str(conn.execute("SELECT nowstamp() AS s").fetchone()["s"])
+        finally:
+            conn.close()
+        self.assertNotEqual(
+            first, second,
+            "nowstamp() 退化成事务时间戳了（见 app/db/schema.py 的 _NOWSTAMP_SQL）")
+
+    def test_every_row_of_one_insert_shares_the_statement_stamp(self):
+        """一条 `INSERT ... SELECT` 写多行时，行与行之间共享同一个时间戳。
+
+        `_ingest_one` 的 `executemany` 与 `sweep_abandoned` 的批量 `UPDATE` 都依赖
+        这一点：同一批操作在语义上是"一次"，不该因为行数多少而产生几十个不同时刻。
+        用 `clock_timestamp()` 会破坏它（行行不同）。
+        """
+        conn = _conn()
+        try:
+            conn.execute("DROP TABLE IF EXISTS _stamp_rows")
+            conn.execute("CREATE TABLE _stamp_rows (n int, at text)")
+            conn.execute(
+                "INSERT INTO _stamp_rows SELECT g, nowstamp() "
+                "FROM generate_series(1, 50) g")
+            row = conn.execute(
+                "SELECT count(DISTINCT at) AS kinds FROM _stamp_rows").fetchone()
+            conn.execute("DROP TABLE _stamp_rows")
+        finally:
+            conn.close()
+        self.assertEqual(int(row["kinds"]), 1)
 
 
 class ClearAllTest(unittest.TestCase):

@@ -94,8 +94,9 @@ logger = logging.getLogger(__name__)
 SOURCES_TABLE = "library_sources"
 CHUNKS_TABLE = "library_chunks"
 
-# 建表语句与 `app/db/schema.py` 里那套是同一套写法、同一时刻执行（见 `ensure_schema`）。
-# 没有迁移脚本：这几条全部幂等，启动期跑一遍就够。
+# 建表语句与 `app/db/schema.py` 里那套形状一致，但**生产路径上只有那边在跑**
+# （`init_schema()` 建到终态）。这里保留是为了"直接拿空库跑脚本 / 测试"也能起来。
+# 新代码不要照着加表：加表请改 `app/db/schema.py` 的 `DDL`。
 #
 # **`"end"` 必须带双引号**：`END` 是 SQL 关键字（`CASE ... END`、`BEGIN ... END` 的
 # 结束标记），PG 的解析器在列位置直接拒绝它——实测 `CREATE TABLE t (start INT, end
@@ -313,9 +314,10 @@ def ingest_many(
     `None`——调用方保留那份材料的临时 id 继续用，不中断生成。
 
     `deadline` 是 `time.monotonic()` 的绝对时刻：入库是生成前的旁路，到点就放弃
-    剩下的。理由见 `docs/AGENT_STREAM_PROTOCOL.md` 的入库说明：SQLite 被并发写锁
-    挡住时一次 `connect` 最久等 10 秒，50 份串行就是几分钟静默，比"少记几份"严重
-    得多。
+    剩下的。理由见 `docs/AGENT_STREAM_PROTOCOL.md` 的入库说明：SQLite 时代被并发
+    写锁挡住时一次 `connect` 最久等 10 秒，50 份串行就是几分钟静默，比"少记几份"
+    严重得多；迁到 PG 之后写锁等待没有了，但一次 `connect` 仍可能等池（默认 10 秒，
+    池满时抛 `PoolTimeout`），而入库依然是串行的一百多次往返——同样的理由成立。
     """
     if not sources:
         return []

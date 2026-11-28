@@ -92,6 +92,9 @@ MAX_ROWS = 5000
 CACHE_ENV = "MINDMAP_EXTERNAL_CACHE"
 _FALSEY = frozenset({"0", "off", "no", "false", "disable", "disabled", "none"})
 
+#: 建表建索引语句。**生产路径不再执行它们**（表由 `db.schema.init_schema()` 建），
+#: 保留是因为测试与一次性脚本会直接拿它们兜"空库上也能跑"。热路径上别调：PG 上每条
+#: `IF NOT EXISTS` 都是真实往返，实测 2.458ms。
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {CACHE_TABLE} (
     query_hash   TEXT PRIMARY KEY,
     query        TEXT NOT NULL,
@@ -137,15 +140,17 @@ def _now() -> datetime:
 
 
 def _open() -> Connection | None:
-    """开连接并确保表存在。任何失败都返回 None：缓存不可用不是错误。"""
+    """开连接。任何失败都返回 None：缓存不可用不是错误。
+
+    **这里不再建表建索引**：`external_cache` 由 `db.schema.init_schema()` 在建库时
+    建好。SQLite 时代重放 DDL 是空转；PG 上每条都是真实往返（实测 2.458ms），而这
+    是检索热路径——每查一次缓存都要走一次。
+    """
     try:
-        conn = repository.connect()
-        conn.execute(_CREATE)
-        conn.execute(_INDEX)
+        return repository.connect()
     except (DatabaseError, OSError) as exc:
         logger.warning("外部检索缓存不可用：%s", type(exc).__name__)
         return None
-    return conn
 
 
 def _parse_stamp(value: str) -> datetime | None:

@@ -49,6 +49,9 @@ MAX_ROWS = 200_000
 #: 瓶颈从来不是批大小。
 _QUERY_BATCH = 400
 
+#: 建表语句。**生产路径不再执行它**（表由 `db.schema.init_schema()` 建），保留是因为
+#: 测试与一次性脚本会直接拿它兜"空库上也能跑"。热路径上别调：PG 上一条
+#: `CREATE TABLE IF NOT EXISTS` 是真实往返，实测 2.458ms。
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {VECTOR_TABLE} (
     text_hash TEXT NOT NULL,
     model     TEXT NOT NULL,
@@ -92,14 +95,17 @@ _unpack = unpack
 
 
 def _open() -> Connection | None:
-    """开连接并确保表存在。任何失败都返回 None：缓存不可用不是错误。"""
+    """开连接。任何失败都返回 None：缓存不可用不是错误。
+
+    **这里不再建表**：`chunk_vectors` 由 `db.schema.init_schema()` 在建库时建好。
+    SQLite 时代重放 `CREATE TABLE IF NOT EXISTS` 是空转；PG 上每条都是真实往返
+    （实测 2.458ms），而这是检索热路径——一次生成要读上百次向量。
+    """
     try:
-        conn = repository.connect()
-        conn.execute(_CREATE)
+        return repository.connect()
     except (DatabaseError, OSError) as exc:
         logger.warning("向量缓存不可用：%s", type(exc).__name__)
         return None
-    return conn
 
 
 def get_vectors(hashes: list[str], model: str) -> dict[str, list[float]]:

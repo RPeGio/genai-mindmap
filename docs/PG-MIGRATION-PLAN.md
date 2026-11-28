@@ -21,7 +21,7 @@
 | D1 | 用 shim 包 psycopg，不逐处改 SQL | 手改 189 处 = 189 个引入 bug 的机会，且 `?`→`%s` 靠人眼在 15 个文件里做不可靠 | 新决策 |
 | D2 | 连接池 `psycopg_pool`，**不是**可选项 | 现有"每次操作新开连接 + 连接内重放 13 张表 DDL"在 PG 上是 2.98ms/次；一次生成仅 settings 读就要 5-27 次 | 与第一轮一致（硬性前置） |
 | D3 | **不引入 alembic / SQLAlchemy** | 两者需要 SQLAlchemy（本项目零 ORM），只为 DDL 版本管理引入 ~30MB 依赖不值得。DDL 全部幂等（`CREATE TABLE IF NOT EXISTS` + `ADD COLUMN IF NOT EXISTS`），一个 `schema_migrations` 表 + 有序步骤列表足够（~150 行） | **推翻第一轮"alembic 是前置条件"**：那条的前提是"DDL 不能每次连接重放"，用一个启动期执行的幂等 schema 初始化就能满足，不需要 alembic |
-| D4 | 时间戳保持 `TEXT`，格式用服务器端 `nowstamp()` 生成 | 实测 `to_char(now() at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')` 与 SQLite `strftime('%Y-%m-%dT%H:%M:%fZ','now')` **逐字节同格式**；且与 `timestamptz` 版插入开销相同（4.147 vs 4.171ms）。保住所有"按字典序比时间"的现有逻辑 | 新决策 |
+| D4 | 时间戳保持 `TEXT`，格式用服务器端 `nowstamp()` 生成 | 实测 `to_char(statement_timestamp() at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')` 与 SQLite `strftime('%Y-%m-%dT%H:%M:%fZ','now')` **逐字节同格式**；且与 `timestamptz` 版插入开销相同（4.147 vs 4.171ms）。保住所有"按字典序比时间"的现有逻辑。**时钟取 `statement_timestamp()` 而不是 `now()`**：后者是事务时间戳、一个事务内恒定，而 SQLite 的 `now` 是每条语句重新求值（实测同事务隔 0.4 秒写两行，`now()` 版时间戳逐字节相等）；也不能用 `clock_timestamp()`，它在同一条语句的多行之间就会变，而 SQLite 的 `now` 在一条语句内是常量 | 评审后修正 |
 | D5 | 用 STABLE SQL 函数 `nowstamp(offset_seconds DEFAULT 0)` 替代 `_NOW` 常量 | psycopg 只在 `params is not None` 时解析 `%`，而 `to_char` 格式串里全是 `%`。做成函数后 **SQL 文本里不含任何 `%`**，彻底绕开 `%%` 逃逸陷阱。实测函数被内联，无额外开销（3.879 vs 3.938ms） | 新决策 |
 | D6 | `edit_events.id` / `library_chunks.id` 用 `bigserial`，**不用 UUID** | `contracts/edits.py:132 id: int` → `openapi.json` → `schema.d.ts` → `types.ts` → `client.ts` 整链不动。用 UUID 要重导契约，多一轮风险 | 新决策（沿用早前判断） |
 | D7 | 向量继续存 `bytea`（原 BLOB），**不上 pgvector** | `vector_cache.py` 是纯 Python 计算，只把表当 KV 存取；引入 pgvector 是另一件事 | 沿用现状 |
@@ -176,6 +176,8 @@ class Conn:
 - **必须在 `execute` 里包 SAVEPOINT**：psycopg 语句出错会让整个事务进 aborted 状态
   （`InFailedSqlTransaction`），而现有代码 10+ 处依赖"吞掉异常继续用同一连接"。
   实测代价：每语句 +0.12-0.17ms，6 语句周期 +1.0ms（+24%）—— 可接受。
+  实测确认：包了 SAVEPOINT 之后 `SELECT 1/0` 失败，同一连接上的下一条语句照常返回
+  （事务**没有**进 aborted 态），从池里再取一条也正常。
 
 **池配置**：`min_size=1, max_size=8, timeout=10, max_idle=300, max_lifetime=3600, open=False`，
 在 lifespan 里 `pool.open()`。`configure` 设 `row_factory`，`reset` 用默认（回滚）。
@@ -183,9 +185,9 @@ class Conn:
 
 **lifespan**：启动 `init_schema()`（它内部经 `get_pool()` 顺带把池打开），shutdown
 `close_pool()`。`init_schema()` 顺序执行幂等 DDL（含 `CREATE OR REPLACE FUNCTION
-nowstamp(...)`），并写 `schema_meta` 行（键 `version`，一个键值表而不是一整张迁移历史
-——本项目没有版本递进，只有"建到终态"，记一版是为了让"这个库是哪天哪一版建的"能直接
-查）。**不再**在每次连接时重放 DDL。
+nowstamp(...)`），并写 `schema_migrations` 行（键 `version`，一个键值表而不是一整张迁移
+历史——本项目没有版本递进，只有"建到终态"，记一版是为了让"这个库是哪天哪一版建的"能
+直接查）。**不再**在每次连接时重放 DDL。
 
 **`db_path()` → `dsn()`**：环境变量 `MINDMAP_PG_DSN` 一条串搞定，缺省
 `postgresql:///mindmaps?host=/var/run/postgresql`（**走 Unix socket，同机部署的默认形态**）。
