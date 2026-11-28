@@ -867,6 +867,9 @@ export interface paths {
          *     **为什么是 200 而不是 4xx**：失败原因分成"地址不通""密钥被拒""模型不存在"
          *     三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成"请求
          *     没发出去"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。
+         *
+         *     走的是 `probe_connection()` 两步探测：第一步免费带回思考档位枚举，第二步
+         *     照旧验证三层。限速在最前面——它防的就是"测试"本身被当烧额度的刀。
          */
         post: operations["test_model_settings_api_settings_model_test_post"];
         delete?: never;
@@ -2609,6 +2612,11 @@ export interface components {
              * @default 0
              */
             latency_ms: number;
+            /**
+             * Effort Options
+             * @default []
+             */
+            effort_options: string[];
         };
         /** Theme */
         Theme: {

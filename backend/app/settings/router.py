@@ -12,12 +12,20 @@
 **配置按人分开存**（第三片）：每个人（登录账号、游客）在 `model_settings` 里
 自己一行，读的时候按"自己那行 → 部署方那行 → 环境变量"回落。部署方那行是全站
 共享配置（游客免费额度用的就是它），只有部署方能改——判定在 `_deployer()`。
+
+**「测试连接」有限速**（2026-11-28 起，与档位探测一起引入）：探测的**第二步**
+是会花真额度的最小请求，而失焦自动触发意味着一次配置可能连测好几次。不设限的话，
+一个脚本可以拿它当"烧额度慢刀"——每次只烧一个 token，但一直烧。按身份（账号或
+游客）+ IP 各记一份，缺省每分钟 10 次，`MINDMAP_SETTINGS_TEST_LIMIT` 可调。
 """
 from __future__ import annotations
 
+import os
+import threading
+import time
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict
 
 from app.auth import identity as identity_module
@@ -27,6 +35,69 @@ from app.settings import probe as probe_module
 from app.settings import store
 
 router = APIRouter(prefix="/settings", tags=["模型设置"])
+
+
+# ---------------------------------------------------------------- 测试限速
+
+#: 缺省 10 次/分钟。探测第二步一次只烧一个 token，10 次 = 每分钟最多一个 token
+#: 出门——正常用户（填表、失焦、偶尔点一次按钮）用不到十分之一。
+TEST_LIMIT_DEFAULT = 10
+TEST_LIMIT_ENV = "MINDMAP_SETTINGS_TEST_LIMIT"
+_TEST_WINDOW = 60.0
+
+#: 键 = (身份, IP)。身份是账号 id 或游客 id，匿名（还没领游客 cookie 的）只有 IP。
+#: 两个维度都记与登录限速（`auth/throttle.py`）同一理由：只按账号限会被撞库式
+#: 换号绕过，只按 IP 限会拖累 NAT 后面的真人。
+_TEST_HITS: dict[tuple[str, str], list[float]] = {}
+_TEST_LOCK = threading.Lock()
+
+
+def _test_limit() -> int:
+    raw = (os.getenv(TEST_LIMIT_ENV) or "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return TEST_LIMIT_DEFAULT
+
+
+def _test_subject(request: Request) -> tuple[str, str]:
+    ident = identity_module.current_identity()
+    who = ident.user.id if ident.user else (ident.guest_id or "")
+    ip = request.client.host if request.client else "unknown"
+    return (who, ip)
+
+
+def _test_allow(subject: tuple[str, str], *, now: float) -> tuple[bool, float]:
+    """(放行, 需要等多久)。滑窗记满即拒，`Retry-After` 按最早那一条算。"""
+    limit = _test_limit()
+    with _TEST_LOCK:
+        hits = _TEST_HITS.get(subject)
+        if hits is None:
+            _TEST_HITS[subject] = [now]
+            _test_shrink(now)
+            return True, 0.0
+        fresh = [stamp for stamp in hits if now - stamp < _TEST_WINDOW]
+        if len(fresh) >= limit:
+            _TEST_HITS[subject] = fresh
+            return False, max(1.0, _TEST_WINDOW - (now - fresh[0]))
+        fresh.append(now)
+        _TEST_HITS[subject] = fresh
+        _test_shrink(now)
+        return True, 0.0
+
+
+def _test_shrink(now: float) -> None:
+    """桶数失控时（每 IP 一个键的脚本洪泛）先把过期条目清掉，还不行就整表清。
+
+    清整表等于给攻击者发新额度——但这个限速的对手模型是"一个人拿脚本烧额度"，
+    不是分布式洪泛；把进程内存耗光反而伤了所有真人。
+    """
+    if len(_TEST_HITS) <= 10_000:
+        return
+    for key, stamps in list(_TEST_HITS.items()):
+        if not stamps or now - stamps[-1] >= _TEST_WINDOW:
+            del _TEST_HITS[key]
+    if len(_TEST_HITS) > 10_000:
+        _TEST_HITS.clear()
 
 
 def _deployer() -> bool:
@@ -293,10 +364,16 @@ class TestModelSettingsResponse(BaseModel):
     model: str
     status: int | None = None
     latency_ms: int = 0
+    #: 探测第一步拿到的思考档位枚举（供应商顺序、已与 `EFFORT_WORDS` 交集）。
+    #: 空 = 没探到，面板不显示下拉、沿用服务商默认——与 `GET` 里
+    #: `reasoning_effort_options` 为空的含义一致，但**这份来自服务商的现场校验**，
+    #: 不是静态目录。
+    effort_options: list[str] = []
 
 
 @router.post("/model/test", response_model=TestModelSettingsResponse)
 async def test_model_settings(
+    request: Request,
     body: TestModelSettingsRequest | None = None,
 ) -> TestModelSettingsResponse:
     """发一次最小 chat 请求，验证地址 / 密钥 / 模型名。
@@ -304,7 +381,17 @@ async def test_model_settings(
     **为什么是 200 而不是 4xx**：失败原因分成"地址不通""密钥被拒""模型不存在"
     三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成"请求
     没发出去"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。
+
+    走的是 `probe_connection()` 两步探测：第一步免费带回思考档位枚举，第二步
+    照旧验证三层。限速在最前面——它防的就是"测试"本身被当烧额度的刀。
     """
+    allowed, retry_after = _test_allow(_test_subject(request), now=time.monotonic())
+    if not allowed:
+        raise store.SettingsError(
+            "settings_test_rate_limited",
+            f"测试连接太频繁了（每分钟 {_test_limit()} 次），约 {int(retry_after)} 秒后再试。",
+            status=429,
+            headers={"Retry-After": str(int(retry_after))})
     overrides = body or TestModelSettingsRequest()
     resolved = store.resolve()
     given_base = (overrides.base_url or "").strip().rstrip("/")
@@ -361,10 +448,14 @@ async def test_model_settings(
     refusal = probe_module._refuse(base_url)
     if refusal is not None:
         raise store.SettingsError("settings_base_url_refused", refusal, status=400)
-    result = await probe_module.probe(base_url, api_key, model)
+    # 两步探测：第一步免费带回思考档位枚举（前端下拉靠它渲染），第二步照旧
+    # 验地址 / 密钥 / 模型名。失败时 `effort_options` 保持空——结论与枚举互不
+    # 拖累：连接不通的结论照样成立，只是没有档位可渲染。
+    result = await probe_module.probe_connection(base_url, api_key, model)
     return TestModelSettingsResponse(
         ok=result.ok, message=result.message, model=result.model,
         status=result.status, latency_ms=result.latency_ms,
+        effort_options=list(result.effort_options),
     )
 
 

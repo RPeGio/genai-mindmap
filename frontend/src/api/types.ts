@@ -1104,6 +1104,12 @@ export interface TestModelSettingsResponse {
   /** 对端 HTTP 状态码；超时/连不上时是 `null`。 */
   status?: number | null;
   latency_ms: number;
+  /**
+   * 探测第一步从供应商校验文案里拿到的思考档位枚举（供应商顺序、已与后端白名单
+   * 交集）。空 = 没探到：端点不认识档位字段、或第一步被短路——下拉不渲染，
+   * 沿用服务商默认。
+   */
+  effort_options: string[];
 }
 
 // ---- 账号与会话（`/api/auth/*`）----

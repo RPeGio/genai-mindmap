@@ -650,6 +650,101 @@ describe('测试连接', () => {
   });
 });
 
+describe('失焦自动探测：档位枚举是问供应商要的，不是我们编的', () => {
+  it('模型名失焦发一次探测，成功后下拉出现且默认挑 low', async () => {
+    const backend = stubBackend({
+      probe: { effort_options: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    // 打开面板、一个字没改时：现场枚举没有、目录快照也是空 → "没有公开档位信息"。
+    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
+
+    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
+    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    await flushPromises();
+
+    expect(backend.tests).toHaveLength(1);
+    const select = wrapper.get('[data-test="settings-effort"]');
+    // 用户拍板的默认：有 low 挑 low，不用点任何东西。
+    expect((select.element as HTMLSelectElement).value).toBe('low');
+    const words = select.findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  it('同一个签名只发一次：再失焦、换个输入框失焦都不重发', async () => {
+    const backend = stubBackend({ probe: { effort_options: ['low'] } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    const model = wrapper.get('[data-test="settings-model"]');
+    await model.setValue('z-ai/glm-5.3-flash');
+    await model.trigger('blur');
+    await flushPromises();
+    // 限速是每分钟 10 次：点进去又点出来这类失焦把额度烧光，手动按钮就没得用了。
+    await model.trigger('blur');
+    await flushPromises();
+    await wrapper.get('[data-test="settings-base-url"]').trigger('blur');
+    await flushPromises();
+
+    expect(backend.tests).toHaveLength(1);
+  });
+
+  it('探测成功但没有 low 时，默认挑最靠前一档', async () => {
+    stubBackend({ probe: { effort_options: ['high', 'max'] } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
+    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    await flushPromises();
+
+    expect((wrapper.get('[data-test="settings-effort"]').element as HTMLSelectElement).value).toBe('high');
+  });
+
+  it('探测失败就不出下拉：失败结论与旧枚举互不拖累', async () => {
+    const backend = stubBackend({
+      probe: { ok: false, message: '密钥被拒绝（HTTP 401）', status: 401, latency_ms: 40, effort_options: [] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
+    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    await flushPromises();
+
+    expect(backend.tests).toHaveLength(1);
+    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
+    expect(text(wrapper, '[data-test="settings-effort-unknown"]')).toContain('没有公开档位信息');
+  });
+
+  it('探测进行中整面板盖着加载态，结束后收走', async () => {
+    stubBackend({ probe: { effort_options: ['low'] } });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    // 失焦是异步动作，但 `testing` 在进入函数第一行就置位——遮罩此刻就该在。
+    expect(has(wrapper, '[data-test="settings-detecting"]')).toBe(true);
+    await flushPromises();
+    expect(has(wrapper, '[data-test="settings-detecting"]')).toBe(false);
+  });
+
+  it('免费档是部署方开的功能：失焦不探测', async () => {
+    const backend = stubBackend({
+      current: { model_source: 'free', model: 'nemotron-3.5-super-vl-free' },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    await flushPromises();
+
+    expect(backend.tests).toHaveLength(0);
+  });
+});
+
 describe('demo 模式必须说出来', () => {
   it('`llm_mode=demo` 时面板顶部有醒目提示：配好了也不会调模型', async () => {
     stubBackend({ current: { llm_mode: 'demo' } });
@@ -725,6 +820,10 @@ describe('关闭', () => {
     const last = focusable[focusable.length - 1];
     const first = focusable[0];
     last.element.focus();
+    // 面板打开时自动聚焦了 base-url，把它挪到 `last` 上会触发一次失焦探测；
+    // 探测期间「测试连接」按钮被 `:disabled` 暂时移出可聚焦列表（探测结束即恢复，
+    // 见 blur 探测那条功能）。等这一次探测落地，列表恢复原状，下面的圈才算数。
+    await flushPromises();
     expect(document.activeElement).toBe(last.element);
 
     await panel.trigger('keydown', { key: 'Tab' });

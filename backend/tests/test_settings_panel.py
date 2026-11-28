@@ -57,12 +57,20 @@ def _reset_module_state():
 
     `_CACHE`：读缓存跨用例存活。键里带了库路径，正常情况下不会串，但"直接写库再
     读"的用例会撞上自己上一次读过的旧值——那种失败读起来像"保存没生效"。
+
+    `router._TEST_HITS`：测试连接的限速桶跨用例存活。每个用例都按同一个
+    （身份， IP）打点，攒够 10 条之后所有普通用例都会莫名吃到 429——那种失败
+    读起来像"端点坏了"，其实是前一个用例攒的账。
     """
+    from app.settings import router as router_module
+
     store._DEGRADED_WARNED = False
     store._CACHE.clear()
+    router_module._TEST_HITS.clear()
     yield
     store._DEGRADED_WARNED = False
     store._CACHE.clear()
+    router_module._TEST_HITS.clear()
 
 
 def _body(**kwargs) -> dict:
@@ -543,12 +551,18 @@ class _FakeResponse:
 
 
 class _FakeClient:
-    """假 httpx 客户端：记录请求，返回预设响应（或抛预设异常）。"""
+    """假 httpx 客户端：记录请求，返回预设响应（或抛预设异常）。
 
-    def __init__(self, *, response=None, exc=None, sent: list | None = None) -> None:
+    `responses` 给两步探测用：按调用次序逐个返回（探测总是两发，两步的结论
+    常常不同），发完之后回落到 `response`。
+    """
+
+    def __init__(self, *, response=None, exc=None, sent: list | None = None,
+                 responses: list | None = None) -> None:
         self.response = response
         self.exc = exc
         self.sent = sent if sent is not None else []
+        self.responses = list(responses) if responses is not None else None
 
     async def __aenter__(self):
         return self
@@ -560,6 +574,10 @@ class _FakeClient:
         self.sent.append({"url": url, "json": json, "headers": headers})
         if self.exc is not None:
             raise self.exc
+        if self.responses is not None:
+            if self.responses:
+                return self.responses.pop(0)
+            return self.response
         return self.response
 
 
@@ -571,8 +589,27 @@ def _use_fake(monkeypatch, **kwargs) -> list:
     return sent
 
 
+def _use_fake_sequence(monkeypatch, *responses) -> list:
+    """两步探测专用：每一步各回一个响应（`_use_fake` 只会永远回同一个）。"""
+    sent: list = []
+    fake = _FakeClient(sent=sent, responses=list(responses))
+    monkeypatch.setattr(probe_module, "_client", lambda: fake)
+    return sent
+
+
+# Command Code（2026-11-28 实测）：档位校验先于模型名校验，拒绝文案原样回传
+# 合法值枚举。测试引用原文，防止将来文案一变测试还绿着。
+COMMAND_CODE_ENUM_SNIPPET = (
+    'Invalid option: expected one of "off"|"low"|"medium"|"high"|"xhigh"|"max"')
+
+
 def test_probe_success_sends_one_tiny_request(monkeypatch):
-    """成功路径：请求体是 `max_tokens=1` 的一次 ping，地址拼在 `/chat/completions`。"""
+    """成功路径：先免费拿枚举、再验三层，地址拼在 `/chat/completions`。
+
+    两步的形状要分开钉住：第一步带档位哨兵（第二步**不带**档位字段——那是
+    `probe()` 的语义，一个 token 就够，不需要档位参数），第二步的请求体就是
+    原来的样子。
+    """
     sent = _use_fake(monkeypatch, response=_FakeResponse(200, {
         "model": "deepseek-chat",
         "choices": [{"message": {"role": "assistant", "content": "p"}}],
@@ -585,11 +622,15 @@ def test_probe_success_sends_one_tiny_request(monkeypatch):
     assert body["model"] == "deepseek-chat"
     assert "连接正常" in body["message"]
     assert sent[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert sent[1]["url"] == "https://api.deepseek.com/v1/chat/completions"
     assert sent[0]["json"]["max_tokens"] == 1
     assert sent[0]["json"]["model"] == "deepseek-chat"
     assert sent[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
     # 打码值只有末 4 位 + 一次 ping：一次测试连接的花费是"一个 token"。
     assert sent[0]["json"]["messages"] == [{"role": "user", "content": "ping"}]
+    # 第一步带哨兵、第二步不带档位字段（`probe()` 的语义没有变）。
+    assert sent[0]["json"]["reasoning_effort"] == probe_module.PROBE_EFFORT_SENTINEL
+    assert "reasoning_effort" not in sent[1]["json"]
 
 
 def test_probe_uses_the_unsaved_form_values(monkeypatch):
@@ -724,6 +765,169 @@ def test_probe_with_incomplete_config_is_a_400():
     response = client.post("/api/settings/model/test", json=_body())
     assert response.status_code == 400
     assert response.json()["code"] == "settings_incomplete"
+
+
+# ---------------------------------------------------------------- 档位探测与限速
+
+def test_the_enum_is_parsed_from_the_validators_rejection(monkeypatch):
+    """第一步的收获：校验器的拒绝文案里带回合法档位枚举（供应商顺序、滤掉 off）。
+
+    `off` 出现在供应商枚举里，但我们的保存校验不认它——列进下拉会出现"选了就
+    存不上"的自相矛盾，所以必须在这里滤掉，而不是到了界面再说。
+    """
+    sent = _use_fake_sequence(
+        monkeypatch,
+        _FakeResponse(400, {"error": {"message": COMMAND_CODE_ENUM_SNIPPET}}),
+        _FakeResponse(200, {"choices": [{"message": {}}]}),
+    )
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
+
+    assert body["ok"] is True
+    assert body["effort_options"] == ["low", "medium", "high", "xhigh", "max"]
+    assert sent[0]["json"]["reasoning_effort"] == probe_module.PROBE_EFFORT_SENTINEL
+
+
+def test_an_enum_word_outside_the_whitelist_is_not_listed(monkeypatch):
+    """枚举解析只认 `EFFORT_WORDS` 里的词：供应商随便说的别的词不进下拉。"""
+    from app.settings import probe
+
+    snippet = 'expected one of "off"|"silly"|"low"|"minimal"|"low"'
+    assert probe._enum_from_snippet(snippet) == ("low", "minimal")
+
+
+def test_a_401_on_step_one_short_circuits_step_two(monkeypatch):
+    """密钥被拒时第二步会被一字不差地再拒一次：只发第一步，省一次真请求。"""
+    sent = _use_fake_sequence(
+        monkeypatch,
+        _FakeResponse(401, {"error": {"message": f"bad key: {SECRET}"}}),
+        _FakeResponse(200, {"choices": [{"message": {}}]}),
+    )
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
+
+    assert body["ok"] is False
+    assert body["status"] == 401
+    assert len(sent) == 1
+    assert body["effort_options"] == []
+
+
+def test_step_one_400_without_an_enum_still_goes_to_step_two(monkeypatch):
+    """有的端点根本不认识档位字段：第一步 400 但没有枚举——结论交给第二步说。"""
+    sent = _use_fake_sequence(
+        monkeypatch,
+        _FakeResponse(400, {"error": {"message": "reasoning_effort is unknown"}}),
+        _FakeResponse(200, {"choices": [{"message": {}}]}),
+    )
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
+
+    assert body["ok"] is True
+    assert body["effort_options"] == []
+    assert len(sent) == 2
+
+
+def test_a_step_one_200_means_the_endpoint_ignored_the_sentinel(monkeypatch):
+    """200 = 哨兵被当空气忽略了，没有枚举可言，但三层照常验。"""
+    sent = _use_fake_sequence(
+        monkeypatch,
+        _FakeResponse(200, {"choices": []}),
+        _FakeResponse(200, {"choices": [{"message": {}}]}),
+    )
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
+
+    assert body["ok"] is True
+    assert body["effort_options"] == []
+    assert len(sent) == 2
+
+
+def test_step_two_is_where_a_bad_model_name_is_caught(monkeypatch):
+    """档位枚举回答不了"模型存不存在"（校验顺序在先）——那是第二步的事。
+
+    实测（2026-11-28）：不存在的模型 + 垃圾档位照样回完整枚举，所以第二步失败
+    时结论以它为准，枚举跟着结论一起作废（响应里不给半套）。
+    """
+    sent = _use_fake_sequence(
+        monkeypatch,
+        _FakeResponse(400, {"error": {"message": COMMAND_CODE_ENUM_SNIPPET}}),
+        _FakeResponse(400, {"error": {
+            "message": 'Model "nope" is not supported on this endpoint.',
+            "param": "model"}}),
+    )
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="nope")).json()
+
+    assert body["ok"] is False
+    assert "模型" in body["message"] or "not supported" in body["message"]
+    assert body["effort_options"] == []
+    assert len(sent) == 2
+
+
+def test_a_timeout_on_step_one_short_circuits_step_two(monkeypatch):
+    """地址不通时第二步只会是同一个结论：短路。"""
+    sent = _use_fake(monkeypatch, exc=httpx.ConnectTimeout("timed out"))
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://slow.example/v1", api_key=SECRET, model="m")).json()
+
+    assert body["ok"] is False
+    assert "超时" in body["message"]
+    assert len(sent) == 1
+
+
+def test_a_404_on_step_one_short_circuits_step_two(monkeypatch):
+    """404 与 5xx 同理：第二步会是同一个结论，复述第一句就够。"""
+    sent = _use_fake(monkeypatch, response=_FakeResponse(
+        404, {"error": {"message": "not found"}}))
+    body = client.post("/api/settings/model/test", json=_body(
+        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="m")).json()
+
+    assert body["ok"] is False
+    assert body["status"] == 404
+    assert len(sent) == 1
+
+
+def test_the_test_endpoint_is_rate_limited_with_retry_after(monkeypatch):
+    """限速防的是"测试"被当烧额度的刀：到量 429，`Retry-After` 写在响应头。
+
+    429 走的是 400 那条错误通道（`SettingsError` 带 `headers`），不是 `ok=false`
+    的结论——它是"这次请求没发出去"，不是"这次测试失败了"。
+    """
+    from app.settings import router as router_module
+
+    monkeypatch.setenv(router_module.TEST_LIMIT_ENV, "2")
+    _use_fake(monkeypatch, response=_FakeResponse(200, {"choices": [{"message": {}}]}))
+    payload = _body(base_url="https://api.deepseek.com/v1", api_key=SECRET,
+                    model="deepseek-chat")
+
+    assert client.post("/api/settings/model/test", json=payload).status_code == 200
+    assert client.post("/api/settings/model/test", json=payload).status_code == 200
+    third = client.post("/api/settings/model/test", json=payload)
+    assert third.status_code == 429
+    assert third.json()["code"] == "settings_test_rate_limited"
+    assert "Retry-After" in third.headers
+
+
+def test_the_rate_limit_buckets_by_identity_then_ip(monkeypatch):
+    """只按 IP 限会拖累 NAT 后面的真人：换了身份就换一个桶。
+
+    这份本地 app 只挂了 settings 路由（没有身份中间件），所以身份维度在
+    `_test_allow` 这一层钉：同 IP 下匿名与游客是两个桶。"cookie → 身份 → 桶"
+    的接线由带完整 app 的测试文件覆盖（`test_gate.py` 等）。
+    """
+    from app.settings import router as router_module
+
+    monkeypatch.setenv(router_module.TEST_LIMIT_ENV, "2")
+    anon = ("", "203.0.113.9")
+    guest = ("guest-1a2b3c", "203.0.113.9")
+
+    assert router_module._test_allow(anon, now=1.0) == (True, 0.0)
+    assert router_module._test_allow(anon, now=2.0) == (True, 0.0)
+    blocked, retry = router_module._test_allow(anon, now=3.0)
+    assert blocked is False and retry > 0
+
+    # 同一个 IP，换一个身份：新桶，立刻可用。
+    assert router_module._test_allow(guest, now=3.5) == (True, 0.0)
 
 
 # ---------------------------------------------------------------- 密钥不出门

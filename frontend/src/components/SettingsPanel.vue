@@ -33,6 +33,11 @@ import {
  *
  * 「测试连接」发的是 `max_tokens=1` 的一次 ping——验地址/密钥/模型名，花费大约一个
  * token。它也可以用**还没保存**的值，所以"填了先测、测通了再存"是通的。
+ *
+ * 模型名 / 服务地址**失焦时自动触发同一次测试**（值变了才发，2026-11-28 起）：
+ * 探测第一步免费带回思考档位枚举，面板趁势把下拉渲染出来、默认挑 low（没有
+ * low 就挑第一档）。不能指望用户每次都记得点「测试连接」——不测就拿不到档位，
+ * 下拉就一直不出现，用户也就永远不知道可以调。探测期间整面板进加载态。
  */
 
 const settingsStore = useSettingsStore();
@@ -51,6 +56,17 @@ const reasoningEffort = ref('');
 /** 打开面板时的快照，用来算"改了哪几个字段"。 */
 const initial = ref({ base_url: '', model: '', deep_model: '', reasoning_effort: '' });
 
+/**
+ * 失焦探测的三个记忆位：
+ *
+ * - `probedEffortOptions`：最近一次**成功**探测带回来的档位枚举（供应商现场给的，
+ *   比打开面板时目录快照里的新鲜）。`null` = 还没探测成功过，下拉回落目录数据。
+ * - `lastProbe`：上次探测的 `地址|密钥|模型` 签名。失焦是很频繁的事件（点一下别处
+ *   也算），不能每次都发——值没变就跳过，限速额度留给真变化。
+ */
+const probedEffortOptions = ref<string[] | null>(null);
+const lastProbe = ref('');
+
 const baseUrlInput = ref<HTMLInputElement | null>(null);
 
 const view = computed(() => settingsStore.settings);
@@ -68,8 +84,15 @@ const guestOnly = computed(() => authStore.kind === 'guest');
 /** 免费档：档位是目录替这个模型选好的，界面只显示，不提供编辑。 */
 const isFreeTier = computed(() => view.value?.model_source === SETTING_SOURCE_FREE);
 
-/** 目录给这个模型声明的档位。空数组 = 目录没说，界面不显示下拉（别自己编）。 */
-const effortOptions = computed(() => view.value?.reasoning_effort_options ?? []);
+/**
+ * 下拉的选项来源有两层：探测成功后的**现场枚举**优先（它就是给眼前这个模型问
+ * 的）；没探测过（或失败）时回落打开面板时目录快照里的 `reasoning_effort_options`。
+ * 两层都空 = 界面不显示下拉（别自己编）。
+ */
+const effortOptions = computed(() => {
+  if (probedEffortOptions.value !== null) return probedEffortOptions.value;
+  return view.value?.reasoning_effort_options ?? [];
+});
 
 /** 下拉里每个档位的人话。`none` 排在最前（目录声明了它就能关思考）。 */
 function effortLabel(word: string): string {
@@ -155,13 +178,64 @@ onMounted(async () => {
   baseUrlInput.value?.focus();
 });
 
-/** 测试连接：**优先用表单里的值**（含还没保存的关键改动），空字段回落生效值。 */
-async function runTest(): Promise<void> {
+/** 测试请求体：**优先用表单里的值**（含还没保存的关键改动），空字段回落生效值。 */
+function testBody(): TestModelSettingsRequest {
   const body: TestModelSettingsRequest = {};
   if (baseUrl.value.trim()) body.base_url = baseUrl.value.trim();
   if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
   if (model.value.trim()) body.model = model.value.trim();
-  await settingsStore.test(body);
+  return body;
+}
+
+/**
+ * 探测完把结果记进两个记忆位，成功再顺一次"默认档位"。
+ *
+ * 失败时清掉上一次的现场枚举：结论是"这个模型/密钥不行"，旧枚举就是替一个
+ * 已经被否掉的配置背书。目录快照回落接管下拉的有无。
+ */
+function rememberProbe(body: TestModelSettingsRequest, result: Awaited<ReturnType<typeof settingsStore.test>>): void {
+  lastProbe.value = [body.base_url ?? '', body.api_key ?? '', body.model ?? ''].join('|');
+  if (result?.ok) {
+    probedEffortOptions.value = result.effort_options ?? [];
+    adoptDefaultEffort();
+  } else {
+    probedEffortOptions.value = null;
+  }
+}
+
+/**
+ * 探测成功后把档位落到一个真实存在的值上（用户拍板的默认：low，没有 low 就
+ * 挑第一档）。已经挑了有效档位的不动——那可能是用户自己选的。
+ */
+function adoptDefaultEffort(): void {
+  const options = effortOptions.value;
+  if (!options.length || guestOnly.value || isFreeTier.value) return;
+  if (reasoningEffort.value && options.includes(reasoningEffort.value)) return;
+  reasoningEffort.value = options.includes('low') ? 'low' : (options[0] ?? '');
+}
+
+/** 手动「测试连接」：空表单也发，让后端把"三项没配齐"说清，而不是静默不动作。 */
+async function runTest(): Promise<void> {
+  const body = testBody();
+  const result = await settingsStore.test(body);
+  rememberProbe(body, result);
+}
+
+/**
+ * 失焦自动探测（模型名、服务地址两个输入框都挂了它）。
+ *
+ * 触发条件按序排除：游客与免费档是只读视图，探测没有意义；正在测试（手动按钮
+ * 或上一次失焦还没回来）不再并发；表单里地址与模型名全空，发也是 400；签名与
+ * 上次相同（点进去又点出来、没改一个字）跳过——限速是每分钟 10 次，浪费不得。
+ */
+async function maybeProbe(): Promise<void> {
+  if (guestOnly.value || isFreeTier.value || settingsStore.testing) return;
+  if (!baseUrl.value.trim() && !model.value.trim()) return;
+  const body = testBody();
+  const signature = [body.base_url ?? '', body.api_key ?? '', body.model ?? ''].join('|');
+  if (signature === lastProbe.value) return;
+  const result = await settingsStore.test(body);
+  rememberProbe(body, result);
 }
 
 async function runSave(): Promise<void> {
@@ -263,10 +337,25 @@ function trapFocus(event: KeyboardEvent): void {
       aria-modal="true"
       aria-label="模型设置"
       data-test="settings-panel"
-      class="max-h-full w-full max-w-lg overflow-auto rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-xl"
+      class="relative max-h-full w-full max-w-lg overflow-auto rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-xl"
       @click.stop
       @keydown="trapFocus"
     >
+      <!--
+        探测加载态：失焦自动触发意味着探测可能在用户没点任何按钮时发生，不盖一层
+        遮罩的话，"下拉怎么自己出现了/没了"会读成界面乱跳。盖住 + 不可编辑 +
+        `aria-busy`，一句话说清在等什么。
+      -->
+      <div
+        v-if="settingsStore.testing"
+        data-test="settings-detecting"
+        aria-busy="true"
+        class="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-white/70"
+      >
+        <span class="rounded-md bg-white/90 px-3 py-1.5 text-xs text-slate-500 shadow">
+          检测模型可用性…
+        </span>
+      </div>
       <header class="mb-3 flex items-start justify-between gap-2">
         <div>
           <h2 class="text-base font-semibold text-slate-900">模型设置</h2>
@@ -353,6 +442,7 @@ function trapFocus(event: KeyboardEvent): void {
             data-test="settings-base-url"
             placeholder="https://api.deepseek.com/v1"
             class="rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
+            @blur="maybeProbe"
           />
           <!-- 这句是给"填了另一家原生 API"的人看的：不做 provider 下拉就意味着用户
                可以填任意地址，而生成侧只会一种协议。不写这一句，非 OpenAI 兼容的
@@ -422,6 +512,7 @@ function trapFocus(event: KeyboardEvent): void {
             data-test="settings-model"
             placeholder="deepseek-chat"
             class="rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
+            @blur="maybeProbe"
           />
         </label>
 
