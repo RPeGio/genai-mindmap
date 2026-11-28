@@ -34,10 +34,10 @@ import {
  * 「测试连接」发的是 `max_tokens=1` 的一次 ping——验地址/密钥/模型名，花费大约一个
  * token。它也可以用**还没保存**的值，所以"填了先测、测通了再存"是通的。
  *
- * 模型名 / 服务地址**失焦时自动触发同一次测试**（值变了才发，2026-11-28 起）：
- * 探测第一步免费带回思考档位枚举，面板趁势把下拉渲染出来、默认挑 low（没有
- * low 就挑第一档）。不能指望用户每次都记得点「测试连接」——不测就拿不到档位，
- * 下拉就一直不出现，用户也就永远不知道可以调。探测期间整面板进加载态。
+ * 思考档位是**用户自己管的那份列表**（默认五档 off/low/medium/high/max 起步），
+ * 不再向供应商探测——垃圾值探测只对 Command Code 有效、换别家直接报错
+ * （2026-11-28 实测，已废弃）。平时是下拉；点「编辑」全部变成输入框，
+ * 改值、清空一格即删，按下面的「保存」退出编辑。
  */
 
 const settingsStore = useSettingsStore();
@@ -57,15 +57,11 @@ const reasoningEffort = ref('');
 const initial = ref({ base_url: '', model: '', deep_model: '', reasoning_effort: '' });
 
 /**
- * 失焦探测的三个记忆位：
- *
- * - `probedEffortOptions`：最近一次**成功**探测带回来的档位枚举（供应商现场给的，
- *   比打开面板时目录快照里的新鲜）。`null` = 还没探测成功过，下拉回落目录数据。
- * - `lastProbe`：上次探测的 `地址|密钥|模型` 签名。失焦是很频繁的事件（点一下别处
- *   也算），不能每次都发——值没变就跳过，限速额度留给真变化。
+ * 档位编辑态：`effortDraft` 是编辑中的列表副本（空格子 = 删除该档位）。
+ * 编辑只改这份副本，按「保存」才整表提交——否则一格手滑就真改了生效配置。
  */
-const probedEffortOptions = ref<string[] | null>(null);
-const lastProbe = ref('');
+const editingEfforts = ref(false);
+const effortDraft = ref<string[]>([]);
 
 /**
  * "按下 + 松开都在遮罩上"才算点遮罩。只看 click 会把从卡片里拖出去的松手当成
@@ -97,14 +93,11 @@ const guestOnly = computed(() => authStore.kind === 'guest');
 const isFreeTier = computed(() => view.value?.model_source === SETTING_SOURCE_FREE);
 
 /**
- * 下拉的选项来源有两层：探测成功后的**现场枚举**优先（它就是给眼前这个模型问
- * 的）；没探测过（或失败）时回落打开面板时目录快照里的 `reasoning_effort_options`。
- * 两层都空 = 界面不显示下拉（别自己编）。
+ * 下拉的选项就是后端 `GET` 给的 `reasoning_effort_options`：非免费档是用户自己
+ * 管的那份（没自定义过 = 内置默认五档），免费档是模型目录（只读）。
+ * 空数组 = 界面不显示下拉（别自己编）。
  */
-const effortOptions = computed(() => {
-  if (probedEffortOptions.value !== null) return probedEffortOptions.value;
-  return view.value?.reasoning_effort_options ?? [];
-});
+const effortOptions = computed(() => view.value?.reasoning_effort_options ?? []);
 
 /** 下拉里每个档位的人话。`none` 排在最前（目录声明了它就能关思考）。 */
 function effortLabel(word: string): string {
@@ -179,10 +172,9 @@ function fillFrom(next: typeof view.value): void {
     deep_model: deepModel.value.trim(),
     reasoning_effort: reasoningEffort.value,
   };
-  // 刚填进来的就是基准状态：点进去又点出来（比如面板打开时自动聚焦地址框，
-  // 用户点了模型框，地址框失焦）不该触发一次"什么都没改"的探测。签名与
-  // `rememberProbe` 记的是同一套：地址|密钥|模型，都取 trim 后的值。
-  lastProbe.value = [baseUrl.value.trim(), apiKey.value.trim(), model.value.trim()].join('|');
+  // 载入的新视图就是编辑基准：编辑态若还开着（保存成功会走到这里），一起收掉，
+  // 免得草稿还指着已被覆盖的旧列表。
+  editingEfforts.value = false;
 }
 
 onMounted(async () => {
@@ -203,57 +195,43 @@ function testBody(): TestModelSettingsRequest {
   return body;
 }
 
-/**
- * 探测完把结果记进两个记忆位，成功再顺一次"默认档位"。
- *
- * 失败时清掉上一次的现场枚举：结论是"这个模型/密钥不行"，旧枚举就是替一个
- * 已经被否掉的配置背书。目录快照回落接管下拉的有无。
- */
-function rememberProbe(body: TestModelSettingsRequest, result: Awaited<ReturnType<typeof settingsStore.test>>): void {
-  lastProbe.value = [body.base_url ?? '', body.api_key ?? '', body.model ?? ''].join('|');
-  if (result?.ok) {
-    probedEffortOptions.value = result.effort_options ?? [];
-    adoptDefaultEffort();
-  } else {
-    probedEffortOptions.value = null;
-  }
-}
-
-/**
- * 探测成功后把档位落到一个真实存在的值上（用户拍板的默认：low，没有 low 就
- * 挑第一档）。已经挑了有效档位的不动——那可能是用户自己选的。
- */
-function adoptDefaultEffort(): void {
-  const options = effortOptions.value;
-  if (!options.length || guestOnly.value || isFreeTier.value) return;
-  if (reasoningEffort.value && options.includes(reasoningEffort.value)) return;
-  reasoningEffort.value = options.includes('low') ? 'low' : (options[0] ?? '');
-}
-
 /** 手动「测试连接」：空表单也发，让后端把"三项没配齐"说清，而不是静默不动作。 */
 async function runTest(): Promise<void> {
-  const body = testBody();
-  const result = await settingsStore.test(body);
-  rememberProbe(body, result);
+  await settingsStore.test(testBody());
 }
 
 /**
- * 失焦自动探测（模型名、服务地址两个输入框都挂了它）。
+ * 进入档位编辑态：把当前生效的列表抄进草稿。列表没自定义过（选项=默认五档）
+ * 也照抄——第一格想改成自己模型的真档位时，改的就是这一格。
  *
- * 触发条件按序排除：游客与免费档是只读视图，探测没有意义；正在测试（手动按钮
- * 或上一次失焦还没回来）不再并发；**模型名为空**（用户正在清掉重填）——探测的
- * 对象就是模型名，此刻回落生效值去测，测到的是一个表单里已经不存在的名字；
- * 签名与上次相同（点进去又点出来、没改一个字，含 `fillFrom` 种下的基准状态）
- * 跳过——限速是每分钟 10 次，浪费不得。
+ * 没有单独的「取消」按钮：误入编辑态的出路是直接按「保存」——什么都不改时
+ * 提交上去的列表与生效值相同，后端判 `changed=false`，什么都不会变。
  */
-async function maybeProbe(): Promise<void> {
-  if (guestOnly.value || isFreeTier.value || settingsStore.testing) return;
-  if (!model.value.trim()) return;
-  const body = testBody();
-  const signature = [body.base_url ?? '', body.api_key ?? '', body.model ?? ''].join('|');
-  if (signature === lastProbe.value) return;
-  const result = await settingsStore.test(body);
-  rememberProbe(body, result);
+function startEditing(): void {
+  effortDraft.value = effortOptions.value.length
+    ? [...effortOptions.value]
+    : ['off', 'low', 'medium', 'high', 'max'];
+  editingEfforts.value = true;
+}
+
+/**
+ * 提交档位列表并退出编辑。
+ *
+ * 后端按"改完之后的列表"校验档位，所以这次提交要带上档位本身：改完的列表里
+ * 已经没有当前选中值时，把选中值落到一个真实存在的档位上（用户拍板的默认：
+ * low，没有 low 就挑第一档，全空就清掉）——不发它，整个 PUT 会被 400 拒掉。
+ */
+async function saveEffortOptions(): Promise<void> {
+  // 空白格 = 删除（后端同样丢弃，但这里要**先**算，选中值才有依据）。
+  const next = effortDraft.value.map((word) => word.trim()).filter(Boolean);
+  const body: SaveModelSettingsRequest = { clear_api_key: false, effort_options: next };
+  if (reasoningEffort.value && !next.includes(reasoningEffort.value)) {
+    body.reasoning_effort = next.includes('low')
+      ? 'low'
+      : (next[0] ?? '');
+  }
+  const saved = await settingsStore.save(body);
+  if (saved) fillFrom(saved);
 }
 
 async function runSave(): Promise<void> {
@@ -366,9 +344,9 @@ function trapFocus(event: KeyboardEvent): void {
       @keydown="trapFocus"
     >
       <!--
-        探测加载态：失焦自动触发意味着探测可能在用户没点任何按钮时发生，不盖一层
-        遮罩的话，"下拉怎么自己出现了/没了"会读成界面乱跳。盖住 + 不可编辑 +
-        `aria-busy`，一句话说清在等什么。
+        测试加载态：点「测试连接」期间盖住整面板——测的就是表单里的值，这期间
+        再改输入只会测到一半新一半旧。盖住 + 不可编辑 + `aria-busy`，
+        一句话说清在等什么。
       -->
       <div
         v-if="settingsStore.testing"
@@ -466,7 +444,6 @@ function trapFocus(event: KeyboardEvent): void {
             data-test="settings-base-url"
             placeholder="https://api.deepseek.com/v1"
             class="rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
-            @blur="maybeProbe"
           />
           <!-- 这句是给"填了另一家原生 API"的人看的：不做 provider 下拉就意味着用户
                可以填任意地址，而生成侧只会一种协议。不写这一句，非 OpenAI 兼容的
@@ -536,7 +513,6 @@ function trapFocus(event: KeyboardEvent): void {
             data-test="settings-model"
             placeholder="deepseek-chat"
             class="rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
-            @blur="maybeProbe"
           />
         </label>
 
@@ -564,8 +540,9 @@ function trapFocus(event: KeyboardEvent): void {
         </label>
 
         <!--
-          思考强度。选项来自**这个模型在目录里的声明**，不是我们自己编的一排——
-          发一个供应商没声明的档位是实测会 400 的形状。
+          思考强度。选项是**用户自己管的那份列表**（默认五档起步），不是问供应商
+          要的——垃圾值探测只对 Command Code 有效，已废弃。平时是下拉；「编辑」
+          把所有档位变成输入框，改值、清空一格即删，按下面的「保存」退出。
         -->
         <label v-if="isFreeTier" class="flex flex-col gap-1">
           <span class="text-xs font-medium text-slate-600">思考强度</span>
@@ -574,9 +551,20 @@ function trapFocus(event: KeyboardEvent): void {
             class="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs text-slate-700"
           >免费模型自动{{ view?.reasoning_effort ? `：${view.reasoning_effort}` : '（沿用服务商默认）' }}</span>
         </label>
-        <label v-else-if="effortOptions.length > 0" class="flex flex-col gap-1">
-          <span class="text-xs font-medium text-slate-600">思考强度（可选）</span>
+        <div v-else class="flex flex-col gap-1">
+          <span class="flex items-baseline justify-between gap-2">
+            <span class="text-xs font-medium text-slate-600">思考强度（可选）</span>
+            <button
+              v-if="!editingEfforts"
+              type="button"
+              data-test="settings-effort-edit"
+              class="text-[11px] text-slate-500 underline decoration-dotted hover:text-slate-700"
+              title="编辑档位列表（改值、清空一格即删）"
+              @click="startEditing"
+            >编辑</button>
+          </span>
           <select
+            v-if="!editingEfforts && effortOptions.length > 0"
             v-model="reasoningEffort"
             data-test="settings-effort"
             class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
@@ -588,17 +576,42 @@ function trapFocus(event: KeyboardEvent): void {
               :value="word"
             >{{ effortLabel(word) }}</option>
           </select>
-          <span class="text-[11px] text-slate-400">
+          <template v-if="editingEfforts">
+            <div class="flex flex-col gap-1">
+              <input
+                v-for="(_, index) in effortDraft"
+                :key="index"
+                v-model="effortDraft[index]"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                data-test="settings-effort-input"
+                placeholder="档位值（原样发给供应商；清空一格 = 删除该档位）"
+                class="rounded-md border border-slate-300 px-2 py-1.5 text-xs text-slate-800 outline-none focus:border-slate-500"
+              />
+            </div>
+            <span class="text-[11px] leading-relaxed text-slate-400">
+              列表就是下拉的选项，也是发给供应商的档位参数值。全清空 = 恢复默认五档。
+            </span>
+            <button
+              type="button"
+              data-test="settings-effort-save"
+              class="self-start rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+              :disabled="settingsStore.saving"
+              @click="saveEffortOptions"
+            >{{ settingsStore.saving ? '保存中…' : '保存' }}</button>
+          </template>
+          <p
+            v-else-if="effortOptions.length === 0"
+            data-test="settings-effort-unknown"
+            class="text-[11px] text-slate-400"
+          >
+            该模型没有公开档位信息，沿用服务商默认。
+          </p>
+          <span v-if="!editingEfforts && effortOptions.length > 0" class="text-[11px] text-slate-400">
             思考越多越慢也越费。生成时实际用的是「当前使用的模型」那一个档位。
           </span>
-        </label>
-        <p
-          v-else
-          data-test="settings-effort-unknown"
-          class="text-[11px] text-slate-400"
-        >
-          该模型没有公开档位信息，沿用服务商默认。
-        </p>
+        </div>
       </div>
       </template>
 

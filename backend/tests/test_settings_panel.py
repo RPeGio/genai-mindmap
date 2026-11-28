@@ -375,45 +375,97 @@ def test_config_error_mentions_both_env_and_the_panel(monkeypatch):
 
 # ---------------------------------------------------------------- 思考强度
 
-def _seed_effort_options(monkeypatch, base: str = "https://api.deepseek.com/v1"):
-    """把目录缓存放成"当前模型有档位"的形状，让 GET 的 `reasoning_effort_options`
-    有东西可报。走 `free_models` 的真缓存路径（开着开关直写缓存）。"""
-    from app.generation import free_models
+def test_the_effort_choice_round_trips_through_the_panel():
+    """面板里挑了档位 → 存进自己那行 → `GET` 与 `resolve()` 都看见它。
 
-    monkeypatch.setenv(store.BASE_URL_ENV, base)
-    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
-    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
-    with free_models._LOCK:
-        free_models._CACHE[base.rstrip("/")] = (
-            10.0 ** 9 + 10.0,
-            [free_models.FreeModel("deepseek-chat", "low", 128000,
-                                   ("none", "low", "high"))],
-        )
-
-
-def test_the_effort_choice_round_trips_through_the_panel(monkeypatch):
-    """面板里挑了档位 → 存进自己那行 → `GET` 与 `resolve()` 都看见它。"""
-    _seed_effort_options(monkeypatch)
+    档位清单是**用户自己管的那份**（默认五档起步），不再问供应商要——垃圾值
+    探测只对 Command Code 有效，已废弃（2026-11-28 实测）。
+    """
     client.put("/api/settings/model", json=_body(reasoning_effort="low"))
     body = client.get("/api/settings/model").json()
     assert body["reasoning_effort"] == "low"
-    assert body["reasoning_effort_options"] == ["none", "low", "high"]
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
     resolved = store.resolve()
     assert resolved.reasoning_effort == "low"
 
 
-def test_an_unknown_effort_word_is_refused_at_save_time(monkeypatch):
-    """非法档位在保存时被 400 拦下，而不是第一次生成时炸出来。"""
-    _seed_effort_options(monkeypatch)
-    response = client.put("/api/settings/model", json=_body(reasoning_effort="off"))
+def test_options_default_to_the_five_builtin_words():
+    """没自定义过 = 默认五档，不是空列表：面板永远有得选。"""
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
+    assert body["reasoning_effort"] is None
+
+
+def test_an_unknown_effort_word_is_refused_at_save_time():
+    """不在档位列表里的值在保存时被 400 拦下，而不是第一次生成时炸出来。
+
+    用 `banana` 而不是 `off`：off 在默认五档里是合法的（"关思考"最常见字面值），
+    当年拿它当非法值是因为校验词表里没有它——词表换成自定义列表后它合法了。
+    """
+    response = client.put("/api/settings/model", json=_body(reasoning_effort="banana"))
     assert response.status_code == 400
     assert response.json()["code"] == "settings_effort_invalid"
     assert store.resolve().reasoning_effort is None
 
 
-def test_clearing_the_effort_sends_no_key_again(monkeypatch):
+def test_custom_options_round_trip_and_gate_the_effort():
+    """编辑态改出来的档位列表整行生效；挑"新档位"必须与列表同一次提交。
+
+    先算列表再校验档位（`save()` 的顺序）就是为这个场景：否则"加一个新档位并
+    选中它"会被旧列表拒掉，用户永远改不出第一步。
+    """
+    response = client.put("/api/settings/model", json=_body(
+        reasoning_effort="slow", effort_options=["slow", "medium"]))
+    assert response.status_code == 200
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["slow", "medium"]
+    assert store.resolve().reasoning_effort == "slow"
+
+    # 列表里没有的档位照样拒：门是这张表，不是全局词表。
+    refused = client.put("/api/settings/model", json=_body(reasoning_effort="high"))
+    assert refused.status_code == 400
+    assert refused.json()["code"] == "settings_effort_invalid"
+
+
+def test_removing_the_current_effort_from_the_list_is_refused():
+    """把正在选中的档位从列表里删掉 = 两个动作打架：整单拒绝，不许半套。"""
+    client.put("/api/settings/model", json=_body(reasoning_effort="low"))
+    response = client.put("/api/settings/model", json=_body(effort_options=["fast"]))
+    assert response.status_code == 400
+    assert response.json()["code"] == "settings_effort_invalid"
+    # 列表和档位都留在原值：不接受"列表改了、档位悬空"的中间态。
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
+    assert store.resolve().reasoning_effort == "low"
+
+
+def test_empty_options_list_restores_the_defaults():
+    """全清空 = 恢复默认五档，不是"从此没有档位"。"""
+    client.put("/api/settings/model", json=_body(
+        reasoning_effort="low", effort_options=["low"]))
+    assert client.get("/api/settings/model").json()["reasoning_effort_options"] == ["low"]
+
+    client.put("/api/settings/model", json=_body(reasoning_effort="low", effort_options=[]))
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["off", "low", "medium", "high", "max"]
+    assert body["reasoning_effort"] == "low"
+
+
+def test_options_input_is_normalized_not_refused():
+    """空白项丢弃（编辑态的"清空即删"）、重复去重保序；超长的整单 400。"""
+    client.put("/api/settings/model", json=_body(
+        effort_options=["low", "  ", "low", "medium"]))
+    body = client.get("/api/settings/model").json()
+    assert body["reasoning_effort_options"] == ["low", "medium"]
+
+    long_one = "x" * (store.MAX_EFFORT_CHARS + 1)
+    refused = client.put("/api/settings/model", json=_body(effort_options=[long_one]))
+    assert refused.status_code == 400
+    assert refused.json()["code"] == "settings_effort_invalid"
+
+
+def test_clearing_the_effort_sends_no_key_again():
     """空串 = 清掉，回到"不发这个键"。`None`（键都不带）= 不改。"""
-    _seed_effort_options(monkeypatch)
     client.put("/api/settings/model", json=_body(reasoning_effort="low"))
     assert store.resolve().reasoning_effort == "low"
 
@@ -426,19 +478,10 @@ def test_clearing_the_effort_sends_no_key_again(monkeypatch):
 
 
 def test_the_effort_follows_whichever_row_supplies_the_model(monkeypatch):
-    """档位跟着"模型名来自哪一行"走：部署方那行挑的档位，借用者也能看见。"""
-    from app.generation import free_models
-
+    """档位跟着"这次用谁的配置"走：部署方那行挑的档位，借用者也能看见。"""
     base = "https://api.deepseek.com/v1"
     monkeypatch.setenv(store.BASE_URL_ENV, base)
     monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
-    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
-    with free_models._LOCK:
-        free_models._CACHE[base.rstrip("/")] = (
-            10.0 ** 9 + 10.0,
-            [free_models.FreeModel("deepseek-chat", "low", 128000,
-                                   ("none", "low", "high"))],
-        )
     store.save(base_url=base, model="deepseek-chat",
                reasoning_effort="high", scope="instance")
 
@@ -447,17 +490,25 @@ def test_the_effort_follows_whichever_row_supplies_the_model(monkeypatch):
     assert body["reasoning_effort"] == "high"
 
 
-def test_options_come_from_the_directory_not_from_us(monkeypatch):
-    """`reasoning_effort_options` 是目录给的，目录没说的档位不会出现在下拉里。"""
+def test_free_tier_options_still_come_from_the_directory(monkeypatch):
+    """免费档是唯一还走目录的地方：游客只读，档位清单是供应商说的。"""
     from app.generation import free_models
 
     base = "https://api.deepseek.com/v1"
     monkeypatch.setenv(store.BASE_URL_ENV, base)
     monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
-    # 开关没开、缓存是空的：目录没给档位信息，面板不该显示下拉。
+    monkeypatch.setenv(store.API_KEY_ENV, "env-key-0000")
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+    with free_models._LOCK:
+        free_models._CACHE[base.rstrip("/")] = (
+            10.0 ** 9 + 10.0,
+            [free_models.FreeModel("deepseek-chat", "low", 128000,
+                                   ("none", "low", "high"))],
+        )
+
     body = client.get("/api/settings/model").json()
-    assert body["reasoning_effort_options"] == []
-    assert body["reasoning_effort"] is None
+    assert body["model_source"] == "free"
+    assert body["reasoning_effort_options"] == ["none", "low", "high"]
 
 
 # ---------------------------------------------------------------- 深度思考那一档
@@ -551,18 +602,12 @@ class _FakeResponse:
 
 
 class _FakeClient:
-    """假 httpx 客户端：记录请求，返回预设响应（或抛预设异常）。
+    """假 httpx 客户端：记录请求，返回预设响应（或抛预设异常）。"""
 
-    `responses` 给两步探测用：按调用次序逐个返回（探测总是两发，两步的结论
-    常常不同），发完之后回落到 `response`。
-    """
-
-    def __init__(self, *, response=None, exc=None, sent: list | None = None,
-                 responses: list | None = None) -> None:
+    def __init__(self, *, response=None, exc=None, sent: list | None = None) -> None:
         self.response = response
         self.exc = exc
         self.sent = sent if sent is not None else []
-        self.responses = list(responses) if responses is not None else None
 
     async def __aenter__(self):
         return self
@@ -574,10 +619,6 @@ class _FakeClient:
         self.sent.append({"url": url, "json": json, "headers": headers})
         if self.exc is not None:
             raise self.exc
-        if self.responses is not None:
-            if self.responses:
-                return self.responses.pop(0)
-            return self.response
         return self.response
 
 
@@ -589,26 +630,11 @@ def _use_fake(monkeypatch, **kwargs) -> list:
     return sent
 
 
-def _use_fake_sequence(monkeypatch, *responses) -> list:
-    """两步探测专用：每一步各回一个响应（`_use_fake` 只会永远回同一个）。"""
-    sent: list = []
-    fake = _FakeClient(sent=sent, responses=list(responses))
-    monkeypatch.setattr(probe_module, "_client", lambda: fake)
-    return sent
-
-
-# Command Code（2026-11-28 实测）：档位校验先于模型名校验，拒绝文案原样回传
-# 合法值枚举。测试引用原文，防止将来文案一变测试还绿着。
-COMMAND_CODE_ENUM_SNIPPET = (
-    'Invalid option: expected one of "off"|"low"|"medium"|"high"|"xhigh"|"max"')
-
-
 def test_probe_success_sends_one_tiny_request(monkeypatch):
-    """成功路径：先免费拿枚举、再验三层，地址拼在 `/chat/completions`。
+    """成功路径：一次最小请求验三层，地址拼在 `/chat/completions`。
 
-    两步的形状要分开钉住：第一步带档位哨兵（第二步**不带**档位字段——那是
-    `probe()` 的语义，一个 token 就够，不需要档位参数），第二步的请求体就是
-    原来的样子。
+    档位枚举不从这里来——垃圾值探测只对 Command Code 有效，已整体废弃；请求体
+    不带档位字段，`probe()` 探的只有地址、密钥、模型名。
     """
     sent = _use_fake(monkeypatch, response=_FakeResponse(200, {
         "model": "deepseek-chat",
@@ -621,16 +647,13 @@ def test_probe_success_sends_one_tiny_request(monkeypatch):
     assert body["ok"] is True
     assert body["model"] == "deepseek-chat"
     assert "连接正常" in body["message"]
+    assert len(sent) == 1
     assert sent[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
-    assert sent[1]["url"] == "https://api.deepseek.com/v1/chat/completions"
     assert sent[0]["json"]["max_tokens"] == 1
     assert sent[0]["json"]["model"] == "deepseek-chat"
     assert sent[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
     # 打码值只有末 4 位 + 一次 ping：一次测试连接的花费是"一个 token"。
     assert sent[0]["json"]["messages"] == [{"role": "user", "content": "ping"}]
-    # 第一步带哨兵、第二步不带档位字段（`probe()` 的语义没有变）。
-    assert sent[0]["json"]["reasoning_effort"] == probe_module.PROBE_EFFORT_SENTINEL
-    assert "reasoning_effort" not in sent[1]["json"]
 
 
 def test_probe_uses_the_unsaved_form_values(monkeypatch):
@@ -767,124 +790,8 @@ def test_probe_with_incomplete_config_is_a_400():
     assert response.json()["code"] == "settings_incomplete"
 
 
-# ---------------------------------------------------------------- 档位探测与限速
+# ---------------------------------------------------------------- 测试连接的限速
 
-def test_the_enum_is_parsed_from_the_validators_rejection(monkeypatch):
-    """第一步的收获：校验器的拒绝文案里带回合法档位枚举（供应商顺序、滤掉 off）。
-
-    `off` 出现在供应商枚举里，但我们的保存校验不认它——列进下拉会出现"选了就
-    存不上"的自相矛盾，所以必须在这里滤掉，而不是到了界面再说。
-    """
-    sent = _use_fake_sequence(
-        monkeypatch,
-        _FakeResponse(400, {"error": {"message": COMMAND_CODE_ENUM_SNIPPET}}),
-        _FakeResponse(200, {"choices": [{"message": {}}]}),
-    )
-    body = client.post("/api/settings/model/test", json=_body(
-        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
-
-    assert body["ok"] is True
-    assert body["effort_options"] == ["low", "medium", "high", "xhigh", "max"]
-    assert sent[0]["json"]["reasoning_effort"] == probe_module.PROBE_EFFORT_SENTINEL
-
-
-def test_an_enum_word_outside_the_whitelist_is_not_listed(monkeypatch):
-    """枚举解析只认 `EFFORT_WORDS` 里的词：供应商随便说的别的词不进下拉。"""
-    from app.settings import probe
-
-    snippet = 'expected one of "off"|"silly"|"low"|"minimal"|"low"'
-    assert probe._enum_from_snippet(snippet) == ("low", "minimal")
-
-
-def test_a_401_on_step_one_short_circuits_step_two(monkeypatch):
-    """密钥被拒时第二步会被一字不差地再拒一次：只发第一步，省一次真请求。"""
-    sent = _use_fake_sequence(
-        monkeypatch,
-        _FakeResponse(401, {"error": {"message": f"bad key: {SECRET}"}}),
-        _FakeResponse(200, {"choices": [{"message": {}}]}),
-    )
-    body = client.post("/api/settings/model/test", json=_body(
-        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
-
-    assert body["ok"] is False
-    assert body["status"] == 401
-    assert len(sent) == 1
-    assert body["effort_options"] == []
-
-
-def test_step_one_400_without_an_enum_still_goes_to_step_two(monkeypatch):
-    """有的端点根本不认识档位字段：第一步 400 但没有枚举——结论交给第二步说。"""
-    sent = _use_fake_sequence(
-        monkeypatch,
-        _FakeResponse(400, {"error": {"message": "reasoning_effort is unknown"}}),
-        _FakeResponse(200, {"choices": [{"message": {}}]}),
-    )
-    body = client.post("/api/settings/model/test", json=_body(
-        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
-
-    assert body["ok"] is True
-    assert body["effort_options"] == []
-    assert len(sent) == 2
-
-
-def test_a_step_one_200_means_the_endpoint_ignored_the_sentinel(monkeypatch):
-    """200 = 哨兵被当空气忽略了，没有枚举可言，但三层照常验。"""
-    sent = _use_fake_sequence(
-        monkeypatch,
-        _FakeResponse(200, {"choices": []}),
-        _FakeResponse(200, {"choices": [{"message": {}}]}),
-    )
-    body = client.post("/api/settings/model/test", json=_body(
-        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="deepseek-chat")).json()
-
-    assert body["ok"] is True
-    assert body["effort_options"] == []
-    assert len(sent) == 2
-
-
-def test_step_two_is_where_a_bad_model_name_is_caught(monkeypatch):
-    """档位枚举回答不了"模型存不存在"（校验顺序在先）——那是第二步的事。
-
-    实测（2026-11-28）：不存在的模型 + 垃圾档位照样回完整枚举，所以第二步失败
-    时结论以它为准，枚举跟着结论一起作废（响应里不给半套）。
-    """
-    sent = _use_fake_sequence(
-        monkeypatch,
-        _FakeResponse(400, {"error": {"message": COMMAND_CODE_ENUM_SNIPPET}}),
-        _FakeResponse(400, {"error": {
-            "message": 'Model "nope" is not supported on this endpoint.',
-            "param": "model"}}),
-    )
-    body = client.post("/api/settings/model/test", json=_body(
-        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="nope")).json()
-
-    assert body["ok"] is False
-    assert "模型" in body["message"] or "not supported" in body["message"]
-    assert body["effort_options"] == []
-    assert len(sent) == 2
-
-
-def test_a_timeout_on_step_one_short_circuits_step_two(monkeypatch):
-    """地址不通时第二步只会是同一个结论：短路。"""
-    sent = _use_fake(monkeypatch, exc=httpx.ConnectTimeout("timed out"))
-    body = client.post("/api/settings/model/test", json=_body(
-        base_url="https://slow.example/v1", api_key=SECRET, model="m")).json()
-
-    assert body["ok"] is False
-    assert "超时" in body["message"]
-    assert len(sent) == 1
-
-
-def test_a_404_on_step_one_short_circuits_step_two(monkeypatch):
-    """404 与 5xx 同理：第二步会是同一个结论，复述第一句就够。"""
-    sent = _use_fake(monkeypatch, response=_FakeResponse(
-        404, {"error": {"message": "not found"}}))
-    body = client.post("/api/settings/model/test", json=_body(
-        base_url="https://api.deepseek.com/v1", api_key=SECRET, model="m")).json()
-
-    assert body["ok"] is False
-    assert body["status"] == 404
-    assert len(sent) == 1
 
 
 def test_the_test_endpoint_is_rate_limited_with_retry_after(monkeypatch):

@@ -996,10 +996,9 @@ export interface ModelSettings {
    */
   reasoning_effort?: string | null;
   /**
-   * 这一个模型在目录里声明的全部档位（目录顺序）。
-   *
-   * 空数组 = 目录没给档位信息：面板据此**不显示**"思考强度"下拉，而不是自己
-   * 编一排档位——发一个目录没声明的档位是实测会 400 的形状。
+   * 档位下拉的选项。**用户自己管的那份**：存过自定义列表就用它，否则是内置默认
+   * 五档（`off/low/medium/high/max`）——面板永远有得选，不再问供应商要。
+   * 例外是免费档（`model_source === 'free'`）：那时它来自模型目录，且**只读**。
    */
   reasoning_effort_options: string[];
   /** 地址 / 密钥 / 模型名三项齐了没有。判据与后端 `_config()` 一致。 */
@@ -1056,9 +1055,16 @@ export interface SaveModelSettingsRequest {
   deep_model?: string | null;
   /**
    * 思考档位。`null` = 不改；`""` = 清掉（请求里不发这个键，走服务商默认）；
-   * 其余值必须是下拉选项之一——目录没声明的档位后端会 400 `settings_effort_invalid`。
+   * 其余值必须在自己那行的档位列表里——不在列表里的值后端 400
+   * `settings_effort_invalid`。
    */
   reasoning_effort?: string | null;
+  /**
+   * 思考档位列表本身（编辑态「保存」提交的就是它）。`null` = 不改；给了就**整表
+   * 替换**（去重保序、空白项丢弃、"清空即删"；全清空 = 恢复内置默认五档）。
+   * 与 `reasoning_effort` 同一次提交时，档位按**改完之后的列表**校验。
+   */
+  effort_options?: string[] | null;
   /** 显式清除已保存的密钥。与同时提交 `api_key` 冲突（400 `settings_clear_conflict`）。 */
   clear_api_key: boolean;
   /**
@@ -1104,12 +1110,6 @@ export interface TestModelSettingsResponse {
   /** 对端 HTTP 状态码；超时/连不上时是 `null`。 */
   status?: number | null;
   latency_ms: number;
-  /**
-   * 探测第一步从供应商校验文案里拿到的思考档位枚举（供应商顺序、已与后端白名单
-   * 交集）。空 = 没探到：端点不认识档位字段、或第一步被短路——下拉不渲染，
-   * 沿用服务商默认。
-   */
-  effort_options: string[];
 }
 
 // ---- 账号与会话（`/api/auth/*`）----

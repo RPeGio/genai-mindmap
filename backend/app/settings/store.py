@@ -119,6 +119,17 @@ SOURCE_PUBLIC = "public"
 MAX_URL_CHARS = 200
 MAX_MODEL_CHARS = 200
 MAX_KEY_CHARS = 500
+#: 档位词与档位条数的上限。一个档位就是一个会原样发给供应商的 API 参数值，
+#: 16 个字符放得下 `none`/`medium`/`xhigh` 这类词；16 条放得下任何一家供应商的
+#: 全集。超限更可能是没清干净的草稿而不是真需求。
+MAX_EFFORT_CHARS = 16
+MAX_EFFORT_ITEMS = 16
+
+#: 用户自定义档位列表的**默认集**。哪一行都没存过 `effort_options` 时下拉就是这
+#: 五个：`off` 是"关思考"在兼容端点里最常见的字面值（DeepSeek/Command Code 都
+#: 用它），`none` 反而不是——所以默认集给 `off` 而不给 `none`。用户随时可以在
+#: 编辑态里把任何一档改成自己模型的真档位；改过之后这份默认集就再不参与。
+DEFAULT_EFFORT_OPTIONS = ("off", "low", "medium", "high", "max")
 
 #: 生成侧与 probe 拼请求时一律用 `base + "/chat/completions"`，所以库里存的必须是
 #: **前缀**。用户粘完整端点时由 `_check_base_url` 剥掉这一段。
@@ -141,7 +152,8 @@ _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
     deep_model       TEXT NOT NULL DEFAULT '',
     updated_at       TEXT,
     api_key_host     TEXT NOT NULL DEFAULT '',
-    reasoning_effort TEXT NOT NULL DEFAULT ''
+    reasoning_effort TEXT NOT NULL DEFAULT '',
+    effort_options   TEXT NOT NULL DEFAULT ''
 )"""
 
 #: 降级只告警一次。库坏了（文件被删、权限变了、盘满）时每一次模型调用都会走到
@@ -218,6 +230,10 @@ def ensure_schema(conn: Connection) -> None:
         # 这个人给自己那把模型挑的思考档位。老库补列时全部是空串 = "没挑过，
         # 请求里不发这个键"——与"加这个字段之前"的行为逐字节相同。
         "reasoning_effort": "TEXT NOT NULL DEFAULT ''",
+        # 这个人自己管的思考档位列表（JSON 数组字符串）。空串 = 没自定义，下拉用
+        # `DEFAULT_EFFORT_OPTIONS`；解析失败也当没自定义（坏 JSON 不值得让面板
+        # 整个空一栏，那是"库写坏了"的形态，得靠修数据而不是靠 500）。
+        "effort_options": "TEXT NOT NULL DEFAULT ''",
     })
 
 
@@ -234,8 +250,13 @@ class Ready:
     #: 它是"密钥不出门"那条防线的锚点：地址一变，锚点对不上就不交密钥。
     api_key_host: str = ""
     #: 这个人给自己那把模型挑的思考档位。空串 = 没挑过（请求里不发这个键，
-    #: 走服务商默认）。值域是 `free_models.EFFORT_WORDS`，写入时校验。
+    #: 走服务商默认）。值域是这一行的 `effort_options`（没自定义则是
+    #: `DEFAULT_EFFORT_OPTIONS`），写入时按它校验。
     reasoning_effort: str = ""
+    #: 这个人自己管的档位列表。**空元组 = 没自定义**（下拉用 `DEFAULT_EFFORT_OPTIONS`）。
+    #: 刻意用元组而不是 `None`：`Ready` 是比较/缓存的对象，"没自定义"与"自定义了
+    #: 空列表"在语义上是同一件事（空列表保存即恢复默认，见 `save()`）。
+    effort_options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -413,7 +434,7 @@ def saved(owner: str | None = None) -> Ready:
         with closing(_connect()) as conn:
             row = conn.execute(
                 f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host, "
-                f"reasoning_effort "
+                f"reasoning_effort, effort_options "
                 f"FROM {TABLE} WHERE owner = ?", (owner,)).fetchone()
     except DatabaseError as exc:
         if not _DEGRADED_WARNED:
@@ -430,6 +451,7 @@ def saved(owner: str | None = None) -> Ready:
         updated_at=row["updated_at"],
         api_key_host=_row_host(row),
         reasoning_effort=row["reasoning_effort"] or "",
+        effort_options=_row_options(row),
     )
     _CACHE[key] = (time.monotonic(), ready)
     return ready
@@ -449,6 +471,30 @@ def _row_host(row: Row) -> str:
     return row.get("api_key_host") or ""
 
 
+def _row_options(row: sqlite3.Row) -> tuple[str, ...]:
+    """兼容"还没补上 `effort_options` 列"的库，理由与 `_row_host` 相同。
+
+    列在、值是空串 = 没自定义（返回空元组，调用方回落 `DEFAULT_EFFORT_OPTIONS`）；
+    值是坏 JSON 也当没自定义——那是"库被写坏了"的形态，面板不该因此整栏空白，
+    更不该 500。宽松解析的代价是"写坏了看不出来"，但这一栏只喂下拉选项，
+    坏了的后果是"回到默认五档"，可接受。
+    """
+    if "effort_options" not in row.keys():
+        return ()
+    raw = (row["effort_options"] or "").strip()
+    if not raw:
+        return ()
+    import json
+
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(word for word in parsed if isinstance(word, str))
+
+
 def _read_strict(owner: str, *, timeout: float | None = None) -> Ready | None:
     """像 `saved(owner)` 一样读那一行，但**读失败时抛、不降级**。只有写路径用。
 
@@ -466,7 +512,7 @@ def _read_strict(owner: str, *, timeout: float | None = None) -> Ready | None:
     with closing(_connect(timeout=timeout)) as conn:
         row = conn.execute(
             f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host, "
-            f"reasoning_effort "
+            f"reasoning_effort, effort_options "
             f"FROM {TABLE} WHERE owner = ?", (owner,)).fetchone()
     if row is None:
         return None
@@ -478,6 +524,7 @@ def _read_strict(owner: str, *, timeout: float | None = None) -> Ready | None:
         updated_at=row["updated_at"],
         api_key_host=_row_host(row),
         reasoning_effort=row["reasoning_effort"] or "",
+        effort_options=_row_options(row),
     )
 
 
@@ -871,15 +918,43 @@ def _read_strict_for_save(owner: str) -> Ready:
     return Ready() if row is None else row
 
 
-def _effort_words() -> tuple[str, ...]:
-    """思考档位的合法值域。
+def _options_json(options: tuple[str, ...]) -> str:
+    """档位列表 → 库里那格字符串。空元组存空串（= 没自定义，读侧回落默认集）。"""
+    import json
 
-    函数内运行时 import，与 `_free_model` 同一个理由：`free_models` 在读配置时
-    会调回本模块（`free_tier_endpoint()`），顶层互相 import 有环的风险。
+    return json.dumps(list(options), ensure_ascii=False) if options else ""
+
+
+def _normalize_effort_options(values: list[str]) -> tuple[str, ...]:
+    """把编辑态提交的一把档位值收成**去重保序**的元组，越界当场 400。
+
+    判据逐条说清：
+
+    - **空白项直接丢**（"清空即删"的语义就落在这里）：界面上输入框清空的意思是
+      "这个档位不要了"，不是"存一个空档位"——空档位发出去会在供应商那边 400。
+    - 单条超长 / 条数超限都要 400：一个档位就是一次会原样发出去的 API 参数值，
+      超长的更可能是没清干净的草稿；条数超限是编辑态丢了起点之后的失控。
+    - **去重保序**：同一档位出现两次，下拉里就会有两行长得一样但语义只有一个，
+      第二次选中谁也不记得——保序是为了让用户自己排的顺序（low 在前、off 在后）
+      原样出现在下拉里。
     """
-    from app.generation import free_models
-
-    return free_models.EFFORT_WORDS
+    seen: list[str] = []
+    for value in values:
+        word = _norm_text(value)
+        if not word:
+            continue
+        if len(word) > MAX_EFFORT_CHARS:
+            raise SettingsError(
+                "settings_effort_invalid",
+                f"档位「{word}」最多 {MAX_EFFORT_CHARS} 个字符。",
+                status=400)
+        if word not in seen:
+            seen.append(word)
+    if len(seen) > MAX_EFFORT_ITEMS:
+        raise SettingsError(
+            "settings_effort_invalid",
+            f"档位最多 {MAX_EFFORT_ITEMS} 个。", status=400)
+    return tuple(seen)
 
 
 def save(
@@ -889,6 +964,7 @@ def save(
     model: str | None = None,
     deep_model: str | None = None,
     reasoning_effort: str | None = None,
+    effort_options: list[str] | None = None,
     clear_api_key: bool = False,
     scope: str = "user",
 ) -> tuple[Resolved, bool]:
@@ -909,9 +985,18 @@ def save(
         回滚、临时排查）。
 
     `reasoning_effort` 的语义与上面三个一致（`None` = 不改，`""` = 清掉、请求里
-    不发这个键），但合法值域收得紧：必须是 `free_models.EFFORT_WORDS` 里的一个。
-    发一个供应商不认识的档位是实测会 400 的形状，让它在保存时就被拦下，比在
-    第一次生成时才炸出来要好——那时用户只会看到"生成失败"。
+    不发这个键），但合法值域收得紧：必须是**这一行自己的档位列表**（`effort_options`；
+    没自定义则是 `DEFAULT_EFFORT_OPTIONS`）里的一个。发一个供应商不认识的档位是
+    实测会 400 的形状，让它在保存时就被拦下，比在第一次生成时才炸出来要好——
+    那时用户只会看到"生成失败"。列表本身是用户自定义的：默认五档
+    (`off/low/medium/high/max`) 只是起点，用户可以把自己的真档位（比如
+    `"thinking=off"`）填进列表里再挑它。
+
+    `effort_options` 是档位列表本身：`None` = 不改；给了就**整表替换**
+    （`_normalize_effort_options` 去重保序、清空项丢弃、越界 400；全清空 = 恢复
+    内置默认）。**先算它、再校验 `reasoning_effort`**——这次提交如果同时改了
+    列表与档位，档位必须按**改完之后的列表**校验，否则"加一个新档位并选中它"
+    这个最自然的动作会被旧列表拒掉。
 
     `changed=False` 时**不刷 `updated_at`**：同值重复保存把时间戳刷成"刚刚"，
     界面上就会出现一条看起来刚改过、其实一直没变的记录——与 `user_prefs.set`
@@ -961,17 +1046,23 @@ def save(
                   else _check_text(model, label="模型名", limit=MAX_MODEL_CHARS))
     next_deep = (current.deep_model if deep_model is None
                  else _check_text(deep_model, label="深度思考模型名", limit=MAX_MODEL_CHARS))
+    # 先定档位列表，再按它校验档位——见 docstring 里"先算它、再校验"那段。
+    next_options = (current.effort_options if effort_options is None
+                    else _normalize_effort_options(effort_options))
+    allowed_efforts = next_options or DEFAULT_EFFORT_OPTIONS
     if reasoning_effort is None:
         next_effort = current.reasoning_effort
     else:
-        effort = _norm_text(reasoning_effort)
-        if effort and effort not in _effort_words():
-            raise SettingsError(
-                "settings_effort_invalid",
-                "这个思考强度不认识；请从下拉的选项里挑一个，"
-                "或留空表示沿用服务商默认。",
-                status=400)
-        next_effort = effort
+        next_effort = _norm_text(reasoning_effort)
+    # 校验对**两种来源**都生效：这次提交的档位，和没提交、跟着留存的旧档位。
+    # 只查前者会漏掉"把正在选中的档位从列表里删掉"——列表改了、档位悬空，
+    # 之后每次 resolve() 都拿到一个不在列表里的值，界面上它从下拉里消失。
+    if next_effort and next_effort not in allowed_efforts:
+        raise SettingsError(
+            "settings_effort_invalid",
+            "这个思考强度不在档位列表里；把列表改成包含它，"
+            "或从下拉的选项里挑一个。",
+            status=400)
 
     # 密钥的锚点。三种情形，对应三件不同的事，与上面 `next_key` 那三段一一对应：
     #
@@ -999,17 +1090,19 @@ def save(
     else:
         next_host = old_host
 
-    changed = (next_base, next_key, next_model, next_deep, next_effort, next_host) != (
+    changed = (next_base, next_key, next_model, next_deep, next_effort,
+               _options_json(next_options), next_host) != (
         current.base_url, current.api_key, current.model, current.deep_model,
-        current.reasoning_effort, _norm_text(current.api_key_host).lower())
+        current.reasoning_effort, _options_json(current.effort_options),
+        _norm_text(current.api_key_host).lower())
     if changed:
         try:
             with closing(_connect(timeout=SETTINGS_LOCK_TIMEOUT)) as conn, conn:
                 conn.execute(
                     f"""INSERT INTO {TABLE}
                             (owner, base_url, api_key, model, deep_model, updated_at,
-                             api_key_host, reasoning_effort)
-                        VALUES (?, ?, ?, ?, ?, {_NOW}, ?, ?)
+                             api_key_host, reasoning_effort, effort_options)
+                        VALUES (?, ?, ?, ?, ?, {_NOW}, ?, ?, ?)
                         ON CONFLICT(owner) DO UPDATE SET
                             base_url         = excluded.base_url,
                             api_key          = excluded.api_key,
@@ -1017,9 +1110,10 @@ def save(
                             deep_model       = excluded.deep_model,
                             updated_at       = excluded.updated_at,
                             api_key_host     = excluded.api_key_host,
-                            reasoning_effort = excluded.reasoning_effort""",
+                            reasoning_effort = excluded.reasoning_effort,
+                            effort_options   = excluded.effort_options""",
                     (owner, next_base, next_key, next_model, next_deep, next_host,
-                     next_effort),
+                     next_effort, _options_json(next_options)),
                 )
         except DatabaseError as exc:
             # 与 `_read_strict_for_save` 同一条规矩：写不进去也要给出能读的 code。
@@ -1056,6 +1150,7 @@ def clear(owner: str | None = None) -> int:
 __all__ = [
     "API_KEY_ENV",
     "BASE_URL_ENV",
+    "DEFAULT_EFFORT_OPTIONS",
     "DEEP_MODEL_ENV",
     "INSTANCE_OWNER",
     "LLM_MODE_ENV",

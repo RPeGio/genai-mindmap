@@ -13,10 +13,10 @@
 自己一行，读的时候按"自己那行 → 部署方那行 → 环境变量"回落。部署方那行是全站
 共享配置（游客免费额度用的就是它），只有部署方能改——判定在 `_deployer()`。
 
-**「测试连接」有限速**（2026-11-28 起，与档位探测一起引入）：探测的**第二步**
-是会花真额度的最小请求，而失焦自动触发意味着一次配置可能连测好几次。不设限的话，
-一个脚本可以拿它当"烧额度慢刀"——每次只烧一个 token，但一直烧。按身份（账号或
-游客）+ IP 各记一份，缺省每分钟 10 次，`MINDMAP_SETTINGS_TEST_LIMIT` 可调。
+**「测试连接」有限速**（2026-11-28 起）：每点一次都是一次打到供应商的真请求
+（`max_tokens=1`）。不设限的话，一个脚本可以拿它当"烧额度慢刀"——每次只烧一个
+token，但一直烧。按身份（账号或游客）+ IP 各记一份，缺省每分钟 10 次，
+`MINDMAP_SETTINGS_TEST_LIMIT` 可调。
 """
 from __future__ import annotations
 
@@ -168,8 +168,10 @@ class ModelSettings(BaseModel):
     #: 这次生成会发出去的思考档位；`null` = 不发这个键（走服务商默认）。
     #: 免费档时它来自目录（每模型各自），用户自己挑的走自己那行。
     reasoning_effort: str | None = None
-    #: 这一个模型在目录里声明的全部档位（目录顺序）。空 = 目录没给档位信息，
-    #: 面板据此不显示"思考强度"下拉——发一个目录没声明的档位会 400。
+    #: 思考强度的全部可选档位。**用户自己管的那份**：自己那行存过
+    #: `effort_options` 就用它（编辑态里改过任何一档就是这份），没存过就是内置
+    #: 默认五档（`off/low/medium/high/max`）。免费档例外——那份模型不是用户配的，
+    #: 档位仍来自目录、面板只读。
     reasoning_effort_options: list[str] = []
     #: 三项（地址 / 密钥 / 模型名）齐了没有。判据与 `_config()` 一致。
     configured: bool
@@ -231,17 +233,21 @@ def _view(resolved: store.Resolved, *, updated_at: str | None) -> ModelSettings:
 
 
 def _effort_options(resolved: store.Resolved) -> tuple[str, ...]:
-    """面板"思考强度"下拉的选项：**这一个模型**在目录里声明的档位。
+    """面板"思考强度"下拉的选项：**用户自己管的那份列表**。
 
-    函数内 import 与 `store._effort_words` 同一个理由（`free_models` 会调回
-    settings 一侧，顶层互相 import 有环的风险）。目录没给档位信息（Command Code
-    的形状，或列表还没拉到）时返回空——面板不显示下拉，用户存不了目录没声明的值。
+    免费档例外：那份模型不是用户配的（游客只读，改不了），档位仍来自目录——
+    目录没给档位信息时返回空，面板显示"免费模型自动"。其余一切来源都走
+    自己那行存的 `effort_options`，没存过就是 `DEFAULT_EFFORT_OPTIONS` 五档。
+    函数内 import 与 store 侧同一个理由（`free_models` 会调回 settings，
+    顶层互相 import 有环的风险）。
     """
     from app.generation import free_models
 
-    if not resolved.model:
-        return ()
-    return free_models.options_for(resolved.base_url, resolved.model)
+    if resolved.free_tier:
+        if not resolved.model:
+            return ()
+        return free_models.options_for(resolved.base_url, resolved.model)
+    return store.saved().effort_options or store.DEFAULT_EFFORT_OPTIONS
 
 
 def _configured(resolved: store.Resolved) -> bool:
@@ -281,8 +287,12 @@ class SaveModelSettingsRequest(BaseModel):
     model: str | None = None
     deep_model: str | None = None
     #: 思考档位。`None` = 不改；`""` = 清掉（请求里不发这个键，走服务商默认）；
-    #: 其余值必须在 `free_models.EFFORT_WORDS` 里（`settings_effort_invalid` 400）。
+    #: 其余值必须在这一行的档位列表里（`effort_options`，没自定义则是内置默认
+    #: 五档；`settings_effort_invalid` 400）。
     reasoning_effort: str | None = None
+    #: 档位列表本身。`None` = 不改；给了就整表替换（去重保序、空白项丢弃、
+    #: 单条 ≤16 字符、≤16 条；全清空 = 恢复内置默认五档）。
+    effort_options: list[str] | None = None
     #: 显式清除已经保存的密钥。与同时给 `api_key` 冲突（400）。
     clear_api_key: bool = False
     #: 写到哪一行。`user` 缺省，`instance` 仅部署方可用。别的值 422。
@@ -328,6 +338,7 @@ def save_model_settings(body: SaveModelSettingsRequest) -> SaveModelSettingsResp
         model=body.model,
         deep_model=body.deep_model,
         reasoning_effort=body.reasoning_effort,
+        effort_options=body.effort_options,
         clear_api_key=body.clear_api_key,
         scope=body.scope,
     )
@@ -364,11 +375,6 @@ class TestModelSettingsResponse(BaseModel):
     model: str
     status: int | None = None
     latency_ms: int = 0
-    #: 探测第一步拿到的思考档位枚举（供应商顺序、已与 `EFFORT_WORDS` 交集）。
-    #: 空 = 没探到，面板不显示下拉、沿用服务商默认——与 `GET` 里
-    #: `reasoning_effort_options` 为空的含义一致，但**这份来自服务商的现场校验**，
-    #: 不是静态目录。
-    effort_options: list[str] = []
 
 
 @router.post("/model/test", response_model=TestModelSettingsResponse)
@@ -382,8 +388,12 @@ async def test_model_settings(
     三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成"请求
     没发出去"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。
 
-    走的是 `probe_connection()` 两步探测：第一步免费带回思考档位枚举，第二步
-    照旧验证三层。限速在最前面——它防的就是"测试"本身被当烧额度的刀。
+    走的是单步 `probe()`：一个 `max_tokens=1` 的最小请求，同时验地址 / 密钥 /
+    模型名三层。限速在最前面——它防的就是"测试"本身被当烧额度的刀（每次测试
+    都是一次打到供应商的真请求）。思考档位的枚举**不从这里来**：下拉选项是
+    用户自己管的那份列表（`GET` 里的 `reasoning_effort_options`），垃圾值探测
+    拿枚举的做法只对 Command Code 一家有效，别家直接 4xx（2026-11-28 实测），
+    已废弃。
     """
     allowed, retry_after = _test_allow(_test_subject(request), now=time.monotonic())
     if not allowed:
@@ -448,14 +458,11 @@ async def test_model_settings(
     refusal = probe_module._refuse(base_url)
     if refusal is not None:
         raise store.SettingsError("settings_base_url_refused", refusal, status=400)
-    # 两步探测：第一步免费带回思考档位枚举（前端下拉靠它渲染），第二步照旧
-    # 验地址 / 密钥 / 模型名。失败时 `effort_options` 保持空——结论与枚举互不
-    # 拖累：连接不通的结论照样成立，只是没有档位可渲染。
-    result = await probe_module.probe_connection(base_url, api_key, model)
+    # 单步探测：一次最小请求验三层。档位枚举不从这里来（见 docstring）。
+    result = await probe_module.probe(base_url, api_key, model)
     return TestModelSettingsResponse(
         ok=result.ok, message=result.message, model=result.model,
         status=result.status, latency_ms=result.latency_ms,
-        effort_options=list(result.effort_options),
     )
 
 

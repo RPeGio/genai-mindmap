@@ -648,130 +648,115 @@ describe('测试连接', () => {
     expect(text(wrapper, '[data-test="settings-error"]')).toContain('三项');
     expect(wrapper.html()).not.toContain(SECRET);
   });
-});
 
-describe('失焦自动探测：档位枚举是问供应商要的，不是我们编的', () => {
-  it('模型名失焦发一次探测，成功后下拉出现且默认挑 low', async () => {
-    const backend = stubBackend({
-      probe: { effort_options: ['low', 'medium', 'high', 'xhigh', 'max'] },
-    });
+  it('测试进行中整面板盖着加载态，结束后收走', async () => {
+    stubBackend({ probe: { message: '连接正常（320 毫秒）' } });
     const wrapper = mountApp();
     await openPanel(wrapper);
 
-    // 打开面板、一个字没改时：现场枚举没有、目录快照也是空 → "没有公开档位信息"。
-    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
-
-    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
-    await wrapper.get('[data-test="settings-model"]').trigger('blur');
-    await flushPromises();
-
-    expect(backend.tests).toHaveLength(1);
-    const select = wrapper.get('[data-test="settings-effort"]');
-    // 用户拍板的默认：有 low 挑 low，不用点任何东西。
-    expect((select.element as HTMLSelectElement).value).toBe('low');
-    const words = select.findAll('option').map(option => option.element.value);
-    expect(words).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
-  });
-
-  it('同一个签名只发一次：再失焦、换个输入框失焦都不重发', async () => {
-    const backend = stubBackend({ probe: { effort_options: ['low'] } });
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    const model = wrapper.get('[data-test="settings-model"]');
-    await model.setValue('z-ai/glm-5.3-flash');
-    await model.trigger('blur');
-    await flushPromises();
-    // 限速是每分钟 10 次：点进去又点出来这类失焦把额度烧光，手动按钮就没得用了。
-    await model.trigger('blur');
-    await flushPromises();
-    await wrapper.get('[data-test="settings-base-url"]').trigger('blur');
-    await flushPromises();
-
-    expect(backend.tests).toHaveLength(1);
-  });
-
-  it('探测成功但没有 low 时，默认挑最靠前一档', async () => {
-    stubBackend({ probe: { effort_options: ['high', 'max'] } });
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
-    await wrapper.get('[data-test="settings-model"]').trigger('blur');
-    await flushPromises();
-
-    expect((wrapper.get('[data-test="settings-effort"]').element as HTMLSelectElement).value).toBe('high');
-  });
-
-  it('探测失败就不出下拉：失败结论与旧枚举互不拖累', async () => {
-    const backend = stubBackend({
-      probe: { ok: false, message: '密钥被拒绝（HTTP 401）', status: 401, latency_ms: 40, effort_options: [] },
-    });
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
-    await wrapper.get('[data-test="settings-model"]').trigger('blur');
-    await flushPromises();
-
-    expect(backend.tests).toHaveLength(1);
-    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
-    expect(text(wrapper, '[data-test="settings-effort-unknown"]')).toContain('没有公开档位信息');
-  });
-
-  it('打开面板点进模型框不改一个字，不探测：地址框失焦也不算改了配置', async () => {
-    const backend = stubBackend();
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    // 打开面板时自动聚焦的是地址框；点模型框 = 地址框失焦。刚打开的表单是
-    // 基准状态（`fillFrom` 种下的签名），失焦不该替它发明一次请求。
-    await wrapper.get('[data-test="settings-base-url"]').trigger('blur');
-    await wrapper.get('[data-test="settings-model"]').trigger('blur');
-    await flushPromises();
-
-    expect(backend.tests).toHaveLength(0);
-  });
-
-  it('模型名清空后失焦不探测：回落生效值测出来的是表单里没有的名字', async () => {
-    const backend = stubBackend();
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    // 用户正在清掉重填。此刻探测会拿"生效值"里的旧模型名去测——那个名字
-    // 表单里已经没有了，结论只会误导。
-    await wrapper.get('[data-test="settings-model"]').setValue('');
-    await wrapper.get('[data-test="settings-model"]').trigger('blur');
-    await flushPromises();
-
-    expect(backend.tests).toHaveLength(0);
-  });
-
-  it('探测进行中整面板盖着加载态，结束后收走', async () => {
-    stubBackend({ probe: { effort_options: ['low'] } });
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    // 基准状态不触发探测：先真的改一下模型名。
-    await wrapper.get('[data-test="settings-model"]').setValue('z-ai/glm-5.3-flash');
-    await wrapper.get('[data-test="settings-model"]').trigger('blur');
-    // 失焦是异步动作，但 `testing` 在进入函数第一行就置位——遮罩此刻就该在。
+    await wrapper.get('[data-test="settings-test"]').trigger('click');
+    // 测的就是表单里的值：这期间再改输入只会测到一半新一半旧，遮罩挡住它。
     expect(has(wrapper, '[data-test="settings-detecting"]')).toBe(true);
     await flushPromises();
     expect(has(wrapper, '[data-test="settings-detecting"]')).toBe(false);
   });
+});
 
-  it('免费档是部署方开的功能：失焦不探测', async () => {
+describe('思考强度：档位是用户自己管的那份列表', () => {
+  it('下拉选项就是 GET 给的那份列表：挑一档会进保存请求', async () => {
     const backend = stubBackend({
-      current: { model_source: 'free', model: 'nemotron-3.5-super-vl-free' },
+      current: { reasoning_effort_options: ['off', 'low', 'medium', 'high', 'max'] },
     });
     const wrapper = mountApp();
     await openPanel(wrapper);
 
-    await wrapper.get('[data-test="settings-model"]').trigger('blur');
+    const select = wrapper.get('[data-test="settings-effort"]');
+    const words = select.findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'off', 'low', 'medium', 'high', 'max']);
+    expect(text(wrapper, '[data-test="settings-effort-default"]')).toContain('沿用服务商默认');
+
+    await select.setValue('low');
+    await wrapper.get('[data-test="settings-save"]').trigger('click');
     await flushPromises();
 
-    expect(backend.tests).toHaveLength(0);
+    expect(backend.puts[0].body).toMatchObject({ reasoning_effort: 'low' });
+  });
+
+  it('点「编辑」：下拉变成输入框，草稿抄的是当前生效的列表', async () => {
+    stubBackend({
+      current: { reasoning_effort: 'medium', reasoning_effort_options: ['low', 'medium'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    expect(has(wrapper, '[data-test="settings-effort-edit"]')).toBe(true);
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+
+    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
+    const inputs = wrapper.findAll('[data-test="settings-effort-input"]');
+    expect(inputs.map(input => (input.element as HTMLInputElement).value)).toEqual(['low', 'medium']);
+  });
+
+  it('改一格、清空一格：保存发整表 effort_options，退出编辑回到下拉', async () => {
+    const backend = stubBackend({
+      current: { reasoning_effort_options: ['off', 'low', 'medium', 'high', 'max'] },
+      saved: { reasoning_effort_options: ['slow', 'low', 'medium', 'high'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+    const inputs = wrapper.findAll('[data-test="settings-effort-input"]');
+    await inputs[0].setValue('slow');
+    await inputs[4].setValue('');
+    await wrapper.get('[data-test="settings-effort-save"]').trigger('click');
+    await flushPromises();
+
+    // 清空一格 = 删除：提交的是改完之后的整表，不是补丁。
+    expect(backend.puts[0].body).toMatchObject({ effort_options: ['slow', 'low', 'medium', 'high'] });
+    expect(has(wrapper, '[data-test="settings-effort-input"]')).toBe(false);
+    // 保存响应里的列表就是下一次的下拉选项。
+    const words = wrapper.get('[data-test="settings-effort"]').findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'slow', 'low', 'medium', 'high']);
+  });
+
+  it('选中的档位被删掉时，保存请求同时把它换到还存在的档位上', async () => {
+    const backend = stubBackend({
+      current: { reasoning_effort: 'high', reasoning_effort_options: ['low', 'medium', 'high'] },
+      saved: { reasoning_effort: 'low', reasoning_effort_options: ['low', 'medium'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+    // 把 high（当前选中）清掉。
+    await wrapper.findAll('[data-test="settings-effort-input"]')[2].setValue('');
+    await wrapper.get('[data-test="settings-effort-save"]').trigger('click');
+    await flushPromises();
+
+    // 不带 reasoning_effort 的话，后端按新列表校验会整个 400。
+    expect(backend.puts[0].body).toMatchObject({
+      effort_options: ['low', 'medium'],
+      reasoning_effort: 'low',
+    });
+  });
+
+  it('全清空 = 恢复默认五档：发空数组，下拉回到默认选项', async () => {
+    const backend = stubBackend({
+      current: { reasoning_effort_options: ['slow'] },
+      saved: { reasoning_effort_options: ['off', 'low', 'medium', 'high', 'max'] },
+    });
+    const wrapper = mountApp();
+    await openPanel(wrapper);
+
+    await wrapper.get('[data-test="settings-effort-edit"]').trigger('click');
+    await wrapper.get('[data-test="settings-effort-input"]').setValue('');
+    await wrapper.get('[data-test="settings-effort-save"]').trigger('click');
+    await flushPromises();
+
+    expect(backend.puts[0].body).toMatchObject({ effort_options: [] });
+    const words = wrapper.get('[data-test="settings-effort"]').findAll('option').map(option => option.element.value);
+    expect(words).toEqual(['', 'off', 'low', 'medium', 'high', 'max']);
   });
 });
 
@@ -947,42 +932,7 @@ describe('store 与纯函数', () => {
   });
 });
 
-describe('思考强度：档位是模型目录给的，不是我们自己编的', () => {
-  it('目录给了档位就有下拉，选项原样来自目录；挑一档会进保存请求', async () => {
-    const backend = stubBackend({ current: { reasoning_effort_options: ['none', 'low', 'high'] } });
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    const select = wrapper.get('[data-test="settings-effort"]');
-    const words = select.findAll('option').map(option => option.element.value);
-    expect(words).toEqual(['', 'none', 'low', 'high']);
-    expect(text(wrapper, '[data-test="settings-effort-default"]')).toContain('沿用服务商默认');
-
-    await select.setValue('low');
-    await wrapper.get('[data-test="settings-save"]').trigger('click');
-    await flushPromises();
-
-    expect(backend.puts[0].body).toMatchObject({ reasoning_effort: 'low' });
-  });
-
-  it('目录没给档位就不显示下拉，说"沿用服务商默认"', async () => {
-    stubBackend({ current: { reasoning_effort_options: [] } });
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
-    expect(text(wrapper, '[data-test="settings-effort-unknown"]')).toContain('没有公开档位信息');
-  });
-
-  it('免费档：档位是只读的，不提供编辑', async () => {
-    stubBackend({ current: { model_source: 'free', model: 'nemotron-3.5-super-vl-free', reasoning_effort: 'none' } });
-    const wrapper = mountApp();
-    await openPanel(wrapper);
-
-    expect(has(wrapper, '[data-test="settings-effort"]')).toBe(false);
-    expect(text(wrapper, '[data-test="settings-effort-free"]')).toContain('none');
-  });
-
+describe('游客是只读视图', () => {
   it('游客是只读视图：看得见在用哪个模型，看不见四个输入框', async () => {
     stubBackend({
       auth: { guest_id: 'g-123' },

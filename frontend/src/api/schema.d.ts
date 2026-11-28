@@ -868,8 +868,12 @@ export interface paths {
          *     三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成"请求
          *     没发出去"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。
          *
-         *     走的是 `probe_connection()` 两步探测：第一步免费带回思考档位枚举，第二步
-         *     照旧验证三层。限速在最前面——它防的就是"测试"本身被当烧额度的刀。
+         *     走的是单步 `probe()`：一个 `max_tokens=1` 的最小请求，同时验地址 / 密钥 /
+         *     模型名三层。限速在最前面——它防的就是"测试"本身被当烧额度的刀（每次测试
+         *     都是一次打到供应商的真请求）。思考档位的枚举**不从这里来**：下拉选项是
+         *     用户自己管的那份列表（`GET` 里的 `reasoning_effort_options`），垃圾值探测
+         *     拿枚举的做法只对 Command Code 一家有效，别家直接 4xx（2026-11-28 实测），
+         *     已废弃。
          */
         post: operations["test_model_settings_api_settings_model_test_post"];
         delete?: never;
@@ -2275,6 +2279,8 @@ export interface components {
             deep_model?: string | null;
             /** Reasoning Effort */
             reasoning_effort?: string | null;
+            /** Effort Options */
+            effort_options?: string[] | null;
             /**
              * Clear Api Key
              * @default false
@@ -2612,11 +2618,6 @@ export interface components {
              * @default 0
              */
             latency_ms: number;
-            /**
-             * Effort Options
-             * @default []
-             */
-            effort_options: string[];
         };
         /** Theme */
         Theme: {

@@ -15,20 +15,19 @@
 再把正文截到 200 字——既留下能查的信息，又不把密钥写进响应体（界面会显示它，
 用户一截图就出去了）。
 
-**两步探测**（`probe_connection`，2026-11-28 起）：面板要在换模型后立刻渲染
-"思考强度"下拉，而档位清单只能问供应商。第一步带一个校验器不认的档位哨兵
-（`PROBE_EFFORT_SENTINEL`）发请求，从拒绝文案里把合法档位枚举拿回来——这一步
-不进推理层、不花额度；第二步仍是 `probe()`，验地址、密钥、模型名（档位枚举
-管不着模型存不存在，实测在先）。
+**思考档位的枚举不从这里来**（2026-11-28 二次修订）：曾有一版"两步探测"——第一步
+带一个校验器不认的档位哨兵，从拒绝文案里把合法档位枚举拿回来。实测它只对
+Command Code 一家有效，换成别家直接 4xx（且其枚举本就不等于模型真实支持集），
+已整体废弃；下拉选项改为用户自己管的那份列表（`store.DEFAULT_EFFORT_OPTIONS`
+起步，编辑态里改成自己模型的真档位）。
 """
 from __future__ import annotations
 
 import ipaddress
 import json
 import os
-import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import httpx
@@ -41,12 +40,6 @@ TIMEOUT_SECONDS = 15.0
 #: `max_tokens=1`：只要能拿到一个 200 就证明三层都对。多花一个 token 没有任何
 #: 额外信息，而推理模型的 thinking 段也会被这个上限压住。
 PROBE_MAX_TOKENS = 1
-
-#: 第一步探测用的档位哨兵：一个**任何供应商校验器都不认**的值。发它不是为了
-#: 生成，是为了从校验器的拒绝文案里把合法档位枚举拿回来（实测 2026-11-28：
-#: Command Code 在这一步不进推理层、不花额度）。取 `__probe__` 而不是 `off`：
-#: `off` 本身是合法枚举词，有的模型真的接受它——那一步就变成一次真生成。
-PROBE_EFFORT_SENTINEL = "__probe__"
 
 #: 错误正文最多回多少字。够看清"model not found"这类原话，又不至于把一页 HTML
 #: 错误页塞进界面。
@@ -62,9 +55,6 @@ class ProbeResult:
     model: str
     status: int | None = None
     latency_ms: int = 0
-    #: 第一步探测到的思考档位枚举（供应商顺序、已与 `EFFORT_WORDS` 求交集）。
-    #: 空 = 没探到：端点不认识这个字段、模型根本没接档位参数、或第一步被短路。
-    effort_options: tuple[str, ...] = ()
 
 
 #: 允许把模型地址指向内网 / 本机。**默认关**。
@@ -298,98 +288,5 @@ async def probe(base_url: str, api_key: str, model: str) -> ProbeResult:
                        latency_ms=latency)
 
 
-def _enum_from_snippet(snippet: str) -> tuple[str, ...]:
-    """从校验器的错误文案里解析档位枚举，与我们的白名单求交集（保供应商顺序）。
-
-    实测文案形状：``Invalid option: expected one of "off"|"low"|"medium"|…``。
-    只收 `EFFORT_WORDS` 里有的词，两个原因：供应商枚举里的 `off` 在保存校验时
-    本来就不合法（`settings_effort_invalid`），列进下拉会出现"选了就存不上"的
-    自相矛盾；不在白名单里的任何词都不可信，放进界面就是替供应商的格式背书。
-    """
-    from app.generation import free_models
-
-    found: list[str] = []
-    for word in re.findall(r'"([^"]{1,16})"', snippet or ""):
-        if word in free_models.EFFORT_WORDS and word not in found:
-            found.append(word)
-    return tuple(found)
-
-
-async def probe_connection(base_url: str, api_key: str, model: str) -> ProbeResult:
-    """两步探测：先免费拿思考档位枚举，再一次最小请求验证三层。
-
-    **为什么是两步**：换模型后面板要立刻渲染"思考强度"下拉，而档位清单只能问
-    供应商。实测（2026-11-28，Command Code）请求体带 `PROBE_EFFORT_SENTINEL` 时，
-    校验器把合法值枚举原样写进拒绝文案（`expected one of "off"|"low"|…`），
-    而这一步不进推理层、不花额度。但**模型名是否存在校验器管不着**（不存在的
-    模型照样回枚举），所以第二步仍是一次 `probe()`（`max_tokens=1`）。
-
-    第一步的结论怎么用（状态 → 动作）：
-
-    - 401/403 → 密钥被拒，第二步会被一字不差地再拒一次，**短路**省一次真请求。
-    - 连接失败 / 超时 → 地址不通，同理短路。
-    - 400 → 无论文案里有没有枚举都继续第二步：档位校验在模型名校验**之前**
-      （实测在先），模型存不存在是第二步说了算。
-    - 200 → 端点把哨兵当空气忽略了，没有枚举，继续第二步。
-    - 其余（404/429/5xx）→ 第二步会是同一个结论，短路复述第一句。
-
-    **枚举 ≠ 模型真的支持**：校验器枚举是全局的（`off` 在里面，但很多模型关不掉
-    思考），交集也保证不了每一档都可用。已确认的策略是诚实展示——用户真发到
-    不支持的档位时，生成侧把服务商原话递到界面上。
-    """
-    started = time.monotonic()
-
-    def _elapsed() -> int:
-        return int((time.monotonic() - started) * 1000)
-
-    refusal = _refuse(base_url)
-    if refusal is not None:
-        # 与 `probe()` 同一条：一条字节都不发。
-        return ProbeResult(ok=False, model=model, message=refusal)
-
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": PROBE_MAX_TOKENS,
-        "temperature": 0,
-        "stream": False,
-        "reasoning_effort": PROBE_EFFORT_SENTINEL,
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    options: tuple[str, ...] = ()
-    try:
-        async with _client() as client:
-            response = await client.post(base_url + "/chat/completions", json=body,
-                                         headers=headers)
-    except httpx.TimeoutException:
-        return ProbeResult(
-            ok=False, model=model,
-            message=f"连接超时（{TIMEOUT_SECONDS:.0f} 秒没有响应），请检查地址是否可达。",
-            latency_ms=_elapsed())
-    except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
-        return ProbeResult(
-            ok=False, model=model,
-            message=f"连不上这个地址：{type(exc).__name__}。请检查地址与网络。",
-            latency_ms=_elapsed())
-
-    if response.status_code in (401, 403):
-        snippet = _redact(_body_snippet(response), api_key)
-        return ProbeResult(ok=False, model=model, status=response.status_code,
-                           message=_message_for_status(response.status_code, snippet),
-                           latency_ms=_elapsed())
-    if response.status_code != 200:
-        snippet = _redact(_body_snippet(response), api_key)
-        options = _enum_from_snippet(snippet)
-        if response.status_code != 400:
-            return ProbeResult(ok=False, model=model, status=response.status_code,
-                               message=_message_for_status(response.status_code, snippet),
-                               latency_ms=_elapsed())
-
-    result = await probe(base_url, api_key, model)
-    if result.ok:
-        return replace(result, effort_options=options)
-    return result
-
-
-__all__ = ["ALLOW_PRIVATE_ENV", "PROBE_EFFORT_SENTINEL", "PROBE_MAX_TOKENS",
-           "ProbeResult", "TIMEOUT_SECONDS", "probe", "probe_connection"]
+__all__ = ["ALLOW_PRIVATE_ENV", "PROBE_MAX_TOKENS",
+           "ProbeResult", "TIMEOUT_SECONDS", "probe"]
