@@ -10,12 +10,12 @@
 """
 from __future__ import annotations
 
-import sqlite3
 from contextlib import closing
 from datetime import timedelta
 
 import pytest
 
+from app.db.errors import DatabaseError
 from app.generation.service import GenerationError
 from app.memory import store, summarize
 from app.mindmaps import repository
@@ -203,8 +203,9 @@ def test_due_is_none_when_the_model_is_not_configured(monkeypatch):
     add_run("r1", ended_minutes_ago=60)
     assert summarize.due() is None
     with closing(repository.connect()) as conn:
-        rows = conn.execute(f"SELECT COUNT(*) FROM {store.SESSION_TABLE}").fetchone()
-    assert rows[0] == 0
+        rows = conn.execute(
+            f"SELECT COUNT(*) AS total FROM {store.SESSION_TABLE}").fetchone()
+    assert rows["total"] == 0
 
 
 def test_due_caps_the_number_of_runs(monkeypatch):
@@ -577,7 +578,7 @@ def test_router_swallows_summary_failures(monkeypatch, caplog):
     add_run("previous", ended_minutes_ago=60)
 
     def boom(*args, **kwargs):
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     monkeypatch.setattr(summarize, "due", boom)
     with caplog.at_level("WARNING", logger=agent_router.__name__):

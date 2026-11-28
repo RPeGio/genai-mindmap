@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,33 @@ from app.optimization.router import router as optimization_router
 from app.prefs.router import router as prefs_router
 from app.settings.router import router as settings_router
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """启动时把表建好，退出时把连接池关掉。
+
+    为什么建表在这里而不是在 `repository.connect()` 里：**旧的 SQLite 实现是后者**。
+    那时"新开连接就等于新开文件"，把建表塞进连接的构造函数是最省事的办法，代价是
+    每次连接都要重放十几条 DDL——SQLite 上这是空转（`IF NOT EXISTS` 命中已有表），
+    PostgreSQL 上则是**每次连接 2.5ms 的真实往返**。本项目一次生成要读几十次设置，
+    这个开销会直接从"微秒级"变成"几十毫秒级"。
+
+    所以建表只做一次，连接只从池里拿。`init_schema()` 自身是幂等的，多 worker
+    同时启动也是安全的（`CREATE TABLE IF NOT EXISTS` + `ADD COLUMN IF NOT EXISTS`
+    都是服务端原子判据，不需要应用层加锁）。
+
+    建表失败不吞：库连不上时就该在启动阶段炸掉，而不是让每个请求各自超时一次。
+    """
+    from app.db.pool import close_pool
+    from app.db.schema import init_schema
+
+    init_schema()
+    try:
+        yield
+    finally:
+        close_pool()
+
+
 def _app_version() -> str:
     """线上版本号。
 
@@ -31,7 +59,7 @@ def _app_version() -> str:
     return os.getenv("MINDMAP_VERSION", "").strip() or "dev"
 
 
-app = FastAPI(title="生成式 AI 思维导图", version=_app_version())
+app = FastAPI(title="生成式 AI 思维导图", version=_app_version(), lifespan=lifespan)
 # 所有错误出口统一成 {code, message, detail, request_id}，见 app/core/errors.py
 register_error_handlers(app)
 # 每个请求解析一次"当前是谁"，放进 ContextVar（见 app/auth/identity.py）。

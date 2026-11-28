@@ -8,12 +8,14 @@
 
 **上传材料或写一个主题 → agent 生成一张可编辑的思维导图 / 流程图 / 鱼骨图 → 在画布上改、存、导出。**
 
-部署目标是 **2C2G 单机 + SQLite 单文件**，任何改动先问"这台机器扛得住吗"。
+部署目标是 **2C2G 单机 + 本地 PostgreSQL 16 实例**，任何改动先问"这台机器扛得住吗"。
+
+（原先是"SQLite 单文件"，已迁到 PG；换的理由不是数据量——活跃库只有 20 行真实数据——而是**形态**：考核要求"含数据库"，单文件库没有服务端形态，多进程写只能靠"不要起第二个 worker"来回避，也没有 `pg_dump`/`pg_restore` 那种能单独验证的恢复流程。内存实测：PG 常驻 45 MB、池预热 67 MB、8 线程写压测后 168 MB，2C2G 扛得住。方案与实测见 `PG-MIGRATION-PLAN.md`。）
 
 ## 技术栈
 
 ```
-后端    FastAPI + Pydantic v2（extra="forbid"）+ SQLite
+后端    FastAPI + Pydantic v2（extra="forbid"）+ PostgreSQL 16（psycopg 3 连接池，`app/db/` 兼容层）
 检索    BM25 + 向量（text-embedding-v3, 1024 维）+ RRF 融合 + qwen3-rerank
 前端    Vue 3 + Pinia + @vue-flow/core + Tailwind + Vite
 模型    DeepSeek（chat / reasoner），OpenAI 兼容协议

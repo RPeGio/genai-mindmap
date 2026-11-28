@@ -31,15 +31,20 @@ python scripts/measure_profile_ab.py --bubble MAP_B
 `edit_events` 里 559 条 `kind='update'` 是灌进去的：`after` 一律是原文 + `（改）`。
 另外 `'80字' → '1800字'` 这种占位描述也算不了数。判据写在 `_is_synthetic` 里，两条
 都是**机械可判**的，不依赖"这条看起来像测试"。
+
+## 读的是**真库**，不建临时库
+
+这个脚本量的是"这个库里真实发生过什么"（`edit_events` 有多少条真数据、哪张图被改过），
+换个空库就永远是 0 条。库由 `MINDMAP_PG_DSN` 指定（没配落 `app.db.pool.DEFAULT_DSN`）。
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import os
-import sqlite3
 import statistics
 import sys
 from contextlib import closing
@@ -50,8 +55,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.agent import shapes  # noqa: E402
 from app.contracts.mindmap import DiagramContent  # noqa: E402
+from app.db.conn import Row  # noqa: E402
 from app.prefs import profile as profile_mod  # noqa: E402
 from app.prefs import style as style_mod  # noqa: E402
+
+
+def _close_pool() -> None:
+    """退出前关池。
+
+    本脚本读真库、没有 `_pg_tmp` 帮忙收尾，不关的话进程退出时 psycopg_pool 的工作
+    线程会拖 5 秒并打 `couldn't stop thread 'mindmap-worker-*'`——那不是错误，只是
+    没人关池，但看起来像错误，会把真正的失败混进噪声里。池是懒建的，没碰库时这里
+    是空操作。
+    """
+    from app.db import pool as pool_module
+
+    pool_module.close_pool()
+
 
 #: 灌数据脚本留在 `after` 末尾的机械标记。
 SYNTHETIC_MARK = "（改）"
@@ -60,21 +80,24 @@ SYNTHETIC_MARK = "（改）"
 _PLACEHOLDER = ("字",)
 
 
-def _db_path() -> str:
-    return os.getenv("MINDMAP_DB_PATH", os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "mindmaps.db"))
+def _connect() -> Any:
+    """连应用自己那个库（DSN 由 `MINDMAP_PG_DSN` 决定，与生产同一条路）。
 
+    以前这里是 `sqlite3.connect(...)` + `row_factory = sqlite3.Row`；PG 之后统一走
+    `repository.connect()`：它返回的 `Conn` 支持 `execute` / `fetchall`，行本身是
+    `dict`（池的 `row_factory` 就是 `dict_row`），所以下面 `row["after"]` 这类下标
+    访问一行不用改。走这一层而不是自己 `psycopg.connect` 的理由是连接池：脚本里
+    五个地方各开一个连接，手连就是五份握手，而且 `?` 占位符还得自己换成 `%s`。
+    """
+    from app.mindmaps import repository
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_db_path())
-    conn.row_factory = sqlite3.Row
-    return conn
+    return repository.connect()
 
 
 # ---------------------------------------------------------------- 假数据识别
 
 
-def _is_synthetic(row: sqlite3.Row) -> bool:
+def _is_synthetic(row: Row) -> bool:
     """这条 `edit_events` 是不是灌进来的假数据。
 
     两条判据，都只读字段、不猜语义：
@@ -413,6 +436,7 @@ def _walk_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    atexit.register(_close_pool)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", action="store_true", help="真库报告（不调模型）")
     parser.add_argument("--ab", type=int, default=0, metavar="N", help="真跑 A/B，每组 N 次")

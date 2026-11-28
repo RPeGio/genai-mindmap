@@ -20,8 +20,9 @@
 CI 的 shell 是进程级作用域，未必继承了用户级那几项，`subprocess` 调 pwsh 在本机
 也不一定找得到 PATH 里的可执行文件——直接读注册表最稳。
 
-`--material` 会临时把 `MINDMAP_DB_PATH` 指到 `data/measure.db`（外部来源要入库才
-能拿到持久 id），跑完可以直接删。
+`--material` 会给这次运行现建一个**一次性 database**（`_pg_tmp`，跑完删掉）：外部
+来源要入库才能拿到持久 id，而把 measure 的数据写进开发库会让"库里有几份来源"再也
+说不清。
 """
 from __future__ import annotations
 
@@ -36,8 +37,12 @@ from pathlib import Path
 # 脚本在 `scripts/` 下，`python scripts/xxx.py` 会把**脚本目录**放进 sys.path
 # 而不是 cwd——不补这一行，`import app` 在仓库根之外直接失败。
 BACKEND = Path(__file__).resolve().parents[1]
-if str(BACKEND) not in sys.path:
-    sys.path.insert(0, str(BACKEND))
+SCRIPTS = Path(__file__).resolve().parent
+for entry in (BACKEND, SCRIPTS):
+    if str(entry) not in sys.path:
+        sys.path.insert(0, str(entry))
+
+import _pg_tmp  # noqa: E402  （`scripts/` 已在上面插进 sys.path）
 
 CREDENTIALS = (
     "MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY",
@@ -304,18 +309,28 @@ async def _main(argv: list[str]) -> int:
     # `external.DEFAULT_PROXY`）。这里曾经 setdefault 一个 7890，和兜底值 7897
     # 不是同一个数——两处各写一个，改了一处就变成"脚本能通、应用不通"。
 
+    material_text = ""
+    if args.material is not None:
+        material_text = (open(args.material, encoding="utf-8").read()
+                         if args.material else DEFAULT_MATERIAL)
+        # 材料要入库才能拿到持久 id（外部来源的命中带的是库里的 `source_id`）。
+        # 用一次性 database 而不是开发库：这个脚本一次只量一份材料，往真库里灌
+        # 只会让"库里有几份来源"再也说不清。`_pg_tmp` 负责建表与收尾（关池 → DROP）。
+        with _pg_tmp.temp_database("mm_single_call"):
+            return await _measure(args, material_text)
+    return await _measure(args, material_text)
+
+
+async def _measure(args: argparse.Namespace, material_text: str) -> int:
     from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
     from app.agent.tools import build_registry
     from app.contracts.source import Source, SourceKind
 
     topic = args.topic or ("预算管理办法" if args.material is not None else DEFAULT_TOPIC)
     sources: list[Source] = []
-    if args.material is not None:
-        text = (open(args.material, encoding="utf-8").read() if args.material
-                else DEFAULT_MATERIAL)
+    if material_text:
         sources = [Source(id="s-measure", kind=SourceKind.document, status="parsed",
-                          filename="measure.md", text=text)]
-        os.environ.setdefault("MINDMAP_DB_PATH", "data/measure.db")
+                          filename="measure.md", text=material_text)]
 
     reports: list[dict] = []
     for round_index in range(1, max(1, args.repeat) + 1):

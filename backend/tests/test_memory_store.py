@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 
+from app.db.errors import UniqueViolation
 from app.knowledge import vector_cache
 from app.memory import store
 from app.mindmaps import repository
@@ -85,21 +86,24 @@ def put(
 # ---------------------------------------------------------------- 表
 
 def test_tables_are_created_with_the_other_tables():
-    """两张表在 `repository.connect()` 里就建好，与 `mindmaps` / `runs` 同一时刻。
+    """两张表由 `init_schema()` 一次建好，与 `mindmaps` / `runs` 同一时刻。
 
     读记忆的两条路径（每次生成前的一次检索、会话结束时的总结）都在热路径上，
     多一条"发现表不存在 → 建表"的分支，等于在最需要稳定的地方多一个可能抛错的
     分支——`runs` / `user_prefs` / `edit_events` 的注释里都写过同一条理由。
+
+    判据从 `sqlite_master` 换成 `information_schema.tables`：PG 上没有前者。
     """
     with closing(repository.connect()) as conn:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        names = {row["table_name"] for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()")}
     assert {store.ITEM_TABLE, store.SESSION_TABLE} <= names
     assert store.count(owner="") == 0
 
 
 def test_schema_is_idempotent():
-    """连两次不炸、不重复建。表是每次 connect 都会执行的 DDL。"""
+    """连两次不炸、不重复建。建表已挪到 `init_schema()`，这里验的是连接可重入。"""
     repository.connect().close()
     repository.connect().close()
     assert store.count(owner="") == 0
@@ -110,13 +114,15 @@ def test_text_hash_is_unique(monkeypatch):
 
     "先查再插"在并发下会漏（总结管线与手工添加可能同时写）。让数据库裁决，才不会
     出现同一条偏好两条记录——那会白占两个 top_k 名额。
+
+    抛的是 `UniqueViolation`（`psycopg.errors.UniqueViolation`，sqlstate 23505），
+    不是 SQLite 的 `IntegrityError`；两者在 `app/db/errors.py` 里各有别名。
     """
     fake_embedding(monkeypatch)
     put("同一条文本", [1.0, 0.0])
-    import sqlite3
 
     with closing(repository.connect()) as conn:
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(UniqueViolation):
             conn.execute(
                 f"INSERT INTO {store.ITEM_TABLE} "
                 "(id, text, kind, source, created_at, text_hash) "

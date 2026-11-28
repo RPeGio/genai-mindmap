@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import threading
 from contextlib import closing
 from dataclasses import dataclass
@@ -37,6 +36,7 @@ from typing import Any, Sequence
 from pydantic import TypeAdapter
 
 from app.contracts.mindmap import DiagramContent
+from app.db.conn import Connection, Row
 from app.mindmaps import repository
 
 logger = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ ABANDONED_FAILURE = {
 
 #: 时间格式与 `mindmaps` / `library_*` 完全一致（SQLite 的 `%f` 是毫秒）。
 #: 三处格式不同就会在"谁更晚"的比较上错一天。
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_NOW = "nowstamp()"
 
 
 @dataclass(frozen=True)
@@ -202,19 +202,19 @@ class Claim:
 CHECKPOINT_LOCK_TIMEOUT = 2.0
 
 
-def _connect(*, timeout: float = 10) -> sqlite3.Connection:
-    """连接 + 关掉 Python 的隐式事务。
-
-    `isolation_level=None` 是必需的：`begin()` 要显式开 `BEGIN IMMEDIATE` 才能让
-    "读到的状态"和"写下的状态"在同一把写锁里。留在默认的隐式事务模式下，
-    `BEGIN` 会撞上 Python 自己刚开的那条，抛 `cannot start a transaction within
-    a transaction`——而那条错误只在并发时才出现，平时一点痕迹都没有。
+def _connect(*, timeout: float = 10) -> Connection:
+    """从池里取一条连接。
 
     `timeout` 透传给 `repository.connect()`：只有检查点那条路会调短它。
+
+    **历史**：这里原来还有一行 `conn.isolation_level = None`。那是 SQLite 的隐式事务
+    开关——不开它，显式 `BEGIN IMMEDIATE` 会撞上 Python 自己开的那条事务，抛
+    `cannot start a transaction within a transaction`，而且只在并发时出现。psycopg
+    没有这个概念（`isolation_level` 指的是 READ COMMITTED/SERIALIZABLE 那套），
+    事务由 psycopg 隐式开、由 `COMMIT`/`ROLLBACK` 收尾。`BEGIN IMMEDIATE` 那几句
+    现在由 `Conn.execute` 吞成 no-op（见 `app/db/conn.py` 的分派规则）。
     """
-    conn = repository.connect(timeout=timeout)
-    conn.isolation_level = None
-    return conn
+    return repository.connect(timeout=timeout)
 
 
 #: 读库时用的一份联合解析器：形状判别在契约层（`DiagramContent` 的注释），
@@ -238,7 +238,7 @@ def _loads(text: str | None) -> Any:
         return None
 
 
-def _record(row: sqlite3.Row) -> RunRecord:
+def _record(row: Row) -> RunRecord:
     raw_candidate = _loads(row["candidate"])
     candidate: DiagramContent | None = None
     if isinstance(raw_candidate, dict):
@@ -315,41 +315,48 @@ def begin(run_id: str, request: dict[str, Any], *, owner: str | None = None) -> 
 
         owner = owner_of(current_identity())
     # 先把僵住的 `running` 行收掉，再认领。顺序不能反：这一行如果是上一次崩溃
-    # 留下的化石，先 `sweep` 才能把它判成 `failed`，下面那条 `UPDATE` 才有资格
-    # 重开它。放在事务外面，是因为 `sweep_abandoned` 自己开一条 `BEGIN IMMEDIATE`，
-    # 套在这里面的 `BEGIN IMMEDIATE` 里会直接报"事务里不能开事务"。
+    # 留下的化石，先 `sweep` 才能把它判成 `failed`，下面那条语句才有资格重开它。
     try:
         sweep_abandoned()
     except Exception:  # noqa: BLE001 — 清理是维护动作，坏掉不该挡住用户这一次生成
         logger.warning("超龄 running 的清理没有跑成，这次照常认领", exc_info=True)
     with closing(_connect()) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            created = conn.execute(
-                "INSERT OR IGNORE INTO runs (run_id, status, request, created_at, updated_at, owner) "
-                f"VALUES (?, ?, ?, {_NOW}, {_NOW}, ?)",
-                (run_id, STATUS_RUNNING, payload, owner),
-            )
-            claimed = created.rowcount == 1
-            if not claimed:
-                reopened = conn.execute(
-                    f"UPDATE runs SET status = ?, failure = NULL, "
-                    f"partial = NULL, partial_reason = NULL, checkpointed_at = NULL, "
-                    # 重开是**另一个请求**在用这行跑，`request` 必须换成这一轮的摘要；
-                    # 空摘要（内部调用方不传）用 COALESCE 保住旧值，等于"这次没带摘要"。
-                    # `owner` 不换：`WHERE ... AND owner = ?` 已经限定只有本人能重开，
-                    # 这一句在语义上是冗余的自证（写回同一个值），留着是为了让 SQL
-                    # 自解释"这行的主人还是他"。
-                    f"request = COALESCE(?, request), owner = ?, updated_at = {_NOW} "
-                    "WHERE run_id = ? AND status IN (?, ?) AND owner = ?",
-                    (STATUS_RUNNING, payload, owner, run_id, *RESTARTABLE_STATUSES, owner),
-                )
-                claimed = reopened.rowcount == 1
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        # **一条语句完成"插入或重开"，不再包 `BEGIN IMMEDIATE`。**
+        #
+        # 原来是「`BEGIN IMMEDIATE` → `INSERT OR IGNORE` 看 rowcount → 失败再
+        # `UPDATE ... WHERE status IN (?,?) AND owner = ?` 看 rowcount → COMMIT」。
+        # 三段之间靠 SQLite 的写锁串起来。PG 上没有 `BEGIN IMMEDIATE` 这种"一开事务
+        # 就拿写锁"的语法，而整个 `claim()` 的语义（"同一 run_id 只有一个请求能认领"）
+        # 恰恰依赖读-判-写的原子性——拆成 SELECT 再 INSERT 会重新引入那个竞态。
+        #
+        # 改成 `INSERT ... ON CONFLICT (run_id) DO UPDATE ... WHERE ... RETURNING *`：
+        # - 冲突且 `WHERE` 成立（终态 + 本人）→ 原地重开，返回新行，`claimed=True`；
+        # - 冲突且 `WHERE` 不成立（`running`/`done`、或别人的行）→ **一行都不返回**，
+        #   `claimed=False`，下面补一条 SELECT 把已有那行读给调用方（409 或重放要用）；
+        # - 不冲突 → 插入，返回新行，`claimed=True`。
+        # 判定与写入在同一条语句里由数据库裁决，并发下不可能两个请求都拿到 True。
+        row = conn.execute(
+            "INSERT INTO runs (run_id, status, request, created_at, updated_at, owner) "
+            f"VALUES (?, ?, ?, {_NOW}, {_NOW}, ?) "
+            "ON CONFLICT (run_id) DO UPDATE SET "
+            "status = EXCLUDED.status, failure = NULL, partial = NULL, "
+            "partial_reason = NULL, checkpointed_at = NULL, "
+            # 重开是**另一个请求**在用这行跑，`request` 必须换成这一轮的摘要；
+            # 空摘要（内部调用方不传）用 COALESCE 保住旧值，等于"这次没带摘要"。
+            "request = COALESCE(EXCLUDED.request, runs.request), "
+            # `owner` 写成同一个值：`WHERE ... AND runs.owner = EXCLUDED.owner` 已经
+            # 限定只有本人能重开，这一句在语义上是冗余的自证，留着是为了让 SQL
+            # 自解释"这行的主人还是他"。
+            "owner = EXCLUDED.owner, updated_at = EXCLUDED.updated_at "
+            "WHERE runs.status IN (?, ?) AND runs.owner = EXCLUDED.owner "
+            "RETURNING *",
+            (run_id, STATUS_RUNNING, payload, owner, *RESTARTABLE_STATUSES),
+        ).fetchone()
+        claimed = row is not None
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        conn.commit()
     if row is None:  # pragma: no cover — 插入或重开的成功路径上必有一行
         raise RuntimeError(f"runs 里没有 run_id={run_id} 的行，插入与重开都没生效")
     return Claim(record=_record(row), claimed=claimed)
@@ -405,7 +412,11 @@ def finish(
                 "reasoning = COALESCE(?, reasoning), "
                 "partial = COALESCE(?, partial), "
                 "partial_reason = COALESCE(?, partial_reason), "
-                "checkpointed_at = CASE WHEN ? IS NULL THEN checkpointed_at ELSE NULL END, "
+                # `::text` 是**必需的**，不是保险：PG 在 `? IS NULL` 里推不出参数类型
+                # （这个位置没有列或常量给它参照），参数一多就报
+                # `IndeterminateDatatype: could not determine data type of parameter $10`。
+                # SQLite 不做类型推导，所以老代码里没有这个 cast。
+                "checkpointed_at = CASE WHEN ?::text IS NULL THEN checkpointed_at ELSE NULL END, "
                 "updated_at = " + _NOW +
                 " WHERE run_id = ? AND status <> ?",
                 (status, dumped,
@@ -442,10 +453,12 @@ def checkpoint(run_id: str, content: DiagramContent) -> bool:
     返回这一行有没有真的被写。写不进去不抛异常——调用方在生成的中途，为了一个
     "存不上就算了"的保险不该让整轮失败。
 
-    等写锁的上限是 `CHECKPOINT_LOCK_TIMEOUT`（2 秒），不是默认的 10 秒：这条路上
-    的阻塞发生在事件循环里（调用方在线程池里跑它，但等的是这一轮生成的时间），
-    一把慢锁不值得陪满十秒。超时抛的 `sqlite3.OperationalError` 照常往外抛——由
-    调用方决定记日志还是继续，这里不替它吞。
+    这个上限是 `CHECKPOINT_LOCK_TIMEOUT`（2 秒），不是默认的 10 秒，但**含义变了**：
+    原来它是"等 SQLite 写锁的上限"，现在 PG 上没有"写锁等待"这个可配的东西，它变成
+    "等池里空出一条连接的上限"。仍然值得单独写一个更短的值——等池的每一秒都是这一轮
+    生成在等，而检查点本身是"存不上就算了"的东西。超时抛的是
+    `psycopg_pool.PoolTimeout`（不是数据库错误），照常往外抛——由调用方决定记日志
+    还是继续，这里不替它吞。
     """
     with closing(_connect(timeout=CHECKPOINT_LOCK_TIMEOUT)) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -489,29 +502,30 @@ def sweep_abandoned(*, seconds: int = RUN_ABANDONED_SECONDS) -> list[str]:
     多 worker 部署时，另一进程的活跃 run 只能靠时间兜——那也正是阈值取到 1800 秒
     这么宽的原因。
 
-    截止时刻由 **SQLite 自己算**（`strftime(..., 'now', '-N seconds')`），不在这里
-    用 Python 拼时间串：`updated_at` 是 SQLite 按 UTC 写下的同一格式，两边各算一次
-    就有时区与精度两个地方会分叉，而分叉的表现是"清理要么一直不触发、要么清掉刚开
-    的那一轮"，两种都很难从日志上认出来。
+    截止时刻由**数据库自己算**（`nowstamp(-N)`），不在这里用 Python 拼时间串：
+    `updated_at` 是按 UTC 写下的同一格式，两边各算一次就有时区与精度两个地方会分叉，
+    而分叉的表现是"清理要么一直不触发、要么清掉刚开的那一轮"，两种都很难从日志上认
+    出来。`nowstamp()` 是 `app/db/schema.py` 建的服务器端函数，接秒数偏移。
     """
     protected = _active_ids()
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             rows = conn.execute(
-                "SELECT run_id FROM runs WHERE status = ? AND updated_at < "
-                "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
-                (STATUS_RUNNING, f"-{max(1, seconds)} seconds"),
+                "SELECT run_id FROM runs WHERE status = ? AND updated_at < nowstamp(?)",
+                (STATUS_RUNNING, -max(1, seconds)),
             ).fetchall()
             swept = [row["run_id"] for row in rows if row["run_id"] not in protected]
             if swept:
-                placeholders = ", ".join("?" for _ in swept)
+                # `= ANY(?)` 绑一个 Python list（psycopg 适配成数组），不再手拼
+                # `IN (?,?,?)` 的占位符串：原来那串是按 `len(swept)` 动态生成的，
+                # 一旦数量变化就得重算，而漏算的表现是"清理只清掉前 N 个"。
                 conn.execute(
                     f"UPDATE runs SET status = ?, failure = ?, updated_at = {_NOW} "
-                    f"WHERE run_id IN ({placeholders})",
+                    f"WHERE run_id = ANY(?)",
                     (STATUS_FAILED,
                      json.dumps(ABANDONED_FAILURE, ensure_ascii=False),
-                     *swept),
+                     swept),
                 )
             conn.execute("COMMIT")
         except BaseException:

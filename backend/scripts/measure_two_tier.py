@@ -47,6 +47,14 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+# `scripts/` 不是包，`_pg_tmp` 就在旁边。显式插一次而不是指望 sys.path[0]
+# （以 `-m` 跑、或在测试里按路径加载时不一样）。
+SCRIPTS = Path(__file__).resolve().parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import _pg_tmp  # noqa: E402  （必须在 sys.path 插好之后）
+
 CREDENTIALS = (
     "MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY",
     "MINDMAP_LLM_MODEL", "MINDMAP_EMBEDDING_BASE_URL", "MINDMAP_EMBEDDING_API_KEY",
@@ -353,8 +361,16 @@ async def _main(argv: list[str]) -> int:
     os.environ["MINDMAP_EXTERNAL_KNOWLEDGE"] = "0"
     os.environ["MINDMAP_LIBRARY_SEARCH"] = "0"
     os.environ["MINDMAP_LIBRARY_REMEMBER"] = "0"
-    os.environ.setdefault("MINDMAP_DB_PATH", "data/measure_two_tier.db")
+    # 库：临时 database（原先是 `data/measure_two_tier.db` 这个临时文件）。这个脚本
+    # 一批批重灌同一份二十节材料、每跑一次换一份正文，落在真库里等于把开发库的来源
+    # 与图冲掉；落在临时文件里就要自己管文件生命周期。改成临时库之后，建库、`init_schema()`
+    # （**必须显式建表**：`repository.connect()` 不再建表）、关池、删库全在 `_pg_tmp` 里。
+    with _pg_tmp.temp_database("mm_two_tier"):
+        # 拆出 `_measure` 只为让 `with` 包住整段；异常路径同样走出口清理。
+        return await _measure(args)
 
+
+async def _measure(args: argparse.Namespace) -> int:
     text = (Path(args.material).read_text(encoding="utf-8")
             if args.material else _default_material())
     topic = args.topic or DEFAULT_TOPIC

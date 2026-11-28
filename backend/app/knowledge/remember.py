@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 
 from app.contracts.source import Source
+from app.db.errors import DatabaseError
 from app.knowledge import library as knowledge_library
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ def _maybe_prune() -> None:
         _prune_checked_at = now
         try:
             total = knowledge_library.count()
-        except (sqlite3.Error, OSError) as exc:
+        except (DatabaseError, OSError) as exc:
             logger.warning("读不到知识库条数（%s），本次跳过淘汰：%s",
                            type(exc).__name__, str(exc)[:160])
             return
@@ -90,7 +90,7 @@ def _prune_once() -> None:
     """执行一次淘汰；这是守护线程里跑的东西，异常只记日志、不许往外抛。"""
     try:
         removed = knowledge_library.prune()
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("知识库自动淘汰失败（%s）：%s", type(exc).__name__, str(exc)[:160])
     except Exception:  # noqa: BLE001 - 守护线程里没人接异常，兜住并留栈
         logger.exception("知识库自动淘汰出现未预期异常")

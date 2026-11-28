@@ -1,8 +1,6 @@
 """节点引用的三层校验与 API 闭环；所有模型调用均为 mock。"""
 from copy import deepcopy
 import json
-from pathlib import Path
-from uuid import uuid4
 
 from pydantic import ValidationError
 import pytest
@@ -77,17 +75,11 @@ def tree(sources):
 
 @pytest.fixture
 def client(monkeypatch):
-    # 使用唯一的临时数据库文件，既不触碰开发库，也不依赖临时目录的 ACL。
-    data = Path(__file__).resolve().parents[1] / "data"
-    data.mkdir(exist_ok=True)
-    db_file = data / f"source-refs-{uuid4().hex}.db"
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(db_file))
+    # 库的隔离由 `conftest.fresh_db` 负责（每用例清表）：不再建临时库文件。
+    # `MINDMAP_DB_PATH` 已废除，写它既不起作用、又会让人以为隔离还靠文件。
     monkeypatch.setenv("MINDMAP_LLM_MODE", "model")
-    try:
-        with guest_client() as api:
-            yield api
-    finally:
-        db_file.unlink(missing_ok=True)
+    with guest_client() as api:
+        yield api
 
 
 @pytest.mark.parametrize("fields", [

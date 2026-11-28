@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from app.contracts.source import Source, SourceKind, SourceMetadata
+from app.db.errors import DatabaseError
 from app.ingestion.service import parse_bytes, write_content_hash
 from app.knowledge import graph_extract, graph_ingest, graph_store, library, service
 from app.knowledge.service import (
@@ -83,7 +83,7 @@ def _source(text: str, **kwargs) -> Source:
 
 def _row_count(table: str) -> int:
     with repository.connect() as conn:
-        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        return conn.execute(f"SELECT COUNT(*) AS total FROM {table}").fetchone()["total"]
 
 
 # ---------------------------------------------------------------- 1 入库身份
@@ -451,7 +451,7 @@ def test_library_pick_is_capped(monkeypatch):
 def test_library_unavailable_degrades_to_request_sources(monkeypatch):
     """库坏了不影响这次检索：退化成"只看本次请求的材料"，不抛错。"""
     def boom(*args, **kwargs):  # noqa: ARG001 - 只对齐签名
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     monkeypatch.setattr(service.knowledge_library, "recent", boom)
     source = _source(_material(1))
@@ -508,7 +508,6 @@ def test_prune_by_count_keeps_the_most_recent():
 
 def test_prune_keeps_vector_cache(monkeypatch, tmp_path):
     """`chunk_vectors` 不跟着删：缓存按文本哈希索引，删了只会重算。"""
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "vectors.db"))
     from app.knowledge import vector_cache
 
     with repository.connect() as conn:
@@ -519,7 +518,7 @@ def test_prune_keeps_vector_cache(monkeypatch, tmp_path):
     _age(source_id, "2020-01-01T00:00:00.000Z")
     assert library.prune(keep_days=1) == 1
     with repository.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) AS total FROM chunk_vectors").fetchone()["total"] == 1
 
 
 # ---------------------------------------------------------------- 6 指纹写入方

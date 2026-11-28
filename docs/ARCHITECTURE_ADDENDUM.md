@@ -2,6 +2,8 @@
 
 本文**不重复** [系统架构](ARCHITECTURE.md) 的内容，只补三块它标为"规划中"但没给出可执行细节的部分：存储迁移、流式协议、生成流水线。
 
+第 1 节已经**执行完毕**（方案与实测见 [PG 迁移方案](PG-MIGRATION-PLAN.md)），正文按落地后的实际形态重写，不再是"迁移时机 + 未来步骤"的设计稿；第 2、3 节仍是设计稿，与实现的差异在各自开头的警告框里写明。
+
 所有命名、路径、限制以现有代码为准：
 
 - 节点字段是 `label`，不是 `topic`
@@ -15,56 +17,72 @@
 
 ### 1.1 迁移时机
 
-现状是 SQLite 单文件（`backend/data/mindmaps.db`），适合当前本地原型。出现下列需求时评估迁移：
+迁移动机写在 [系统架构](ARCHITECTURE.md) 的选型条目里，结论是：部署要求"含数据库"，而 SQLite 是进程内的单文件库——没有服务端形态，备份要停机 `sqlite3 .backup`，连接数、在线恢复、主从都无从谈起，多进程写还会偶发 `database is locked`。这几条在 W1–W3 期间是"以后再说"的取舍（决策 Q35），验收后按 [PG 迁移方案](PG-MIGRATION-PLAN.md) 执行。
 
-- 需要多实例部署或并发写入
-- 需要全文检索、向量检索
-- 实测数据量、写入并发或查询性能超出需求
-- 需要更完整的服务器端运维、恢复或部署能力
+**实际触发点不是数据量，是形态。** 迁移前活跃库 `backend/data/mindmaps.db` 只有 20 行真实数据，`mindmaps` 4 行、`runs` 4 行、`edit_events` 6 行——按记录数算 SQLite 还能撑很久。所以这次没有任何"性能不够了"的实测依据，理由纯粹是"部署要一个真数据库 + 单文件库没有运维面"。
 
-不存在适用于所有项目的固定记录数或文档大小迁移阈值；SQLite 也支持备份，具体取舍应以测试、运维需求和团队能力为准。
+迁移已完成，几个容易被误判的边界一并记下（都是实测，不是推断）：
+
+- **表结构没有照抄 PostgreSQL 的习惯**：`timestamptz` 改成 `text` 存 UTC 字符串（服务器端 `nowstamp()` 生成，格式与 SQLite 的 `strftime('%Y-%m-%dT%H:%M:%fZ','now')` 逐字节一致），这样 `edited_at` 之类的字符串比较、切片、`date()` 派生逻辑全都不用动。改成 `timestamptz` 会连带改契约与前端时间处理，收益不成比例。
+- **主键没改成 UUID**：`edit_events.id` / `library_chunks.id` 用 `bigserial`，`mindmaps.id` 本来就在契约里是字符串。换成 UUID 会波及 `openapi.json` 与 `schema.d.ts`。
+- **没有上 pgvector**：向量仍存 `bytea`，由纯 Python 的 `vector_cache.py` 做 KV。pgvector 解决的是"库内近似最近邻"，当前检索是先取候选再在 Python 里算，换索引等于重写检索链（D7）。
+- **没有引入 Alembic / SQLAlchemy**：第一轮把 `alembic` 当硬性前置，实测后推翻了。表结构用幂等 DDL（`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`）+ 一张 `schema_migrations` 记账表就够，约 150 行；引入迁移框架的复杂度（配置、版本目录、与测试夹具的交互）超过它解决的问题。
 
 ### 1.2 表设计
 
-对齐现有 `MapRecord`（`id / version / content / updated_at`）：
+本节曾给出一份 `uuid / jsonb / timestamptz` 的示例 DDL。**落地版本没有采用它**，实际形态对齐现有 `MapRecord`（`id / version / content / updated_at / owner`）：
 
 ```sql
-create table mindmaps (
-  id         uuid        primary key,
-  version    integer     not null default 1,
-  content    jsonb       not null,          -- MindMapContent 序列化
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+-- 落地形态（backend/app/db/schema.py），不是本节早先的示例
+CREATE TABLE IF NOT EXISTS mindmaps (
+  id         TEXT PRIMARY KEY,
+  version    INTEGER NOT NULL,
+  content    TEXT NOT NULL,          -- MindMapContent 序列化成 JSON 文本
+  updated_at TEXT NOT NULL,          -- UTC 字符串，nowstamp() 生成
+  owner      TEXT NOT NULL DEFAULT ''
 );
-
-create index mindmaps_updated_at_idx on mindmaps (updated_at desc);
-
--- 只有在真要做"按节点文字搜导图"时才建
-create index mindmaps_content_gin on mindmaps using gin (content jsonb_path_ops);
 ```
 
-初期可不拆 nodes 表：现有契约把整棵树当作一个文档读写。节点级搜索、权限、引用或协作成熟后，再根据查询模式和实测结果决定是否拆表；不预先断言两种方案的性能差距。
+三处偏离及理由：
+
+- `uuid` → `TEXT`：主键在契约里本来就是字符串，PG 的 `uuid` 类型会逼契约层跟着改类型。
+- `jsonb` → `TEXT`：`content` 全程是"整块读出、整块写回"，没有一次按 JSON 路径查询。改成 `jsonb` 要多一次序列化/反序列化，还会让"逐字节相等"这条导入校验（M6 验收）变得不可能——`jsonb` 会重排键序、去空白。
+- `timestamptz` → `TEXT`：理由见 1.1 最后一条，实测两种写法插入开销相同（4.147 vs 4.171ms），保住现有全部按字典序比时间的代码。
+- `created_at` 那列实际不存在（现有 `MapRecord` 就没有），不为了"看齐惯例"凭空加一列——新建导图时 `updated_at` 就是创建时间。
+
+原示例里那句"初期可不拆 nodes 表"依然成立：现有契约把整棵树当作一个文档读写。节点级搜索、权限、引用或协作成熟后，再根据查询模式和实测结果决定是否拆表；不预先断言两种方案的性能差距。
 
 ### 1.3 乐观锁保持不变
 
-现有语义是版本号比对，迁移后原样保留：
+现有语义是版本号比对，迁移后原样保留——这是"什么没变"里最重要的一条，因为它同时决定 404 与 409 的分流：
 
 ```sql
 update mindmaps
-   set content = $2, version = version + 1, updated_at = now()
+   set content = $2, version = version + 1, updated_at = nowstamp()
  where id = $1 and version = $3;
 -- 影响行数为 0 → 检查记录是否存在，区分 404 和 409
 ```
 
+`now()` 换成了 `nowstamp()`（UTC 字符串，见 1.1），`$2`/`$3` 的占位符形态与原设计一致：shim 会把 Python 侧的 `?` 翻译成 `%s`，所以 `repository.py` 里的 SQL 写法没动，改的只是"语句最后由谁执行、时间戳由谁生成"。
+
 ### 1.4 迁移步骤
 
-1. `alembic init` + 建表迁移脚本
-2. 写一次性导入脚本：读 SQLite 的 `MapRecord` → 批量写 PG
-3. `backend/app/mindmaps/repository.py` 换实现，**对外接口签名不变**，路由层与测试不受影响
-4. 双写观察一周，比对两库记录数与抽样内容
-5. 确认迁移和回滚方案后切换；按备份保留策略保存旧库，避免立即删除唯一副本
+原方案是「`alembic init` → 写迁移脚本 → 双写观察一周 → 切换」。**这套做法没有执行**，原因是它假设了两件不成立的事：
 
-`repository.py` 目前只有几百行且职责集中，这是迁移成本低的原因，也是前面建议"先别急着上 PG"的原因。
+1. **假设线上库有大量数据、需要一段并跑期来比对。** 实际活跃库 `backend/data/mindmaps.db` 只有 20 行真实数据（`mindmaps` 4 / `runs` 4 / `edit_events` 6 / `prefs` 1 / `model_settings` 2 / `sessions` 1 / `users` 1，其余表 0 行），导入是一秒钟的事，"双写一周"没有观测对象。
+2. **假设迁移框架是必要前置。** 实测后推翻（D3）：幂等 DDL 足够，不需要 `alembic`。
+
+实际执行的是下面这条单程路径：
+
+1. **停服**：`systemctl stop genai-mindmap`，确认没有写入方。
+2. **跑导入脚本**：`backend/scripts/migrate_sqlite_to_pg.py`，读 SQLite 的 `MapRecord` 等表 → 批量写 PG。脚本幂等（重跑不重复插入），支持 `--dry-run`；三处 legacy 就地迁移（`user_prefs` 主键形态、`model_settings` 单行、`style_profile`）在这步一次搬进终态表，运行期不再有"半成品状态要续上"。
+3. **校验行数与内容**：逐表比对行数（上面那组数字），并抽 1 张导图比对 `content` **逐字节相等**。行数对但内容漂了等于没迁。
+4. **切换**：写入 `MINDMAP_PG_DSN`，起服务，`init_schema()` 幂等建表并记 `schema_migrations`。
+5. **旧库原样保留**：`/var/lib/genai-mindmap/mindmaps.db` 改名为 `mindmaps.db.pre-pg` 留在原地当回滚点，**不删、不覆盖、不压缩**。要保留的是*原文件名可还原*的那一份，而不是塞进备份目录的压缩包。
+
+   **回滚要同时退代码和数据，两件缺一不可**：停服务、把文件名改回去**只解决数据那一半**——迁移后的代码根本不读 `MINDMAP_DB_PATH`，去掉 `MINDMAP_PG_DSN` 它只会回落到 `app/db/pool.py` 的 `DEFAULT_DSN`（还是一个 PostgreSQL 库），不会自己变回 SQLite。所以完整回滚是：停服 → 旧库改名还原 → **checkout 迁移前的代码快照** → 起服。反过来只退代码也不成立：那份旧代码看不懂 PG 里的写入。**这条与 `docs/DEPLOY.md` 第 10 节末尾的警告是同一件事，别只读一半。**
+
+`repository.py` 只有几百行且职责集中，所以在它下面垫一层 shim 就能完成切换，路由层与测试的对外接口不受影响——这也是"先别急着上 PG"和"一晚上就能迁完"能同时成立的原因：成本低的是迁移动作，不是运维形态的变化。
 
 ---
 

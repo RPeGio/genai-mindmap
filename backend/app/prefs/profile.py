@@ -79,12 +79,13 @@ import json
 import logging
 import math
 import os
-import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
+from app.db.conn import Connection
+from app.db.errors import DatabaseError
 from app.knowledge import embedding, vector_cache
 from app.memory.store import age_days, decay, utcnow
 
@@ -218,7 +219,7 @@ SWITCH_ENV = "MINDMAP_PROFILE_RERANK"
 #: 池键的前缀：**新图还没保存时用 `run:<run_id>`**。判据见 `pool_key`。
 POOL_RUN_PREFIX = "run:"
 
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_NOW = "nowstamp()"
 
 #: `map_id` 是**池键**（不是"导图主键"）：
 #:   - 空串 / NULL = 隔离之前那批全局方向（`stored(map_id=None)` 的全量视图里还在，
@@ -229,7 +230,7 @@ _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 #:     拿不到它，见 `pool_key`）。
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {VECTOR_TABLE} (
     id         TEXT PRIMARY KEY,
-    vector     BLOB NOT NULL,
+    vector     bytea NOT NULL,
     label      TEXT NOT NULL,
     weight     REAL NOT NULL,
     samples    INTEGER NOT NULL,
@@ -296,7 +297,7 @@ class Boost:
 # ---------------------------------------------------------------- 建表
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: Connection) -> None:
     """建表，并给已存在的表补上 `map_id` 列（幂等）。
 
     补列是必须的：`CREATE TABLE IF NOT EXISTS` 只保证"表存在"，不保证"列齐全"。
@@ -309,12 +310,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     包含进来的依据。不做数据回填：给它们编一个 `map_id` 等于伪造归属。
     """
     conn.execute(_CREATE)
-    from app.mindmaps.repository import _ensure_columns
+    from app.db.schema import ensure_columns
 
-    _ensure_columns(conn, VECTOR_TABLE, {"map_id": "TEXT"})
+    ensure_columns(conn, VECTOR_TABLE, {"map_id": "TEXT"})
 
 
-def _connect() -> sqlite3.Connection:
+def _connect() -> Connection:
     from app.mindmaps import repository
 
     return repository.connect()
@@ -466,7 +467,7 @@ def _samples(owner: str) -> list[Sample]:
                 if body.strip():
                     collected.append(Sample(body, "material", row["created_at"],
                                              str(row["filename"] or "")[:40]))
-        except sqlite3.Error as exc:
+        except DatabaseError as exc:
             logger.warning("画像取样：材料表读不出来（%s），这次只用导图与记忆",
                            type(exc).__name__)
         try:
@@ -489,7 +490,7 @@ def _samples(owner: str) -> list[Sample]:
                 if body.strip():
                     collected.append(Sample(body, "mindmap", row["updated_at"],
                                              str(payload.get("title") or "")[:40]))
-        except sqlite3.Error as exc:
+        except DatabaseError as exc:
             logger.warning("画像取样：导图表读不出来（%s），这次只用材料与记忆",
                            type(exc).__name__)
         try:
@@ -502,7 +503,7 @@ def _samples(owner: str) -> list[Sample]:
                 text = str(row["text"] or "").strip()
                 if text:
                     collected.append(Sample(text, "memory", row["at"], text[:40]))
-        except sqlite3.Error:
+        except DatabaseError:
             # `memory_items` 在没写过记忆的库上可能整张表都是空的，这不是故障。
             # 也可能是老库还没补 `owner` 列——那同样不该让整次取样失败。
             pass

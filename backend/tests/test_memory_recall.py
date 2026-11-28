@@ -303,7 +303,7 @@ def test_recall_touch_marks_last_used(monkeypatch):
         row = conn.execute(
             f"SELECT last_used_at FROM {store.ITEM_TABLE} WHERE id = ?", (item_id,)
         ).fetchone()
-    assert row[0] is not None
+    assert row["last_used_at"] is not None
 
 
 def test_recall_does_not_touch_by_default(monkeypatch):
@@ -315,7 +315,7 @@ def test_recall_does_not_touch_by_default(monkeypatch):
         row = conn.execute(
             f"SELECT last_used_at FROM {store.ITEM_TABLE} WHERE id = ?", (item_id,)
         ).fetchone()
-    assert row[0] is None
+    assert row["last_used_at"] is None
 
 
 def test_recall_query_vector_is_cached(monkeypatch):
@@ -391,7 +391,7 @@ def test_prompt_for_marks_the_hits_as_used(monkeypatch):
         row = conn.execute(
             f"SELECT last_used_at FROM {store.ITEM_TABLE} WHERE id = ?", (item_id,)
         ).fetchone()
-    assert row[0] is not None
+    assert row["last_used_at"] is not None
 
 
 def test_prompt_for_and_notes_header_are_two_different_paragraphs():

@@ -12,14 +12,15 @@
    开放注册 + 人人能改公共配置 = 任何陌生人注册一下就把全站的模型地址指到自己的
    服务器上，顺带把所有人的免费额度花光。
 4. **迁移**：老库那唯一一行要变成实例行。它是升级路径，不是新装路径——写错的话
-   已经在用的部署升级之后会看到"我配的密钥不见了"。
+   已经在用的部署升级之后会看到"我配的密钥不见了"。这条路径现在由一次性导入脚本
+   承担（`docs/PG-MIGRATION-PLAN.md` 的 D10），`settings.store` 里那个就在线搬表的
+   `_migrate_legacy` 已经删掉；原先锁"半迁移状态"的四条用例随代码路径一起删除。
 
 界面不做的事这里也不假装：这一批还没有登录界面与门禁，所以 `TestClient(app)` 里
 "没有 cookie"的请求就是匿名——匿名请求的 owner 是实例行（与改造前逐字节一致）。
 """
 from __future__ import annotations
 
-import sqlite3
 from contextlib import closing
 
 import pytest
@@ -74,7 +75,7 @@ def _read(client: TestClient) -> dict:
 
 def _owners() -> set[str]:
     with closing(repository.connect()) as conn:
-        return {row[0] for row in conn.execute(f"SELECT owner FROM {store.TABLE}")}
+        return {row["owner"] for row in conn.execute(f"SELECT owner FROM {store.TABLE}")}
 
 
 # ---------------------------------------------------------------- 隔离
@@ -310,109 +311,6 @@ def test_the_deployer_is_the_first_created_account_even_if_it_logs_out():
     again.post("/api/auth/login",
                json={"username": "deployer", "password": PASSWORD})
     assert _read(again)["can_edit_instance"] is True
-
-
-# ---------------------------------------------------------------- 迁移
-
-
-def _legacy_db(path) -> None:
-    """造一个老库：单行表 + 一行真配置（`id INTEGER PRIMARY KEY CHECK (id = 1)`）。"""
-    conn = sqlite3.connect(str(path))
-    try:
-        conn.execute(
-            """CREATE TABLE model_settings (
-                   id           INTEGER PRIMARY KEY CHECK (id = 1),
-                   base_url     TEXT NOT NULL DEFAULT '',
-                   api_key      TEXT NOT NULL DEFAULT '',
-                   model        TEXT NOT NULL DEFAULT '',
-                   deep_model   TEXT,
-                   updated_at   TEXT,
-                   api_key_host TEXT NOT NULL DEFAULT ''
-               )""")
-        conn.execute(
-            "INSERT INTO model_settings (id, base_url, api_key, model) "
-            "VALUES (1, 'https://old.example/v1', ?, 'old-model')", (KEY_A,))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def test_a_legacy_single_row_becomes_the_instance_row(tmp_path, monkeypatch):
-    path = tmp_path / "legacy.db"
-    _legacy_db(path)
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(path))
-    store._CACHE.clear()
-
-    with closing(repository.connect()) as conn:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert store.TABLE in names
-        # 迁移完老表就该走了，不留在库当"第二份真相"。
-        assert store._LEGACY_TABLE not in names
-        owners = [row[0] for row in conn.execute(f"SELECT owner FROM {store.TABLE}")]
-    assert owners == [store.INSTANCE_OWNER]
-
-    resolved = store.resolve()
-    assert resolved.base_url == "https://old.example/v1"
-    assert resolved.api_key == KEY_A
-    assert resolved.model == "old-model"
-    # 老行没有 `api_key_host`，兜底用那一行自己的地址 → 密钥照旧交出（不能因为
-    # 升级就把所有人的密钥打成 `unbound`）。
-    assert resolved.api_key_source == store.SOURCE_SAVED
-
-
-def test_a_half_migrated_database_finishes_the_job(tmp_path, monkeypatch):
-    """进程在"改名之后、搬运之前"被杀掉：下次连接要把它补完。
-
-    这是两段式迁移的意义所在——迁移跑在每一个请求都会调的 `connect()` 上，
-    不能有"只许成功一次"的假设。
-    """
-    path = tmp_path / "half.db"
-    _legacy_db(path)
-    conn = sqlite3.connect(str(path))
-    try:
-        # 只做第 1 段（改名），不建新表、不搬运。
-        conn.execute(f"ALTER TABLE {store.TABLE} RENAME TO {store._LEGACY_TABLE}")
-        conn.commit()
-    finally:
-        conn.close()
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(path))
-    store._CACHE.clear()
-
-    with closing(repository.connect()) as conn:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert store.TABLE in names
-        assert store._LEGACY_TABLE not in names
-    assert store.resolve().api_key == KEY_A
-
-
-def test_a_migrated_database_is_not_migrated_twice(tmp_path, monkeypatch):
-    """迁移是幂等的：第二次 `connect()` 不该把实例行搬空或搬重。"""
-    path = tmp_path / "twice.db"
-    _legacy_db(path)
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(path))
-    store._CACHE.clear()
-
-    for _ in range(3):
-        with closing(repository.connect()) as conn:
-            rows = conn.execute(
-                f"SELECT owner, api_key FROM {store.TABLE}").fetchall()
-        assert len(rows) == 1
-        assert rows[0][1] == KEY_A
-
-
-def test_a_fresh_database_needs_no_migration(tmp_path, monkeypatch):
-    """新库直接就是新形状：没有老表、没有中间表，一行都没有。"""
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "fresh.db"))
-    store._CACHE.clear()
-
-    with closing(repository.connect()) as conn:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert store.TABLE in names
-        assert store._LEGACY_TABLE not in names
-        assert conn.execute(f"SELECT COUNT(*) FROM {store.TABLE}").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------- 时间戳

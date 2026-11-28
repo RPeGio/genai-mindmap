@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +22,7 @@ from app.agent.router import router
 from app.agent.stream import encode_event
 from app.contracts.source import Source, SourceKind
 from app.core.errors import register_error_handlers
+from app.db.errors import DatabaseError
 from app.generation.service import GenerationError
 
 app = FastAPI()
@@ -212,11 +212,15 @@ class SourcesFrameTest(unittest.TestCase):
         self.assertEqual(frames[0]["seq"], 1)
 
     def test_stream_still_ends_with_done_when_ingest_fails(self):
-        """入库失败不能把流打断：材料照样用，只是没进库。"""
+        """入库失败不能把流打断：材料照样用，只是没进库。
+
+        抛的是数据层现在真正会抛的 `DatabaseError`（`psycopg.Error` 的别名，见
+        `app/db/errors.py`），不是原来的 `sqlite3.OperationalError`。
+        """
         source = Source(kind=SourceKind.text, status="parsed", text="# 材料\n\n正文。")
 
         def boom(sources):
-            raise sqlite3.OperationalError("database is locked")
+            raise DatabaseError("database is locked")
 
         with patch("app.agent.router.remember_sources", boom):
             with patch("app.agent.router.run", return_value=_scripted(DoneEvent(seq=1))):
@@ -227,7 +231,7 @@ class SourcesFrameTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         frames = _frames(response.text)
-        # 入库抛的是 sqlite3 错误，被包成 error 帧后仍然以尾。
+        # 入库抛的是数据库错误，被包成 error 帧后仍然以尾。
         self.assertEqual(frames[-1]["type"], "error")
         self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))
 

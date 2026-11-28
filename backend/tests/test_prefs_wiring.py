@@ -123,8 +123,8 @@ def test_profile_db_has_no_row_until_refresh():
     from app.mindmaps import repository
 
     with closing(repository.connect()) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM style_profile").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM profile_vectors").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) AS total FROM style_profile").fetchone()["total"] == 0
+        assert conn.execute("SELECT COUNT(*) AS total FROM profile_vectors").fetchone()["total"] == 0
 
 
 def test_style_profile_is_not_written_into_runs_request():

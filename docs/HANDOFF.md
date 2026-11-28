@@ -24,7 +24,7 @@
 
 | 编号 | 日期 | 提出人 | 决策 | 状态与依据 |
 |---|---|---|---|---|
-| H0 | 2026-11-03 | 陈嘉涛提出评估，RPeGio 裁定 | 后端地基压缩：W1 只做统一错误体 + `urllib`→`httpx`，SQLAlchemy / Alembic / PG 迁移顺延到验收之后，v1 继续用 `sqlite3` | 已写入 `docs/PLAN.md` Q35；W1–W3 以"SQLite 单文件 + 备份脚本"兑现"含数据库"的考核要求 |
+| H0 | 2026-11-03 | 陈嘉涛提出评估，RPeGio 裁定 | 后端地基压缩：W1 只做统一错误体 + `urllib`→`httpx`，SQLAlchemy / Alembic / PG 迁移顺延到验收之后，v1 继续用 `sqlite3` | 已写入 `docs/PLAN.md` Q35；W1–W3 以"SQLite 单文件 + 备份脚本"兑现"含数据库"的考核要求。**后续（验收后已执行）**：PG 迁移这条顺延项已完成——存储换 PostgreSQL 16，"SQLite 单文件 + 备份脚本"退役、备份换 `pg_dump -Fc`；SQLAlchemy / Alembic 仍未引入且已判定不引入（第一轮把 `alembic` 当硬性前置，实测后推翻，改成幂等 DDL + `schema_migrations` 表）。**Q35 里真正永久生效的只剩"W1 只做两项"这一层压缩**，它当时的目的（不挤占契约 v2 的排期）已经达到 |
 | H0b | 2026-11-03 | 陈嘉涛提出评估，RPeGio 裁定 | 实时协作（F17 / Yjs）保留，但排期延后：W2 不设硬门，W3 视余量决定是否落地 | 已写入 `docs/PLAN.md` Q36；`NEXT-PLAN.md` 原"W2 不做协作"的提议不再成立 |
 | H1 | 2026-11-03 | RPeGio | 节点正文复用契约 v2 已有的 `Node.note`（`max_length=2000`），`label` 继续当短标题，**不收紧** 200 字上限 | 陈嘉涛在契约 v2 审查时认可（PR #13，2026-11-10 合入 `dev` 的 `9f015ab`）；后端随 PR #13 落地（`backend/app/contracts/mindmap.py`、`backend/tests/test_contract_v2.py`），前端随本轮 PR 接线：详情面板可编辑正文，保存/打开/导出都发 `note`，`toContractV1()` / `toExportV1()` 已删除 |
 | H2 | 2026-11-04 | RPeGio | 保存以**整棵树**为单位提交（`POST /api/mindmaps` 建图、`PUT /api/mindmaps/{id}` 带 `version`），不做字段级合并；编辑上限在前端也校验一遍（标题/节点 200 字、1000 节点、8 层、每节点 50 子节点），文案与后端一致 | 陈嘉涛在 R3 开发期即已认可（RPeGio 于 2026-11-10 复核转述）；实现见 PR #7（`dev` 的 `4594fd4`）与 PR #10（`28fbbe3`，上限随上游 `13cce17` 由 300 改 1000）；后端校验始终是唯一权威（`backend/app/contracts/mindmap.py`），前端 `src/mindmap/edits.ts` 的 `validateDraft()` 只为省一次 422 往返 |

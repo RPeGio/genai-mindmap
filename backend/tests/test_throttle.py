@@ -15,12 +15,13 @@
 """
 from __future__ import annotations
 
-import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.auth import identity, store, throttle
+from app.db.conn import Connection
+from app.db.errors import DatabaseError
 from app.main import app
 
 PASSWORD = "password123"
@@ -51,7 +52,7 @@ def _login(client: TestClient, username: str, password: str = PASSWORD,
                        headers=headers)
 
 
-def _db() -> sqlite3.Connection:
+def _db() -> Connection:
     from app.mindmaps import repository
 
     return repository.connect()
@@ -187,10 +188,10 @@ def test_an_empty_address_still_gets_a_bucket():
 def test_a_successful_login_clears_the_account_bucket():
     client = _register("clear_a")
     _fail(client, "clear_a", 5, ip="10.4.4.4")
-    assert any(row[0] == throttle.bucket_account("clear_a") for row in _rows())
+    assert any(row["bucket"] == throttle.bucket_account("clear_a") for row in _rows())
     response = _login(client, "clear_a", PASSWORD, ip="10.4.4.4")
     assert response.status_code == 200
-    assert not any(row[0] == throttle.bucket_account("clear_a") for row in _rows())
+    assert not any(row["bucket"] == throttle.bucket_account("clear_a") for row in _rows())
 
 
 def test_a_good_login_clears_the_account_bucket_but_not_the_ip_bucket():
@@ -206,9 +207,9 @@ def test_a_good_login_clears_the_account_bucket_but_not_the_ip_bucket():
     _fail(client, "clear_b", throttle.MAX_FAILURES, ip="10.5.5.5")
     _elapse("10.5.5.5", "clear_b", throttle.COOLDOWN_SECONDS + 0.1)
     assert _login(client, "clear_b", PASSWORD, ip="10.5.5.5").status_code == 200
-    assert not any(row[0] == throttle.bucket_account("clear_b") for row in _rows())
-    ip_row = [row for row in _rows() if row[0] == throttle.bucket_ip("10.5.5.5")]
-    assert ip_row and ip_row[0][1] >= throttle.MAX_FAILURES
+    assert not any(row["bucket"] == throttle.bucket_account("clear_b") for row in _rows())
+    ip_row = [row for row in _rows() if row["bucket"] == throttle.bucket_ip("10.5.5.5")]
+    assert ip_row and ip_row[0]["failures"] >= throttle.MAX_FAILURES
     # 同一个 IP 换个从没失败过的账号继续撞：那一次被放行（冷却已到），但紧接着
     # 又回到 429——IP 桶没有因为前一次成功而归零。
     _register("clear_c")
@@ -230,7 +231,7 @@ def test_clear_all_empties_the_table():
 def test_a_broken_throttle_table_lets_people_in(monkeypatch):
     """限速表坏了 → 放行。关掉保护比把所有人关在门外好；见模块头。"""
     def broken(**kwargs):
-        raise sqlite3.OperationalError("no such table")
+        raise DatabaseError("no such table")
 
     monkeypatch.setattr(throttle, "_connect", broken)
     assert throttle.retry_after(ip="10.7.7.7", username="whoever") == 0
@@ -243,7 +244,7 @@ def test_writing_a_failure_does_not_raise_when_the_table_is_gone(monkeypatch):
     client = _register("degrade_a")
 
     def broken(**kwargs):
-        raise sqlite3.OperationalError("disk I/O error")
+        raise DatabaseError("disk I/O error")
 
     monkeypatch.setattr(throttle, "_connect", broken)
     # 表坏了：仍要正常回答"密码不对"，而不是 500。
@@ -253,8 +254,9 @@ def test_writing_a_failure_does_not_raise_when_the_table_is_gone(monkeypatch):
 def test_the_table_is_created_by_the_repository():
     conn = _db()
     try:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        names = {row["table_name"] for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()")}
     finally:
         conn.close()
     assert throttle.TABLE in names

@@ -32,6 +32,16 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+# `scripts/` 不是包（没有 `__init__.py`），而 `_pg_tmp` 就躺在旁边。以
+# `python scripts/xxx.py` 跑时 sys.path[0] 本来就是 scripts/，但这不能靠运气：
+# 别人用 `-m`、或者在测试里按路径加载本文件时都不同。显式插一次，理由与
+# `evaluate_retrieval.py` 里插 `scripts/` 是同一个（它也要 import 旁边的 case 文件）。
+SCRIPTS = Path(__file__).resolve().parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import _pg_tmp  # noqa: E402  （必须在 sys.path 插好之后）
+
 CREDENTIALS = (
     "MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY",
     "MINDMAP_LLM_MODEL", "MINDMAP_EMBEDDING_BASE_URL", "MINDMAP_EMBEDDING_API_KEY",
@@ -208,8 +218,18 @@ def main(argv: list[str] | None = None) -> int:
 
     _fill_credentials()
     os.environ["MINDMAP_EXTERNAL_KNOWLEDGE"] = "0"
-    os.environ.setdefault("MINDMAP_DB_PATH", "data/measure_shapes.db")
+    # 库：临时 database（原先是 `data/measure_shapes.db` 这个临时文件）。用库而不是
+    # 文件之后，"每个脚本一个库"要从集群里建，建/删都要连 admin 库并 autocommit；
+    # 那套生命周期统一在 `_pg_tmp` 里，理由见那个模块的 docstring。这里必须**先有库
+    # 再跑**：`init_schema()` 也由 `_pg_tmp` 调，漏了它第一次 ingest 就会撞
+    # `relation "library_sources" does not exist`（`repository.connect()` 不再建表）。
+    with _pg_tmp.temp_database("mm_shapes"):
+        # 拆成 `_measure` 只为让 `with` 包住整段：这个脚本的读写全在那个循环里，
+        # 收尾（关池 → 删库）走 `with` 的出口，异常路径也照样清。
+        return _measure(args)
 
+
+def _measure(args: argparse.Namespace) -> int:
     cases = [case for case in CASES if not args.only or case["key"] == args.only]
     report: dict[str, list[dict]] = {}
     raw: list[dict] = []

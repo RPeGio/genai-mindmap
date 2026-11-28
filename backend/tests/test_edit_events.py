@@ -16,12 +16,10 @@
 
 最后一条单独说：它是刻意的取舍，不是容错偷懒。保存的语义是"用户的内容没丢"，
 为了统计丢掉一次真实保存，代价方向完全错了。同一个方向还有一条：
-`test_existing_table_gets_the_new_columns`——旧表补不上列时，`record()` 的异常被
-自己吞掉，事件会**全部静默丢失**，那正是这张表最擅长的那种坏法。
+`test_ensure_columns_adds_the_new_columns_to_an_existing_table`——旧表补不上列时，
+`record()` 的异常被自己吞掉，事件会**全部静默丢失**，那正是这张表最擅长的那种坏法。
 """
 from __future__ import annotations
-
-import sqlite3
 
 import pytest
 from fastapi import FastAPI
@@ -434,10 +432,15 @@ def _move_to_yesterday(map_id: str, *, events: bool = True) -> None:
 
     健康检查按**入库时刻**判日，所以这里改的是 `recorded_at` 而不是 `at`——改 `at`
     （前端时钟）测不出任何东西，那正是这个探测器要绕开的那一位。
+
+    时间串由**数据库**算（`to_char` 那套），不在 Python 里拼：`recorded_at` 的格式
+    是定宽 UTC 文本，Python 拼出来的字符串只要差一位，`recorded_at >= ?` 的字典序
+    比较就会在边界上错一天——而这条用例测的恰恰是"跨日窗口"。
     """
-    stamp = None
     with repository.connect() as conn, conn:
-        stamp = conn.execute("SELECT date('now','-1 day') || 'T12:00:00.000Z'").fetchone()[0]
+        stamp = conn.execute(
+            "SELECT to_char(((now() AT TIME ZONE 'utc')::date - 1), 'YYYY-MM-DD') "
+            "       || 'T12:00:00.000Z' AS stamp").fetchone()["stamp"]
         conn.execute("UPDATE mindmaps SET updated_at = ? WHERE id = ?", (stamp, map_id))
         if events:
             conn.execute("UPDATE edit_events SET recorded_at = ? WHERE map_id = ?",
@@ -551,12 +554,19 @@ def test_record_failure_does_not_fail_the_save(monkeypatch, caplog):
     """统计写失败 → 保存照常成功 + 一条 warning。
 
     这条用例锁的是取舍，不是容错：为了统计丢掉一次真实保存，方向是错的。
+
+    抛的异常类型从 `sqlite3.OperationalError` 换成了数据层现在的
+    `DatabaseError`（`psycopg.Error` 的别名，见 `app/db/errors.py`）。`record()` 自己
+    是 `except Exception` 兜的，所以这条用例在两类异常下都成立——但**写成本项目真正
+    会抛的那一种**，才不至于哪天有人把兜底收窄成 `except DatabaseError` 时这条用例
+    还在绿。
     """
+    from app.db.errors import DatabaseError
 
     class BrokenRepository:
         @staticmethod
         def connect():
-            raise sqlite3.OperationalError("disk I/O error")
+            raise DatabaseError("disk I/O error")
 
     monkeypatch.setattr(edits, "repository", BrokenRepository)
     with caplog.at_level("WARNING"):
@@ -573,46 +583,75 @@ def test_truncated_count_is_accepted_and_not_stored():
     assert summary["total"] == 1
 
 
-def test_repository_creates_the_table_on_connect():
-    """表在 `repository.connect()` 里建好，与 `mindmaps` / `runs` 同一时刻。
+def test_the_table_has_every_column_the_writers_use():
+    """终态表的列必须齐。
 
-    不这样做，读统计那条路就要多一个"发现表不存在 → 建表"的分支——而它会在
-    第一次有人打开面板时表现为一次 500。
+    **原来这条叫 `test_repository_creates_the_table_on_connect`，靠"连一次
+    `repository.connect()` 就把表建出来"来验**。换到 PostgreSQL 之后建表从
+    `connect()` 挪到了 `init_schema()`（lifespan / `conftest._test_schema` 里跑）：
+    PG 上每次连接重放 13 条 DDL 实测 2.458ms，而一次生成要开几十条连接，那条路
+    不能留。所以这里改成直接验终态表的列集，不再依赖"谁在什么时候建它"。
+
+    列集是最该锁的东西：`edits.record()` 的 INSERT 一旦撞上缺列，异常被它自己的
+    `except` 吞掉 → **所有编辑事件静默丢失**，而面板只是显示"0 次改动"。
     """
     with repository.connect() as conn:
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(edit_events)")]
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'edit_events'").fetchall()
+    columns = {str(row["column_name"]) for row in rows}
     assert {"map_id", "run_id", "actor", "kind", "node_id", "field",
             "before", "after", "depth", "subtree_size", "change_count",
-            "at", "recorded_at"} <= set(columns)
+            "at", "recorded_at"} <= columns
 
 
-def test_existing_table_gets_the_new_columns(tmp_path, monkeypatch):
-    """老库里的表**已经存在**，`CREATE TABLE IF NOT EXISTS` 不会给它补列。
+def test_ensure_columns_adds_the_new_columns_to_an_existing_table():
+    """老表缺列时能补上，且**不清空已有行**。
 
-    少这一步的后果不是报错，是 `edits.record()` 的 INSERT 抛 "no such column"、被它
-    自己的 `except` 吞掉 → 所有事件静默丢失。这条用例先用旧 DDL 建表，再连一次。
+    原来这条叫 `test_existing_table_gets_the_new_columns`，做法是"拿 sqlite3 建一张
+    旧 DDL 的表、改 `MINDMAP_DB_PATH` 指过去、再连一次"。那个做法在新形状下没有
+    对应物：库是一个服务端，不是可以被 `MINDMAP_DB_PATH` 指来指去的文件；而"补列"
+    这件事本身也从 `PRAGMA + ALTER + 吞 duplicate column` 换成了
+    `ADD COLUMN IF NOT EXISTS`（见 `app/db/schema.py`）。
+
+    所以这条改成直接验新契约：一张缺列的表面上调 `ensure_columns` 能补齐，而且
+    原有行还在、新列是 NULL——NULL 在这里有确切含义（"当时没记"），不做回填。
     """
-    legacy = tmp_path / "legacy.db"
-    with sqlite3.connect(legacy) as conn:
-        conn.execute("""CREATE TABLE edit_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, map_id TEXT NOT NULL, run_id TEXT,
+    from app.db import schema
+
+    table = "probe_edit_events"
+    with repository.connect() as conn, conn:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"""CREATE TABLE {table} (
+            id bigserial PRIMARY KEY, map_id TEXT NOT NULL, run_id TEXT,
             actor TEXT NOT NULL, kind TEXT NOT NULL, node_id TEXT, field TEXT,
-            before TEXT, after TEXT, depth INTEGER, at TEXT NOT NULL,
+            "before" TEXT, "after" TEXT, depth INTEGER, at TEXT NOT NULL,
             recorded_at TEXT NOT NULL)""")
-        conn.execute("INSERT INTO edit_events (map_id, actor, kind, at, recorded_at) "
-                     "VALUES ('old', 'user', 'update', 'x', 'x')")
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(legacy))
+        conn.execute(f"INSERT INTO {table} (map_id, actor, kind, at, recorded_at) "
+                     f"VALUES ('old', 'user', 'update', 'x', 'x')")
+    try:
+        with repository.connect() as conn, conn:
+            schema.ensure_columns(conn, table, {
+                "subtree_size": "INTEGER",
+                "change_count": "INTEGER",
+            })
+        with repository.connect() as conn:
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = ?",
+                (table,)).fetchall()
+            columns = {str(row["column_name"]) for row in rows}
+            kept = conn.execute(f"SELECT COUNT(*) AS total FROM {table}").fetchone()["total"]
+            row = conn.execute(
+                f"SELECT subtree_size, change_count FROM {table}").fetchone()
 
-    with repository.connect() as conn:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(edit_events)")}
-        kept = conn.execute("SELECT COUNT(*) FROM edit_events").fetchone()[0]
-
-    assert {"subtree_size", "change_count"} <= columns
-    # 不做迁移：老行还是 NULL，而 NULL 在这里有确切含义（"当时没记"）。
-    assert kept == 1
-    with repository.connect() as conn:
-        row = conn.execute("SELECT subtree_size, change_count FROM edit_events").fetchone()
-    assert row[0] is None and row[1] is None
+        assert {"subtree_size", "change_count"} <= columns
+        # 不做数据回填：老行还是 NULL，而 NULL 在这里有确切含义（"当时没记"）。
+        assert int(kept) == 1
+        assert row["subtree_size"] is None and row["change_count"] is None
+    finally:
+        with repository.connect() as conn, conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 @pytest.mark.parametrize(

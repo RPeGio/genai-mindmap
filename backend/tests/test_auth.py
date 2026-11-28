@@ -192,8 +192,7 @@ def test_an_expired_session_stops_working():
     assert store.session_user(token) is not None
 
     with closing(repository.connect()) as conn, conn:
-        conn.execute("UPDATE sessions SET expires_at = "
-                     "strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 seconds')")
+        conn.execute("UPDATE sessions SET expires_at = nowstamp(-1)")
     assert store.session_user(token) is None
 
 
@@ -220,16 +219,27 @@ def test_changing_the_password_of_a_vanished_user_is_false():
 
 
 def test_the_schema_comes_up_with_the_repository():
-    """`repository.connect()` 建表：中间件在链最前面读它，不能等第一条请求建。"""
+    """表的形状由 `init_schema()` 建好：中间件在链最前面读它，不能等第一条请求建。
+
+    原来这条查 `sqlite_master` 验"连一次就建表"。建表已经挪到 lifespan 的
+    `init_schema()`（见 `docs/PG-MIGRATION-PLAN.md` D1-D3），所以判据换成
+    "那两张表在 `information_schema` 里、每个写者用的列都在"。
+    """
     from contextlib import closing
 
     from app.mindmaps import repository
 
     with closing(repository.connect()) as conn:
-        names = {row["name"] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert {store.USER_TABLE, store.SESSION_TABLE} <= names
-    # 幂等：再来一次不报错。
+        tables = {row["table_name"] for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()")}
+        assert {store.USER_TABLE, store.SESSION_TABLE} <= tables
+        columns = {row["column_name"] for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ?",
+            (store.USER_TABLE,))}
+    assert {"id", "username", "password_hash", "created_at"} <= columns
+    # 幂等：再来一次不报错（`ensure_schema` 保留成薄壳，供直接拿空库跑脚本时用）。
     with closing(repository.connect()) as conn:
         store.ensure_schema(conn)
 

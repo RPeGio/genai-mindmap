@@ -24,13 +24,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 
 import pytest
 from conftest import guest_client
 
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
+from app.db.errors import DatabaseError
 from app.knowledge import library, shelf
 from app.mindmaps import repository
 
@@ -89,7 +89,7 @@ def _insert_raw_map(map_id: str, content: str) -> None:
     with repository.connect() as conn:
         conn.execute(
             "INSERT INTO mindmaps (id, version, content, updated_at) "
-            "VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            "VALUES (?, 1, ?, nowstamp())",
             (map_id, content),
         )
 
@@ -336,7 +336,7 @@ def _stamp(source_id: str, stamp: str) -> None:
 def test_listing_survives_a_broken_library(client, monkeypatch):
     """库读不出来时列表空着返回，不把入口整个打成 500。"""
     def boom(*args, **kwargs):
-        raise sqlite3.OperationalError("no such table: library_sources")
+        raise DatabaseError("no such table: library_sources")
 
     monkeypatch.setattr(library, "list_sources", boom)
 
@@ -354,7 +354,7 @@ def test_broken_library_on_preview_is_503_not_404(client, monkeypatch):
     `test_unknown_source_is_404` 覆盖。
     """
     def boom(source_id):
-        raise sqlite3.OperationalError("no such table: library_sources")
+        raise DatabaseError("no such table: library_sources")
 
     monkeypatch.setattr(library, "load", boom)
 
@@ -399,7 +399,7 @@ def test_listing_survives_a_broken_mindmap_table(client, monkeypatch):
     _ingest(_material(1))
 
     def boom(*args, **kwargs):
-        raise sqlite3.OperationalError("no such table: mindmaps")
+        raise DatabaseError("no such table: mindmaps")
 
     monkeypatch.setattr(repository, "list_maps", boom)
 

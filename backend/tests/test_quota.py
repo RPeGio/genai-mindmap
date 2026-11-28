@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 from typing import Any
 from unittest.mock import patch
 
@@ -32,6 +31,8 @@ from app.agent.contracts import AgentRunRequest, DoneEvent, RunBudget
 from app.agent.router import router
 from app.contracts.mindmap import MindMapContent
 from app.core.errors import register_error_handlers
+from app.db.conn import Connection
+from app.db.errors import DatabaseError
 from app.generation import free_models, quota
 from app.generation.service import GenerationError
 from app.settings import store
@@ -72,7 +73,7 @@ def _clean():
     free_models.reset()
 
 
-def _db() -> sqlite3.Connection:
+def _db() -> Connection:
     from app.mindmaps import repository
 
     return repository.connect()
@@ -213,7 +214,7 @@ def test_yesterday_rows_are_cleaned_up(monkeypatch):
         conn.close()
     assert len(_rows()) == 1
     quota.consume("10.0.0.2")
-    assert [row[1] for row in _rows()] == [quota.day_key()]
+    assert [row["day"] for row in _rows()] == [quota.day_key()]
 
 
 def test_seconds_until_tomorrow_is_within_a_day():
@@ -241,7 +242,7 @@ def test_a_broken_table_lets_everyone_in(monkeypatch, caplog):
     _enable(monkeypatch)
 
     def broken():
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     with patch.object(quota, "_connect", new=broken):
         with caplog.at_level("ERROR"):
@@ -255,7 +256,7 @@ def test_a_failed_refund_only_warns(monkeypatch, caplog):
     _enable(monkeypatch)
 
     def broken():
-        raise sqlite3.OperationalError("database is locked")
+        raise DatabaseError("database is locked")
 
     with patch.object(quota, "_connect", new=broken):
         with caplog.at_level("WARNING"):
@@ -267,8 +268,9 @@ def test_the_table_comes_up_with_the_repository():
     quota.clear_all()
     conn = _db()
     try:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        names = {row["table_name"] for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()")}
     finally:
         conn.close()
     assert quota.TABLE in names
@@ -552,4 +554,4 @@ def test_a_caller_chosen_address_is_not_charged_against_the_public_pool(
         _post("chosen")
     assert quota.remaining("10.0.0.1") == quota.DEFAULT_LIMIT
     before = _rows()
-    assert before == [] or all(row[2] == 0 for row in before)
+    assert before == [] or all(row["used"] == 0 for row in before)

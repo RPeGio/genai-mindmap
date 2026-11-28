@@ -7,16 +7,23 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
-import tempfile
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-# 与 tests/conftest.py 同一套隔离：无凭证、开关全关、库落临时目录。脚本能被反复跑，
-# 也就不会碰到仓库里的 backend/data/mindmaps.db。
-os.environ["MINDMAP_DB_PATH"] = str(Path(tempfile.mkdtemp()) / "mindmaps.db")
+import _pg_tmp  # noqa: E402  （脚本以 `python scripts/...` 跑，sys.path[0] 就是本目录）
+
+# 与 tests/conftest.py 同一套隔离：无凭证、开关全关、库是**一次性 database**。
+# 脚本能被反复跑，也就不会碰上 `MINDMAP_PG_DSN` 指的那个库（以前是往
+# `backend/data/mindmaps.db` 旁边塞一个临时文件，库从独立进程起之后没有"文件"了）。
+#
+# 为什么用模块级 create + atexit 而不是 `with`：这个脚本没有 `main()`，从第 98 行起
+# 就是顶层直跑（中间还夹着 `TestClient` 的请求）；没有一处能包住整段。atexit 就是
+# 收尾，`close()` 幂等（先关池再 DROP，异常退出也会走到）。
+_DB = _pg_tmp.TempDatabase.create("mm_prefs")
+atexit.register(_DB.close)
 for name in ("DASHSCOPE_API_KEY", "MINDMAP_LLM_API_KEY", "MINDMAP_LLM_BASE_URL",
              "MINDMAP_LLM_MODEL", "MINDMAP_EMBEDDING_API_KEY", "MINDMAP_NEO4J_URI",
              "MINDMAP_NEO4J_PASSWORD"):

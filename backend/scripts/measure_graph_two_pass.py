@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import os
 import re
@@ -280,6 +281,13 @@ def _label_of(content, node_id: str) -> str:
 
 
 async def main(argv: list[str]) -> int:
+    # 退出前关池：本脚本读真库、没有 `_pg_tmp` 帮忙收尾，不关的话 psycopg_pool 的
+    # 工作线程会拖 5 秒并打 `couldn't stop thread 'mindmap-worker-*'`——那不是错误，
+    # 只是没人关池，但看起来像错误，会把真正的失败混进噪声里。池是懒建的，没碰库时
+    # 这里是空操作。
+    from app.db import pool as _pool_module
+
+    atexit.register(_pool_module.close_pool)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repeat", type=int, default=2, help="每组跑几次")
     parser.add_argument("--branches", type=int, default=6)
@@ -289,7 +297,11 @@ async def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     _fill_env_from_registry()
-    os.environ.setdefault("MINDMAP_DB_PATH", str(BACKEND / "data" / "mindmaps.db"))
+    # 这里**刻意不建临时库**：本脚本读的是建图那一刻入库的那四份材料（下面按
+    # filename 找 source_id），换一个空库等于每次都在 `missing` 上返回 2。库由
+    # `MINDMAP_PG_DSN` 指定（没配就落到 `app.db.pool.DEFAULT_DSN`），也就是
+    # `scripts/ingest_graph_corpus.py` 跑过的那个真库——建图与量图必须看同一个库，
+    # 否则边上的 source_id 与请求里的临时 id 对不上，`subgraph` 静默回退全图。
     os.environ["MINDMAP_EXTERNAL_KNOWLEDGE"] = "0"
     os.environ.setdefault("MINDMAP_NEO4J_URI", "bolt://127.0.0.1:7687")
     os.environ.setdefault("MINDMAP_NEO4J_USER", "neo4j")

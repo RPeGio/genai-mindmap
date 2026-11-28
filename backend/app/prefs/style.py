@@ -43,7 +43,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
 import statistics
 from contextlib import closing
 from dataclasses import dataclass, field, replace
@@ -53,6 +52,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from app.agent import shapes
 from app.contracts.mindmap import DiagramContent
+from app.db.conn import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ REPEAT_CAP = 2
 #: 一次读进几百 MB 的 candidate）。
 MAX_RUNS = 400
 
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_NOW = "nowstamp()"
 
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {STYLE_TABLE} (
     owner      TEXT NOT NULL DEFAULT '',
@@ -118,18 +118,6 @@ _CREATE = f"""CREATE TABLE IF NOT EXISTS {STYLE_TABLE} (
     confidence REAL NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (owner, key)
-)"""
-
-#: 老库里 `style_profile` 的主键只有 `key`。SQLite 改不了主键，只能改名重建
-#: （与 `user_prefs` / `model_settings` 同一套两段式，理由也一样）。
-_LEGACY_TABLE = f"{STYLE_TABLE}_legacy_v1"
-
-_LEGACY_CREATE = f"""CREATE TABLE {_LEGACY_TABLE} (
-    key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,
-    samples    INTEGER NOT NULL,
-    confidence REAL NOT NULL,
-    updated_at TEXT NOT NULL
 )"""
 
 #: 老表的行归谁：无主（`''`）。部署方第一次 `refresh()` 时
@@ -243,46 +231,21 @@ class Observation:
 # ---------------------------------------------------------------- 建表
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    """建表。由 `repository.connect()` 在同一连接上调用，幂等。
+def ensure_schema(conn: Connection) -> None:
+    """建表。幂等。
 
-    与 `memory_items` / `library_sources` 建在同一时刻的理由一样：读它的路径
-    （每次生成前拼提示词）在热路径上，多一个"发现表不存在 → 建表"的分支只会在
-    最不该出错的地方多一条可能出错的路径。
+    **这里原来是三段式就地迁移**：老库的 `style_profile` 主键只有 `key`，加 `owner`
+    之后主键必须变成 `(owner, key)`（一个全局画像等于让新用户在第一次生成时就拿到
+    别人的形状结论，而那段文字是直接进提示词的）。SQLite 改不了主键，只能
+    "改名 → 建新表 → 搬行 → 删老表"，每一步都 commit。
 
-    **加 `owner` 之后主键必须变成 `(owner, key)`**：画像描述的是"这个人的图长什么
-    样"，一个全局画像等于让新用户在第一次生成时就拿到别人的形状结论——而那段文字
-    是直接进提示词的，比列表里看到一行别人的数据更影响输出。SQLite 改不了主键，
-    所以走两段式：改名 → 建新表 → 搬行 → 删老表。每一步都 commit（`connect()` 的
-    调用方不会替我们提交，见 `settings.store._migrate_legacy` 的实测记录）。
+    那条路的前提在 PostgreSQL 上不成立：`init_schema()` 建出来的就是终态表，
+    老库数据由一次性导入脚本搬成终态形状。所以这里只剩建表本身。
+
+    `_adopt_legacy()` 不受影响——它不是 schema 迁移，是"老库无主行归部署方"的
+    业务认领。`owner = ''` 在新库里自然不存在，于是它在新库上是零成本的空转。
     """
     conn.execute(_CREATE)
-    columns = {
-        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({STYLE_TABLE})")}
-    legacy = _table_exists(conn, _LEGACY_TABLE)
-    if not columns or ("owner" in columns and not legacy):
-        return
-    if "owner" not in columns:
-        # 老表：先改名，再建新表。改名之后 `PRAGMA table_info(STYLE_TABLE)` 是空集，
-        # 所以后面必须重新查，不能复用上面的 `columns`。
-        conn.execute(f"ALTER TABLE {STYLE_TABLE} RENAME TO {_LEGACY_TABLE}")
-        conn.commit()
-    conn.execute(_CREATE)
-    if legacy or _table_exists(conn, _LEGACY_TABLE):
-        conn.execute(
-            f"INSERT OR IGNORE INTO {STYLE_TABLE} "
-            f"(owner, key, value, samples, confidence, updated_at) "
-            f"SELECT ?, key, value, samples, confidence, updated_at FROM {_LEGACY_TABLE}",
-            (_NO_OWNER,))
-        conn.commit()
-        conn.execute(f"DROP TABLE IF EXISTS {_LEGACY_TABLE}")
-        conn.commit()
-
-
-def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
-    return row is not None
 
 
 def _owner() -> str:
@@ -317,7 +280,7 @@ def _adopt_legacy() -> None:
                        type(exc).__name__)
 
 
-def _connect() -> sqlite3.Connection:
+def _connect() -> Connection:
     from app.mindmaps import repository
 
     return repository.connect()

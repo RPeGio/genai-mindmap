@@ -23,6 +23,28 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    # 测试库。迁移到 PostgreSQL 后 pytest 不再是"建个临时文件库"就行：conftest 会
+    # 真的连一个 PG，每个用例 `DELETE FROM` 全表清场（见 backend/tests/conftest.py
+    # 的 _test_schema）。没有这一个 service，整套后端测试在 CI 上连不上库直接全红。
+    #
+    # 版本钉 16（不是 postgres:latest）：生产装的就是 16，`pg_dump`/`pg_restore` 与
+    # 客户端版本相关，CI 用别的版本测出来的东西不可信。
+    # health-cmd 那串不是可选的：容器起来了但 PG 还在 initdb/恢复 WAL 时端口是通的、
+    # 查询会 57P03；没有 healthcheck 的 `docker run` 只保证"进程起了"，pytest 会在
+    # 几秒的长窗口里撞上这个状态并留下莫名其妙的 connection refused。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mindmap_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       # 几个"逐字节对比旧版本"的测试用 `git show <commit>:path` 载历史文件
       # （`test_edges` / `test_agent_diagram_type` / `test_external_directions`），
@@ -45,7 +67,13 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov
 
+      # env 里的 DSN 必须显式给：conftest 的默认值指向开发机的
+      # postgresql://postgres@127.0.0.1:55433/mindmap_test（那是本机自定义端口，
+      # 为了不跟系统装的 PG 抢 5432），CI 的 service 映射在标准 5432 上、且要求
+      # 口令。漏了这一行不会被 skip，而是每条用例都在 fixture 里连接失败。
       - name: Test
+        env:
+          MINDMAP_TEST_DSN: postgresql://postgres:postgres@localhost:5432/mindmap_test
         run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=0
 
       # 前端的契约类型由这份快照生成。忘了重新导出时，本地那条 pytest

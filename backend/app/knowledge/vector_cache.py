@@ -1,4 +1,4 @@
-"""块向量的 SQLite 缓存：混合检索里省掉重复的 embedding 调用。
+"""块向量的缓存（PostgreSQL `chunk_vectors` 表）：混合检索里省掉重复的 embedding 调用。
 
 **为什么按文本哈希缓存，而不是按 `source_id`**：`Source.id` 是
 `uuid4()` 默认值，同一份材料每次请求都会拿到新 id——按它缓存的命中率恒为 0，
@@ -12,11 +12,15 @@
 会连带丢掉那些仍被别处引用的向量。代价是这张表**没有** `source_id` 列，所以
 "某个来源的向量"永远查不出来——那是刻意的，它是缓存，不是索引。
 
-**为什么和导图共用同一个库**（`mindmaps.repository.db_path()`）：省掉一个文件、
-一套备份、一套"测试要记得改路径"的环境变量。风险是事务隔离——`INSERT OR IGNORE`
-是单条自动提交的短写，不与 `update_map` 的乐观锁共用事务，SQLite 的库级写锁
-在毫秒级争用下由 `timeout=10` 吸收。真出现写冲突时最坏结果是这轮缓存没写进去
-（下次重新 embed），不会破坏导图记录。
+**为什么和导图共用同一个库**（`mindmaps.repository.dsn()`）：省掉一套备份、
+一套"测试要记得改连接串"的环境变量。风险是事务隔离——写入是单条自动提交的短写，
+不与 `update_map` 的乐观锁共用事务；PG 的行锁只锁那一行，真出现写冲突时最坏结果
+是这轮缓存没写进去（下次重新 embed），不会破坏导图记录。
+
+**向量列是 `bytea`，不是 pgvector**：仓库里向量的相似度由纯 Python 算
+（`app/knowledge/service.py` 的混合检索），没有 ANN 索引需求；上 pgvector 只是
+多一个扩展依赖、多一份 HNSW 内存（2C2G 上不划算），换不来本项目的查询方式。
+打包格式（小端 float32）与 `memory_items` 逐字节同构，见 `pack()` 的 docstring。
 
 **上限保护**：行数到 `MAX_ROWS` 就不再写入，只读已有。向量表是纯缓存，丢掉
 它只会变慢，不会丢数据，所以宁可停写也不要让它吃掉磁盘。
@@ -25,10 +29,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import sqlite3
 import struct
 from contextlib import closing
 
+from app.db.conn import Connection
+from app.db.errors import DatabaseError
 from app.mindmaps import repository
 
 logger = logging.getLogger(__name__)
@@ -39,14 +44,16 @@ VECTOR_TABLE = "chunk_vectors"
 # 被静默跨过的体积，所以到线就停写。
 MAX_ROWS = 200_000
 
-# SQLite 单条语句的变量上限是 999（老版本），一次 IN 查询按 400 分批留足余量。
+#: 一次 IN 查询按 400 分批。SQLite 那里是"单条语句最多 999 个变量"的上限；PG 的
+#: 上限是 65535，但保持 400 不动：批越小，单条语句的往返与内存越可控，而这条路的
+#: 瓶颈从来不是批大小。
 _QUERY_BATCH = 400
 
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {VECTOR_TABLE} (
     text_hash TEXT NOT NULL,
     model     TEXT NOT NULL,
     dim       INTEGER NOT NULL,
-    vector    BLOB NOT NULL,
+    vector    bytea NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (text_hash, model)
 )"""
@@ -84,12 +91,12 @@ _pack = pack
 _unpack = unpack
 
 
-def _open() -> sqlite3.Connection | None:
+def _open() -> Connection | None:
     """开连接并确保表存在。任何失败都返回 None：缓存不可用不是错误。"""
     try:
         conn = repository.connect()
         conn.execute(_CREATE)
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("向量缓存不可用：%s", type(exc).__name__)
         return None
     return conn
@@ -123,8 +130,8 @@ def get_vectors(hashes: list[str], model: str) -> dict[str, list[float]]:
 def put_vectors(items: list[tuple[str, list[float]]], model: str) -> int:
     """写入向量；同 (文本, 模型) 已有记录时忽略。返回真正落库的条数。
 
-    `INSERT OR IGNORE` 而不是 REPLACE：同一段文本同一模型算出来的向量本来就
-    应该一样，重复写只会白加一次磁盘写和一次 WAL 抖动。
+    `ON CONFLICT DO NOTHING` 而不是 REPLACE：同一段文本同一模型算出来的向量本来
+    就应该一样，重复写只会白加一次磁盘写和一次 WAL 抖动。
     """
     if not items:
         return 0
@@ -134,7 +141,7 @@ def put_vectors(items: list[tuple[str, list[float]]], model: str) -> int:
     written = 0
     with closing(conn), conn:
         # 上限检查放在写入前，一次检索只走一次 COUNT。
-        total = conn.execute(f"SELECT COUNT(*) FROM {VECTOR_TABLE}").fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) AS total FROM {VECTOR_TABLE}").fetchone()["total"]
         if total >= MAX_ROWS:
             logger.info("向量缓存已达上限 %d 行，本次只读不写（%d 条未落库）",
                         MAX_ROWS, len(items))
@@ -143,9 +150,10 @@ def put_vectors(items: list[tuple[str, list[float]]], model: str) -> int:
             if not vector:
                 continue
             cursor = conn.execute(
-                f"INSERT OR IGNORE INTO {VECTOR_TABLE} "
+                f"INSERT INTO {VECTOR_TABLE} "
                 f"(text_hash, model, dim, vector, created_at) "
-                f"VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                f"VALUES (?, ?, ?, ?, nowstamp()) "
+                f"ON CONFLICT (text_hash, model) DO NOTHING",
                 (hash_value, model, len(vector), _pack(vector)),
             )
             written += cursor.rowcount

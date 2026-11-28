@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 import time
+
+from app.db.conn import Connection
+from app.db.errors import DatabaseError
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +54,12 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
 """
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: Connection) -> None:
     """建表。由 `repository.connect()` 在同一条连接上调用，幂等。"""
     conn.execute(_CREATE)
 
 
-def _connect() -> sqlite3.Connection:
+def _connect() -> Connection:
     """拿连接。函数内 import 避免环，与 `auth/store.py` 同一手法。"""
     from app.mindmaps import repository
 
@@ -120,7 +122,7 @@ def seconds_until_tomorrow(now: float | None = None) -> int:
     return max(1, int(midnight + 24 * 3600 - current))
 
 
-def _used(conn: sqlite3.Connection, key: str, day: str) -> int:
+def _used(conn: Connection, key: str, day: str) -> int:
     row = conn.execute(
         f"SELECT used FROM {TABLE} WHERE bucket = ? AND day = ?", (key, day)
     ).fetchone()
@@ -136,7 +138,7 @@ def remaining(ip: str) -> int:
             return max(0, limit() - _used(conn, key, day))
         finally:
             conn.close()
-    except sqlite3.Error as error:
+    except DatabaseError as error:
         logger.error("免费额度表读不出来，本次按不限量处理：%s", error)
         return limit()
 
@@ -148,34 +150,39 @@ def consume(ip: str) -> bool:
     看到"还剩 1 次"然后都放行——额度是给"发得出去"设的闸，闸必须在门口。
     代价是失败的那次可能白扣一格，所以 `refund()` 是这套设计的一部分，不是补丁。
 
-    `BEGIN IMMEDIATE`：读-判-写三步要原子。用默认的延迟事务时，两个进程/线程可以
-    都读到旧值再各自 +1（与 `runs.begin()` 同一个理由）。
+    **原子性靠一条语句，不再靠 `BEGIN IMMEDIATE`**：原来那段是"读 used → 判上限 →
+    写 used + 1"，靠 SQLite 的写锁把三步圈在一起。PG 上没有 `BEGIN IMMEDIATE`
+    这种"一开事务就拿写锁"的东西（`SELECT ... FOR UPDATE` 也能做到，但要多一次
+    往返、还要处理"行不存在时锁不到"），所以改成一条
+    `INSERT ... ON CONFLICT DO UPDATE ... WHERE used < 上限 RETURNING used`：
+    上限判定进了 `ON CONFLICT` 的 `WHERE`，写与判在同一条语句里由数据库裁决，
+    并发下不会再出现"两个请求都读到 1"。
+
+    返回 `None`（拿不到 RETURNING 行）就是超额。实测：上限 2 时连续四次
+    `consume` 返回 `[True, True, False, False]`，最终 `used == 2`。
     """
     key, day = bucket(ip), day_key()
     ceiling = limit()
     try:
         conn = _connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
             # 顺手清掉旧日期的行：表只按天用，留着只是一直变大。放在这里是因为
             # 它是唯一一处"一定会写"的地方（与 `throttle` 把清理留给写入同一手法）。
             conn.execute(f"DELETE FROM {TABLE} WHERE day <> ?", (day,))
-            used = _used(conn, key, day)
-            if used >= ceiling:
-                conn.rollback()
-                return False
-            conn.execute(
+            row = conn.execute(
                 f"INSERT INTO {TABLE} (bucket, day, used, last_at) VALUES (?, ?, 1, ?) "
-                f"ON CONFLICT(bucket, day) DO UPDATE SET used = used + 1, last_at = excluded.last_at",
-                (key, day, time.time()),
-            )
+                f"ON CONFLICT (bucket, day) DO UPDATE SET used = {TABLE}.used + 1, "
+                f"last_at = excluded.last_at WHERE {TABLE}.used < ? "
+                f"RETURNING used",
+                (key, day, time.time(), ceiling),
+            ).fetchone()
             conn.commit()
-            return True
+            return row is not None
         finally:
             conn.close()
-    except sqlite3.Error as error:
-        # 见模块 docstring：读不出来就放开。这里**不**吞 `OperationalError` 之外
-        # 的东西——那会是代码 bug，让它冒出来。
+    except DatabaseError as error:
+        # 见模块 docstring：读不出来就放开。这里**不**吞别的异常——
+        # 那会是代码 bug，让它冒出来。
         logger.error("免费额度表写不进去，本次按不限量处理：%s", error)
         return True
 
@@ -186,7 +193,6 @@ def refund(ip: str) -> None:
     try:
         conn = _connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 f"UPDATE {TABLE} SET used = used - 1 WHERE bucket = ? AND day = ? AND used > 0",
                 (key, day),
@@ -194,7 +200,7 @@ def refund(ip: str) -> None:
             conn.commit()
         finally:
             conn.close()
-    except sqlite3.Error as error:
+    except DatabaseError as error:
         # 还不回去只是多扣一次，比抛出去让一条已经结束的流变成 500 好。
         logger.warning("免费额度没能退回（%s），这次会多扣一格", error)
 
@@ -209,7 +215,7 @@ def clear_all() -> int:
             return int(deleted)
         finally:
             conn.close()
-    except sqlite3.Error as error:
+    except DatabaseError as error:
         logger.error("免费额度表清不掉：%s", error)
         return 0
 

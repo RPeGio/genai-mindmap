@@ -103,7 +103,7 @@ STATUS_DONE = "done"
 STATUS_EMPTY = "empty"
 STATUS_FAILED = "failed"
 
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_NOW = "nowstamp()"
 
 
 # ---------------------------------------------------------------- 提示词

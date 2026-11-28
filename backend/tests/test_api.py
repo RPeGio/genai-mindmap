@@ -1,46 +1,28 @@
 """通过 ASGI 请求验证导图持久化与契约版本兼容，不访问第三方模型。"""
 import asyncio
 import json
-import os
-import tempfile
 import unittest
 import uuid
-from pathlib import Path
-from unittest.mock import patch
 from app.main import app
-
-BACKEND = Path(__file__).resolve().parents[1]
 
 #: 门禁要求"有身份"，而这个文件手写 ASGI scope、不经过 `TestClient` 的 cookie 罐。
 #: 直接给一个合法的游客 cookie：**得用 `store.sign_guest()` 现签**，光有 32 位
 #: 小写十六进制不够——游客 cookie 现在是 `<id>.<hmac>`，裸 id 会被当成坏 cookie
 #: 等价于没 cookie（`store.read_guest` 返回 None），于是每个请求都 401。
-#: 签名密钥从库路径派生，所以必须在 `MINDMAP_DB_PATH` 打好之后才签（见 `_cookie()`）。
+#: 签名密钥从连接串派生（`dsn()`），所以必须在 `MINDMAP_PG_DSN` 定好之后才签
+#: （见 `_guest_cookie()`；`conftest.clean_env` 已经在用例开始前设好）。
 #: **同一个测试类里所有请求共用这一个 id**——不共用的话第二次 `PUT` 会撞上
 #: `map_forbidden`（图归上一个游客所有），那看起来像隔离出了 bug，其实是测试自己换了个人。
 GUEST_ID = uuid.uuid4().hex
 
 
 def _guest_cookie() -> bytes:
-    """现签一次游客 cookie。**不能提到模块级常量**：那时 `MINDMAP_DB_PATH` 还没打。"""
+    """现签一次游客 cookie。**不能提到模块级常量**：那时 DSN 还没定下来。"""
     from app.auth import store as auth_store
     return f"mm_guest={auth_store.sign_guest(GUEST_ID)}".encode()
 
 
 class ApiTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        data = BACKEND / "data"
-        data.mkdir(exist_ok=True)
-        cls.tmp = tempfile.TemporaryDirectory(dir=data, ignore_cleanup_errors=True)
-        cls.env = patch.dict(os.environ, {"MINDMAP_DB_PATH": str(Path(cls.tmp.name) / "test.db")})
-        cls.env.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.env.stop()
-        cls.tmp.cleanup()
-
     def call(self, path, method="GET", data=None):
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else b""
 

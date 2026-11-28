@@ -102,13 +102,15 @@ def _forbidden(*args, **kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _isolated(monkeypatch, tmp_path):
+def _isolated(monkeypatch):
     # `conftest.py` 的全局默认是"无凭证 + 开关关"。这个文件测的正是向量路，
     # 显式打开开关；凭证仍由各用例按需 `_keyed()` 配，否则"没配置"的用例
     # 会被这里的默认值掩盖掉。
+    #
+    # 库的隔离由 `conftest.fresh_db` 负责（每用例清表），这里不再建临时库文件：
+    # `MINDMAP_DB_PATH` 已废除，写它既不起作用、又会让人以为隔离还靠文件。
     monkeypatch.setenv("MINDMAP_HYBRID_SEARCH", "1")
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "vectors.db"))
     # 重试退避在测试里没有意义，别真的等 0.5 + 1.0 秒
     monkeypatch.setattr(embedding, "RETRY_BACKOFF", 0.0)
 

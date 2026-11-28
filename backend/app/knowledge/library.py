@@ -79,13 +79,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
 from uuid import uuid4
 
 from app.contracts.source import Source, SourceKind, SourceMetadata
+from app.db.conn import Connection, Row
+from app.db.errors import DatabaseError, UniqueViolation
 from app.mindmaps import repository
 
 logger = logging.getLogger(__name__)
@@ -93,9 +94,13 @@ logger = logging.getLogger(__name__)
 SOURCES_TABLE = "library_sources"
 CHUNKS_TABLE = "library_chunks"
 
-# 建表语句与 `mindmaps.repository.connect()` 里那条 `CREATE TABLE IF NOT EXISTS`
-# 是同一套写法、同一时刻执行（见 `ensure_schema`）。没有迁移脚本：这三条全部幂等，
-# 而且库文件是单机的、只有一个写入方，读时补齐比"记得跑脚本"可靠。
+# 建表语句与 `app/db/schema.py` 里那套是同一套写法、同一时刻执行（见 `ensure_schema`）。
+# 没有迁移脚本：这几条全部幂等，启动期跑一遍就够。
+#
+# **`"end"` 必须带双引号**：`END` 是 SQL 关键字（`CASE ... END`、`BEGIN ... END` 的
+# 结束标记），PG 的解析器在列位置直接拒绝它——实测 `CREATE TABLE t (start INT, end
+# INT)` 报 `syntax error at or near "end"`。SQLite 不把它当保留字，所以老代码里
+# 这一列是裸写的；迁移时每一处 SQL 都得加引号，漏一处的表现是"建表成功、查询报错"。
 CREATE_SOURCES = f"""CREATE TABLE IF NOT EXISTS {SOURCES_TABLE} (
     id            TEXT PRIMARY KEY,
     content_hash  TEXT NOT NULL,
@@ -109,43 +114,46 @@ CREATE_SOURCES = f"""CREATE TABLE IF NOT EXISTS {SOURCES_TABLE} (
 )"""
 
 CREATE_CHUNKS = f"""CREATE TABLE IF NOT EXISTS {CHUNKS_TABLE} (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         bigserial PRIMARY KEY,
     source_id  TEXT NOT NULL REFERENCES {SOURCES_TABLE}(id) ON DELETE CASCADE,
     start      INTEGER NOT NULL,
-    end        INTEGER NOT NULL,
+    "end"      INTEGER NOT NULL,
     level      INTEGER NOT NULL,
     parent     INTEGER,
-    UNIQUE(source_id, start, end, level)
+    UNIQUE(source_id, start, "end", level)
 )"""
 
 CREATE_CHUNKS_INDEX = (
     f"CREATE INDEX IF NOT EXISTS idx_{CHUNKS_TABLE}_source ON {CHUNKS_TABLE}(source_id)")
 
-# 时间格式与 `mindmaps` 表完全一致（SQLite 的 %f 是毫秒，不是微秒）。
-# 不为好看：`last_used_at` 参与淘汰比较，两处格式不同就会在边界上错一天。
-# 所以 `prune` 的 cutoff 也在 SQL 里生成，不在 Python 里拼——拼出来的 Python
+# 时间格式与 `mindmaps` 表完全一致。`nowstamp()` 是 `app/db/schema.py` 在 PG 上建的
+# 服务器端函数，产出与 SQLite `strftime('%Y-%m-%dT%H:%M:%fZ','now')` 逐字节同形的
+# UTC 文本（三位毫秒 + `Z`）；带参数版接秒数偏移。
+#
+# 为什么格式必须逐字节一致：`last_used_at` 参与淘汰比较，两处格式不同就会在边界上
+# 错一天。所以 `prune` 的 cutoff 也在 SQL 里生成，不在 Python 里拼——拼出来的 Python
 # `%f` 是 6 位微秒，与库里的 3 位毫秒比字符串时 `...00.123Z` vs `...00.123456Z`
 # 的第四位是 `Z` 对 `4`，字典序立刻反过来。
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_NOW = "nowstamp()"
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    """建两张表与索引。幂等，供 `repository.connect()` 在每次连接时调用。"""
+def ensure_schema(conn: Connection) -> None:
+    """建两张表与索引。幂等，供 `init_schema()` / 直接拿空库跑脚本时调用。"""
     conn.execute(CREATE_SOURCES)
     conn.execute(CREATE_CHUNKS)
     conn.execute(CREATE_CHUNKS_INDEX)
 
 
-def _connect() -> sqlite3.Connection:
-    """连接 + 打开外键。
+def _connect() -> Connection:
+    """拿连接。
 
-    `PRAGMA foreign_keys` 是**连接级**开关，SQLite 默认关着，`ON DELETE CASCADE`
-    只有在它打开时才生效。不打开的表现是 `forget` 返回真、切块静默留着——脏数据
-    不会报错，只会在下一次 `prune` 之后让表越来越大。
+    **原来这里还有一行 `PRAGMA foreign_keys = ON`**。那是 SQLite 的连接级开关：
+    SQLite 默认**不**强制外键，不打开它 `ON DELETE CASCADE` 就是一句死条文——表现是
+    `forget` 返回真、切块静默留着，脏数据不报错，只会在下一次 `prune` 之后让表越来
+    越大。PG 的外键约束**默认就是强制的**（而且是事务性的），这一行在 PG 上没有对应
+    物，也不需要对应物。
     """
-    conn = repository.connect()
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return repository.connect()
 
 
 def content_hash(text: str) -> str:
@@ -220,7 +228,7 @@ def ingest(source: Source) -> str:
         return _ingest_one(conn, source)
 
 
-def _ingest_one(conn: sqlite3.Connection, source: Source) -> str:
+def _ingest_one(conn: Connection, source: Source) -> str:
     """在调用方给的连接/事务里写一份来源，返回持久 id。
 
     单份的写入包在自己的 `SAVEPOINT` 里：批量入库共用一个事务，一份失败只能回滚
@@ -259,7 +267,7 @@ def _ingest_one(conn: sqlite3.Connection, source: Source) -> str:
                 (source_id, digest, source.filename, source.kind.value, text,
                  _metadata_json(source.metadata)),
             )
-        except sqlite3.IntegrityError:
+        except UniqueViolation:
             # 并发的两次上传同一份材料：唯一约束替"先查后写"的窗口兜底。
             # 回滚到本份的 SAVEPOINT 而不是整库回滚——同批别的材料不能被带走。
             conn.execute("ROLLBACK TO ingest_one")
@@ -276,18 +284,19 @@ def _ingest_one(conn: sqlite3.Connection, source: Source) -> str:
 
         rows = _chunk_rows(source_id, text)
         conn.executemany(
-            f"INSERT OR IGNORE INTO {CHUNKS_TABLE} "
-            "(source_id, start, end, level, parent) VALUES (?, ?, ?, ?, ?)", rows)
+            f"INSERT INTO {CHUNKS_TABLE} "
+            '(source_id, start, "end", level, parent) VALUES (?, ?, ?, ?, ?) '
+            "ON CONFLICT DO NOTHING", rows)
     except BaseException:
         try:
             conn.execute("ROLLBACK TO ingest_one")
-        except sqlite3.Error:         # pragma: no cover - 连接已坏时原始异常更重要
+        except DatabaseError:         # pragma: no cover - 连接已坏时原始异常更重要
             pass
         raise
     finally:
         try:
             conn.execute("RELEASE ingest_one")
-        except sqlite3.Error:         # pragma: no cover - 连接已坏时原始异常更重要
+        except DatabaseError:         # pragma: no cover - 连接已坏时原始异常更重要
             pass
 
     logger.info("知识库入库 来源=%s 正文=%d 字 切块=%d 行",
@@ -321,7 +330,7 @@ def ingest_many(
                 break
             try:
                 results.append(_ingest_one(conn, source))
-            except (ValueError, sqlite3.Error, OSError) as exc:
+            except (ValueError, DatabaseError, OSError) as exc:
                 # ValueError 是空正文（不该进库），其余是库本身的问题。
                 logger.warning(
                     "材料没能进知识库（%s: %s），本次仍按原样使用：%s",
@@ -336,7 +345,7 @@ def ingest_many(
     return results
 
 
-def _to_source(row: sqlite3.Row) -> Source:
+def _to_source(row: Row) -> Source:
     """一行 → `Source`。`metadata` 过 `SourceMetadata` 的 validator 再归一化一次。
 
     那道归一化不是冗余：库里存的可能是上一版代码写进去的时间串（带偏移、带毫秒、
@@ -376,7 +385,7 @@ def chunks(source_id: str) -> list[StoredChunk]:
     """
     with closing(_connect()) as conn, conn:
         rows = conn.execute(
-            f"SELECT start, end, level, parent FROM {CHUNKS_TABLE} "
+            f'SELECT start, "end", level, parent FROM {CHUNKS_TABLE} '
             "WHERE source_id = ? ORDER BY start, level", (source_id,)).fetchall()
     return [StoredChunk(start=row["start"], end=row["end"], level=row["level"],
                         parent=row["parent"]) for row in rows]
@@ -468,13 +477,13 @@ def prune(*, keep_days: int = 90, keep_count: int = 200) -> int:
     删来源级联删切块，**不删 `chunk_vectors`**——理由见模块 docstring 的
     「与向量缓存的关系」。
     """
-    days = f"-{max(int(keep_days), 0)} days"
+    days = -max(int(keep_days), 0) * 86400
     keep = max(int(keep_count), 0)
     removed = 0
     with closing(_connect()) as conn, conn:
         removed += conn.execute(
             f"DELETE FROM {SOURCES_TABLE} "
-            f"WHERE last_used_at < strftime('%Y-%m-%dT%H:%M:%fZ','now',?)",
+            f"WHERE last_used_at < nowstamp(?)",
             (days,)).rowcount
         removed += conn.execute(
             f"DELETE FROM {SOURCES_TABLE} WHERE id NOT IN ("

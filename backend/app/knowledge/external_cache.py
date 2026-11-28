@@ -51,13 +51,14 @@ import hashlib
 import json
 import logging
 import os
-import sqlite3
 import unicodedata
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.contracts.source import ISO_SECONDS_FORMAT
+from app.db.conn import Connection
+from app.db.errors import DatabaseError
 from app.mindmaps import repository
 
 logger = logging.getLogger(__name__)
@@ -135,13 +136,13 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _open() -> sqlite3.Connection | None:
+def _open() -> Connection | None:
     """开连接并确保表存在。任何失败都返回 None：缓存不可用不是错误。"""
     try:
         conn = repository.connect()
         conn.execute(_CREATE)
         conn.execute(_INDEX)
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("外部检索缓存不可用：%s", type(exc).__name__)
         return None
     return conn
@@ -205,7 +206,7 @@ def get(raw_query: str, *, limit: int) -> tuple[list[dict[str, Any]], int] | Non
                 (key,),
             )
             return kept, int(row["hit_count"] or 0)
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("外部检索缓存读取失败：%s", type(exc).__name__)
         return None
 
@@ -235,7 +236,7 @@ def put(raw_query: str, *, limit: int, records: list[dict[str, Any]]) -> bool:
             # 过期行顺手清掉：这张表没有别的 GC，而"过期"正是唯一确定的删除判据。
             # 放在写入前而不是定时任务里，是因为写入是这条链上唯一的低频操作。
             conn.execute(f"DELETE FROM {CACHE_TABLE} WHERE searched_at < ?", (deadline,))
-            total = conn.execute(f"SELECT COUNT(*) FROM {CACHE_TABLE}").fetchone()[0]
+            total = conn.execute(f"SELECT COUNT(*) AS total FROM {CACHE_TABLE}").fetchone()["total"]
             if total >= MAX_ROWS:
                 logger.info("外部检索缓存已达上限 %d 行，本次只读不写", MAX_ROWS)
                 return False
@@ -250,7 +251,7 @@ def put(raw_query: str, *, limit: int, records: list[dict[str, Any]]) -> bool:
                 (key, normalize_query(raw_query)[:200], body, int(limit), stamp),
             )
             return True
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("外部检索缓存写入失败：%s", type(exc).__name__)
         return False
 
@@ -269,6 +270,6 @@ def clear() -> int:
         with closing(conn), conn:
             cursor = conn.execute(f"DELETE FROM {CACHE_TABLE}")
             return int(cursor.rowcount or 0)
-    except (sqlite3.Error, OSError) as exc:
+    except (DatabaseError, OSError) as exc:
         logger.warning("外部检索缓存清空失败：%s", type(exc).__name__)
         return 0

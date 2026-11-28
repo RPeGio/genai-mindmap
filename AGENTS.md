@@ -2,12 +2,13 @@
 
 ## 项目与部署
 
-上传材料 → 检索 → 生成/生长导图 → 画布编辑与保存。部署目标是 **2C2G 单机 + SQLite 单文件**（`MINDMAP_DB_PATH`）。任何改动先问"这台机器扛得住吗"：不要引入常驻内存索引、多 worker 写假设、重依赖或启动期大计算。
+上传材料 → 检索 → 生成/生长导图 → 画布编辑与保存。部署目标是 **2C2G 单机 + 本机 PostgreSQL 16**（连接串 `MINDMAP_PG_DSN`，测试用 `MINDMAP_TEST_DSN`；`MINDMAP_DB_PATH` 已废除）。任何改动先问"这台机器扛得住吗"：不要引入常驻内存索引、多进程内存假设、重依赖或启动期大计算。**"单文件库"那套旧直觉要换掉**：库现在是独立进程（空闲 45 MB / 池预热 67 MB / 8 线程写压测 168 MB），多 worker 不再是写者冲突问题、而是多一份池与多一份 Python 运行时；备份恢复是 `pg_dump -Fc` / `pg_restore`，不是拷文件。方案与实测见 `docs/PG-MIGRATION-PLAN.md`。
 
 ## 技术栈
 
 - 后端：FastAPI + Pydantic v2（`extra="forbid"` 是默认风格；CI 用 Python 3.12）
-- 检索：SQLite + BM25/向量混合、RRF 融合，可选 rerank 与 Neo4j 图
+- 存储：PostgreSQL 16 + psycopg 3 连接池，经 `backend/app/db/` 兼容层访问（`?` 占位符与每语句 SAVEPOINT 在那里转；写 SQL 时仍按原有写法）
+- 检索：BM25/向量混合、RRF 融合，可选 rerank 与 Neo4j 图（向量存 `bytea`，没有 pgvector 索引）
 - 前端：Vue 3 + Pinia + @vue-flow/core + Tailwind，Vite + vitest
 - 契约：`backend/openapi.json` 是前后端唯一形状来源，`schema.d.ts` 由它生成
 
@@ -43,6 +44,8 @@ npm run gen:api                         # 由 backend/openapi.json 重生成 sch
 cd backend && python -m uvicorn app.main:app --reload --port 8000
 cd frontend && npm run dev
 ```
+
+**跑后端测试前先起一个 PG**。测试不再落临时文件，而是连一个真实库并每用例清表（`conftest.py` 的 `fresh_db`）：没设 `MINDMAP_TEST_DSN` 时会回落到 `postgresql://postgres@127.0.0.1:55433/mindmap_test`——那个端口是开发机上惯用的，CI 里由 `postgres:16` service 顶上。库连不上时不是 skip、是每个用例报连接错误：**"测试红了"里有一半是"库没起"**，先 `pg_isready` 再怀疑代码。表由 `init_schema()` 建，`repository.connect()` 已经不再建表。
 
 ## 约定（每条都对应一次真实 bug，别删"为什么"）
 

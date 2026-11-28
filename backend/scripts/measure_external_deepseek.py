@@ -38,7 +38,6 @@ import argparse
 import os
 import statistics
 import sys
-import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -57,6 +56,7 @@ from app.knowledge import external  # noqa: E402
 
 sys.path.insert(0, str(BACKEND / "scripts"))
 import measure_external_relevance as baseline  # noqa: E402
+import _pg_tmp  # noqa: E402  （`scripts/` 上一行已插进 sys.path）
 
 TOPICS: list[tuple[str, str]] = baseline.TOPICS
 SEARCH_ENV = external.DEEPSEEK_SEARCH_ENV
@@ -184,17 +184,23 @@ def _sources_of(hits: Sequence[external.ExternalHit]) -> list[Any]:
 def run_truncation(limit_topics: int | None) -> int:
     """正文长度 → chunk 数；以及"六源 vs 五源"时检索池里的源分布。
 
-    两条读数共用一个临时库：`library.ingest` 是生产入库的同一条路，`chunks()` 是
+    两条读数共用一个临时 database：`library.ingest` 是生产入库的同一条路，`chunks()` 是
     同一条切块实现——自己写一个"按 300 字数一数"的近似只会得到另一个数。
+
+    库的生命周期用 `with` 包住：这个函数是"跑完就结束"的直线流程，
+    收尾（关池 → DROP ... WITH (FORCE)）交给 `_pg_tmp`，异常路径也会清。
     """
+    _key()
+    os.environ[SEARCH_ENV] = "1"
+    with _pg_tmp.temp_database("mm_deepseek"):
+        return _run_truncation(limit_topics)
+
+
+def _run_truncation(limit_topics: int | None) -> int:
     from app.contracts.source import Source, SourceKind
     from app.knowledge import library, service
 
-    _key()
-    tmp = tempfile.mkdtemp(prefix="measure-deepseek-")
-    os.environ["MINDMAP_DB_PATH"] = str(Path(tmp) / "probe.db")
     topics = TOPICS if limit_topics is None else TOPICS[:limit_topics]
-    os.environ[SEARCH_ENV] = "1"
 
     def chunk_count(text: str) -> int:
         probe = Source(kind=SourceKind.web, text=text, status="parsed",

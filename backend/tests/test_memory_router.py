@@ -191,7 +191,7 @@ def test_search_does_not_mark_last_used(monkeypatch):
         row = conn.execute(
             f"SELECT last_used_at FROM {store.ITEM_TABLE} WHERE id = ?", (item_id,)
         ).fetchone()
-    assert row[0] is None
+    assert row["last_used_at"] is None
 
 
 def test_search_reports_scanned_zero_on_an_empty_table(monkeypatch):

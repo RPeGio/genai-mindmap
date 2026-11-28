@@ -42,12 +42,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import math
 import os
 import re
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,13 +55,25 @@ from unittest.mock import patch
 
 BACKEND = Path(__file__).resolve().parents[1]
 REPO = BACKEND.parent
+SCRIPTS = Path(__file__).resolve().parent
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+# `scripts/` 不是包，`_pg_tmp` 就在旁边；显式插一次（不要指望 sys.path[0]：
+# `-m` 跑、测试按路径加载时它都不是这个目录）。
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
-# 环境必须在 import 应用之前定下来：`repository.db_path()` 这类在 import 期就可能
-# 缓存，早设比晚设安全。
-_TMP = tempfile.mkdtemp(prefix="measure-slicing-")
-os.environ["MINDMAP_DB_PATH"] = str(Path(_TMP) / "measure.db")
+import _pg_tmp  # noqa: E402  （必须在 sys.path 插好之后）
+
+# 环境必须在 import 应用之前定下来：下面这些 `from app...` 一执行，应用侧就可能
+# 走到连接池。临时库在这一行就建好、`init_schema()` 也在这里跑完——`M2` 之后
+# `repository.connect()` **不再建表**，漏了建表，第一次入库就是
+# `relation "library_sources" does not exist`。
+# 用模块级 create + atexit 而不是 `with`：这个脚本没有单一出口（若干函数各跑一段），
+# `close()` 幂等，atexit 就是收尾。
+_DB = _pg_tmp.TempDatabase.create("mm_slicing")
+atexit.register(_DB.close)
+
 os.environ.pop("MINDMAP_HYBRID_SEARCH", None)
 os.environ.setdefault("MINDMAP_PARENT_RETRIEVAL", "1")
 os.environ.setdefault("MINDMAP_EXTERNAL_KNOWLEDGE", "0")

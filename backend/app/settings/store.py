@@ -46,13 +46,14 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from app.core.errors import AppError
+from app.db.conn import Connection, Row
+from app.db.errors import DatabaseError
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +64,6 @@ logger = logging.getLogger(__name__)
 #: 一行的去处**（迁移就是把 `id = 1` 那一行搬成 `owner = ''`，不搬成任何一个 URI）。
 TABLE = "model_settings"
 INSTANCE_OWNER = ""
-
-#: 迁移时老表临时叫这个名字。带版本号是为了让"迁移到一半被杀掉"这件事可以被识别：
-#: 下次启动看到 `_legacy` 表还在、新表也在，就知道要补一次搬运而不是从头重来。
-_LEGACY_TABLE = f"{TABLE}_legacy_v1"
 
 #: 环境变量名。与 `generation/service.py` 里的读法保持同一组名字——回落就是
 #: "库里没有才发现它在这里"，名字一旦对不上，回落会静默变成"未配置"。
@@ -135,8 +132,9 @@ _ENDPOINT_SUFFIX = "/chat/completions"
 SETTINGS_LOCK_TIMEOUT = 2.0
 
 #: 时间格式与 `mindmaps` / `runs` / `user_prefs` 完全一致。三处格式不同会在
-#: "谁更晚"上错一天（`app/agent/runs.py:_NOW` 写过这条教训）。
-_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+#: "谁更晚"上错一天（`app/agent/runs.py:_NOW` 写过这条教训）。`nowstamp()` 由
+#: `app/db/schema.py` 在 PG 上建，产出与 SQLite 那条 strftime 逐字节同形。
+_NOW = "nowstamp()"
 
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
     owner        TEXT PRIMARY KEY,
@@ -147,13 +145,6 @@ _CREATE = f"""CREATE TABLE IF NOT EXISTS {TABLE} (
     updated_at   TEXT,
     api_key_host TEXT NOT NULL DEFAULT ''
 )"""
-
-#: 老表（单行，`id INTEGER PRIMARY KEY CHECK (id = 1)`）的形状标记。
-#:
-#: 判据用"有没有 `id` 列"而不是"有没有 `owner` 列"：两者互补，但 `id` 是**老表独有**
-#: 的列，而 `owner` 在新表里也一定存在——用 `owner` 判会在"迁移到一半"时把半成品
-#: 当成已完成。
-_LEGACY_MARKER_COLUMN = "id"
 
 #: 降级只告警一次。库坏了（文件被删、权限变了、盘满）时每一次模型调用都会走到
 #: 这里，逐次 `warning` 会把日志刷满，反而看不出"从哪一刻开始坏的"。
@@ -192,169 +183,27 @@ class SettingsError(AppError):
     """设置写入被拒。带着业务 code 出去，界面才有话可说。"""
 
 
-def _columns(conn: sqlite3.Connection) -> set[str]:
-    return _columns_of(conn, TABLE)
+def ensure_schema(conn: Connection) -> None:
+    """建表。幂等。
 
+    **这个函数现在是空转的**，保留它是因为 `test_auth.py` 直接 import 过几个模块的
+    `ensure_schema`，删掉会连带改测试口径（那是 M4 的范围）。
 
-def _columns_of(conn: sqlite3.Connection, table: str) -> set[str]:
-    """这张表现在的列名；表不存在时是空集。
+    历史：它原来做三件事——把老的单行表迁成"一 owner 一行"、建表、给已存在的表补列。
+    前两件的前提（老库是 SQLite、`CREATE TABLE IF NOT EXISTS` 不给已有表补列）在
+    PostgreSQL 上都不成立：建出来的就是终态表，老数据由一次性导入脚本搬进终态形状。
+    第三件换成 PG 的 `ADD COLUMN IF NOT EXISTS`，仍然需要（以后加列时用得上）。
 
-    迁移要按**老表实际有什么列**来搬（见 `_copy_legacy_rows`），所以不能只有
-    "当前表"这一份。
+    `_migrate_legacy` 那段被删掉的是**运行期的就地迁移**，包括它那句最贵的注释：
+    SQLite 的 DDL 自动提交而 DML 不自动提交，所以"改名 → 建表 → 搬行 → 删表"这四步
+    里 `INSERT ... SELECT` 会停在未提交事务里，一 `close()` 就整段回滚，留下"新表空
+    的 + 老表还在"，判据下次仍然成立 → 反复搬空表、老数据再也读不到。**那个坑在 PG
+    上换了个形状**：PG 的 DDL 是事务性的，所以整段要么全成要么全不成，反而更安全。
     """
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    from app.db.schema import ensure_columns
 
-
-def _has_table(conn: sqlite3.Connection, name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
-    return row is not None
-
-
-def _not_null_columns(conn: sqlite3.Connection, table: str = TABLE) -> set[str]:
-    """这张表里所有带 `NOT NULL` 的列。
-
-    搬行时要对它们补默认值：`INSERT OR IGNORE` 会把违反约束的整行丢掉，而老表
-    可能允许 NULL（main 的 `deep_model TEXT` 就没有 `NOT NULL`）。用 `PRAGMA
-    table_info` 的 `notnull` 那一位判断，不手抄列名——手抄的清单改表时不会跟着变。
-    """
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})") if row[3]}
-
-
-def _copy_legacy_rows(conn: sqlite3.Connection) -> None:
-    """把老表那一行搬进新表，**只搬两张表都有的列**。
-
-    列名不能写死。`api_key_host` 是 PR#27 才加到新表上的，而 main 时代的老表里
-    根本没有这一列——写死成 `SELECT ..., COALESCE(api_key_host, '') FROM 老表`
-    会在 `SELECT` 阶段抛 `no such column`，而这里是 `connect()` 的中段，抛出去
-    就是**整个服务起不来**（不是 `saved()` 那个降级分支能兜住的）。
-
-    实测过：拿 main 的老库跑一遍，`repository.connect()` 直接
-    `sqlite3.OperationalError: no such column: api_key_host`。
-
-    老表没有的列按"新表那次补列的语义"给默认值：`api_key_host` 缺就是空串
-    （= 没绑定过，`resolve()` 按"绑定校验不生效"处理，不会在升级后把已存配置
-    打成未配置）。老表有而新表没有的列（已废弃的）自然不搬。
-    """
-    source = _columns_of(conn, _LEGACY_TABLE)
-    target = _columns(conn)
-    if not source or not target:
-        return
-    #: 老表里没有时补什么。目前只有 `api_key_host` 是"新增列"，它的缺省语义是空串。
-    defaults: dict[str, object] = {"api_key_host": ""}
-    overrides: dict[str, object] = {"owner": INSTANCE_OWNER}
-    carried = [name for name in sorted(target)
-               if name not in overrides and name in source]
-    missing = [name for name in sorted(target)
-               if name not in overrides and name not in source and name in defaults]
-    names = [*overrides, *carried, *missing]
-    #: 新表里 `NOT NULL` 的那些列。老表可能宽容地允许 NULL（main 的
-    #: `deep_model TEXT` 就没有 `NOT NULL`，而新表是 `TEXT NOT NULL DEFAULT ''`），
-    #: 搬过来时要在 `SELECT` 里就地补默认值。
-    required = _not_null_columns(conn)
-    select_parts = ["?"] * len(overrides)
-    values: list[object] = [*overrides.values()]
-    for name in carried:
-        if name in required:
-            select_parts.append(f'COALESCE("{name}", ?)')
-            values.append(defaults.get(name, ""))
-        else:
-            select_parts.append(f'"{name}"')
-    select_parts.extend(["?"] * len(missing))
-    values.extend(defaults[name] for name in missing)
-    # `OR IGNORE` 而不是 `OR REPLACE`：能走到"老表还在、新表也有行"的时候，说明上一次
-    # 迁移在"搬完 / 删老表"之间断了，而那一瞬间之后可能已经有人在新表上保存过配置。
-    # 老表里那份是**更旧的**，拿它盖掉新行等于把用户刚改的设置回退。已经搬过去的那
-    # 一份本来就一样，IGNORE 不丢东西。
-    #
-    # **`IGNORE` 的代价**：它连 `NOT NULL` 违规也一起吞掉（`OR REPLACE` 会换成列
-    # 默认值）。实测过：main 的老库里 `deep_model` 是 NULL，直接搬会让整行被静默
-    # 丢掉、`rowcount = 0`，用户看到"升级完密钥没了"。所以上面逐个 `COALESCE`。
-    conn.execute(
-        f"""INSERT OR IGNORE INTO {TABLE} ({", ".join(f'"{name}"' for name in names)})
-            SELECT {", ".join(select_parts)} FROM {_LEGACY_TABLE}""", tuple(values))
-
-
-def _migrate_legacy(conn: sqlite3.Connection) -> None:
-    """把老的单行表搬成"一行一个 owner"。幂等，且**两段都能续上**。
-
-    老表是 `id INTEGER PRIMARY KEY CHECK (id = 1)`——它把"部署方那一份配置"钉死在
-    唯一一行上。新表的主键换成 `owner`，老那一行搬成 `owner = ''`（`INSTANCE_OWNER`）。
-
-    **为什么不用 `ALTER TABLE ADD COLUMN owner` 再补主键**：SQLite 不支持给已有表
-    加主键，也不支持改主键。要么重建表，要么放弃主键约束——而放弃约束之后"同一个
-    owner 两行"就成了一种可能的状态，那时 `SELECT` 得靠 `ORDER BY` 猜哪行生效，
-    正是老设计用 `CHECK (id = 1)` 想避免的那件事。
-
-    **两段式，每段都可续**：
-
-      1. `RENAME` 老表 → `_LEGACY_TABLE`，再建新表，再 `INSERT ... SELECT` 搬那一行。
-      2. 删掉 `_LEGACY_TABLE`。
-
-    进程在任何一处被杀掉，下一次 `connect()` 看到的都是可识别的中间态：新表已建、
-    老表还在 → 再搬一次（`INSERT OR IGNORE` 幂等）；老表已删、新表在 → 什么都不做。
-    这是刻意的：迁移跑在一个每个请求都会调的函数里，它不能有"只许成功一次"的假设。
-
-    **每段末尾都要 `commit()`**——这一版最贵的教训。`sqlite3` 在默认
-    `isolation_level` 下只对 DML 开事务，DDL（`ALTER` / `CREATE` / `DROP`）走自动
-    提交。所以"改名 → 建表 → 搬行 → 删表"这四步里，一、二、四步立刻落盘，而
-    `INSERT ... SELECT` 停在一个没人提交的事务里，`connect()` 的调用方一 `close()`
-    就整段回滚。磁盘上留下的是"新表空的 + 老表还在"，而判据（老表在 = 还没搬完）
-    下次仍然成立，于是**又搬一次空表、老数据再也没被读过**——用户在页面上看到的是
-    "我配的密钥没了"。第一次读之所以还能读到，是因为同一条连接里事务还没回滚。
-
-    开发库上真踩到过：
-
-        tables: [... 'model_settings_legacy_v1' ... 'model_settings']
-        model_settings rows: []
-
-    **只在真的看到老表时才动**（判据是 `id` 列且没有 `owner` 列）。老表独有的 `id`
-    而不是新表也有的 `owner`：迁移到一半时新表已经有了 `owner`，用 `owner` 判会把
-    半成品当成已完成。
-    """
-    columns = _columns(conn)
-    legacy_renamed = _has_table(conn, _LEGACY_TABLE)
-    if _LEGACY_MARKER_COLUMN in columns and "owner" not in columns:
-        # 第 1 段。老表名还在，先改名腾出表名（`IF NOT EXISTS` 的 `_CREATE` 才能建新表）。
-        conn.execute(f"ALTER TABLE {TABLE} RENAME TO {_LEGACY_TABLE}")
-        legacy_renamed = True
-    if legacy_renamed:
-        # 新表必须在这里就建出来，不能留给 `ensure_schema()` 后面的那句 `_CREATE`：
-        # 改名之后 `PRAGMA table_info({TABLE})` 是**空集**（表名已经挪走了），下面
-        # 那段"看到 `owner` 列才算搬"的判据会永远为假，于是搬运与删表都不发生——
-        # 结果是库里同时躺着一张空的新表和一张没搬的老表，老配置看起来"不见了"。
-        conn.execute(_CREATE)
-    if legacy_renamed and _has_table(conn, _LEGACY_TABLE):
-        # 第 2 段。搬那一行（如果它真的有行：老库可能是空表）。
-        _copy_legacy_rows(conn)
-        conn.commit()
-        conn.execute(f"DROP TABLE {_LEGACY_TABLE}")
-    conn.commit()
-
-
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    """建表。由 `repository.connect()` 在同一个连接上调用，幂等。
-
-    与 `user_prefs` / `memory_items` / `library_sources` 建在同一时刻的理由一样：
-    读它的路径（**每一次模型调用**，见 `generation.service._config`）在热路径上，
-    多一个"发现表不存在 → 建表"的分支只会在最不该出错的地方多一条可能出错的路径。
-
-    **先迁移、再建表**：顺序反了的话，老库上 `CREATE TABLE IF NOT EXISTS` 会因为
-    同名表已存在而静默什么都不做，`_ensure_columns` 随后补上 `deep_model` 之类的列，
-    于是"迁移"看起来成功了——而表还是单行的那张，`SELECT ... WHERE owner = ?` 会抛
-    `no such column: owner`，被 `saved()` 的降级分支吞成"未配置"。用户看到的是
-    "我配的密钥不见了"，而不是"迁移没跑"。
-
-    `_ensure_columns` 那一步在新表上是空操作（建表语句里已经有全部列），留着是为了
-    下一个人往这张表加列时不必记得"`CREATE TABLE IF NOT EXISTS` 不会给**已经存在**
-    的表补列"——线上那张表一旦有行，加列就再也进不去了，而缺列的表现是
-    `SELECT` 抛 `no such column`，被下面的降级分支吞成"未配置"，看起来像"用户没设过"。
-    """
-    _migrate_legacy(conn)
     conn.execute(_CREATE)
-    from app.mindmaps.repository import _ensure_columns
-
-    _ensure_columns(conn, TABLE, {
+    ensure_columns(conn, TABLE, {
         "deep_model": "TEXT",
         "updated_at": "TEXT",
         # 密钥绑定在哪台主机上。老库补这一列时全部是空串 = "没绑定过"，
@@ -408,7 +257,7 @@ class Resolved:
     reasoning_effort: str | None = None
 
 
-def _connect(*, timeout: float | None = None) -> sqlite3.Connection:
+def _connect(*, timeout: float | None = None) -> Connection:
     # 函数内 import：`repository.connect()` 里要用本模块的 `ensure_schema`，模块顶层
     # 反向 import 回去就成环。与 `app/prefs/style.py` / `app/memory/store.py` 同一手法。
     from app.mindmaps import repository
@@ -538,7 +387,7 @@ def saved(owner: str | None = None) -> Ready:
             row = conn.execute(
                 f"SELECT base_url, api_key, model, deep_model, updated_at, api_key_host "
                 f"FROM {TABLE} WHERE owner = ?", (owner,)).fetchone()
-    except sqlite3.Error as exc:
+    except DatabaseError as exc:
         if not _DEGRADED_WARNED:
             _DEGRADED_WARNED = True
             logger.warning(
@@ -557,7 +406,7 @@ def saved(owner: str | None = None) -> Ready:
     return ready
 
 
-def _row_host(row: sqlite3.Row) -> str:
+def _row_host(row: Row) -> str:
     """兼容"还没补上 `api_key_host` 列"的库。
 
     `_ensure_columns` 会让新库与新连接都带上这一列，但降级路径（`saved()` 读失败
@@ -954,7 +803,7 @@ def _read_strict_for_save(owner: str) -> Ready:
     """
     try:
         row = _read_strict(owner, timeout=SETTINGS_LOCK_TIMEOUT)
-    except sqlite3.Error as exc:
+    except DatabaseError as exc:
         # 宁可这次保存失败，也不能把"读不到"当成"是空的"：那会把用户已存的
         # base_url 与密钥一起写成空串，还回 200「保存成功」。
         raise SettingsError(
@@ -1084,7 +933,7 @@ def save(
                             api_key_host = excluded.api_key_host""",
                     (owner, next_base, next_key, next_model, next_deep, next_host),
                 )
-        except sqlite3.Error as exc:
+        except DatabaseError as exc:
             # 与 `_read_strict_for_save` 同一条规矩：写不进去也要给出能读的 code。
             # 裸 `OperationalError` 冒到 FastAPI 会变 500 + 一段 traceback，面板
             # 只能显示一句通用错误——而这条路上最可能发生的事恰恰是"过几秒就好了"。

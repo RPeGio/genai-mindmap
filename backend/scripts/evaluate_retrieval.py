@@ -133,7 +133,6 @@ import math
 import os
 import re
 import sys
-import tempfile
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -153,6 +152,7 @@ if str(SCRIPTS) not in sys.path:
 
 import eval_cases_crossdoc as crossdoc_cases  # noqa: E402
 import eval_cases_manual as manual_cases  # noqa: E402
+import _pg_tmp  # noqa: E402  （`scripts/` 已在上面插进 sys.path）
 from app.contracts.source import Source, SourceKind  # noqa: E402
 from app.ingestion.service import parse_bytes, parse_text  # noqa: E402
 from app.knowledge import library as knowledge_library  # noqa: E402
@@ -1008,10 +1008,18 @@ PERSIST_DB_ENV = "MINDMAP_EVAL_DB_PATH"
 
 为什么非它不可：图上的每条边存的是**入库那一刻**的持久 `source_id`，而
 `library.ingest` 的 id 是 `uuid4`（同一个正文在两个库里是两个 id）。默认的临时库
-每次换路径，于是图证据的 `source_id` 在 `library.load` 里查不到，`_Resolver` 把它
+每次换一个库，于是图证据的 `source_id` 在 `library.load` 里查不到，`_Resolver` 把它
 整条丢掉——`--graph 1` 会与 `--graph 0` 逐位相同，而且**看不出原因**（丢证据是
-`logger.debug`）。所以建图与评估必须指同一个库文件：建图那一刻 `MINDMAP_DB_PATH`
+`logger.debug`）。所以建图与评估必须指同一个库：建图那一刻 `MINDMAP_PG_DSN`
 指哪，评估就把它写进 `MINDMAP_EVAL_DB_PATH`。
+
+取值两种写法（PG 里没有"文件路径"这个概念了，所以它认库名也认连接串）：
+
+  - **库名**（如 `mindmap_graph`）：在同一个集群里建（已存在就复用），跑完**不删**。
+    这是 `--graph 1` 的常规用法——图与评估要同一个库，那个库得活到下一次评估；
+  - **完整 DSN**（含 `://`）：直接用，连建都不建（不替人往别的集群里建库）。
+
+不设就建一个一次性 database，跑完删掉（`_pg_tmp` 负责关池 → DROP）。
 """
 
 
@@ -1024,8 +1032,8 @@ def _id_space(materials: Sequence[Material], *, need_library: bool) -> Iterator[
     id 空间都得登记——漏了任何一个，那批命中都会因为"查不到指纹"被静默判成别的
     材料（`library=False` 时 id_map 为空，就是把全部 recall 变成 0 的那个 bug）。
 
-    默认库落临时目录、跑完删掉：**不碰** `backend/data/mindmaps.db`。设了
-    `MINDMAP_EVAL_DB_PATH` 就改用那个文件并且**不删**（理由见那个常量）——重复
+    默认库是一次性 database、跑完删掉：**不碰** `MINDMAP_PG_DSN` 指的那个库。设了
+    `MINDMAP_EVAL_DB_PATH` 就改用那个库并且**不删**（理由见那个常量）——重复
     `ingest` 同一份正文是幂等的（`UNIQUE(content_hash)`），所以多条 case 共用它安全。
     """
     id_map = {material.source.id: material.content_hash for material in materials}
@@ -1033,34 +1041,29 @@ def _id_space(materials: Sequence[Material], *, need_library: bool) -> Iterator[
         yield id_map
         return
     persistent = os.getenv(PERSIST_DB_ENV, "").strip()
-    work = None
     if persistent:
-        db_path = Path(persistent)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        work = Path(tempfile.mkdtemp(prefix="retrieval-eval-"))
-        db_path = work / "library.db"
-    previous = os.environ.get("MINDMAP_DB_PATH")
-    os.environ["MINDMAP_DB_PATH"] = str(db_path)
-    try:
+        # 持久库：`created=True` 说明这个库是本次新建的空库——空库里的 source_id
+        # 与图里存的永远对不上，与其静默退化成 `--graph 1 == --graph 0`，不如在这里
+        # 就把"你可能忘了先建图"点出来（丢证据是 logger.debug，不点出来看不见）。
+        _dsn, created = _pg_tmp.persistent_database(persistent)
+        if created:
+            print(f"[evaluate] 新建了持久库 {persistent}（是空的）。"
+                  f"要量图检索，先让建图那一步也用它。", file=sys.stderr)
+        try:
+            for material in materials:
+                id_map[knowledge_library.ingest(material.source)] = material.content_hash
+            yield id_map
+        finally:
+            # 持久库不删，但**池必须关**：脚本结束前还攥着一个连接，调用方（可能是
+            # 同进程里紧接着跑的另一段）改 DSN 时会拿到指向旧库的池。
+            from app.db import pool as _pool_module
+
+            _pool_module.close_pool()
+        return
+    with _pg_tmp.temp_database("mm_eval"):
         for material in materials:
             id_map[knowledge_library.ingest(material.source)] = material.content_hash
         yield id_map
-    finally:
-        if previous is None:
-            os.environ.pop("MINDMAP_DB_PATH", None)
-        else:
-            os.environ["MINDMAP_DB_PATH"] = previous
-        if work is None:
-            return
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            candidate = Path(f"{db_path}{suffix}")
-            if candidate.exists():
-                candidate.unlink()
-        try:
-            work.rmdir()
-        except OSError:
-            pass
 
 
 def _ranked_hits(

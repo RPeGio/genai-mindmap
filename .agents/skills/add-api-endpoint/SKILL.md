@@ -62,21 +62,20 @@ class Node(BaseModel):
 
 ## 3. 用例：`backend/tests/`
 
-用 `fastapi.testclient.TestClient`，fixture 照抄 `backend/tests/test_source_refs.py:78`：
+用 `fastapi.testclient.TestClient`，fixture 照抄 `backend/tests/test_source_refs.py:76`（那里解题思路是"别自己建库"）：
 
 ```python
 @pytest.fixture
 def client(monkeypatch):
-    data = Path(__file__).resolve().parents[1] / "data"
-    data.mkdir(exist_ok=True)
-    db_file = data / f"source-refs-{uuid4().hex}.db"
-    monkeypatch.setenv("MINDMAP_DB_PATH", str(db_file))
-    try:
-        with TestClient(app) as api:
-            yield api
-    finally:
-        db_file.unlink(missing_ok=True)
+    # 库的隔离由 `conftest.fresh_db` 负责（每用例清表）：不要自己建临时库。
+    monkeypatch.setenv("MINDMAP_LLM_MODE", "model")
+    with guest_client() as api:
+        yield api
 ```
+
+**不要写 `monkeypatch.setenv("MINDMAP_DB_PATH", ...)` 建临时库文件。** 那个变量已废除（库换成 PostgreSQL，连接串是 `MINDMAP_PG_DSN`，测试缺省见 `conftest.py`）；写它既不起作用、又会让人以为隔离还靠文件。隔离的正确出处是一处：`conftest.py` 的 autouse `fresh_db`，它在每个用例前 `clear_all()` 清全部表。
+
+同理，**不要自己 `sqlite3.connect()` 去造前置数据**——直接 `repository.connect()`，并注意行是 `dict`（池的 `row_factory` 是 `dict_row`，`row["col"]` 而不是 `row[0]`）；表由 `init_schema()` 建，`repository.connect()` 不再建表。
 
 **三条错误路径各写一条，不要只测成功**：
 

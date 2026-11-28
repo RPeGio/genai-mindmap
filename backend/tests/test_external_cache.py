@@ -116,7 +116,7 @@ def _rows() -> int:
     try:
         with repository.connect() as conn:
             return int(conn.execute(
-                f"SELECT COUNT(*) FROM {external_cache.CACHE_TABLE}").fetchone()[0])
+                f"SELECT COUNT(*) AS total FROM {external_cache.CACHE_TABLE}").fetchone()["total"])
     except Exception:  # noqa: BLE001 — 没有表 = 没有缓存，与"0 行"同义
         return 0
 
@@ -209,14 +209,14 @@ def test_hit_count_tracks_reuse(monkeypatch):
     external.search_external("碳中和")
     with repository.connect() as conn:
         before = conn.execute(
-            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()[0]
+            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()["hit_count"]
     assert before == 0
 
     external.search_external("碳中和")
     external.search_external("碳中和")
     with repository.connect() as conn:
         after = conn.execute(
-            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()[0]
+            f"SELECT hit_count FROM {external_cache.CACHE_TABLE}").fetchone()["hit_count"]
     assert after == 2
 
 
@@ -413,7 +413,7 @@ def test_expired_rows_are_pruned_on_write(monkeypatch):
     assert _rows() == 1
     with repository.connect() as conn:
         query = conn.execute(
-            f"SELECT query FROM {external_cache.CACHE_TABLE}").fetchone()[0]
+            f"SELECT query FROM {external_cache.CACHE_TABLE}").fetchone()["query"]
     assert query == "另一件事"
 
 

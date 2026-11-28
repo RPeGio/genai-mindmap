@@ -60,7 +60,9 @@ REM   - 行首 # 是注释，空行跳过
 REM   - 只按**第一个** = 切分，值里可以再有 = （比如带参数的 URL）
 REM   - 值为空时**不设置**。这一条是有意的：.env.example 里满是 KEY= 这种空
 REM     占位行，照抄成 .env 之后如果把空值也 set 进去，就会顶掉代码里的缺省
-REM     值（MINDMAP_DB_PATH 会变成空串、MINDMAP_AGENT_ENABLED 会变成非数字）
+REM     值（MINDMAP_AGENT_ENABLED 会变成非数字、MINDMAP_PG_DSN 会变成空串）
+REM     ——空串尤其坑：`app/db/pool.py` 是 `getenv(...) or DEFAULT_DSN`，空串会
+REM     被当成"配了但配错了"，而不是"没配，用缺省的本机 socket"。
 REM 不支持：行尾注释、多行值、${VAR} 插值。.env.example 里都不出现。
 if not exist "%ENV_FILE%" (
     echo [提示] 没有 %ENV_FILE%，跳过加载。
