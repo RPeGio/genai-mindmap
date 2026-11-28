@@ -203,6 +203,72 @@ def test_list_sources_omits_text_and_counts_chunks():
     assert "text" not in entry, "摘要不该带正文"
 
 
+# ---------------------------------------------------------------- 1.5 控制字符
+
+
+def test_nul_in_text_is_folded_before_the_hash():
+    """正文里的 NUL 折成空格再算指纹：PG 的 text 收不下 `0x00`。
+
+    SQLite 的 TEXT 允许 NUL，所以这类正文能存进老库；迁 PG 时整批 INSERT 会抛
+    `psycopg.DataError: PostgreSQL text fields cannot contain NUL (0x00) bytes`。
+    治本点在入库关口，这样新的外部抓取内容不会再带进来。
+
+    断言的重心是**指纹与落库正文一致**：折字符在算 `digest` 之前，否则唯一键
+    描述的正文和库里存的正文是两份东西。
+    """
+    dirty = "思维导图（Mind Map）又叫心智图，依据\x00大脑放射性思维的特点"
+    source_id = library.ingest(_source(dirty))
+
+    stored = library.load(source_id)
+    assert stored is not None
+    assert "\x00" not in (stored.text or "")
+    assert stored.text == dirty.replace("\x00", " ")
+    assert stored.content_hash == library.content_hash(stored.text)
+
+
+def test_folding_keeps_line_breaks_so_chunking_still_works():
+    """只折"不该出现的"控制字符，不折换行与制表。
+
+    知识库正文靠段落切块（`service._chunk_tree`）。把 `\\n` 也折成空格会把整篇压成
+    一行——NUL 的问题修好了，切块与检索全坏了，而且不会有任何报错。
+    """
+    dirty = "一、总则\n\n本制度规定\t费用支出。\x00\n\n二、审批权限\n\n五万元以内。"
+    text = library.fold_control_chars(dirty)
+
+    assert "\x00" not in text
+    assert text.count("\n") == dirty.count("\n"), "换行必须原样保留"
+    assert "\t" in text, "制表符必须原样保留"
+    assert "。 \n\n二、" in text, "NUL 应当折成空格而不是被删掉"
+
+
+def test_folding_only_changes_the_dirty_record():
+    """干净的正文一个字都不动：折字符不该成为"每次入库都换一条记录"的原因。"""
+    text = _material(11)
+    assert library.fold_control_chars(text) == text
+    source_id = library.ingest(_source(text))
+    stored = library.load(source_id)
+    assert stored is not None
+    assert stored.text == text
+    assert stored.content_hash == library.content_hash(text)
+
+
+def test_text_of_only_control_chars_counts_as_blank(monkeypatch):
+    """只有控制字符的正文折完是空白：按空正文拒掉，不落一堆空格进库。"""
+    with pytest.raises(ValueError, match="正文为空"):
+        library.ingest(_source("\x00\x01\x02"))
+    assert _row_count("library_sources") == 0
+
+
+def test_dirty_and_clean_text_collapse_to_one_record():
+    """折字符之后同一条正文只该有一条记录：唯一键算的是折后的正文。"""
+    clean = "思维导图 又叫心智图"
+    first = library.ingest(_source(clean))
+    second = library.ingest(_source(clean.replace(" ", "\x00")))
+
+    assert first == second
+    assert _row_count("library_sources") == 1
+
+
 # ---------------------------------------------------------------- 2 切块台账
 
 

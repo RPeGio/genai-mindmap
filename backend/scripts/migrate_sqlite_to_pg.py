@@ -303,6 +303,10 @@ def _migrate_table(conn, legacy: sqlite3.Connection,
     新增的列（`owner` / `api_key_host` 这类）不在交集里，于是走 PG 的列默认值。
     **列默认值兜不住的那几个**（NOT NULL 又没有 DEFAULT，见 `_NOT_NULL_FILLS`）
     显式给个常量，否则整行会被 `ON CONFLICT DO NOTHING` 静默吞掉。
+
+    搬运时逐列把字符串里的控制字符折成空格：SQLite 的 TEXT 允许 NUL，PG 的 text
+    不允许，一条含 NUL 的正文会让整批 INSERT 抛 `psycopg.DataError`（真实发生过，
+    见 `docs/PG-MIGRATION-PLAN.md`）。折了几处会进报表，不是静默改写。
     """
     legacy_cols = _legacy_columns(legacy, table)
     legacy_names = [column["name"] for column in legacy_cols]
@@ -343,6 +347,13 @@ def _migrate_table(conn, legacy: sqlite3.Connection,
     raw_rows = legacy.execute(f"SELECT {select} FROM {_quote(table)}").fetchall()
     rows: list[tuple[Any, ...]] = []
     filled = 0
+    folded = 0
+    # 老库是 SQLite，它的 TEXT 收得下 NUL；PG 的 text 不收（`0x00` 会让整批 INSERT
+    # 抛 `psycopg.DataError`）。**只折控制字符、不动别的**：这批字符在目标库里本来
+    # 也表达不出原意（详见 `library.fold_control_chars`）。延迟 import 与既有风格
+    # 一致，也保证 `--dry-run` 这条不连目标库的路径连这个模块都不加载。
+    from app.knowledge.library import fold_control_chars
+
     for raw in raw_rows:
         values: list[Any] = []
         for name in carried:
@@ -352,6 +363,11 @@ def _migrate_table(conn, legacy: sqlite3.Connection,
                 # `DO NOTHING` 静默吞掉，所以就地补上目标列的默认值。
                 value = defaults[name]
                 filled += 1
+            if isinstance(value, str):
+                folded_value = fold_control_chars(value)
+                if folded_value != value:
+                    folded += 1
+                    value = folded_value
             values.append(value)
         values.extend(pinned[name] for name in pinned)
         rows.append(tuple(values))
@@ -367,6 +383,7 @@ def _migrate_table(conn, legacy: sqlite3.Connection,
         "columns": len(carried) + len(pinned),
         "vendored": vendored,
         "filled": filled,
+        "folded": folded,
         "pinned": sorted(pinned),
     }
 
@@ -536,6 +553,8 @@ def _print_counts(title: str, rows: list[dict[str, Any]], *, dry: bool) -> None:
         note = []
         if row.get("filled"):
             note.append(f"补默认 {row['filled']} 处")
+        if row.get("folded"):
+            note.append(f"折控制字符 {row['folded']} 处")
         if row.get("pinned"):
             note.append("老表缺列按 `_NOT_NULL_FILLS` 填 " + ",".join(row["pinned"]))
         if row.get("vendored"):

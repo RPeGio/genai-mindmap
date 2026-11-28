@@ -268,6 +268,15 @@ nowstamp(...)`），并写 `schema_migrations` 行（键 `version`，一个键�
 users 1，其余 0 行），并抽 1 张导图比对 `content` 逐字节相等。
 脚本必须**幂等**（重跑不重复插入）且支持 `--dry-run`。
 
+**补充（真实跑过之后才发现的）**：SQLite 的 `TEXT` 允许 NUL 字节而 PG 的 `text` 不允许，
+一条含 NUL 的正文会让整批 INSERT 抛
+`psycopg.DataError: PostgreSQL text fields cannot contain NUL (0x00) bytes`，迁移停在那张表
+（实测撞在 `library_sources`，外部抓取的百科正文里夹了一个 `\x00`）。
+所以脚本搬运时逐列把字符串里的控制字符折成空格（保留 `\t\n\r\f`，正文靠它们分段切块），
+报表里注明"折控制字符 N 处"。同一个折法也必须放进真正的入库口
+`app/knowledge/library.py::_ingest_one()`——只在迁移脚本里兜底，等于交换完服务一起来、
+下一次外部抓取又把 NUL 写进 PG。
+
 ### M7 · 文档（可与任何阶段并行）
 
 | | |

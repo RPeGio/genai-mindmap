@@ -80,6 +80,7 @@ import hashlib
 import json
 import logging
 import time
+import unicodedata
 from contextlib import closing
 from dataclasses import dataclass
 from uuid import uuid4
@@ -93,6 +94,10 @@ logger = logging.getLogger(__name__)
 
 SOURCES_TABLE = "library_sources"
 CHUNKS_TABLE = "library_chunks"
+
+# `fold_control_chars` 要保留的控制字符：制表、换行、回车、换页。正文靠它们分段，
+# 折成空格会把整篇压成一行（切块算法按段落切——见那个函数的 docstring）。
+_KEPT_CONTROLS = frozenset("\t\n\r\f")
 
 # 建表语句与 `app/db/schema.py` 里那套形状一致，但**生产路径上只有那边在跑**
 # （`init_schema()` 建到终态）。这里保留是为了"直接拿空库跑脚本 / 测试"也能起来。
@@ -155,6 +160,34 @@ def _connect() -> Connection:
     物，也不需要对应物。
     """
     return repository.connect()
+
+
+def fold_control_chars(text: str) -> str:
+    """把控制字符（Unicode `Cc` 类）折成空格，但**保留换行与制表**。
+
+    **为什么必须折**：PostgreSQL 的 `text` 不允许 NUL（`0x00`），一条含 NUL 的正文
+    会让整批 `INSERT` 抛
+    `psycopg.DataError: PostgreSQL text fields cannot contain NUL (0x00) bytes`；
+    SQLite 的 TEXT 没这条限制，所以这类正文能一路存进老库、直到迁 PG 时才炸。其余
+    控制字符虽然 PG 收得下，但落进导出的文档会变成看不见的方块或 ANSI 控制序列。
+
+    **为什么单留 `\\t\\n\\r` 与分页符**：知识库正文是带结构的材料，切块算法（
+    `service._chunk_tree`）按段落与标题切，把这些折成空格会把整篇压成一行——NUL 的
+    问题修好了，切块与检索全坏了。要折的只是"不该出现的那些"。
+
+    **折成空格而不是删掉**：`abc\\x00def` 是两个词，不是 `abcdef`。口径与
+    `app.importing.normalize.one_line` 同源（那边更激进，连换行一起折——它服务的是
+    单行字段，不是正文），跨层 import 会把解析层拖进检索层，所以这里独立实现。
+
+    调用点只有 `_ingest_one`：那是全库唯一的入库关口，`ingest` 与 `ingest_many`
+    都经它，一处折字符覆盖两条入口。
+    """
+    if not text:
+        return text
+    return "".join(
+        " " if unicodedata.category(ch) == "Cc" and ch not in _KEPT_CONTROLS else ch
+        for ch in text
+    )
 
 
 def content_hash(text: str) -> str:
@@ -236,6 +269,12 @@ def _ingest_one(conn: Connection, source: Source) -> str:
     它自己，不能把同批已经写好的材料一起带走。
     """
     text = source.text or ""
+
+    # 控制字符在**判定空正文与算指纹之前**折掉：指纹与落库正文必须逐字节对应，
+    # 否则唯一键（`content_hash`）描述的正文和库里存的正文是两份东西——见
+    # `fold_control_chars`。顺序也决定了"只有控制字符"的正文会被当成空正文拒掉，
+    # 而不是折成一堆空格落进库。
+    text = fold_control_chars(text)
     if not text.strip():
         raise ValueError("正文为空：空材料不该进知识库")
 

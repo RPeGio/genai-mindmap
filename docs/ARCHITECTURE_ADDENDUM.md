@@ -76,6 +76,8 @@ update mindmaps
 
 1. **停服**：`systemctl stop genai-mindmap`，确认没有写入方。
 2. **跑导入脚本**：`backend/scripts/migrate_sqlite_to_pg.py`，读 SQLite 的 `MapRecord` 等表 → 批量写 PG。脚本幂等（重跑不重复插入），支持 `--dry-run`；三处 legacy 就地迁移（`user_prefs` 主键形态、`model_settings` 单行、`style_profile`）在这步一次搬进终态表，运行期不再有"半成品状态要续上"。
+
+   脚本搬运时会把字符串里的控制字符折成空格（`\t\n\r\f` 除外），并在报表里注明"折控制字符 N 处"。原因不是洁癖：SQLite 的 `TEXT` 允许 NUL 而 PG 的 `text` 不允许，**一条含 NUL 的正文会让整批 INSERT 抛 `psycopg.DataError: PostgreSQL text fields cannot contain NUL (0x00) bytes`**，迁移直接停在那张表（真实发生过：外部抓取的百科正文里夹了一个 `\x00`）。同一个折法也在入库口 `app/knowledge/library.py::_ingest_one()` 里，否则迁移完服务一起来、下一次抓取又会把 NUL 写进 PG。
 3. **校验行数与内容**：逐表比对行数（上面那组数字），并抽 1 张导图比对 `content` **逐字节相等**。行数对但内容漂了等于没迁。
 4. **切换**：写入 `MINDMAP_PG_DSN`，起服务，`init_schema()` 幂等建表并记 `schema_migrations`。
 5. **旧库原样保留**：`/var/lib/genai-mindmap/mindmaps.db` 改名为 `mindmaps.db.pre-pg` 留在原地当回滚点，**不删、不覆盖、不压缩**。要保留的是*原文件名可还原*的那一份，而不是塞进备份目录的压缩包。
