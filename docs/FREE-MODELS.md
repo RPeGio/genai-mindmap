@@ -65,6 +65,13 @@
 `retry_after` 透传）；上游偶发的模型级 429 仍然走"换下一个候选"。判据是**正文里的
 类型名**，不是状态码——Command Code 偶发的模型级 429 与它同码不同性。
 
+`retry_after` 透到哪了：`FreeQuotaExhausted` → `ErrorEvent.retry_after`（**SSE 的
+`error` 帧**，前端据此写"约 19 小时后恢复"）→ 前端 `failures.ts` 的
+`free_quota_exhausted` 卡片。它是 `GenerationError` 的**子类**，所以三个出口
+（`backend/app/agent/service.py` 的 except 链、工具内异常那条、`backend/app/agent/router.py`
+的兜底）都必须把它排在 `except GenerationError` **之前**——顺序反了它会被吞成可重试的
+`generation_failed`，卡片永远不出现。
+
 ## 3. 三条实测约束 → 三个设计决定
 
 ### 约束一：列表要 20 秒以上

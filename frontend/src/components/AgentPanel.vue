@@ -368,6 +368,7 @@ const rawFailure = computed(() => {
   const parts = [store.agentError];
   if (store.agentErrorCode) parts.push(`code=${store.agentErrorCode}`);
   if (store.agentErrorLimit) parts.push(`limit=${store.agentErrorLimit}`);
+  if (store.agentErrorRetryAfter) parts.push(`retry_after=${store.agentErrorRetryAfter}s`);
   return parts.join(' · ');
 });
 

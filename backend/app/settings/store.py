@@ -471,7 +471,7 @@ def _row_host(row: Row) -> str:
     return row.get("api_key_host") or ""
 
 
-def _row_options(row: sqlite3.Row) -> tuple[str, ...]:
+def _row_options(row: Row) -> tuple[str, ...]:
     """兼容"还没补上 `effort_options` 列"的库，理由与 `_row_host` 相同。
 
     列在、值是空串 = 没自定义（返回空元组，调用方回落 `DEFAULT_EFFORT_OPTIONS`）；
@@ -479,9 +479,7 @@ def _row_options(row: sqlite3.Row) -> tuple[str, ...]:
     更不该 500。宽松解析的代价是"写坏了看不出来"，但这一栏只喂下拉选项，
     坏了的后果是"回到默认五档"，可接受。
     """
-    if "effort_options" not in row.keys():
-        return ()
-    raw = (row["effort_options"] or "").strip()
+    raw = (row.get("effort_options") or "").strip()
     if not raw:
         return ()
     import json
@@ -777,7 +775,12 @@ def resolve() -> Resolved:
     #
     # 没有自己行的人（游客/匿名）借用部署方那行时，部署方挑过的档位跟着借走：
     # 那是他给"这份共享配置"挑的。空串 = 没挑过，None = 请求里不发这个键。
-    if reasoning_effort is None:
+    #
+    # **免费档不参与这段回落**：上面那段已经把档位定成"目录为那个模型声明的值"，
+    # 目录没声明就是 None（那四个无档位模型），此时必须**不发键**——发一个目录
+    # 没声明的档位实测 400。用户自己存的档位是给他自己的模型挑的，此刻不在用，
+    # 回落进来会得到一个"看起来有档位、实际一调就 400"的配置。
+    if reasoning_effort is None and model_source != SOURCE_FREE:
         reasoning_effort = _norm_text(stored.reasoning_effort) or None
         if reasoning_effort is None and model_source == SOURCE_INSTANCE:
             reasoning_effort = _norm_text(instance.reasoning_effort) or None

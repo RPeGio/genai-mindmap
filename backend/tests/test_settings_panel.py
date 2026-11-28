@@ -511,6 +511,37 @@ def test_free_tier_options_still_come_from_the_directory(monkeypatch):
     assert body["reasoning_effort_options"] == ["none", "low", "high"]
 
 
+def test_a_free_model_without_effort_does_not_borrow_the_saved_word(monkeypatch):
+    """目录没给档位的免费模型（OpenCode 的 `big-pickle` 那类）不能借用用户存过的值。
+
+    用户存 `high` 是给他**自己的**模型挑的；免费档把模型整个换掉之后它不在用。
+    借过去就是一个"目录没声明、实测会 400"的请求。判据是 `model_source`，
+    不是"档位为空"——后者正好是这里要放行的情形。
+    """
+    from app.generation import free_models
+
+    base = "https://api.deepseek.com/v1"
+    monkeypatch.setenv(store.BASE_URL_ENV, base)
+    monkeypatch.setenv(store.MODEL_ENV, "deepseek-chat")
+    monkeypatch.setenv(store.API_KEY_ENV, "env-key-0000")
+    monkeypatch.setenv(free_models.ENABLED_ENV, "1")
+
+    # 用户自己有密钥的那行，挑过档位。
+    client.put("/api/settings/model", json=_body(reasoning_effort="high"))
+    assert store.resolve().reasoning_effort == "high"
+
+    # 免费档接管，而目录给的这个模型**没有**档位信息。
+    with free_models._LOCK:
+        free_models._CACHE[base.rstrip("/")] = (
+            10.0 ** 9 + 10.0,
+            [free_models.FreeModel("deepseek-chat", None, 128000)],
+        )
+
+    resolved = store.resolve()
+    assert resolved.free_tier is True
+    assert resolved.reasoning_effort is None
+
+
 # ---------------------------------------------------------------- 深度思考那一档
 
 def test_explicit_deep_model_from_the_panel_reaches_model_for():

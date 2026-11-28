@@ -906,7 +906,7 @@ export type AgentEvent =
        */
       served_model?: string | null;
     }
-  | { type: 'error'; seq: number; code: string; message: string; limit?: string };
+  | { type: 'error'; seq: number; code: string; message: string; limit?: string; retry_after?: number };
 
 // ---- 用户偏好 ----
 

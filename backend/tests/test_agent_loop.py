@@ -30,6 +30,7 @@ from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
+    FreeQuotaExhausted,
     GenerationError,
     ModelNotConfigured,
     estimate_input_tokens,
@@ -1344,6 +1345,24 @@ class PartialDeliveryTest(unittest.TestCase):
         self.assertEqual(error.type, "error")
         self.assertEqual(error.code, "model_not_configured")
         self.assertIn("环境变量", error.message)
+
+    def test_free_quota_exhausted_has_its_own_code(self):
+        """免费档用完了也必须是独立错误码。
+
+        它和 `model_not_configured` 是同一类失败：重试一百次还是同一个结果——
+        换模型也没用，`FreeQuotaExhausted` 说的是**账号级**的那个桶。两者都是
+        `GenerationError` 的子类，所以 except 的顺序决定了界面上出现的是"明天
+        再来 / 填自己的密钥"那张卡，还是可重试的 `generation_failed`。
+        """
+        events = _collect(
+            _request(),
+            ScriptedProvider([FreeQuotaExhausted("今日免费体验额度已用完，明天再来，或配置自己的模型继续。")]),
+            build_registry("create"),
+        )
+        error = events[-1]
+        self.assertEqual(error.type, "error")
+        self.assertEqual(error.code, "free_quota_exhausted")
+        self.assertIn("明天再来", error.message)
 
 
 class EditKeepsItsOwnSnapshotTest(unittest.TestCase):

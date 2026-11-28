@@ -57,6 +57,7 @@ from app.agent.tools import (
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import DiagramContent
 from app.generation.service import (
+    FreeQuotaExhausted,
     GenerationError,
     ModelNotConfigured,
     _demo_content,
@@ -701,6 +702,7 @@ def _deliver_or_fail(
     served_model: str | None = None,
     reasoning: str = "",
     log_code: str | None = None,
+    retry_after: int | None = None,
 ) -> DoneEvent | ErrorEvent:
     """收尾的唯一口径：**这一轮产出过树就交树，一棵都没长出来才报错。**
 
@@ -745,6 +747,7 @@ def _deliver_or_fail(
         )
     return ErrorEvent(
         seq=next(seq), code=code, message=message, limit=limit,
+        retry_after=retry_after,
     )
 
 
@@ -1394,6 +1397,18 @@ async def _loop(
                 tool_calls=tool_calls, model=model_name, reasoning=last_reasoning,
             )
             return
+        except FreeQuotaExhausted as exc:
+            # 免费档的每日桶用完：**这一档不能重试**（换十个模型还是同一个桶），
+            # 界面要的是"明天再来 / 填自己的密钥"那张卡，不是"再试一次"。
+            # 它必须是 `GenerationError` 之前的一条独立分支——两者是父子类，
+            # 顺序反了这一条永远走不到，用户拿到的就是可重试的 `generation_failed`。
+            yield _deliver_or_fail(
+                ctx, seq, usage_total,
+                code="free_quota_exhausted", message=str(exc),
+                tool_calls=tool_calls, model=model_name, reasoning=last_reasoning,
+                retry_after=exc.retry_after,
+            )
+            return
         except GenerationError as exc:
             # 日志由 `_deliver_or_fail` 统一记（它带 `log_code`，两条分支都记一次）。
             # 这里再写一条会把同一次失败记成两条——两条都带 `model_calls_used`，
@@ -1568,13 +1583,26 @@ async def _loop(
                 # `_deliver_or_fail` 的 error 帧，等于替路由做决定（它还要落库、
                 # 发 DONE_FRAME），两条出口对同一件事各说一遍容易漂移。
                 if ctx.produced and isinstance(outcome.error, (ModelNotConfigured, GenerationError)):
-                    config_error = isinstance(outcome.error, ModelNotConfigured)
+                    # 三条分支的 code 不能合并：`model_not_configured` 与
+                    # `free_quota_exhausted` 都是"重试一百次也一样"的失败，界面给的是
+                    # 可操作的那两张卡；把它们并进 `generation_failed`（可重试）会让
+                    # 用户对着一个不会变的结果反复点。判据取最具体的类型在前。
+                    if isinstance(outcome.error, ModelNotConfigured):
+                        code = "model_not_configured"
+                    elif isinstance(outcome.error, FreeQuotaExhausted):
+                        code = "free_quota_exhausted"
+                    else:
+                        code = "generation_failed"
                     yield _deliver_or_fail(
                         ctx, seq, usage_total,
-                        code="model_not_configured" if config_error else "generation_failed",
+                        code=code,
                         message=str(outcome.error),
                         tool_calls=tool_calls, call=call,
                         model=model_name, reasoning=last_reasoning,
+                        retry_after=(
+                            outcome.error.retry_after
+                            if isinstance(outcome.error, FreeQuotaExhausted) else None
+                        ),
                     )
                     return
                 # 这里的 `_log_failure` 只覆盖"继续上抛"的那一半：走上面分支时

@@ -139,6 +139,37 @@ describe('失败分类', () => {
     expect(guide.actions.some(item => item.kind === 'copy')).toBe(true);
   });
 
+  it('免费额度带 retry_after 时说"约 N 小时后"，不给就退回"每天零点"', () => {
+    // 上游 `retry-after` 实测是 68612 秒 ≈ 19 小时。有它就别说"明天"——用户
+    // 最想知道的是"还要等多久"，而"明天"在晚上八点和凌晨一点是两个意思。
+    const withHeader = guideForFailure({
+      code: 'free_quota_exhausted',
+      retry_after: 68612,
+      canRetry: true,
+      running: false,
+    });
+    expect(withHeader.next).toContain('19 小时');
+    expect(withHeader.next).not.toContain('零点');
+    // 两条路仍然都在：等恢复是零成本的，填密钥是当场能做的。
+    expect(withHeader.next).toContain('模型设置');
+
+    // 公共配额那一档不带这个头，退回"每天零点"。
+    const without = guideForFailure({
+      code: 'free_quota_exhausted',
+      canRetry: true,
+      running: false,
+    });
+    expect(without.next).toContain('零点');
+
+    // 脏值不炸：0 / NaN 都当作"没说"。
+    for (const bad of [0, Number.NaN]) {
+      const guide = guideForFailure({
+        code: 'free_quota_exhausted', retry_after: bad, canRetry: true, running: false,
+      });
+      expect(guide.next).toContain('零点');
+    }
+  });
+
   it('身份过期时先给动作（刷新），再说额度，不假装是操作失误', () => {
     const guide = guideForFailure({
       code: 'auth_required',

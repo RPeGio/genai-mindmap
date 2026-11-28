@@ -205,13 +205,15 @@ DDL: tuple[str, ...] = (
     )""",
     # ---------------------------------------------------------------- 模型配置
     """CREATE TABLE IF NOT EXISTS model_settings (
-        owner        TEXT PRIMARY KEY,
-        base_url     TEXT NOT NULL DEFAULT '',
-        api_key      TEXT NOT NULL DEFAULT '',
-        model        TEXT NOT NULL DEFAULT '',
-        deep_model   TEXT NOT NULL DEFAULT '',
-        updated_at   TEXT,
-        api_key_host TEXT NOT NULL DEFAULT ''
+        owner              TEXT PRIMARY KEY,
+        base_url           TEXT NOT NULL DEFAULT '',
+        api_key            TEXT NOT NULL DEFAULT '',
+        model              TEXT NOT NULL DEFAULT '',
+        deep_model         TEXT NOT NULL DEFAULT '',
+        updated_at         TEXT,
+        api_key_host       TEXT NOT NULL DEFAULT '',
+        reasoning_effort   TEXT NOT NULL DEFAULT '',
+        effort_options     TEXT NOT NULL DEFAULT ''
     )""",
     # ---------------------------------------------------------------- 知识库
     """CREATE TABLE IF NOT EXISTS library_sources (
@@ -340,6 +342,20 @@ TABLES_IN_CLEAR_ORDER: tuple[str, ...] = (
 SEQUENCES: tuple[str, ...] = ("edit_events_id_seq", "library_chunks_id_seq")
 
 
+#: 已经建过表的库里要补的列（表名 → 列名 → 声明）。
+#:
+#: **为什么它不能只写进上面的 `DDL`**：`CREATE TABLE IF NOT EXISTS` 对已存在的表
+#: 什么都不做，所以"老库升上来"永远长不出新列——PG 迁移那一版建出来的库就是这种
+#: 老库，而它正是 PR#33 合进来时要面对的形状。DDL 管新库、这张表管老库，
+#: 两处必须同时写；`ADD COLUMN IF NOT EXISTS` 让新库上是空操作，重复执行也安全。
+INCREMENTAL_COLUMNS: dict[str, dict[str, str]] = {
+    "model_settings": {
+        "reasoning_effort": "TEXT NOT NULL DEFAULT ''",
+        "effort_options": "TEXT NOT NULL DEFAULT ''",
+    },
+}
+
+
 def init_schema(conn: Conn | None = None) -> None:
     """建全部表、索引与 `nowstamp()`。幂等，可重复执行。
 
@@ -353,6 +369,8 @@ def init_schema(conn: Conn | None = None) -> None:
         conn.execute(_NOWSTAMP_SQL)
         for statement in DDL:
             conn.execute(statement)
+        for table, columns in INCREMENTAL_COLUMNS.items():
+            ensure_columns(conn, table, columns)
         # 用 "INSERT ... ON CONFLICT" 而不是 "INSERT OR REPLACE"：后者在 PG 里没有
         # 这个写法，而且我们只想"第一次写入时记版本"，不想每次启动都覆盖。
         conn.execute(

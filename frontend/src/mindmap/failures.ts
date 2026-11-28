@@ -44,6 +44,11 @@ export interface FailureInput {
   code?: string;
   /** 预算类失败的细分原因（`max_seconds` / `max_model_calls` / …）。 */
   limit?: string | null;
+  /**
+   * 还要等多久（秒）。只有免费档的每日桶带它：上游 `retry-after` 是到恢复的
+   * 秒数（实测约 19 小时），有它就写"约 N 小时后恢复"，没有才退回"明天零点"。
+   */
+  retry_after?: number | null;
   /** 后端原话。**不改写**：卡片把它折在 `<details>` 里给排障的人看。 */
   message?: string;
   /** 这一次的请求还留在 store 里没有（没有就没什么可重试的）。 */
@@ -93,6 +98,23 @@ function retryBlocker(input: FailureInput, pointless?: string): string | undefin
 }
 
 /**
+ * 「还要等多久」那句话。
+ *
+ * `retry_after` 是上游给的**秒数**（实测 68612 左右），有就换算成小时说准一点；
+ * 没有（公共配额那一档不带这个头）就退回"每天零点"——两种说法都不假装知道
+ * 具体时刻，只是精度不同。
+ */
+function freeQuotaWhen(input: FailureInput): string {
+  const seconds = input.retry_after;
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+    return '免费额度每天零点恢复，明天再来就行。';
+  }
+  const hours = seconds / 3600;
+  if (hours >= 1) return `免费额度约 ${Math.round(hours)} 小时后恢复，那之后再来就行。`;
+  return '免费额度马上就会恢复，隔一分钟再来就行。';
+}
+
+/**
  * 后端错误码 / 前端合成码 →「发生了什么 + 下一步」。
  *
  * 未知码走兜底分支：宁可只说一句"出错了，可以重试"，也不要猜一个错的解释——
@@ -126,10 +148,14 @@ function explain(input: FailureInput): FailureGuide {
       // 指引必须给出**两条都能立刻走的路**，而不是只说"等明天"：填自己的密钥是
       // 当场就能解决的动作，而且正好把这个用户从"蹭公共额度"变成"花自己的钱"，
       // 那对他和对部署方都更好。顺序上先说"明天会自己恢复"，因为那是零成本的那条。
+      //
+      // 恢复时刻：上游 `retry-after` 给的是**到恢复还有多少秒**，有它就说
+      // "约 N 小时后恢复"——比让用户自己猜"明天"是哪一刻准。公共配额那一档没有
+      // 这个头，那时退回"每天零点"。
       return {
         title: '今天的免费次数用完了',
         next:
-          '免费额度每天零点恢复，明天再来就行。想现在继续，'
+          `${freeQuotaWhen(input)}想现在继续，`
           + '打开页面右上角的「模型设置」填自己的密钥——填了就不再受这个限制。',
         actions: [
           retryAction(
